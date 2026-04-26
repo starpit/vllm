@@ -36,7 +36,7 @@ use crate::classified::{Expr, ExternKind, LocalId, OpKind, Program, Stmt, Weight
 // ── Types ─────────────────────────────────────────────────────────
 
 /// A dimension expression.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Dim {
     /// Concrete integer literal.
     Lit(u64),

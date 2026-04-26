@@ -14,6 +14,27 @@ pub mod tile_table;
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
 
+/// Runtime gate for the per-op trace the macro emits inside every
+/// `__dispatch_one`. Reads `FERRITE_TRACE` from the environment on
+/// the first call and caches the result. Set `FERRITE_TRACE=1`
+/// (or any non-empty, non-"0" value) before launch to enable;
+/// pair with `CUDA_LAUNCH_BLOCKING=1` so the trace lines align
+/// with kernel completion order.
+///
+/// Unconditionally compiled in — the cost when disabled is one
+/// atomic-load + branch per dispatched op. The Op enum carries
+/// `#[derive(Debug)]` so the trace can pretty-print variants.
+#[inline]
+pub fn trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERRITE_TRACE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
 /// content discrimination. Canonicalizes object key order and
 /// hashes numbers as f64 bits so manifest-time and runtime produce

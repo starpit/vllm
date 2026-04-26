@@ -39,6 +39,7 @@ use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{ImplementationLibrary, MatchInfo, OpInstance, OpcodeShape, SlotMap};
 use crate::schedule::Loop;
+use crate::shape::Shape;
 use crate::solver::{Assignment, SubgraphId};
 
 // ── Slot allocation ──────────────────────────────────────────────
@@ -72,18 +73,36 @@ pub fn build_slot_map(fuf: &Fuf) -> SlotMap {
 /// detection relies on.
 ///
 /// Constraints honored:
-/// 1. **Live-range overlap.** Two slots co-live iff one's def
-///    position ≤ the other's last-use position and vice versa.
-///    Co-live slots get distinct colors.
-/// 2. **Aliasing.** A `View` slot's `ref_slot` points at its source
-///    slot; runtime navigation requires the two be distinct entries
-///    in `__tiles`. So `dst.color != src.color` for every alias
-///    pair surfaced via `Implementation::output_alias`.
-/// 3. **Consume.** `consumes_input_tiles` declares a slot whose
+/// 1. **Shape partitioning.** Each color carries the shape of the
+///    tiles it holds. A freed color goes back to *its shape's* free
+///    pool; a tile of a different shape can never reuse it. This is
+///    load-bearing for in-place mutation: `cutlass_gemm_add` writes
+///    `[M, N]` into the residual buffer, so the buffer must have
+///    been allocated for `[M, N]`. If a `[M, num_kv_heads, head_dim]`
+///    K-tile and a `[M, hidden]` residual tile share a slot because
+///    their lifetimes don't overlap, the K-tile's smaller buffer
+///    survives into the residual op and the in-place write goes OOB.
+/// 2. **Live-range overlap (within a shape).** Two same-shape slots
+///    co-live iff one's def position ≤ the other's last-use position
+///    and vice versa. Co-live slots within a shape get distinct
+///    colors.
+/// 3. **Same-shape aliasing collapses.** When `output_alias`
+///    declares dst aliases owner AND `dst.shape == owner.shape`,
+///    the dst is the same physical buffer (in-place mutation
+///    semantics: the kernel mutates owner's buffer and downstream
+///    consumers read it). The allocator pins dst to owner's color
+///    — same `__tiles` slot, no `View` entry, no `Op::Alias` row.
+/// 4. **Different-shape aliasing keeps a View.** `Reshape`-style
+///    aliases (dst shape ≠ owner shape) point at the owner's
+///    storage with new metadata; they need their own slot to hold
+///    a `View`/`Reshaped` entry. Shape partitioning already places
+///    them in a different free pool from the owner, so the runtime
+///    `View(ref_slot=owner_slot)` indirection is non-trivial.
+/// 5. **Consume.** `consumes_input_tiles` declares a slot whose
 ///    `OwnedTensor` migrates into the consumer's output. The
 ///    consumed slot's last-use is the consume site — past that it's
 ///    dead and its color is freed.
-/// 4. **Protected slots** (the per-bucket fn's return tile, and the
+/// 6. **Protected slots** (the per-bucket fn's return tile, and the
 ///    backbone-output slot for `forward_backbone`) never have their
 ///    color reused — they must stay alive past the slice's end so
 ///    the per-bucket fn can `take_owned` them.
@@ -219,14 +238,27 @@ pub fn colored_slot_map(
     }
     pairs.sort_by_key(|&(p, t, s)| (p, t, s));
 
-    // Linear-scan: walk pairs in def order. Maintain `active` =
-    // currently-live (color, last_use, owner_key). Free a color when
-    // its owner's last_use < current def_pos. For aliases the
-    // constraint is dst.color != src.color while both alive — encoded
-    // by excluding src's color from the candidate pool when picking
-    // dst's color.
+    // Linear-scan, partitioned by shape. Each color is born tagged
+    // with the shape of the tile that minted it; a freed color
+    // returns to *that* shape's pool. A tile of a different shape
+    // never reuses it.
+    //
+    // Aliases: an `output_alias` declaration whose dst and resolved
+    // owner share a shape pins the dst to the owner's color. These
+    // are in-place mutation aliases (CutlassGemmAdd's add output is
+    // the residual buffer; FusedAddRmsNorm's outputs are the
+    // mutated upstream buffers). They literally share storage, so
+    // they're the same `__tiles` slot — no `View` entry, no
+    // `Op::Alias` row, no separate active entry.
+    //
+    // Aliases whose dst and owner have *different* shapes are
+    // metadata-only (Reshape). They get their own slot in their
+    // own shape pool; a `View { ref_slot: owner_slot }` entry
+    // populated by `Op::Alias(dst_slot, owner_slot)` indirects to
+    // the owner's storage.
     let mut active: Vec<(usize, u32, (TileId, u8))> = Vec::new();
-    let mut free_colors: BTreeSet<u32> = BTreeSet::new();
+    let mut free_colors_by_shape: HashMap<Shape, BTreeSet<u32>> = HashMap::new();
+    let mut color_shape: HashMap<u32, Shape> = HashMap::new();
     let mut next_color: u32 = 0;
     let mut sm = SlotMap::new();
 
@@ -241,17 +273,34 @@ pub fn colored_slot_map(
         // color, breaking byte-equivalence across layers.
         active.retain(|&(lu, color, _ts)| {
             if lu <= dp {
-                free_colors.insert(color);
+                let s = color_shape[&color].clone();
+                free_colors_by_shape.entry(s).or_default().insert(color);
                 false
             } else {
                 true
             }
         });
 
-        // Compute this pair's own last_use.
+        let tile_shape = fuf.get(tile).outputs[slot as usize].clone();
         let is_alias = alias_to_owner.contains_key(&(tile, slot));
+
+        // Same-shape alias collapse: dst pins to owner's color.
+        // No active entry (the owner's already covers the combined
+        // lifetime via `owner_last_use` resolution).
+        if is_alias {
+            let owner = resolve((tile, slot));
+            let owner_shape = fuf.get(owner.0).outputs[owner.1 as usize].clone();
+            if owner_shape == tile_shape {
+                let owner_color = sm.of(owner.0, owner.1);
+                sm.insert_at(tile, slot, owner_color);
+                continue;
+            }
+        }
+
+        // Compute lu_self for the active entry.
         let lu_self = if is_alias {
-            // View dst: dies after its last reader.
+            // Different-shape alias (Reshape view): dies after its
+            // last reader.
             *view_last_use.get(&(tile, slot)).unwrap_or(&dp)
         } else {
             // Owner: dies at its own last_use, OR at consume site
@@ -270,43 +319,16 @@ pub fn colored_slot_map(
             }
         };
 
-        // Constraint: an alias dst's color must differ from its
-        // resolved owner's color (the View's `ref_slot` points at
-        // owner's slot index; they coexist in `__tiles`).
-        let exclude: Option<u32> = if is_alias {
-            let owner = resolve((tile, slot));
-            // Owner's color was assigned earlier (smaller def_pos).
-            Some(sm.of(owner.0, owner.1))
+        // Pick from this shape's free pool; mint a new color if empty.
+        let pool = free_colors_by_shape.entry(tile_shape.clone()).or_default();
+        let color = if let Some(&c) = pool.iter().next() {
+            pool.remove(&c);
+            c
         } else {
-            None
-        };
-
-        // Pick the smallest free color, skipping `exclude`.
-        let color = {
-            let mut chosen: Option<u32> = None;
-            // BTreeSet iter ascending — picks lowest first.
-            for &c in free_colors.iter() {
-                if Some(c) == exclude {
-                    continue;
-                }
-                chosen = Some(c);
-                break;
-            }
-            match chosen {
-                Some(c) => {
-                    free_colors.remove(&c);
-                    c
-                }
-                None => {
-                    // Out of free colors — mint a new one. (If the
-                    // new color happens to collide with `exclude`,
-                    // that's impossible because `exclude` was
-                    // already minted as a smaller color.)
-                    let c = next_color;
-                    next_color += 1;
-                    c
-                }
-            }
+            let c = next_color;
+            next_color += 1;
+            color_shape.insert(c, tile_shape.clone());
+            c
         };
 
         sm.insert_at(tile, slot, color);
@@ -541,9 +563,22 @@ fn parse_u32_literal(ts: &TokenStream) -> Option<u32> {
 /// Apply loop compression to `lowered.instances` in place. When
 /// [`detect_repeating_run`] finds a contiguous run, replace it
 /// with one `Op::Loop` row plus a single iteration's body. The
-/// iteration-index field on the body's rows is zeroed — the
-/// interpreter passes the runtime iteration counter as `__layer`,
-/// which arm bodies use directly. No-op when no run is detected.
+/// iteration-index field on each body row is set to that row's
+/// **per-row baseline** — the value the field had in iter 0 at
+/// that row's position — instead of zeroed. The interpreter passes
+/// the runtime iteration counter as `__layer`, and arm bodies
+/// compute `let layer: u32 = __layer + layer;` so each row's
+/// effective index is `__l + baseline`.
+///
+/// Per-row baselines are load-bearing because the body period can
+/// span a layer boundary: in Llama, the body's trailing
+/// `FusedAddRmsNorm(input_layernorm)` IS the *next* layer's
+/// input_ln (fused with the residual add); its iter-0 layer is 1,
+/// not 0, while the body's other rows have iter-0 layer 0.
+/// Zeroing all rows to 0 collapses every iteration's input_ln to
+/// `__l` — i.e., uses layer N's weights when computing layer N+1's
+/// input ln. Numerical drift accumulates and decode turns to
+/// garbage after a few tokens.
 ///
 /// `iter_index_field_name` is the field name a variant uses to
 /// carry its iteration-index value. Today's only such name is
@@ -579,7 +614,11 @@ pub fn apply_loop_compression(
     for inst in &lowered.instances[start..start + period] {
         let mut copy = inst.clone();
         if let Some(&fi) = iter_idx.get(&inst.name.to_string()) {
-            copy.field_values[fi] = quote! { 0u32 };
+            // Preserve the iter-0 baseline per row — the arm
+            // computes `layer = __layer + baseline` at dispatch.
+            let baseline = parse_u32_literal(&inst.field_values[fi]).unwrap_or(0);
+            let lit = proc_macro2::Literal::u32_suffixed(baseline);
+            copy.field_values[fi] = quote! { #lit };
         }
         new_instances.push(copy);
     }
@@ -726,8 +765,11 @@ impl ArchOpcodes {
         let loop_variant = variant_decl(&loop_variant_shape());
         quote! {
             /// Per-arch opcode enum. Variants from solver-picked Impls;
-            /// `Alias` / `Free` / `Loop` always present.
-            #[derive(Copy)]
+            /// `Alias` / `Free` / `Loop` always present. `Debug` is
+            /// always derived so `ferrite_forward::trace_enabled()`'s
+            /// runtime trace can pretty-print variants without a
+            /// rebuild.
+            #[derive(Debug, Copy)]
             #[allow(non_camel_case_types, dead_code)]
             pub enum #enum_ident {
                 #(#variants,)*
@@ -762,14 +804,23 @@ impl ArchOpcodes {
         // Partition `extracted_prelude` into (shared, per-variant
         // residual). A tuple (fname, fty, value) is "shared" when
         // it appears in 2+ variants with byte-identical fty AND
-        // value — those lift to ONE fn-scope let, dedup'd by
-        // (fname, fty.to_string(), value.to_string()). The rest
-        // stay at the top of their owning arm.
+        // value AND the field name `fname` is associated with that
+        // single value across every variant that extracts it.
+        //
+        // The fname-uniqueness gate is load-bearing: if variant A
+        // extracts `in_slot = 2u32` and variant B extracts
+        // `in_slot = 1u32`, both can't be lifted to fn scope without
+        // shadowing — `let in_slot = 2u32; let in_slot = 1u32;`
+        // would collapse all `in_slot` references to `1u32`. So
+        // either fname is single-valued (lift) or every variant
+        // keeps its own value in the per-arm residual (no lift).
         //
         // Why dedup by string: `syn::Type` and `TokenStream` don't
         // implement Eq; their `to_string()` form is stable for the
         // simple literal-or-path tokens these prelude lets carry.
         let mut occurrences: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+        let mut values_per_fname: BTreeMap<String, std::collections::BTreeSet<(String, String)>> =
+            BTreeMap::new();
         for entries in self.extracted_prelude.values() {
             // Within one variant, count each (key) at most once
             // (multiple instances of the variant get extracted into
@@ -778,16 +829,24 @@ impl ArchOpcodes {
             let mut seen_in_variant: std::collections::HashSet<(String, String, String)> =
                 std::collections::HashSet::new();
             for (fname, fty, val) in entries {
-                let key = (
-                    fname.to_string(),
-                    fty.to_token_stream().to_string(),
-                    val.to_string(),
-                );
+                let fty_s = fty.to_token_stream().to_string();
+                let val_s = val.to_string();
+                let key = (fname.to_string(), fty_s.clone(), val_s.clone());
                 if seen_in_variant.insert(key.clone()) {
                     *occurrences.entry(key).or_insert(0) += 1;
                 }
+                values_per_fname
+                    .entry(fname.to_string())
+                    .or_default()
+                    .insert((fty_s, val_s));
             }
         }
+        let single_valued = |fname: &syn::Ident| -> bool {
+            values_per_fname
+                .get(&fname.to_string())
+                .map(|set| set.len() == 1)
+                .unwrap_or(false)
+        };
         // Walk one canonical (fname, fty, val) representative per
         // shared key — a key shared across N variants will be hit
         // N times, so we dedup the actual emit by inserting into
@@ -801,16 +860,21 @@ impl ArchOpcodes {
         // &'a LinearLayer` types verbatim per binding (~4 lines per
         // weight_fn / cos_sin_fn declaration).
         let mut shared_lets: Vec<TokenStream> = Vec::new();
-        let mut emitted_shared: std::collections::HashSet<(String, String, String)> =
+        let mut emitted_shared: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         for entries in self.extracted_prelude.values() {
             for (fname, _fty, val) in entries {
+                if !single_valued(fname) {
+                    continue;
+                }
                 let key = (
                     fname.to_string(),
                     _fty.to_token_stream().to_string(),
                     val.to_string(),
                 );
-                if occurrences.get(&key).copied().unwrap_or(0) >= 2 && emitted_shared.insert(key) {
+                if occurrences.get(&key).copied().unwrap_or(0) >= 2
+                    && emitted_shared.insert(fname.to_string())
+                {
                     shared_lets.push(quote! { let #fname = #val; });
                 }
             }
@@ -830,6 +894,14 @@ impl ArchOpcodes {
                     entries
                         .iter()
                         .filter(|(fname, fty, val)| {
+                            // Stays per-arm if EITHER fname is
+                            // multi-valued across variants (can't
+                            // safely lift to fn scope without
+                            // shadow) OR the (fname, fty, val) is
+                            // unique to this variant (not shared).
+                            if !single_valued(fname) {
+                                return true;
+                            }
                             let key = (
                                 fname.to_string(),
                                 fty.to_token_stream().to_string(),
@@ -841,23 +913,68 @@ impl ArchOpcodes {
                         .collect()
                 })
                 .unwrap_or_default();
-            // Per-arm `let layer: u32 = __layer;` is the bridge
-            // from `Op::Loop`'s iteration counter to arm bodies.
-            // For variants whose `OpcodeShape` has a `layer:`
-            // field, the destructure pattern would otherwise bind
-            // `layer` to the (zeroed-by-apply_loop_compression)
-            // row literal; this shadow overrides with the runtime
-            // iteration index. Variants without a `layer:` field
-            // are unaffected — the binding is just unused
-            // (suppressed by the fn's `unused_variables` allow).
+            // Per-arm `let layer: u32 = __layer + layer;` combines
+            // the runtime iter counter (`__layer`) with the row's
+            // per-row baseline (the destructured `layer` field,
+            // which `apply_loop_compression` set to that row's
+            // iter-0 value). For body rows aligned with the loop's
+            // iter-0 the baseline is 0, so the result is `__l`. For
+            // a row whose iter-0 layer is +k off (e.g., a body's
+            // trailing `input_layernorm` that semantically belongs
+            // to the next layer, baseline=1), the result is `__l+k`.
+            // For non-loop ops the dispatcher passes `__layer=0`,
+            // so the baseline IS the layer (e.g., post-loop
+            // `CutlassGemv(layer=27)` resolves to 27).
+            //
+            // Only emitted when the variant carries a `layer` field;
+            // variants without one would fail to compile because
+            // `layer` wouldn't be in scope to add.
+            let has_layer_field = shape.fields.iter().any(|(fname, _)| fname == "layer");
+            let layer_shadow = if has_layer_field {
+                quote! { let layer: u32 = __layer + layer; }
+            } else {
+                quote! {}
+            };
             quote! {
                 #enum_ident::#var #pat => {
-                    let layer: u32 = __layer;
+                    #layer_shadow
                     #(#residual)*
                     #body
                 }
             }
         });
+        // Per-op trace, always compiled. Gate at runtime via
+        // `ferrite_forward::trace_enabled()` (set `FERRITE_TRACE=1`
+        // before launch). Disabled cost is one atomic-load + branch
+        // per dispatched op. Pair with `CUDA_LAUNCH_BLOCKING=1` so
+        // trace lines align with kernel completion order.
+        let trace_print = quote! {
+            if ::ferrite_forward::trace_enabled() {
+                let __snap: ::std::vec::Vec<::std::string::String> = __tiles
+                    .iter()
+                    .enumerate()
+                    .map(|(__si, __se)| match __se {
+                        ::std::option::Option::Some(::ferrite_forward::TileEntry::Owned(__t)) => {
+                            let __gt = __t.as_gpu_tensor();
+                            ::std::format!("[{}]O{:?}", __si, __gt.shape())
+                        }
+                        ::std::option::Option::Some(::ferrite_forward::TileEntry::View { ref_slot }) => {
+                            ::std::format!("[{}]V({})", __si, ref_slot)
+                        }
+                        ::std::option::Option::Some(::ferrite_forward::TileEntry::Reshaped { ref_slot, tensor }) => {
+                            ::std::format!("[{}]R{:?}({})", __si, tensor.shape(), ref_slot)
+                        }
+                        ::std::option::Option::None => ::std::format!("[{}]_", __si),
+                    })
+                    .collect();
+                ::std::eprintln!(
+                    "FERRITE l={} {:?} | {}",
+                    __layer,
+                    __op,
+                    __snap.join(" "),
+                );
+            }
+        };
         quote! {
             /// Dispatch one op. `__layer` = loop iter index inside
             /// `Op::Loop`, else 0.
@@ -871,6 +988,7 @@ impl ArchOpcodes {
                 ctx: &::ferrite_forward::ForwardCtx,
                 device: &mut ::ferrite_cuda_core::device::GpuDevice,
             ) {
+                #trace_print
                 #(#shared_lets)*
                 match __op {
                     #(#arms,)*
@@ -1637,18 +1755,20 @@ mod tests {
         );
     }
 
-    /// A View dst has a separate slot in `__tiles` from its source;
-    /// at runtime the View carries `ref_slot = src.color` and the
-    /// interpreter dereferences. So `dst.color != src.color` is a
-    /// hard constraint — the test checks the colorer never violates
-    /// it even when the source is otherwise "free" by lifetime.
+    /// Same-shape alias collapses: dst and source share the slot.
+    /// `output_alias` says t1 aliases t0's storage; t0 and t1 have
+    /// the same shape (both `[1]` here, modeling an in-place mutator
+    /// like `cutlass_gemm_add` whose output IS the residual buffer
+    /// post-mutation). The runtime never has two `__tiles` entries
+    /// for one buffer — so the colorer must place them at the same
+    /// color, no `View` indirection, no `Op::Alias` row.
     #[test]
-    fn coloring_alias_dst_distinct_from_source() {
+    fn coloring_same_shape_alias_collapses_to_source() {
         let f = Fuf {
             nodes: vec![
-                add_tile(0, &[]),               // source
-                add_tile(1, &[(TileId(0), 0)]), // alias-dst (Views t0)
-                add_tile(2, &[(TileId(1), 0)]), // reads via the View
+                add_tile(0, &[]),               // source, shape [1]
+                add_tile(1, &[(TileId(0), 0)]), // alias-dst, shape [1]
+                add_tile(2, &[(TileId(1), 0)]), // reads via the alias
             ],
         };
         let mut lib = ImplementationLibrary::new();
@@ -1659,7 +1779,7 @@ mod tests {
         }));
         let id_alias = lib.push(Box::new(StubImpl {
             name: "stub_alias",
-            alias_to: Some((TileId(0), 0)), // t1 aliases t0's storage
+            alias_to: Some((TileId(0), 0)),
             consumes: vec![],
         }));
         let sfuf = linear_assignment(
@@ -1670,12 +1790,112 @@ mod tests {
         let protected: HashSet<(TileId, u8)> = HashSet::new();
         let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
-        // t0 is the source; t1 is an alias dst. Both must have
-        // distinct colors so the runtime View can navigate.
+        assert_eq!(
+            sm.of(TileId(0), 0),
+            sm.of(TileId(1), 0),
+            "same-shape alias dst must share color with source (in-place mutation)",
+        );
+    }
+
+    /// Different-shape alias keeps its own slot: dst and source have
+    /// distinct colors so the runtime can hold a `View { ref_slot:
+    /// source_color }` entry at the dst slot. Models `Reshape` —
+    /// dst metadata differs (rank or dims) but storage is shared via
+    /// indirection. Source's color stays in its own shape pool; dst
+    /// gets a fresh color in *its* shape pool. They can never collide.
+    #[test]
+    fn coloring_different_shape_alias_keeps_own_slot() {
+        let f = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Add,
+                    inputs: vec![],
+                    outputs: vec![vec![Dim::Lit(6)]], // [6]
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Reshape,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![vec![Dim::Lit(2), Dim::Lit(3)]], // [2,3]
+                },
+                add_tile(2, &[(TileId(1), 0)]),
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let id_plain = lib.push(Box::new(StubImpl {
+            name: "stub",
+            alias_to: None,
+            consumes: vec![],
+        }));
+        let id_alias = lib.push(Box::new(StubImpl {
+            name: "stub_reshape",
+            alias_to: Some((TileId(0), 0)),
+            consumes: vec![],
+        }));
+        let sfuf = linear_assignment(
+            &[TileId(0), TileId(1), TileId(2)],
+            &[id_plain, id_alias, id_plain],
+        );
+        let lp = linear_loop(3);
+        let protected: HashSet<(TileId, u8)> = HashSet::new();
+        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+
         assert_ne!(
             sm.of(TileId(0), 0),
             sm.of(TileId(1), 0),
-            "alias dst color must differ from source color"
+            "different-shape alias dst needs its own slot for the View entry",
+        );
+    }
+
+    /// Shape-partitioned reuse: a `[1]` tile and an `[N]` tile cannot
+    /// share a slot even when their lifetimes are disjoint. This is
+    /// the load-bearing invariant for in-place mutations whose
+    /// downstream op writes more bytes than the prior occupant's
+    /// allocation. Without shape partitioning, a `[41, 8, 128]` K
+    /// tile (84 KB) would hand its slot to a `[41, 3072]` residual
+    /// tile (252 KB), and the next `cutlass_gemm_add` would write
+    /// past the buffer's end — observed as the K=8192 N=5120 cublas
+    /// panic on Llama 3.2 3B before this fix.
+    #[test]
+    fn coloring_disjoint_lifetimes_dont_share_across_shapes() {
+        let f = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Add,
+                    inputs: vec![],
+                    outputs: vec![vec![Dim::Lit(8)]],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Add,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![vec![Dim::Lit(3072)]],
+                },
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let id_plain = lib.push(Box::new(StubImpl {
+            name: "stub",
+            alias_to: None,
+            consumes: vec![],
+        }));
+        let sfuf = linear_assignment(&[TileId(0), TileId(1)], &[id_plain; 2]);
+        let lp = linear_loop(2);
+        let protected: HashSet<(TileId, u8)> = HashSet::new();
+        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+
+        assert_ne!(
+            sm.of(TileId(0), 0),
+            sm.of(TileId(1), 0),
+            "tiles of different shape never share a color, even with disjoint lifetimes",
         );
     }
 
@@ -1773,10 +1993,10 @@ mod tests {
 
     /// `apply_loop_compression`: when a run is detected,
     /// `instances` becomes prefix + Op::Loop + one-iteration body
-    /// (with iter-index field zeroed) + suffix. Locks the rewrite
-    /// shape end-to-end.
+    /// (with each iter-index field set to that row's iter-0
+    /// baseline) + suffix. Locks the rewrite shape end-to-end.
     #[test]
-    fn loop_compression_emits_loop_and_zeroes_iter_field() {
+    fn loop_compression_emits_loop_and_keeps_baseline() {
         let mut arch_opcodes = ArchOpcodes::new();
         arch_opcodes.register(
             OpcodeShape::new(
@@ -1804,8 +2024,60 @@ mod tests {
         assert_eq!(lb.instances[0].field_values[0].to_string(), "3");
         assert_eq!(lb.instances[0].field_values[1].to_string(), "1");
         assert_eq!(lb.instances[1].name.to_string(), "Norm");
-        // Body's `layer` field zeroed.
+        // Body's `layer` field carries the iter-0 baseline (0).
         assert_eq!(lb.instances[1].field_values[1].to_string(), "0u32");
+    }
+
+    /// Per-row baseline preservation: when the body period has rows
+    /// whose iter-0 layer values differ (e.g., row A starts at 0,
+    /// row B starts at 1 — Llama's body has `input_layernorm` at
+    /// position 6 with baseline = 1 because it logically belongs to
+    /// the *next* layer), `apply_loop_compression` must keep each
+    /// row's baseline. Zeroing all rows to 0 silently uses layer N's
+    /// weights for layer N+1's input ln — accumulating drift that
+    /// turns decode into garbage after a few tokens.
+    #[test]
+    fn loop_compression_preserves_per_row_baseline() {
+        let mut arch_opcodes = ArchOpcodes::new();
+        arch_opcodes.register(
+            OpcodeShape::new("A", vec![("layer", syn::parse_quote!(u32))]),
+            quote! {},
+        );
+        arch_opcodes.register(
+            OpcodeShape::new("B", vec![("layer", syn::parse_quote!(u32))]),
+            quote! {},
+        );
+        let mut lb = LoweredBucket {
+            instances: vec![
+                // iter 0: A@0, B@1
+                op("A", &["0u32"]),
+                op("B", &["1u32"]),
+                // iter 1: A@1, B@2
+                op("A", &["1u32"]),
+                op("B", &["2u32"]),
+                // iter 2: A@2, B@3
+                op("A", &["2u32"]),
+                op("B", &["3u32"]),
+            ],
+            num_slots: 1,
+            final_slot: 0,
+        };
+        apply_loop_compression(&arch_opcodes, &mut lb, "layer");
+        assert_eq!(lb.instances.len(), 3, "Loop + 2 body rows");
+        assert_eq!(lb.instances[0].name.to_string(), "Loop");
+        assert_eq!(lb.instances[1].name.to_string(), "A");
+        assert_eq!(
+            lb.instances[1].field_values[0].to_string(),
+            "0u32",
+            "row A's baseline is 0",
+        );
+        assert_eq!(lb.instances[2].name.to_string(), "B");
+        assert_eq!(
+            lb.instances[2].field_values[0].to_string(),
+            "1u32",
+            "row B's baseline is 1 — must be preserved, not zeroed, so the arm \
+             can compute `__layer + 1` for the iter-N execution",
+        );
     }
 
     /// No loop in the IR → `apply_loop_compression` is a no-op.
@@ -1904,19 +2176,24 @@ mod tests {
             "expected manual Clone impl, got: {ts}"
         );
         assert!(ts.contains("fn clone (& self) -> Self { * self }"));
-        // Derive list is just Copy, not Copy+Clone — that's how we
-        // dodge the AssertParamIsClone expansion.
-        assert!(ts.contains("# [derive (Copy)]"));
+        // Derive list is `Debug, Copy` — Debug is unconditional so
+        // `ferrite_forward::trace_enabled()`'s runtime trace can
+        // pretty-print variants; Clone is hand-rolled to skip the
+        // AssertParamIsClone expansion.
+        assert!(ts.contains("# [derive (Debug , Copy)]"));
         assert!(!ts.contains("# [derive (Copy , Clone)]"));
+        assert!(!ts.contains("# [derive (Debug , Copy , Clone)]"));
     }
 
-    /// `__dispatch_one` emits exactly ONE `let layer: u32 = __layer;`
-    /// per arm and ZERO `let _ = layer;` lines. The unused-warning
-    /// suppression is handled by the fn-level
-    /// `#[allow(unused_variables)]`, so the `let _ = layer;` line
-    /// the prior emit added per-arm + once at the fn top is pure
-    /// expansion bloat (~3 lines × N arms × N model variants on
-    /// llama).
+    /// `__dispatch_one` emits `let layer: u32 = __layer + layer;`
+    /// once per arm whose variant carries a `layer` field, and
+    /// nothing for arms without one. The shadow combines the
+    /// runtime iter counter with the row's per-row baseline (set by
+    /// `apply_loop_compression`); it's gated on `has_layer_field`
+    /// because adding to a destructured `layer` that doesn't exist
+    /// would fail to compile. Also pins ZERO `let _ = layer;` lines
+    /// — the fn-level `#[allow(unused_variables)]` already covers
+    /// unused-warning suppression.
     #[test]
     fn arch_interpreter_drops_layer_drop_lines() {
         let mut ops = ArchOpcodes::new();
@@ -1931,36 +2208,36 @@ mod tests {
         let enum_ident = format_ident!("LlamaOp");
         let helper_ident = format_ident!("__llama_interpret");
         let ts = ops.emit_interpreter(&helper_ident, &enum_ident).to_string();
-        // Per-arm `let layer: u32 = __layer;` shadow MUST stay —
-        // it's the bridge from Op::Loop's iteration counter to arm
-        // bodies. 2 registered variants → at least 2 occurrences.
-        let shadow_count = ts.matches("let layer : u32 = __layer ;").count();
-        assert!(
-            shadow_count >= 2,
-            "expected one `let layer = __layer;` shadow per arm, got {shadow_count}"
+        // The arm whose variant has a `layer` field emits the
+        // combining shadow; the one without does not. Exactly 1
+        // occurrence is the load-bearing assertion.
+        let shadow_count = ts.matches("let layer : u32 = __layer + layer ;").count();
+        assert_eq!(
+            shadow_count, 1,
+            "expected exactly one `let layer = __layer + layer;` shadow (the variant with a layer field), got {shadow_count}",
         );
-        // No `let _ = layer;` lines anywhere — the fn's
-        // `#[allow(unused_variables)]` already suppresses warnings.
         assert!(
             !ts.contains("let _ = layer ;"),
             "expansion contains redundant `let _ = layer;` lines"
         );
-        // The fn-top redundant `let layer = __layer; let _ = layer;`
-        // is gone — match opens directly. Approximate by checking the
-        // fn body opens `match __op`.
         assert!(ts.contains("__layer : u32 , __tiles"));
-        // Find what comes immediately after the fn signature's
-        // closing brace + opening body brace `{`. Should be
-        // `match __op {` not `let layer ...`.
+        // Body opens with the always-compiled `trace_enabled()`
+        // gate (runtime no-op when `FERRITE_TRACE` is unset). The
+        // match follows. Pin both: trace gate before match, no
+        // residual `let layer = __layer ;` setup at the fn top.
         let after_open = ts
             .split_once(", ) { ")
             .or_else(|| ts.split_once(") { "))
             .map(|(_, rhs)| rhs)
             .unwrap_or(&ts);
         assert!(
-            after_open.starts_with("match __op {"),
-            "fn body must open with `match __op`, got: {}",
+            after_open.starts_with("if :: ferrite_forward :: trace_enabled ()"),
+            "fn body must open with the trace gate, got: {}",
             &after_open[..after_open.len().min(80)],
+        );
+        assert!(
+            ts.contains("match __op {"),
+            "fn body must contain the match",
         );
     }
 

@@ -362,22 +362,59 @@ was the *cause* of bug A). Updated:
 `arch_enum_uses_manual_clone_impl_to_skip_assertparamisclone`
 (derive list grew Debug).
 
-### 6. Goldens — NEXT THING
+### 6. Goldens — TRIAGE COMPLETE; 3 STABLE FAILURES + FP8 BOOT CRASHES
 
-§5 fix lands runtime correctness on Llama 3.2 3B. Run the e2e
-golden suite to confirm no regressions across sibling arches:
+Ran the small-model subset both parallel and serial. Parallel
+flakes 5 extra tests (granite/qwen2-bf16 garbage, etc.) due to
+concurrent kernel streams perturbing bf16 — those PASS serially
+(`--test-threads=1` is required for commit-gating). Serial run on
+`{gemma3_1b, qwen3_0_6b, llama_3_2_1b_awq, granite_3_3_2b,
+qwen2_0_5b}` returns **2 pass / 3 fail**, deterministic.
 
-```
-cargo test --release --test e_correctness -p vllm-e2e \
-    --features e2e,cuda -- --ignored --test-threads=1
-```
+**Stable serial failures (chat coherent, golden divergent):**
 
-Llama subset first; match must be exact. Then Qwen2 / Qwen3 /
-Mistral / Phi3 / Gemma2 / Gemma3 / Granite / CommandR / DeepSeek-V2
-/ DeepSeek-V3. Any divergence is most likely a sibling-arch
-manifestation of one of §5's three bugs (e.g., a different impl
-mix exposes a layer-baseline corner case the M=8 / M=64 paths
-don't hit).
+- `gemma3_1b` — prompt 2 position 1: golden=`"Here"` vs engine top-1
+  =`"**"` (-0.915), engine top-2 =`"Okay"` (-1.915). `"Here"` not in
+  engine top-20. Engine produces fluent markdown-formatted answer,
+  golden wants prose preamble. Both valid continuations.
+- `qwen3_0_6b` — prompt 4 position 3: golden=`" be"` vs engine
+  top-2=`" include"` (-1.286), `" have"` (-1.411). After 3 tokens
+  matched, divergence flips to a different valid continuation.
+- `llama_3_2_1b_awq` — completion HTTP 500 with `null` logprob
+  serialization; engine's logprob field went NaN/Inf. Marlin/AWQ
+  path. Different failure mode from the other two.
+
+`vllm chat unsloth/gemma-3-1b-it --prompt "why is the sky blue"`
+and `vllm chat Qwen/Qwen3-0.6B --prompt "why is the sky blue?"`
+produce coherent text — the models work, they just rank tokens
+differently from Python vLLM's golden.
+
+**Common factor (gemma3 + qwen3):** per-head Q/K-norm. Both arches
+emit `Reshape(2D→3D) → RmsNorm → Reshape(3D→2D)` in QKV path. Qwen2
+(no per-head norm) PASSES the same prompt set. Hypothesis: the
+per-head-norm Reshape/View chain has a subtle numerical or kernel
+divergence vs Python vLLM. Structural analysis of the IR
+(coloring, alias rows, ref_slot=self pattern, runtime drop
+semantics) didn't surface a smoking gun — `as_gpu_tensor` for
+Reshaped returns `tensor` directly (no walk through ref_slot), so
+the self-referential ref_slot is metadata-only.
+
+**FP8 dynamic boot crashes — separate kernel issue, NOT this branch's bug.**
+`qwen2_0_5b_fp8_dynamic` / `qwen3_0_6b_fp8_dynamic` /
+`gemma3_1b_fp8_dynamic` all SIGABRT on server start with:
+`cutlass::arch::Mma<...float_e4m3_t...> with Operator_=
+OpMultiplyAddFastAccum not implemented`. `OpMultiplyAddFastAccum`
+is a Hopper (sm_90+) FP8 fast-accumulate op; the L4 is sm_89 (Ada).
+The CUTLASS template specialization picks the wrong operator for
+sm_89 FP8. Fix is in `ferrite-kernels/cutlass` config, not in the
+interpreter codegen.
+
+**Goldens that pass serially (subset tested):** granite_3_3_2b,
+qwen2_0_5b. Llama 3.2 3B BF16 chat coherent (per §5). The full
+serial sweep across all 46 tests has not been run — start there
+when revisiting this. Prefer chat-test before debugging a golden:
+if chat is coherent, the golden divergence is borderline noise or
+a kernel difference, not a forward-correctness bug.
 
 ### 7. Open warnings / cleanup
 

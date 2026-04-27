@@ -377,25 +377,37 @@ fn encode_op_arm(
             ctx,
         )?)),
         "CutlassGemm" => Some(Some(encode_cutlass_gemm_lm_head(inst, layer_offset, ctx)?)),
+        "AttentionViaCache" | "FlashInferAttentionDecode" => {
+            Some(Some(encode_attention_decode(inst, layer_offset, ctx)?))
+        }
 
-        // ── Attention arms not yet implemented (P2-2 follow-up) ──
+        // ── Prefill attention — runtime-tape follow-up ──────────
         //
-        // Variable-length payload shapes (decode batched pairs;
-        // prefill per-Q-block × per-kv-head). Land in a separate
-        // commit. Until then, panic at macro-expand time so the
-        // canonical can't accidentally be marked kvm-eligible.
-        // Returning `None` here would silently mark these
-        // canonicals kvm-ineligible — strictly weaker than failing
-        // loudly during P2-2 development.
-        "AttentionViaCache"
-        | "AttentionPrefillContiguous"
-        | "FlashInferAttentionDecode"
-        | "FlashInferAttentionPrefill" => unimplemented!(
-            "kvm_mega encoder: variant `{}` not yet implemented \
-             (P2-2 follow-up — attention payload shapes). \
-             Ineligible canonicals fall to host via \
-             `pick_interpreter`; landing this arm un-ineligibles \
-             the relevant llama-style canonicals.",
+        // `OPCODE_GQA_AttentionPrefill` rows depend on per-sequence
+        // `q_len` (one row per `(seq, q_block_of_16, kv_head)`
+        // triple). The bucket-level workload point pins
+        // `num_tokens` but NOT per-seq lengths, so prefill row
+        // counts are call-time-variable — they can't live in the
+        // static `[[i32; 32]; N]` tape the encoder would emit
+        // alongside decode rows.
+        //
+        // KVM_MAPPING.md Q2 punts this to a separate P2 follow-up.
+        // The pattern the older branch ships is to defer prefill
+        // tape construction to the launcher: the launcher calls
+        // `tk_instructions::build_throughput_instructions(...,
+        // Some(&seq_info))` per forward and copies the resulting
+        // `Vec<i32>` into the device tape buffer. The encoder
+        // emits **the structural envelope** (the layer index +
+        // attached metadata) and the launcher fills in the rows.
+        // That re-shape isn't done here yet; for now, prefill IR
+        // variants panic so any canonical containing them can't
+        // be marked kvm-eligible by accident.
+        "AttentionPrefillContiguous" | "FlashInferAttentionPrefill" => unimplemented!(
+            "kvm_mega encoder: prefill attention arm `{}` not \
+             yet implemented — KVM_MAPPING.md Q2 follow-up. \
+             Prefill row counts depend on per-call seq_info, so \
+             this arm needs the runtime-tape design (launcher \
+             rebuilds rows per forward) before landing.",
             inst.name
         ),
 
@@ -728,6 +740,60 @@ fn encode_cutlass_gemm_lm_head(
     Some(out)
 }
 
+/// `AttentionViaCache(in, out, layer, cos_sin_fn, biased)` and
+/// `FlashInferAttentionDecode(in, out, layer, cos_sin_fn, ?, ?)`
+/// → `OPCODE_GQA_AttentionDecode`. Variable-length payload per
+/// `attention_decode.cu:70-81`:
+///
+/// ```text
+/// [opcode, layer, num_entries=2*num_pairs,
+///  seq_0, kv_0, seq_1, kv_1, …]
+/// ```
+///
+/// where each `(seq_idx, kv_head_idx)` pair occupies two i32s
+/// after the 3-int header. The kernel reads
+/// `s.instruction()[2] / 2` to get the pair count
+/// (`attention_decode.cu:71`).
+///
+/// Row capacity: `(INSTRUCTION_WIDTH - 3) / 2 = 14` pairs per
+/// row. Total pairs = `num_tokens × num_kv_heads`; the encoder
+/// chunks into 14-pair rows.
+fn encode_attention_decode(
+    inst: &OpInstance,
+    layer_offset: u32,
+    ctx: &EncodeCtx,
+) -> Option<Vec<KvmEncodedRow>> {
+    let _in_slot = parse_u32_literal(&inst.field_values[0])?;
+    let _out_slot = parse_u32_literal(&inst.field_values[1])?;
+    let layer_baseline = parse_u32_literal(&inst.field_values[2])?;
+    let layer = (layer_baseline + layer_offset) as i32;
+
+    const MAX_PAIRS_PER_INST: usize = (INSTRUCTION_WIDTH - 3) / 2; // 14
+
+    // Build the (seq_idx, kv_head_idx) pair list, then chunk.
+    // Mirrors `tk_instructions.rs:131-149` exactly.
+    let mut pairs: Vec<(i32, i32)> =
+        Vec::with_capacity((ctx.num_tokens * ctx.num_kv_heads) as usize);
+    for seq_idx in 0..ctx.num_tokens as i32 {
+        for kv_head in 0..ctx.num_kv_heads as i32 {
+            pairs.push((seq_idx, kv_head));
+        }
+    }
+
+    let mut out: Vec<KvmEncodedRow> = Vec::with_capacity(pairs.len().div_ceil(MAX_PAIRS_PER_INST));
+    for chunk in pairs.chunks(MAX_PAIRS_PER_INST) {
+        let mut row = KvmEncodedRow::new(OPCODE_GQA_ATTENTION_DECODE);
+        row.payload[1] = layer;
+        row.payload[2] = (chunk.len() * 2) as i32; // num_entries
+        for (i, &(seq, kv)) in chunk.iter().enumerate() {
+            row.payload[3 + 2 * i] = seq;
+            row.payload[3 + 2 * i + 1] = kv;
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
 // ── Helpers (private) ───────────────────────────────────────────
 
 /// Extract a `u32` literal from a TokenStream that's expected to
@@ -898,6 +964,35 @@ mod tests {
                 u32_lit(out_slot),
                 u32_lit(layer),
                 weight_path,
+            ],
+        )
+    }
+
+    fn attention_via_cache_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        let cos_sin_path: TokenStream = "Weights::rotary".parse().unwrap();
+        op(
+            "AttentionViaCache",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                cos_sin_path,
+                "false".parse().unwrap(), // biased
+            ],
+        )
+    }
+
+    fn flashinfer_attention_decode_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        let cos_sin_path: TokenStream = "Weights::rotary".parse().unwrap();
+        op(
+            "FlashInferAttentionDecode",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                cos_sin_path,
+                u32_lit(0), // window/extra slot
+                "false".parse().unwrap(),
             ],
         )
     }
@@ -1147,6 +1242,73 @@ mod tests {
         for (i, row) in bucket.rows[32..].iter().enumerate() {
             assert_eq!(row.payload[3], i as i32);
         }
+    }
+
+    /// Decode attention with one batched payload row. With
+    /// num_tokens=1 + num_kv_heads=8 → 8 pairs, fits in one row,
+    /// `num_entries = 16`.
+    #[test]
+    fn attention_decode_emits_single_batched_row_for_small_workload() {
+        let arch = arch_with_norm_and_gemm_add();
+        let prog = vec![attention_via_cache_inst(0, 1, 9)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+            .expect("AttentionViaCache has a kvm arm");
+        assert_eq!(bucket.rows.len(), 1);
+        let row = &bucket.rows[0];
+        assert_eq!(row.opcode(), OPCODE_GQA_ATTENTION_DECODE);
+        assert_eq!(row.payload[1], 9); // layer
+        assert_eq!(row.payload[2], 16); // num_entries = 8 pairs × 2
+        // First pair: (seq=0, kv=0); second: (seq=0, kv=1); …
+        for kv in 0..8 {
+            assert_eq!(row.payload[3 + 2 * kv], 0); // seq_idx
+            assert_eq!(row.payload[3 + 2 * kv + 1], kv as i32); // kv_head
+        }
+    }
+
+    /// num_tokens=4 × num_kv_heads=8 → 32 pairs → ⌈32/14⌉ = 3
+    /// rows. First two rows have 14 pairs (num_entries=28), last
+    /// has 4 pairs (num_entries=8).
+    #[test]
+    fn attention_decode_chunks_pairs_into_14_per_row() {
+        let arch = arch_with_norm_and_gemm_add();
+        let mut ctx = ctx_llama_1b();
+        ctx.num_tokens = 4;
+        let prog = vec![attention_via_cache_inst(0, 1, 0)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx).unwrap();
+        assert_eq!(bucket.rows.len(), 3);
+        assert_eq!(bucket.rows[0].payload[2], 28); // 14 pairs × 2
+        assert_eq!(bucket.rows[1].payload[2], 28);
+        assert_eq!(bucket.rows[2].payload[2], 8); // 4 pairs × 2
+        // Verify chunk boundaries: row 0 covers pairs 0..14, row 1
+        // covers 14..28, row 2 covers 28..32. Pairs are
+        // (seq=p/8, kv=p%8) where p is the pair index.
+        let pair_at = |row_idx: usize, slot: usize| -> (i32, i32) {
+            let r = &bucket.rows[row_idx];
+            (r.payload[3 + 2 * slot], r.payload[3 + 2 * slot + 1])
+        };
+        assert_eq!(pair_at(0, 0), (0, 0));
+        assert_eq!(pair_at(0, 13), (1, 5)); // pair 13 = seq 1, kv 5
+        assert_eq!(pair_at(1, 0), (1, 6)); // pair 14
+        assert_eq!(pair_at(2, 0), (3, 4)); // pair 28 = seq 3, kv 4
+        assert_eq!(pair_at(2, 3), (3, 7)); // pair 31 (final)
+    }
+
+    /// `FlashInferAttentionDecode` shares the row layout with
+    /// `AttentionViaCache`. The legacy and FA-based paths are two
+    /// IR variants but one TK opcode.
+    #[test]
+    fn flashinfer_attention_decode_uses_same_opcode_and_layout() {
+        let arch = arch_with_norm_and_gemm_add();
+        let legacy =
+            try_encode_bucket(&arch, &[attention_via_cache_inst(0, 1, 7)], &ctx_llama_1b())
+                .unwrap();
+        let fi = try_encode_bucket(
+            &arch,
+            &[flashinfer_attention_decode_inst(0, 1, 7)],
+            &ctx_llama_1b(),
+        )
+        .unwrap();
+        assert_eq!(legacy.rows, fi.rows);
     }
 
     /// `CutlassGemm` at LM_Head position → `OPCODE_LM_Head` with

@@ -7,7 +7,263 @@
 > mega builds on top of its `Instruction<W>` IR + `static
 > BACKBONE_M_<N>: &[Instruction<W>]` slices without modification.
 
+## PIVOT 2026-04-27 — KvmMega is now the perf path
+
+Tip `af4e8a13c`. **Phase 1 (PrimMega-as-perf-path) is closed; we
+have pivoted to KvmMega via the vendored TK throughput ops.**
+
+### Why the pivot
+
+1. **Paged attention is non-negotiable.** Decode-path attention reads
+   from ferrite's paged KV pool; mega has to honor that. The candidate
+   routes are:
+   - Vendor TK standalone attention (`~/ThunderKittens/kernels/
+     attention/mha_h100/`) — contiguous K/V only. **Disqualified.**
+   - FlashInfer DC — has paged KV, but plumbing the plan handle
+     into the launcher (set_io / replan / params host→device per
+     forward, plus per-tuple shim accessors) is heavy. **Abandoned.**
+   - The vendored `Megakernels/demos/cross-gpu-llama/` ops
+     (`attention_decode.cu`, `attention_prefill.cu`,
+     `qkv_rope_append.cu`) — paged-KV-aware by construction; consume
+     the `(kv_indptr, kv_indices, kv_last_page_len)` CSR triple
+     directly. **The shipping path on `worktree-ferrite-mega@417e16bda`,
+     E2E "capital of France is Paris" verified on H100 Llama-3.2-1B
+     at TTFT 9.1ms / ITL 7.5ms.**
+
+2. **TK kernels aren't natively DC-callable.** They're authored as
+   KVM-framework structs (`controller / loader / consumer / storer`
+   warp specialization). Plugging them into PrimMega's
+   `switch(opcode)` body would require unwrapping the warp
+   specialization — a rewrite that destroys the perf those kernels
+   are designed for.
+
+3. **PrimMega proved its job.** `feedback_prim_mega_is_scaffolding`
+   already framed PrimMega as scaffolding for KvmMega; the Embed mega
+   arm landing (`2bd945e6a`) demonstrates the encoder + launcher
+   emission + `LAUNCHER_TABLE` infra works end-to-end. Adding more
+   PrimMega arms (FlashInfer DC, FusedGateUpSiluMul decomp,
+   occupancy-derived launch geometry) is investment in the wrong
+   target.
+
+### What's done (this session, pivot prep)
+
+Four commits past `468aa7faf`:
+
+- `2bd945e6a` — **Embed mega arm**. Closed the last gap in PrimMega's
+  scaffolding proof: `dc_embed<T>` C++ kernel, `OP_EMBED` opcode,
+  `encode_embed` arm, `ForwardField::InputIds`, `DcEmbeddingImpl`.
+  232/232 tests, models build clean. PrimMega remains structurally
+  complete; `LAUNCHER_TABLE` will not see real `Some/Some` entries
+  via this path because the FI DC + FusedGateUpSiluMul gap won't be
+  closed (per pivot above), but the launcher *symbols* are emitted
+  and verifiable.
+
+- `b3f67673e` — **cross-gpu-llama vendor deltas.** Ported four-file
+  diff from `worktree-ferrite-mega@417e16bda` onto our vendor:
+  - `attention_decode.cu` / `attention_prefill.cu`: relax
+    `GQA_RATIO == 8` → `<= 16`; hoist `qkv_kv_blocks` /
+    `qkv_q_blocks` as `constexpr` off `Globals` so they generalize
+    across (matmul_out_block_size, head_dim, num_devices).
+  - `qkv_rope_append.cu`: drop two `static_assert(num_devices == 8,
+    "Fix this function.")` markers (the algorithmic dependency is
+    still real and stays Phase 2 follow-up).
+  - `llama.cuh`: `#pragma once` → `#ifndef LLAMA_CUH_INCLUDED` guard
+    so codegen-emitted TUs can include op `.cu` files that include
+    `llama.cuh` without redefinition; gate every `LLAMA_<DIM>` on
+    `#ifndef` so per-arch defines from codegen take precedence.
+
+- `eb22e4df5` — **`tk_paged_kv` + `tk_instructions` ported** to
+  `crates/ferrite-forward/src/`. Both host-side, both already
+  KvmMega-shaped:
+  - `tk_paged_kv::build_decode_metadata` — D2H `block_table` +
+    `seqused_k`, build CSR triple, H2D back. Per-call work,
+    no kernel.
+  - `tk_instructions::build_throughput_instructions` — emits
+    `Vec<i32>` of length `total_instructions * 32` with the 13
+    cross-gpu-llama opcodes (`OPCODE_AttnNorm`,
+    `OPCODE_QKV_RopeAppend`, …, `OPCODE_AllDeviceBarrier`).
+    Work-stealing: kernel atomically increments
+    `global_instruction_index`, no per-op grid sync — DAG ordering
+    encoded by tape position.
+
+- `af4e8a13c` — **`generate_tk_megakernel` + `TkModelDims`** ported.
+  New `cuda_codegen` module in `ferrite-forward-macro` carrying the
+  per-arch `.cu` source generator: `LLAMA_<DIM>` macro overrides,
+  13-op includes, `ops::` alias block, `mk<llama_config,
+  llama_70b_globals, op1..op13>` instantiation, `extern "C" int
+  tk_megakernel_<model>_launch(...)` wrapper with ~50 flat C-friendly
+  args. Older branch's `DevicePhase`-based `generate_megakernel`
+  stripped (depended on data structures from a different IR).
+
+### What's NOT yet done (Phase 2 — KvmMega proper)
+
+- **Encoder reshape.** `interpreters/prim_mega.rs` produces an
+  8-opcode flat tape; KvmMega's tape format is a 13-opcode
+  work-stealing tape (different opcodes, different row payloads,
+  different DAG-encoding mechanism). New file
+  `interpreters/kvm_mega.rs` consumes the same `Vec<OpInstance>` the
+  PrimMega encoder consumes, emits a TK-shape `Vec<i32>`. Five
+  mapping unknowns to resolve before writing code (see "§Phase 2
+  work order" below).
+
+- **KvmFit Impls.** New `MegakernelFit::Kvm` Impls in `impl_lib.rs`
+  for the variants TK throughput consumes. Per
+  `feedback_prim_mega_is_scaffolding`, KvmFit Impls are the actual
+  perf-path Impls; they replace (not extend) the PrimMega DC
+  siblings on Hopper.
+
+- **`forward!` proc-macro consumer for `generate_tk_megakernel`.**
+  Today `cuda_codegen::generate_tk_megakernel` is a library function
+  with no caller. Wire it into `codegen.rs`'s per-canonical emit so
+  per-arch megakernel `.cu` files land in `~/.cache/cudaforge/
+  megakernels/` for `build_megakernels` to pick up.
+
+- **Launcher fn shape.** `PrimMegaLauncher<W>` in
+  `ferrite-forward/src/lib.rs` is the right shape but the body
+  changes: instead of `prim_mega_llama_launch(tape, len, pt[],
+  grid, block, smem, stream)`, it's
+  `tk_megakernel_<model>_launch(...)` taking the ~50 flat args
+  (weights, activations, KV cache, RoPE tables, paged metadata,
+  attn_scale, num_pages, batch_size, num_prefill_tokens). The host
+  side builds the metadata via `tk_paged_kv` + the tape via
+  `tk_instructions` immediately before each call.
+
+### What's NOT going to happen (recorded so future sessions don't
+chase them)
+
+- **No FlashInfer DC arm in prim_mega.cu.** The `dc_flashinfer.cuh`
+  template (`cd9fd897c`) stays vendored as a reference for the
+  pattern but won't be wired up. Plan-handle threading is too heavy
+  for the value vs the KvmMega route.
+
+- **No occupancy-derived launch geometry for prim_mega_llama_kernel.**
+  The placeholders `grid_x=132 / block_x=256 / smem=49152` stay; the
+  kernel itself is scaffolding and will be retired when KvmMega
+  ships. Effort would be wasted.
+
+- **No FusedGateUpSiluMul decomp into Gemm × 2 + SiluMul rows for
+  PrimMega forced mode.** Same reason.
+
+- **No per-arch PrimMega TUs.** PrimMega remains a single
+  `prim_mega_llama_kernel` (mis-named — actually generic across the
+  CUTLASS-DC path on any arch). KvmMega is per-arch by construction
+  (`generate_tk_megakernel(model_name, dims)`).
+
+### What stays (the rules still apply)
+
+`§Things-that-must-not-happen` is unchanged and applies fully to the
+KvmMega encoder. Specifically:
+
+- No `_` catch-all in `interpreters/kvm_mega.rs`'s match. Missing
+  variants surface as compile errors at codegen.
+- No runtime fallback ("try mega, fall back if it fails").
+- No piecemeal Impl migration. KvmFit Impl audit is wholesale.
+- No mega wire types in `ferrite-forward` runtime — same
+  macro-emitted launcher + vendored `.cu` discipline.
+- North stars (`feedback_ferrite_compiler_stars`): no math leakage,
+  no combinatorial explosion, const-prop natural, megakernel
+  natural.
+
+The host-interpreter pivot (`HANDOFF_INTERPRETER.md`) remains the
+prerequisite. The `Instruction<W>` IR is unchanged — KvmMega is
+another consumer of the same IR, not a new IR.
+
+## Phase 2 work order — the actual entry point for the next session
+
+**Step P2-1 — Encoder mapping design (paper, not code).** Before
+writing `interpreters/kvm_mega.rs`, resolve five mapping unknowns and
+land them as a `KVM_MAPPING.md` doc (or rustdoc on
+`interpreters/kvm_mega.rs`). This is the gate; nothing below
+proceeds until it's settled.
+
+The five unknowns:
+
+1. **Residual fusion.** TK's `OPCODE_AttnNorm` / `OPCODE_MlpNorm`
+   include the cross-layer residual-add as input. We have
+   `FusedAddRmsNorm` and `Add` as separate variants. Two options:
+   (a) the encoder collapses adjacent `Add` + `RmsNorm` (or fuses
+   straight from `FusedAddRmsNorm`) into one TK row at encode time;
+   (b) the solver picks claims at TK granularity (a new
+   `KvmFusedAddRmsNorm` Impl that claims both tiles together). (b)
+   is more principled but bigger refactor. Pick one; document why.
+
+2. **QKV decode/prefill collapse.** TK has one `OPCODE_QKV_RopeAppend`.
+   We have `FusedQkvRopeCache` (decode) + `FusedQkvRopePrefill`
+   (prefill) as distinct variants. Likely both map to the same
+   opcode; the encoder reads the variant tag to decide which row
+   payload to emit. Verify the TK op handles both cases (checked
+   `cross-gpu-llama/qkv_rope_append.cu` — yes, it conditions on
+   `g.num_prefill_tokens`).
+
+3. **Gate/Up split.** TK has `OPCODE_GateSiLU` + `OPCODE_UpMatmul`
+   as **two** opcodes. We have `FusedGateUpSiluMul` as **one**
+   variant. The encoder must emit two TK rows from one of our rows.
+   Splitting at encode time is mechanical; the alternative (split
+   the Impl back out) defeats our fusion analysis. Pick (a) encoder
+   split.
+
+4. **GemmAdd routing.** TK's `OPCODE_O_ProjResidual` and
+   `OPCODE_DownProjResidual` both map to `CutlassGemmAdd` (or
+   `Gemm` followed by `Add`). The encoder needs to know *which*
+   TK opcode to emit based on position in the tape (post-attention
+   vs post-MLP). Either rely on tape order (encoder maintains
+   per-bucket "I've seen attn / I've seen MLP" state) or add tile
+   metadata that distinguishes them.
+
+5. **Barrier synthesis.** TK's `OPCODE_Barrier_Inc` /
+   `OPCODE_AllDeviceBarrier` have no `Instruction<W>` analog —
+   they're tape-position-synthesized between phases. The encoder
+   inserts them at the right cadence. Match
+   `worktree-ferrite-mega@417e16bda`'s `tk_instructions::build_
+   throughput_instructions` exactly — that's the pattern that ships
+   coherent output.
+
+Output of P2-1: a table mapping each `Instruction<W>` variant + each
+TK opcode bidirectionally, with row-payload field-by-field
+correspondence. Lands as a single doc commit.
+
+**Step P2-2 — `interpreters/kvm_mega.rs` encoder.** Mirror
+`interpreters/prim_mega.rs`'s shape:
+- `EncodedRow` reused if applicable, or new `KvmEncodedRow` with
+  TK's exact 32-int row payload semantics.
+- `try_encode_bucket(arch_opcodes, instances, ctx) ->
+  Option<KvmEncodedBucket>` with closed match per
+  `Instruction<W>` variant per the P2-1 mapping table.
+- `emit_kvm_program` + `emit_kvm_launcher` rendering the static
+  tape + launcher fn body.
+
+Tests on synthetic OpInstances per variant.
+
+**Step P2-3 — KvmFit Impls in `impl_lib.rs`.** New
+`MegakernelFit::Kvm` Impls covering the variants TK consumes. By
+`feedback_no_piecemeal_codegen_migration`, this is wholesale — every
+variant the TK throughput tape supports gets a KvmFit Impl in one
+commit.
+
+**Step P2-4 — Wire `generate_tk_megakernel` into `codegen.rs`.**
+Per-canonical: when the bucket is fully KvmFit, emit a
+`tk_megakernel_<canonical>.cu` to the megakernel cache dir (similar
+to `prim_mega_llama_kernel`'s build path), emit Rust extern "C" decl
+for `tk_megakernel_<canonical>_launch`, populate
+`LAUNCHER_TABLE` with a `KvmMegaLauncher` arm.
+
+**Step P2-5 — `FERRITE_FORCE_KVM_MEGA` env override + E2E.**
+Parallel to `FERRITE_FORCE_PRIM_MEGA`. Once a Llama-3.2-1B canonical
+has full KvmFit coverage, set the env var and confirm "capital of
+France is Paris" coherent on H100, byte-equal vs host on a fixed
+seed. Matches `worktree-ferrite-mega@417e16bda`'s verification.
+
+**Step P2-6 — Cross-arch coverage.** Cohere, Granite, Gemma3 each
+need their own per-arch megakernel TU. The `head_dim=64, GQA=4`
+gate the older branch hit (only Llama-3.2-1B / Granite compiled)
+applies; non-conforming archs stay on host.
+
 ## Where we are
+
+Phase 1 work order steps 1–5 done + cost model picks DC on Hopper /
+host on Ada (principled, not push-order) + **DC coverage corrected
+to wholesale-per-kernel for every CUTLASS family the kernel-level
+Params allows** + step 6 prim_mega encoder match landed + **step 7a
 
 Phase 1 work order steps 1–5 done + cost model picks DC on Hopper /
 host on Ada (principled, not push-order) + **DC coverage corrected
@@ -518,6 +774,18 @@ reflects the actual landed sequence + remaining gaps.
    path lights up automatically once coverage is whole.
 
 ## Next session — what to pick up
+
+> **OBSOLETE PRE-PIVOT (2026-04-27).** This whole section described
+> the original PrimMega Phase-1 push (FI DC plan-handle threading,
+> FusedGateUpSiluMul decomp, occupancy-derived launch geometry).
+> Superseded by the **§PIVOT 2026-04-27 — KvmMega is now the perf
+> path** section at the top of this file. Read that section's
+> "§Phase 2 work order — the actual entry point for the next
+> session" instead.
+>
+> The text below is preserved for forensics — if you ever want to
+> revive PrimMega coverage, this is the punch list. Do not work
+> from it without reading the pivot section first.
 
 Architecture is settled (whole-forward + tape, scaffolding for
 KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS

@@ -751,6 +751,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &library,
             &manifest,
             canonical_override.as_ref(),
+            &target_profile,
         );
         let stub_items = &sm.stub_items;
         per_model_ts.push(quote! {

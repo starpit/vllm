@@ -3222,6 +3222,7 @@ pub fn emit_model(
     lib: &ImplementationLibrary,
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical_override: Option<&Ident>,
+    target_profile: &crate::target::TargetProfile,
 ) -> TokenStream {
     if let Some(canonical) = canonical_override {
         return emit_shim_model(program, fuf, sfufs, lib, model, manifest, canonical);
@@ -3483,26 +3484,30 @@ pub fn emit_model(
         );
         prim_mega_emitted.insert(*wp, (bb_ok, lm_ok));
 
-        // KVM mega tape emission. Independent from prim_mega: each
-        // bucket attempts encode separately. Kvm-ineligible
-        // canonicals fall through silently (no static emitted).
-        let kvm_ctx = kvm_encode_ctx_from_bounds(&bounds, *wp);
-        let kvm_bb_ok = try_emit_kvm_mega(
-            &arch_opcodes,
-            &lowered.backbone,
-            &bucket_static_ident("KVM_BACKBONE_M", *wp),
-            &kvm_ctx,
-            &mut static_slices,
-        );
-        let kvm_lm_ok = try_emit_kvm_mega(
-            &arch_opcodes,
-            &lowered.lm_head,
-            &bucket_static_ident("KVM_LM_HEAD_M", *wp),
-            &kvm_ctx,
-            &mut static_slices,
-        );
-        if kvm_bb_ok || kvm_lm_ok {
-            kvm_emitted_any = true;
+        // KVM mega tape emission. Skip entirely on targets that don't
+        // support KVM — saves ~95% of the encoder cost on Ada / pre-
+        // Hopper builds where the KvmFit Impls are all dormant
+        // (target_compatible() returns false). No tape array emitted,
+        // no .cu file written.
+        if target_profile.kvm_compatible() {
+            let kvm_ctx = kvm_encode_ctx_from_bounds(&bounds, *wp);
+            let kvm_bb_ok = try_emit_kvm_mega(
+                &arch_opcodes,
+                &lowered.backbone,
+                &bucket_static_ident("KVM_BACKBONE_M", *wp),
+                &kvm_ctx,
+                &mut static_slices,
+            );
+            let kvm_lm_ok = try_emit_kvm_mega(
+                &arch_opcodes,
+                &lowered.lm_head,
+                &bucket_static_ident("KVM_LM_HEAD_M", *wp),
+                &kvm_ctx,
+                &mut static_slices,
+            );
+            if kvm_bb_ok || kvm_lm_ok {
+                kvm_emitted_any = true;
+            }
         }
     }
 

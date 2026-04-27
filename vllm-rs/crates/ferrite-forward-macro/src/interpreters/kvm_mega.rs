@@ -947,11 +947,16 @@ pub fn emit_kvm_cu_source(canonical_name: &str, dims: &KvmKernelDims) -> String 
         dims.sm_count,
     ));
 
-    // Vendor includes. Order matters: llama.cuh first (defines
-    // globals_t + macros), then the op .cu files (which use those
-    // types). Mirrors third_party/megakernels/demos/cross-gpu-llama/llama.cu.
+    // Vendor framework includes. cross-gpu-llama/llama.cuh and the
+    // op .cu files use kittens types (`semaphore`, `sv_bf<>`, ...) +
+    // megakernel types (`state<>`) without including the framework
+    // headers themselves — vendor's Makefile force-includes pch.cuh
+    // (`-include pch.cuh`) to prepend kittens.cuh + megakernel.cuh.
+    // We do the prepend explicitly here.
     out.push_str(
-        "#include \"llama.cuh\"\n\
+        "#include \"kittens.cuh\"\n\
+         #include \"megakernel.cuh\"\n\n\
+         #include \"llama.cuh\"\n\
          #include \"batched_rms_norm.cu\"\n\
          #include \"qkv_rope_append.cu\"\n\
          #include \"attention_decode.cu\"\n\

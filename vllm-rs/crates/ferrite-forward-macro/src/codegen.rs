@@ -3201,9 +3201,19 @@ pub fn emit_model(
         // — `arch_opcodes` keeps the shape registration for
         // `emit_bucket_static_slice`'s shape-checking pass.
         arch_opcodes.register(term_imp.opcode_shape());
+        // LM head shares the backbone's colored slot map, so
+        // shape-by-color is identical. Truncate/pad to num_slots
+        // mirrors `lower_bucket`'s post-pass (the backbone constructs
+        // it the same way).
+        let mut lm_slot_shapes = slots.slot_shapes().to_vec();
+        if (lm_slot_shapes.len() as u32) < num_slots {
+            lm_slot_shapes.resize(num_slots as usize, crate::shape::Shape::default());
+        }
+        lm_slot_shapes.truncate(num_slots as usize);
         let lowered_lm = crate::interpreters::host::LoweredBucket {
             instances: term_emits,
             num_slots,
+            slot_shapes: lm_slot_shapes,
             final_slot: terminal_slot,
         };
 

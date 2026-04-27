@@ -58,7 +58,13 @@ pub fn build_slot_map(fuf: &Fuf) -> SlotMap {
     for node in &fuf.nodes {
         let n_outputs = node.outputs.len().max(1) as u8;
         for slot in 0..n_outputs {
-            sm.insert(node.id, slot);
+            let color = sm.insert(node.id, slot);
+            // outputs is `Vec<Shape>` indexed by slot; nodes with
+            // zero declared outputs (sinks) take Shape::default()
+            // — the slot_shapes accessor's "untouched" sentinel.
+            if let Some(shape) = node.outputs.get(slot as usize) {
+                sm.set_shape(color, shape.clone());
+            }
         }
     }
     sm
@@ -293,6 +299,10 @@ pub fn colored_slot_map(
             if owner_shape == tile_shape {
                 let owner_color = sm.of(owner.0, owner.1);
                 sm.insert_at(tile, slot, owner_color);
+                // Idempotent: owner already set this color's shape
+                // when it was minted. Re-setting with the same
+                // value keeps the slot_shapes invariant explicit.
+                sm.set_shape(owner_color, owner_shape);
                 continue;
             }
         }
@@ -332,6 +342,7 @@ pub fn colored_slot_map(
         };
 
         sm.insert_at(tile, slot, color);
+        sm.set_shape(color, tile_shape);
         active.push((lu_self, color, (tile, slot)));
     }
 
@@ -349,6 +360,13 @@ pub struct LoweredBucket {
     pub instances: Vec<OpInstance>,
     /// Total size of the runtime tile table for this bucket.
     pub num_slots: u32,
+    /// Per-slot shapes indexed by flat slot id, length [`num_slots`].
+    /// Source for the mega launcher's per-slot
+    /// `caching.alloc_tensor(&shape, dtype)` pre-allocation pass.
+    /// Slots the allocator didn't touch (rare — sink tiles with
+    /// zero declared outputs in `build_slot_map`'s naive path) are
+    /// [`Shape::default`]; the host emitter never reads them.
+    pub slot_shapes: Vec<Shape>,
     /// Slot index whose `Owned` entry is the bucket fn's return
     /// value.
     pub final_slot: u32,
@@ -932,9 +950,19 @@ pub fn lower_bucket(
 
     let final_slot = slots.of(final_tile.0, final_tile.1);
 
+    // Snapshot exactly `num_slots` shapes; tail-pad with default if
+    // the allocator left a sparse vec (sink tiles in build_slot_map's
+    // naive path).
+    let mut slot_shapes = slots.slot_shapes().to_vec();
+    if (slot_shapes.len() as u32) < num_slots {
+        slot_shapes.resize(num_slots as usize, Shape::default());
+    }
+    slot_shapes.truncate(num_slots as usize);
+
     LoweredBucket {
         instances,
         num_slots,
+        slot_shapes,
         final_slot,
     }
 }
@@ -1286,6 +1314,56 @@ mod tests {
         assert_ne!(sm.of(TileId(1), 0), sm.of(TileId(2), 0));
     }
 
+    /// `slot_shapes()` is dense (length == `total()`) after the
+    /// colored allocator finishes, and each slot's recorded shape
+    /// equals the shape of the tile(s) parked at that color. The
+    /// mega launcher consumes this vec to size per-slot
+    /// `caching.alloc_tensor(&shape, dtype)` calls — if it's
+    /// sparse, mega launch silently allocates wrong-shape buffers
+    /// for collapsed reused slots.
+    #[test]
+    fn coloring_slot_shapes_dense_and_match_tile_shapes() {
+        // Diamond keeps two slots co-live, so we can pin both
+        // slot_shapes entries against their tile's shape. add_tile
+        // bakes `outputs: vec![vec![Dim::Lit(1)]]` so every slot
+        // shape is `[Dim::Lit(1)]`.
+        let f = Fuf {
+            nodes: vec![
+                add_tile(0, &[]),
+                add_tile(1, &[(TileId(0), 0)]),
+                add_tile(2, &[(TileId(0), 0)]),
+                add_tile(3, &[(TileId(1), 0), (TileId(2), 0)]),
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let id_plain = lib.push(Box::new(StubImpl {
+            name: "stub",
+            alias_to: None,
+            consumes: vec![],
+        }));
+        let sfuf = linear_assignment(
+            &[TileId(0), TileId(1), TileId(2), TileId(3)],
+            &[id_plain; 4],
+        );
+        let lp = linear_loop(4);
+        let protected: HashSet<(TileId, u8)> = HashSet::new();
+        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+
+        let total = sm.total() as usize;
+        assert_eq!(
+            sm.slot_shapes().len(),
+            total,
+            "slot_shapes must be dense over total()"
+        );
+        let expected: Shape = vec![Dim::Lit(1)];
+        for (i, shape) in sm.slot_shapes().iter().enumerate() {
+            assert_eq!(
+                shape, &expected,
+                "slot {i} shape must match its tile's output shape"
+            );
+        }
+    }
+
     /// A `protected` slot's color must NEVER appear on any other
     /// tile — the per-bucket fn's `take_owned(final_slot)` runs at
     /// the very end and would corrupt other tiles if their colors
@@ -1585,6 +1663,7 @@ mod tests {
                 op("Norm", &["7u32", "2u32"]),
             ],
             num_slots: 1,
+            slot_shapes: Vec::new(),
             final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
@@ -1630,6 +1709,7 @@ mod tests {
                 op("B", &["3u32"]),
             ],
             num_slots: 1,
+            slot_shapes: Vec::new(),
             final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
@@ -1661,6 +1741,7 @@ mod tests {
         let mut lb = LoweredBucket {
             instances: original.clone(),
             num_slots: 1,
+            slot_shapes: Vec::new(),
             final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");

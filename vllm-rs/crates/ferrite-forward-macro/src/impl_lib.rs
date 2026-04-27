@@ -846,6 +846,14 @@ impl OpInstance {
 pub struct SlotMap {
     map: BTreeMap<(TileId, u8), u32>,
     total: u32,
+    /// Per-color tile shape, parallel to the dense color space.
+    /// Populated by [`set_shape`] from the slot allocator (colored
+    /// or naive); consumed by mega-launcher emission to size the
+    /// runtime tile table's per-slot tensor pre-allocation. Size is
+    /// always `>= total` after construction; entries the allocator
+    /// didn't touch keep `Shape::default()` (an empty Vec<Dim>) and
+    /// must not be dereferenced.
+    slot_shapes: Vec<Shape>,
 }
 
 impl SlotMap {
@@ -880,6 +888,20 @@ impl SlotMap {
         }
     }
 
+    /// Record the tile shape associated with `color`. Idempotent: the
+    /// linear-scan allocator may set the same color across same-shape
+    /// alias collapse (where dst's shape == owner's shape, by
+    /// construction) and across reused-color same-shape lifetimes.
+    /// Lazily extends [`slot_shapes`]; out-of-band entries the caller
+    /// hasn't set keep [`Shape::default`].
+    pub fn set_shape(&mut self, color: u32, shape: Shape) {
+        let needed = (color as usize) + 1;
+        if self.slot_shapes.len() < needed {
+            self.slot_shapes.resize(needed, Shape::default());
+        }
+        self.slot_shapes[color as usize] = shape;
+    }
+
     /// Resolve `(tile, output_slot)` → flat slot index. Panics
     /// when the pair was never inserted — codegen invariant.
     #[inline]
@@ -897,6 +919,15 @@ impl SlotMap {
     #[inline]
     pub fn total(&self) -> u32 {
         self.total
+    }
+
+    /// Per-slot shapes indexed by flat slot id (== color). Length is
+    /// `total()` after the allocator finishes. Used by mega-launcher
+    /// emission to pre-allocate the per-slot OwnedTensor entries via
+    /// `caching.alloc_tensor(&shape, dtype)` before kernel launch.
+    #[inline]
+    pub fn slot_shapes(&self) -> &[Shape] {
+        &self.slot_shapes
     }
 }
 

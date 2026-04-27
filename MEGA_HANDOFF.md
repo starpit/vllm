@@ -192,13 +192,19 @@ as `KVM_MAPPING.md` (this commit). Five unknowns resolved:
 - Q5 barriers: not emitted for single-GPU. Cross-instruction sync
   is by per-op `Bar` increments + loader spin-waits, not tape rows.
 
-Read `KVM_MAPPING.md` before writing P2-2. **Open items surfaced
-there block P2-2** — chiefly: bump solver K bound (Q3). DSL-shape
-precondition (Q1) **confirmed satisfied** (2026-04-27): llama DSL
-already emits unfused `gemm + add + rmsnorm`; existing
-`CutlassGemmAddImpl` already claims `(Gemm, Add)`. Work is in
-`impl_lib.rs` (new `KvmCutlassGemmAddImpl` + `KvmRmsNormImpl`
-tier) + `interpreters/kvm_mega.rs` encoder. No DSL refactor.
+Read `KVM_MAPPING.md` before writing P2-2. Both blocking
+preconditions **confirmed satisfied** (2026-04-27):
+- Q1 DSL shape: llama already emits unfused `gemm + add + rmsnorm`;
+  existing `CutlassGemmAddImpl` already claims `(Gemm, Add)`.
+- Q3 solver claim-mask: K=16 bounds tile-spread, not output-row
+  fan-out. `FusedGateUpSiluMulImpl` claims 4 tiles; KvmFit
+  sibling inherits. No bump needed.
+
+Work for P2-2..P2-5 is in `impl_lib.rs` (new `Kvm*Impl` tier
+delegating to host counterparts, parallel to `Dc*Impl`) +
+`interpreters/kvm_mega.rs` (encoder) + `codegen.rs` (wire
+`generate_tk_megakernel`) + a new `FERRITE_FORCE_KVM_MEGA` env
+override. No DSL refactor; no solver refactor.
 
 The five unknowns:
 

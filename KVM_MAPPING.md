@@ -265,12 +265,16 @@ Per matmul fan-out: `num_batch_blocks × num_intermediate_blocks`
 rows for each. Total fan-out from one IR `FusedGateUpSiluMul`
 tile is `2 × num_batch_blocks × num_intermediate_blocks`.
 
-**Solver claim-mask precondition (per `feedback_solver_claim_mask_size`):**
-the picked `KvmFusedGateUpSiluMulImpl`'s `fan_out` is wider than
-any current Impl (PrimMega's widest is `OP_CUTLASS_GEMM_SPLITK`'s
-single-row claim). Verify K bound + `u8`/`u16` typing in `solver.rs`
-covers the new fan-out before P2-3 lands; bump if necessary, with
-a unit test pinning it (mirror `solver_picks_dc_siblings_on_h100`).
+**Solver claim-mask precondition — confirmed satisfied
+(2026-04-27).** `feedback_solver_claim_mask_size` bounds **claim
+spread** (FUF tile positions a single Impl claims, encoded as a
+K-bit mask in `solver.rs::ClaimMask`), not output-row fan-out.
+The host `FusedGateUpSiluMulImpl` claims 4 tiles
+`(Gemm, Gemm, Silu, Mul)` (`impl_lib.rs:2962-3060`); the KvmFit
+sibling inherits via delegate-to-host. K=16 (`solver.rs:464`) has
+ample headroom. The 2×B×I row count is the encoder's tape-emit
+shape, bounded only by the emitted static array size — no solver
+constraint.
 
 **Why split, not "register two tiles per Impl":** TK has them as
 two opcodes because their data dependencies and storer barriers
@@ -401,9 +405,10 @@ synthetic OpInstance sequences (mirror
 1. ~~**DSL shape for residual fusion.**~~ ✅ Confirmed satisfied —
    see Q1 above. Llama DSL already emits the unfused triple; the
    work is in `impl_lib.rs`, not the DSL.
-2. **Solver claim-mask K bound** for `KvmFusedGateUpSiluMulImpl`'s
-   `2 × num_batch_blocks × num_intermediate_blocks` fan-out
-   (Q3). Add unit test before P2-3. Still open.
+2. ~~**Solver claim-mask K bound.**~~ ✅ Confirmed satisfied — see
+   Q3 above. `K=16` bounds **tile-spread**, not row fan-out.
+   `FusedGateUpSiluMulImpl` claims 4 tiles; KvmFit sibling
+   inherits. No bump needed.
 3. **Mixed prefill/decode in one forward.** Out of P2 scope per
    Q2. If the calling code allows it, the launcher must split
    into two megakernel calls (or fall to host).

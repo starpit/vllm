@@ -181,10 +181,12 @@ pub struct PositionRoles {
 /// Walk the unrolled instance list and tag each `RmsNorm` /
 /// `CutlassGemmAdd` with its structural role. The DSL invariant
 /// (`2*L+1` norms, `2*L` gemmadds in alternation) drives the
-/// tagging; deviation panics so DSL changes that break the
-/// invariant surface as compile-time errors, not silent
-/// mis-mappings.
-pub fn classify_positions(instances: &[OpInstance]) -> PositionRoles {
+/// tagging; returns `None` when the structure deviates so the
+/// caller can mark the canonical kvm-ineligible. Codegen
+/// integration relies on this being a clean fall-through, not a
+/// panic — many real canonicals have shapes that aren't llama-
+/// style (e.g., LM_Head-only buckets, MLA decoders, etc.).
+pub fn classify_positions(instances: &[OpInstance]) -> Option<PositionRoles> {
     let n = instances.len();
     let mut norm: Vec<Option<NormRole>> = vec![None; n];
     let mut gemm_add: Vec<Option<GemmAddRole>> = vec![None; n];
@@ -198,26 +200,20 @@ pub fn classify_positions(instances: &[OpInstance]) -> PositionRoles {
     if total_norms == 0 && total_gemm_adds == 0 {
         // Trivial bucket (no norms, no residuals). Empty roles
         // leave both Vecs as all-None; harmless.
-        return PositionRoles { norm, gemm_add };
+        return Some(PositionRoles { norm, gemm_add });
     }
 
     // Invariant: norms = 2*L+1, gemmadds = 2*L for some L >= 0.
-    // Derived from the DSL structure documented in KVM_MAPPING.md
-    // §"Ordering invariant".
-    assert!(
-        total_norms >= 1 && total_norms % 2 == 1,
-        "kvm_mega: expected 2*L+1 RmsNorm instances (odd, >= 1); \
-         got {total_norms}. DSL structure changed?"
-    );
+    // Derived from the llama-style DSL structure. Anything else
+    // is kvm-ineligible.
+    if total_norms < 1 || total_norms.is_multiple_of(2) {
+        // Need odd count: 2*L + 1 norms (per layer + final lm_head).
+        return None;
+    }
     let l_from_norms = (total_norms - 1) / 2;
-    assert_eq!(
-        total_gemm_adds,
-        2 * l_from_norms,
-        "kvm_mega: expected 2*L = {} CutlassGemmAdd instances given \
-         {total_norms} RmsNorm instances; got {total_gemm_adds}. \
-         DSL structure changed?",
-        2 * l_from_norms
-    );
+    if total_gemm_adds != 2 * l_from_norms {
+        return None;
+    }
 
     let mut norm_idx = 0usize;
     let mut gemm_add_idx = 0usize;
@@ -243,7 +239,7 @@ pub fn classify_positions(instances: &[OpInstance]) -> PositionRoles {
         }
     }
 
-    PositionRoles { norm, gemm_add }
+    Some(PositionRoles { norm, gemm_add })
 }
 
 // ── Encoder driver ──────────────────────────────────────────────
@@ -305,7 +301,7 @@ pub fn try_encode_bucket(
     // Drop the layer_offset wrapper for classification (it doesn't
     // depend on per-iter offsets).
     let flat: Vec<OpInstance> = unrolled.iter().map(|(inst, _)| inst.clone()).collect();
-    let roles = classify_positions(&flat);
+    let roles = classify_positions(&flat)?;
 
     let mut rows: Vec<KvmEncodedRow> = Vec::new();
     let _ = arch_opcodes; // shape registry consumed in P2-2 step 2 (sanity-check upfront)
@@ -840,6 +836,34 @@ fn encode_attention_prefill(
     Some(out)
 }
 
+// ── Program static emission ────────────────────────────────────
+
+/// Emit a `static <ident>: [[i32; 32]; N] = [...]` from an
+/// already-resolved [`KvmEncodedBucket`]. The C++ kernel reads
+/// instruction rows out of this static at runtime via the
+/// launcher's `cudaMemcpyAsync` to a device tape buffer.
+pub fn emit_kvm_program(
+    static_ident: &syn::Ident,
+    bucket: &KvmEncodedBucket,
+) -> proc_macro2::TokenStream {
+    use quote::quote;
+    let n = bucket.rows.len();
+    let rows = bucket.rows.iter().map(|row| {
+        let cells = row.payload.iter().map(|v| {
+            let lit = proc_macro2::Literal::i32_unsuffixed(*v);
+            quote! { #lit }
+        });
+        quote! { [ #(#cells),* ] }
+    });
+    let width_lit = proc_macro2::Literal::usize_unsuffixed(INSTRUCTION_WIDTH);
+    let n_lit = proc_macro2::Literal::usize_unsuffixed(n);
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        static #static_ident: [[i32; #width_lit]; #n_lit] = [ #(#rows),* ];
+    }
+}
+
 // ── Helpers (private) ───────────────────────────────────────────
 
 /// Extract a `u32` literal from a TokenStream that's expected to
@@ -1106,7 +1130,7 @@ mod tests {
             gemm_add_inst(6, 7, 0, "Weights::mlp_down_proj", 128, 128, 3),
             rms_norm_inst(8, 9, 0, "Weights::norm"),
         ];
-        let roles = classify_positions(&prog);
+        let roles = classify_positions(&prog).unwrap();
         assert_eq!(roles.norm[0], Some(NormRole::Attn));
         assert_eq!(roles.norm[2], Some(NormRole::Mlp));
         assert_eq!(roles.norm[4], Some(NormRole::LmHead));
@@ -1147,7 +1171,7 @@ mod tests {
             ));
         }
         prog.push(rms_norm_inst(8, 9, 0, "Weights::norm"));
-        let roles = classify_positions(&prog);
+        let roles = classify_positions(&prog).unwrap();
         // Norms: positions 0, 2, 4, 6, 8 — Attn, Mlp, Attn, Mlp, LmHead.
         assert_eq!(roles.norm[0], Some(NormRole::Attn));
         assert_eq!(roles.norm[2], Some(NormRole::Mlp));
@@ -1161,16 +1185,16 @@ mod tests {
         assert_eq!(roles.gemm_add[7], Some(GemmAddRole::DownProj));
     }
 
-    /// Even-count norms violate the DSL invariant. Must panic
-    /// with a clear message — no silent miscoding.
+    /// Even-count norms don't match llama-shape (need 2*L+1 odd).
+    /// `classify_positions` returns `None` so the canonical falls
+    /// through to host as kvm-ineligible — no panic at codegen.
     #[test]
-    #[should_panic(expected = "expected 2*L+1 RmsNorm")]
     fn classify_rejects_even_norm_count() {
         let prog = vec![
             rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
             rms_norm_inst(2, 3, 0, "Weights::post_attention_layernorm"),
         ];
-        classify_positions(&prog);
+        assert!(classify_positions(&prog).is_none());
     }
 
     /// AttnNorm row carries opcode 1 + layer + num_items=1 + batch
@@ -1501,5 +1525,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.rows, fi.rows);
+    }
+
+    /// `emit_kvm_program` renders a `static <ident>: [[i32; 32]; N]`
+    /// declaration with one row per `KvmEncodedRow`. Verify the
+    /// rendered TokenStream parses as a `static` item with the
+    /// right shape.
+    #[test]
+    fn emit_kvm_program_renders_static_array() {
+        let arch = arch_with_norm_and_gemm_add();
+        let prog = vec![
+            rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
+            gemm_add_inst(2, 3, 0, "Weights::self_attn_o_proj", 128, 128, 3),
+            rms_norm_inst(4, 5, 0, "Weights::post_attention_layernorm"),
+            gemm_add_inst(6, 7, 0, "Weights::mlp_down_proj", 128, 128, 3),
+            rms_norm_inst(8, 9, 0, "Weights::norm"),
+        ];
+        let mut ctx = ctx_llama_1b();
+        ctx.batch_size = 8;
+        ctx.matmul_batch_block_size = 8;
+        let bucket = try_encode_bucket(&arch, &prog, &ctx, None).unwrap();
+        let static_ident = Ident::new("KVM_TEST", Span::call_site());
+        let ts = emit_kvm_program(&static_ident, &bucket);
+        let item: syn::ItemStatic = syn::parse2(ts).expect("renders as a parseable static item");
+        assert_eq!(item.ident, "KVM_TEST");
     }
 }

@@ -41,6 +41,7 @@ use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
 use crate::interpreters::host::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
+use crate::interpreters::kvm_mega;
 use crate::interpreters::prim_mega::{
     EncodeCtx, emit_prim_mega_launcher, emit_prim_mega_program, try_encode_bucket,
 };
@@ -2933,20 +2934,72 @@ fn encode_ctx_from_bounds(
     }
 }
 
+/// Build a [`kvm_mega::EncodeCtx`] from the per-canonical bounds
+/// and workload point. Pulls model dims from `bounds`; uses
+/// vendor defaults from `llama.cuh` for the matmul block sizes
+/// (`MATMUL_OUT_BLOCK_SIZE = 256`, `MATMUL_BATCH_BLOCK_SIZE = 128`).
+/// `batch_size` rounds `num_tokens` up to a multiple of the batch
+/// block size — kvm norm rows fan out one-per-padded-position, so
+/// the kernel sees a multiple-of-block batch.
+fn kvm_encode_ctx_from_bounds(
+    bounds: &BTreeMap<String, u64>,
+    wp: crate::solver::WorkloadPoint,
+) -> kvm_mega::EncodeCtx {
+    let g = |k: &str| -> u64 { bounds.get(k).copied().unwrap_or(0) };
+    let num_q = g("num_attention_heads");
+    let num_kv = g("num_key_value_heads");
+    let head_dim = g("head_dim");
+    let matmul_batch_block_size: u32 = 128;
+    let matmul_out_block_size: u32 = 256;
+    let num_tokens = wp.num_tokens as u32;
+    let batch_size = if num_tokens == 0 {
+        matmul_batch_block_size
+    } else {
+        num_tokens.next_multiple_of(matmul_batch_block_size)
+    };
+    kvm_mega::EncodeCtx {
+        num_tokens,
+        hidden_size: g("hidden_size") as u32,
+        q_size: (num_q * head_dim) as u32,
+        kv_size: (num_kv * head_dim) as u32,
+        head_size: head_dim as u32,
+        intermediate_size: g("intermediate_size") as u32,
+        vocab_size: g("vocab_size") as u32,
+        num_kv_heads: num_kv as u32,
+        batch_size,
+        matmul_batch_block_size,
+        matmul_out_block_size,
+    }
+}
+
+/// Try to encode a bucket with the kvm_mega encoder. On `Some`,
+/// emit the device-resident program static into `static_slices`
+/// and return `true`. On `None` (kvm-ineligible), no-op.
+///
+/// Launcher emission isn't done yet (P2-4b — needs per-arch
+/// `globals_t` + extern entry point); this just emits the tape
+/// array so the encoder integrates with codegen.
+fn try_emit_kvm_mega(
+    arch_opcodes: &ArchOpcodes,
+    bucket: &crate::interpreters::host::LoweredBucket,
+    static_ident: &proc_macro2::Ident,
+    ctx: &kvm_mega::EncodeCtx,
+    static_slices: &mut Vec<TokenStream>,
+) -> bool {
+    let Some(encoded) = kvm_mega::try_encode_bucket(arch_opcodes, &bucket.instances, ctx, None)
+    else {
+        return false;
+    };
+    static_slices.push(kvm_mega::emit_kvm_program(static_ident, &encoded));
+    true
+}
+
 /// Try to encode a bucket with the prim_mega encoder. On `Some`,
 /// emit the device-resident program static + launcher fn into
 /// `static_slices` and return `true`. On `None` (mega-ineligible
 /// canonical), no-op and return `false` — the LAUNCHER_TABLE entry
-/// for any bucket sharing this canonical will be `None`, and step-8
+/// for any bucket sharing this canonical will be `None`, and the
 /// dispatch falls through to the host interpreter.
-///
-/// Both emissions go into the per-arch module's scope so the
-/// launcher's `Weights::<fn>` paths resolve against the canonical's
-/// own `Weights` type. `static_ident` is the program-static name
-/// (e.g., `MEGA_BACKBONE_M_8`); `launcher_ident` is the launcher fn
-/// name (e.g., `prim_mega_backbone_m_8`). Naming is post-hoc — step
-/// 8's dispatch reads both via `format_ident!("prim_mega_…m_{}",
-/// wp)` to find the launcher per workload point.
 fn try_emit_prim_mega(
     bounds: &BTreeMap<String, u64>,
     ctx: &EncodeCtx,
@@ -3400,6 +3453,29 @@ pub fn emit_model(
             &mut static_slices,
         );
         prim_mega_emitted.insert(*wp, (bb_ok, lm_ok));
+
+        // KVM mega tape emission. Independent from prim_mega: each
+        // bucket attempts encode separately. No launcher fn yet
+        // (P2-4b — per-arch globals_t + extern entry point); this
+        // emits only the device-resident tape array, so the
+        // encoder is exercised against every real canonical at
+        // codegen time. Kvm-ineligible canonicals fall through
+        // silently (no static emitted).
+        let kvm_ctx = kvm_encode_ctx_from_bounds(&bounds, *wp);
+        try_emit_kvm_mega(
+            &arch_opcodes,
+            &lowered.backbone,
+            &bucket_static_ident("KVM_BACKBONE_M", *wp),
+            &kvm_ctx,
+            &mut static_slices,
+        );
+        try_emit_kvm_mega(
+            &arch_opcodes,
+            &lowered.lm_head,
+            &bucket_static_ident("KVM_LM_HEAD_M", *wp),
+            &kvm_ctx,
+            &mut static_slices,
+        );
     }
 
     // `sk_axis_active`: true when the model declared `sk_buckets`;

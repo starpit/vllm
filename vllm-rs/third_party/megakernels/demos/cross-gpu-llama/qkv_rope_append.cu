@@ -185,7 +185,12 @@ struct qkv_rope_append {
 
     struct consumer {
         static __device__ void run(const Globals &g, state<Config> &s) {
-            static_assert(Globals::num_devices == 8, "Fix this function.");
+            // Original `static_assert(num_devices == 8)` was a vendor
+            // "tested only with 8" marker — the consumer body uses
+            // num_devices only via Globals::num_attention_heads /
+            // Globals::num_devices through the matmul_pipeline + KV_COL_START
+            // (already parameterized). NUM_CONSUMER_WARPS=8 stays;
+            // base_llama_config pins it.
             static_assert(Config::NUM_CONSUMER_WARPS == 8, "Fix this function.");
 
             parsed_instruction inst{s};
@@ -284,7 +289,14 @@ struct qkv_rope_append {
         static __device__ void run(const Globals &g, state<Config> &s) {
             wait(outputs_arrived(s), 0);
 
-            static_assert(Globals::num_devices == 8, "Fix this function.");
+            // Original `static_assert(num_devices == 8)` was paired with
+            // `kv_head_idx_on_this_gpu = 0` which assumed exactly one
+            // KV head per device. Generalized below to
+            // `inst.local_col - KV_COL_START`, which equals 0 in vendor's
+            // tested Llama-70B@TP=8 case (KV_COL_START=4, single KV col
+            // at col=4) and varies 0..(num_kv_heads/num_devices - 1) for
+            // multi-KV-head-per-device configs (e.g. Llama-70B@TP=1
+            // has 8 KV cols at 4..11 → kv_head_idx 0..7).
             parsed_instruction inst{s};
 
             sv_bf_head_dim *output_vecs[2] = {
@@ -318,7 +330,11 @@ struct qkv_rope_append {
                         auto page_idx = append_idx / Globals::kv_page_size;
                         auto offset_in_page = append_idx % Globals::kv_page_size;
 
-                        auto kv_head_idx_on_this_gpu = 0;
+                        // Generalized from vendor's hardcoded 0 (which
+                        // assumed 1 KV head per device). KV cols start at
+                        // KV_COL_START; each KV col handles one (K, V)
+                        // pair for one KV head on this device.
+                        auto kv_head_idx_on_this_gpu = inst.local_col - KV_COL_START;
 
                         tma::store_async(
                             g.k_cache, first_vec,

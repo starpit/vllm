@@ -322,13 +322,24 @@ impl TargetProfile {
     /// primitive megakernel interpreter needs. See `MEGA_HANDOFF.md`
     /// Phase 1.
     ///
-    /// Returns `false` until a primitive megakernel `.cu` is
-    /// authored for the target. The post-solve
+    /// True when `compute_capability >= 80` — `sm_80` is the
+    /// cooperative-grid-launch threshold the persistent kernel
+    /// requires (`cudaLaunchCooperativeKernel` plus
+    /// `cg::this_grid().sync()` between phases). Pre-Ampere
+    /// (sm_70 / sm_75) cards lack reliable grid-wide cooperative
+    /// sync and disqualify themselves here. The target also needs
+    /// the per-arch `prim_mega_<arch>_kernel` extern symbol linked
+    /// into `libmegakernels.a`; today only Llama is wired (see
+    /// `vllm-cuda/csrc/megakernel/prim_mega.cu`), so this gate is
+    /// also implicitly per-arch — when an arch's globals + launcher
+    /// land, this method gets a per-arch refinement.
+    ///
+    /// The post-solve
     /// [`pick_interpreter`](crate::interpreters::pick_interpreter)
     /// uses this in conjunction with per-impl
     /// [`MegakernelFit`](crate::impl_lib::MegakernelFit).
     pub fn prim_mega_compatible(&self) -> bool {
-        false
+        self.compute_capability >= 80
     }
 
     /// Whether this target supports the KVM megakernel — i.e. has

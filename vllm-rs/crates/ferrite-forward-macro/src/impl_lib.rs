@@ -1364,6 +1364,150 @@ impl Implementation for RmsNormRefImpl {
         )])
     }
 }
+
+// ── DcRmsNormImpl ────────────────────────────────────────────────
+//
+// PrimMega-tier sibling to [`RmsNormRefImpl`]. Same claim pattern,
+// same `opcode_shape` + `fan_out` (so codegen merges both into the
+// per-arch enum's `RmsNorm` variant — host interpreter dispatches
+// identically regardless of which sibling the solver picked). The
+// difference is the launch envelope: this impl is `DeviceCallable`,
+// `MegakernelFit::Primitive`, and gated by `prim_mega_compatible()`
+// at the target level. When the post-solve selector sees every
+// picked impl ≥ Primitive AND `prim_mega_compatible()`, it routes
+// the canonical through PrimMega — which dispatches `RmsNorm` rows
+// to the `dc_rms_norm` arm in `prim_mega.cu` instead of a host
+// kernel call.
+//
+// Why a sibling rather than overriding `RmsNormRefImpl`: an Impl
+// has exactly one `launch_kind`, and the host kernel's
+// `KernelBoundary` / `StreamOrder` handoffs are different physical
+// machinery from the megakernel's `InKernelGridSync` /
+// `SyncThreads`. Keeping them as separate registrations lets the
+// solver score each on its own merits — Phase 1 hardware naturally
+// keeps host cheaper because `InKernelGridSync = 100us` outweighs
+// `KernelBoundary = 5us`; Phase 2 hardware (mbarrier-capable) flips
+// the math.
+
+#[derive(Debug, Default)]
+pub struct DcRmsNormImpl;
+
+impl Implementation for DcRmsNormImpl {
+    fn name(&self) -> &'static str {
+        "dc_rmsnorm"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible()
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::RmsNorm)?;
+        if let Some(s) = weight_storage_of(fuf.get(seed))
+            && !matches!(s, StorageFormat::Dense)
+        {
+            return None;
+        }
+        Some(info)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        // PrimMega phases are separated by `cg::this_grid().sync()`
+        // (forced by the early-exit pattern in dc_* kernels — see
+        // `prim_mega.cu` header comment). Mega-internal handoffs
+        // only; host-stream handoffs would imply a `KernelBoundary`
+        // crossing, which a DeviceCallable doesn't get.
+        const H: &[Handoff] = &[Handoff::InKernelGridSync, Handoff::SyncThreads];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::InKernelGridSync, Handoff::SyncThreads];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        // Two DeviceCallable impls in the same persistent kernel
+        // share a CTA; they tolerate co-residency by definition.
+        // The macro emits both arms inside `prim_mega_<arch>_kernel`'s
+        // switch.
+        true
+    }
+
+    // Same opcode_shape + fan_out as RmsNormRefImpl — both siblings
+    // contribute the identical "RmsNorm" variant, codegen merges
+    // them, host eval and prim_mega encoder both consume the variant
+    // through their respective interpreter dispatch.
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "RmsNorm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "DcRmsNorm: first input must be a Tile (got {other:?}); \
+                 the FUF tile shape doesn't match what fan_out expects"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("DcRmsNorm: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("RmsNorm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
 /// Reference HostCallback impl for `OpKind::LayerNorm`. Hand-written
 /// (parallel to [`RmsNormRefImpl`]) to expose the host-interpreter
 /// `opcode_shape` / `fan_out` overrides. Same
@@ -1842,6 +1986,11 @@ pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
+    // PrimMega sibling to RmsNormRefImpl. `target_compatible` gates
+    // on `prim_mega_compatible()`, so this entry stays dormant on
+    // pre-Ampere targets and is solver-feasible only when the
+    // megakernel `.cu` is linkable. See `MEGA_HANDOFF.md`.
+    lib.push(Box::new(DcRmsNormImpl));
     lib.push(Box::new(LayerNormRefImpl));
     // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
     // expansion time (i.e. when `forward!` runs during a build) drops
@@ -13190,5 +13339,77 @@ mod tests {
         model.bounds.insert("num_key_value_heads".to_string(), 8);
         model.bounds.insert("head_dim".to_string(), 128);
         model
+    }
+
+    // ── DC sibling Impl flag tests ───────────────────────────────
+    //
+    // Pin the load-bearing flag set on the new mega-tier siblings:
+    // `launch_kind = DeviceCallable`, `megakernel_fit = Primitive`,
+    // `target_compatible` gated on `prim_mega_compatible()`. The
+    // selector + solver hook off these — a regression here silently
+    // routes mega-eligible canonicals through the host interpreter.
+    #[test]
+    fn dc_rms_norm_advertises_primitive_megakernel_fit() {
+        let imp = DcRmsNormImpl;
+        assert_eq!(imp.launch_kind(), LaunchKind::DeviceCallable);
+        assert_eq!(imp.megakernel_fit(), MegakernelFit::Primitive);
+        assert!(MegakernelFit::Primitive >= MegakernelFit::None);
+        assert!(MegakernelFit::Primitive < MegakernelFit::Kvm);
+    }
+
+    #[test]
+    fn dc_rms_norm_target_gate_follows_prim_mega_compatible() {
+        // sm_89 (L4) is ≥80 → prim_mega-compatible → DC sibling
+        // accepted. A pre-Ampere profile would reject; we synthesize
+        // one from the L4 profile by clamping `compute_capability`.
+        let mut profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        assert!(profile.prim_mega_compatible());
+        assert!(DcRmsNormImpl.target_compatible(&profile));
+
+        profile.compute_capability = 75; // hypothetical sm_75 (Turing)
+        assert!(!profile.prim_mega_compatible());
+        assert!(!DcRmsNormImpl.target_compatible(&profile));
+    }
+
+    #[test]
+    fn dc_rms_norm_handoffs_are_mega_internal_only() {
+        // Host-stream handoffs (StreamOrder, StreamEvent,
+        // KernelBoundary) are illegal for a DeviceCallable: the
+        // PrimMega persistent kernel never crosses a launch
+        // boundary mid-tape. Only intra-grid sync mechanisms apply.
+        let imp = DcRmsNormImpl;
+        let allowed: std::collections::HashSet<_> =
+            [Handoff::InKernelGridSync, Handoff::SyncThreads]
+                .iter()
+                .copied()
+                .collect();
+        for &h in imp.supported_input_handoffs() {
+            assert!(allowed.contains(&h), "input handoff leaked: {h:?}");
+        }
+        for &h in imp.supported_output_handoffs() {
+            assert!(allowed.contains(&h), "output handoff leaked: {h:?}");
+        }
+    }
+
+    #[test]
+    fn dc_rms_norm_and_host_sibling_share_opcode_shape() {
+        // Codegen merges variants by ident across Impls; the merge
+        // panics on field-shape mismatch. DcRmsNormImpl deliberately
+        // contributes the same "RmsNorm" variant + identical fields
+        // as RmsNormRefImpl so the host interpreter's eval and the
+        // (future) PrimMega encoder both consume the same wire row.
+        let host = RmsNormRefImpl.opcode_shape();
+        let dc = DcRmsNormImpl.opcode_shape();
+        assert_eq!(host.name.to_string(), dc.name.to_string());
+        assert_eq!(host.fields.len(), dc.fields.len());
+        for ((a_name, a_ty), (b_name, b_ty)) in host.fields.iter().zip(&dc.fields) {
+            assert_eq!(a_name.to_string(), b_name.to_string());
+            assert_eq!(
+                quote!(#a_ty).to_string(),
+                quote!(#b_ty).to_string(),
+                "field type drift on {}",
+                a_name
+            );
+        }
     }
 }

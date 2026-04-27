@@ -285,11 +285,23 @@ reflects the actual landed sequence + remaining gaps.
    In codegen.rs, after the solver picks per canonical, call
    `interpreters::pick_interpreter(&picked, &profile)` and emit
    the appropriate runtime path. Stderr-trace the decision.
-⏳ — **New Impls in impl_lib.rs returning `DeviceCallable +
+🟡 — **New Impls in impl_lib.rs returning `DeviceCallable +
    Primitive` fit.** Sibling for every CUTLASS launcher we have
    a DC sibling for, every ferrite-owned DC op, every FI config.
    `emit_call` produces encoder code (writes opcode + ptr-table
    indices to the program tape) instead of a host-launcher call.
+   Started: `DcRmsNormImpl` registered alongside `RmsNormRefImpl`
+   (same `RmsNorm` variant + identical `fan_out`; differs in
+   `launch_kind = DeviceCallable`, `megakernel_fit = Primitive`,
+   and mega-internal-only handoffs). `prim_mega_compatible()`
+   bumped from stub-`false` to `compute_capability >= 80` so the
+   sibling is solver-feasible on Ada / Hopper. Selector unit
+   tests pin the post-solve routing: PrimMega when every pick is
+   ≥Primitive AND target supports it, Host the moment a None-fit
+   sibling lands in the picked set.
+   Remaining: DC siblings for FusedAddRmsNormImpl,
+   FusedQkvRopeCacheImpl, CutlassGemmImpl, CutlassGemvImpl,
+   silu/mul, FlashInfer attention configs.
 ⏳ 9. End-to-end: `vllm chat unsloth/Llama-3.2-3B-Instruct
    --enforce-eager` → solver picks DeviceCallable Impls (because
    tiebreak prefers them at equal cost) → selector picks

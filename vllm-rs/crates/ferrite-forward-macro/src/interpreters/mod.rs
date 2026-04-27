@@ -69,3 +69,53 @@ pub fn pick_interpreter(picked: &[&dyn Implementation], profile: &TargetProfile)
         Interpreter::Host
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::impl_lib::{DcRmsNormImpl, RmsNormRefImpl};
+
+    /// L4 / sm_89 — `prim_mega_compatible() == true`,
+    /// `kvm_compatible() == false`. The two-axis selector should
+    /// route through PrimMega when every picked impl is Primitive
+    /// or better, and fall back to Host the moment a None-fit impl
+    /// gets picked alongside.
+    #[test]
+    fn picks_prim_mega_when_all_impls_primitive_and_target_supports() {
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let dc = DcRmsNormImpl;
+        let picked: Vec<&dyn Implementation> = vec![&dc];
+        assert_eq!(pick_interpreter(&picked, &profile), Interpreter::PrimMega);
+    }
+
+    #[test]
+    fn falls_back_to_host_when_any_pick_is_none_fit() {
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let dc = DcRmsNormImpl;
+        let host = RmsNormRefImpl;
+        // Mixed pick: host sibling drags `min_fit` down to None even
+        // though the DC sibling alone would have qualified.
+        let picked: Vec<&dyn Implementation> = vec![&dc, &host];
+        assert_eq!(pick_interpreter(&picked, &profile), Interpreter::Host);
+    }
+
+    #[test]
+    fn falls_back_to_host_when_target_lacks_prim_mega() {
+        let mut profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        profile.compute_capability = 75; // hypothetical Turing
+        assert!(!profile.prim_mega_compatible());
+        let dc = DcRmsNormImpl;
+        let picked: Vec<&dyn Implementation> = vec![&dc];
+        assert_eq!(pick_interpreter(&picked, &profile), Interpreter::Host);
+    }
+
+    #[test]
+    fn empty_pick_set_falls_through_to_host() {
+        // `min` over an empty iter returns None; the selector
+        // defaults to None-fit and lands on Host. Pin that against
+        // future refactors that might want to promote-on-empty.
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let picked: Vec<&dyn Implementation> = Vec::new();
+        assert_eq!(pick_interpreter(&picked, &profile), Interpreter::Host);
+    }
+}

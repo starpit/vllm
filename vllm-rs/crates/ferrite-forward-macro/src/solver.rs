@@ -343,17 +343,19 @@ pub fn solve(
         per_workload.insert(wp, a);
     }
 
-    eprintln!(
-        "    solve-profile: tiles={} impls={} points={} | cache={}ms p1(cost+filter)={}ms p2(mask)={}ms p3(dp)={}ms p4(reconstruct)={}ms",
-        fuf.len(),
-        lib.len(),
-        points.len(),
-        d_cache.as_millis(),
-        ns_phase1.load(Ordering::Relaxed) / 1_000_000,
-        ns_phase2.load(Ordering::Relaxed) / 1_000_000,
-        ns_phase3.load(Ordering::Relaxed) / 1_000_000,
-        ns_phase4.load(Ordering::Relaxed) / 1_000_000,
-    );
+    if crate::ferrite_debug() {
+        eprintln!(
+            "    solve-profile: tiles={} impls={} points={} | cache={}ms p1(cost+filter)={}ms p2(mask)={}ms p3(dp)={}ms p4(reconstruct)={}ms",
+            fuf.len(),
+            lib.len(),
+            points.len(),
+            d_cache.as_millis(),
+            ns_phase1.load(Ordering::Relaxed) / 1_000_000,
+            ns_phase2.load(Ordering::Relaxed) / 1_000_000,
+            ns_phase3.load(Ordering::Relaxed) / 1_000_000,
+            ns_phase4.load(Ordering::Relaxed) / 1_000_000,
+        );
+    }
 
     Ok(WorkloadAssignments { per_workload })
 }

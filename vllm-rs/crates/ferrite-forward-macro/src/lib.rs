@@ -226,14 +226,19 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
     }
 }
 
-fn fmt_us(us: f64) -> String {
-    if us < 1000.0 {
-        format!("{us:.0}µs")
-    } else if us < 100_000.0 {
-        format!("{:.1}ms", us / 1000.0)
-    } else {
-        format!("{:.0}ms", us / 1000.0)
-    }
+/// Truthy when `FERRITE_DEBUG` is set to anything non-empty other
+/// than "0". Gates the noisier solver-internals output (per-phase
+/// timings, per-model solve time) at proc-macro time.
+///
+/// Caveat: cargo doesn't track plain env vars across proc-macro
+/// invocations (the rebuild-tracking variant `tracked_env::var` is
+/// nightly-only), so flipping `FERRITE_DEBUG` between cached builds
+/// won't re-run the macro on its own — touch a model source file or
+/// run `cargo clean -p ferrite-model-<arch>` to force re-expansion.
+pub(crate) fn ferrite_debug() -> bool {
+    std::env::var("FERRITE_DEBUG")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
 }
 
 fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
@@ -515,29 +520,109 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             .map(|l| l.num_waves())
             .max()
             .unwrap_or(0);
-        let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
-        let per_m: String = sfufs
-            .per_workload
-            .iter()
-            .map(|(wp, a)| {
-                if sk_axis_active {
-                    format!(
-                        " M={}sk={}→{}",
-                        wp.num_tokens,
-                        wp.sk_bucket,
-                        fmt_us(a.predicted_us)
-                    )
+        // Set of kernel classes seen across every workload point.
+        // Classification must be TOTAL: any impl name that doesn't
+        // map to a known class fails the build, prompting us to add
+        // the kernel to the explicit table.
+        //
+        // Three semantic axes:
+        //   - attention backend: fa2 / fi / mla
+        //   - GEMM backend (pure or fused-with-GEMM): cublas /
+        //     cutlass / marlin. fp8 folds into cutlass (uses
+        //     `cutlass_scaled_mm_with_bias`); bnb4 folds into cublas
+        //     (dequant + cuBLAS matmul).
+        //   - non-gemm: kernels that are neither attention nor
+        //     GEMM-bearing — element-wise, reshapes, residual adds,
+        //     standalone norms. Surfaced because their existence is
+        //     usually a "why didn't we fuse this?" signal.
+        const CLASS_LABELS: [&str; 7] = [
+            "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm",
+        ];
+        // Names that are non-gemm despite a `fused_` prefix (norm-
+        // side fusions with no matmul). Listed explicitly so the
+        // generic `fused_` → cublas fallback below doesn't capture
+        // them.
+        const NON_GEMM_NAMES: &[&str] = &[
+            "embed_ref",
+            "rmsnorm_ref",
+            "layer_norm_ref",
+            "add_ref",
+            "reshape_ref",
+            "rope_append_ref",
+            "scalar_mul_inplace",
+            "scalar_offset_rms_norm",
+            "tanh_softcap_inplace",
+            "softcap",
+            "nosoftcap",
+            "deepseek_moe_ref",
+            "fused_add_rms_norm",
+            "fused_add_rms_norm_with_offset",
+        ];
+        let mut classes_used = [false; 7];
+        let mut unknown_names: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        for assignment in sfufs.per_workload.values() {
+            for impl_id in assignment.impls.values() {
+                let name = library.get(*impl_id).name();
+                let bucket = if name.starts_with("flashinfer") {
+                    Some(1) // fi
+                } else if name.starts_with("mla_") {
+                    Some(2) // mla
+                } else if name.starts_with("attention_")
+                    || name.starts_with("sliding_attention_")
+                    || name.starts_with("fa2_")
+                {
+                    Some(0) // fa2
+                } else if name.starts_with("marlin") {
+                    Some(5) // marlin
+                } else if name.starts_with("fp8") {
+                    Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
+                } else if name.starts_with("bnb4") {
+                    Some(3) // cublas (bnb4 dequant + cuBLAS matmul)
+                } else if name.starts_with("cutlass") {
+                    Some(4) // cutlass
+                } else if NON_GEMM_NAMES.contains(&name) {
+                    Some(6) // non-gemm
+                } else if name.starts_with("fused_") || name == "gemm_ref" {
+                    Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
                 } else {
-                    format!(" M={}→{}", wp.num_tokens, fmt_us(a.predicted_us))
+                    None
+                };
+                match bucket {
+                    Some(b) => classes_used[b] = true,
+                    None => {
+                        unknown_names.insert(name);
+                    }
                 }
-            })
+            }
+        }
+        if !unknown_names.is_empty() {
+            return Err(syn::Error::new(
+                args.span,
+                format!(
+                    "[{}] kernel-class summary: no class assigned for impl name(s): {}. \
+                     Add a class (or extend an existing prefix) in lib.rs.",
+                    model.source_stem,
+                    unknown_names.iter().copied().collect::<Vec<_>>().join(", "),
+                ),
+            ));
+        }
+        let kernel_mix: String = classes_used
+            .iter()
+            .zip(CLASS_LABELS.iter())
+            .filter(|(seen, _)| **seen)
+            .map(|(_, label)| format!(" {label}"))
             .collect();
+        let solve_ms_part = if ferrite_debug() {
+            format!(" · {:>3} ms", d_solve.as_millis())
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  ferrite · {variant:<30} · {tiles:>4} tiles · {waves:>3} waves · {solve_ms:>3} ms ·{per_m}",
+            "  ferrite · {variant:<30} · {tiles:>4} tiles · {waves:>3} waves{solve_ms_part} ·{kernel_mix}",
             variant = model.source_stem,
             tiles = model_fuf.len(),
             waves = max_waves,
-            solve_ms = d_solve.as_millis(),
         );
 
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);

@@ -2972,6 +2972,34 @@ fn kvm_encode_ctx_from_bounds(
     }
 }
 
+/// Build a [`kvm_mega::KvmKernelDims`] for the canonical's `.cu`
+/// source. Pulls model dims from `bounds`; uses vendor defaults for
+/// the kvm-specific block sizes / page sizes (matched to
+/// `third_party/megakernels/demos/cross-gpu-llama/llama.cuh:26-75`).
+/// `sm_count` defaults to 132 (H100); kvm doesn't run on Ada/below.
+fn kvm_kernel_dims_from_bounds(
+    bounds: &BTreeMap<String, u64>,
+    canonical_name: &str,
+) -> kvm_mega::KvmKernelDims {
+    let g = |k: &str| -> u64 { bounds.get(k).copied().unwrap_or(0) };
+    let _ = canonical_name;
+    kvm_mega::KvmKernelDims {
+        num_layers: g("num_hidden_layers") as u32,
+        hidden_dim: g("hidden_size") as u32,
+        intermediate_dim: g("intermediate_size") as u32,
+        head_dim: g("head_dim") as u32,
+        num_attention_heads: g("num_attention_heads") as u32,
+        num_kv_heads: g("num_key_value_heads") as u32,
+        kv_page_size: 128,
+        prefill_kv_block_size: 128,
+        decode_kv_block_size: 16,
+        matmul_out_block_size: 2 * g("head_dim") as u32, // matches vendor's 2*head_dim contract
+        matmul_batch_block_size: 128,
+        num_devices: 1,
+        sm_count: 132,
+    }
+}
+
 /// Try to encode a bucket with the kvm_mega encoder. On `Some`,
 /// emit the device-resident program static into `static_slices`
 /// and return `true`. On `None` (kvm-ineligible), no-op.
@@ -3407,6 +3435,7 @@ pub fn emit_model(
     // the bucket-level pair to be `Some(_)`; partial encoding is an
     // ineligible canonical at the all-or-nothing tier semantics.
     let mut prim_mega_emitted: HashMap<crate::solver::WorkloadPoint, (bool, bool)> = HashMap::new();
+    let mut kvm_emitted_any = false;
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
@@ -3455,27 +3484,45 @@ pub fn emit_model(
         prim_mega_emitted.insert(*wp, (bb_ok, lm_ok));
 
         // KVM mega tape emission. Independent from prim_mega: each
-        // bucket attempts encode separately. No launcher fn yet
-        // (P2-4b — per-arch globals_t + extern entry point); this
-        // emits only the device-resident tape array, so the
-        // encoder is exercised against every real canonical at
-        // codegen time. Kvm-ineligible canonicals fall through
-        // silently (no static emitted).
+        // bucket attempts encode separately. Kvm-ineligible
+        // canonicals fall through silently (no static emitted).
         let kvm_ctx = kvm_encode_ctx_from_bounds(&bounds, *wp);
-        try_emit_kvm_mega(
+        let kvm_bb_ok = try_emit_kvm_mega(
             &arch_opcodes,
             &lowered.backbone,
             &bucket_static_ident("KVM_BACKBONE_M", *wp),
             &kvm_ctx,
             &mut static_slices,
         );
-        try_emit_kvm_mega(
+        let kvm_lm_ok = try_emit_kvm_mega(
             &arch_opcodes,
             &lowered.lm_head,
             &bucket_static_ident("KVM_LM_HEAD_M", *wp),
             &kvm_ctx,
             &mut static_slices,
         );
+        if kvm_bb_ok || kvm_lm_ok {
+            kvm_emitted_any = true;
+        }
+    }
+
+    // Per-canonical .cu source emission. If any bucket of this
+    // canonical was kvm-eligible (tape emitted at least once), write
+    // the per-arch megakernel TU into the cudaforge cache so
+    // build_megakernels picks it up. If no bucket was eligible (e.g.,
+    // a canonical with FusedAddRmsNorm or Marlin* IR variants), skip
+    // — writing a .cu we know NVCC will choke on would break the
+    // libmegakernels.a build.
+    if kvm_emitted_any {
+        let canonical_bounds = bounds_for_wp(model, *bucket_points.first().unwrap());
+        let dims = kvm_kernel_dims_from_bounds(&canonical_bounds, &model.name);
+        let cu_source = kvm_mega::emit_kvm_cu_source(&model.name, &dims);
+        if let Err(e) = kvm_mega::write_kvm_cu_to_cache(&model.name, &cu_source) {
+            panic!(
+                "kvm_mega: failed to write per-canonical .cu file for `{}`: {}",
+                model.name, e
+            );
+        }
     }
 
     // `sk_axis_active`: true when the model declared `sk_buckets`;

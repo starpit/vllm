@@ -1014,6 +1014,31 @@ pub fn emit_kvm_cu_source(canonical_name: &str, dims: &KvmKernelDims) -> String 
     out
 }
 
+/// Write a per-canonical .cu source to
+/// `~/.cache/cudaforge/megakernels/tk_megakernel_<canonical>.cu`.
+/// `build_megakernels` in `ferrite-cuda-builder/build.rs` scans
+/// that directory and compiles every .cu file into
+/// `libmegakernels.a`.
+///
+/// Filesystem errors propagate so the proc-macro fails loudly at
+/// expand time rather than silently producing a stale build.
+pub fn write_kvm_cu_to_cache(
+    canonical_name: &str,
+    source: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME env var not set; cannot resolve cudaforge cache dir",
+        )
+    })?;
+    let cache_dir = std::path::PathBuf::from(home).join(".cache/cudaforge/megakernels");
+    std::fs::create_dir_all(&cache_dir)?;
+    let path = cache_dir.join(format!("tk_megakernel_{canonical_name}.cu"));
+    std::fs::write(&path, source)?;
+    Ok(path)
+}
+
 // ── Helpers (private) ───────────────────────────────────────────
 
 /// Extract a `u32` literal from a TokenStream that's expected to

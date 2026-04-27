@@ -586,6 +586,14 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
         .include_path("../../crates/vllm-cuda/csrc")
+        // Vendor cross-gpu-llama (KvmMega) — per-canonical
+        // tk_megakernel_<arch>.cu files emitted by `forward!` at
+        // proc-macro expand time `#include` from this dir.
+        .include_path("../../third_party/megakernels/demos/cross-gpu-llama")
+        // Vendor megakernels framework (mk<>, controller/loader/...).
+        .include_path("../../third_party/megakernels/include")
+        // ThunderKittens primitives (kittens::gl, kittens::pgl, tile types).
+        .include_path("../../third_party/thunderkittens/include")
         .with_cutlass(Some(CUTLASS_COMMIT))
         .with_git_dependency(
             "flashinfer",

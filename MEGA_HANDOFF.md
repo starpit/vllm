@@ -288,20 +288,25 @@ reflects the actual landed sequence + remaining gaps.
 🟡 — **New Impls in impl_lib.rs returning `DeviceCallable +
    Primitive` fit.** Sibling for every CUTLASS launcher we have
    a DC sibling for, every ferrite-owned DC op, every FI config.
-   `emit_call` produces encoder code (writes opcode + ptr-table
-   indices to the program tape) instead of a host-launcher call.
-   Started: `DcRmsNormImpl` registered alongside `RmsNormRefImpl`
-   (same `RmsNorm` variant + identical `fan_out`; differs in
-   `launch_kind = DeviceCallable`, `megakernel_fit = Primitive`,
-   and mega-internal-only handoffs). `prim_mega_compatible()`
-   bumped from stub-`false` to `compute_capability >= 80` so the
-   sibling is solver-feasible on Ada / Hopper. Selector unit
-   tests pin the post-solve routing: PrimMega when every pick is
-   ≥Primitive AND target supports it, Host the moment a None-fit
-   sibling lands in the picked set.
-   Remaining: DC siblings for FusedAddRmsNormImpl,
-   FusedQkvRopeCacheImpl, CutlassGemmImpl, CutlassGemvImpl,
-   silu/mul, FlashInfer attention configs.
+   Done (thin-delegation pattern — host-counterpart instance
+   answers `matches` / `cost_us` / `fan_out` / `opcode_shape`,
+   sibling overrides only `launch_kind`, `megakernel_fit`,
+   `target_compatible`, mega-internal handoffs):
+   - `DcRmsNormImpl` (host: `RmsNormRefImpl`) — `cf918daec`
+   - `DcFusedAddRmsNormImpl` (host: `FusedAddRmsNormImpl`)
+   - `DcFusedQkvRopeCacheImpl` (host: `FusedQkvRopeCacheImpl`)
+   - `DcCutlassGemmImpl` × 11 tiles via `CUTLASS_DC_TILE_ZOO`
+     — intersection of `CUTLASS_TILE_ZOO` ∩
+     `CUTLASS_DC_GEMM_LIST` (the host CSV-calibrated zoo and the
+     C++ X-macro list); a `dc_cutlass_zoo_is_subset_of_host_zoo`
+     test pins the invariant so cost-lookup never misses the CSV.
+   `prim_mega_compatible()` bumped from stub-`false` to
+   `compute_capability >= 80` so the siblings are solver-feasible
+   on Ada / Hopper.
+   Remaining: DC siblings for `FusedQkvRopePrefillImpl`,
+   `CutlassGemvImpl`, silu_mul, FlashInfer attention configs;
+   plus the `s2` deep-pipeline / 32×* / W8 / sm90 CUTLASS DC
+   tile fan-out (Rust + C++ X-macro both need it).
 ⏳ 9. End-to-end: `vllm chat unsloth/Llama-3.2-3B-Instruct
    --enforce-eager` → solver picks DeviceCallable Impls (because
    tiebreak prefers them at equal cost) → selector picks

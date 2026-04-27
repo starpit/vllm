@@ -1365,29 +1365,43 @@ impl Implementation for RmsNormRefImpl {
     }
 }
 
-// ── DcRmsNormImpl ────────────────────────────────────────────────
+// ── DC sibling Impls ─────────────────────────────────────────────
 //
-// PrimMega-tier sibling to [`RmsNormRefImpl`]. Same claim pattern,
-// same `opcode_shape` + `fan_out` (so codegen merges both into the
-// per-arch enum's `RmsNorm` variant — host interpreter dispatches
-// identically regardless of which sibling the solver picked). The
-// difference is the launch envelope: this impl is `DeviceCallable`,
-// `MegakernelFit::Primitive`, and gated by `prim_mega_compatible()`
-// at the target level. When the post-solve selector sees every
-// picked impl ≥ Primitive AND `prim_mega_compatible()`, it routes
-// the canonical through PrimMega — which dispatches `RmsNorm` rows
-// to the `dc_rms_norm` arm in `prim_mega.cu` instead of a host
-// kernel call.
+// Each DC sibling pairs 1:1 with a host Impl that already has a
+// device-callable kernel sibling in `vllm-cuda/csrc/megakernel/`
+// (`dc_rms_norm`, `dc_fused_add_rms_norm`, `dc_fused_qkv_rope_cache`,
+// `dc_cutlass::dc_gemm`). Same FUF claim pattern, same
+// `opcode_shape`, same `fan_out` — codegen merges the host + DC
+// siblings into one per-arch enum variant, and the host interpreter
+// + (future) PrimMega encoder both consume the variant through
+// their respective dispatch. Differences are surface-only:
 //
-// Why a sibling rather than overriding `RmsNormRefImpl`: an Impl
-// has exactly one `launch_kind`, and the host kernel's
-// `KernelBoundary` / `StreamOrder` handoffs are different physical
-// machinery from the megakernel's `InKernelGridSync` /
-// `SyncThreads`. Keeping them as separate registrations lets the
-// solver score each on its own merits — Phase 1 hardware naturally
-// keeps host cheaper because `InKernelGridSync = 100us` outweighs
-// `KernelBoundary = 5us`; Phase 2 hardware (mbarrier-capable) flips
-// the math.
+//   - `launch_kind`            HostCallback → DeviceCallable
+//   - `megakernel_fit`         None → Primitive
+//   - `target_compatible`      gated on `prim_mega_compatible()`
+//   - `supported_*_handoffs`   mega-internal only
+//
+// All other behavior (`matches`, `cost_us`, `resources`,
+// `input_layouts`, `output_layouts`, `output_alias`,
+// `consumes_input_tiles`, `required_weights`, `opcode_shape`,
+// `fan_out`) delegates to the host counterpart so a regression in
+// the host pattern propagates automatically. The
+// `dc_*_share_opcode_shape` tests pin the variant-merge contract
+// codegen depends on.
+//
+// Why a sibling rather than flipping `RmsNormRefImpl`'s
+// `launch_kind`: an Impl has exactly one `launch_kind`, and the
+// host kernel's `KernelBoundary` / `StreamOrder` handoffs are
+// different physical machinery from the megakernel's
+// `InKernelGridSync` / `SyncThreads`. Two siblings let the solver
+// score each on its own merits — Phase 1 hardware naturally keeps
+// host cheaper because `InKernelGridSync = 100us` outweighs
+// `KernelBoundary = 5us` per edge; Phase 2 hardware
+// (mbarrier-capable) flips the math.
+
+/// Mega-internal handoffs supported by every DC sibling. Module
+/// constant so all DC Impls reference the same slice.
+const DC_HANDOFFS: &[Handoff] = &[Handoff::InKernelGridSync, Handoff::SyncThreads];
 
 #[derive(Debug, Default)]
 pub struct DcRmsNormImpl;
@@ -1397,22 +1411,16 @@ impl Implementation for DcRmsNormImpl {
         "dc_rmsnorm"
     }
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile.prim_mega_compatible()
+        profile.prim_mega_compatible() && RmsNormRefImpl.target_compatible(profile)
     }
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let info = single_tile_match(fuf, seed, OpKind::RmsNorm)?;
-        if let Some(s) = weight_storage_of(fuf.get(seed))
-            && !matches!(s, StorageFormat::Dense)
-        {
-            return None;
-        }
-        Some(info)
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        RmsNormRefImpl.matches(fuf, seed, profile)
     }
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        elementwise_cost(m, ctx)
+        RmsNormRefImpl.cost_us(m, ctx)
     }
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        RmsNormRefImpl.resources(m)
     }
     fn launch_kind(&self) -> LaunchKind {
         LaunchKind::DeviceCallable
@@ -1421,90 +1429,210 @@ impl Implementation for DcRmsNormImpl {
         MegakernelFit::Primitive
     }
     fn supported_input_handoffs(&self) -> &[Handoff] {
-        // PrimMega phases are separated by `cg::this_grid().sync()`
-        // (forced by the early-exit pattern in dc_* kernels — see
-        // `prim_mega.cu` header comment). Mega-internal handoffs
-        // only; host-stream handoffs would imply a `KernelBoundary`
-        // crossing, which a DeviceCallable doesn't get.
-        const H: &[Handoff] = &[Handoff::InKernelGridSync, Handoff::SyncThreads];
-        H
+        DC_HANDOFFS
     }
     fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::InKernelGridSync, Handoff::SyncThreads];
-        H
+        DC_HANDOFFS
     }
     fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+        RmsNormRefImpl.input_layouts(m)
     }
     fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+        RmsNormRefImpl.output_layouts(m)
     }
     fn is_compute_bound(&self) -> bool {
-        false
+        RmsNormRefImpl.is_compute_bound()
     }
     fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
         // Two DeviceCallable impls in the same persistent kernel
         // share a CTA; they tolerate co-residency by definition.
-        // The macro emits both arms inside `prim_mega_<arch>_kernel`'s
-        // switch.
         true
     }
-
-    // Same opcode_shape + fan_out as RmsNormRefImpl — both siblings
-    // contribute the identical "RmsNorm" variant, codegen merges
-    // them, host eval and prim_mega encoder both consume the variant
-    // through their respective interpreter dispatch.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        RmsNormRefImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        RmsNormRefImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        RmsNormRefImpl.required_weights(claimed_tiles, fuf, program)
+    }
     fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new(
-            "RmsNorm",
-            vec![
-                ("in_slot", syn::parse_quote!(u32)),
-                ("out_slot", syn::parse_quote!(u32)),
-                ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-            ],
-        )
+        RmsNormRefImpl.opcode_shape()
     }
     fn fan_out(
         &self,
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
-        let tile = m.claimed_tiles[0];
-        let node = fuf.get(tile);
-        let (in_id, in_slot) = match node.inputs.first() {
-            Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => panic!(
-                "DcRmsNorm: first input must be a Tile (got {other:?}); \
-                 the FUF tile shape doesn't match what fan_out expects"
-            ),
-        };
-        let in_slot_idx = slots.of(in_id, in_slot);
-        let out_slot_idx = slots.of(tile, 0);
-        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
-        let acc = accessors
-            .first()
-            .expect("DcRmsNorm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
-        let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("RmsNorm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { Weights::#base_ident },
-            ],
-        )])
+        RmsNormRefImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DcFusedAddRmsNormImpl;
+
+impl Implementation for DcFusedAddRmsNormImpl {
+    fn name(&self) -> &'static str {
+        "dc_fused_add_rms_norm"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && FusedAddRmsNormImpl.target_compatible(profile)
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        FusedAddRmsNormImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedAddRmsNormImpl.cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        FusedAddRmsNormImpl.resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        FusedAddRmsNormImpl.input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        FusedAddRmsNormImpl.output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        FusedAddRmsNormImpl.is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        FusedAddRmsNormImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        FusedAddRmsNormImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedAddRmsNormImpl.required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        FusedAddRmsNormImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        FusedAddRmsNormImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DcFusedQkvRopeCacheImpl;
+
+impl Implementation for DcFusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "dc_fused_qkv_rope_cache"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && FusedQkvRopeCacheImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        FusedQkvRopeCacheImpl.workload_constraint()
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        FusedQkvRopeCacheImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        FusedQkvRopeCacheImpl.resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        FusedQkvRopeCacheImpl.input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        FusedQkvRopeCacheImpl.output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        FusedQkvRopeCacheImpl.is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        FusedQkvRopeCacheImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        FusedQkvRopeCacheImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        FusedQkvRopeCacheImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        FusedQkvRopeCacheImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 
@@ -2047,6 +2175,10 @@ pub fn starter_library() -> ImplementationLibrary {
         }));
     }
     lib.push(Box::new(FusedAddRmsNormImpl));
+    // PrimMega sibling — same claim, identical fan_out, mega-internal
+    // handoffs only. Solver-feasible only on prim_mega-compatible
+    // targets.
+    lib.push(Box::new(DcFusedAddRmsNormImpl));
     // Singleton fallback for residual `Add`s whose downstream is not
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
     // adds before any LayerNorm. Emits `add_inplace`.
@@ -2068,6 +2200,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // Decode / prefill QKV+rope variants — the solver picks via
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
+    // PrimMega sibling — `dc_fused_qkv_rope_cache` is wired in
+    // prim_mega.cu. The prefill variant has no DC sibling yet
+    // because no `dc_fused_qkv_rope_prefill` exists in
+    // megakernel_ops.cuh.
+    lib.push(Box::new(DcFusedQkvRopeCacheImpl));
     lib.push(Box::new(FusedQkvRopePrefillImpl));
     // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
     // followed by the same fused_qkv_rope_cache / fused_qkv_rope
@@ -2128,6 +2265,19 @@ pub fn starter_library() -> ImplementationLibrary {
     // would otherwise break its fusion chain.
     for tile in CUTLASS_TILE_ZOO {
         lib.push(Box::new(CutlassGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
+    // PrimMega siblings — one per (tile_m, tile_n, stages) tuple
+    // present in BOTH the host CSV-calibrated zoo AND the C++ DC
+    // X-macro list. Each delegates `cost_us` to the host CutlassGemm
+    // sibling, so the SAME CSV row drives both — solver scoring is
+    // apples-to-apples and the only divergence is launch_kind +
+    // handoff cost (which lives at the edge level).
+    for tile in CUTLASS_DC_TILE_ZOO {
+        lib.push(Box::new(DcCutlassGemmImpl {
             tile_m: tile.0,
             tile_n: tile.1,
             stages: tile.2,
@@ -8109,6 +8259,157 @@ impl Implementation for CutlassGemmImpl {
     }
 }
 
+// ── DcCutlassGemmImpl ────────────────────────────────────────────
+//
+// PrimMega sibling to [`CutlassGemmImpl`]. Each (tile_m, tile_n,
+// stages) tuple registered here corresponds to a typedef +
+// switch-arm pair in `vllm-cuda/csrc/megakernel/prim_mega.cu`'s
+// CUTLASS_DC_GEMM_LIST expansion (`dc_cutlass.cuh` ::
+// `dc_gemm<DcGemm_*>`). `CUTLASS_DC_TILE_ZOO` below pins the
+// overlap between the host CSV-calibrated zoo
+// (`CUTLASS_TILE_ZOO`) and the DC X-macro list — only tuples
+// present in BOTH appear here. DC-only tile shapes (the `s2` deep-
+// pipeline variants currently present only in the C++ X-macro;
+// the GEMV / SplitK / W8 / 32×* / sm90 variants pending
+// follow-up) get registered when their host counterparts ship.
+//
+// Cost delegates to CutlassGemmImpl which reads the same CSV row
+// (`cutlass_<TBM>x<TBN>_s<S>`). The DC sibling carries no extra
+// per-tile state; the trait-object wrapper holds (tile_m, tile_n,
+// stages) and constructs a fresh CutlassGemmImpl on every call.
+
+/// (tile_m, tile_n, stages) tuples that exist in BOTH the host
+/// `CUTLASS_TILE_ZOO` AND `prim_mega.cu`'s `CUTLASS_DC_GEMM_LIST`.
+/// Pinned here so a drift on either side surfaces as a missing /
+/// extra zoo entry rather than a runtime mismatch. The host's
+/// `CUTLASS_TILE_ZOO` carries 32×* small-M tiles the DC list
+/// doesn't yet have; the DC list carries `s2` deep-pipeline
+/// variants the host CSV doesn't (yet) calibrate. Intersection
+/// only:
+const CUTLASS_DC_TILE_ZOO: &[(u32, u32, u32)] = &[
+    (64, 64, 3),
+    (64, 64, 4),
+    (64, 128, 3),
+    (64, 128, 4),
+    (128, 64, 3),
+    (128, 64, 4),
+    (128, 128, 3),
+    (128, 128, 4),
+    (128, 256, 3),
+    (256, 64, 3),
+    (256, 64, 4),
+];
+
+#[derive(Debug, Clone)]
+pub struct DcCutlassGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl DcCutlassGemmImpl {
+    fn host(&self) -> CutlassGemmImpl {
+        CutlassGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+    }
+}
+
+impl Implementation for DcCutlassGemmImpl {
+    fn name(&self) -> &'static str {
+        // The host counterpart's `name()` is `static_name()` — a
+        // tile-shape-keyed `&'static str`. We mirror it under a
+        // `dc_` prefix so cost-table / debug logs disambiguate the
+        // two siblings while keeping the same per-tile string set.
+        match (self.tile_m, self.tile_n, self.stages) {
+            (64, 64, 3) => "dc_cutlass_64x64_s3",
+            (64, 64, 4) => "dc_cutlass_64x64_s4",
+            (64, 128, 3) => "dc_cutlass_64x128_s3",
+            (64, 128, 4) => "dc_cutlass_64x128_s4",
+            (128, 64, 3) => "dc_cutlass_128x64_s3",
+            (128, 64, 4) => "dc_cutlass_128x64_s4",
+            (128, 128, 3) => "dc_cutlass_128x128_s3",
+            (128, 128, 4) => "dc_cutlass_128x128_s4",
+            (128, 256, 3) => "dc_cutlass_128x256_s3",
+            (256, 64, 3) => "dc_cutlass_256x64_s3",
+            (256, 64, 4) => "dc_cutlass_256x64_s4",
+            _ => "dc_cutlass_unknown",
+        }
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && self.host().target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        self.host().workload_constraint()
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        self.host().matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        self.host().cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        self.host().resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.host().input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.host().output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        self.host().is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        self.host().output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        self.host().consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        self.host().required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        self.host().opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        self.host().fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
 // ── CutlassGemmSplitKImpl ────────────────────────────────────────
 //
 // Singleton Gemm impl backed by CUTLASS `GemmSplitKParallel` — the K
@@ -13398,17 +13699,89 @@ mod tests {
         // contributes the same "RmsNorm" variant + identical fields
         // as RmsNormRefImpl so the host interpreter's eval and the
         // (future) PrimMega encoder both consume the same wire row.
-        let host = RmsNormRefImpl.opcode_shape();
-        let dc = DcRmsNormImpl.opcode_shape();
-        assert_eq!(host.name.to_string(), dc.name.to_string());
-        assert_eq!(host.fields.len(), dc.fields.len());
-        for ((a_name, a_ty), (b_name, b_ty)) in host.fields.iter().zip(&dc.fields) {
-            assert_eq!(a_name.to_string(), b_name.to_string());
+        assert_share_opcode_shape(&RmsNormRefImpl, &DcRmsNormImpl);
+    }
+
+    #[test]
+    fn dc_fused_add_rms_norm_share_opcode_shape() {
+        assert_share_opcode_shape(&FusedAddRmsNormImpl, &DcFusedAddRmsNormImpl);
+    }
+
+    #[test]
+    fn dc_fused_qkv_rope_cache_share_opcode_shape() {
+        assert_share_opcode_shape(&FusedQkvRopeCacheImpl, &DcFusedQkvRopeCacheImpl);
+    }
+
+    #[test]
+    fn dc_cutlass_gemm_share_opcode_shape() {
+        // Tile-shape tuples must agree per-tile; iterate the DC zoo
+        // and check each pairing.
+        for &(m, n, s) in CUTLASS_DC_TILE_ZOO {
+            let host = CutlassGemmImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+            };
+            let dc = DcCutlassGemmImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+            };
+            assert_share_opcode_shape(&host, &dc);
+        }
+    }
+
+    /// Helper: pin the variant-merge contract codegen depends on —
+    /// host + DC siblings declare structurally identical opcode
+    /// shapes. A drift here surfaces as a codegen panic at build
+    /// time; the test catches it earlier.
+    fn assert_share_opcode_shape(host: &dyn Implementation, dc: &dyn Implementation) {
+        let h = host.opcode_shape();
+        let d = dc.opcode_shape();
+        assert_eq!(
+            h.name.to_string(),
+            d.name.to_string(),
+            "{} vs {} variant ident drift",
+            host.name(),
+            dc.name()
+        );
+        assert_eq!(
+            h.fields.len(),
+            d.fields.len(),
+            "{} vs {} field count drift",
+            host.name(),
+            dc.name()
+        );
+        for ((a_name, a_ty), (b_name, b_ty)) in h.fields.iter().zip(&d.fields) {
+            assert_eq!(
+                a_name.to_string(),
+                b_name.to_string(),
+                "{} vs {} field-name drift",
+                host.name(),
+                dc.name()
+            );
             assert_eq!(
                 quote!(#a_ty).to_string(),
                 quote!(#b_ty).to_string(),
-                "field type drift on {}",
+                "{} vs {} field-type drift on {}",
+                host.name(),
+                dc.name(),
                 a_name
+            );
+        }
+    }
+
+    #[test]
+    fn dc_cutlass_zoo_is_subset_of_host_zoo() {
+        // Every DC tile must also be in the host zoo so cost lookup
+        // (which delegates to CutlassGemmImpl) finds a CSV row. A
+        // DC-only tile would silently miss CSV → UNCALIBRATED_COST_US
+        // → solver never picks it → dead registration.
+        let host: std::collections::HashSet<_> = CUTLASS_TILE_ZOO.iter().copied().collect();
+        for &dc_tile in CUTLASS_DC_TILE_ZOO {
+            assert!(
+                host.contains(&dc_tile),
+                "DC tile {dc_tile:?} missing from CUTLASS_TILE_ZOO"
             );
         }
     }

@@ -17,6 +17,16 @@ pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
 
+// KvmMega host-side support (Phase 2 pivot — see MEGA_HANDOFF.md).
+// Both modules are independent of the encoder + launcher — they
+// build runtime data the megakernel consumes (paged-KV CSR triple
+// and the flat work-stealing instruction tape). Ported from
+// worktree-ferrite-mega@417e16bda; consumer wiring lands later.
+#[cfg(feature = "cuda")]
+pub mod tk_instructions;
+#[cfg(feature = "cuda")]
+pub mod tk_paged_kv;
+
 #[cfg(feature = "cuda")]
 pub use info::{
     BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep, VariantDump,

@@ -625,6 +625,44 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             waves = max_waves,
         );
 
+        // Mega selection trace. Per workload point, gather the
+        // solver-picked impls and ask `pick_interpreter` what would
+        // run. Today this is observability-only: the runtime path
+        // still routes through Host (the encoder + per-arch launcher
+        // — Phase 1 work-order steps 6 + 7 in MEGA_HANDOFF.md — are
+        // pending, so PrimMega even when picked has no body to run).
+        // Surfacing the decision here validates that DC siblings
+        // landed in `cf918daec` / `9b4168ed4` actually flow through
+        // the post-solve dispatch and that `prim_mega_compatible()`
+        // gates correctly per target. Once the encoder lands, the
+        // same predicate flips into the real runtime branch.
+        let interp_per_m: String = sfufs
+            .per_workload
+            .iter()
+            .map(|(wp, a)| {
+                let picked: Vec<&dyn impl_lib::Implementation> = a
+                    .impls
+                    .values()
+                    .map(|imp_id| library.get(*imp_id))
+                    .collect();
+                let it = interpreters::pick_interpreter(&picked, &target_profile);
+                let tag = match it {
+                    interpreters::Interpreter::Host => "Host",
+                    interpreters::Interpreter::PrimMega => "PrimMega",
+                    interpreters::Interpreter::KvmMega => "KvmMega",
+                };
+                if sk_axis_active {
+                    format!(" M={}sk={}→{}", wp.num_tokens, wp.sk_bucket, tag)
+                } else {
+                    format!(" M={}→{}", wp.num_tokens, tag)
+                }
+            })
+            .collect();
+        eprintln!(
+            "  ferrite · {variant:<30} · interp:{interp_per_m}",
+            variant = model.source_stem,
+        );
+
         let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
 
         solved.push(SolvedModel {

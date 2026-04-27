@@ -9,8 +9,9 @@
 
 ## Where we are
 
-Phase 1 work order steps 1–5 done + DC siblings partially landed.
-Six commits on `feat/rust` past the host-pivot baseline:
+Phase 1 work order steps 1–5 done + DC siblings partially landed
++ step 8's trace half. Seven commits on `feat/rust` past the
+host-pivot baseline:
 
 - `f7249aaae` — vendor `Megakernels` (throughput@`91eaff262`) +
   `ThunderKittens` (`0b55588d2`) under `vllm-rs/third_party/`.
@@ -281,10 +282,23 @@ reflects the actual landed sequence + remaining gaps.
    ptr / instruction tape ptr; launcher fn hosts the
    `prim_mega_llama_launch` extern call (already declared in
    `ferrite-kernels/src/megakernel.rs`).
-⏳ 8. Wire `pick_interpreter` into codegen post-solve dispatch.
-   In codegen.rs, after the solver picks per canonical, call
-   `interpreters::pick_interpreter(&picked, &profile)` and emit
-   the appropriate runtime path. Stderr-trace the decision.
+🟡 8. **Wire `pick_interpreter` into codegen post-solve dispatch.**
+   Trace half landed: `lib.rs` now emits a per-workload
+   `interp: M=…→Host|PrimMega|KvmMega` line alongside the existing
+   solve summary, after gathering the SFUF's picked impls and
+   running them through `pick_interpreter`. Confirms DC siblings
+   (`cf918daec` / `9b4168ed4`) flow through correctly:
+   commandr today reports `Host` across every M bucket because
+   the solver's cost-only tiebreak (`solver.rs:434–439` —
+   claim-size DESC, then cost ASC) doesn't bias toward DC at
+   equal cost. Adding a `MegakernelFit`-aware tiebreak after
+   the cost compare would flip at least one bucket to PrimMega
+   without changing what gets picked when costs differ; that
+   tiebreak is a single-commit follow-up, not blocked on the
+   encoder.
+   Remaining: emit the actual runtime path (the `if PrimMega
+   then …` branch) once the encoder + launcher (steps 6 + 7)
+   land and there's a real mega program to call.
 🟡 — **New Impls in impl_lib.rs returning `DeviceCallable +
    Primitive` fit.** Sibling for every CUTLASS launcher we have
    a DC sibling for, every ferrite-owned DC op, every FI config.

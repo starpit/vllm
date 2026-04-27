@@ -9,10 +9,63 @@
 
 ## Where we are
 
-Nothing committed on this branch yet. Vendor sources `~/Megakernels`
-and `~/ThunderKittens` are inspected but not yet copied into the
-tree. The host interpreter at the parent commit (`8a45b39d6` or
-later, after the seam swap + slot-metadata fix) is the platform.
+Phase 1 work order steps 1–5 done + DC siblings partially landed.
+Six commits on `feat/rust` past the host-pivot baseline:
+
+- `f7249aaae` — vendor `Megakernels` (throughput@`91eaff262`) +
+  `ThunderKittens` (`0b55588d2`) under `vllm-rs/third_party/`.
+  Megakernels LICENSE restored from upstream `main`'s tip; see
+  `third_party/VENDOR.md`.
+- `ef265b2a8` — `MegakernelFit::{None, Primitive, Kvm}` enum +
+  defaulted `Implementation::megakernel_fit()` →
+  `MegakernelFit::None`; `interpreter_codegen.rs` renamed to
+  `interpreters/host.rs` with sibling stubs `prim_mega.rs` +
+  `kvm_mega.rs`; `interpreters::pick_interpreter` selector +
+  `TargetProfile::{prim_mega_compatible, kvm_compatible}` stubs.
+- `e9c489c6e` — persistent `__global__` skeleton at
+  `vllm-cuda/csrc/megakernel/prim_mega.cu`. Cooperative grid sync
+  between phases (forced by existing `dc_*` early-return
+  pattern); pointer table side-channel for 64-bit ptrs; arms
+  wired to `dc_rms_norm` / `dc_fused_add_rms_norm` /
+  `dc_fused_qkv_rope_cache` / `dc_silu_and_mul` / `dc_gemv` from
+  the existing `megakernel_ops.cuh`. Build infra extension in
+  `ferrite-cuda-builder/build.rs::build_megakernels` to scan the
+  tree-resident dir alongside `~/.cache/cudaforge/megakernels/`.
+- `a2924e765` — CUTLASS DC pattern proven for one tile. On-device
+  Params construction via `CUTLASS_HOST_DEVICE` constructors
+  (`gemm.h:99–135`, `threadblock_swizzle.h:64`); zero
+  host-side `prepare_*_params` shim needed for non-splitK
+  configs (split_k_slices=1 sidesteps the workspace branch in
+  `device::Gemm::initialize`). Header at
+  `vllm-cuda/csrc/dc_cutlass.cuh`.
+- `9a66f06b3` — wholesale CUTLASS DC fan-out via X-macro list
+  (`cutlass_gemm_configs.cuh::CUTLASS_DC_GEMM_LIST`) expanded
+  three times in prim_mega.cu (typedefs + `CutlassConfig` enum +
+  `run_cutlass_gemm` switch arms). 18 workhorse tiles —
+  `64x64`, `64x128`, `128x64`, `128x128`, `128x256`, `256x64`,
+  `256x128` at stages `s2/s3/s4`. Deep-pipeline (s5+), 32x*
+  small-M, K64, W8, swizzle, silu, GEMV, splitK, sm90 not yet
+  fanned out (each needs its own typedef macro shape).
+- `cd9fd897c` — FI DC template at
+  `vllm-cuda/csrc/dc_flashinfer.cuh`. `dc_persistent_attn<
+  Runner1, Runner2, Reduction, Params>` mirrors vendor's
+  `PersistentKernelTemplate` body
+  (`flashinfer/attention/persistent_template.cuh:60–97`).
+  Verifies: `Runner1::Run + Runner2::Run +
+  cg::this_grid().sync() + Reduction::Run` are all
+  `static __device__ __forceinline__` on
+  `persistent.cuh:181 + 488`, directly callable from inside
+  another `__global__`. `build_megakernels` now pulls the
+  FlashInfer headers via the same `with_git_dependency` pin
+  (`08ab45d67`) the standalone shim build uses.
+
+The host interpreter at the parent commit (`8a45b39d6` or later,
+after the seam swap + slot-metadata fix) is the platform.
+
+`libmegakernels.a` builds clean (~2.0 MB at 18 CUTLASS tiles +
+ferrite DC ops; FlashInfer not yet instantiated). Includes
+`prim_mega_llama_kernel` + `prim_mega_llama_launch` exported
+symbols.
 
 The pivot already staked the abstractions we need:
 
@@ -176,36 +229,71 @@ build).
 
 ## Phase 1 — work order
 
-1. Vendor Megakernels + ThunderKittens. Snapshot upstream
-   commits in a top-level `VENDOR.md`.
-2. Add `MegakernelFit` enum + `megakernel_fit()` trait method
-   defaulting to `None`. No Impls return non-`None` yet — just
-   the surface.
-3. `interpreters/prim_mega.rs` skeleton: empty encoder match,
-   stub launcher, `target_prim_mega_compatible(profile) -> bool`.
-   Always returns `Interpreter::Host` from the selector at this
-   point (no canonicals are eligible yet).
-4. Author the **first DeviceCallable Impl pair** — pick the
-   cheapest, simplest kernel today's cost-optimal Llama path uses
-   (probably cutlass GEMV at decode-M=1, or rmsnorm). Sibling
-   Impl with `launch_kind() == DeviceCallable` and
-   `megakernel_fit() == Primitive`. Same `cost_us`, deterministic
-   tiebreak.
-5. Author the **primitive megakernel `.cu`** for the first arch
-   (Llama small): persistent `__global__`, switch over opcodes,
-   one arm = one `__device__` call into the wrapped kernel.
-   `__syncthreads()` between ops.
-6. Encoder match in `prim_mega.rs` for the variants Llama small
-   actually uses.
-7. Per-arch `globals` struct emit + launcher fn.
-8. Eligibility check + post-solve selector.
-9. End-to-end: `vllm chat unsloth/Llama-3.2-3B-Instruct
+The original PoC-pair-then-widen framing (steps 4 + 10) was
+collapsed into a single wholesale audit per the no-piecemeal
+rule (`feedback_no_piecemeal_codegen_migration`). The list below
+reflects the actual landed sequence + remaining gaps.
+
+✅ 1. Vendor Megakernels + ThunderKittens. `f7249aaae`.
+✅ 2. `MegakernelFit` enum + `megakernel_fit()` trait method
+   defaulting to `None`. `ef265b2a8`.
+✅ 3. `interpreters/{host,prim_mega,kvm_mega}.rs` rename +
+   `Interpreter` enum + `pick_interpreter` selector +
+   `TargetProfile::{prim_mega_compatible, kvm_compatible}`
+   stubs (currently both return `false`). `ef265b2a8`.
+✅ 5. **Primitive megakernel `.cu`** at
+   `vllm-cuda/csrc/megakernel/prim_mega.cu` —
+   `prim_mega_llama_kernel` + `prim_mega_llama_launch` (cooperative
+   launch). Arms: rms_norm / fused_add_rms_norm / qkv_rope_cache
+   / silu_and_mul / gemv / cutlass_gemm. `e9c489c6e`.
+🟡 4 + 10. **DC sibling audit + wholesale wrapping.** Audit
+   correction landed: all CUTLASS host launchers + all FlashInfer
+   `fi_run_*` configs ARE wholesale-DC-able. The earlier
+   "0 eligible" finding was wrong on FlashInfer (missed the
+   `static __device__ Run` methods on
+   `persistent.cuh:181 + 488`).
+   Done:
+   - CUTLASS DC pattern (`dc_cutlass.cuh`) — `a2924e765`.
+   - 18 standard tile fan-out via X-macro
+     (`cutlass_gemm_configs.cuh`) — `9a66f06b3`.
+   - FI DC template (`dc_flashinfer.cuh`) — `cd9fd897c`.
+   Remaining:
+   - CUTLASS deep-pipeline (s5+) variants, 32x* small-M,
+     K64 / W8 / swizzle / silu / GEMV / splitK / splitK_K64,
+     sm90 GemmUniversalAdapter. Each needs its own typedef macro
+     shape; the GEMV case especially is its own beast (see the
+     `cutlass_gemv_launch` shape in cutlass_standalone_gemm.cu
+     line 521–574 — uses `gemm::kernel::Gemv` not
+     `gemm::device::Gemm`).
+   - FI DC arm in prim_mega.cu + the host-side params marshaling
+     (copy `plan->params_1` / `params_2` from
+     `flashinfer_shim.cu.j2`'s `FlashInferPlan` to a device-
+     resident buffer; encoder emits `OP_FI_PAGED_ATTN` row with
+     pt[] indices for the two Params blobs + smem offset).
+
+⏳ 6. Encoder match in `prim_mega.rs`. Exhaustive over
+   `Instruction<W>` → `[i32; 32]`; no `_` arm; per-bucket
+   `MEGA_PROGRAM_M_<N>` static slice emission with `Loop`
+   unrolled at encode time. Slot conventions match prim_mega.cu
+   (see the per-op docstrings on `run_*` fns).
+⏳ 7. Per-arch globals struct emit + launcher fn. Macro emits a
+   per-arch globals carrying weight ptrs / kv-cache ptrs / output
+   ptr / instruction tape ptr; launcher fn hosts the
+   `prim_mega_llama_launch` extern call (already declared in
+   `ferrite-kernels/src/megakernel.rs`).
+⏳ 8. Wire `pick_interpreter` into codegen post-solve dispatch.
+   In codegen.rs, after the solver picks per canonical, call
+   `interpreters::pick_interpreter(&picked, &profile)` and emit
+   the appropriate runtime path. Stderr-trace the decision.
+⏳ — **New Impls in impl_lib.rs returning `DeviceCallable +
+   Primitive` fit.** Sibling for every CUTLASS launcher we have
+   a DC sibling for, every ferrite-owned DC op, every FI config.
+   `emit_call` produces encoder code (writes opcode + ptr-table
+   indices to the program tape) instead of a host-launcher call.
+⏳ 9. End-to-end: `vllm chat unsloth/Llama-3.2-3B-Instruct
    --enforce-eager` → solver picks DeviceCallable Impls (because
    tiebreak prefers them at equal cost) → selector picks
    `PrimMega` → coherent output, byte-equal to host run.
-10. **Then** widen the audit: every kernel today's cost-optimal
-    Impls call gets a DeviceCallable wrapping. Once the full
-    Llama forward is DeviceCallable-fit, Phase 1 is done.
 
 ## Phase 2 — work order (later)
 

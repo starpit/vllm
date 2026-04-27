@@ -13,8 +13,9 @@ Phase 1 work order steps 1–5 done + cost model picks DC on Hopper /
 host on Ada (principled, not push-order) + **DC coverage corrected
 to wholesale-per-kernel for every CUTLASS family the kernel-level
 Params allows** + step 6 prim_mega encoder match landed + **step 7a
-program-static emission landed**. Tip `2519acde1`. Sixteen commits
-on `feat/rust` past the host-pivot baseline.
+program-static emission landed** + **step 7b/7c launcher emission
++ codegen wiring landed**. Tip `cb0b6d3fa`. Twenty-two commits on
+`feat/rust` past the host-pivot baseline.
 
 **Architecture decision (2026-04-27):** PrimMega stays whole-forward
 + opcode tape (current `prim_mega.cu` shape), NOT per-layer inline
@@ -414,27 +415,37 @@ reflects the actual landed sequence + remaining gaps.
    emission lands as part of step 7 (the launcher needs to consume
    `EncodedBucket`'s ptr_plan + runtime_fills regardless, so
    emission groups naturally with the launcher fn).
-🟡 7. Per-arch globals struct emit + launcher fn. **Step 7a landed
-   (`2519acde1`):** `emit_prim_mega_program(static_ident,
-   &EncodedBucket) -> TokenStream` renders the encoder's resolved
-   rows into `static <ident>: [[i32; 32]; N] = [...]` matching
-   prim_mega.cu's `tape + pc * INSTRUCTION_WIDTH` contract. Inner
-   width pinned as a literal `32` (not the `usize` const) so the
-   static type reads `[[i32; 32]; N]` verbatim. Trailing slots
-   zero-pad. ConstExpr token streams render verbatim (parenthesized)
-   so per-canonical CanonicalParams shape constants route without a
-   new RowSlot variant. Pre-condition: `assign_ptr_indices` has
-   resolved every Ptr → `Const(idx)` and Runtime → `Const(0)`;
-   hitting either unresolved variant panics at macro expansion. 8
-   unit tests pin outer shape, 32-cell padding, opcode in slot 0,
-   ConstExpr verbatim, runtime-filled slot zero-pinned, both panic
-   paths, and outer length for loop-unrolled programs.
-   **Step 7b/7c remaining:** ptr_plan / runtime_fill statics + the
-   launcher fn body. Gates on a runtime-types design call
-   (tile_table type, ForwardCtx field paths for Positions /
-   SlotMapping, caching-allocator workspace API). Launcher fn hosts
-   the `prim_mega_llama_launch` extern call (already declared in
-   `ferrite-kernels/src/megakernel.rs`).
+✅ 7. Per-arch globals struct emit + launcher fn.
+   **7a (`2519acde1`):** `emit_prim_mega_program(static_ident,
+   &EncodedBucket) -> TokenStream` renders resolved rows into
+   `static <ident>: [[i32; 32]; N]` matching prim_mega.cu's
+   `tape + pc * INSTRUCTION_WIDTH` contract.
+   **7b/7c (`984d9e8ff`..`cb0b6d3fa`):** five-phase landing of the
+   launcher fn — surfaced `slot_shapes` from colored_slot_map →
+   `LoweredBucket` (phase 1, `984d9e8ff`); added
+   `RuntimeSource::WeightShapeDim { fn_ident, layer, dim_idx }` for
+   CUTLASS N/K runtime resolution (phase 2, `46630dbb3`); extended
+   `WorkspaceKind::SplitKScratch` with `(split_k, m, weight_fn,
+   weight_layer)` resolved shape source (phase 3, `adde6f37f`);
+   `emit_prim_mega_launcher(fn_ident, static_program_ident, bucket,
+   slot_shapes, bounds, ctx) -> TokenStream` rendering the full fn
+   body inline — tile pre-alloc, split-K workspaces, tape buffer +
+   memcpy, per-PtrSpec pt[] fills (TileSlot / Weight with KvCache
+   prefix routing / Workspace / Forward), runtime patches for
+   eps + WeightShapeDim, extern call (phase 4, `278832120`); wired
+   into codegen.rs's per-canonical static_slices loop alongside
+   BACKBONE_M_<wp>/LM_HEAD_M_<wp> (phase 5, `cb0b6d3fa`). 14 new
+   unit tests; cargo test 230/230 ✓; commandr/llama/qwen2 builds
+   clean. **Today every real model's `try_encode_bucket` returns
+   None on every canonical** because at least one op in each bucket
+   lacks a mega arm (Embed / FusedGateUpSiluMul / attention) — so
+   the launcher body is dead in practice. The infra is what matters:
+   the launcher symbols are emitted whenever encoding succeeds, so
+   step 8's dispatch can call them once DC sibling coverage widens.
+   **Placeholders remaining in launcher:** grid_x=132 / block_x=256
+   / smem_size=49152 are TODO-marked — derive from
+   `cudaOccupancyMaxActiveBlocksPerMultiprocessor` against the
+   picked phase's smem requirement.
 🟡 8. **Wire `pick_interpreter` into codegen post-solve dispatch.**
    Trace half landed (`1f4bf3192`): `lib.rs` emits per-workload
    `interp: M=…→Host|PrimMega|KvmMega` alongside the solve
@@ -495,13 +506,15 @@ reflects the actual landed sequence + remaining gaps.
 
 Architecture is settled (whole-forward + tape, scaffolding for
 KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS
-family the kernel-level Params allows. Remaining Phase-1 work, in
+family the kernel-level Params allows. Step 7 (program-static +
+launcher emit + codegen wiring) is done. Remaining Phase-1 work, in
 rough order of leverage / effort:
 
-1. **Step 7b/7c — launcher fn (inlined ptr_plan + runtime_fill).**
-   The program-static half landed in 7a. Runtime-types decision
-   below (settled this session, 2026-04-27); the implementation is
-   the actual remaining work.
+0. **Step 7b/7c — launcher fn (LANDED `984d9e8ff`..`cb0b6d3fa`).**
+   Five phases shipped this session as separate commits. Reference
+   notes preserved below for the runtime-types contract the launcher
+   implements; future tweaks (grid_x/block_x/smem occupancy
+   derivation, real e2e wire-up) should match the same shape.
 
    **Runtime-types decision (settled):**
 

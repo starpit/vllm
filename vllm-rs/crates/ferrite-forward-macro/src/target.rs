@@ -316,6 +316,29 @@ impl TargetProfile {
         let t_mem_us = fit.alpha_us_per_byte * bytes + fit.beta_us;
         Some(t_compute_us.max(t_mem_us))
     }
+
+    /// Whether this target carries the runtime artifacts (per-arch
+    /// `globals` struct + persistent `__global__` switch) the
+    /// primitive megakernel interpreter needs. See `MEGA_HANDOFF.md`
+    /// Phase 1.
+    ///
+    /// Returns `false` until a primitive megakernel `.cu` is
+    /// authored for the target. The post-solve
+    /// [`pick_interpreter`](crate::interpreters::pick_interpreter)
+    /// uses this in conjunction with per-impl
+    /// [`MegakernelFit`](crate::impl_lib::MegakernelFit).
+    pub fn prim_mega_compatible(&self) -> bool {
+        false
+    }
+
+    /// Whether this target supports the KVM megakernel — i.e. has
+    /// the vendored `~/Megakernels` template instantiated for it
+    /// AND meets the sm≥90 floor that ThunderKittens 2.0 requires.
+    /// See `MEGA_HANDOFF.md` Phase 2. Returns `false` until KVM
+    /// authoring lands.
+    pub fn kvm_compatible(&self) -> bool {
+        false
+    }
 }
 
 /// Build a `TargetProfile` from a `ferrite-cuda-targets` profile

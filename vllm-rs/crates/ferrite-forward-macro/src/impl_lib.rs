@@ -162,6 +162,31 @@ pub enum LaunchKind {
     DeviceCallable,
 }
 
+/// Whether an implementation can run inside one of the megakernel
+/// interpreters (`PrimMega` / `KvmMega`). See `MEGA_HANDOFF.md`.
+///
+/// Ordering is meaningful: `Kvm > Primitive > None`. A `Kvm`-fit
+/// impl is implicitly `Primitive`-fit. The post-solve interpreter
+/// selector takes the `min` over picked impls; if every pick is
+/// `>= Primitive` (and the target supports it) the run uses
+/// `PrimMega`, and likewise for `Kvm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MegakernelFit {
+    /// Cannot run inside any megakernel interpreter — must use the
+    /// host interpreter. Default for every existing impl.
+    None,
+    /// Runs inside `PrimMega`: a persistent `__global__` whose body
+    /// is a switch over `[i32; 32]` opcodes calling `__device__`
+    /// wrappers around vendor kernels (cutlass / flashinfer / TK).
+    /// Per-op handoff is `__syncthreads()` or grid sync.
+    Primitive,
+    /// Runs inside `KvmMega`: vendored `~/Megakernels` template
+    /// instantiated per arch with warp specialization, page virtual
+    /// memory, per-SM instruction tape. Output-tile-granular
+    /// `fan_out`.
+    Kvm,
+}
+
 /// Synchronization mechanism that conveys data between two
 /// implementations on a producer→consumer dependency edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -468,6 +493,17 @@ pub trait Implementation: fmt::Debug + Send + Sync {
 
     /// How this implementation is launched / scheduled.
     fn launch_kind(&self) -> LaunchKind;
+
+    /// Whether this impl can run inside one of the megakernel
+    /// interpreters. Default `None` means host-only — the impl
+    /// participates in solver scoring exactly as before, but it
+    /// disqualifies the canonical from `PrimMega` / `KvmMega`
+    /// post-solve. New `DeviceCallable` wrappings should return
+    /// `Primitive`; new KVM-template Impls should return `Kvm`.
+    /// See `MEGA_HANDOFF.md` for the locked design.
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::None
+    }
 
     /// The handoff mechanisms this impl can use to **receive** its
     /// boundary inputs from upstream.

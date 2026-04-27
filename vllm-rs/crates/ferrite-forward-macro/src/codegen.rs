@@ -40,7 +40,7 @@ use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
-use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
+use crate::interpreters::host::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
 
@@ -2869,8 +2869,8 @@ fn bucket_static_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_m
 /// `forward` runs both, `forward_backbone` runs only the backbone
 /// and DtoD-copies the backbone-output slot.
 struct CanonicalLowered {
-    backbone: crate::interpreter_codegen::LoweredBucket,
-    lm_head: crate::interpreter_codegen::LoweredBucket,
+    backbone: crate::interpreters::host::LoweredBucket,
+    lm_head: crate::interpreters::host::LoweredBucket,
 }
 
 /// Resolve the `(TileId, u8)` whose `OwnedTensor` is the backbone's
@@ -3153,7 +3153,7 @@ pub fn emit_model(
         // Per-bucket colored slot map. Computed once and shared
         // between backbone lowering and the lm_head fan_out so they
         // agree on slot indices.
-        let slots = crate::interpreter_codegen::colored_slot_map(
+        let slots = crate::interpreters::host::colored_slot_map(
             fuf,
             sfuf,
             loop_ir,
@@ -3191,10 +3191,7 @@ pub fn emit_model(
         let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
         let term_match = crate::impl_lib::MatchInfo {
             claimed_tiles: term_claimed.clone(),
-            boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
-                fuf,
-                &term_claimed,
-            ),
+            boundary_inputs: crate::interpreters::host::collect_boundary_inputs(fuf, &term_claimed),
             boundary_outputs: term_claimed,
         };
         let term_emits = term_imp
@@ -3204,7 +3201,7 @@ pub fn emit_model(
         // — `arch_opcodes` keeps the shape registration for
         // `emit_bucket_static_slice`'s shape-checking pass.
         arch_opcodes.register(term_imp.opcode_shape());
-        let lowered_lm = crate::interpreter_codegen::LoweredBucket {
+        let lowered_lm = crate::interpreters::host::LoweredBucket {
             instances: term_emits,
             num_slots,
             final_slot: terminal_slot,
@@ -3234,12 +3231,8 @@ pub fn emit_model(
     // repeats — middle layers — and keeps the boundary residues as
     // straight-line code in prelude/suffix.
     for (cl, _, _, _) in canonical_lowered.values_mut() {
-        crate::interpreter_codegen::apply_loop_compression(
-            &arch_opcodes,
-            &mut cl.backbone,
-            "layer",
-        );
-        crate::interpreter_codegen::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
+        crate::interpreters::host::apply_loop_compression(&arch_opcodes, &mut cl.backbone, "layer");
+        crate::interpreters::host::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
     }
 
     // Per-canonical CanonicalParams impl + Instruction type alias.

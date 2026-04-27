@@ -156,6 +156,14 @@ struct Cluster<'a> {
     labels: Vec<String>,
     backbone: &'a [NormalizedStep],
     lm_head: &'a [NormalizedStep],
+    /// Union of `m_min..m_max_excl` across every clustered bucket.
+    /// Most clusters have a single M-range so this matches the
+    /// header label exactly; clusters that merge multiple M-ranges
+    /// (same structural picks at different M) widen to the union.
+    /// Used by the GEMM-line shape annotation so each row reads
+    /// `(M=…,N=…,K=…)` self-containedly without scanning the header.
+    m_min: u64,
+    m_max_excl: u64,
 }
 
 fn print_variant<W: Write>(
@@ -177,11 +185,15 @@ fn print_variant<W: Write>(
             .find(|c| same_shape(c.backbone, &b.backbone) && same_shape(c.lm_head, &b.lm_head))
         {
             c.labels.push(label);
+            c.m_min = c.m_min.min(b.m_min);
+            c.m_max_excl = c.m_max_excl.max(b.m_max_excl);
         } else {
             clusters.push(Cluster {
                 labels: vec![label],
                 backbone: &b.backbone,
                 lm_head: &b.lm_head,
+                m_min: b.m_min,
+                m_max_excl: b.m_max_excl,
             });
         }
     }
@@ -207,10 +219,11 @@ fn print_variant<W: Write>(
                 c.lm_head.len()
             ))
         )?;
+        let m_range = Some((c.m_min, c.m_max_excl));
         writeln!(out, "  {}", style.bold("backbone"))?;
-        print_tree(out, c.backbone, "  ", style, &widths)?;
+        print_tree(out, c.backbone, "  ", style, &widths, m_range)?;
         writeln!(out, "  {}", style.bold("lm_head"))?;
-        print_tree(out, c.lm_head, "  ", style, &widths)?;
+        print_tree(out, c.lm_head, "  ", style, &widths, m_range)?;
     }
     Ok(())
 }
@@ -292,24 +305,30 @@ struct Widths {
 fn compute_widths(clusters: &[Cluster<'_>]) -> Widths {
     let mut w = Widths::default();
     for c in clusters {
+        let m_range = Some((c.m_min, c.m_max_excl));
         for steps in [c.backbone, c.lm_head] {
-            measure_steps(steps, 0, &mut w);
+            measure_steps(steps, 0, &mut w, m_range);
         }
     }
     w
 }
 
-fn measure_steps(steps: &[NormalizedStep], depth: usize, w: &mut Widths) {
+fn measure_steps(
+    steps: &[NormalizedStep],
+    depth: usize,
+    w: &mut Widths,
+    m_range: Option<(u64, u64)>,
+) {
     let mut i = 0;
     while i < steps.len() {
         let s = &steps[i];
         if s.kind == "Loop" {
             let body_len = loop_body_len(s);
             let body_end = (i + 1 + body_len).min(steps.len());
-            measure_steps(&steps[i + 1..body_end], depth + 1, w);
+            measure_steps(&steps[i + 1..body_end], depth + 1, w, m_range);
             i = body_end;
         } else {
-            let r = render_fields(s);
+            let r = render_fields(s, m_range);
             w.kind = w.kind.max(r.kind.chars().count());
             w.slots = w.slots.max(r.slots.chars().count());
             w.layer = w.layer.max(r.layer.chars().count());
@@ -332,7 +351,21 @@ fn display_kind(kind: &str) -> &str {
     }
 }
 
-fn render_fields(step: &NormalizedStep) -> RowFields {
+/// Format the cluster's M-range as it appears in shape annotations.
+/// Single-M clusters (`m_min + 1 == m_max_excl`) render as `M=N`;
+/// multi-M as `M=lo..hi` with `∞` for the open upper bound. Matches
+/// the bucket label convention used in the header.
+fn fmt_m_range(m_min: u64, m_max_excl: u64) -> String {
+    if m_min + 1 == m_max_excl {
+        format!("M={m_min}")
+    } else if m_max_excl == u64::MAX {
+        format!("M={m_min}..∞")
+    } else {
+        format!("M={m_min}..{m_max_excl}")
+    }
+}
+
+fn render_fields(step: &NormalizedStep, m_range: Option<(u64, u64)>) -> RowFields {
     let mut slots: Vec<String> = Vec::new();
     let mut layer: Option<u32> = None;
     let mut kernels: Vec<&'static str> = Vec::new();
@@ -362,9 +395,12 @@ fn render_fields(step: &NormalizedStep) -> RowFields {
     } else {
         format!("<{}>", kernels.join("+"))
     };
-    let shape_str = match weight_shape {
-        Some((n, k)) => format!("(N={n},K={k})"),
-        None => String::new(),
+    let shape_str = match (weight_shape, m_range) {
+        (Some((n, k)), Some((m_min, m_max_excl))) => {
+            format!("({},N={n},K={k})", fmt_m_range(m_min, m_max_excl))
+        }
+        (Some((n, k)), None) => format!("(N={n},K={k})"),
+        (None, _) => String::new(),
     };
     RowFields {
         kind: display_kind(step.kind).to_string(),
@@ -376,17 +412,19 @@ fn render_fields(step: &NormalizedStep) -> RowFields {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_tree<W: Write>(
     out: &mut W,
     steps: &[NormalizedStep],
     indent: &str,
     style: &Style,
     widths: &Widths,
+    m_range: Option<(u64, u64)>,
 ) -> io::Result<()> {
     let tops = top_level_indices(steps);
     for (i, &idx) in tops.iter().enumerate() {
         let is_last = i + 1 == tops.len();
-        render_node(out, steps, idx, indent, is_last, 0, style, widths)?;
+        render_node(out, steps, idx, indent, is_last, 0, style, widths, m_range)?;
     }
     Ok(())
 }
@@ -429,6 +467,7 @@ fn render_node<W: Write>(
     depth: usize,
     style: &Style,
     widths: &Widths,
+    m_range: Option<(u64, u64)>,
 ) -> io::Result<()> {
     let s = &steps[idx];
     let connector = if is_last { "└─ " } else { "├─ " };
@@ -456,6 +495,7 @@ fn render_node<W: Write>(
                 depth + 1,
                 style,
                 widths,
+                m_range,
             )?;
         }
     } else {
@@ -468,7 +508,7 @@ fn render_node<W: Write>(
         writeln!(
             out,
             "{prefix}{connector}{}",
-            format_row_styled(s, style, widths, extra)
+            format_row_styled(s, style, widths, extra, m_range)
         )?;
     }
     Ok(())
@@ -483,8 +523,9 @@ fn format_row_styled(
     style: &Style,
     widths: &Widths,
     extra_pad: usize,
+    m_range: Option<(u64, u64)>,
 ) -> String {
-    let r = render_fields(step);
+    let r = render_fields(step, m_range);
 
     // Right-pad each segment to its column width with spaces, then
     // wrap the visible text in style codes. `extra_pad` extends the

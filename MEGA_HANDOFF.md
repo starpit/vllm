@@ -12,9 +12,9 @@
 Phase 1 work order steps 1–5 done + cost model picks DC on Hopper /
 host on Ada (principled, not push-order) + **DC coverage corrected
 to wholesale-per-kernel for every CUTLASS family the kernel-level
-Params allows** + step 6 prim_mega encoder match landed. Tip
-`46ae45a77`. Fifteen commits on `feat/rust`
-past the host-pivot baseline.
+Params allows** + step 6 prim_mega encoder match landed + **step 7a
+program-static emission landed**. Tip `2519acde1`. Sixteen commits
+on `feat/rust` past the host-pivot baseline.
 
 **Architecture decision (2026-04-27):** PrimMega stays whole-forward
 + opcode tape (current `prim_mega.cu` shape), NOT per-layer inline
@@ -414,10 +414,26 @@ reflects the actual landed sequence + remaining gaps.
    emission lands as part of step 7 (the launcher needs to consume
    `EncodedBucket`'s ptr_plan + runtime_fills regardless, so
    emission groups naturally with the launcher fn).
-⏳ 7. Per-arch globals struct emit + launcher fn. Macro emits a
-   per-arch globals carrying weight ptrs / kv-cache ptrs / output
-   ptr / instruction tape ptr; launcher fn hosts the
-   `prim_mega_llama_launch` extern call (already declared in
+🟡 7. Per-arch globals struct emit + launcher fn. **Step 7a landed
+   (`2519acde1`):** `emit_prim_mega_program(static_ident,
+   &EncodedBucket) -> TokenStream` renders the encoder's resolved
+   rows into `static <ident>: [[i32; 32]; N] = [...]` matching
+   prim_mega.cu's `tape + pc * INSTRUCTION_WIDTH` contract. Inner
+   width pinned as a literal `32` (not the `usize` const) so the
+   static type reads `[[i32; 32]; N]` verbatim. Trailing slots
+   zero-pad. ConstExpr token streams render verbatim (parenthesized)
+   so per-canonical CanonicalParams shape constants route without a
+   new RowSlot variant. Pre-condition: `assign_ptr_indices` has
+   resolved every Ptr → `Const(idx)` and Runtime → `Const(0)`;
+   hitting either unresolved variant panics at macro expansion. 8
+   unit tests pin outer shape, 32-cell padding, opcode in slot 0,
+   ConstExpr verbatim, runtime-filled slot zero-pinned, both panic
+   paths, and outer length for loop-unrolled programs.
+   **Step 7b/7c remaining:** ptr_plan / runtime_fill statics + the
+   launcher fn body. Gates on a runtime-types design call
+   (tile_table type, ForwardCtx field paths for Positions /
+   SlotMapping, caching-allocator workspace API). Launcher fn hosts
+   the `prim_mega_llama_launch` extern call (already declared in
    `ferrite-kernels/src/megakernel.rs`).
 🟡 8. **Wire `pick_interpreter` into codegen post-solve dispatch.**
    Trace half landed (`1f4bf3192`): `lib.rs` emits per-workload
@@ -482,21 +498,8 @@ KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS
 family the kernel-level Params allows. Remaining Phase-1 work, in
 rough order of leverage / effort:
 
-1. **Per-arch globals struct + launcher emission (step 7).** Macro
-   emits a per-arch globals carrying weight ptrs / kv-cache ptrs /
-   output ptr / instruction-tape ptr / SplitK workspace ptrs.
-   Launcher fn hosts the `prim_mega_<arch>_launch` extern call
-   (already declared in `ferrite-kernels/src/megakernel.rs`).
-   **Consumes the [`EncodedBucket`] step 6 produces** —
-   `assign_ptr_indices` already deduped pointer specs into a stable
-   `ptr_plan: Vec<PtrSpec>` and surfaced runtime-filled slots into
-   `runtime_fills: Vec<(row_idx, slot_idx, RuntimeSource)>`. The
-   launcher needs:
-   - Static `MEGA_PROGRAM_M_<N>: &[[i32; 32]]` from `EncodedRow`s
-     (renders `RowSlot::Const(c)` as `c`, `RowSlot::ConstExpr(ts)`
-     as `ts`, `RowSlot::Ptr` is already resolved to a `Const(idx)`
-     by `assign_ptr_indices`, `RowSlot::Runtime` zeroed and
-     patched per-call).
+1. **Step 7b/7c — ptr_plan + runtime_fill + launcher fn.** The
+   program-static half landed in 7a. Remaining:
    - Static `MEGA_PTR_PLAN_M_<N>` describing how the launcher
      fills `pt[i]` from `(W, ForwardCtx, tile_table)` — one entry
      per `PtrSpec` in `ptr_plan`.
@@ -506,6 +509,18 @@ rough order of leverage / effort:
    - Workspace allocation pass: walk `ptr_plan` for
      `PtrSpec::Workspace(SplitKScratch{..})` and pre-alloc per-row
      scratch from `CachingAllocator`.
+   - Per-arch globals struct + launcher fn `prim_mega_<arch>_launch`
+     hosting the `prim_mega_llama_launch` extern call.
+   These four can plausibly be inlined into a single launcher fn
+   body (no separate statics) since the call site sees the resolved
+   `EncodedBucket` at codegen time. Open question deferred to next
+   session: tile_table parameter type, `ForwardCtx.fwd.input_ids` /
+   `slot_mapping` field paths, and the `CachingAllocator` API the
+   launcher allocates workspace + device tape buffer through. Survey
+   `host::lower_bucket`'s call site (codegen.rs:3168) for the
+   matching per-bucket fn signature host emits — the launcher fn
+   should plug into the same shape so step 8's `pick_interpreter`
+   dispatch is a one-line branch.
 
 2. **TODO step 7: complete CUTLASS GEMM N/K + qkv kv_cache ptrs.**
    The encoder leaves `N`, `K` slots in `OP_CUTLASS_GEMM` /

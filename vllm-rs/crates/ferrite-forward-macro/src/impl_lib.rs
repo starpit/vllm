@@ -2413,6 +2413,18 @@ pub fn starter_library() -> ImplementationLibrary {
             split_k: sk,
         }));
     }
+    // PrimMega siblings for SplitK. Same source of truth
+    // (`CUTLASS_SPLITK_ZOO`) — drift is structurally impossible. The
+    // C++ side `CUTLASS_DC_SPLITK_LIST` is pinned to this list by
+    // the `dc_splitk_zoo_equals_host_zoo` test.
+    for &(tm, tn, st, sk) in CUTLASS_SPLITK_ZOO {
+        lib.push(Box::new(DcCutlassGemmSplitKImpl {
+            tile_m: tm,
+            tile_n: tn,
+            stages: st,
+            split_k: sk,
+        }));
+    }
 
     lib.push(Box::new(CutlassGemvImpl));
     lib.push(Box::new(DcCutlassGemvImpl));
@@ -8832,6 +8844,137 @@ impl Implementation for CutlassGemmSplitKImpl {
     }
 }
 
+// ── DcCutlassGemmSplitKImpl ──────────────────────────────────────
+//
+// PrimMega sibling to [`CutlassGemmSplitKImpl`]. SplitK has a two-
+// kernel runtime topology (GEMM grid + Reduction); the C++ DC
+// template `dc_cutlass::dc_gemm_splitk` inlines both phases with a
+// `cg::this_grid().sync()` between them. Both `kernel::GemmSplitK-
+// Parallel::Params` and `kernel::ReduceSplitK::Params` are
+// `CUTLASS_HOST_DEVICE` constructible — same DC pattern as the
+// non-splitK variant, just with the extra reduction phase.
+//
+// Workspace: per-fanout `[split_k, M, N] * sizeof(float)` scratch.
+// The launcher pre-allocates this from CachingAllocator (same
+// contract as the host launcher's `cutlass_gemm_*_skN_launch` work-
+// space arg) and threads the pointer into the megakernel's
+// pointer table via the encoder.
+//
+// Cost delegates to the host counterpart's CSV-row lookup
+// (`cutlass_<TBM>x<TBN>_s<S>_splitN`); same row drives both, so DP
+// scoring is apples-to-apples.
+
+#[derive(Debug, Clone)]
+pub struct DcCutlassGemmSplitKImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+    pub split_k: u32,
+}
+
+impl DcCutlassGemmSplitKImpl {
+    fn host(&self) -> CutlassGemmSplitKImpl {
+        CutlassGemmSplitKImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+            split_k: self.split_k,
+        }
+    }
+}
+
+impl Implementation for DcCutlassGemmSplitKImpl {
+    fn name(&self) -> &'static str {
+        // One arm per CUTLASS_SPLITK_ZOO entry. Drift caught by
+        // `dc_cutlass_splitk_name_covers_full_zoo` test below.
+        match (self.tile_m, self.tile_n, self.stages, self.split_k) {
+            (64, 64, 4, 2) => "dc_cutlass_64x64_s4_split2",
+            (64, 64, 4, 4) => "dc_cutlass_64x64_s4_split4",
+            (64, 64, 4, 8) => "dc_cutlass_64x64_s4_split8",
+            (64, 128, 4, 2) => "dc_cutlass_64x128_s4_split2",
+            (64, 128, 4, 4) => "dc_cutlass_64x128_s4_split4",
+            (64, 128, 4, 8) => "dc_cutlass_64x128_s4_split8",
+            (128, 64, 4, 2) => "dc_cutlass_128x64_s4_split2",
+            (128, 64, 4, 4) => "dc_cutlass_128x64_s4_split4",
+            (128, 64, 4, 8) => "dc_cutlass_128x64_s4_split8",
+            (128, 128, 4, 2) => "dc_cutlass_128x128_s4_split2",
+            (128, 128, 4, 4) => "dc_cutlass_128x128_s4_split4",
+            (128, 128, 4, 8) => "dc_cutlass_128x128_s4_split8",
+            _ => "dc_cutlass_splitk_unknown",
+        }
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && self.host().target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        self.host().workload_constraint()
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        self.host().matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        self.host().cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        self.host().resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.host().input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.host().output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        self.host().is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        self.host().output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        self.host().consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        self.host().required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        self.host().opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        self.host().fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
 // ── CutlassGemmAddImpl ───────────────────────────────────────────
 //
 // Two-tile fusion: `(Gemm, Add)` where the Add is a residual-stream
@@ -14161,44 +14304,60 @@ mod tests {
     /// omits — we compare on the (TB_M, TB_N, STAGES) projection,
     /// which is what `CutlassGemmImpl` and `DcCutlassGemmImpl` index
     /// by.
-    #[test]
-    fn dc_zoo_equals_host_zoo() {
-        const CUH: &str = include_str!("../../vllm-cuda/csrc/cutlass_gemm_configs.cuh");
-        // Parse rows of the form `X( TBM, TBN, TBK, STAGES, …)`.
-        // Take only entries inside the `CUTLASS_DC_GEMM_LIST` macro
-        // body (everything after `#define CUTLASS_DC_GEMM_LIST(X)`
-        // up to the trailing entry without a backslash). The cuh
-        // file currently has only one X-macro list, so a permissive
-        // `X(…)` match suffices.
-        let mut cpp: std::collections::BTreeSet<(u32, u32, u32)> =
-            std::collections::BTreeSet::new();
-        for line in CUH.lines() {
-            let line = line.trim();
-            if !line.starts_with("X(") {
+    /// Parse rows from a specific X-macro body in
+    /// `cutlass_gemm_configs.cuh`. `define_marker` is the macro
+    /// signature that opens the body (e.g. "CUTLASS_DC_GEMM_LIST(X)").
+    /// Returns rows as Vec<&str> column lists; caller projects to
+    /// the columns it cares about. Stops at the first non-`X(`,
+    /// non-blank, non-comment line — the body ends when the X(...)
+    /// rows do (the last row in a #define block has no trailing
+    /// backslash; subsequent text is outside the macro body).
+    fn parse_xmacro_rows<'a>(cuh: &'a str, define_marker: &str) -> Vec<Vec<&'a str>> {
+        let mut in_block = false;
+        let mut rows: Vec<Vec<&str>> = Vec::new();
+        for line in cuh.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains(define_marker) {
+                in_block = true;
                 continue;
             }
-            let inner = line
+            if !in_block {
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") {
+                continue;
+            }
+            if !trimmed.starts_with("X(") {
+                break;
+            }
+            let inner = trimmed
                 .trim_start_matches("X(")
                 .trim_end_matches('\\')
                 .trim()
                 .trim_end_matches(')')
                 .trim();
             let cols: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
-            // Need at least TBM, TBN, TBK, STAGES.
-            if cols.len() < 4 {
-                continue;
+            rows.push(cols);
+            if !trimmed.ends_with('\\') {
+                break;
             }
-            let tbm: u32 = cols[0]
-                .parse()
-                .unwrap_or_else(|e| panic!("CUTLASS_DC_GEMM_LIST: bad TB_M `{}`: {e}", cols[0]));
-            let tbn: u32 = cols[1]
-                .parse()
-                .unwrap_or_else(|e| panic!("CUTLASS_DC_GEMM_LIST: bad TB_N `{}`: {e}", cols[1]));
-            let stages: u32 = cols[3]
-                .parse()
-                .unwrap_or_else(|e| panic!("CUTLASS_DC_GEMM_LIST: bad STAGES `{}`: {e}", cols[3]));
-            cpp.insert((tbm, tbn, stages));
         }
+        rows
+    }
+
+    #[test]
+    fn dc_zoo_equals_host_zoo() {
+        const CUH: &str = include_str!("../../vllm-cuda/csrc/cutlass_gemm_configs.cuh");
+        let cpp: std::collections::BTreeSet<(u32, u32, u32)> =
+            parse_xmacro_rows(CUH, "CUTLASS_DC_GEMM_LIST(X)")
+                .into_iter()
+                .map(|cols| {
+                    let tbm: u32 = cols[0].parse().expect("TB_M");
+                    let tbn: u32 = cols[1].parse().expect("TB_N");
+                    let stages: u32 = cols[3].parse().expect("STAGES");
+                    (tbm, tbn, stages)
+                })
+                .collect();
         let rust: std::collections::BTreeSet<(u32, u32, u32)> =
             CUTLASS_TILE_ZOO.iter().copied().collect();
         let cpp_only: Vec<_> = cpp.difference(&rust).copied().collect();
@@ -14210,5 +14369,73 @@ mod tests {
              {cpp_only:?}\n  Rust has but C++ doesn't: {rust_only:?}\n\
              Both sides must list the same (TB_M, TB_N, STAGES) tuples."
         );
+    }
+
+    /// Sibling pin for `CUTLASS_DC_SPLITK_LIST` ↔ `CUTLASS_SPLITK_ZOO`.
+    /// Same shape as `dc_zoo_equals_host_zoo` but compares on
+    /// (TB_M, TB_N, STAGES, SPLIT_K).
+    #[test]
+    fn dc_splitk_zoo_equals_host_zoo() {
+        const CUH: &str = include_str!("../../vllm-cuda/csrc/cutlass_gemm_configs.cuh");
+        let cpp: std::collections::BTreeSet<(u32, u32, u32, u32)> =
+            parse_xmacro_rows(CUH, "CUTLASS_DC_SPLITK_LIST(X)")
+                .into_iter()
+                .map(|cols| {
+                    let tbm: u32 = cols[0].parse().expect("TB_M");
+                    let tbn: u32 = cols[1].parse().expect("TB_N");
+                    let stages: u32 = cols[3].parse().expect("STAGES");
+                    let split_k: u32 = cols[7].parse().expect("SPLIT_K");
+                    (tbm, tbn, stages, split_k)
+                })
+                .collect();
+        let rust: std::collections::BTreeSet<(u32, u32, u32, u32)> =
+            CUTLASS_SPLITK_ZOO.iter().copied().collect();
+        let cpp_only: Vec<_> = cpp.difference(&rust).copied().collect();
+        let rust_only: Vec<_> = rust.difference(&cpp).copied().collect();
+        assert!(
+            cpp_only.is_empty() && rust_only.is_empty(),
+            "DC SplitK zoo drift between Rust CUTLASS_SPLITK_ZOO and \
+             C++ CUTLASS_DC_SPLITK_LIST.\n  C++ has but Rust doesn't: \
+             {cpp_only:?}\n  Rust has but C++ doesn't: {rust_only:?}"
+        );
+    }
+
+    #[test]
+    fn dc_cutlass_splitk_name_covers_full_zoo() {
+        for &(m, n, s, sk) in CUTLASS_SPLITK_ZOO {
+            let dc = DcCutlassGemmSplitKImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+                split_k: sk,
+            };
+            let name = dc.name();
+            assert_ne!(
+                name, "dc_cutlass_splitk_unknown",
+                "CUTLASS_SPLITK_ZOO entry ({m}, {n}, {s}, {sk}) has no \
+                 name() arm in DcCutlassGemmSplitKImpl"
+            );
+            let expected = format!("dc_cutlass_{m}x{n}_s{s}_split{sk}");
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn dc_cutlass_splitk_share_opcode_shape() {
+        for &(m, n, s, sk) in CUTLASS_SPLITK_ZOO {
+            let host = CutlassGemmSplitKImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+                split_k: sk,
+            };
+            let dc = DcCutlassGemmSplitKImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+                split_k: sk,
+            };
+            assert_share_opcode_shape(&host, &dc);
+        }
     }
 }

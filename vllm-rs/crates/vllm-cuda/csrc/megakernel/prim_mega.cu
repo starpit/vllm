@@ -43,8 +43,11 @@
 #include "../cutlass_gemm_configs.cuh"
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/device/gemm_splitk_parallel.h>
 #include <cutlass/gemm/kernel/gemv.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/thread/conversion_op.h>
+#include <cutlass/reduction/thread/reduction_operators.h>
 
 // FlashInfer DC. Header carries the
 // `dc_flashinfer::dc_persistent_attn<Runner1, Runner2, Reduction,
@@ -83,6 +86,33 @@ namespace prim_mega_cutlass_configs {
         STAGES>;
 CUTLASS_DC_GEMM_LIST(DC_GEMM_TYPEDEF)
 #undef DC_GEMM_TYPEDEF
+
+// SplitK typedef per row. Mirrors the standalone's
+// `GemmSplitK_<TB_M>x<TB_N>_s<STAGES>` aliases — same template
+// shape with the parallel-K reduction epilogue. SPLIT_K column is
+// unused in the typedef itself (it's a runtime arg) but threaded
+// through the X-macro for the per-(tile, split_k) switch arm
+// below.
+#define DC_SPLITK_TYPEDEF(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K, SPLIT_K) \
+    using DcGemmSplitK_##TB_M##x##TB_N##_s##STAGES##_sk##SPLIT_K =               \
+        cutlass::gemm::device::GemmSplitKParallel<                               \
+            cutlass::bfloat16_t, cutlass::layout::RowMajor,                      \
+            cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                   \
+            cutlass::bfloat16_t, cutlass::layout::RowMajor,                      \
+            float,                                                                \
+            cutlass::arch::OpClassTensorOp,                                      \
+            cutlass::arch::Sm80,                                                 \
+            cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                          \
+            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                    \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                 \
+            cutlass::epilogue::thread::LinearCombination<                        \
+                cutlass::bfloat16_t, 8, float, float>,                           \
+            cutlass::epilogue::thread::Convert<float, 8, float>,                 \
+            cutlass::reduction::thread::ReduceAdd<float, float, 8>,              \
+            cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,  \
+            STAGES>;
+CUTLASS_DC_SPLITK_LIST(DC_SPLITK_TYPEDEF)
+#undef DC_SPLITK_TYPEDEF
 
 // CUTLASS GEMV kernel — single config, M=1 only. Mirrors
 // `GemvKernel_8` in cutlass_standalone_gemm.cu so the CSV-calibrated
@@ -127,6 +157,12 @@ enum Opcode : int {
     // fan-out is a follow-up commit driven from
     // cutlass_standalone_gemm.cu's instantiation list.
     OP_CUTLASS_GEMM = 6,
+    // CUTLASS SplitK GEMM (two-phase: GEMM + Reduction). row[1] is
+    // the (tile, split_k) config id (one of `CutlassSplitKConfig`
+    // below). Workspace for [split_k, M, N] float partial sums is
+    // pre-allocated by the launcher and indexed into via the
+    // pointer table.
+    OP_CUTLASS_GEMM_SPLITK = 7,
     // Reserved for follow-up commits.
     // OP_FI_ATTN_DECODE   = 0x2000,
     // OP_FI_ATTN_PREFILL  = 0x2001,
@@ -142,6 +178,13 @@ enum CutlassConfig : int {
     CC_GEMM_##TB_M##x##TB_N##x##TB_K##_s##STAGES,
     CUTLASS_DC_GEMM_LIST(DC_GEMM_ENUM_ENTRY)
 #undef DC_GEMM_ENUM_ENTRY
+};
+
+enum CutlassSplitKConfig : int {
+#define DC_SPLITK_ENUM_ENTRY(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K, SPLIT_K) \
+    CC_SPLITK_##TB_M##x##TB_N##_s##STAGES##_sk##SPLIT_K,
+    CUTLASS_DC_SPLITK_LIST(DC_SPLITK_ENUM_ENTRY)
+#undef DC_SPLITK_ENUM_ENTRY
 };
 
 // Per-arm argument layouts. Each arm owns its slot interpretation;
@@ -275,6 +318,46 @@ __device__ __forceinline__ void run_cutlass_gemm(const int* row, void* const* pt
     }
 }
 
+// ── CUTLASS_GEMM_SPLITK ──────────────────────────────────────────
+// row[1]:  ptr_idx C
+// row[2]:  ptr_idx A
+// row[3]:  ptr_idx B
+// row[4]:  ptr_idx workspace ([split_k, M, N] float scratch)
+// row[5]:  M
+// row[6]:  N
+// row[7]:  K
+// row[8]:  alpha as float-bit pattern
+// row[9]:  beta  as float-bit pattern
+// row[10]: smem byte offset within kernel-wide smem
+// row[11]: CutlassSplitKConfig id (selects template + split_k)
+// row[12]: split_k_slices (runtime, must match config's SPLIT_K)
+__device__ __forceinline__ void run_cutlass_gemm_splitk(const int* row, void* const* pt) {
+    extern __shared__ char smem[];
+    void* C        = pt[row[1]];
+    const void* A  = pt[row[2]];
+    const void* B  = pt[row[3]];
+    void* workspace = pt[row[4]];
+    int M          = row[5];
+    int N          = row[6];
+    int K          = row[7];
+    float alpha    = __int_as_float(row[8]);
+    float beta     = __int_as_float(row[9]);
+    char* op_smem  = smem + row[10];
+    int config_id  = row[11];
+    int split_k    = row[12];
+
+    switch (config_id) {
+#define DC_SPLITK_SWITCH_ARM(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K, SPLIT_K) \
+        case CC_SPLITK_##TB_M##x##TB_N##_s##STAGES##_sk##SPLIT_K:                       \
+            dc_cutlass::dc_gemm_splitk<                                                 \
+                prim_mega_cutlass_configs::DcGemmSplitK_##TB_M##x##TB_N##_s##STAGES##_sk##SPLIT_K>( \
+                C, A, B, M, N, K, alpha, beta, split_k, workspace, op_smem);            \
+            break;
+        CUTLASS_DC_SPLITK_LIST(DC_SPLITK_SWITCH_ARM)
+#undef DC_SPLITK_SWITCH_ARM
+    }
+}
+
 // ── GEMV (M=1) ──────────────────────────────────────────────────
 // row[1]: ptr_idx out (= C, [1, N])
 // row[2]: ptr_idx x (= A, [1, K] input vector)
@@ -338,6 +421,9 @@ __global__ void prim_mega_llama_kernel(const int* __restrict__ tape,
                 break;
             case OP_CUTLASS_GEMM:
                 run_cutlass_gemm(row, pt);
+                break;
+            case OP_CUTLASS_GEMM_SPLITK:
+                run_cutlass_gemm_splitk(row, pt);
                 break;
             // FlashInfer attention arms land in follow-up commits. No `default:` arm — an unknown
             // opcode here means the encoder emitted a row it shouldn't

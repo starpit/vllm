@@ -52,3 +52,25 @@
     X( 128,   256,    32,    3,     64,     64,     32)          \
     X( 256,    64,    32,    3,     64,     32,     32)          \
     X( 256,    64,    32,    4,     64,     32,     32)
+
+// SplitK config list. Mirrors `CUTLASS_SPLITK_ZOO` in
+// `crates/ferrite-forward-macro/src/impl_lib.rs`. Drift between the
+// Rust list and this C++ X-macro is caught by
+// `dc_splitk_zoo_equals_host_zoo` in impl_lib.rs::tests. Each row
+// expands to a `(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K,
+// SPLIT_K)` 8-tuple — the warp shape mirrors the host's standalone
+// instantiation in `cutlass_standalone_gemm.cu`.
+#define CUTLASS_DC_SPLITK_LIST(X)                                  \
+    /* TB_M  TB_N  TB_K  STAGES  WARP_M  WARP_N  WARP_K  SPLIT_K */ \
+    X(  64,    64,    32,    4,     32,     32,     32,    2)      \
+    X(  64,    64,    32,    4,     32,     32,     32,    4)      \
+    X(  64,    64,    32,    4,     32,     32,     32,    8)      \
+    X(  64,   128,    32,    4,     32,     64,     32,    2)      \
+    X(  64,   128,    32,    4,     32,     64,     32,    4)      \
+    X(  64,   128,    32,    4,     32,     64,     32,    8)      \
+    X( 128,    64,    32,    4,     64,     32,     32,    2)      \
+    X( 128,    64,    32,    4,     64,     32,     32,    4)      \
+    X( 128,    64,    32,    4,     64,     32,     32,    8)      \
+    X( 128,   128,    32,    4,     64,     32,     32,    2)      \
+    X( 128,   128,    32,    4,     64,     32,     32,    4)      \
+    X( 128,   128,    32,    4,     64,     32,     32,    8)

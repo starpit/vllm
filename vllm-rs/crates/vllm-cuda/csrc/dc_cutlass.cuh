@@ -36,6 +36,7 @@
 
 #pragma once
 
+#include <cooperative_groups.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/gemm.h>
 #include <cutlass/gemm/kernel/gemv.h>
@@ -178,6 +179,109 @@ __device__ __forceinline__ void dc_gemv(void* C,
     typename GemvKernel::SharedStorage smem_storage{};
     GemvKernel op;
     op(*params, smem_storage);
+}
+
+// ── dc_gemm_splitk — GemmSplitKParallel (two-phase) ──────────────
+//
+// `device::GemmSplitKParallel`'s host launcher fires TWO kernels:
+// (1) the GEMM grid writes per-K-slice partial sums to a workspace
+// of shape [split_k, M, N] in `float` accumulator format; (2) a
+// Reduction kernel reads the workspace and writes the final
+// `[M, N]` bf16 output. Both kernels' Params and operator() are
+// `CUTLASS_HOST_DEVICE` / `CUTLASS_DEVICE` callable, so we inline
+// both phases here separated by `cg::this_grid().sync()`.
+//
+// Caller contract additions over `dc_gemm`:
+//   - `workspace`: caller-supplied [split_k, M, N] float scratch.
+//     Size formula: `split_k * M * N * sizeof(float)`. Same
+//     contract as the host launcher's `cutlass_gemm_*_skN_launch`
+//     workspace argument.
+//   - `split_k_slices`: number of K partitions. Must match the
+//     `DeviceGemmSplitK` template's calibration (the host's
+//     `_skN` suffix in the CSV row — same N here).
+//
+// Persistent-kernel grid: blockIdx is shared across both phases.
+// The launcher sizes grid_dim to the max-needed across all phases
+// in the program. Each kernel's own bounds check early-returns
+// out-of-range CTAs (GemmSplitKParallel: `params.grid_tiled_shape`
+// guard at gemm_splitk_parallel.h:143; Reduction: thread_offset
+// guard at reduce_split_k.h:159). The Reduction's logical grid is
+// 2D (M-tiles × N-tiles); blockIdx.z is unused for it.
+
+template <typename DeviceGemmSplitK>
+__device__ __forceinline__ void dc_gemm_splitk(void* C,
+                                               const void* A,
+                                               const void* B,
+                                               int M,
+                                               int N,
+                                               int K,
+                                               float alpha,
+                                               float beta,
+                                               int split_k_slices,
+                                               void* workspace,
+                                               char* smem) {
+    using GemmKernel = typename DeviceGemmSplitK::GemmKernel;
+    using ReductionKernel = typename DeviceGemmSplitK::ReductionKernel;
+    using ThreadblockSwizzle = typename GemmKernel::ThreadblockSwizzle;
+    using ThreadblockShape = typename DeviceGemmSplitK::ThreadblockShape;
+    using ElementAccumulator = typename DeviceGemmSplitK::ElementAccumulator;
+    using OutputOp = typename GemmKernel::OutputOp;
+    using ReductionOutputOp = typename ReductionKernel::OutputOp;
+    using ReductionOp = typename ReductionKernel::ReductionOp;
+
+    cutlass::gemm::GemmCoord problem_size{M, N, K};
+
+    // Mirror device::GemmSplitKParallel::initialize() (gemm_splitk_parallel.h:271).
+    cutlass::gemm::GemmCoord grid_tiled_shape =
+        ThreadblockSwizzle().get_tiled_shape(
+            problem_size,
+            {ThreadblockShape::kM, ThreadblockShape::kN, ThreadblockShape::kK},
+            split_k_slices);
+
+    // Workspace: [split_k, M, N] float, RowMajor stride N.
+    cutlass::TensorRef<ElementAccumulator, cutlass::layout::RowMajor>
+        ref_workspace(static_cast<ElementAccumulator*>(workspace), N);
+
+    int64_t partition_stride = static_cast<int64_t>(M) * static_cast<int64_t>(N);
+
+    // Phase 1: GEMM grid writes to workspace.
+    typename DeviceGemmSplitK::ElementA* A_ptr = reinterpret_cast<
+        typename DeviceGemmSplitK::ElementA*>(const_cast<void*>(A));
+    typename DeviceGemmSplitK::ElementB* B_ptr = reinterpret_cast<
+        typename DeviceGemmSplitK::ElementB*>(const_cast<void*>(B));
+    typename DeviceGemmSplitK::ElementC* C_ptr =
+        reinterpret_cast<typename DeviceGemmSplitK::ElementC*>(C);
+
+    typename GemmKernel::Params gemm_params(
+        problem_size,
+        grid_tiled_shape,
+        {A_ptr, K},
+        {B_ptr, K},
+        ref_workspace,
+        typename OutputOp::Params{},  // GEMM-phase: identity convert (no alpha/beta — those land in reduction)
+        partition_stride);
+
+    GemmKernel gemm_op;
+    gemm_op(gemm_params, *reinterpret_cast<typename GemmKernel::SharedStorage*>(smem));
+
+    // Inter-phase barrier — the GEMM grid's writes to workspace must
+    // be visible before the Reduction reads them.
+    cooperative_groups::this_grid().sync();
+
+    // Phase 2: Reduction reads workspace, writes final C.
+    typename ReductionKernel::Params reduce_params(
+        problem_size.mn(),
+        grid_tiled_shape.k(),
+        partition_stride,
+        ref_workspace,
+        {C_ptr, N},
+        {C_ptr, N},
+        typename ReductionOutputOp::Params{alpha, beta},
+        typename ReductionOp::Params{});
+
+    ReductionKernel reduce_op;
+    typename ReductionKernel::SharedStorage reduce_smem{};
+    reduce_op(reduce_params, reduce_smem);
 }
 
 }  // namespace dc_cutlass

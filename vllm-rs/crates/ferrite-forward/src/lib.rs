@@ -93,6 +93,68 @@ pub fn find_bucket<Op: 'static>(
     &table[0]
 }
 
+/// Same scan as [`find_bucket`] but returns the matching index. The
+/// emitted forward dispatch uses this to look up the parallel
+/// `LAUNCHER_TABLE` entry for the same bucket. Falls back to `0` on
+/// no-match for the same reason — the first bucket is the smallest
+/// and absorbs out-of-range inputs.
+#[cfg(feature = "cuda")]
+pub fn find_bucket_idx<Op: 'static>(
+    table: &'static [BucketEntry<Op>],
+    num_tokens: u64,
+    sk: u64,
+) -> usize {
+    for (i, e) in table.iter().enumerate() {
+        if e.0 <= num_tokens && num_tokens < e.1 && e.2 <= sk && sk < e.3 {
+            return i;
+        }
+    }
+    0
+}
+
+/// Prim-mega launcher fn pointer type. Each canonical's emitted
+/// `prim_mega_<bucket>_m_<wp>` fn matches this signature; the
+/// generated `LAUNCHER_TABLE` stores them as `Option<PrimMegaLauncher
+/// <Weights>>` per bucket so step-8 dispatch can branch off the
+/// `pick_interpreter` decision (today: gated by `prim_mega_forced()`).
+///
+/// `tiles` is owned by the caller — the launcher pre-allocates per-
+/// slot `OwnedTensor`s into it, runs the cooperative kernel, and
+/// returns. The caller `take_owned`s the terminal slot afterward,
+/// matching `run`'s shape.
+#[cfg(feature = "cuda")]
+pub type PrimMegaLauncher<W> = unsafe fn(
+    &W,
+    &ForwardCtx,
+    &mut ferrite_cuda_core::device::GpuDevice,
+    &mut Vec<Option<TileEntry>>,
+);
+
+/// Runtime gate for forcing PrimMega dispatch. Reads
+/// `FERRITE_FORCE_PRIM_MEGA` once and caches; set to a non-empty,
+/// non-"0" value to force every canonical bucket whose launcher is
+/// emitted to route through it. Today every model's
+/// `try_encode_bucket` returns `None` on every canonical (sparse DC
+/// sibling coverage), so even with the override set most buckets
+/// fall back to the host interpreter — this lets us byte-equality-
+/// test launchers as DC arms widen, before flipping the cost-driven
+/// `pick_interpreter` selector at the canonical level.
+///
+/// Forcing onto a bucket whose launcher table entry is `None`
+/// panics at the dispatch site (loud failure beats silent host
+/// fallback when we're trying to validate the launcher path).
+#[cfg(feature = "cuda")]
+#[inline]
+pub fn prim_mega_forced() -> bool {
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("FERRITE_FORCE_PRIM_MEGA")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Runtime gate for the per-op trace `Instruction::eval` opens
 /// each match with. Reads `FERRITE_TRACE` from the environment on
 /// the first call and caches the result. Set `FERRITE_TRACE=1`

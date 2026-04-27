@@ -2935,7 +2935,10 @@ fn encode_ctx_from_bounds(
 
 /// Try to encode a bucket with the prim_mega encoder. On `Some`,
 /// emit the device-resident program static + launcher fn into
-/// `static_slices`. On `None` (mega-ineligible canonical), no-op.
+/// `static_slices` and return `true`. On `None` (mega-ineligible
+/// canonical), no-op and return `false` — the LAUNCHER_TABLE entry
+/// for any bucket sharing this canonical will be `None`, and step-8
+/// dispatch falls through to the host interpreter.
 ///
 /// Both emissions go into the per-arch module's scope so the
 /// launcher's `Weights::<fn>` paths resolve against the canonical's
@@ -2952,9 +2955,9 @@ fn try_emit_prim_mega(
     static_ident: &proc_macro2::Ident,
     launcher_ident: &proc_macro2::Ident,
     static_slices: &mut Vec<TokenStream>,
-) {
+) -> bool {
     let Some(encoded) = try_encode_bucket(arch_opcodes, &bucket.instances, ctx) else {
-        return;
+        return false;
     };
     static_slices.push(emit_prim_mega_program(static_ident, &encoded));
     static_slices.push(emit_prim_mega_launcher(
@@ -2965,6 +2968,7 @@ fn try_emit_prim_mega(
         bounds,
         ctx,
     ));
+    true
 }
 
 /// Render the alias-prelude statements for one [`LoweredBucket`].
@@ -3342,6 +3346,14 @@ pub fn emit_model(
     // is emitted with `#[allow(dead_code)]` so the cuda build stays
     // clean while DC sibling coverage widens.
     let mut static_slices: Vec<TokenStream> = Vec::new();
+    // Track which canonicals successfully emitted prim_mega launchers
+    // so the per-bucket LAUNCHER_TABLE below can `Some(...)` only for
+    // buckets sharing a canonical that fully encoded.
+    //
+    // wp → (backbone_emitted, lm_head_emitted). Both must be true for
+    // the bucket-level pair to be `Some(_)`; partial encoding is an
+    // ineligible canonical at the all-or-nothing tier semantics.
+    let mut prim_mega_emitted: HashMap<crate::solver::WorkloadPoint, (bool, bool)> = HashMap::new();
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
@@ -3369,7 +3381,7 @@ pub fn emit_model(
         // has both call targets ready when coverage permits.
         let bounds = bounds_for_wp(model, *wp);
         let mega_ctx = encode_ctx_from_bounds(&bounds, *wp);
-        try_emit_prim_mega(
+        let bb_ok = try_emit_prim_mega(
             &bounds,
             &mega_ctx,
             &arch_opcodes,
@@ -3378,7 +3390,7 @@ pub fn emit_model(
             &bucket_static_ident("prim_mega_backbone_m", *wp),
             &mut static_slices,
         );
-        try_emit_prim_mega(
+        let lm_ok = try_emit_prim_mega(
             &bounds,
             &mega_ctx,
             &arch_opcodes,
@@ -3387,6 +3399,7 @@ pub fn emit_model(
             &bucket_static_ident("prim_mega_lm_head_m", *wp),
             &mut static_slices,
         );
+        prim_mega_emitted.insert(*wp, (bb_ok, lm_ok));
     }
 
     // `sk_axis_active`: true when the model declared `sk_buckets`;
@@ -3427,6 +3440,14 @@ pub fn emit_model(
         .map(|(i, &m)| (m, i))
         .collect();
     let mut bucket_table_entries: Vec<TokenStream> = Vec::new();
+    // Parallel to FORWARD_TABLE: per-bucket
+    // `(Option<launcher_backbone>, Option<launcher_lm_head>)`. Step-8
+    // dispatch reads this table when `prim_mega_forced()` (or, later,
+    // `pick_interpreter`'s decision) routes the canonical through
+    // PrimMega; both fns share the canonical's `Weights` type, so the
+    // tuple type is `(Option<__PrimMegaLauncher>, ...)` where the
+    // alias points at `::ferrite_forward::PrimMegaLauncher<Weights>`.
+    let mut launcher_table_entries: Vec<TokenStream> = Vec::new();
     for (i, wp) in bucket_points.iter().enumerate() {
         let canonical = bucket_canonical[i];
         let bb_static = bucket_static_ident("BACKBONE_M", canonical);
@@ -3497,6 +3518,22 @@ pub fn emit_model(
                 #num_slots_lit, #backbone_slot_lit, #terminal_slot_lit,
             ),
         });
+
+        // Parallel launcher entry. Both backbone and lm_head must
+        // have encoded for the bucket to be PrimMega-eligible at the
+        // canonical level — partial coverage falls through to host.
+        let (bb_ok, lm_ok) = prim_mega_emitted
+            .get(&canonical)
+            .copied()
+            .unwrap_or((false, false));
+        let launcher_entry = if bb_ok && lm_ok {
+            let bb_launcher = bucket_static_ident("prim_mega_backbone_m", canonical);
+            let lm_launcher = bucket_static_ident("prim_mega_lm_head_m", canonical);
+            quote! { (::core::option::Option::Some(#bb_launcher), ::core::option::Option::Some(#lm_launcher)), }
+        } else {
+            quote! { (::core::option::Option::None, ::core::option::Option::None), }
+        };
+        launcher_table_entries.push(launcher_entry);
     }
 
     // FORWARD_TABLE — one row per bucket. `__B` aliases the
@@ -3512,6 +3549,24 @@ pub fn emit_model(
         };
     };
 
+    // LAUNCHER_TABLE — parallel to FORWARD_TABLE, one row per bucket.
+    // Each row is `(Option<bb_launcher>, Option<lm_launcher>)`. Step-8
+    // dispatch picks one or the other based on `prim_mega_forced()`
+    // (and, eventually, the cost-driven `pick_interpreter` decision).
+    let launcher_table = quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(non_camel_case_types, dead_code)]
+        type __PrimMegaLauncher = ::ferrite_forward::PrimMegaLauncher<Weights>;
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        static LAUNCHER_TABLE: &[(
+            ::core::option::Option<__PrimMegaLauncher>,
+            ::core::option::Option<__PrimMegaLauncher>,
+        )] = &[
+            #(#launcher_table_entries)*
+        ];
+    };
+
     quote! {
         #weights
 
@@ -3523,8 +3578,16 @@ pub fn emit_model(
 
         #forward_table
 
+        #launcher_table
+
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
-        /// run the universal interpreter.
+        /// run the picked interpreter. `FERRITE_FORCE_PRIM_MEGA=1`
+        /// routes any bucket whose LAUNCHER_TABLE entry is `Some(_)`
+        /// through the prim_mega launcher; partial coverage (only one
+        /// of backbone/lm_head encoded) is treated as ineligible at
+        /// the canonical level and falls through to the host
+        /// interpreter. Forced + ineligible panics — silent fallback
+        /// would mask launcher correctness regressions.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -3533,9 +3596,29 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let e = ::ferrite_forward::find_bucket(
+            let bidx = ::ferrite_forward::find_bucket_idx(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
+            let e = &FORWARD_TABLE[bidx];
+            if ::ferrite_forward::prim_mega_forced() {
+                match &LAUNCHER_TABLE[bidx] {
+                    (::core::option::Option::Some(bb), ::core::option::Option::Some(lm)) => {
+                        let mut tiles: ::std::vec::Vec<
+                            ::core::option::Option<::ferrite_forward::TileEntry>,
+                        > = (0..e.6).map(|_| ::core::option::Option::None).collect();
+                        unsafe {
+                            (bb)(wm, ctx, device, &mut tiles);
+                            (lm)(wm, ctx, device, &mut tiles);
+                        }
+                        return ::ferrite_forward::take_owned(&mut tiles, e.8);
+                    }
+                    _ => ::core::panic!(
+                        "FERRITE_FORCE_PRIM_MEGA set but bucket {bidx} has no \
+                         prim_mega launcher (canonical's try_encode_bucket \
+                         returned None — DC sibling coverage is too sparse)",
+                    ),
+                }
+            }
             unsafe {
                 ::ferrite_forward::run(e.4, e.5, wm, ctx, device, e.6, e.8)
             }
@@ -3551,9 +3634,44 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let e = ::ferrite_forward::find_bucket(
+            let bidx = ::ferrite_forward::find_bucket_idx(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
+            let e = &FORWARD_TABLE[bidx];
+            if ::ferrite_forward::prim_mega_forced() {
+                match &LAUNCHER_TABLE[bidx] {
+                    (::core::option::Option::Some(bb), _) => {
+                        let mut tiles: ::std::vec::Vec<
+                            ::core::option::Option<::ferrite_forward::TileEntry>,
+                        > = (0..e.6).map(|_| ::core::option::Option::None).collect();
+                        unsafe { (bb)(wm, ctx, device, &mut tiles); }
+                        // Mirror run_backbone: DtoD-copy the backbone
+                        // tile so it outlives the per-call tile table.
+                        let bb_view = unsafe {
+                            ::ferrite_forward::tile_ref(&tiles, e.7).as_view(&tiles)
+                        };
+                        let bb_shape: ::std::vec::Vec<usize> = bb_view
+                            .shape()
+                            .iter()
+                            .map(|&d| d as usize)
+                            .collect();
+                        let bb_out = device.caching.alloc_tensor(&bb_shape, bb_view.dtype());
+                        unsafe {
+                            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                                bb_out.raw_ptr(),
+                                bb_view.raw_ptr() as *const u8,
+                                bb_view.size_bytes(),
+                                device.compute_stream,
+                            ).expect("forward_backbone: prim_mega DtoD copy");
+                        }
+                        return bb_out;
+                    }
+                    _ => ::core::panic!(
+                        "FERRITE_FORCE_PRIM_MEGA set but bucket {bidx} has no \
+                         prim_mega backbone launcher",
+                    ),
+                }
+            }
             unsafe {
                 ::ferrite_forward::run_backbone(e.4, wm, ctx, device, e.6, e.7)
             }

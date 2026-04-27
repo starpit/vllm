@@ -40,24 +40,36 @@ pub struct CostCtx<'a> {
     pub bounds: &'a BTreeMap<String, u64>,
 }
 
+/// Evaluate a `Dim` to a concrete integer using `bounds`. Free
+/// function so non-`CostCtx` callers (e.g. `fan_out`, which only has
+/// `fuf + bounds`) can reuse it without round-tripping through a
+/// CostCtx instance.
+pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
+    match dim {
+        Dim::Lit(n) => Some(*n),
+        Dim::Bound(name) => bounds.get(name).copied(),
+        Dim::Mul(cs) => cs
+            .iter()
+            .map(|c| eval_dim_with(c, bounds))
+            .try_fold(1u64, |acc, v| v.map(|x| acc.saturating_mul(x))),
+        Dim::Var(_) => None,
+    }
+}
+
+pub fn eval_shape_with(shape: &Shape, bounds: &BTreeMap<String, u64>) -> Option<Vec<u64>> {
+    shape.iter().map(|d| eval_dim_with(d, bounds)).collect()
+}
+
 impl CostCtx<'_> {
     /// Evaluate a `Dim` to a concrete integer using `bounds`.
     /// Returns `None` if the dim contains a Var (should not happen
     /// for the standard body after shape inference closes).
     pub fn eval_dim(&self, dim: &Dim) -> Option<u64> {
-        match dim {
-            Dim::Lit(n) => Some(*n),
-            Dim::Bound(name) => self.bounds.get(name).copied(),
-            Dim::Mul(cs) => cs
-                .iter()
-                .map(|c| self.eval_dim(c))
-                .try_fold(1u64, |acc, v| v.map(|x| acc.saturating_mul(x))),
-            Dim::Var(_) => None,
-        }
+        eval_dim_with(dim, self.bounds)
     }
 
     pub fn eval_shape(&self, shape: &Shape) -> Option<Vec<u64>> {
-        shape.iter().map(|d| self.eval_dim(d)).collect()
+        eval_shape_with(shape, self.bounds)
     }
 
     /// Convenience: read `num_tokens` from bounds. Panics if not
@@ -1513,6 +1525,8 @@ impl Implementation for GemmRefImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -1522,7 +1536,7 @@ impl Implementation for GemmRefImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -1543,6 +1557,8 @@ impl Implementation for GemmRefImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
+            .expect("Gemm: weight (N, K) must resolve from FUF + bounds at fan_out time");
         Some(vec![OpInstance::new(
             syn::Ident::new("Gemm", proc_macro2::Span::call_site()),
             vec![
@@ -1550,6 +1566,8 @@ impl Implementation for GemmRefImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }
@@ -6810,22 +6828,39 @@ fn gemm_is_fusion_partner(fuf: &Fuf, seed: TileId) -> bool {
 /// dim.
 fn gemm_mnk(ctx: &CostCtx, node: &crate::fuf::FufNode) -> Option<(u32, u32, u32)> {
     let m = ctx.num_tokens() as u32;
-    let out_shape = node.outputs.first().and_then(|s| ctx.eval_shape(s))?;
+    let (n, k) = gemm_nk_from_fuf(ctx.fuf, node, ctx.bounds)?;
+    Some((m, n, k))
+}
+
+/// Static (N, K) of a Gemm tile from its FUF node + variable bounds.
+/// `N` is the tile's output last dim (out_features); `K` is the
+/// input's last dim (in_features). Available to `fan_out` impls so
+/// they can bake weight shape into the emitted `Instruction` for the
+/// runtime shape-assert that guards against loader/codegen drift.
+fn gemm_nk_from_fuf(
+    fuf: &Fuf,
+    node: &crate::fuf::FufNode,
+    bounds: &BTreeMap<String, u64>,
+) -> Option<(u32, u32)> {
+    let out_shape = node
+        .outputs
+        .first()
+        .and_then(|s| eval_shape_with(s, bounds))?;
     if out_shape.len() != 2 {
         return None;
     }
     let n = *out_shape.last()? as u32;
     let k = node.inputs.iter().find_map(|inp| match inp {
         FufInput::Tile { id, slot } => {
-            let up = ctx.fuf.get(*id);
+            let up = fuf.get(*id);
             up.outputs
                 .get(*slot as usize)
-                .and_then(|s| ctx.eval_shape(s))
+                .and_then(|s| eval_shape_with(s, bounds))
                 .and_then(|v| v.last().copied())
         }
         _ => None,
     })? as u32;
-    Some((m, n, k))
+    Some((n, k))
 }
 
 impl Implementation for CutlassGemmImpl {
@@ -6929,6 +6964,8 @@ impl Implementation for CutlassGemmImpl {
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -6938,7 +6975,7 @@ impl Implementation for CutlassGemmImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -6959,6 +6996,8 @@ impl Implementation for CutlassGemmImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
+        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
+            .expect("CutlassGemm: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemm", proc_macro2::Span::call_site()),
             vec![
@@ -6969,6 +7008,8 @@ impl Implementation for CutlassGemmImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }
@@ -7127,6 +7168,8 @@ impl Implementation for CutlassGemmSplitKImpl {
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
                 ("split_k", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -7136,7 +7179,7 @@ impl Implementation for CutlassGemmSplitKImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -7158,6 +7201,8 @@ impl Implementation for CutlassGemmSplitKImpl {
         let tile_n = self.tile_n;
         let stages = self.stages;
         let split_k = self.split_k;
+        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
+            .expect("CutlassGemmSplitK: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemmSplitK", proc_macro2::Span::call_site()),
             vec![
@@ -7169,6 +7214,8 @@ impl Implementation for CutlassGemmSplitKImpl {
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #split_k },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }
@@ -7395,6 +7442,8 @@ impl Implementation for CutlassGemmAddImpl {
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -7404,7 +7453,7 @@ impl Implementation for CutlassGemmAddImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let gemm_id = *m
@@ -7443,6 +7492,8 @@ impl Implementation for CutlassGemmAddImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("CutlassGemmAdd: gemm (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemmAdd", proc_macro2::Span::call_site()),
             vec![
@@ -7453,6 +7504,8 @@ impl Implementation for CutlassGemmAddImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }
@@ -7547,6 +7600,8 @@ impl Implementation for CutlassGemvImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -7556,7 +7611,7 @@ impl Implementation for CutlassGemvImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -7574,6 +7629,8 @@ impl Implementation for CutlassGemvImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
+            .expect("CutlassGemv: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemv", proc_macro2::Span::call_site()),
             vec![
@@ -7581,6 +7638,8 @@ impl Implementation for CutlassGemvImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }

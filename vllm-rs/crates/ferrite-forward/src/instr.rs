@@ -94,7 +94,7 @@ pub enum Instruction<W> {
     FusedAddRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
     FusedAddRmsNormWithOffset(u32, u32, u32, f32, WtFn<W, RmsNorm>),
     ScalarOffsetRmsNorm(u32, u32, u32, f32, WtFn<W, RmsNorm>),
-    Gemm(u32, u32, u32, WtFn<W, LinearLayer>),
+    Gemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     FusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
@@ -133,10 +133,21 @@ pub enum Instruction<W> {
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32, CosSinFn<W>),
     DeepSeekMoe(u32, u32, u32, WtFn<W, DeepSeekV2MoELayer>),
-    CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
-    CutlassGemmSplitK(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32),
-    CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
-    CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>),
+    CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    CutlassGemmSplitK(
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
+    CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
     CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     MarlinGemm(u32, u32, u32, WtFn<W, MarlinLinear>),
@@ -169,6 +180,34 @@ impl<W> Clone for Instruction<W> {
     fn clone(&self) -> Self {
         *self
     }
+}
+
+/// Assert a runtime weight tensor's `[N, K]` shape matches the
+/// codegen-time constants the `Instruction` was emitted with. The
+/// constants come from the FUF's `eval_shape` at solve time; the
+/// runtime tensor is whatever `WtFn` resolved to from the loaded
+/// safetensors. A mismatch means the loader produced a weight whose
+/// shape disagrees with the model the solver compiled against —
+/// silent shape drift here corrupts every output. Real `assert!`,
+/// not `debug_assert!`, because release builds need to fail loud
+/// rather than march on with a K-mismatch.
+#[track_caller]
+fn assert_weight_shape(
+    op: &'static str,
+    weight: ferrite_cuda_core::tensor::GpuTensor,
+    n: u32,
+    k: u32,
+) {
+    let actual_n = weight.dim(0) as u32;
+    let actual_k = weight.dim(1) as u32;
+    assert_eq!(
+        actual_n, n,
+        "{op}: weight N (out_features) mismatch — runtime={actual_n} codegen={n}"
+    );
+    assert_eq!(
+        actual_k, k,
+        "{op}: weight K (in_features) mismatch — runtime={actual_k} codegen={k}"
+    );
 }
 
 impl<W: CanonicalParams> Instruction<W> {
@@ -304,10 +343,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Gemm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Gemm(in_slot, out_slot, layer, weight_fn, n, k) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("Gemm", w.dense_weight(), n, k);
                 let out = ctx
                     .device
                     .cublas
@@ -999,10 +1039,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
+                n,
+                k,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassGemm", w.dense_weight(), n, k);
                 let out = cutlass::cutlass_gemm(
                     *v,
                     w.dense_weight(),
@@ -1021,10 +1064,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_n,
                 stages,
                 split_k,
+                n,
+                k,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassGemmSplitK", w.dense_weight(), n, k);
                 let out = cutlass::cutlass_gemm_splitk(
                     *v,
                     w.dense_weight(),
@@ -1042,11 +1088,14 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
+                n,
+                k,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassGemmAdd", w.dense_weight(), n, k);
                 cutlass::cutlass_gemm_add(
                     *v,
                     w.dense_weight(),
@@ -1055,10 +1104,11 @@ impl<W: CanonicalParams> Instruction<W> {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::CutlassGemv(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::CutlassGemv(in_slot, out_slot, layer, weight_fn, n, k) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassGemv", w.dense_weight(), n, k);
                 let out = cutlass::cutlass_gemv(
                     *v,
                     w.dense_weight(),

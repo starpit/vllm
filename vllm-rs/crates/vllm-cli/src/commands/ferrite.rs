@@ -269,6 +269,10 @@ struct RowFields {
     layer: String,   // "L=15" or "" when no Layer field
     kernels: String, // "<RmsNorm>" or "<LinearLayer+RmsNorm>" or ""
     rope: bool,
+    /// "(N=128256,K=4096)" for GEMM-class steps, "" otherwise. Lives
+    /// in its own column so cuBLAS-vs-CUTLASS analyses can read shape
+    /// alongside slot pattern without cross-referencing model config.
+    shape: String,
 }
 
 #[derive(Default)]
@@ -277,6 +281,7 @@ struct Widths {
     slots: usize,
     layer: usize,
     kernels: usize,
+    shape: usize,
     /// Deepest tree nesting any non-loop row appears at. Top-level
     /// rows are depth 0; loop bodies are depth 1. Used to expand the
     /// kind column on shallow rows so the slots/layer/kernels
@@ -309,6 +314,7 @@ fn measure_steps(steps: &[NormalizedStep], depth: usize, w: &mut Widths) {
             w.slots = w.slots.max(r.slots.chars().count());
             w.layer = w.layer.max(r.layer.chars().count());
             w.kernels = w.kernels.max(r.kernels.chars().count());
+            w.shape = w.shape.max(r.shape.chars().count());
             w.max_depth = w.max_depth.max(depth);
             i += 1;
         }
@@ -331,12 +337,14 @@ fn render_fields(step: &NormalizedStep) -> RowFields {
     let mut layer: Option<u32> = None;
     let mut kernels: Vec<&'static str> = Vec::new();
     let mut has_rope = false;
+    let mut weight_shape: Option<(u32, u32)> = None;
     for f in &step.fields {
         match f {
             NormalizedField::Slot(s) => slots.push(format!("s{s}")),
             NormalizedField::Layer(l) => layer = Some(*l),
             NormalizedField::LayerKind(k) => kernels.push(k),
             NormalizedField::RopeCosSin => has_rope = true,
+            NormalizedField::WeightShape { n, k } => weight_shape = Some((*n, *k)),
             _ => {}
         }
     }
@@ -354,12 +362,17 @@ fn render_fields(step: &NormalizedStep) -> RowFields {
     } else {
         format!("<{}>", kernels.join("+"))
     };
+    let shape_str = match weight_shape {
+        Some((n, k)) => format!("(N={n},K={k})"),
+        None => String::new(),
+    };
     RowFields {
         kind: display_kind(step.kind).to_string(),
         slots: slots_str,
         layer: layer_str,
         kernels: kernels_str,
         rope: has_rope,
+        shape: shape_str,
     }
 }
 
@@ -481,20 +494,24 @@ fn format_row_styled(
     let slots_padded = pad_right(&r.slots, widths.slots);
     let layer_padded = pad_right(&r.layer, widths.layer);
     let kernels_padded = pad_right(&r.kernels, widths.kernels);
+    let shape_padded = pad_right(&r.shape, widths.shape);
 
     let kind_styled = style.kind(&kind_padded);
     let slots_styled = style.dim(&slots_padded);
     let layer_styled = style.dim(&layer_padded);
     let kernels_styled = style.dim(&kernels_padded);
+    let shape_styled = style.dim(&shape_padded);
     let rope_styled = if r.rope {
         style.dim("rope")
     } else {
         " ".repeat(4)
     };
 
-    format!("{kind_styled}  {slots_styled}  {layer_styled}  {kernels_styled}  {rope_styled}")
-        .trim_end()
-        .to_string()
+    format!(
+        "{kind_styled}  {slots_styled}  {layer_styled}  {kernels_styled}  {shape_styled}  {rope_styled}"
+    )
+    .trim_end()
+    .to_string()
 }
 
 fn pad_right(s: &str, width: usize) -> String {

@@ -193,8 +193,12 @@ as `KVM_MAPPING.md` (this commit). Five unknowns resolved:
   is by per-op `Bar` increments + loader spin-waits, not tape rows.
 
 Read `KVM_MAPPING.md` before writing P2-2. **Open items surfaced
-there block P2-2** — chiefly: confirm DSL shape (Q1) and bump
-solver K bound (Q3).
+there block P2-2** — chiefly: bump solver K bound (Q3). DSL-shape
+precondition (Q1) **confirmed satisfied** (2026-04-27): llama DSL
+already emits unfused `gemm + add + rmsnorm`; existing
+`CutlassGemmAddImpl` already claims `(Gemm, Add)`. Work is in
+`impl_lib.rs` (new `KvmCutlassGemmAddImpl` + `KvmRmsNormImpl`
+tier) + `interpreters/kvm_mega.rs` encoder. No DSL refactor.
 
 The five unknowns:
 

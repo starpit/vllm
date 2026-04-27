@@ -199,14 +199,38 @@ A peephole-fusion path inside the encoder would be a hand-rolled
 optimizer competing with the solver — exactly the anti-pattern
 those rules block.
 
-**Action item before P2-2:** verify the llama (and cohere /
-gemma3 / etc.) forward DSLs actually emit the unfused triple and
-not `FusedAddRmsNorm` directly. If they emit `FusedAddRmsNorm`,
-the DSL must be refactored to emit `Add + RmsNorm` first; that
-refactor is wholesale across every arch per
-`feedback_no_piecemeal_codegen_migration`. **This is a precondition
-for P2-2; do not start the encoder code without confirming the
-DSL shape first.**
+**DSL precondition — confirmed satisfied (2026-04-27).** Llama
+DSL at `crates/ferrite-model-llama/src/lib.rs:21-34` emits exactly
+`gemm + add + rmsnorm` as separate FUF tiles. The `Add` and
+`RmsNorm` tiles are present as distinct claim targets; today's
+solver picks `FusedAddRmsNormImpl` (claims the `(Add, RmsNorm)`
+pair, emits the `FusedAddRmsNorm` IR variant — see
+`impl_lib.rs:1085-1089` comment).
+
+**Mechanism for KvmMega — confirmed feasible:** the existing
+`CutlassGemmAddImpl` (`impl_lib.rs:8170-8226`) already claims
+`(Gemm, Add)` and emits `Instruction::CutlassGemmAdd`. Its
+PrimMega sibling `DcCutlassGemmAddImpl` follows the
+delegate-to-host pattern. KvmMega needs the analogous tier:
+
+- `KvmCutlassGemmAddImpl` (one per CUTLASS tile zoo entry) —
+  delegates `matches`/`cost_us`/`fan_out` to `CutlassGemmAddImpl`,
+  overrides `megakernel_fit() -> Kvm`. Emits the same
+  `CutlassGemmAdd` IR variant; the encoder maps it to
+  `OPCODE_O_ProjResidual` or `OPCODE_DownProjResidual` per Q4
+  phase state.
+- `KvmRmsNormImpl` — delegates to `RmsNormImpl` (claims just the
+  `RmsNorm` tile), emits `RmsNorm` IR variant. Encoder maps to
+  `OPCODE_AttnNorm` / `OPCODE_MlpNorm` / `OPCODE_LM_HeadNorm` per
+  position in tape.
+
+On Hopper, kvm-tier costs win over the host pair by the
+megakernel-handoff cost diff (5us → 0us), so the solver picks
+the kvm pair for full-coverage canonicals.
+
+DSL change-set: zero. Work concentrates in `impl_lib.rs` (P2-3)
+and the encoder (P2-2). Net of "refactor wholesale across every
+arch" risk.
 
 **Why mapping `FusedAddRmsNorm` directly to `OPCODE_AttnNorm` is
 wrong:** the TK norm ops do not perform any add. They read from
@@ -374,13 +398,12 @@ synthetic OpInstance sequences (mirror
 
 ## Open items surfaced (block P2-2 if hit)
 
-1. **DSL shape for residual fusion.** Per Q1: confirm the forward
-   DSL emits `Gemm + Add + RmsNorm` (unfused) and not
-   `FusedAddRmsNorm` directly. If the latter, refactor wholesale
-   first.
+1. ~~**DSL shape for residual fusion.**~~ ✅ Confirmed satisfied —
+   see Q1 above. Llama DSL already emits the unfused triple; the
+   work is in `impl_lib.rs`, not the DSL.
 2. **Solver claim-mask K bound** for `KvmFusedGateUpSiluMulImpl`'s
    `2 × num_batch_blocks × num_intermediate_blocks` fan-out
-   (Q3). Add unit test before P2-3.
+   (Q3). Add unit test before P2-3. Still open.
 3. **Mixed prefill/decode in one forward.** Out of P2 scope per
    Q2. If the calling code allows it, the launcher must split
    into two megakernel calls (or fall to host).

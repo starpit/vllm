@@ -1,0 +1,4 @@
+[submodule "ThunderKittens"]
+	path = ThunderKittens
+	url = https://github.com/HazyResearch/ThunderKittens.git
+	branch = megakernels

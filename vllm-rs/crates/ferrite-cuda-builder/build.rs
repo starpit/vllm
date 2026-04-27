@@ -571,15 +571,29 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         "-std=c++17"
     };
 
-    // The megakernel .cu files include megakernel_ops.cuh from vllm-cuda/csrc.
+    // The megakernel .cu files include megakernel_ops.cuh +
+    // dc_cutlass.cuh + dc_flashinfer.cuh from vllm-cuda/csrc, so
+    // both vendors' headers need to be on the include path. The
+    // commit pins must match the corresponding stand-alone shim
+    // builds (`build_cutlass_standalone_gemm`,
+    // `build_flashinfer_attention`) so the same template
+    // instantiations resolve to the same upstream code.
     const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
+    const FLASHINFER_COMMIT: &str = "08ab45d67705b301ee66e63c6999c934c72dd41c";
 
     let mut mk_builder = cudaforge::KernelBuilder::new();
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
         .include_path("../../crates/vllm-cuda/csrc")
-        .with_cutlass(Some(CUTLASS_COMMIT));
+        .with_cutlass(Some(CUTLASS_COMMIT))
+        .with_git_dependency(
+            "flashinfer",
+            "https://github.com/flashinfer-ai/flashinfer.git",
+            FLASHINFER_COMMIT,
+            vec!["include"],
+            /*recurse_submodules=*/ false,
+        );
     mk_builder
         .arg(std_flag)
         .arg("-O3")

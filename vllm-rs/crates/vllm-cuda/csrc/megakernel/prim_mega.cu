@@ -45,6 +45,16 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 
+// FlashInfer DC. Header carries the
+// `dc_flashinfer::dc_persistent_attn<Runner1, Runner2, Reduction,
+// Params>` template; no arm is wired up yet because the FI Params
+// marshaling (host side: copy plan->params_1 / params_2 to device-
+// resident storage; encoder: emit OP_FI_PAGED_ATTN with pt[]
+// indices for the two Params blobs + smem offset) is the next
+// commit. Including the header here gives the include path a
+// compile-time check.
+#include "../dc_flashinfer.cuh"
+
 namespace prim_mega_cutlass_configs {
 
 // Expansion #1: typedef per row.

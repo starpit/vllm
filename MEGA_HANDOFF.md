@@ -170,11 +170,31 @@ another consumer of the same IR, not a new IR.
 
 ## Phase 2 work order — the actual entry point for the next session
 
-**Step P2-1 — Encoder mapping design (paper, not code).** Before
-writing `interpreters/kvm_mega.rs`, resolve five mapping unknowns and
-land them as a `KVM_MAPPING.md` doc (or rustdoc on
-`interpreters/kvm_mega.rs`). This is the gate; nothing below
-proceeds until it's settled.
+**Step P2-1 — Encoder mapping design (paper, not code).** ✅ Landed
+as `KVM_MAPPING.md` (this commit). Five unknowns resolved:
+- Q1 residual fusion: option (b) — match-by-IR-variant. DSL must
+  emit `Gemm + Add + RmsNorm` unfused; solver picks `KvmCutlassGemmAddImpl`
+  (over `Gemm + Add` claim) on Hopper + `KvmRmsNormImpl` (over
+  `RmsNorm` alone). `FusedAddRmsNorm` → kvm-ineligible (mapping it
+  to `OPCODE_AttnNorm` would double-add since the residual is in
+  the prior matmul-with-residual storer).
+- Q2 QKV: both `FusedQkvRopeCache` + `FusedQkvRopePrefill` → same
+  `OPCODE_QKV_RopeAppend` row template; `g.num_prefill_tokens`
+  toggles kernel-side. Mixed prefill+decode in one forward = out
+  of P2 scope.
+- Q3 Gate/Up: encoder splits `FusedGateUpSiluMul` into
+  `OPCODE_GateSiLU` + `OPCODE_UpMatmul` rows at encode time.
+  Solver claim-mask K bound likely needs to grow per
+  `feedback_solver_claim_mask_size`.
+- Q4 GemmAdd routing: encoder phase-state machine (`Phase::Attn`
+  after `OPCODE_AttnNorm`, `Phase::Mlp` after `OPCODE_MlpNorm`)
+  picks O_Proj vs Down_Proj opcode for `CutlassGemmAdd`.
+- Q5 barriers: not emitted for single-GPU. Cross-instruction sync
+  is by per-op `Bar` increments + loader spin-waits, not tape rows.
+
+Read `KVM_MAPPING.md` before writing P2-2. **Open items surfaced
+there block P2-2** — chiefly: confirm DSL shape (Q1) and bump
+solver K bound (Q3).
 
 The five unknowns:
 

@@ -11960,6 +11960,7 @@ mod tests {
             memory_bandwidth_gbps: 300.0,
             shared_memory_per_sm_kb: 100,
             cost_table,
+            kernel_fits: std::collections::HashMap::new(),
         }
     }
 

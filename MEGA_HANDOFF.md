@@ -12,7 +12,7 @@
 Phase 1 work order steps 1–5 done + cost model picks DC on Hopper /
 host on Ada (principled, not push-order) + **DC coverage corrected
 to wholesale-per-kernel for every CUTLASS family the kernel-level
-Params allows**. Tip `b080a097d`. Thirteen commits on `feat/rust`
+Params allows**. Tip `23764209c`. Fourteen commits on `feat/rust`
 past the host-pivot baseline.
 
 **Architecture decision (2026-04-27):** PrimMega stays whole-forward

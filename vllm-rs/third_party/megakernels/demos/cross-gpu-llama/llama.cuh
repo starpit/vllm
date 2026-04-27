@@ -132,7 +132,11 @@ struct globals_t {
     using weights_big_indim_t =
         kittens::gl<kittens::bf16, 1, -1, -1, intermediate_dim / num_devices, kittens::st_bf<256, 64>>;
 
-    using activations_t = kittens::gl<kittens::bf16, 1, 1, -1, -1, kittens::sv_bf<hidden_dim>, kittens::st_bf<16, 128>,
+    // Vendor literal 128 in `st_bf<16, 128>` is head_dim — parameterized
+    // here. The 64s in `st_bf<64, 64>` and `st_bf<16, 64>` are kept as
+    // literals because they're vendor-tuned tile shapes (kv-block /
+    // pipeline-depth specific) that aren't head_dim-derived.
+    using activations_t = kittens::gl<kittens::bf16, 1, 1, -1, -1, kittens::sv_bf<hidden_dim>, kittens::st_bf<16, head_dim>,
                                       kittens::st_bf<64, 64>, kittens::sv_bf<head_dim>, kittens::st_bf<16, 64>>;
 
     using activations_parallel_t =

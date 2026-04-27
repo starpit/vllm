@@ -29,7 +29,7 @@ struct attention_prefill {
     using attn_bf_rt = rt_bf<16, kv_page_size>;
     using max_vec_rv = col_vec<rt_fl<16, head_dim>>;
     using norm_vec_rv = col_vec<rt_fl<16, head_dim>>;
-    using head_vec_sv = sv_bf<128>;
+    using head_vec_sv = sv_bf<head_dim>;
 
     struct prefill_instruction {
         int layer_idx;
@@ -350,7 +350,7 @@ struct attention_prefill {
             warp::store(O(s, warpid()), O_reg);
             group<8>::sync(0);
 
-            rv_fl<128> out_vecs[16];
+            rv_fl<head_dim> out_vecs[16];
 #pragma unroll
             for (int i = 0; i < 16; i++) {
                 warp::load(out_vecs[i], O(s, warpid()), {i, 0});

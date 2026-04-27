@@ -14,7 +14,17 @@ struct qkv_rope_append {
     static constexpr int NUM_ITERS = Globals::hidden_dim / PIPELINE_K_DIM;
     static_assert(KV_COL_START % 2 == 0, "Fix");
 
-    static_assert(Globals::head_dim == 128, "Head dim must be 128.");
+    // Vendor pinned head_dim to 128 (Llama-70B). Relaxed: surrounding
+    // code is parameterized below via Globals::head_dim. Constraints
+    // that remain real:
+    //  - num_generated_heads (= matmul_out_block_size / head_dim) must
+    //    be 2 for the K/V split (output_vecs[0]=K, output_vecs[1]=V at
+    //    the storer). Pin this with a separate assert.
+    //  - head_dim % 32 == 0 (already asserted in apply_rope_inplace).
+    static constexpr int num_generated_heads_assert =
+        Globals::matmul_out_block_size / Globals::head_dim;
+    static_assert(num_generated_heads_assert == 2,
+                  "matmul_out_block_size must equal 2*head_dim (the K/V split assumes 2 heads per QKV col)");
 
     using sv_fl_head_dim = sv_fl<Globals::head_dim>;
     using sv_bf_head_dim = sv_bf<Globals::head_dim>;
@@ -90,7 +100,10 @@ struct qkv_rope_append {
             parsed_instruction inst{s};
 
             semaphore &rope_arrived_sem = rope_arrived(s);
-            tma::expect_bytes(rope_arrived_sem, sizeof(float) * 128 * 256 / WARP_THREADS);
+            // matmul_batch_block_size tokens × (cos + sin) × head_dim
+            // floats; vendor literal 128*256 = 128 * 2 * 128 (= mbbs * 2*head_dim).
+            tma::expect_bytes(rope_arrived_sem,
+                              sizeof(float) * Globals::matmul_batch_block_size * 2 * Globals::head_dim / WARP_THREADS);
 
             matmul_pipeline::template loader_loop(s, g, inst.layer);
             s.loader_record(LOAD2_EVENT);
@@ -198,7 +211,9 @@ struct qkv_rope_append {
             using matmul_rt = rt_fl<16, 256>;
             using matmul_st = st_fl<16, 256>;
 
-            rv_fl<128> out_vecs[16][2];
+            // Vendor literal 128 = head_dim: each output_vec slot holds
+            // one head's worth of floats.
+            rv_fl<Globals::head_dim> out_vecs[16][2];
 
             matmul_rt out_fl = matmul_pipeline::matmul_loop<6>(s, g);
 
@@ -229,7 +244,9 @@ struct qkv_rope_append {
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     warp::load(out_vecs[i][0], convert_tile, {i, 0});
-                    warp::load(out_vecs[i][1], convert_tile, {i, 128});
+                    // Vendor literal 128 = head_dim: convert_tile is
+                    // 16xmatmul_out_block_size; head 1 starts at column head_dim.
+                    warp::load(out_vecs[i][1], convert_tile, {i, Globals::head_dim});
                 }
                 group<8>::sync(0);
             } else {
@@ -239,7 +256,9 @@ struct qkv_rope_append {
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     warp::load(out_vecs[i][0], convert_tile, {i, 0});
-                    warp::load(out_vecs[i][1], convert_tile, {i, 128});
+                    // Vendor literal 128 = head_dim: convert_tile is
+                    // 16xmatmul_out_block_size; head 1 starts at column head_dim.
+                    warp::load(out_vecs[i][1], convert_tile, {i, Globals::head_dim});
                 }
             }
 

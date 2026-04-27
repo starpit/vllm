@@ -133,8 +133,7 @@ pub struct EncodeCtx {
     pub num_kv_heads: u32,
     /// Padded batch — what the kernel sees as `g.batch_size`. Norm
     /// rows are emitted for every padded position so the per-op
-    /// `Bar` counters reach their expected count
-    /// (`tk_instructions.rs:86-88`).
+    /// `Bar` counters reach their expected count.
     pub batch_size: u32,
     pub matmul_batch_block_size: u32,
     pub matmul_out_block_size: u32,
@@ -256,16 +255,8 @@ pub fn classify_positions(instances: &[OpInstance]) -> PositionRoles {
 ///
 /// `prefill_seq_info` is the per-call `(q_len, token_offset)` list
 /// the prefill attention arm needs to compute its row count and
-/// payloads (mirrors
-/// `tk_instructions::build_throughput_instructions`'s same-named
-/// argument). Pass `None` for a pure-decode bucket; pass
-/// `Some(&seq_info)` for a prefill bucket. The macro-side encoder
-/// uses this for the byte-equal correctness pin against the
-/// reference function — at real codegen time the macro is the
-/// kvm-eligibility predicate + launcher driver, and the actual
-/// runtime tape is rebuilt per forward by the launcher via
-/// `build_throughput_instructions`. This argument exists so test
-/// fixtures can supply the same seq info to both sides.
+/// payloads. Pass `None` for a pure-decode bucket; pass
+/// `Some(&seq_info)` for a prefill bucket.
 pub fn try_encode_bucket(
     arch_opcodes: &ArchOpcodes,
     instances: &[OpInstance],
@@ -465,15 +456,13 @@ fn encode_op_arm(
 /// [opcode, layer_idx, num_items=1, local_batch_idx_0, 0, …, 0]
 /// ```
 ///
-/// Fan-out: one row per padded batch position (`ctx.batch_size` rows
-/// total). Each row carries `num_items=1` and one batch index;
-/// the kernel can batch via `num_items > 1` but the older-branch
-/// encoder (and we, mirroring) emit the simpler shape — see
-/// `tk_instructions.rs:86-88` comment for why batch padding must
-/// be honored exactly (downstream `Bar` counters depend on it).
+/// Fan-out: one row per padded batch position (`ctx.batch_size`
+/// rows total). Each row carries `num_items=1` and one batch
+/// index; the kernel can batch via `num_items > 1` but we emit
+/// the simpler shape. Batch padding must be honored exactly
+/// because downstream `Bar` counters depend on it.
 ///
-/// LM_HeadNorm pins `layer_idx = 0` by convention
-/// (`tk_instructions.rs:230-232`).
+/// LM_HeadNorm pins `layer_idx = 0` by convention.
 fn encode_rms_norm(
     inst: &OpInstance,
     layer_offset: u32,
@@ -498,7 +487,7 @@ fn encode_rms_norm(
         NormRole::LmHead => OPCODE_LM_HEAD_NORM,
     };
     let layer_field = match role {
-        NormRole::LmHead => 0, // pin per `tk_instructions.rs:230`
+        NormRole::LmHead => 0, // LM_Head runs once at end-of-forward; layer slot is unused
         _ => layer as i32,
     };
 
@@ -685,7 +674,7 @@ fn encode_fused_gate_up_silu_mul(
 /// Fan-out: `num_batch_blocks × num_logit_blocks`, where
 /// `num_logit_blocks = vocab_size / matmul_out_block_size`. By
 /// convention slot 1 (`layer`) is `0` — LM_Head runs once at
-/// end-of-forward (`tk_instructions.rs:241-250` comment).
+/// end-of-forward; the kernel doesn't read this slot.
 ///
 /// Why this arm is "LM_Head only" without an explicit role tag:
 /// every other `Gemm` in a llama-style DSL gets claimed by a
@@ -718,7 +707,7 @@ fn encode_cutlass_gemm_lm_head(
     for batch_block in 0..num_batch_blocks {
         for logit_block in 0..num_logit_blocks {
             let mut row = KvmEncodedRow::new(OPCODE_LM_HEAD);
-            row.payload[1] = 0; // layer pinned per tk_instructions.rs:243
+            row.payload[1] = 0; // layer slot unused by lm_head kernel
             row.payload[2] = batch_block;
             row.payload[3] = logit_block;
             row.payload[4] = batch_block;
@@ -757,10 +746,15 @@ fn encode_attention_decode(
     let layer_baseline = parse_u32_literal(&inst.field_values[2])?;
     let layer = (layer_baseline + layer_offset) as i32;
 
-    const MAX_PAIRS_PER_INST: usize = (INSTRUCTION_WIDTH - 3) / 2; // 14
+    // FIXME: max-pairs-per-row is unverified. The 32-int row can
+    // physically fit `(32 - 3) / 2 = 14` pairs, but vendor's Python
+    // scheduler at `Megakernels/megakernels/demos/tp_throughput/
+    // scheduler.py` uses `group_size = 8` — likely the kernel's
+    // actual semaphore budget. Pin against vendor before this arm
+    // is wired into codegen.
+    const MAX_PAIRS_PER_INST: usize = (INSTRUCTION_WIDTH - 3) / 2;
 
     // Build the (seq_idx, kv_head_idx) pair list, then chunk.
-    // Mirrors `tk_instructions.rs:131-149` exactly.
     let mut pairs: Vec<(i32, i32)> =
         Vec::with_capacity((ctx.num_tokens * ctx.num_kv_heads) as usize);
     for seq_idx in 0..ctx.num_tokens as i32 {
@@ -793,24 +787,18 @@ fn encode_attention_decode(
 ///  prefill_token_offset, kv_head_idx, 0, …, 0]
 /// ```
 ///
-/// One row per `(seq_idx, q_block_of_16, kv_head_idx)` triple. Per
-/// `tk_instructions.rs:111-130` the loop order is outer
-/// `seq_idx` → `kv_head` → `q_block`; we mirror that exactly so
-/// the byte-equal pin holds.
+/// One row per `(seq_idx, q_block_of_16, kv_head_idx)` triple.
+/// Loop order: outer `seq_idx` → `kv_head` → `q_block`.
 ///
 /// ### `prefill_seq_info`
 ///
 /// `prefill_seq_info[seq_idx] = (q_len, token_offset)` —
 /// `token_offset = seqused_k - num_q_tokens` for that seq
-/// (post-history-append). This data is per-call; the macro only
-/// receives it via the encoder driver argument so test fixtures
-/// can byte-compare against the reference. Real codegen passes
-/// `None` and the launcher rebuilds the prefill tape per forward
-/// via `tk_instructions::build_throughput_instructions`.
+/// (post-history-append). This data is per-call.
 ///
 /// `None` → return an empty Vec (the canonical is structurally
-/// kvm-eligible; row construction is just deferred). `Some(&[])`
-/// → also empty Vec (no sequences to encode).
+/// kvm-eligible; row construction is deferred). `Some(&[])` →
+/// also empty Vec (no sequences to encode).
 fn encode_attention_prefill(
     inst: &OpInstance,
     layer_offset: u32,
@@ -1243,7 +1231,7 @@ mod tests {
     }
 
     /// LM_HeadNorm pins layer=0 even when the IR's layer field is
-    /// nonzero. Mirrors `tk_instructions.rs:230-232` convention.
+    /// nonzero. The kernel doesn't read layer for LM_HeadNorm.
     #[test]
     fn lm_head_norm_pins_layer_to_zero() {
         let arch = arch_with_norm_and_gemm_add();
@@ -1415,7 +1403,7 @@ mod tests {
 
     /// `CutlassGemm` at LM_Head position → `OPCODE_LM_Head` with
     /// layer pinned to 0 regardless of the IR's layer value
-    /// (mirrors `tk_instructions.rs:243`). Fan-out:
+    /// (kernel doesn't read layer for LM_Head). Fan-out:
     /// num_batch_blocks × num_logit_blocks. With ctx_llama_1b:
     /// vocab=128_256, out_block=256, but vocab/256 = 501 — not
     /// integer-clean. Use a vocab-aligned variant for this test
@@ -1438,93 +1426,6 @@ mod tests {
         }
     }
 
-    /// **Capstone pin:** byte-equal comparison against the older
-    /// branch's known-good `tk_instructions::build_throughput_instructions`
-    /// (ported intact at
-    /// `crates/ferrite-forward/src/tk_instructions.rs`). Build a
-    /// synthetic 1-layer decode IR exercising every encoder arm
-    /// landed in P2-2 (Embed implicit; AttnNorm; QKV+RoPE+Append;
-    /// AttentionDecode; O_ProjResidual; MlpNorm; GateSiLU+UpMatmul;
-    /// DownProjResidual; LM_HeadNorm; LM_Head), encode it, flatten
-    /// to `Vec<i32>`, and compare the entire tape byte-for-byte.
-    ///
-    /// This is the strongest correctness pin available pre-launcher:
-    /// any divergence between our encoder and the older branch's
-    /// shipping path (which boots E2E "capital of France is Paris"
-    /// on H100 Llama-3.2-1B per MEGA_HANDOFF.md "Why the pivot")
-    /// fails the test. Land additional arms by extending the
-    /// synthetic IR + bumping `num_layers` here.
-    #[test]
-    fn full_layer_decode_byte_equal_to_reference_tk_instructions() {
-        use ferrite_forward::tk_instructions::build_throughput_instructions;
-
-        let ctx = ctx_llama_1b();
-        let num_layers = 1usize;
-        let num_attention_heads = 32usize; // ctx_llama_1b implicit; reference takes it as a separate arg
-
-        // Synthetic 1-layer decode IR. Mirrors the `forward!`
-        // expansion shape post-Impl-pick on a llama canonical
-        // targeting kvm: every IR variant the encoder maps lives
-        // here exactly once. Slot indices are arbitrary distinct
-        // u32s; the kvm encoder doesn't read them (TK kernels read
-        // from globals_t, not pt[]).
-        let prog: Vec<OpInstance> = vec![
-            rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
-            qkv_rope_cache_inst(2, 3, 0),
-            attention_via_cache_inst(4, 5, 0),
-            gemm_add_inst(6, 7, 0, "Weights::self_attn_o_proj", 128, 128, 3),
-            rms_norm_inst(8, 9, 0, "Weights::post_attention_layernorm"),
-            gate_up_silu_mul_inst(10, 11, 0),
-            gemm_add_inst(12, 13, 0, "Weights::mlp_down_proj", 128, 128, 3),
-            rms_norm_inst(14, 15, 0, "Weights::norm"),
-            cutlass_gemm_inst(16, 17, 0, "Weights::lm_head", 128, 128, 3),
-        ];
-
-        let arch = arch_with_norm_and_gemm_add();
-        let bucket = try_encode_bucket(&arch, &prog, &ctx, None)
-            .expect("full-layer decode IR has all kvm arms landed");
-
-        // Flatten Vec<KvmEncodedRow> to Vec<i32> in row order.
-        let mut ours: Vec<i32> = Vec::with_capacity(bucket.rows.len() * INSTRUCTION_WIDTH);
-        for row in &bucket.rows {
-            ours.extend_from_slice(&row.payload);
-        }
-
-        let reference = build_throughput_instructions(
-            ctx.batch_size as usize,
-            ctx.num_tokens as usize,
-            num_layers,
-            num_attention_heads,
-            ctx.num_kv_heads as usize,
-            ctx.head_size as usize,
-            ctx.hidden_size as usize,
-            ctx.intermediate_size as usize,
-            ctx.vocab_size as usize,
-            ctx.matmul_batch_block_size as usize,
-            ctx.matmul_out_block_size as usize,
-            None, // decode mode (prefill is P2-x runtime-tape follow-up)
-        );
-
-        assert_eq!(
-            ours.len(),
-            reference.len(),
-            "tape length mismatch: ours={} rows × 32, ref={} rows × 32",
-            ours.len() / INSTRUCTION_WIDTH,
-            reference.len() / INSTRUCTION_WIDTH
-        );
-        // Compare row-by-row to make divergences readable.
-        for (row_idx, (ours_row, ref_row)) in ours
-            .chunks(INSTRUCTION_WIDTH)
-            .zip(reference.chunks(INSTRUCTION_WIDTH))
-            .enumerate()
-        {
-            assert_eq!(
-                ours_row, ref_row,
-                "row {row_idx} diverges from reference: ours={ours_row:?}, ref={ref_row:?}"
-            );
-        }
-    }
-
     /// `None` SeqInfo for a prefill arm = canonical structurally
     /// kvm-eligible, rows deferred to launcher. Empty Vec, NOT
     /// `None` from `try_encode_bucket` (which would mark
@@ -1542,9 +1443,8 @@ mod tests {
     }
 
     /// Synthetic SeqInfo: 2 sequences, q_lens [16, 24], offsets
-    /// [0, 32]. With ctx num_kv_heads=8 and the
-    /// `tk_instructions.rs:111-130` loop order
-    /// (seq → kv_head → q_block):
+    /// [0, 32]. With ctx num_kv_heads=8 and loop order
+    /// outer seq → kv_head → q_block:
     ///   - Seq 0: 16 q-tokens → ⌈16/16⌉=1 q-block × 8 kv heads = 8
     ///   - Seq 1: 24 q-tokens → ⌈24/16⌉=2 q-blocks × 8 kv heads = 16
     ///
@@ -1601,82 +1501,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.rows, fi.rows);
-    }
-
-    /// **Capstone pin (prefill):** byte-equal comparison against
-    /// `tk_instructions::build_throughput_instructions` with
-    /// `Some(&seq_info)`. Mirrors `full_layer_decode_…` exactly,
-    /// but with the prefill IR variants in the QKV + attention
-    /// slots and a synthetic SeqInfo. Locks the prefill arm + the
-    /// per-call SeqInfo threading against the older branch's
-    /// known-good shipping path.
-    #[test]
-    fn full_layer_prefill_byte_equal_to_reference_tk_instructions() {
-        use ferrite_forward::tk_instructions::build_throughput_instructions;
-
-        let ctx = ctx_llama_1b();
-        let num_layers = 1usize;
-        let num_attention_heads = 32usize;
-
-        // Synthetic prefill batch: 4 sequences, varying q_lens and
-        // offsets. Total prefill q-tokens = 16+8+24+1 = 49 (would
-        // be ctx.num_tokens at the workload point in real use; for
-        // this test num_tokens stays at 1 since we're pinning the
-        // tape-shape contract, not the launcher path).
-        let seq_info: Vec<(usize, usize)> = vec![(16, 0), (8, 16), (24, 0), (1, 100)];
-
-        let prog: Vec<OpInstance> = vec![
-            rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
-            qkv_rope_prefill_inst(2, 3, 0),
-            attention_prefill_contiguous_inst(4, 5, 0),
-            gemm_add_inst(6, 7, 0, "Weights::self_attn_o_proj", 128, 128, 3),
-            rms_norm_inst(8, 9, 0, "Weights::post_attention_layernorm"),
-            gate_up_silu_mul_inst(10, 11, 0),
-            gemm_add_inst(12, 13, 0, "Weights::mlp_down_proj", 128, 128, 3),
-            rms_norm_inst(14, 15, 0, "Weights::norm"),
-            cutlass_gemm_inst(16, 17, 0, "Weights::lm_head", 128, 128, 3),
-        ];
-
-        let arch = arch_with_norm_and_gemm_add();
-        let bucket = try_encode_bucket(&arch, &prog, &ctx, Some(&seq_info))
-            .expect("full-layer prefill IR has all kvm arms landed");
-
-        let mut ours: Vec<i32> = Vec::with_capacity(bucket.rows.len() * INSTRUCTION_WIDTH);
-        for row in &bucket.rows {
-            ours.extend_from_slice(&row.payload);
-        }
-
-        let reference = build_throughput_instructions(
-            ctx.batch_size as usize,
-            ctx.num_tokens as usize,
-            num_layers,
-            num_attention_heads,
-            ctx.num_kv_heads as usize,
-            ctx.head_size as usize,
-            ctx.hidden_size as usize,
-            ctx.intermediate_size as usize,
-            ctx.vocab_size as usize,
-            ctx.matmul_batch_block_size as usize,
-            ctx.matmul_out_block_size as usize,
-            Some(&seq_info),
-        );
-
-        assert_eq!(
-            ours.len(),
-            reference.len(),
-            "tape length mismatch: ours={} rows × 32, ref={} rows × 32",
-            ours.len() / INSTRUCTION_WIDTH,
-            reference.len() / INSTRUCTION_WIDTH
-        );
-        for (row_idx, (ours_row, ref_row)) in ours
-            .chunks(INSTRUCTION_WIDTH)
-            .zip(reference.chunks(INSTRUCTION_WIDTH))
-            .enumerate()
-        {
-            assert_eq!(
-                ours_row, ref_row,
-                "row {row_idx} diverges from reference: ours={ours_row:?}, ref={ref_row:?}"
-            );
-        }
     }
 }

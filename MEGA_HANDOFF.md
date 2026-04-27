@@ -498,40 +498,117 @@ KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS
 family the kernel-level Params allows. Remaining Phase-1 work, in
 rough order of leverage / effort:
 
-1. **Step 7b/7c — ptr_plan + runtime_fill + launcher fn.** The
-   program-static half landed in 7a. Remaining:
-   - Static `MEGA_PTR_PLAN_M_<N>` describing how the launcher
-     fills `pt[i]` from `(W, ForwardCtx, tile_table)` — one entry
-     per `PtrSpec` in `ptr_plan`.
-   - Static `MEGA_RUNTIME_FILL_M_<N>` driving the post-copy patch
-     pass on the device tape buffer (rendered `RuntimeSource` ID
-     + the `Weights` accessor + layer).
-   - Workspace allocation pass: walk `ptr_plan` for
-     `PtrSpec::Workspace(SplitKScratch{..})` and pre-alloc per-row
-     scratch from `CachingAllocator`.
-   - Per-arch globals struct + launcher fn `prim_mega_<arch>_launch`
-     hosting the `prim_mega_llama_launch` extern call.
-   These four can plausibly be inlined into a single launcher fn
-   body (no separate statics) since the call site sees the resolved
-   `EncodedBucket` at codegen time. Open question deferred to next
-   session: tile_table parameter type, `ForwardCtx.fwd.input_ids` /
-   `slot_mapping` field paths, and the `CachingAllocator` API the
-   launcher allocates workspace + device tape buffer through. Survey
-   `host::lower_bucket`'s call site (codegen.rs:3168) for the
-   matching per-bucket fn signature host emits — the launcher fn
-   should plug into the same shape so step 8's `pick_interpreter`
-   dispatch is a one-line branch.
+1. **Step 7b/7c — launcher fn (inlined ptr_plan + runtime_fill).**
+   The program-static half landed in 7a. Runtime-types decision
+   below (settled this session, 2026-04-27); the implementation is
+   the actual remaining work.
 
-2. **TODO step 7: complete CUTLASS GEMM N/K + qkv kv_cache ptrs.**
-   The encoder leaves `N`, `K` slots in `OP_CUTLASS_GEMM` /
-   `OP_CUTLASS_GEMM_SPLITK` rows zeroed because `LinearLayer.weight`
-   shape is per-Weights and not in `OpInstance`. Step 7's launcher
-   resolves them from the same accessor's tensor at call time
-   (similar to runtime_fills, but via N/K-shaped row slots).
-   Likewise `OP_QKV_ROPE_CACHE`'s `ptr_k_cache` / `ptr_v_cache`
-   placeholders use synthesized `kv_cache_<layer>_{k,v}` accessor
-   names that step 7 must intercept via per-arch Weights' KvCache
-   field — these aren't real `Weights::<ident>` paths today.
+   **Runtime-types decision (settled):**
+
+   - **`tile_table` type.** `&mut Vec<Option<TileEntry>>` from
+     `ferrite_forward::tile_table::TileEntry` — exactly the host's
+     `InterpreterCtx::tiles`. The launcher fn signature mirrors
+     the host's `run` shape but threads tiles in by `&mut` so step
+     8's `pick_interpreter` dispatch is a one-line branch off the
+     same per-bucket fn body that calls `ferrite_forward::run`
+     today (codegen.rs:3430). Concretely:
+     ```rust
+     unsafe fn prim_mega_<arch>_launch_m_<wp>(
+         wm: &Weights,
+         fwd: &ForwardCtx,
+         device: &mut GpuDevice,
+         tiles: &mut Vec<Option<TileEntry>>,
+     );
+     ```
+     The launcher's caller (the per-canonical `forward` fn in
+     codegen.rs ~3420) allocates `tiles = vec![None; num_slots]`
+     once, passes it through, and `take_owned`s the terminal slot
+     after — same pattern as `ferrite_forward::run`.
+
+   - **ForwardCtx field paths.** `ForwardField::Positions` →
+     `ctx.fwd.positions` (TensorView<'a>); `ForwardField::SlotMapping`
+     → `ctx.fwd.slot_mapping` (TensorView<'a>). Both already match
+     the encoder's `ForwardField` variants. `.raw_ptr()` returns
+     the device pointer the launcher writes into pt[].
+
+   - **CachingAllocator API.** `device.caching.alloc_tensor(&shape,
+     dtype) -> OwnedTensor` is the only entrypoint the launcher
+     uses. Three call sites:
+     1. **Per-tile slot pre-allocation.** `tiles[slot] =
+        Some(TileEntry::Owned(device.caching.alloc_tensor(&shape,
+        dtype)))` — one call per active slot at launch time.
+     2. **Tape buffer.** Static program is `[[i32; 32]; N]` in
+        rodata; launcher allocates a device-resident copy via
+        `caching.alloc_tensor(&[N, 32], DType::I32)`, memcpys the
+        static in, then patches `runtime_fills`.
+     3. **Workspace.** `WorkspaceKind::SplitKScratch` →
+        `caching.alloc_tensor(&[split_k * M * N], DType::F32)`. M
+        is `num_tokens`; (N, split_k) come from the encoded row;
+        N is unblocked by the WeightShapeDim mechanism below.
+     pt[] is a small device array of `*mut c_void`; allocate via
+     `caching.alloc_tensor(&[ptr_plan.len() * 8], DType::U8)` then
+     reinterpret, host-build the pointer list in a `Vec<*mut
+     c_void>`, memcpy_htod_async to the device buffer.
+
+   - **Slot-shape blocker resolution.** `colored_slot_map` already
+     tracks `color_shape: HashMap<u32, Shape>` internally
+     (interpreters/host.rs:261). Surface it: change `SlotMap` to
+     carry parallel `slot_shapes: Vec<Shape>` (or return a tuple
+     `(SlotMap, Vec<Shape>)` from `colored_slot_map`). Thread
+     through `LoweredBucket` so step 7c's launcher emits per-slot
+     pre-allocation. Small infra change; backwards compatible
+     because `SlotMap::of` keeps its current contract — the
+     parallel vec is additive.
+
+   - **N/K-from-accessor (CutlassGemm + CutlassGemmSplitK +
+     CutlassGemv).** Add a new `RuntimeSource` variant:
+     ```rust
+     RuntimeSource::WeightShapeDim {
+         fn_ident: String, layer: u32, dim_idx: u8,
+     }
+     ```
+     Encoder pushes it for the N / K placeholders that currently
+     emit `Const(0)`. `assign_ptr_indices` already zeroes
+     `Runtime` slots and records the patch into `runtime_fills`,
+     so emission infra unchanged. Launcher's runtime-fill pass
+     resolves it via `(weight_fn)(W, layer).weight.shape()[dim_idx
+     as usize] as i32` and patches the device tape buffer.
+
+   - **kv_cache K/V pointer interception (`OP_QKV_ROPE_CACHE`).**
+     The encoder synthesizes `kv_cache_<layer>_{k,v}` PtrSpecs.
+     Step 7c emits a special-case arm in the launcher's pt[]
+     fill: pattern-match the synthetic `fn_ident` prefix, route
+     to `wm.kv_cache.get_k(layer).raw_ptr()` / `.get_v(layer)`.
+     The exact KvCache accessor lives on per-arch Weights via
+     `ferrite_kernels::kv_cache::KvCachePool` — verify with
+     `commandr` first since it's the smallest verify model.
+
+   **Implementation order (one commit per phase, all must land
+   together to avoid dead-code violations):**
+
+   1. Surface `slot_shapes` from `colored_slot_map` →
+      `LoweredBucket`. Tests on existing `colored_slot_map` cases.
+   2. Add `RuntimeSource::WeightShapeDim`; rewrite
+      `encode_cutlass_gemm` / `_splitk` / `_gemv` to use it for
+      N / K. Update existing arm tests.
+   3. Extend `WorkspaceKind::SplitKScratch` to carry resolved
+      shape source (`(M_source, N_source, split_k)` triple, where
+      sources are `WeightShapeDim`-style for N).
+   4. Implement `emit_prim_mega_launcher(static_program_ident,
+      bucket, slot_shapes, ctx) -> TokenStream` rendering the
+      whole launcher fn body inline. Tests pin the outer shape
+      (fn signature + ordering of pt[] fills + runtime patches).
+   5. Wire into `codegen.rs` per-canonical emission alongside
+      `BACKBONE_M_<wp>` / `LM_HEAD_M_<wp>` static slices: emit
+      `prim_mega_backbone_m_<wp>` launcher fn when `try_encode_
+      bucket` returns `Some`. Step 8 dispatch swaps
+      `ferrite_forward::run(...)` ↔ launcher call based on
+      `pick_interpreter`'s decision.
+
+   The plumbing through codegen.rs is the only "one-shot" piece
+   — phases 1-4 are local to `interpreters/`. Phase 5 lights up
+   PrimMega for any canonical where every pick is `>=
+   Primitive`-fit on Hopper. Step 9 e2e validation comes after.
 
 3. **Step-9 e2e via `FERRITE_FORCE_PRIM_MEGA=1` override.** Don't
    wait on 100% DC coverage to flip the all-or-nothing

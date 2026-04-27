@@ -14,7 +14,9 @@ host on Ada (principled, not push-order) + **DC coverage corrected
 to wholesale-per-kernel for every CUTLASS family the kernel-level
 Params allows** + step 6 prim_mega encoder match landed + **step 7a
 program-static emission landed** + **step 7b/7c launcher emission
-+ codegen wiring landed**. Tip `cb0b6d3fa`. Twenty-two commits on
++ codegen wiring landed** + **step 8 forward dispatch + step 9
+`FERRITE_FORCE_PRIM_MEGA` env override landed (co-dependent, single
+commit `0fb11c236`)**. Tip `0fb11c236`. Twenty-three commits on
 `feat/rust` past the host-pivot baseline.
 
 **Architecture decision (2026-04-27):** PrimMega stays whole-forward
@@ -446,19 +448,33 @@ reflects the actual landed sequence + remaining gaps.
    / smem_size=49152 are TODO-marked — derive from
    `cudaOccupancyMaxActiveBlocksPerMultiprocessor` against the
    picked phase's smem requirement.
-🟡 8. **Wire `pick_interpreter` into codegen post-solve dispatch.**
-   Trace half landed (`1f4bf3192`): `lib.rs` emits per-workload
-   `interp: M=…→Host|PrimMega|KvmMega` alongside the solve
-   summary. With the cost model now correctly biased
-   (`3f700439f` — DC siblings strictly cheaper than host on
-   sm_90+, gated out on Ada), the trace lights up DC seeds
-   internally even though the canonical-level interpreter
-   selection still reports `Host` everywhere because of sparse
-   DC sibling coverage (every backbone has at least one non-DC
-   pick → all-or-nothing `pick_interpreter` falls through).
-   Remaining: emit the actual runtime path (the `if PrimMega
-   then …` branch) once the encoder + launcher (steps 6 + 7)
-   land and there's a real mega program to call.
+✅ 8. **Forward dispatch wired (`0fb11c236`, co-landed with step 9).**
+   Trace half (`1f4bf3192`) was already in. Runtime half added a
+   parallel `LAUNCHER_TABLE: &[(Option<__PrimMegaLauncher>,
+   Option<__PrimMegaLauncher>)]` aligned with `FORWARD_TABLE` —
+   per-bucket `(bb_launcher, lm_launcher)` populated when the
+   canonical's `try_emit_prim_mega` succeeded for both backbone +
+   lm_head, `(None, None)` otherwise (all-or-nothing tier semantics).
+   `forward()` / `forward_backbone()` now `find_bucket_idx` →
+   branch on `prim_mega_forced()` → call launcher pair (alloc
+   tiles, run cooperative, `take_owned` terminal slot or DtoD-copy
+   backbone) → else fall through to `ferrite_forward::run`. New
+   `find_bucket_idx`, `PrimMegaLauncher<W>` type alias,
+   `prim_mega_forced()` env-cached gate all live in
+   `ferrite-forward/src/lib.rs`.
+✅ 9. **`FERRITE_FORCE_PRIM_MEGA` env override (`0fb11c236`).** Co-
+   dependent with step 8 (the override is the only consumer of the
+   dispatch branch; the branch is dead without the override). Reads
+   the env var once, caches via `OnceLock`. When set, every bucket
+   whose `LAUNCHER_TABLE[bidx]` is `Some/Some` routes through the
+   launcher; partial coverage panics loudly (silent host fallback
+   would mask launcher correctness regressions). Today every real
+   model's `try_encode_bucket` returns `None` on every canonical
+   (Embed has no mega arm), so all `LAUNCHER_TABLE` entries are
+   `(None, None)` and forcing panics on any real model. That's the
+   intended state until DC sibling coverage widens — the infra is
+   done; this gate replaces the original step-9 e2e plan, which
+   depended on widening coverage first.
 🟡 — **New Impls in impl_lib.rs returning `DeviceCallable +
    Primitive` fit.** Sibling for every CUTLASS launcher we have
    a DC sibling for, every ferrite-owned DC op, every FI config.
@@ -491,30 +507,37 @@ reflects the actual landed sequence + remaining gaps.
    `CutlassGemvImpl`, silu_mul, FlashInfer attention configs;
    plus the `s2` deep-pipeline / 32×* / W8 / sm90 CUTLASS DC
    tile fan-out (Rust + C++ X-macro both need it).
-⏳ 9. End-to-end: `vllm chat unsloth/Llama-3.2-3B-Instruct
-   --enforce-eager` on H100 → solver picks DeviceCallable Impls
-   wherever a DC sibling exists (host pays +5us/pick, DC pays 0us
-   per pick — wave-level overhead is amortized) → selector picks
-   `PrimMega` for any canonical where every pick is `>=`
-   Primitive-fit. Today coverage is too sparse for the all-or-
-   nothing tier semantics to flip whole canonicals (commandr +
-   Llama still report `Host` even on H100), so step 9 is gated on
-   widening DC siblings to cover every op in at least one arch's
-   forward.
+⏳ 10. **End-to-end byte-equality validation.** Once one canonical
+   has wholesale DC coverage (every op has a mega arm), set
+   `FERRITE_FORCE_PRIM_MEGA=1` and `vllm chat unsloth/Llama-3.2-3B-
+   Instruct --enforce-eager` on H100 — confirm coherent output AND
+   diff token-by-token against the host path on a fixed seed.
+   Today this gates on the canonical-coverage milestone (Embed,
+   FusedGateUpSiluMul, attention DC arms all need to land for at
+   least one forward shape). The cost-driven `pick_interpreter`
+   path lights up automatically once coverage is whole.
 
 ## Next session — what to pick up
 
 Architecture is settled (whole-forward + tape, scaffolding for
 KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS
-family the kernel-level Params allows. Step 7 (program-static +
-launcher emit + codegen wiring) is done. Remaining Phase-1 work, in
-rough order of leverage / effort:
+family the kernel-level Params allows. Steps 7 (program-static +
+launcher emit + codegen wiring) **and 8 + 9 (forward dispatch +
+`FERRITE_FORCE_PRIM_MEGA` env override)** are done. Remaining Phase-1
+work, in rough order of leverage / effort:
 
-0. **Step 7b/7c — launcher fn (LANDED `984d9e8ff`..`cb0b6d3fa`).**
-   Five phases shipped this session as separate commits. Reference
-   notes preserved below for the runtime-types contract the launcher
-   implements; future tweaks (grid_x/block_x/smem occupancy
-   derivation, real e2e wire-up) should match the same shape.
+0. **Steps 8 + 9 — forward dispatch + FERRITE_FORCE_PRIM_MEGA
+   (LANDED `0fb11c236`).** Co-dependent: parallel
+   `LAUNCHER_TABLE` aligned with `FORWARD_TABLE`,
+   `forward()`/`forward_backbone()` branch on `prim_mega_forced()`.
+   `find_bucket_idx`, `PrimMegaLauncher<W>`, `prim_mega_forced()` all
+   live in `ferrite-forward/src/lib.rs`. Today every real model's
+   table entries are `(None, None)` (Embed has no mega arm), so
+   forcing panics on any real model — that's the intended state
+   until DC sibling coverage widens. Reference notes from step 7's
+   landing preserved below for the runtime-types contract; future
+   launcher tweaks (grid_x/block_x/smem occupancy derivation, etc.)
+   should match the same shape.
 
    **Runtime-types decision (settled):**
 
@@ -623,16 +646,23 @@ rough order of leverage / effort:
    PrimMega for any canonical where every pick is `>=
    Primitive`-fit on Hopper. Step 9 e2e validation comes after.
 
-3. **Step-9 e2e via `FERRITE_FORCE_PRIM_MEGA=1` override.** Don't
-   wait on 100% DC coverage to flip the all-or-nothing
-   `pick_interpreter` tier. Add a forced-override env var that
-   makes the runtime route through PrimMega for any canonical
-   where the picked impls support it (downgrade to host per-op
-   when individual picks aren't DC-able). Lets us byte-equality-
-   test the encoder + launcher against host on H100 before sm90 /
-   FlashInfer DC arms land. Per `feedback_prim_mega_is_scaffolding`,
-   this is the right gating mechanism — coverage widening is a
-   separate goal driven by the cost model, not a PrimMega gate.
+3. **Widen DC sibling coverage so at least one canonical encodes
+   wholesale.** Today every real model has at least one op without
+   a mega arm in every bucket (Embed, FusedGateUpSiluMul,
+   attention), so `try_encode_bucket` returns `None` everywhere
+   and `LAUNCHER_TABLE` is all `(None, None)`. The cheapest path
+   to a forced-prim-mega-runs validation is probably:
+   a. Add the Embed mega arm (it's a single device-side gather; the
+      shape can land as `OP_EMBED` with a runtime token-id pt[]
+      pointer).
+   b. Add the FlashInfer DC arm (next item — template ready).
+   c. Add `CutlassFusedGateUpSiluMul` host fallback into mega via
+      decomposing into `CutlassGemm × 2 + SiluMul` rows when the
+      bucket is forced (costs a slot, fine for scaffolding).
+   Once one canonical has wholesale arms, set
+   `FERRITE_FORCE_PRIM_MEGA=1` and validate byte-equality against
+   host on H100. The cost-driven `pick_interpreter` path then
+   automatically lights up.
 
 4. **FlashInfer DC arms in `prim_mega.cu` + Params marshaling.**
    `dc_flashinfer.cuh` template is ready (`cd9fd897c`); needs the

@@ -359,25 +359,42 @@ fn encode_op_arm(
             Some(None)
         }
 
-        // ── Arms not yet implemented (P2-2 follow-up commits) ──
+        "FusedQkvRopeCache" => Some(Some(encode_fused_qkv_rope(
+            inst,
+            layer_offset,
+            ctx,
+            /*is_prefill=*/ false,
+        )?)),
+        "FusedQkvRopePrefill" => Some(Some(encode_fused_qkv_rope(
+            inst,
+            layer_offset,
+            ctx,
+            /*is_prefill=*/ true,
+        )?)),
+        "FusedGateUpSiluMul" => Some(Some(encode_fused_gate_up_silu_mul(
+            inst,
+            layer_offset,
+            ctx,
+        )?)),
+        "CutlassGemm" => Some(Some(encode_cutlass_gemm_lm_head(inst, layer_offset, ctx)?)),
+
+        // ── Attention arms not yet implemented (P2-2 follow-up) ──
         //
-        // Each becomes a fully-implemented arm in a subsequent
+        // Variable-length payload shapes (decode batched pairs;
+        // prefill per-Q-block × per-kv-head). Land in a separate
         // commit. Until then, panic at macro-expand time so the
         // canonical can't accidentally be marked kvm-eligible.
-        // (Returning `None` here would silently mark these
-        // canonicals kvm-ineligible — strictly weaker than
-        // failing loudly during P2-2 development.)
-        "FusedQkvRopeCache"
-        | "FusedQkvRopePrefill"
-        | "AttentionViaCache"
+        // Returning `None` here would silently mark these
+        // canonicals kvm-ineligible — strictly weaker than failing
+        // loudly during P2-2 development.
+        "AttentionViaCache"
         | "AttentionPrefillContiguous"
         | "FlashInferAttentionDecode"
-        | "FlashInferAttentionPrefill"
-        | "FusedGateUpSiluMul"
-        | "CutlassGemm" => unimplemented!(
+        | "FlashInferAttentionPrefill" => unimplemented!(
             "kvm_mega encoder: variant `{}` not yet implemented \
-             (P2-2 follow-up). Ineligible canonicals fall to host \
-             via `pick_interpreter`; landing this arm un-ineligibles \
+             (P2-2 follow-up — attention payload shapes). \
+             Ineligible canonicals fall to host via \
+             `pick_interpreter`; landing this arm un-ineligibles \
              the relevant llama-style canonicals.",
             inst.name
         ),
@@ -556,6 +573,161 @@ fn encode_cutlass_gemm_add(
     Some(out)
 }
 
+/// `FusedQkvRopeCache(in, out, layer, weight_fn, cos_sin_fn,
+/// biased, interleaved)` and `FusedQkvRopePrefill(in, out, layer,
+/// prefill_qo_indptr, prefill_kv_indptr, weight_fn, cos_sin_fn,
+/// biased, interleaved)` both → `OPCODE_QKV_RopeAppend`. Row
+/// layout per `qkv_rope_append.cu:32-39`:
+///
+/// ```text
+/// [opcode, layer, local_row, local_col, row, col, 0, …, 0]
+/// ```
+///
+/// Fan-out: `num_batch_blocks × num_qkv_blocks`, where
+/// `qkv_dim = q_size + 2 * kv_size`. The kernel toggles between
+/// prefill and decode at runtime via `g.num_prefill_tokens`
+/// (KVM_MAPPING.md Q2) — encoder emits the same row layout for
+/// both variants. `is_prefill` is recorded for documentation
+/// only; the kernel doesn't read it from the row.
+fn encode_fused_qkv_rope(
+    inst: &OpInstance,
+    layer_offset: u32,
+    ctx: &EncodeCtx,
+    is_prefill: bool,
+) -> Option<Vec<KvmEncodedRow>> {
+    let _in_slot = parse_u32_literal(&inst.field_values[0])?;
+    let _out_slot = parse_u32_literal(&inst.field_values[1])?;
+    let layer_baseline = parse_u32_literal(&inst.field_values[2])?;
+    let layer = (layer_baseline + layer_offset) as i32;
+    // `FusedQkvRopePrefill` carries two extra slot fields at
+    // positions 3 + 4 (prefill_qo_indptr / prefill_kv_indptr).
+    // The kernel reads those tensors from `globals_t` directly
+    // (`g.prefill_qo_indptr` etc.), not from the row payload, so
+    // the encoder discards them. Validating the field-extraction
+    // would catch DSL drift but adds nothing for kvm correctness.
+
+    let qkv_dim = ctx.q_size + 2 * ctx.kv_size;
+    let num_batch_blocks = (ctx.batch_size / ctx.matmul_batch_block_size) as i32;
+    let num_qkv_blocks = (qkv_dim / ctx.matmul_out_block_size) as i32;
+
+    let mut out = Vec::with_capacity((num_batch_blocks * num_qkv_blocks) as usize);
+    for batch_block in 0..num_batch_blocks {
+        for qkv_block in 0..num_qkv_blocks {
+            let mut row = KvmEncodedRow::new(OPCODE_QKV_ROPE_APPEND);
+            row.payload[1] = layer;
+            row.payload[2] = batch_block; // local_row
+            row.payload[3] = qkv_block; // local_col
+            row.payload[4] = batch_block; // row
+            row.payload[5] = qkv_block; // col
+            out.push(row);
+        }
+    }
+    let _ = is_prefill; // toggled at launch via g.num_prefill_tokens
+    Some(out)
+}
+
+/// `FusedGateUpSiluMul(in, out, layer, weight_fn)` → split into
+/// **two** TK opcodes' worth of rows: `OPCODE_GateSiLU` (gate
+/// projection + SiLU activation) followed by `OPCODE_UpMatmul`
+/// (up projection + elementwise mul into silu_out).
+///
+/// Row layout per `gate_silu.cu:22-28` and `up_matmul.cu:28-34`:
+///
+/// ```text
+/// [opcode, layer, local_row, local_col, row, col, 0, …, 0]
+/// ```
+///
+/// Fan-out per opcode:
+/// `num_batch_blocks × num_intermediate_blocks`. Total rows = 2×.
+/// Gate rows precede up rows in the tape — that's the order TK's
+/// `Bar`-counter chain expects (UpMatmul's loader spin-waits on
+/// the GateSiLU `Bar`; see `up_matmul.cu` gmem_waiter pattern).
+fn encode_fused_gate_up_silu_mul(
+    inst: &OpInstance,
+    layer_offset: u32,
+    ctx: &EncodeCtx,
+) -> Option<Vec<KvmEncodedRow>> {
+    let _in_slot = parse_u32_literal(&inst.field_values[0])?;
+    let _out_slot = parse_u32_literal(&inst.field_values[1])?;
+    let layer_baseline = parse_u32_literal(&inst.field_values[2])?;
+    let layer = (layer_baseline + layer_offset) as i32;
+
+    let num_batch_blocks = (ctx.batch_size / ctx.matmul_batch_block_size) as i32;
+    let num_intermediate_blocks = (ctx.intermediate_size / ctx.matmul_out_block_size) as i32;
+
+    let total = 2 * (num_batch_blocks * num_intermediate_blocks) as usize;
+    let mut out = Vec::with_capacity(total);
+    for opcode in [OPCODE_GATE_SILU, OPCODE_UP_MATMUL] {
+        for batch_block in 0..num_batch_blocks {
+            for block in 0..num_intermediate_blocks {
+                let mut row = KvmEncodedRow::new(opcode);
+                row.payload[1] = layer;
+                row.payload[2] = batch_block;
+                row.payload[3] = block;
+                row.payload[4] = batch_block;
+                row.payload[5] = block;
+                out.push(row);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `CutlassGemm(in, out, layer, weight_fn, tile_m, tile_n,
+/// stages)` at the LM_Head position → `OPCODE_LM_Head`. Row
+/// layout per `lm_head.cu:21-27`:
+///
+/// ```text
+/// [opcode, layer=0, local_row, local_col, row, col, 0, …, 0]
+/// ```
+///
+/// Fan-out: `num_batch_blocks × num_logit_blocks`, where
+/// `num_logit_blocks = vocab_size / matmul_out_block_size`. By
+/// convention slot 1 (`layer`) is `0` — LM_Head runs once at
+/// end-of-forward (`tk_instructions.rs:241-250` comment).
+///
+/// Why this arm is "LM_Head only" without an explicit role tag:
+/// every other `Gemm` in a llama-style DSL gets claimed by a
+/// fusion Impl (`FusedQkvRopeCache` swallows q/k/v projections;
+/// `FusedGateUpSiluMul` swallows gate/up; `CutlassGemmAddImpl`
+/// swallows o_proj+add and down_proj+add). After picks the only
+/// `CutlassGemm` instance left in the unrolled IR is the LM_Head
+/// one. Caveat: if the DSL gains a non-fusable Gemm, we want this
+/// to fail loudly — see assertion below.
+fn encode_cutlass_gemm_lm_head(
+    inst: &OpInstance,
+    layer_offset: u32,
+    ctx: &EncodeCtx,
+) -> Option<Vec<KvmEncodedRow>> {
+    let _in_slot = parse_u32_literal(&inst.field_values[0])?;
+    let _out_slot = parse_u32_literal(&inst.field_values[1])?;
+    // Layer field is unused by the kernel for LM_Head; we still
+    // parse for IR-shape validity. layer_offset zero-base for the
+    // single LM_Head call (post-loop).
+    let _layer_baseline = parse_u32_literal(&inst.field_values[2])?;
+    let _ = layer_offset;
+    let _tile_m = parse_u32_literal(&inst.field_values[4])?;
+    let _tile_n = parse_u32_literal(&inst.field_values[5])?;
+    let _stages = parse_u32_literal(&inst.field_values[6])?;
+
+    let num_batch_blocks = (ctx.batch_size / ctx.matmul_batch_block_size) as i32;
+    let num_logit_blocks = (ctx.vocab_size / ctx.matmul_out_block_size) as i32;
+
+    let mut out = Vec::with_capacity((num_batch_blocks * num_logit_blocks) as usize);
+    for batch_block in 0..num_batch_blocks {
+        for logit_block in 0..num_logit_blocks {
+            let mut row = KvmEncodedRow::new(OPCODE_LM_HEAD);
+            row.payload[1] = 0; // layer pinned per tk_instructions.rs:243
+            row.payload[2] = batch_block;
+            row.payload[3] = logit_block;
+            row.payload[4] = batch_block;
+            row.payload[5] = logit_block;
+            out.push(row);
+        }
+    }
+    Some(out)
+}
+
 // ── Helpers (private) ───────────────────────────────────────────
 
 /// Extract a `u32` literal from a TokenStream that's expected to
@@ -672,6 +844,79 @@ mod tests {
             vec![
                 u32_lit(in_slot),
                 u32_lit(residual_slot),
+                u32_lit(layer),
+                weight_path,
+                u32_lit(tile_m),
+                u32_lit(tile_n),
+                u32_lit(stages),
+            ],
+        )
+    }
+
+    fn qkv_rope_cache_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        let weight_path: TokenStream = "Weights::self_attn_qkv".parse().unwrap();
+        let cos_sin_path: TokenStream = "Weights::rotary".parse().unwrap();
+        op(
+            "FusedQkvRopeCache",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                weight_path,
+                cos_sin_path,
+                "false".parse().unwrap(),
+                "false".parse().unwrap(),
+            ],
+        )
+    }
+
+    fn qkv_rope_prefill_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        let weight_path: TokenStream = "Weights::self_attn_qkv".parse().unwrap();
+        let cos_sin_path: TokenStream = "Weights::rotary".parse().unwrap();
+        op(
+            "FusedQkvRopePrefill",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                u32_lit(0), // prefill_qo_indptr slot
+                u32_lit(0), // prefill_kv_indptr slot
+                weight_path,
+                cos_sin_path,
+                "false".parse().unwrap(),
+                "false".parse().unwrap(),
+            ],
+        )
+    }
+
+    fn gate_up_silu_mul_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        let weight_path: TokenStream = "Weights::mlp_gate_up".parse().unwrap();
+        op(
+            "FusedGateUpSiluMul",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                weight_path,
+            ],
+        )
+    }
+
+    fn cutlass_gemm_inst(
+        in_slot: u32,
+        out_slot: u32,
+        layer: u32,
+        weight: &str,
+        tile_m: u32,
+        tile_n: u32,
+        stages: u32,
+    ) -> OpInstance {
+        let weight_path: TokenStream = weight.parse().unwrap();
+        op(
+            "CutlassGemm",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
                 u32_lit(layer),
                 weight_path,
                 u32_lit(tile_m),
@@ -834,6 +1079,98 @@ mod tests {
         for row in &bucket.rows[lm_head_start..] {
             assert_eq!(row.opcode(), OPCODE_LM_HEAD_NORM);
             assert_eq!(row.payload[1], 0); // pinned to 0
+        }
+    }
+
+    /// `FusedQkvRopeCache` standalone (decode mode) → fan out to
+    /// `num_batch_blocks × num_qkv_blocks` `OPCODE_QKV_RopeAppend`
+    /// rows. With ctx_llama_1b: B=128, Bblock=128, Q=2048, KV=512,
+    /// out_block=256 → qkv_dim=3072, num_qkv_blocks=12,
+    /// num_batch_blocks=1 → 12 rows.
+    #[test]
+    fn qkv_rope_cache_emits_qkv_rope_append() {
+        let arch = arch_with_norm_and_gemm_add();
+        let prog = vec![qkv_rope_cache_inst(0, 1, 5)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+            .expect("FusedQkvRopeCache has a kvm arm");
+        assert_eq!(bucket.rows.len(), 12);
+        for (i, row) in bucket.rows.iter().enumerate() {
+            assert_eq!(row.opcode(), OPCODE_QKV_ROPE_APPEND);
+            assert_eq!(row.payload[1], 5); // layer
+            assert_eq!(row.payload[2], 0); // local_row (single batch block)
+            assert_eq!(row.payload[3], i as i32); // local_col
+            assert_eq!(row.payload[4], 0); // row
+            assert_eq!(row.payload[5], i as i32); // col
+        }
+    }
+
+    /// `FusedQkvRopePrefill` shares opcode + row layout with
+    /// `FusedQkvRopeCache`. The kernel toggles via
+    /// `g.num_prefill_tokens` (KVM_MAPPING.md Q2). Tape-side, the
+    /// only difference is that the prefill IR variant has two extra
+    /// slot fields (qo_indptr / kv_indptr) that the encoder
+    /// discards.
+    #[test]
+    fn qkv_rope_prefill_uses_same_opcode_and_layout() {
+        let arch = arch_with_norm_and_gemm_add();
+        let decode_bucket =
+            try_encode_bucket(&arch, &[qkv_rope_cache_inst(0, 1, 7)], &ctx_llama_1b()).unwrap();
+        let prefill_bucket =
+            try_encode_bucket(&arch, &[qkv_rope_prefill_inst(0, 1, 7)], &ctx_llama_1b()).unwrap();
+        assert_eq!(decode_bucket.rows, prefill_bucket.rows);
+    }
+
+    /// `FusedGateUpSiluMul` splits into 2× rows (gate first, then
+    /// up). Per-opcode fan-out:
+    /// `num_batch_blocks × num_intermediate_blocks`. With
+    /// ctx_llama_1b: I=8192, out_block=256 → 32 inter blocks ×
+    /// 1 batch block = 32 rows per opcode, 64 total.
+    #[test]
+    fn gate_up_silu_mul_splits_into_two_opcodes_in_order() {
+        let arch = arch_with_norm_and_gemm_add();
+        let prog = vec![gate_up_silu_mul_inst(0, 1, 11)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+            .expect("FusedGateUpSiluMul has a kvm arm");
+        assert_eq!(bucket.rows.len(), 64);
+        for row in &bucket.rows[..32] {
+            assert_eq!(row.opcode(), OPCODE_GATE_SILU);
+            assert_eq!(row.payload[1], 11);
+        }
+        for row in &bucket.rows[32..] {
+            assert_eq!(row.opcode(), OPCODE_UP_MATMUL);
+            assert_eq!(row.payload[1], 11);
+        }
+        // Block indices ascend within each opcode partition.
+        for (i, row) in bucket.rows[..32].iter().enumerate() {
+            assert_eq!(row.payload[3], i as i32);
+        }
+        for (i, row) in bucket.rows[32..].iter().enumerate() {
+            assert_eq!(row.payload[3], i as i32);
+        }
+    }
+
+    /// `CutlassGemm` at LM_Head position → `OPCODE_LM_Head` with
+    /// layer pinned to 0 regardless of the IR's layer value
+    /// (mirrors `tk_instructions.rs:243`). Fan-out:
+    /// num_batch_blocks × num_logit_blocks. With ctx_llama_1b:
+    /// vocab=128_256, out_block=256, but vocab/256 = 501 — not
+    /// integer-clean. Use a vocab-aligned variant for this test
+    /// to keep the row count predictable.
+    #[test]
+    fn cutlass_gemm_emits_lm_head_with_layer_pinned() {
+        let arch = arch_with_norm_and_gemm_add();
+        let mut ctx = ctx_llama_1b();
+        ctx.vocab_size = 32_768; // 128 × 256, integer-clean
+        let prog = vec![cutlass_gemm_inst(0, 1, 42, "Weights::lm_head", 128, 128, 3)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx)
+            .expect("CutlassGemm has a kvm arm at LM_Head position");
+        let num_logit_blocks = 32_768 / 256; // 128
+        assert_eq!(bucket.rows.len(), num_logit_blocks);
+        for (i, row) in bucket.rows.iter().enumerate() {
+            assert_eq!(row.opcode(), OPCODE_LM_HEAD);
+            assert_eq!(row.payload[1], 0); // layer pinned to 0
+            assert_eq!(row.payload[2], 0); // local_row (single batch block)
+            assert_eq!(row.payload[3], i as i32); // local_col
         }
     }
 }

@@ -1335,4 +1335,91 @@ mod tests {
             assert_eq!(row.payload[3], i as i32); // local_col
         }
     }
+
+    /// **Capstone pin:** byte-equal comparison against the older
+    /// branch's known-good `tk_instructions::build_throughput_instructions`
+    /// (ported intact at
+    /// `crates/ferrite-forward/src/tk_instructions.rs`). Build a
+    /// synthetic 1-layer decode IR exercising every encoder arm
+    /// landed in P2-2 (Embed implicit; AttnNorm; QKV+RoPE+Append;
+    /// AttentionDecode; O_ProjResidual; MlpNorm; GateSiLU+UpMatmul;
+    /// DownProjResidual; LM_HeadNorm; LM_Head), encode it, flatten
+    /// to `Vec<i32>`, and compare the entire tape byte-for-byte.
+    ///
+    /// This is the strongest correctness pin available pre-launcher:
+    /// any divergence between our encoder and the older branch's
+    /// shipping path (which boots E2E "capital of France is Paris"
+    /// on H100 Llama-3.2-1B per MEGA_HANDOFF.md "Why the pivot")
+    /// fails the test. Land additional arms by extending the
+    /// synthetic IR + bumping `num_layers` here.
+    #[test]
+    fn full_layer_decode_byte_equal_to_reference_tk_instructions() {
+        use ferrite_forward::tk_instructions::build_throughput_instructions;
+
+        let ctx = ctx_llama_1b();
+        let num_layers = 1usize;
+        let num_attention_heads = 32usize; // ctx_llama_1b implicit; reference takes it as a separate arg
+
+        // Synthetic 1-layer decode IR. Mirrors the `forward!`
+        // expansion shape post-Impl-pick on a llama canonical
+        // targeting kvm: every IR variant the encoder maps lives
+        // here exactly once. Slot indices are arbitrary distinct
+        // u32s; the kvm encoder doesn't read them (TK kernels read
+        // from globals_t, not pt[]).
+        let prog: Vec<OpInstance> = vec![
+            rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
+            qkv_rope_cache_inst(2, 3, 0),
+            attention_via_cache_inst(4, 5, 0),
+            gemm_add_inst(6, 7, 0, "Weights::self_attn_o_proj", 128, 128, 3),
+            rms_norm_inst(8, 9, 0, "Weights::post_attention_layernorm"),
+            gate_up_silu_mul_inst(10, 11, 0),
+            gemm_add_inst(12, 13, 0, "Weights::mlp_down_proj", 128, 128, 3),
+            rms_norm_inst(14, 15, 0, "Weights::norm"),
+            cutlass_gemm_inst(16, 17, 0, "Weights::lm_head", 128, 128, 3),
+        ];
+
+        let arch = arch_with_norm_and_gemm_add();
+        let bucket = try_encode_bucket(&arch, &prog, &ctx)
+            .expect("full-layer decode IR has all kvm arms landed");
+
+        // Flatten Vec<KvmEncodedRow> to Vec<i32> in row order.
+        let mut ours: Vec<i32> = Vec::with_capacity(bucket.rows.len() * INSTRUCTION_WIDTH);
+        for row in &bucket.rows {
+            ours.extend_from_slice(&row.payload);
+        }
+
+        let reference = build_throughput_instructions(
+            ctx.batch_size as usize,
+            ctx.num_tokens as usize,
+            num_layers,
+            num_attention_heads,
+            ctx.num_kv_heads as usize,
+            ctx.head_size as usize,
+            ctx.hidden_size as usize,
+            ctx.intermediate_size as usize,
+            ctx.vocab_size as usize,
+            ctx.matmul_batch_block_size as usize,
+            ctx.matmul_out_block_size as usize,
+            None, // decode mode (prefill is P2-x runtime-tape follow-up)
+        );
+
+        assert_eq!(
+            ours.len(),
+            reference.len(),
+            "tape length mismatch: ours={} rows × 32, ref={} rows × 32",
+            ours.len() / INSTRUCTION_WIDTH,
+            reference.len() / INSTRUCTION_WIDTH
+        );
+        // Compare row-by-row to make divergences readable.
+        for (row_idx, (ours_row, ref_row)) in ours
+            .chunks(INSTRUCTION_WIDTH)
+            .zip(reference.chunks(INSTRUCTION_WIDTH))
+            .enumerate()
+        {
+            assert_eq!(
+                ours_row, ref_row,
+                "row {row_idx} diverges from reference: ours={ours_row:?}, ref={ref_row:?}"
+            );
+        }
+    }
 }

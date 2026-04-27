@@ -18,3 +18,11 @@ ferrite-cuda-targets = { path = "../ferrite-cuda-targets" }
 
 [dev-dependencies]
 trybuild = "1"
+# Dev-only cyclic dep: `ferrite-forward` depends on us as a
+# regular dep, but for tests we want to compare the kvm_mega
+# encoder's output against
+# `tk_instructions::build_throughput_instructions` (the older
+# branch's known-good Vec<i32> tape builder). Cargo permits
+# cyclic dev-deps; this stays test-only and never enters the
+# proc-macro build graph.
+ferrite-forward = { path = "../ferrite-forward", features = ["cuda"] }

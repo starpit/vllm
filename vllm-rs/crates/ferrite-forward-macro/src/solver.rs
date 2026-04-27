@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::classified::OpKind;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
-use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchInfo};
+use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchInfo, launch_overhead_us};
 use crate::shape::{Inferred, Shape, extern_shape};
 use crate::target::TargetProfile;
 
@@ -407,7 +407,16 @@ fn solve_one(
             {
                 continue;
             }
-            let cost = imp.cost_us(info, &ctx);
+            let work = imp.cost_us(info, &ctx);
+            // Per-launch overhead — see `launch_overhead_us`. One
+            // entry boundary per pick (not per input edge): a host
+            // kernel launch costs ~5us regardless of fan-in; a
+            // primitive-mega DC op pays ~100us grid-sync. This is
+            // the term that makes the DP's tier preference
+            // load-bearing: without it, DC siblings tie with their
+            // host counterparts (delegated cost_us) and the picker
+            // falls back to library order.
+            let cost = work + launch_overhead_us(imp.launch_kind(), target);
             if !cost.is_finite() {
                 return Err(SolveError::UnreachableCost {
                     tile: node.id,

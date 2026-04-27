@@ -399,12 +399,26 @@ properly value mega benefits:
 - Persistent-SM cache reuse across instructions (vendor's design
   point — currently invisible to ferrite's CSV-driven cost).
 - Cluster-block + DSMEM advantages (sm≥90).
-- Reduced launch-overhead amortization at very small M (today's
-  `Handoff::KernelBoundary=5us` is a placeholder).
+- KvmFit DC ops should pay [`Handoff::Mbarrier`] (~0.1us) rather
+  than [`Handoff::InKernelGridSync`] (~100us) when running inside
+  a KVM megakernel. Today `launch_overhead_us` returns
+  `InKernelGridSync` for every `LaunchKind::DeviceCallable`,
+  which is correct for PrimMega but pessimistic for KvmMega —
+  the term must split on `MegakernelFit` once KvmFit impls
+  appear.
 - Per-SM tape length imbalance penalty (idle SMs at end of
   bucket).
 
-Don't bolt these on before Phase 2 lands.
+What already lands: per-launch overhead is summed into both the
+solver's DP candidate cost AND `loop_cost_us` aggregation (commit
+`<TODO>`). HostCallback / RegularLaunch / CooperativeLaunch all
+pay one `KernelBoundary` per pick (5us); DeviceCallable pays one
+`InKernelGridSync` (100us). This makes the host-vs-DC ranking
+load-bearing on hardware-grounded arithmetic — Phase 1 hardware
+correctly picks host (95us delta per pick); Phase 2 hardware
+will want the Mbarrier-aware refinement above.
+
+Don't bolt the rest on before Phase 2 lands.
 
 ## Things-that-must-not-happen
 

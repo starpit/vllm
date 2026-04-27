@@ -11,10 +11,16 @@
 //! Impls by wave, applies `contention_factor`, and returns the
 //! adjusted total µs.
 //!
-//! Ported in spirit from `ferrite-solver/src/lowering/cost.rs` —
-//! simplified because our assignment doesn't yet carry
-//! `CompilationUnitId`/Handoff edges. Those pieces land with their
-//! consumers (DeviceCallable impls + megakernel emission).
+//! Ported in spirit from `ferrite-solver/src/lowering/cost.rs`.
+//! Per-launch sync overhead lands here too — every Impl pays one
+//! [`launch_overhead_us`](crate::impl_lib::launch_overhead_us)
+//! charge per pick, derived from its `launch_kind()`. The DP at
+//! `solver.rs` adds the same term to candidate costs, so this
+//! aggregator agrees with what was optimized. Per-edge handoff
+//! costs (StreamEvent across compute units, GmemFlag spin, etc.)
+//! still aren't modelled — they only matter once the schedule
+//! routes onto multiple streams or splits a megakernel-internal
+//! op chain across compilation units.
 
 #![allow(dead_code)]
 
@@ -22,7 +28,9 @@ use std::collections::BTreeMap;
 
 use crate::concurrency::ConcurrencyModel;
 use crate::fuf::Fuf;
-use crate::impl_lib::{CostCtx, Implementation, ImplementationLibrary, MatchInfo};
+use crate::impl_lib::{
+    CostCtx, Implementation, ImplementationLibrary, MatchInfo, launch_overhead_us,
+};
 use crate::schedule::{Loop, WorkloadLoops};
 use crate::solver::{Assignment, WorkloadAssignments};
 use crate::target::TargetProfile;
@@ -76,7 +84,13 @@ pub fn loop_cost_us(
             if !factor.is_finite() {
                 return f64::INFINITY;
             }
-            total += imp.cost_us(m, &ctx) * factor;
+            // Effective cost = GPU work × contention + per-launch
+            // sync overhead. Contention only scales the work term —
+            // running two kernels concurrently doesn't halve their
+            // launch boundary; each still pays its own. Mirrors the
+            // solver's phase-1 candidate cost so `predicted_us`
+            // agrees with what the DP optimized.
+            total += imp.cost_us(m, &ctx) * factor + launch_overhead_us(imp.launch_kind(), target);
         }
     }
 
@@ -304,6 +318,123 @@ mod tests {
             assert!(sf.predicted_us.is_finite() && sf.predicted_us > 0.0);
             // On serial chain the refresh shouldn't move the number.
             assert!((before[wp] - sf.predicted_us).abs() < 1e-6);
+        }
+    }
+
+    /// Lock the launch-overhead constants. The DP and `loop_cost_us`
+    /// both consult `launch_overhead_us`; the values come from the
+    /// same `Handoff::cost_us` table used by the rest of the cost
+    /// model, so a one-line tweak there should propagate. This test
+    /// pins the table values so an unrelated edit can't silently
+    /// re-rank host vs DC at the solver.
+    #[test]
+    fn launch_overhead_matches_handoff_table() {
+        use crate::impl_lib::{Handoff, LaunchKind, launch_overhead_us};
+        let target = l4_target();
+        // Host launches all collapse to KernelBoundary — one
+        // cudaLaunchKernel boundary regardless of whether the host
+        // is calling cuBLAS or its own __global__.
+        for lk in [
+            LaunchKind::HostCallback,
+            LaunchKind::RegularLaunch,
+            LaunchKind::CooperativeLaunch,
+        ] {
+            assert_eq!(
+                launch_overhead_us(lk, &target),
+                Handoff::KernelBoundary.cost_us(&target),
+                "{lk:?} should pay KernelBoundary"
+            );
+        }
+        // DC pays grid-sync (PrimMega's per-op handoff). Phase 2
+        // refines this for KvmFit impls — see MEGA_HANDOFF.md
+        // §"Cost-metric refinements (post-Phase 2)".
+        assert_eq!(
+            launch_overhead_us(LaunchKind::DeviceCallable, &target),
+            Handoff::InKernelGridSync.cost_us(&target),
+            "DC should pay InKernelGridSync on Phase 1 hardware"
+        );
+        // The whole point of plumbing this term: DC > Host on
+        // Phase 1 hardware, so the solver naturally picks Host
+        // when it ties on per-Impl GPU work cost.
+        assert!(
+            launch_overhead_us(LaunchKind::DeviceCallable, &target)
+                > launch_overhead_us(LaunchKind::HostCallback, &target),
+            "DC overhead must dominate host overhead on Phase 1; otherwise \
+             the solver's tier preference flips and PrimMega gets picked \
+             prematurely"
+        );
+    }
+
+    /// Solver `predicted_us` should now reflect per-Impl launch
+    /// overhead. On a serial-chain Llama at M=1 the DP picks ~N
+    /// host kernels (roughly one per FUF subgraph after fusion);
+    /// the launch surcharge is `N × 5us`, which is observable.
+    #[test]
+    fn predicted_us_includes_launch_overhead() {
+        use crate::impl_lib::{Handoff, LaunchKind, launch_overhead_us};
+        let params = llama_params("llama-3.2-1b");
+        let file: syn::File =
+            syn::parse_str(&format!("fn _c() {{ {LLAMA_BODY} }}")).expect("parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let ast = parse_block(block).unwrap();
+        let program = classify(&ast).unwrap();
+        let inferred = infer(
+            &program,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let cfg = build_cfg(&program, &params).unwrap();
+        let fuf = unroll(&cfg, &inferred).unwrap();
+        let lib = starter_library();
+        let target = l4_target();
+
+        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfuf = sfufs.get_nt(1).unwrap();
+
+        // Compute the surcharge attributable to launch overhead by
+        // summing it over picked impls. Subtract from predicted_us:
+        // what's left is pure GPU work, must still be positive.
+        let overhead: f64 = sfuf
+            .impls
+            .values()
+            .map(|imp_id| launch_overhead_us(lib.get(*imp_id).launch_kind(), &target))
+            .sum();
+        assert!(
+            overhead > 0.0,
+            "Llama solve must pick at least one impl with non-zero overhead"
+        );
+        // Every host-launched impl contributes 5us; chain has
+        // tens of subgraphs after fusion; surcharge dwarfs the
+        // float-noise threshold by orders of magnitude.
+        let host_floor = Handoff::KernelBoundary.cost_us(&target) * 10.0;
+        assert!(
+            overhead >= host_floor,
+            "expected ≥{host_floor}us launch surcharge across the chain, got {overhead}"
+        );
+        let work = sfuf.predicted_us - overhead;
+        assert!(
+            work.is_finite() && work > 0.0,
+            "predicted_us={} overhead={} → work={} should be positive",
+            sfuf.predicted_us,
+            overhead,
+            work,
+        );
+        // No DC siblings registered for non-Llama-shaped impls;
+        // every Llama backbone pick should still be host-launched
+        // until DC siblings widen further (MEGA_HANDOFF.md §"DC
+        // siblings remaining").
+        for imp_id in sfuf.impls.values() {
+            assert!(
+                !matches!(lib.get(*imp_id).launch_kind(), LaunchKind::DeviceCallable),
+                "DP picked a DC sibling at M=1 unexpectedly: \
+                 {} — `launch_overhead_us` should make Phase 1 \
+                 hardware prefer host",
+                lib.get(*imp_id).name(),
+            );
         }
     }
 }

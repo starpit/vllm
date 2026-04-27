@@ -256,6 +256,49 @@ impl Handoff {
     }
 }
 
+/// Per-launch sync overhead an implementation pays just to enter
+/// its execution context, charged once per pick — not per input
+/// edge. A host-launched kernel pays one [`Handoff::KernelBoundary`]
+/// regardless of how many input tensors it gathers (one
+/// `cudaLaunchKernel` call serves them all). A `DeviceCallable`
+/// inside the primitive megakernel pays one
+/// [`Handoff::InKernelGridSync`] (~100us on L4) per op handoff —
+/// vendored `dc_*` kernels early-return on out-of-range CTAs, so
+/// the persistent `__global__` uses `cg::this_grid().sync()` between
+/// ops as documented in `vllm-cuda/csrc/megakernel/prim_mega.cu`.
+///
+/// Why this is the right shape: the prior cost model summed only
+/// per-Impl GPU work, so DC siblings (which inherit `cost_us` from
+/// their host counterparts via the thin-delegation pattern) tied
+/// with host at every seed and the solver picked host purely by
+/// library push-order. Adding launch overhead at the solver's
+/// candidate-cost step makes the tier ordering load-bearing on the
+/// arithmetic: Phase 1 hardware naturally keeps host cheaper
+/// (~95us per pick) because grid-sync outweighs a relaunch; Phase
+/// 2 hardware (mbarrier-capable) flips the math via Mbarrier (0.1us)
+/// — that's where KvmMega earns its keep.
+///
+/// Per-launch (not per-edge) reflects the launch model: one entry
+/// boundary per pick, regardless of fan-in. Charging per input edge
+/// would over-penalize wide-fan-in kernels (e.g. attention's
+/// q/k/v/positions/cache gather) by 5N us instead of 5us, which is
+/// not how the hardware works.
+///
+/// `RegularLaunch` and `CooperativeLaunch` are also kernel boundaries
+/// from the producer's perspective — a fresh `cudaLaunchKernel` (or
+/// `cudaLaunchCooperativeKernel`) call. Phase 2 will refine
+/// `DeviceCallable` per `MegakernelFit`: Kvm-fit impls inside a KVM
+/// megakernel pay [`Handoff::Mbarrier`] not [`Handoff::InKernelGridSync`].
+/// Tracked in MEGA_HANDOFF.md §"Cost-metric refinements".
+pub fn launch_overhead_us(kind: LaunchKind, profile: &TargetProfile) -> f64 {
+    match kind {
+        LaunchKind::HostCallback | LaunchKind::RegularLaunch | LaunchKind::CooperativeLaunch => {
+            Handoff::KernelBoundary.cost_us(profile)
+        }
+        LaunchKind::DeviceCallable => Handoff::InKernelGridSync.cost_us(profile),
+    }
+}
+
 /// Layout of a tile in memory. Used by the layout-compatibility
 /// constraint: a producer's output layout must equal the
 /// consumer's input layout, OR a layout-conversion implementation

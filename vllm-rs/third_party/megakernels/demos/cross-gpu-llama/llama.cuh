@@ -1,8 +1,9 @@
 #pragma once
 
 #define LLAMA_GLOBAL_WORK_QUEUE
-#define LLAMA_STRICT_BARRIERS
+// #define LLAMA_STRICT_BARRIERS  // disabled: >= check is safer during bring-up
 #define LLAMA_BROADCAST_LM_HEAD_NORM
+#define PRINT_DEADLOCKS
 // #define LLAMA_DETERMINISTIC
 // #define PRINT_DEADLOCKS
 
@@ -22,27 +23,55 @@
 #define OPCODE_Barrier_Inc 12
 #define OPCODE_AllDeviceBarrier 13
 
+#ifndef LLAMA_NUM_LAYERS
 #define LLAMA_NUM_LAYERS 80
+#endif
+#ifndef LLAMA_HIDDEN_DIM
 #define LLAMA_HIDDEN_DIM 8192
+#endif
+#ifndef LLAMA_INTERMEDIATE_DIM
 #define LLAMA_INTERMEDIATE_DIM 28672
+#endif
+#ifndef LLAMA_HEAD_DIM
 #define LLAMA_HEAD_DIM 128
+#endif
+#ifndef LLAMA_NUM_ATTENTION_HEADS
 #define LLAMA_NUM_ATTENTION_HEADS 64
+#endif
+#ifndef LLAMA_NUM_KV_HEADS
 #define LLAMA_NUM_KV_HEADS 8
-#define LLAMA_KV_PAGE_SIZE 128 /*128*/
+#endif
+#ifndef LLAMA_KV_PAGE_SIZE
+#define LLAMA_KV_PAGE_SIZE 128
+#endif
+#ifndef LLAMA_PREFILL_KV_BLOCK_SIZE
 #define LLAMA_PREFILL_KV_BLOCK_SIZE 128
+#endif
+#ifndef LLAMA_DECODE_KV_BLOCK_SIZE
 #define LLAMA_DECODE_KV_BLOCK_SIZE 16
+#endif
+#ifndef LLAMA_MATMUL_OUT_BLOCK_SIZE
 #define LLAMA_MATMUL_OUT_BLOCK_SIZE 256
+#endif
 
+#ifndef LLAMA_MATMUL_BATCH_BLOCK_SIZE
 #ifdef KITTENS_BLACKWELL
 #define LLAMA_MATMUL_BATCH_BLOCK_SIZE 256
 #else
 #define LLAMA_MATMUL_BATCH_BLOCK_SIZE 128
 #endif
+#endif
 
+#ifndef SM_COUNT
 #ifdef KITTENS_BLACKWELL
 #define SM_COUNT 148
 #else
 #define SM_COUNT 132
+#endif
+#endif
+
+#ifndef LLAMA_NUM_DEVICES
+#define LLAMA_NUM_DEVICES 8
 #endif
 
 struct base_llama_config {
@@ -104,11 +133,30 @@ struct llama_config : public base_llama_config {
     static constexpr bool TIMING_RECORD_ENABLED = false;
 };
 
+// Thin wrapper: gives a gl<> object pgl-like operator[](int) → returns self.
+// This allows single-GPU code to use the same `g.field[g.dev_idx]` syntax
+// as multi-GPU pgl code, without changing the op implementations.
+// Preserves gl::identifier so TMA stores route through the gl path (which
+// has valid TMA descriptors), not the pgl path (which needs multicast).
+template<typename GL>
+struct gl_as_pgl : public GL {
+    using _GL = GL;
+    // Keep gl::identifier so ducks::gl::all is satisfied → gl TMA path used.
+    static constexpr int num_devices = 1;
+
+    // Forward all gl constructors.
+    using GL::GL;
+
+    __host__ __device__ const GL &operator[](int) const { return *this; }
+    __host__ __device__       GL &operator[](int)       { return *this; }
+};
+
 template <typename config, int _num_hidden_layers, int _hidden_dim, int _intermediate_dim, int _head_dim,
           int _num_attention_heads, int _num_kv_heads, int _kv_page_size, int _prefill_kv_block_size,
-          int _decode_kv_block_size, int _matmul_out_block_size, int _matmul_batch_block_size, int _sm_count>
+          int _decode_kv_block_size, int _matmul_out_block_size, int _matmul_batch_block_size, int _sm_count,
+          int _num_devices = 1>
 struct globals_t {
-    constexpr static int num_devices = 8;
+    constexpr static int num_devices = _num_devices;
 
     constexpr static int num_hidden_layers = _num_hidden_layers;
     constexpr static int matmul_out_block_size = _matmul_out_block_size;
@@ -135,14 +183,24 @@ struct globals_t {
     using activations_t = kittens::gl<kittens::bf16, 1, 1, -1, -1, kittens::sv_bf<hidden_dim>, kittens::st_bf<16, 128>,
                                       kittens::st_bf<64, 64>, kittens::sv_bf<head_dim>, kittens::st_bf<16, 64>>;
 
-    using activations_parallel_t =
-        kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
-                                 kittens::sv_bf<hidden_dim>, kittens::st_bf<64, 256>, kittens::sv_bf<head_dim>>,
-                     num_devices, false, false>;
+    // For multi-GPU: pgl wraps gl with multicast TMA descriptors.
+    // For single-GPU: gl_as_pgl provides operator[](int) compatibility
+    // so ops can use `g.field[g.dev_idx]` uniformly. No multicast init needed.
+    using activations_parallel_gl_t =
+        kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
+                    kittens::sv_bf<hidden_dim>, kittens::st_bf<64, 256>, kittens::sv_bf<head_dim>>;
+    using activations_parallel_t = std::conditional_t<(num_devices > 1),
+        kittens::pgl<activations_parallel_gl_t, num_devices, false, false>,
+        gl_as_pgl<activations_parallel_gl_t>>;
 
-    using activations_parallel_mc_t =
-        kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>>, num_devices, true, true,
-                     kittens::sv_bf<hidden_dim>>;
+    static constexpr bool enable_mc = (num_devices > 1);
+    using activations_parallel_mc_gl_t =
+        kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
+                    kittens::sv_bf<hidden_dim>>;
+    using activations_parallel_mc_t = std::conditional_t<(num_devices > 1),
+        kittens::pgl<activations_parallel_mc_gl_t, num_devices, enable_mc, enable_mc,
+                     kittens::sv_bf<hidden_dim>>,
+        gl_as_pgl<activations_parallel_mc_gl_t>>;
 
     using activations_big_indim_t =
         kittens::gl<kittens::bf16, 1, 1, -1, intermediate_dim / num_devices, kittens::st_bf<64, 256>,
@@ -160,8 +218,10 @@ struct globals_t {
                                    // kittens::tma::descriptor<kittens::st_bf<16, 128>, 0>,
                                    kittens::sv_bf<head_dim>>;
 
-    using barriers = kittens::pgl<kittens::gl<uint, -1, -1, -1, -1>, num_devices,
-                                  false>;  // no need to initialize multicast
+    using barriers_gl_t = kittens::gl<uint, -1, -1, -1, -1>;
+    using barriers = std::conditional_t<(num_devices > 1),
+        kittens::pgl<barriers_gl_t, num_devices, false>,
+        gl_as_pgl<barriers_gl_t>>;
 
     // vm stuff
     barriers Bar;
@@ -235,12 +295,14 @@ struct globals_t {
 
 typedef globals_t<llama_config, LLAMA_NUM_LAYERS, LLAMA_HIDDEN_DIM, LLAMA_INTERMEDIATE_DIM, LLAMA_HEAD_DIM,
                   LLAMA_NUM_ATTENTION_HEADS, LLAMA_NUM_KV_HEADS, LLAMA_KV_PAGE_SIZE, LLAMA_PREFILL_KV_BLOCK_SIZE,
-                  LLAMA_DECODE_KV_BLOCK_SIZE, LLAMA_MATMUL_OUT_BLOCK_SIZE, LLAMA_MATMUL_BATCH_BLOCK_SIZE, SM_COUNT>
+                  LLAMA_DECODE_KV_BLOCK_SIZE, LLAMA_MATMUL_OUT_BLOCK_SIZE, LLAMA_MATMUL_BATCH_BLOCK_SIZE, SM_COUNT,
+                  LLAMA_NUM_DEVICES>
     llama_70b_globals;
 
 typedef globals_t<llama_config_timer, LLAMA_NUM_LAYERS, LLAMA_HIDDEN_DIM, LLAMA_INTERMEDIATE_DIM, LLAMA_HEAD_DIM,
                   LLAMA_NUM_ATTENTION_HEADS, LLAMA_NUM_KV_HEADS, LLAMA_KV_PAGE_SIZE, LLAMA_PREFILL_KV_BLOCK_SIZE,
-                  LLAMA_DECODE_KV_BLOCK_SIZE, LLAMA_MATMUL_OUT_BLOCK_SIZE, LLAMA_MATMUL_BATCH_BLOCK_SIZE, SM_COUNT>
+                  LLAMA_DECODE_KV_BLOCK_SIZE, LLAMA_MATMUL_OUT_BLOCK_SIZE, LLAMA_MATMUL_BATCH_BLOCK_SIZE, SM_COUNT,
+                  LLAMA_NUM_DEVICES>
     llama_70b_globals_timer;
 
 

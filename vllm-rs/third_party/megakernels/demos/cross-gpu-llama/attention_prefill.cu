@@ -9,9 +9,7 @@ struct attention_prefill {
     static constexpr int NUM_STAGES = 2;
     static constexpr int GQA_RATIO = Globals::num_attention_heads / Globals::num_kv_heads;
     static constexpr int NUM_ATTN_HEADS_PER_DEVICE = Globals::num_attention_heads / Globals::num_devices;
-    static_assert(NUM_ATTN_HEADS_PER_DEVICE == 8, "Fix");
-
-    static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
+    static_assert(GQA_RATIO <= 16, "GQA_RATIO must fit in a 16-row tile.");
 
     static constexpr int head_dim = Globals::head_dim;
     static constexpr int kv_page_size = Globals::kv_page_size;
@@ -136,12 +134,13 @@ struct attention_prefill {
                 int batch_block_idx = prefill_info.abs_q_row / Globals::matmul_batch_block_size;
                 int batch_block_idx_last =
                     prefill_info.abs_q_row_last / Globals::matmul_batch_block_size;  // no alignment guarantees, alas
+                constexpr int qkv_q_blocks = Globals::num_attention_heads / (Globals::matmul_out_block_size / Globals::head_dim) / Globals::num_devices;
                 wait_on_barrier<Scope::GPU>(&g.Bar[g.dev_idx][{prefill_info.layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx, 0}],
-                                128, "loader QKV barrier", "dev=%d, layer=%d, batch_block=%d",
+                                qkv_q_blocks, "loader QKV barrier", "dev=%d, layer=%d, batch_block=%d",
                                 g.dev_idx, prefill_info.layer_idx, batch_block_idx);
                 if (batch_block_idx_last != batch_block_idx) {
                     wait_on_barrier<Scope::GPU>(&g.Bar[g.dev_idx][{prefill_info.layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx_last, 0}],
-                                    128, "loader QKV barrier last", "dev=%d, layer=%d, batch_block=%d",
+                                    qkv_q_blocks, "loader QKV barrier last", "dev=%d, layer=%d, batch_block=%d",
                                     g.dev_idx, prefill_info.layer_idx, batch_block_idx_last);
                 }
                 s.wait_page_ready(Q_page(s));
@@ -183,8 +182,9 @@ struct attention_prefill {
                     for (int j = q_start_idx + laneid * Globals::matmul_batch_block_size; j < q_end_idx;
                          j += WARP_THREADS * Globals::matmul_batch_block_size) {
                         int check_row = j / Globals::matmul_batch_block_size;
+                        constexpr int qkv_kv_blocks = 2 * Globals::num_kv_heads * Globals::head_dim / (Globals::num_devices * Globals::matmul_out_block_size);
                         wait_on_barrier<Scope::GPU>(&g.Bar[g.dev_idx][{prefill_info.layer_idx, OPCODE_QKV_RopeAppend - 1, check_row, 1}],
-                                        32, "loader KV barrier", "dev=%d, layer=%d, check_row=%d",
+                                        qkv_kv_blocks, "loader KV barrier", "dev=%d, layer=%d, check_row=%d",
                                         g.dev_idx, prefill_info.layer_idx, check_row);
                     }
                     warp::sync();

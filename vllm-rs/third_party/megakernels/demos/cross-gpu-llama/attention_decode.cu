@@ -36,9 +36,7 @@ struct attention_decode {
     static constexpr int NUM_STAGES = 3;
     static constexpr int GQA_RATIO = Globals::num_attention_heads / Globals::num_kv_heads;
     static constexpr int NUM_ATTN_HEADS_PER_DEVICE = Globals::num_attention_heads / Globals::num_devices;
-    static_assert(NUM_ATTN_HEADS_PER_DEVICE == 8, "Fix");
-
-    static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
+    static_assert(GQA_RATIO <= 16, "GQA_RATIO must fit in a 16-row tile.");
     static_assert(NUM_STAGES <= Config::NUM_PAGES, "Not enough pages. Time to actually use full pages.");
 
     static constexpr int head_dim = Globals::head_dim;
@@ -212,8 +210,10 @@ struct attention_decode {
                     tma::expect(K_arrived(s, seq_id, stage), K_smem);
                     if (i == 0) {
                         s.loader_record(WAIT_EVENT);
+                        // KV matmul blocks per batch_block = 2*num_kv_heads*head_dim / (num_devices * matmul_out_block_size)
+                        constexpr int qkv_kv_blocks = 2 * Globals::num_kv_heads * Globals::head_dim / (Globals::num_devices * Globals::matmul_out_block_size);
                         wait_on_barrier<Scope::GPU>(&g.Bar[g.dev_idx][{layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx, 1}],
-                                        32, "loader KV barrier", "dev=%d, layer=%d, batch_block=%d",
+                                        qkv_kv_blocks, "loader KV barrier", "dev=%d, layer=%d, batch_block=%d",
                                         g.dev_idx, layer_idx, batch_block_idx);
                         s.loader_record(READY_EVENT);
                     }
@@ -280,8 +280,10 @@ struct attention_decode {
             int batch_block_idx = batch_idx / Globals::matmul_batch_block_size;
             int kv_head_idx = get_kv_head_idx(s, seq_id);
 
+            // Q matmul blocks per batch_block = num_attention_heads / (matmul_out_block_size / head_dim) / num_devices
+            constexpr int qkv_q_blocks = Globals::num_attention_heads / (Globals::matmul_out_block_size / Globals::head_dim) / Globals::num_devices;
             wait_on_barrier<Scope::GPU>(&g.Bar[g.dev_idx][{layer_idx, OPCODE_QKV_RopeAppend - 1, batch_block_idx, 0}],
-                            128, "consumer QKV barrier", "dev=%d, layer=%d, batch_block=%d",
+                            qkv_q_blocks, "consumer QKV barrier", "dev=%d, layer=%d, batch_block=%d",
                             g.dev_idx, layer_idx, batch_block_idx);
             warp::sync();
             s.consumer_record(LOAD2_EVENT);

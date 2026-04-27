@@ -253,10 +253,24 @@ pub fn classify_positions(instances: &[OpInstance]) -> PositionRoles {
 /// kvm-ineligible (no encoder arm, OR a field-extraction failure).
 /// Handles `Loop` rows by unrolling at encode time; skips `Free`
 /// and `Alias` rows. Mirrors prim_mega's discipline.
+///
+/// `prefill_seq_info` is the per-call `(q_len, token_offset)` list
+/// the prefill attention arm needs to compute its row count and
+/// payloads (mirrors
+/// `tk_instructions::build_throughput_instructions`'s same-named
+/// argument). Pass `None` for a pure-decode bucket; pass
+/// `Some(&seq_info)` for a prefill bucket. The macro-side encoder
+/// uses this for the byte-equal correctness pin against the
+/// reference function — at real codegen time the macro is the
+/// kvm-eligibility predicate + launcher driver, and the actual
+/// runtime tape is rebuilt per forward by the launcher via
+/// `build_throughput_instructions`. This argument exists so test
+/// fixtures can supply the same seq info to both sides.
 pub fn try_encode_bucket(
     arch_opcodes: &ArchOpcodes,
     instances: &[OpInstance],
     ctx: &EncodeCtx,
+    prefill_seq_info: Option<&[(usize, usize)]>,
 ) -> Option<KvmEncodedBucket> {
     // Loop unrolling. Mirrors prim_mega's `try_encode_bucket`
     // structure: walk with explicit cursor so `Loop` can advance
@@ -306,7 +320,7 @@ pub fn try_encode_bucket(
     let _ = arch_opcodes; // shape registry consumed in P2-2 step 2 (sanity-check upfront)
 
     for (pos, (inst, layer_offset)) in unrolled.iter().enumerate() {
-        let opt_row = encode_op_arm(inst, *layer_offset, &roles, pos, ctx)?;
+        let opt_row = encode_op_arm(inst, *layer_offset, &roles, pos, ctx, prefill_seq_info)?;
         if let Some(row_or_rows) = opt_row {
             rows.extend(row_or_rows);
         }
@@ -334,6 +348,7 @@ fn encode_op_arm(
     roles: &PositionRoles,
     pos: usize,
     ctx: &EncodeCtx,
+    prefill_seq_info: Option<&[(usize, usize)]>,
 ) -> Option<Option<Vec<KvmEncodedRow>>> {
     match inst.name.to_string().as_str() {
         "RmsNorm" => {
@@ -381,35 +396,9 @@ fn encode_op_arm(
             Some(Some(encode_attention_decode(inst, layer_offset, ctx)?))
         }
 
-        // ── Prefill attention — runtime-tape follow-up ──────────
-        //
-        // `OPCODE_GQA_AttentionPrefill` rows depend on per-sequence
-        // `q_len` (one row per `(seq, q_block_of_16, kv_head)`
-        // triple). The bucket-level workload point pins
-        // `num_tokens` but NOT per-seq lengths, so prefill row
-        // counts are call-time-variable — they can't live in the
-        // static `[[i32; 32]; N]` tape the encoder would emit
-        // alongside decode rows.
-        //
-        // KVM_MAPPING.md Q2 punts this to a separate P2 follow-up.
-        // The pattern the older branch ships is to defer prefill
-        // tape construction to the launcher: the launcher calls
-        // `tk_instructions::build_throughput_instructions(...,
-        // Some(&seq_info))` per forward and copies the resulting
-        // `Vec<i32>` into the device tape buffer. The encoder
-        // emits **the structural envelope** (the layer index +
-        // attached metadata) and the launcher fills in the rows.
-        // That re-shape isn't done here yet; for now, prefill IR
-        // variants panic so any canonical containing them can't
-        // be marked kvm-eligible by accident.
-        "AttentionPrefillContiguous" | "FlashInferAttentionPrefill" => unimplemented!(
-            "kvm_mega encoder: prefill attention arm `{}` not \
-             yet implemented — KVM_MAPPING.md Q2 follow-up. \
-             Prefill row counts depend on per-call seq_info, so \
-             this arm needs the runtime-tape design (launcher \
-             rebuilds rows per forward) before landing.",
-            inst.name
-        ),
+        "AttentionPrefillContiguous" | "FlashInferAttentionPrefill" => Some(Some(
+            encode_attention_prefill(inst, layer_offset, ctx, prefill_seq_info)?,
+        )),
 
         // ── Kvm-ineligible (no TK opcode) — see KVM_MAPPING.md ──
         //
@@ -794,6 +783,75 @@ fn encode_attention_decode(
     Some(out)
 }
 
+/// `AttentionPrefillContiguous(in, out, layer, ?, ?)` and
+/// `FlashInferAttentionPrefill(in, out, layer, ?, ?, ?, ?)`
+/// → `OPCODE_GQA_AttentionPrefill`. Fixed 6-int payload per
+/// `attention_prefill.cu:42-46`:
+///
+/// ```text
+/// [opcode, layer, seq_idx, prefill_block_idx,
+///  prefill_token_offset, kv_head_idx, 0, …, 0]
+/// ```
+///
+/// One row per `(seq_idx, q_block_of_16, kv_head_idx)` triple. Per
+/// `tk_instructions.rs:111-130` the loop order is outer
+/// `seq_idx` → `kv_head` → `q_block`; we mirror that exactly so
+/// the byte-equal pin holds.
+///
+/// ### `prefill_seq_info`
+///
+/// `prefill_seq_info[seq_idx] = (q_len, token_offset)` —
+/// `token_offset = seqused_k - num_q_tokens` for that seq
+/// (post-history-append). This data is per-call; the macro only
+/// receives it via the encoder driver argument so test fixtures
+/// can byte-compare against the reference. Real codegen passes
+/// `None` and the launcher rebuilds the prefill tape per forward
+/// via `tk_instructions::build_throughput_instructions`.
+///
+/// `None` → return an empty Vec (the canonical is structurally
+/// kvm-eligible; row construction is just deferred). `Some(&[])`
+/// → also empty Vec (no sequences to encode).
+fn encode_attention_prefill(
+    inst: &OpInstance,
+    layer_offset: u32,
+    _ctx: &EncodeCtx,
+    prefill_seq_info: Option<&[(usize, usize)]>,
+) -> Option<Vec<KvmEncodedRow>> {
+    let _in_slot = parse_u32_literal(&inst.field_values[0])?;
+    let _out_slot = parse_u32_literal(&inst.field_values[1])?;
+    let layer_baseline = parse_u32_literal(&inst.field_values[2])?;
+    let layer = (layer_baseline + layer_offset) as i32;
+
+    let Some(seq_info) = prefill_seq_info else {
+        // No SeqInfo at codegen time — structural eligibility
+        // confirmed; rows built at runtime by the launcher. Return
+        // empty Vec (NOT `None`, which would mark this canonical
+        // kvm-ineligible).
+        return Some(Vec::new());
+    };
+
+    // num_kv_heads is on EncodeCtx but the decode arm threads it via
+    // the same struct; mirror that.
+    let num_kv_heads = _ctx.num_kv_heads as usize;
+
+    let mut out = Vec::new();
+    for (seq_idx, &(q_len, token_offset)) in seq_info.iter().enumerate() {
+        let num_q_blocks = q_len.div_ceil(16);
+        for kv_head in 0..num_kv_heads {
+            for q_block in 0..num_q_blocks {
+                let mut row = KvmEncodedRow::new(OPCODE_GQA_ATTENTION_PREFILL);
+                row.payload[1] = layer;
+                row.payload[2] = seq_idx as i32;
+                row.payload[3] = q_block as i32;
+                row.payload[4] = token_offset as i32;
+                row.payload[5] = kv_head as i32;
+                out.push(row);
+            }
+        }
+    }
+    Some(out)
+}
+
 // ── Helpers (private) ───────────────────────────────────────────
 
 /// Extract a `u32` literal from a TokenStream that's expected to
@@ -997,6 +1055,34 @@ mod tests {
         )
     }
 
+    fn attention_prefill_contiguous_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        op(
+            "AttentionPrefillContiguous",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                u32_lit(0),               // ?
+                "false".parse().unwrap(), // ?
+            ],
+        )
+    }
+
+    fn flashinfer_attention_prefill_inst(in_slot: u32, out_slot: u32, layer: u32) -> OpInstance {
+        op(
+            "FlashInferAttentionPrefill",
+            vec![
+                u32_lit(in_slot),
+                u32_lit(out_slot),
+                u32_lit(layer),
+                u32_lit(0),
+                u32_lit(0),
+                u32_lit(0),
+                "false".parse().unwrap(),
+            ],
+        )
+    }
+
     fn cutlass_gemm_inst(
         in_slot: u32,
         out_slot: u32,
@@ -1111,7 +1197,7 @@ mod tests {
             gemm_add_inst(6, 7, 7, "Weights::mlp_down_proj", 128, 128, 3),
             rms_norm_inst(8, 9, 0, "Weights::norm"),
         ];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None)
             .expect("AttnNorm + GemmAdd has kvm arms");
         // Row counts: norms = 3 × batch_size (128) = 384;
         // gemm_adds = 2 × num_batch_blocks(1) × num_output_blocks(8) = 16.
@@ -1138,7 +1224,8 @@ mod tests {
             gemm_add_inst(6, 7, 3, "Weights::mlp_down_proj", 128, 128, 3),
             rms_norm_inst(8, 9, 0, "Weights::norm"),
         ];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b()).expect("kvm arms registered");
+        let bucket =
+            try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None).expect("kvm arms registered");
         // batch_size=128 norm rows, then 8 O_Proj rows, then 128
         // norm rows, then 8 DownProj rows, then 128 LmHeadNorm rows.
         let o_proj_start = 128;
@@ -1169,7 +1256,7 @@ mod tests {
             // to 0 because role==LmHead.
             rms_norm_inst(8, 9, 42, "Weights::norm"),
         ];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b()).unwrap();
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None).unwrap();
         let lm_head_start = bucket.rows.len() - 128;
         for row in &bucket.rows[lm_head_start..] {
             assert_eq!(row.opcode(), OPCODE_LM_HEAD_NORM);
@@ -1186,7 +1273,7 @@ mod tests {
     fn qkv_rope_cache_emits_qkv_rope_append() {
         let arch = arch_with_norm_and_gemm_add();
         let prog = vec![qkv_rope_cache_inst(0, 1, 5)];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None)
             .expect("FusedQkvRopeCache has a kvm arm");
         assert_eq!(bucket.rows.len(), 12);
         for (i, row) in bucket.rows.iter().enumerate() {
@@ -1208,10 +1295,20 @@ mod tests {
     #[test]
     fn qkv_rope_prefill_uses_same_opcode_and_layout() {
         let arch = arch_with_norm_and_gemm_add();
-        let decode_bucket =
-            try_encode_bucket(&arch, &[qkv_rope_cache_inst(0, 1, 7)], &ctx_llama_1b()).unwrap();
-        let prefill_bucket =
-            try_encode_bucket(&arch, &[qkv_rope_prefill_inst(0, 1, 7)], &ctx_llama_1b()).unwrap();
+        let decode_bucket = try_encode_bucket(
+            &arch,
+            &[qkv_rope_cache_inst(0, 1, 7)],
+            &ctx_llama_1b(),
+            None,
+        )
+        .unwrap();
+        let prefill_bucket = try_encode_bucket(
+            &arch,
+            &[qkv_rope_prefill_inst(0, 1, 7)],
+            &ctx_llama_1b(),
+            None,
+        )
+        .unwrap();
         assert_eq!(decode_bucket.rows, prefill_bucket.rows);
     }
 
@@ -1224,7 +1321,7 @@ mod tests {
     fn gate_up_silu_mul_splits_into_two_opcodes_in_order() {
         let arch = arch_with_norm_and_gemm_add();
         let prog = vec![gate_up_silu_mul_inst(0, 1, 11)];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None)
             .expect("FusedGateUpSiluMul has a kvm arm");
         assert_eq!(bucket.rows.len(), 64);
         for row in &bucket.rows[..32] {
@@ -1251,7 +1348,7 @@ mod tests {
     fn attention_decode_emits_single_batched_row_for_small_workload() {
         let arch = arch_with_norm_and_gemm_add();
         let prog = vec![attention_via_cache_inst(0, 1, 9)];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b())
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None)
             .expect("AttentionViaCache has a kvm arm");
         assert_eq!(bucket.rows.len(), 1);
         let row = &bucket.rows[0];
@@ -1274,7 +1371,7 @@ mod tests {
         let mut ctx = ctx_llama_1b();
         ctx.num_tokens = 4;
         let prog = vec![attention_via_cache_inst(0, 1, 0)];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx).unwrap();
+        let bucket = try_encode_bucket(&arch, &prog, &ctx, None).unwrap();
         assert_eq!(bucket.rows.len(), 3);
         assert_eq!(bucket.rows[0].payload[2], 28); // 14 pairs × 2
         assert_eq!(bucket.rows[1].payload[2], 28);
@@ -1299,13 +1396,18 @@ mod tests {
     #[test]
     fn flashinfer_attention_decode_uses_same_opcode_and_layout() {
         let arch = arch_with_norm_and_gemm_add();
-        let legacy =
-            try_encode_bucket(&arch, &[attention_via_cache_inst(0, 1, 7)], &ctx_llama_1b())
-                .unwrap();
+        let legacy = try_encode_bucket(
+            &arch,
+            &[attention_via_cache_inst(0, 1, 7)],
+            &ctx_llama_1b(),
+            None,
+        )
+        .unwrap();
         let fi = try_encode_bucket(
             &arch,
             &[flashinfer_attention_decode_inst(0, 1, 7)],
             &ctx_llama_1b(),
+            None,
         )
         .unwrap();
         assert_eq!(legacy.rows, fi.rows);
@@ -1324,7 +1426,7 @@ mod tests {
         let mut ctx = ctx_llama_1b();
         ctx.vocab_size = 32_768; // 128 × 256, integer-clean
         let prog = vec![cutlass_gemm_inst(0, 1, 42, "Weights::lm_head", 128, 128, 3)];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx)
+        let bucket = try_encode_bucket(&arch, &prog, &ctx, None)
             .expect("CutlassGemm has a kvm arm at LM_Head position");
         let num_logit_blocks = 32_768 / 256; // 128
         assert_eq!(bucket.rows.len(), num_logit_blocks);
@@ -1379,7 +1481,7 @@ mod tests {
         ];
 
         let arch = arch_with_norm_and_gemm_add();
-        let bucket = try_encode_bucket(&arch, &prog, &ctx)
+        let bucket = try_encode_bucket(&arch, &prog, &ctx, None)
             .expect("full-layer decode IR has all kvm arms landed");
 
         // Flatten Vec<KvmEncodedRow> to Vec<i32> in row order.
@@ -1411,6 +1513,161 @@ mod tests {
             reference.len() / INSTRUCTION_WIDTH
         );
         // Compare row-by-row to make divergences readable.
+        for (row_idx, (ours_row, ref_row)) in ours
+            .chunks(INSTRUCTION_WIDTH)
+            .zip(reference.chunks(INSTRUCTION_WIDTH))
+            .enumerate()
+        {
+            assert_eq!(
+                ours_row, ref_row,
+                "row {row_idx} diverges from reference: ours={ours_row:?}, ref={ref_row:?}"
+            );
+        }
+    }
+
+    /// `None` SeqInfo for a prefill arm = canonical structurally
+    /// kvm-eligible, rows deferred to launcher. Empty Vec, NOT
+    /// `None` from `try_encode_bucket` (which would mark
+    /// kvm-ineligible).
+    #[test]
+    fn attention_prefill_with_none_seq_info_returns_empty() {
+        let arch = arch_with_norm_and_gemm_add();
+        let prog = vec![attention_prefill_contiguous_inst(0, 1, 0)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), None)
+            .expect("AttentionPrefillContiguous is structurally kvm-eligible");
+        assert!(
+            bucket.rows.is_empty(),
+            "no SeqInfo at codegen → empty rows; launcher rebuilds at runtime"
+        );
+    }
+
+    /// Synthetic SeqInfo: 2 sequences, q_lens [16, 24], offsets
+    /// [0, 32]. With ctx num_kv_heads=8 and the
+    /// `tk_instructions.rs:111-130` loop order
+    /// (seq → kv_head → q_block):
+    ///   - Seq 0: 16 q-tokens → ⌈16/16⌉=1 q-block × 8 kv heads = 8
+    ///   - Seq 1: 24 q-tokens → ⌈24/16⌉=2 q-blocks × 8 kv heads = 16
+    ///
+    /// Total: 24 rows.
+    #[test]
+    fn attention_prefill_with_seq_info_emits_per_q_block_rows() {
+        let arch = arch_with_norm_and_gemm_add();
+        let seq_info: Vec<(usize, usize)> = vec![(16, 0), (24, 32)];
+        let prog = vec![attention_prefill_contiguous_inst(0, 1, 5)];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b(), Some(&seq_info)).unwrap();
+        assert_eq!(bucket.rows.len(), 8 + 16);
+        // Seq 0's 8 rows: q_block=0 fixed, kv_head varies 0..8.
+        for kv_head in 0..8 {
+            let row = &bucket.rows[kv_head];
+            assert_eq!(row.opcode(), OPCODE_GQA_ATTENTION_PREFILL);
+            assert_eq!(row.payload[1], 5); // layer
+            assert_eq!(row.payload[2], 0); // seq_idx
+            assert_eq!(row.payload[3], 0); // q_block_idx
+            assert_eq!(row.payload[4], 0); // token_offset
+            assert_eq!(row.payload[5], kv_head as i32);
+        }
+        // Seq 1's 16 rows: kv_head=0 first (q_block 0 then 1), kv_head=1 next, …
+        let row = &bucket.rows[8]; // first row of seq 1: kv_head=0, q_block=0
+        assert_eq!(row.payload[2], 1); // seq_idx
+        assert_eq!(row.payload[3], 0); // q_block_idx
+        assert_eq!(row.payload[4], 32); // token_offset
+        assert_eq!(row.payload[5], 0); // kv_head
+        let row = &bucket.rows[9]; // q_block=1 within same kv_head
+        assert_eq!(row.payload[3], 1);
+        assert_eq!(row.payload[5], 0);
+        let row = &bucket.rows[10]; // back to q_block=0, kv_head=1
+        assert_eq!(row.payload[3], 0);
+        assert_eq!(row.payload[5], 1);
+    }
+
+    /// `FlashInferAttentionPrefill` shares opcode + row layout with
+    /// `AttentionPrefillContiguous`. Same SeqInfo → same rows.
+    #[test]
+    fn flashinfer_attention_prefill_uses_same_opcode_and_layout() {
+        let arch = arch_with_norm_and_gemm_add();
+        let seq_info: Vec<(usize, usize)> = vec![(8, 0)];
+        let legacy = try_encode_bucket(
+            &arch,
+            &[attention_prefill_contiguous_inst(0, 1, 3)],
+            &ctx_llama_1b(),
+            Some(&seq_info),
+        )
+        .unwrap();
+        let fi = try_encode_bucket(
+            &arch,
+            &[flashinfer_attention_prefill_inst(0, 1, 3)],
+            &ctx_llama_1b(),
+            Some(&seq_info),
+        )
+        .unwrap();
+        assert_eq!(legacy.rows, fi.rows);
+    }
+
+    /// **Capstone pin (prefill):** byte-equal comparison against
+    /// `tk_instructions::build_throughput_instructions` with
+    /// `Some(&seq_info)`. Mirrors `full_layer_decode_…` exactly,
+    /// but with the prefill IR variants in the QKV + attention
+    /// slots and a synthetic SeqInfo. Locks the prefill arm + the
+    /// per-call SeqInfo threading against the older branch's
+    /// known-good shipping path.
+    #[test]
+    fn full_layer_prefill_byte_equal_to_reference_tk_instructions() {
+        use ferrite_forward::tk_instructions::build_throughput_instructions;
+
+        let ctx = ctx_llama_1b();
+        let num_layers = 1usize;
+        let num_attention_heads = 32usize;
+
+        // Synthetic prefill batch: 4 sequences, varying q_lens and
+        // offsets. Total prefill q-tokens = 16+8+24+1 = 49 (would
+        // be ctx.num_tokens at the workload point in real use; for
+        // this test num_tokens stays at 1 since we're pinning the
+        // tape-shape contract, not the launcher path).
+        let seq_info: Vec<(usize, usize)> = vec![(16, 0), (8, 16), (24, 0), (1, 100)];
+
+        let prog: Vec<OpInstance> = vec![
+            rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
+            qkv_rope_prefill_inst(2, 3, 0),
+            attention_prefill_contiguous_inst(4, 5, 0),
+            gemm_add_inst(6, 7, 0, "Weights::self_attn_o_proj", 128, 128, 3),
+            rms_norm_inst(8, 9, 0, "Weights::post_attention_layernorm"),
+            gate_up_silu_mul_inst(10, 11, 0),
+            gemm_add_inst(12, 13, 0, "Weights::mlp_down_proj", 128, 128, 3),
+            rms_norm_inst(14, 15, 0, "Weights::norm"),
+            cutlass_gemm_inst(16, 17, 0, "Weights::lm_head", 128, 128, 3),
+        ];
+
+        let arch = arch_with_norm_and_gemm_add();
+        let bucket = try_encode_bucket(&arch, &prog, &ctx, Some(&seq_info))
+            .expect("full-layer prefill IR has all kvm arms landed");
+
+        let mut ours: Vec<i32> = Vec::with_capacity(bucket.rows.len() * INSTRUCTION_WIDTH);
+        for row in &bucket.rows {
+            ours.extend_from_slice(&row.payload);
+        }
+
+        let reference = build_throughput_instructions(
+            ctx.batch_size as usize,
+            ctx.num_tokens as usize,
+            num_layers,
+            num_attention_heads,
+            ctx.num_kv_heads as usize,
+            ctx.head_size as usize,
+            ctx.hidden_size as usize,
+            ctx.intermediate_size as usize,
+            ctx.vocab_size as usize,
+            ctx.matmul_batch_block_size as usize,
+            ctx.matmul_out_block_size as usize,
+            Some(&seq_info),
+        );
+
+        assert_eq!(
+            ours.len(),
+            reference.len(),
+            "tape length mismatch: ours={} rows × 32, ref={} rows × 32",
+            ours.len() / INSTRUCTION_WIDTH,
+            reference.len() / INSTRUCTION_WIDTH
+        );
         for (row_idx, (ours_row, ref_row)) in ours
             .chunks(INSTRUCTION_WIDTH)
             .zip(reference.chunks(INSTRUCTION_WIDTH))

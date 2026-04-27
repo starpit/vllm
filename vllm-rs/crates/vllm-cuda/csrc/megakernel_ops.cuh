@@ -186,58 +186,6 @@ __device__ void dc_fused_add_rms_norm(
     }
 }
 
-// ── GEMV (device-callable, bf16) ──────────────────────────────
-//
-// y[j] = alpha * W[j,K] @ x[K] + beta * C[j]
-// One CTA per output element (row of W). Threads cooperatively
-// reduce over K. W is [N,K] row-major (our GEMM's B transposed).
-
-template <typename T>
-__device__ void dc_gemv(
-    T* __restrict__ out,         // [N]
-    const T* __restrict__ x,     // [K]
-    const T* __restrict__ W,     // [N, K] row-major
-    int N, int K,
-    float alpha, float beta,
-    int num_rows)                // bounds check (= N in normal use)
-{
-    const int row = blockIdx.x;
-    if (row >= num_rows || row >= N) return;
-
-    constexpr int VEC_SIZE = VecType<T>::SIZE;
-
-    const T* w_row = W + row * K;
-    const int num_vecs = K / VEC_SIZE;
-    const int tail_start = num_vecs * VEC_SIZE;
-
-    // Accumulate dot product.
-    float acc = 0.0f;
-    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
-        float wbuf[VEC_SIZE], xbuf[VEC_SIZE];
-        unpack_vec<T>(vec_load(&w_row[vi * VEC_SIZE]), wbuf);
-        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), xbuf);
-        #pragma unroll
-        for (int j = 0; j < VEC_SIZE; j++) {
-            acc += wbuf[j] * xbuf[j];
-        }
-    }
-    // Scalar tail.
-    for (int i = tail_start + threadIdx.x; i < K; i += blockDim.x) {
-        acc += static_cast<float>(w_row[i]) * static_cast<float>(x[i]);
-    }
-
-    // Block-wide reduction.
-    acc = dc_block_reduce_sum(acc);
-
-    if (threadIdx.x == 0) {
-        float result = alpha * acc;
-        if (beta != 0.0f) {
-            result += beta * static_cast<float>(out[row]);
-        }
-        out[row] = static_cast<T>(result);
-    }
-}
-
 // ── Fused QKV + RoPE + KV cache write (device-callable, decode) ─
 //
 // One CTA per token. Reads from packed QKV output, applies rotary

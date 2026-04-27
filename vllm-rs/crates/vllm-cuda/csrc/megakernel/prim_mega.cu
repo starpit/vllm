@@ -43,6 +43,7 @@
 #include "../cutlass_gemm_configs.cuh"
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/kernel/gemv.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 
 // FlashInfer DC. Header carries the
@@ -82,6 +83,20 @@ namespace prim_mega_cutlass_configs {
         STAGES>;
 CUTLASS_DC_GEMM_LIST(DC_GEMM_TYPEDEF)
 #undef DC_GEMM_TYPEDEF
+
+// CUTLASS GEMV kernel — single config, M=1 only. Mirrors
+// `GemvKernel_8` in cutlass_standalone_gemm.cu so the CSV-calibrated
+// "cutlass_gemv" cost row matches what the megakernel actually runs.
+// Same kElementsPerAccess (8) — max bf16 vectorized load. Epilogue
+// is `LinearCombination<bf16, 1, float, float>` (kElementsPerAccess=1
+// matches the host launcher's epilogue config).
+using DcGemvKernel_bf16_8 = cutlass::gemm::kernel::Gemv<
+    cutlass::bfloat16_t, cutlass::layout::RowMajor,
+    cutlass::bfloat16_t, cutlass::bfloat16_t,
+    float,
+    cutlass::epilogue::thread::LinearCombination<
+        cutlass::bfloat16_t, 1, float, float>,
+    8>;
 
 }  // namespace prim_mega_cutlass_configs
 
@@ -261,25 +276,32 @@ __device__ __forceinline__ void run_cutlass_gemm(const int* row, void* const* pt
 }
 
 // ── GEMV (M=1) ──────────────────────────────────────────────────
-// row[1]: ptr_idx out
-// row[2]: ptr_idx x (input vector)
-// row[3]: ptr_idx W (weight matrix [N, K] row-major)
+// row[1]: ptr_idx out (= C, [1, N])
+// row[2]: ptr_idx x (= A, [1, K] input vector)
+// row[3]: ptr_idx W (= B, [N, K] row-major weight)
 // row[4]: N
 // row[5]: K
 // row[6]: alpha as float-bit pattern
 // row[7]: beta  as float-bit pattern
-// row[8]: num_rows (active CTA count, normally = N)
-template <typename T>
+// row[8]: smem byte offset (reserved; CUTLASS GEMV's SharedStorage is empty)
+//
+// Dispatches to the CUTLASS-based `dc_cutlass::dc_gemv` (matches the
+// host's `cutlass_gemv_launch` exactly so the CSV-calibrated
+// "cutlass_gemv" cost row reflects megakernel runtime). M is implicit
+// (=1) — out-of-contract M != 1 silently no-ops inside the template,
+// mirroring the host launcher's `if (M != 1) return -10`.
 __device__ __forceinline__ void run_gemv(const int* row, void* const* pt) {
-    T* out         = reinterpret_cast<T*>(pt[row[1]]);
-    const T* x     = reinterpret_cast<const T*>(pt[row[2]]);
-    const T* W     = reinterpret_cast<const T*>(pt[row[3]]);
-    int N          = row[4];
-    int K          = row[5];
-    float alpha    = __int_as_float(row[6]);
-    float beta     = __int_as_float(row[7]);
-    int num_rows   = row[8];
-    dc_gemv<T>(out, x, W, N, K, alpha, beta, num_rows);
+    extern __shared__ char smem[];
+    void* C       = pt[row[1]];
+    const void* A = pt[row[2]];
+    const void* B = pt[row[3]];
+    int N         = row[4];
+    int K         = row[5];
+    float alpha   = __int_as_float(row[6]);
+    float beta    = __int_as_float(row[7]);
+    char* op_smem = smem + row[8];
+    dc_cutlass::dc_gemv<prim_mega_cutlass_configs::DcGemvKernel_bf16_8>(
+        C, A, B, /*M=*/1, N, K, alpha, beta, op_smem);
 }
 
 // Persistent kernel. Walks the tape sequentially; one row per op.
@@ -312,7 +334,7 @@ __global__ void prim_mega_llama_kernel(const int* __restrict__ tape,
                 run_silu_and_mul<__nv_bfloat16>(row, pt);
                 break;
             case OP_GEMV:
-                run_gemv<__nv_bfloat16>(row, pt);
+                run_gemv(row, pt);
                 break;
             case OP_CUTLASS_GEMM:
                 run_cutlass_gemm(row, pt);

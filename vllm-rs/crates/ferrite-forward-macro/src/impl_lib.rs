@@ -2415,6 +2415,7 @@ pub fn starter_library() -> ImplementationLibrary {
     }
 
     lib.push(Box::new(CutlassGemvImpl));
+    lib.push(Box::new(DcCutlassGemvImpl));
 
     // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
     //
@@ -9253,6 +9254,98 @@ impl Implementation for CutlassGemvImpl {
     }
 }
 
+// ── DcCutlassGemvImpl ────────────────────────────────────────────
+//
+// PrimMega sibling to [`CutlassGemvImpl`]. Singleton (M=1 only).
+// Delegates everything to the host counterpart: cost reads the same
+// `cutlass_gemv` CSV row, matches/fan_out structurally identical.
+// Override only launch_kind (DeviceCallable), megakernel_fit
+// (Primitive), target_compatible (adds prim_mega_compatible >= 90),
+// and the in/out handoff lists (DC_HANDOFFS). The C++ side is
+// `dc_cutlass::dc_gemv<DcGemvKernel_bf16_8>` in
+// `vllm-cuda/csrc/megakernel/prim_mega.cu`, parameterized on the
+// same kernel typedef the host's `cutlass_gemv_launch` uses — so
+// the megakernel-runtime cost matches the calibrated CSV row.
+
+#[derive(Debug, Default)]
+pub struct DcCutlassGemvImpl;
+
+impl Implementation for DcCutlassGemvImpl {
+    fn name(&self) -> &'static str {
+        "dc_cutlass_gemv"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && CutlassGemvImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        CutlassGemvImpl.workload_constraint()
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        CutlassGemvImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        CutlassGemvImpl.cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        CutlassGemvImpl.resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        CutlassGemvImpl.input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        CutlassGemvImpl.output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        CutlassGemvImpl.is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        CutlassGemvImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        CutlassGemvImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        CutlassGemvImpl.required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        CutlassGemvImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        CutlassGemvImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
 // ── Marlin* impls ────────────────────────────────────────────────
 //
 // Quant-aware mirrors of `GemmRefImpl`, `FusedGateUpSiluMulImpl`,
@@ -14053,6 +14146,11 @@ mod tests {
             };
             assert_share_opcode_shape(&host, &dc);
         }
+    }
+
+    #[test]
+    fn dc_cutlass_gemv_share_opcode_shape() {
+        assert_share_opcode_shape(&CutlassGemvImpl, &DcCutlassGemvImpl);
     }
 
     /// Pins `vllm-cuda/csrc/cutlass_gemm_configs.cuh`'s

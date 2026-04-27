@@ -519,11 +519,22 @@ fn build_cutlass_gemm_bias(cache_dir: &str, rerun_files: &mut Vec<String>) {
 #[cfg(feature = "cuda")]
 #[allow(dead_code)] // disabled on ff-interpreter; see call site in main()
 fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    // Source roots, in priority order:
+    //   1. cache dir (`~/.cache/cudaforge/megakernels/`) — macro-emitted
+    //      .cu files for per-arch persistent kernels (Phase 2 KvmMega
+    //      template instantiations, eventually).
+    //   2. tree-resident `crates/vllm-cuda/csrc/megakernel/` — hand-
+    //      authored .cu files for Phase 1 PrimMega persistent kernels.
+    //
+    // Both feed the same nvcc invocation and link into one
+    // `libmegakernels.a`. See `MEGA_HANDOFF.md` for the locked
+    // design (macro-emitted launcher + vendored .cu only — runtime
+    // crate carries no mega types).
     let megakernel_cache = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");
 
-    let megakernel_cus: Vec<String> = if megakernel_cache.exists() {
+    let mut megakernel_cus: Vec<String> = if megakernel_cache.exists() {
         std::fs::read_dir(&megakernel_cache)
             .into_iter()
             .flatten()
@@ -534,6 +545,19 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     } else {
         vec![]
     };
+
+    let tree_megakernel_dir = std::path::Path::new("../../crates/vllm-cuda/csrc/megakernel");
+    if tree_megakernel_dir.exists() {
+        for entry in std::fs::read_dir(tree_megakernel_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry.path().extension().is_some_and(|ext| ext == "cu") {
+                megakernel_cus.push(entry.path().display().to_string());
+            }
+        }
+    }
 
     if megakernel_cus.is_empty() {
         return;

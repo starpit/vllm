@@ -9,11 +9,85 @@
 
 ## Where we are
 
-Phase 1 work order steps 1–5 done + DC siblings partially landed
-+ step 8 trace half + cost model now picks DC on Hopper / host
-on Ada (principled, not push-order). Tip
-`3f700439f`. Nine commits on `feat/rust` past the host-pivot
-baseline:
+Phase 1 work order steps 1–5 done + cost model picks DC on Hopper /
+host on Ada (principled, not push-order) + **DC coverage corrected
+to wholesale-per-kernel for every CUTLASS family the kernel-level
+Params allows**. Tip `b080a097d`. Thirteen commits on `feat/rust`
+past the host-pivot baseline.
+
+**Architecture decision (2026-04-27):** PrimMega stays whole-forward
++ opcode tape (current `prim_mega.cu` shape), NOT per-layer inline
+kernels (older `worktree-ferrite-mega` branch's pattern). PrimMega is
+**scaffolding for KvmMega**, not a perf path. KvmMega's vendor design
+(`~/Megakernels/include/controller/instruction_fetch.cuh`) is a
+per-SM instruction tape with opcode dispatch — PrimMega mirrors that
+shape so the encoder + launcher + slot conventions transfer when
+KvmMega lands. Per-layer inline would build the wrong muscle. See
+`feedback_prim_mega_is_scaffolding`. **Do not optimize PrimMega**;
+its job is to prove the infra end-to-end with the smallest possible
+delta from KvmMega's eventual shape.
+
+**DC coverage corrective sweep (`8d8ab1f9f`..`b080a097d`):** the
+"wholesale CUTLASS DC fan-out" framing in `9a66f06b3` shipped a
+subset (11 of 16 host tiles + dead s2 entries with no host
+counterpart) — violation of `feedback_no_piecemeal_codegen_migration`.
+Corrected wholesale-per-kernel:
+
+- `8d8ab1f9f` — bf16-generic family: dropped `CUTLASS_DC_TILE_ZOO`
+  carve-out; DC and host registrations both iterate
+  `CUTLASS_TILE_ZOO` so drift is structurally impossible. Pin tests
+  `dc_zoo_equals_host_zoo` (parses .cuh X-macro, asserts equality)
+  + `dc_cutlass_name_covers_full_zoo` (every entry has a non-
+  `unknown` `name()` arm).
+- `3e4723f10` — `CutlassGemmAdd` × 16 tiles: same `device::Gemm`
+  underlying class as bare GEMM (residual-add is a runtime
+  `beta=1.0`), reuses existing `dc_gemm` template — pure Rust DC
+  sibling, no new C++.
+- `61bb767d9` — `CutlassGemv` (singleton M=1): new `dc_gemv` C++
+  template wrapping `kernel::Gemv` with `DcGemvKernel_bf16_8`
+  matching the standalone's `GemvKernel_8`. Caveat:
+  `kernel::Gemv::Arguments` constructor isn't `CUTLASS_HOST_DEVICE`
+  (CUTLASS oversight vs `kernel::Gemm`); worked around via raw-
+  byte placement + field-by-field assignment. Hand-rolled
+  placeholder `dc_gemv` in `megakernel_ops.cuh` deleted.
+- `b080a097d` — `CutlassGemmSplitK` × 12 (tile, split_k) tuples:
+  two-phase wholesale. New `dc_gemm_splitk` template inlines
+  `kernel::GemmSplitKParallel` then `cg::this_grid().sync()` then
+  `kernel::ReduceSplitK` — both Params constructors are
+  `CUTLASS_HOST_DEVICE` in CUTLASS. Workspace contract: caller-
+  supplied `[split_k, M, N]` float scratch, threaded via the
+  pointer table at encoder-emission time. `OP_CUTLASS_GEMM_SPLITK`
+  opcode + `CUTLASS_DC_SPLITK_LIST` X-macro list pinned to
+  `CUTLASS_SPLITK_ZOO` by `dc_splitk_zoo_equals_host_zoo`.
+
+**Hard constraint — three CUTLASS impls stay HostCallback-only:**
+
+- `CutlassFusedGemmBiasImpl` (singleton EVT bias-fused)
+- `CutlassFusedGateUpSiluMulImpl` (singleton MLP fusion)
+- All sm90 kernels (`Gemm_sm90_*` Cooperative / WS / Pingpong /
+  Coop2x1) — the H100-native TMA + warp-specialized path
+
+All three use `cutlass::gemm::device::GemmUniversalAdapter<KernelType>`
+whose kernel-level `kernel::GemmUniversal::Params` constructor takes
+runtime device properties (`device_sms`, `sm_occupancy`) and is
+`__host__` only by CUTLASS design — see `cutlass/gemm/kernel/
+gemm_universal.h:303–324` and `UniversalParamsBase`'s scheduler-
+partitioning logic. Plus `cudaMallocAsync` workspace via
+`gemm_op.get_workspace_size`. Forking CUTLASS to add
+`CUTLASS_HOST_DEVICE` would be invasive (affects every CUTLASS
+consumer). User has explicitly declined the fork. Per the per-kernel
+rule in `feedback_no_piecemeal_codegen_migration`, these stay
+HostCallback-only — that's "this kernel doesn't have a DC form",
+not a half-DC violation. See `feedback_gemm_universal_not_dc_able`.
+
+**Implication for Hopper:** PrimMega-on-Hopper dispatches to the
+sm80-shape `device::Gemm` family (which IS DC-able —
+`kernel::Gemm::Params` is `CUTLASS_HOST_DEVICE`). The wgmma+TMA
+sm90-native perf path is left to KvmMega (which will author TK
+templates DC-friendly from the start, via the vendored
+Megakernels infrastructure).
+
+### Earlier nine commits (now-historical foundation):
 
 - `f7249aaae` — vendor `Megakernels` (throughput@`91eaff262`) +
   `ThunderKittens` (`0b55588d2`) under `vllm-rs/third_party/`.
@@ -279,30 +353,33 @@ reflects the actual landed sequence + remaining gaps.
    `prim_mega_llama_kernel` + `prim_mega_llama_launch` (cooperative
    launch). Arms: rms_norm / fused_add_rms_norm / qkv_rope_cache
    / silu_and_mul / gemv / cutlass_gemm. `e9c489c6e`.
-🟡 4 + 10. **DC sibling audit + wholesale wrapping.** Audit
-   correction landed: all CUTLASS host launchers + all FlashInfer
-   `fi_run_*` configs ARE wholesale-DC-able. The earlier
-   "0 eligible" finding was wrong on FlashInfer (missed the
-   `static __device__ Run` methods on
-   `persistent.cuh:181 + 488`).
-   Done:
+✅ 4 + 10. **DC sibling audit + wholesale-per-kernel wrapping.**
+   Every CUTLASS host launcher whose kernel-level `Params` is
+   `CUTLASS_HOST_DEVICE` constructible has a DC sibling. The few
+   that aren't (GemmUniversalAdapter family) stay HostCallback-only
+   per the per-kernel rule.
    - CUTLASS DC pattern (`dc_cutlass.cuh`) — `a2924e765`.
-   - 18 standard tile fan-out via X-macro
-     (`cutlass_gemm_configs.cuh`) — `9a66f06b3`.
-   - FI DC template (`dc_flashinfer.cuh`) — `cd9fd897c`.
-   Remaining:
-   - CUTLASS deep-pipeline (s5+) variants, 32x* small-M,
-     K64 / W8 / swizzle / silu / GEMV / splitK / splitK_K64,
-     sm90 GemmUniversalAdapter. Each needs its own typedef macro
-     shape; the GEMV case especially is its own beast (see the
-     `cutlass_gemv_launch` shape in cutlass_standalone_gemm.cu
-     line 521–574 — uses `gemm::kernel::Gemv` not
-     `gemm::device::Gemm`).
-   - FI DC arm in prim_mega.cu + the host-side params marshaling
-     (copy `plan->params_1` / `params_2` from
-     `flashinfer_shim.cu.j2`'s `FlashInferPlan` to a device-
-     resident buffer; encoder emits `OP_FI_PAGED_ATTN` row with
-     pt[] indices for the two Params blobs + smem offset).
+   - bf16-generic 16-tile zoo, wholesale (no subset) — `8d8ab1f9f`.
+   - `DcCutlassGemmAddImpl` × 16 tiles (residual+gemm,
+     beta=1.0 epilogue, reuses `dc_gemm`) — `3e4723f10`.
+   - `DcCutlassGemvImpl` (M=1 GEMV, new `dc_gemv` template
+     wrapping `kernel::Gemv` with field-assignment Params
+     workaround) — `61bb767d9`.
+   - `DcCutlassGemmSplitKImpl` × 12 (two-phase: GEMM grid +
+     `cg::this_grid().sync()` + Reduction; new `dc_gemm_splitk`
+     template) — `b080a097d`.
+   - FI DC template (`dc_flashinfer.cuh`) — `cd9fd897c` (arm in
+     prim_mega.cu + Params marshaling pending — see Next session).
+   - `DcRmsNormImpl`, `DcFusedAddRmsNormImpl`,
+     `DcFusedQkvRopeCacheImpl` — `cf918daec` / `9b4168ed4`.
+   Won't-fix (kernel-level constraint):
+   - sm90 family (`Gemm_sm90_*` Cooperative / WS / Pingpong /
+     Coop2x1) — `device::GemmUniversalAdapter`,
+     `kernel::GemmUniversal::Params` is `__host__` only.
+   - `CutlassFusedGemmBiasImpl`, `CutlassFusedGateUpSiluMulImpl` —
+     same `GemmUniversalAdapter` constraint.
+   - See `feedback_gemm_universal_not_dc_able`. User has declined
+     the CUTLASS fork.
 
 ⏳ 6. Encoder match in `prim_mega.rs`. Exhaustive over
    `Instruction<W>` → `[i32; 32]`; no `_` arm; per-bucket
@@ -372,63 +449,63 @@ reflects the actual landed sequence + remaining gaps.
 
 ## Next session — what to pick up
 
-The cost model is principled now (`3f700439f`), so any of the
-remaining Phase-1 steps unblocks something concrete. In rough
-order of leverage / effort:
+Architecture is settled (whole-forward + tape, scaffolding for
+KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS
+family the kernel-level Params allows. Remaining Phase-1 work, in
+rough order of leverage / effort:
 
-1. **Re-evaluate whether PrimMega is worth shipping at all.**
-   The current architecture (whole-forward persistent kernel via
-   opcode-table dispatch in `prim_mega.cu`) is mine, not
-   precedent — the older `worktree-ferrite-mega` branch's
-   `cuda_codegen.rs::generate_megakernel` emitted **one
-   cooperative kernel per layer**, with kernel boundaries
-   between layers. Per-layer vs whole-forward is a wash in the
-   all-DC regime (this branch's tier semantics) but per-layer
-   stays sane under partial coverage and avoids occupancy
-   ceilings. Three options on the table:
-   - Keep PrimMega, redo it per-layer (the working precedent).
-   - Drop PrimMega entirely; KvmMega is the perf path on
-     Hopper anyway (vendored TK templates + mbarrier). The cost
-     model already correctly excludes PrimMega on Ada via the
-     sm_90 gate, so PrimMega's only constituency is "Hopper
-     without TK template authoring" — debatable.
-   - Keep PrimMega as a forced-debug verification path
-     (`FERRITE_FORCE_PRIM_MEGA=1`) for byte-equality testing
-     against host before KvmMega lands.
-   Decision unblocks step 6 (encoder shape depends on whether
-   we're emitting a tape vs inlining per layer).
+1. **Encoder match in `prim_mega.rs` (step 6).** Now unblocked.
+   Emit `[i32; 32]` rows per-bucket as `static MEGA_PROGRAM_M_<N>:
+   &[[i32; 32]] = &[…]`. Slot conventions are pinned per-op by the
+   docstrings on `prim_mega.cu`'s `run_*` fns + `dc_cutlass.cuh`'s
+   per-template caller contracts. The encoder is one exhaustive
+   `match` over `Instruction<W>` variants — variants without an arm
+   mark the canonical mega-ineligible at codegen time (no `_`
+   catch-all, no runtime "refused" returns).
 
-2. **DC sibling coverage widening.** Today's coverage flips
-   ~10% of seeds on H100; the all-or-nothing tier semantics
-   needs ~100% to actually pick PrimMega for a canonical. The
-   biggest gaps:
-   - `DcCutlassGemvImpl` (M=1 GEMV — its own kernel shape via
-     `gemm::kernel::Gemv`)
-   - `DcFusedQkvRopePrefillImpl`
-   - DC siblings for `FusedGateUpSiluMul` (the load-bearing MLP
-     fusion — covers every layer)
-   - FlashInfer attention DC arm in `prim_mega.cu` + Params
-     marshaling (decode + prefill).
-   Each is mechanical (delegate to host counterpart, override 4
-   methods, add the .cu arm), but FI Params marshaling is a real
-   piece of work. Until coverage hits 100%, the trace stays
-   `Host`-everywhere even on H100.
+2. **Per-arch globals struct + launcher emission (step 7).** Macro
+   emits a per-arch globals carrying weight ptrs / kv-cache ptrs /
+   output ptr / instruction-tape ptr / SplitK workspace ptrs.
+   Launcher fn hosts the `prim_mega_<arch>_launch` extern call
+   (already declared in `ferrite-kernels/src/megakernel.rs`).
 
-3. **Wave-level launch counter for cost.rs.** Match the older
-   branch's `cost.rs:90–112`: walk schedule, count `1 launch`
-   per mega wave + `1 launch` per non-mega host pick, multiply
-   by `launch_overhead_us(HostCallback, profile)` once.
-   Improves `predicted_us` accuracy without changing picks
-   (DC's per-pick zero stays zero). Small commit.
+3. **Step-9 e2e via `FERRITE_FORCE_PRIM_MEGA=1` override.** Don't
+   wait on 100% DC coverage to flip the all-or-nothing
+   `pick_interpreter` tier. Add a forced-override env var that
+   makes the runtime route through PrimMega for any canonical
+   where the picked impls support it (downgrade to host per-op
+   when individual picks aren't DC-able). Lets us byte-equality-
+   test the encoder + launcher against host on H100 before sm90 /
+   FlashInfer DC arms land. Per `feedback_prim_mega_is_scaffolding`,
+   this is the right gating mechanism — coverage widening is a
+   separate goal driven by the cost model, not a PrimMega gate.
 
-4. **Encoder match in `prim_mega.rs` (step 6).** Blocked on
-   decision (1) — encoder shape depends on architecture choice.
-   Most of the test surface for the encoder match is in place
-   (the `Instruction<W>` IR is stable, slot conventions are
-   pinned by `prim_mega.cu`'s per-op docstrings).
+4. **FlashInfer DC arms in `prim_mega.cu` + Params marshaling.**
+   `dc_flashinfer.cuh` template is ready (`cd9fd897c`); needs the
+   actual switch arm in `prim_mega.cu` plus host-side Params
+   marshaling — copy `plan->params_1` / `params_2` from
+   `flashinfer_shim.cu.j2`'s `FlashInferPlan` to a device-resident
+   buffer, encoder emits `OP_FI_PAGED_ATTN` row with pt[] indices
+   for the two Params blobs + smem offset. Real piece of work
+   relative to the other DC additions but unblocks attention DC.
 
-Don't let any of these become a yak-shave. (1) is the most
-load-bearing question; resolving it points the rest.
+5. **Wave-level launch counter for cost.rs.** Match the older
+   branch's `cost.rs:90–112`: walk schedule, count `1 launch` per
+   mega wave + `1 launch` per non-mega host pick, multiply by
+   `launch_overhead_us(HostCallback, profile)` once. Improves
+   `predicted_us` accuracy without changing picks. Small commit.
+
+6. **`DcFusedQkvRopePrefillImpl`** (the prefill counterpart to
+   `DcFusedQkvRopeCacheImpl`). Decode-only DC was landed earlier;
+   prefill needs its own arm. Mechanical — delegate to host
+   counterpart, override 4 methods.
+
+**Won't fix without forking CUTLASS:** sm90 wgmma+TMA family,
+`CutlassFusedGemmBiasImpl`, `CutlassFusedGateUpSiluMulImpl`. All
+use `device::GemmUniversalAdapter` whose Params is host-only by
+design. Documented in code + `feedback_gemm_universal_not_dc_able`.
+Hopper-native sm90 perf path is left to KvmMega (TK templates
+authored DC-friendly from the start).
 
 ## Phase 2 — work order (later)
 

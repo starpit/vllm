@@ -3279,6 +3279,15 @@ fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
 
 // ── CutlassFusedGateUpSiluMulImpl ────────────────────────────────
 //
+// **HostCallback only — no DC sibling, by CUTLASS design.** Same
+// constraint as `CutlassFusedGemmBiasImpl`: the underlying kernel
+// uses `device::GemmUniversalAdapter<KernelType>` (via
+// cutlass_2x_gemm), and `kernel::GemmUniversal::Params` is
+// `__host__` only because of the `device_sms` / `sm_occupancy`
+// scheduler partitioning. Cannot be DC-wrapped without forking
+// CUTLASS. See the comment block on `CutlassFusedGemmBiasImpl` for
+// the full rationale.
+//
 // CUTLASS EVT peer to [`FusedGateUpSiluMulImpl`]. Claims the exact
 // same `(Gemm, Gemm, Silu, Mul)` tile pattern and declares the same
 // packed `[gate|up]` LinearLayer accessor — so accessor emission is

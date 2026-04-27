@@ -2546,24 +2546,39 @@ impl Implementation for FusedGateUpSiluMulImpl {
     }
 
     fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Cost = one fused GEMM (M × 2I × H) + one elementwise pass
-        // over the packed [M, 2I] buffer producing [M, I].
-        let num_tokens = ctx.num_tokens() as f64;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
-        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
+        // Cost = one cuBLAS GEMM at packed (M, 2I, K) + one elementwise
+        // silu_mul pass over [M, 2I] producing [M, I].
+        //
+        // Read measured cublas cost from the calibration CSV (the
+        // predictor linreg-extrapolates when the exact (M, 2I, K) row
+        // isn't sampled). Fall back to peak-FLOPS roofline only when
+        // the predictor has no signal at all — keeps this Impl on the
+        // same measurement scale as `CutlassFusedGateUpSiluMulImpl`,
+        // which sums measured cutlass CSV rows. Without this parity
+        // the DP saw a wildly optimistic cuBLAS path (8× faster than
+        // reality at llama-7b prefill) and never picked the CUTLASS
+        // sibling.
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
+        let packed_n = 2u32.saturating_mul(intermediate);
 
-        // Compute-bound GEMM.
-        let flops = 2.0 * num_tokens * (2.0 * intermediate) * hidden;
-        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
-        let gemm_us = if peak > 0.0 && flops > 0.0 {
-            (flops / peak) * 1e6
-        } else {
-            0.0
-        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for("cublas", num_tokens, packed_n, hidden)
+            .unwrap_or_else(|| {
+                let flops = 2.0 * (num_tokens as f64) * (packed_n as f64) * (hidden as f64);
+                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+                if peak > 0.0 && flops > 0.0 {
+                    (flops / peak) * 1e6
+                } else {
+                    0.0
+                }
+            });
 
         // Bandwidth-bound silu*mul: read 2*M*I, write M*I, bf16 = 2 B.
         let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * num_tokens * intermediate * BYTES_PER_ELEM;
+        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
         let silu_mul_us = if bw_gb > 0.0 {
             (bytes / (bw_gb * 1e9)) * 1e6
         } else {

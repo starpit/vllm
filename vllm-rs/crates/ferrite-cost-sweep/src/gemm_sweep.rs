@@ -19,9 +19,10 @@
 use cudarc::cublas::sys as cublas;
 use cudarc::driver::sys;
 use ferrite_kernels::cutlass::{
-    cutlass_gemm_32x64_s3_launch, cutlass_gemm_32x64_s4_launch, cutlass_gemm_32x128_s3_launch,
-    cutlass_gemm_32x128_s4_launch, cutlass_gemm_32x256_s3_launch, cutlass_gemm_64x64_s3_launch,
-    cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x64_s4_sk2_launch,
+    cutlass_gemm_16x64_s3_launch, cutlass_gemm_16x64_s4_launch, cutlass_gemm_16x128_s3_launch,
+    cutlass_gemm_16x128_s4_launch, cutlass_gemm_32x64_s3_launch, cutlass_gemm_32x64_s4_launch,
+    cutlass_gemm_32x128_s3_launch, cutlass_gemm_32x128_s4_launch, cutlass_gemm_32x256_s3_launch,
+    cutlass_gemm_64x64_s3_launch, cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x64_s4_sk2_launch,
     cutlass_gemm_64x64_s4_sk4_launch, cutlass_gemm_64x64_s4_sk8_launch,
     cutlass_gemm_64x128_s3_launch, cutlass_gemm_64x128_s4_launch,
     cutlass_gemm_64x128_s4_sk2_launch, cutlass_gemm_64x128_s4_sk4_launch,
@@ -327,6 +328,10 @@ fn bench_one_shape(
         };
     }
     bench_cutlass!(
+        "cutlass_16x64_s3"   => cutlass_gemm_16x64_s3_launch,
+        "cutlass_16x64_s4"   => cutlass_gemm_16x64_s4_launch,
+        "cutlass_16x128_s3"  => cutlass_gemm_16x128_s3_launch,
+        "cutlass_16x128_s4"  => cutlass_gemm_16x128_s4_launch,
         "cutlass_32x64_s3"   => cutlass_gemm_32x64_s3_launch,
         "cutlass_32x64_s4"   => cutlass_gemm_32x64_s4_launch,
         "cutlass_32x128_s3"  => cutlass_gemm_32x128_s3_launch,
@@ -371,6 +376,10 @@ fn bench_one_shape(
         };
     }
     bench_cutlass_add!(
+        "cutlass_16x64_s3_add"   => cutlass_gemm_16x64_s3_launch,
+        "cutlass_16x64_s4_add"   => cutlass_gemm_16x64_s4_launch,
+        "cutlass_16x128_s3_add"  => cutlass_gemm_16x128_s3_launch,
+        "cutlass_16x128_s4_add"  => cutlass_gemm_16x128_s4_launch,
         "cutlass_32x64_s3_add"   => cutlass_gemm_32x64_s3_launch,
         "cutlass_32x64_s4_add"   => cutlass_gemm_32x64_s4_launch,
         "cutlass_32x128_s3_add"  => cutlass_gemm_32x128_s3_launch,

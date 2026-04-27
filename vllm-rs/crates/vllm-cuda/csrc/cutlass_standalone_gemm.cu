@@ -355,6 +355,22 @@ CUTLASS_GEMM( 32,  256,  32,    32,     64,     32,    3)
 CUTLASS_GEMM( 32,   64,  32,    32,     32,     32,    3)
 CUTLASS_GEMM( 32,  128,  32,    32,     64,     32,    3)
 
+// tile_m=16 — minimum threadblock-M with sm80 tensor cores
+// (MMA m16n8k16 has m=16 floor; warp_m must be a multiple). Targets
+// the prefill lm_head + small-batch QKV regime where M ∈ [8, 16] and
+// the audit measured cuBLAS 5-7% ahead of the smallest existing
+// tile_m=32 zoo. Each TB has 1 warp on M × 2 on N → 2 warps.
+//
+// `16×256` is excluded: CUTLASS's PitchLinearWarpRakedThreadMap<32,16>
+// hits a div-by-zero at instantiation when ThreadblockShape::M=16 +
+// ThreadblockShape::N=256 — the aspect is too extreme for the default
+// shared-memory tile partitioning. `16×{64,128}` with warp `16×{32,64}`
+// stay in the supported regime.
+CUTLASS_GEMM( 16,   64,  32,    16,     32,     32,    4)
+CUTLASS_GEMM( 16,  128,  32,    16,     64,     32,    4)
+CUTLASS_GEMM( 16,   64,  32,    16,     32,     32,    3)
+CUTLASS_GEMM( 16,  128,  32,    16,     64,     32,    3)
+
 // ── SplitK GEMM — splits K-reduction across CTAs ──
 //
 // Critical for shapes where K >> M*N (e.g. down_proj at small batch).

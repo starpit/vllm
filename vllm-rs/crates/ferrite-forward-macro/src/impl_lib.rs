@@ -6734,6 +6734,14 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
 const UNCALIBRATED_COST_US: f64 = 1.0e9;
 
 const CUTLASS_TILE_ZOO: &[(u32, u32, u32)] = &[
+    // tile_m=16 — minimum threadblock M with sm80 tensor cores. Targets
+    // small-M tall-skinny lm_head + QKV regimes where M ∈ [8, 16] and
+    // larger tile_m wastes most of the threadblock's M dimension.
+    // (16, 256) excluded — CUTLASS thread-map div-by-zero at that aspect.
+    (16, 64, 3),
+    (16, 64, 4),
+    (16, 128, 3),
+    (16, 128, 4),
     (32, 64, 3),
     (32, 64, 4),
     (32, 128, 3),
@@ -6770,6 +6778,10 @@ impl CutlassGemmImpl {
     fn static_name(&self) -> &'static str {
         // Names are compile-time-known per CUTLASS_TILE_ZOO entry.
         match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_16x64_s3",
+            (16, 64, 4) => "cutlass_16x64_s4",
+            (16, 128, 3) => "cutlass_16x128_s3",
+            (16, 128, 4) => "cutlass_16x128_s4",
             (32, 64, 3) => "cutlass_32x64_s3",
             (32, 64, 4) => "cutlass_32x64_s4",
             (32, 128, 3) => "cutlass_32x128_s3",
@@ -7222,6 +7234,10 @@ impl CutlassGemmAddImpl {
 
     fn impl_name(&self) -> &'static str {
         match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_16x64_s3_add",
+            (16, 64, 4) => "cutlass_16x64_s4_add",
+            (16, 128, 3) => "cutlass_16x128_s3_add",
+            (16, 128, 4) => "cutlass_16x128_s4_add",
             (32, 64, 3) => "cutlass_32x64_s3_add",
             (32, 64, 4) => "cutlass_32x64_s4_add",
             (32, 128, 3) => "cutlass_32x128_s3_add",

@@ -63,6 +63,50 @@ impl CutlassTile {
 // entry here.
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
+    pub fn cutlass_gemm_16x64_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x64_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
     pub fn cutlass_gemm_32x64_s3_launch(
         c: *mut u16,
         a: *const u16,
@@ -445,6 +489,10 @@ type CutlassLaunchFn =
 #[cfg(feature = "cuda")]
 fn launch_fn_for(tile: CutlassTile) -> CutlassLaunchFn {
     match (tile.tile_m, tile.tile_n, tile.stages) {
+        (16, 64, 3) => cutlass_gemm_16x64_s3_launch,
+        (16, 64, 4) => cutlass_gemm_16x64_s4_launch,
+        (16, 128, 3) => cutlass_gemm_16x128_s3_launch,
+        (16, 128, 4) => cutlass_gemm_16x128_s4_launch,
         (32, 64, 3) => cutlass_gemm_32x64_s3_launch,
         (32, 64, 4) => cutlass_gemm_32x64_s4_launch,
         (32, 128, 3) => cutlass_gemm_32x128_s3_launch,

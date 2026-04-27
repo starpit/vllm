@@ -9,9 +9,14 @@ struct attention_prefill {
     static constexpr int NUM_STAGES = 2;
     static constexpr int GQA_RATIO = Globals::num_attention_heads / Globals::num_kv_heads;
     static constexpr int NUM_ATTN_HEADS_PER_DEVICE = Globals::num_attention_heads / Globals::num_devices;
-    static_assert(NUM_ATTN_HEADS_PER_DEVICE == 8, "Fix");
-
-    static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
+    // Vendor asserts pinned to Llama-70B at TP=8 (NUM_ATTN_HEADS_PER_DEVICE
+    // = 64/8 = 8, GQA_RATIO = 64/8 = 8). Relaxed: surrounding code
+    // parameterizes via heads_per_dev = num_attention_heads /
+    // num_devices (line 368) and GQA_RATIO is used as a runtime
+    // bound (line 381). Register tiles are 16-row capacity, so
+    // GQA_RATIO upper bound is 16.
+    static_assert(NUM_ATTN_HEADS_PER_DEVICE >= 1, "must be positive");
+    static_assert(GQA_RATIO >= 1 && GQA_RATIO <= 16, "GQA_RATIO must fit in 16-row register tiles");
 
     static constexpr int head_dim = Globals::head_dim;
     static constexpr int kv_page_size = Globals::kv_page_size;

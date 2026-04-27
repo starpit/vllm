@@ -36,9 +36,15 @@ struct attention_decode {
     static constexpr int NUM_STAGES = 3;
     static constexpr int GQA_RATIO = Globals::num_attention_heads / Globals::num_kv_heads;
     static constexpr int NUM_ATTN_HEADS_PER_DEVICE = Globals::num_attention_heads / Globals::num_devices;
-    static_assert(NUM_ATTN_HEADS_PER_DEVICE == 8, "Fix");
-
-    static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
+    // Original vendor asserts pinned NUM_ATTN_HEADS_PER_DEVICE and
+    // GQA_RATIO to 8 (Llama-70B at TP=8 shape). Relaxed: surrounding
+    // code parameterizes both — register tiles are 16-row with
+    // "only GQA_RATIO rows used" (lines below), masked_q_warp_load
+    // takes GQA_RATIO at runtime (consumer warp), and the q_head_idx
+    // loops bound on < GQA_RATIO. Upper bound is 16 (register tile
+    // row capacity). Allows us to target Llama-3.2-1B (GQA=4) etc.
+    static_assert(NUM_ATTN_HEADS_PER_DEVICE >= 1, "must be positive");
+    static_assert(GQA_RATIO >= 1 && GQA_RATIO <= 16, "GQA_RATIO must fit in 16-row register tiles");
     static_assert(NUM_STAGES <= Config::NUM_PAGES, "Not enough pages. Time to actually use full pages.");
 
     static constexpr int head_dim = Globals::head_dim;

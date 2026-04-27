@@ -147,6 +147,10 @@ mod tests {
         from_profile_def(&ferrite_cuda_targets::L4_SM89)
     }
 
+    fn h100_target() -> TargetProfile {
+        from_profile_def(&ferrite_cuda_targets::H100_SM90)
+    }
+
     const LLAMA_BODY: &str = r#"
         hidden_states = embed(input_ids, embed_tokens);
         for layer in 0..num_hidden_layers {
@@ -322,47 +326,57 @@ mod tests {
     }
 
     /// Lock the launch-overhead constants. The DP and `loop_cost_us`
-    /// both consult `launch_overhead_us`; the values come from the
-    /// same `Handoff::cost_us` table used by the rest of the cost
-    /// model, so a one-line tweak there should propagate. This test
-    /// pins the table values so an unrelated edit can't silently
-    /// re-rank host vs DC at the solver.
+    /// both consult `launch_overhead_us`; pin the values so an
+    /// unrelated edit can't silently re-rank host vs DC at the
+    /// solver.
     #[test]
     fn launch_overhead_matches_handoff_table() {
         use crate::impl_lib::{Handoff, LaunchKind, launch_overhead_us};
-        let target = l4_target();
-        // Host launches all collapse to KernelBoundary — one
-        // cudaLaunchKernel boundary regardless of whether the host
-        // is calling cuBLAS or its own __global__.
-        for lk in [
-            LaunchKind::HostCallback,
-            LaunchKind::RegularLaunch,
-            LaunchKind::CooperativeLaunch,
-        ] {
+        for target in [l4_target(), h100_target()] {
+            // Host launches all collapse to KernelBoundary — one
+            // cudaLaunchKernel boundary regardless of whether the
+            // host is calling cuBLAS or its own __global__. Same
+            // value on every target (KernelBoundary is target-
+            // agnostic in `Handoff::cost_us`).
+            for lk in [
+                LaunchKind::HostCallback,
+                LaunchKind::RegularLaunch,
+                LaunchKind::CooperativeLaunch,
+            ] {
+                assert_eq!(
+                    launch_overhead_us(lk, &target),
+                    Handoff::KernelBoundary.cost_us(&target),
+                    "{lk:?} should pay KernelBoundary on {}",
+                    target.name,
+                );
+            }
+            // DC pays zero per pick — mega launch overhead is a
+            // wave-level term, amortized over the whole DC chain.
+            // Charging `InKernelGridSync` per pick double-counts
+            // (vs the future wave-level launch counter) AND made
+            // the DP never pick DC siblings, which directly
+            // contradicted the older `worktree-ferrite-mega`
+            // branch's shipped behavior on H100.
             assert_eq!(
-                launch_overhead_us(lk, &target),
-                Handoff::KernelBoundary.cost_us(&target),
-                "{lk:?} should pay KernelBoundary"
+                launch_overhead_us(LaunchKind::DeviceCallable, &target),
+                0.0,
+                "DC must pay zero per-pick on {} — wave-level term covers it",
+                target.name,
+            );
+            // Solver effect: DC strictly cheaper than host at every
+            // seed where DC is feasible. Feasibility is gated by
+            // `prim_mega_compatible()` (sm_90+), so on Ada this
+            // ranking never matters in practice; on Hopper it's
+            // what flips the picks.
+            assert!(
+                launch_overhead_us(LaunchKind::DeviceCallable, &target)
+                    < launch_overhead_us(LaunchKind::HostCallback, &target),
+                "DC overhead must be strictly below host overhead on {} \
+                 — otherwise the solver never picks DC and prim-mega is \
+                 dead even on Hopper",
+                target.name,
             );
         }
-        // DC pays grid-sync (PrimMega's per-op handoff). Phase 2
-        // refines this for KvmFit impls — see MEGA_HANDOFF.md
-        // §"Cost-metric refinements (post-Phase 2)".
-        assert_eq!(
-            launch_overhead_us(LaunchKind::DeviceCallable, &target),
-            Handoff::InKernelGridSync.cost_us(&target),
-            "DC should pay InKernelGridSync on Phase 1 hardware"
-        );
-        // The whole point of plumbing this term: DC > Host on
-        // Phase 1 hardware, so the solver naturally picks Host
-        // when it ties on per-Impl GPU work cost.
-        assert!(
-            launch_overhead_us(LaunchKind::DeviceCallable, &target)
-                > launch_overhead_us(LaunchKind::HostCallback, &target),
-            "DC overhead must dominate host overhead on Phase 1; otherwise \
-             the solver's tier preference flips and PrimMega gets picked \
-             prematurely"
-        );
     }
 
     /// Solver `predicted_us` should now reflect per-Impl launch
@@ -423,18 +437,86 @@ mod tests {
             overhead,
             work,
         );
-        // No DC siblings registered for non-Llama-shaped impls;
-        // every Llama backbone pick should still be host-launched
-        // until DC siblings widen further (MEGA_HANDOFF.md §"DC
-        // siblings remaining").
+        // L4 (Ada) is below `prim_mega_compatible()` — DC siblings
+        // are filtered out at `target_compatible()` time, so the
+        // DP can't pick any. Pin that against future regressions
+        // that might relax the gate without re-checking the cost
+        // model.
         for imp_id in sfuf.impls.values() {
             assert!(
                 !matches!(lib.get(*imp_id).launch_kind(), LaunchKind::DeviceCallable),
-                "DP picked a DC sibling at M=1 unexpectedly: \
-                 {} — `launch_overhead_us` should make Phase 1 \
-                 hardware prefer host",
+                "DP picked a DC sibling at M=1 on L4 unexpectedly: \
+                 {} — DC siblings should be filtered out by \
+                 `target_compatible()` on Ada",
                 lib.get(*imp_id).name(),
             );
         }
+    }
+
+    /// On Hopper the DC-sibling gate opens, host pays +5us per
+    /// pick, DC pays +0us — DC strictly cheaper at every seed
+    /// where it's solver-feasible. The DP must pick DC for at
+    /// least the rms_norm seeds. Counterpart of
+    /// `predicted_us_includes_launch_overhead` (which pins the L4
+    /// half), this test pins the H100 half: the cost-model split
+    /// I plumbed in (`launch_overhead_us`,
+    /// `prim_mega_compatible() >= 90`, target-aware
+    /// `Handoff::InKernelGridSync`) flips picks correctly.
+    #[test]
+    fn solver_picks_dc_siblings_on_h100() {
+        use crate::impl_lib::LaunchKind;
+        let params = llama_params("llama-3.2-1b");
+        let file: syn::File =
+            syn::parse_str(&format!("fn _c() {{ {LLAMA_BODY} }}")).expect("parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let ast = parse_block(block).unwrap();
+        let program = classify(&ast).unwrap();
+        let inferred = infer(
+            &program,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        let cfg = build_cfg(&program, &params).unwrap();
+        let fuf = unroll(&cfg, &inferred).unwrap();
+        let lib = starter_library();
+        let target = h100_target();
+
+        let sfufs = solve(&fuf, &lib, &target, &inferred, &params.bounds, &[1], &[]).unwrap();
+        let sfuf = sfufs.get_nt(1).unwrap();
+
+        let dc_picks: Vec<&'static str> = sfuf
+            .impls
+            .values()
+            .filter_map(|imp_id| {
+                let imp = lib.get(*imp_id);
+                if matches!(imp.launch_kind(), LaunchKind::DeviceCallable) {
+                    Some(imp.name())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !dc_picks.is_empty(),
+            "expected at least one DC sibling picked on H100; got zero. \
+             `launch_overhead_us(DC, h100) == 0` and \
+             `launch_overhead_us(Host, h100) == 5us`, so DC should win \
+             every per-seed cost comparison where it's feasible. Either \
+             `prim_mega_compatible()` regressed below sm_90, the DC \
+             siblings' `target_compatible()` got tightened, or someone \
+             un-zeroed DC's per-pick overhead in `launch_overhead_us`."
+        );
+        // Sanity-check: at least DcRmsNormImpl should be picked
+        // since RmsNorm is the simplest seed in the body and DC's
+        // claim shape matches RmsNormRefImpl exactly via thin
+        // delegation.
+        assert!(
+            dc_picks.iter().any(|n| n.contains("rmsnorm")),
+            "expected `dc_rmsnorm` among DC picks on H100, got: {dc_picks:?}"
+        );
     }
 }

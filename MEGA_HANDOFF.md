@@ -314,17 +314,33 @@ reflects the actual landed sequence + remaining gaps.
      `CUTLASS_DC_GEMM_LIST` (the host CSV-calibrated zoo and the
      C++ X-macro list); a `dc_cutlass_zoo_is_subset_of_host_zoo`
      test pins the invariant so cost-lookup never misses the CSV.
-   `prim_mega_compatible()` bumped from stub-`false` to
-   `compute_capability >= 80` so the siblings are solver-feasible
-   on Ada / Hopper.
+   `prim_mega_compatible()` lives at `compute_capability >= 90`
+   (Hopper+). The earlier `>= 80` was speculative — Ada / Ampere
+   `cg::this_grid().sync()` runs ~100us/call (gmem-atomic spin
+   counters), so prim-mega's per-op handoff blows out the host's
+   ~5us `KernelBoundary` by 20× and host wins by construction on
+   those targets. Hopper has hw-accelerated grid sync (~15us, L2-
+   synchronizer + TMA fences) — that's where the older
+   `worktree-ferrite-mega` branch's "100% megakernel" demo
+   actually shipped. Locked by
+   `cost::tests::solver_picks_dc_siblings_on_h100` (asserts at
+   least one DC sibling picked on H100 LLAMA_BODY at M=1) and
+   `predicted_us_includes_launch_overhead` (asserts zero DC picks
+   on L4).
    Remaining: DC siblings for `FusedQkvRopePrefillImpl`,
    `CutlassGemvImpl`, silu_mul, FlashInfer attention configs;
    plus the `s2` deep-pipeline / 32×* / W8 / sm90 CUTLASS DC
    tile fan-out (Rust + C++ X-macro both need it).
 ⏳ 9. End-to-end: `vllm chat unsloth/Llama-3.2-3B-Instruct
-   --enforce-eager` → solver picks DeviceCallable Impls (because
-   tiebreak prefers them at equal cost) → selector picks
-   `PrimMega` → coherent output, byte-equal to host run.
+   --enforce-eager` on H100 → solver picks DeviceCallable Impls
+   wherever a DC sibling exists (host pays +5us/pick, DC pays 0us
+   per pick — wave-level overhead is amortized) → selector picks
+   `PrimMega` for any canonical where every pick is `>=`
+   Primitive-fit. Today coverage is too sparse for the all-or-
+   nothing tier semantics to flip whole canonicals (commandr +
+   Llama still report `Host` even on H100), so step 9 is gated on
+   widening DC siblings to cover every op in at least one arch's
+   forward.
 
 ## Phase 2 — work order (later)
 
@@ -399,24 +415,44 @@ properly value mega benefits:
 - Persistent-SM cache reuse across instructions (vendor's design
   point — currently invisible to ferrite's CSV-driven cost).
 - Cluster-block + DSMEM advantages (sm≥90).
+- Wave-level launch counting. Today `launch_overhead_us` zeros
+  out per-pick overhead for `DeviceCallable` (the older
+  `worktree-ferrite-mega` branch did the same), so a chain of N
+  DC ops contributes zero launch overhead even though it's one
+  cooperative `cudaLaunchCooperativeKernel` (~5us). The
+  approximation is fine for picks (~0.5us per pick at N=10) but
+  under-counts `predicted_us`. Match the older branch's
+  `cost.rs:90–112`: walk the schedule, count `1 launch` per mega
+  wave + `1 launch` per non-mega host pick, multiply by
+  `launch_overhead_us` once. Comes online when the per-wave
+  scheduler hook (`Wave::is_megakernel`) lands.
+- Per-op `Handoff::InKernelGridSync` charge inside a mega wave.
+  100us/call on Ada, 15us on Hopper (target-aware in
+  `Handoff::cost_us`). Currently uncharged anywhere — fine on
+  Hopper where 9 syncs/layer × 32 layers ≈ 4.3ms is small
+  relative to the work, less fine if PrimMega ever returns to
+  Ada via a per-wave restructure that keeps grid-sync chains
+  short.
 - KvmFit DC ops should pay [`Handoff::Mbarrier`] (~0.1us) rather
-  than [`Handoff::InKernelGridSync`] (~100us) when running inside
-  a KVM megakernel. Today `launch_overhead_us` returns
-  `InKernelGridSync` for every `LaunchKind::DeviceCallable`,
-  which is correct for PrimMega but pessimistic for KvmMega —
-  the term must split on `MegakernelFit` once KvmFit impls
-  appear.
+  than the prim-mega grid-sync when running inside a KVM
+  megakernel. The wave-level term should split on
+  `MegakernelFit` once KvmFit impls appear.
 - Per-SM tape length imbalance penalty (idle SMs at end of
   bucket).
 
 What already lands: per-launch overhead is summed into both the
-solver's DP candidate cost AND `loop_cost_us` aggregation (commit
-`<TODO>`). HostCallback / RegularLaunch / CooperativeLaunch all
-pay one `KernelBoundary` per pick (5us); DeviceCallable pays one
-`InKernelGridSync` (100us). This makes the host-vs-DC ranking
-load-bearing on hardware-grounded arithmetic — Phase 1 hardware
-correctly picks host (95us delta per pick); Phase 2 hardware
-will want the Mbarrier-aware refinement above.
+solver's DP candidate cost AND `loop_cost_us` aggregation.
+HostCallback / RegularLaunch / CooperativeLaunch each pay one
+`KernelBoundary` per pick (~5us — target-agnostic). DeviceCallable
+pays zero per pick (wave-level overhead amortized — see
+"Wave-level launch counting" above). `Handoff::InKernelGridSync` is
+target-aware (100us on Ada, 15us on Hopper) for future consumers
+but isn't yet summed anywhere. The combination makes DC strictly
+cheaper than host at every seed where DC is feasible; feasibility
+gates on `prim_mega_compatible() >= 90`, so on Ada DC is filtered
+out at `target_compatible()` and on Hopper it's picked. Verified
+by `cost::tests::solver_picks_dc_siblings_on_h100` and
+`predicted_us_includes_launch_overhead`.
 
 Don't bolt the rest on before Phase 2 lands.
 

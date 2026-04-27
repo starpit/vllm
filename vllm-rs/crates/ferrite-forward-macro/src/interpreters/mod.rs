@@ -75,14 +75,15 @@ mod tests {
     use super::*;
     use crate::impl_lib::{DcRmsNormImpl, RmsNormRefImpl};
 
-    /// L4 / sm_89 — `prim_mega_compatible() == true`,
+    /// H100 / sm_90 — `prim_mega_compatible() == true`,
     /// `kvm_compatible() == false`. The two-axis selector should
     /// route through PrimMega when every picked impl is Primitive
     /// or better, and fall back to Host the moment a None-fit impl
-    /// gets picked alongside.
+    /// gets picked alongside. L4 stays Host even with a DC sibling
+    /// — see `falls_back_to_host_on_ada_below_prim_mega_floor`.
     #[test]
     fn picks_prim_mega_when_all_impls_primitive_and_target_supports() {
-        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::H100_SM90);
         let dc = DcRmsNormImpl;
         let picked: Vec<&dyn Implementation> = vec![&dc];
         assert_eq!(pick_interpreter(&picked, &profile), Interpreter::PrimMega);
@@ -90,7 +91,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_host_when_any_pick_is_none_fit() {
-        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::H100_SM90);
         let dc = DcRmsNormImpl;
         let host = RmsNormRefImpl;
         // Mixed pick: host sibling drags `min_fit` down to None even
@@ -99,10 +100,15 @@ mod tests {
         assert_eq!(pick_interpreter(&picked, &profile), Interpreter::Host);
     }
 
+    /// L4 (sm_89) is below the prim-mega floor — even if a DC
+    /// sibling somehow ended up in the pick set, the target gate
+    /// rejects PrimMega and we fall through to Host. `target_
+    /// compatible()` on the DC siblings prevents the solver from
+    /// picking them in the first place; this test pins the
+    /// downstream selector behavior independently.
     #[test]
-    fn falls_back_to_host_when_target_lacks_prim_mega() {
-        let mut profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
-        profile.compute_capability = 75; // hypothetical Turing
+    fn falls_back_to_host_on_ada_below_prim_mega_floor() {
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!profile.prim_mega_compatible());
         let dc = DcRmsNormImpl;
         let picked: Vec<&dyn Implementation> = vec![&dc];
@@ -114,7 +120,7 @@ mod tests {
         // `min` over an empty iter returns None; the selector
         // defaults to None-fit and lands on Host. Pin that against
         // future refactors that might want to promote-on-empty.
-        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::H100_SM90);
         let picked: Vec<&dyn Implementation> = Vec::new();
         assert_eq!(pick_interpreter(&picked, &profile), Interpreter::Host);
     }

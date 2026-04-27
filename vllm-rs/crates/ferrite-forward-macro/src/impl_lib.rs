@@ -222,14 +222,50 @@ pub enum Handoff {
 impl Handoff {
     /// Wall-clock cost in microseconds for this handoff on the
     /// given target.
+    ///
+    /// Most entries are target-agnostic (a `cudaLaunchKernel`
+    /// boundary costs ~5us regardless of which sm_XX runs it).
+    /// `InKernelGridSync` is the exception: `cg::this_grid().sync()`
+    /// rides on hardware that differs sharply across capabilities.
+    /// On Hopper (sm_90+) the cooperative-groups grid barrier is
+    /// implemented on top of the L2 synchronizer + TMA fences and
+    /// runs in ~15us per call. On Ada / Ampere (sm_89, sm_80) there's
+    /// no async-barrier hardware — falls back to atomic spin counters
+    /// in gmem at ~100us. This gap is what made the older
+    /// `worktree-ferrite-mega` branch's "100% megakernel" path
+    /// (`f5918269f`: a single cooperative kernel launch per decoder
+    /// layer with grid sync between phases) "decent" on H100 but
+    /// pessimal on L4: 320 syncs × 15us ≈ 4.8ms is small enough to
+    /// be amortized; 320 × 100us ≈ 32ms isn't.
+    ///
+    /// Without this split, `launch_overhead_us` reports the same
+    /// +100us DC-vs-host delta on H100 as on L4, the solver picks
+    /// host everywhere, and PrimMega is dead on every target. With
+    /// it, on H100 the delta shrinks to ~10us — small enough that
+    /// any op whose own cost is dominated by launch overhead (small-M
+    /// decode, fused norms) prefers DC, matching the older branch's
+    /// shipped behavior.
     pub fn cost_us(&self, profile: &TargetProfile) -> f64 {
-        let _ = profile; // target-specific cost tables land later;
-        // for now fall back to empirical-or-universal constants.
         match self {
             Handoff::StreamOrder => 0.0,
             Handoff::StreamEvent => 5.0,
             Handoff::KernelBoundary => 5.0,
-            Handoff::InKernelGridSync => 100.0,
+            Handoff::InKernelGridSync => {
+                if profile.compute_capability >= 90 {
+                    // Hopper: hw-accelerated cooperative-groups grid
+                    // barrier via L2 synchronizer + TMA fences. The
+                    // older `worktree-ferrite-mega` branch's H100
+                    // 100% megakernel path runs 9 syncs/layer × 32
+                    // layers in the few-millisecond range, consistent
+                    // with this number.
+                    15.0
+                } else {
+                    // Ada / Ampere: atomic spin on gmem counter,
+                    // L4 sm_89 measurement. Same number as the
+                    // pre-split constant.
+                    100.0
+                }
+            }
             Handoff::Mbarrier => 0.1,
             Handoff::DsmemRead => 1.0,
             Handoff::GmemFlag => 0.5,
@@ -258,44 +294,59 @@ impl Handoff {
 
 /// Per-launch sync overhead an implementation pays just to enter
 /// its execution context, charged once per pick — not per input
-/// edge. A host-launched kernel pays one [`Handoff::KernelBoundary`]
-/// regardless of how many input tensors it gathers (one
-/// `cudaLaunchKernel` call serves them all). A `DeviceCallable`
-/// inside the primitive megakernel pays one
-/// [`Handoff::InKernelGridSync`] (~100us on L4) per op handoff —
-/// vendored `dc_*` kernels early-return on out-of-range CTAs, so
-/// the persistent `__global__` uses `cg::this_grid().sync()` between
-/// ops as documented in `vllm-cuda/csrc/megakernel/prim_mega.cu`.
+/// edge.
 ///
-/// Why this is the right shape: the prior cost model summed only
-/// per-Impl GPU work, so DC siblings (which inherit `cost_us` from
-/// their host counterparts via the thin-delegation pattern) tied
-/// with host at every seed and the solver picked host purely by
-/// library push-order. Adding launch overhead at the solver's
-/// candidate-cost step makes the tier ordering load-bearing on the
-/// arithmetic: Phase 1 hardware naturally keeps host cheaper
-/// (~95us per pick) because grid-sync outweighs a relaunch; Phase
-/// 2 hardware (mbarrier-capable) flips the math via Mbarrier (0.1us)
-/// — that's where KvmMega earns its keep.
+/// **Host launches** (`HostCallback` / `RegularLaunch` /
+/// `CooperativeLaunch`) pay one [`Handoff::KernelBoundary`]
+/// regardless of how many input tensors they gather (one
+/// `cudaLaunchKernel` call serves them all). Charging per input
+/// edge would over-penalize wide-fan-in kernels (e.g. attention's
+/// q/k/v/positions/cache gather) by 5N us instead of 5us, which
+/// is not how the hardware works.
 ///
-/// Per-launch (not per-edge) reflects the launch model: one entry
-/// boundary per pick, regardless of fan-in. Charging per input edge
-/// would over-penalize wide-fan-in kernels (e.g. attention's
-/// q/k/v/positions/cache gather) by 5N us instead of 5us, which is
-/// not how the hardware works.
+/// **`DeviceCallable`** pays **zero** at the per-pick level. A
+/// chain of N DC siblings sharing one cooperative kernel launch
+/// pays one launch boundary at the wave level, amortized over all
+/// N picks — i.e., `launch_overhead / N` per pick. With N
+/// typically 5–10 inside a mega and `KernelBoundary = 5us`, that's
+/// well under 1us per pick — round to zero. The wave-level launch
+/// counter (TODO, matching `worktree-ferrite-mega/cost.rs:90–112`'s
+/// `launch_count` term) charges the actual cooperative-launch cost
+/// once per mega wave; doing it both per-pick and per-wave would
+/// double-count.
 ///
-/// `RegularLaunch` and `CooperativeLaunch` are also kernel boundaries
-/// from the producer's perspective — a fresh `cudaLaunchKernel` (or
-/// `cudaLaunchCooperativeKernel`) call. Phase 2 will refine
-/// `DeviceCallable` per `MegakernelFit`: Kvm-fit impls inside a KVM
-/// megakernel pay [`Handoff::Mbarrier`] not [`Handoff::InKernelGridSync`].
-/// Tracked in MEGA_HANDOFF.md §"Cost-metric refinements".
+/// **No [`Handoff::InKernelGridSync`] charge per pick.** The
+/// 100us-on-Ada / 15us-on-Hopper grid.sync IS a real cost paid
+/// between adjacent DC ops inside a mega, but it's a wave-internal
+/// term, not a per-pick entry overhead. Charging it per-pick
+/// double-counts vs the eventual wave-level model and (more
+/// pragmatically) made every DC sibling lose every per-seed cost
+/// comparison so the solver never picked any of them. The older
+/// `worktree-ferrite-mega` branch never charged grid.sync per pick
+/// anywhere in its cost summation either — it relied on the
+/// per-target `launch_overhead_us` and the wave-level `launch_count`
+/// term to get the ranking right.
+///
+/// **Solver effect.** Host pays +5us per pick; DC pays +0us. DC
+/// strictly wins at every seed where it's solver-feasible. Today
+/// DC siblings gate on
+/// [`TargetProfile::prim_mega_compatible`] (`compute_capability >=
+/// 90`), so feasibility is restricted to Hopper+ — exactly the
+/// regime where prim-mega is competitive with host. On Ada the
+/// gate keeps DC out of the candidate set entirely, so this
+/// per-pick zero never actually mis-ranks anything.
+///
+/// **Phase 2** refines `DeviceCallable` per
+/// [`MegakernelFit`]: Kvm-fit impls inside a KVM megakernel use
+/// [`Handoff::Mbarrier`] (~0.1us) for intra-kernel handoffs and
+/// produce a different launch-shape entirely. Tracked in
+/// `MEGA_HANDOFF.md` §"Cost-metric refinements".
 pub fn launch_overhead_us(kind: LaunchKind, profile: &TargetProfile) -> f64 {
     match kind {
         LaunchKind::HostCallback | LaunchKind::RegularLaunch | LaunchKind::CooperativeLaunch => {
             Handoff::KernelBoundary.cost_us(profile)
         }
-        LaunchKind::DeviceCallable => Handoff::InKernelGridSync.cost_us(profile),
+        LaunchKind::DeviceCallable => 0.0,
     }
 }
 
@@ -13703,16 +13754,19 @@ mod tests {
 
     #[test]
     fn dc_rms_norm_target_gate_follows_prim_mega_compatible() {
-        // sm_89 (L4) is ≥80 → prim_mega-compatible → DC sibling
-        // accepted. A pre-Ampere profile would reject; we synthesize
-        // one from the L4 profile by clamping `compute_capability`.
-        let mut profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
-        assert!(profile.prim_mega_compatible());
-        assert!(DcRmsNormImpl.target_compatible(&profile));
+        // sm_90 (H100) is the prim_mega floor — Hopper's hw-
+        // accelerated grid barrier (~15us) is what makes
+        // prim-mega competitive with host. Ada / Ampere fall back
+        // to gmem-atomic spin counters (~100us per `grid.sync()`)
+        // that nuke any mega win, so the gate excludes them.
+        let h100 = crate::target::from_profile_def(&ferrite_cuda_targets::H100_SM90);
+        assert!(h100.prim_mega_compatible());
+        assert!(DcRmsNormImpl.target_compatible(&h100));
 
-        profile.compute_capability = 75; // hypothetical sm_75 (Turing)
-        assert!(!profile.prim_mega_compatible());
-        assert!(!DcRmsNormImpl.target_compatible(&profile));
+        // L4 (sm_89) is below the floor → DC sibling rejected.
+        let l4 = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        assert!(!l4.prim_mega_compatible());
+        assert!(!DcRmsNormImpl.target_compatible(&l4));
     }
 
     #[test]

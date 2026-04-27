@@ -1528,6 +1528,88 @@ impl Implementation for RmsNormRefImpl {
 /// constant so all DC Impls reference the same slice.
 const DC_HANDOFFS: &[Handoff] = &[Handoff::InKernelGridSync, Handoff::SyncThreads];
 
+/// PrimMega sibling to [`EmbedRefImpl`]. Same claim, identical
+/// fan_out, mega-internal handoffs only. Solver-feasible only on
+/// `prim_mega_compatible()` targets (Hopper+ today). Embed lives at
+/// the top of every canonical's backbone bucket; without this the
+/// whole bucket is mega-ineligible (no `_` catch-all in encoder, so
+/// the canonical falls through to host).
+#[derive(Debug, Default)]
+pub struct DcEmbeddingImpl;
+
+impl Implementation for DcEmbeddingImpl {
+    fn name(&self) -> &'static str {
+        "dc_embed"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && EmbedRefImpl.target_compatible(profile)
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        EmbedRefImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        EmbedRefImpl.cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        EmbedRefImpl.resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        EmbedRefImpl.input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        EmbedRefImpl.output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        EmbedRefImpl.is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        EmbedRefImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        EmbedRefImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        EmbedRefImpl.required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        EmbedRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        EmbedRefImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DcRmsNormImpl;
 
@@ -2238,6 +2320,9 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
 pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
+    // PrimMega sibling — Embed lives at the top of every canonical's
+    // backbone bucket; without it the whole bucket is mega-ineligible.
+    lib.push(Box::new(DcEmbeddingImpl));
     lib.push(Box::new(RmsNormRefImpl));
     // PrimMega sibling to RmsNormRefImpl. `target_compatible` gates
     // on `prim_mega_compatible()`, so this entry stays dormant on

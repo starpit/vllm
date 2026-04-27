@@ -568,6 +568,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 // category — same kernel family, only launch_kind
                 // differs. Bucket them as their host peers.
                 let dc_alias = match name {
+                    "dc_embed" => Some(6),                       // non-gemm
                     "dc_rmsnorm" => Some(6),                     // non-gemm
                     "dc_fused_add_rms_norm" => Some(6),          // non-gemm
                     "dc_fused_qkv_rope_cache" => Some(3), // cublas (matches host bucket via `fused_` prefix)

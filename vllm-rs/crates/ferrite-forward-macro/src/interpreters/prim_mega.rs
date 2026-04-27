@@ -65,6 +65,7 @@ pub const OP_SILU_AND_MUL: i32 = 4;
 pub const OP_GEMV: i32 = 5;
 pub const OP_CUTLASS_GEMM: i32 = 6;
 pub const OP_CUTLASS_GEMM_SPLITK: i32 = 7;
+pub const OP_EMBED: i32 = 8;
 
 /// Maximum width of one tape row in i32 entries. Pinned to match
 /// `prim_mega::INSTRUCTION_WIDTH` in `prim_mega.cu` and vendor's
@@ -124,7 +125,10 @@ pub enum WorkspaceKind {
 /// the whole tape).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ForwardField {
-    /// `*(ctx.fwd.input_ids)` — `uint32_t*` positions for
+    /// `*(ctx.fwd.input_ids)` — `uint32_t*` token ids.
+    /// Used by `OP_EMBED`.
+    InputIds,
+    /// `*(ctx.fwd.positions)` — `uint32_t*` positions for
     /// rope/qkv cache write. Used by `OP_QKV_ROPE_CACHE`.
     Positions,
     /// `*(ctx.fwd.slot_mapping)` — `int64_t*` slot mapping for
@@ -391,6 +395,7 @@ fn encode_op_arm(
     });
 
     match inst.name.to_string().as_str() {
+        "Embed" => Some(Some(encode_embed(inst, ctx)?)),
         "RmsNorm" => Some(Some(encode_rms_norm(inst, layer_offset, ctx)?)),
         "FusedAddRmsNorm" => Some(Some(encode_fused_add_rms_norm(inst, layer_offset, ctx)?)),
         "FusedQkvRopeCache" => Some(Some(encode_fused_qkv_rope_cache(inst, layer_offset, ctx)?)),
@@ -414,8 +419,7 @@ fn encode_op_arm(
         // variant in `ferrite-forward/src/instr.rs` shows up as
         // a compile error here, not a silent runtime fall-through.
         // Variants that exist but have no DC sibling C++ kernel:
-        "Embed"
-        | "LayerNorm"
+        "LayerNorm"
         | "Reshape"
         | "Add"
         | "ScalarMul"
@@ -465,6 +469,33 @@ fn encode_op_arm(
 }
 
 // ── Per-variant arms ────────────────────────────────────────────
+
+/// `Embed(out_slot, weight_fn)` → `OP_EMBED`. Row layout per
+/// `prim_mega.cu::run_embed`:
+/// `[op, ptr_out, ptr_w, ptr_input_ids, hidden, num_tokens]`.
+///
+/// `weight_fn` is the un-layered token-embedding accessor on
+/// `Weights` (e.g. `Weights::token_embed`). The launcher reads
+/// `.weight.as_gpu_tensor()` against it and `fwd.input_ids` for the
+/// id pointer. Pure gather; no eps, no smem, no runtime-resolved
+/// shape (hidden is a `CanonicalParams` const known at codegen,
+/// num_tokens fixed per workload point).
+fn encode_embed(inst: &OpInstance, ctx: &EncodeCtx) -> Option<EncodedRow> {
+    let out_slot = parse_u32_literal(&inst.field_values[0])?;
+    let fn_ident = path_last_segment(&inst.field_values[1])?;
+
+    let mut row = EncodedRow::new(OP_EMBED);
+    row.push_ptr(PtrSpec::TileSlot(out_slot));
+    row.push_ptr(PtrSpec::Weight {
+        fn_ident,
+        layer: 0,
+        field: WeightField::Weight,
+    });
+    row.push_ptr(PtrSpec::Forward(ForwardField::InputIds));
+    row.push_const(ctx.hidden_size as i32);
+    row.push_const(ctx.num_tokens as i32);
+    Some(row)
+}
 
 /// `RmsNorm(in_slot, out_slot, layer, weight_fn)` →
 /// `OP_RMS_NORM` with row layout per `prim_mega.cu::run_rms_norm`:
@@ -1065,6 +1096,9 @@ pub fn emit_prim_mega_launcher(
                     );
                 }
             }
+            PtrSpec::Forward(ForwardField::InputIds) => quote! {
+                pt_host.push(fwd.input_ids.raw_ptr() as *mut ::core::ffi::c_void);
+            },
             PtrSpec::Forward(ForwardField::Positions) => quote! {
                 pt_host.push(fwd.positions.raw_ptr() as *mut ::core::ffi::c_void);
             },
@@ -1611,9 +1645,50 @@ mod tests {
 
     /// Variants with no prim_mega arm produce `None` from
     /// [`try_encode_bucket`] — the canonical is mega-ineligible.
-    /// Pin: `Embed` has no DC sibling C++ kernel.
+    /// Pin: `LayerNorm` has no DC sibling C++ kernel today.
     #[test]
     fn unsupported_variant_returns_none() {
+        let mut arch = ArchOpcodes::new();
+        arch.register(OpcodeShape::new(
+            "LayerNorm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers::CohereLayerNorm
+                    ),
+                ),
+            ],
+        ));
+        let prog = vec![op(
+            "LayerNorm",
+            vec![
+                quote! { 0u32 },
+                quote! { 1u32 },
+                quote! { 0u32 },
+                quote! { Weights::input_layernorm },
+            ],
+        )];
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b());
+        assert!(
+            bucket.is_none(),
+            "LayerNorm has no prim_mega arm — should reject"
+        );
+    }
+
+    /// Embed encodes to OP_EMBED with three pointer slots
+    /// (out, weight, input_ids) plus hidden_size + num_tokens consts.
+    /// Pin: variant ident → opcode; un-layered weight at layer=0;
+    /// ForwardField::InputIds wired through pt[].
+    #[test]
+    fn embed_encodes_to_op_embed() {
         let mut arch = ArchOpcodes::new();
         arch.register(OpcodeShape::new(
             "Embed",
@@ -1629,13 +1704,31 @@ mod tests {
         ));
         let prog = vec![op(
             "Embed",
-            vec![quote! { 0u32 }, quote! { Weights::token_embed }],
+            vec![quote! { 7u32 }, quote! { Weights::token_embed }],
         )];
-        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b());
-        assert!(
-            bucket.is_none(),
-            "Embed has no prim_mega arm — should reject"
+        let bucket =
+            try_encode_bucket(&arch, &prog, &ctx_llama_1b()).expect("Embed has a mega arm");
+        assert_eq!(bucket.rows.len(), 1);
+        let row = &bucket.rows[0];
+        assert!(matches!(row.slots[0], RowSlot::Const(c) if c == OP_EMBED));
+        // Three pt[] entries in order: out tile, token-embed weight,
+        // forward input_ids.
+        assert_eq!(bucket.ptr_plan.len(), 3);
+        assert_eq!(bucket.ptr_plan[0], PtrSpec::TileSlot(7));
+        assert_eq!(
+            bucket.ptr_plan[1],
+            PtrSpec::Weight {
+                fn_ident: "token_embed".into(),
+                layer: 0,
+                field: WeightField::Weight,
+            }
         );
+        assert_eq!(bucket.ptr_plan[2], PtrSpec::Forward(ForwardField::InputIds));
+        // No runtime fills — embed has no per-call shape resolution.
+        assert!(bucket.runtime_fills.is_empty());
+        // hidden_size + num_tokens at slots 4 and 5.
+        assert!(matches!(row.slots[4], RowSlot::Const(2048)));
+        assert!(matches!(row.slots[5], RowSlot::Const(1)));
     }
 
     /// CutlassGemm encodes to OP_CUTLASS_GEMM with a config_id

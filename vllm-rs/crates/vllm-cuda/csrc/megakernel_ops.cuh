@@ -375,3 +375,41 @@ __device__ void dc_silu_and_mul(
         o[i] = static_cast<T>(gv * uv);
     }
 }
+
+// ── Embed (device-callable token-embedding gather) ─────────────
+//
+// out[i, :] = weight[ids[i], :]   for i in [0, num_tokens)
+//
+// One CTA per output row (token); threads cooperate over hidden_size.
+// Mirrors the non-vectorized `embedding_gather_kernel` in
+// embedding_kernels.cu but with the standard "one CTA per row,
+// CTAs beyond num_rows early-exit" megakernel shape so the same grid
+// can re-use across phases. Pure copy — no reductions, no smem.
+template <typename T>
+__device__ void dc_embed(
+    T* __restrict__ out,            // [num_tokens, hidden_size]
+    const T* __restrict__ weight,   // [vocab_size, hidden_size]
+    const uint32_t* __restrict__ ids,  // [num_tokens]
+    int hidden_size,
+    int num_tokens)
+{
+    const int row = blockIdx.x;
+    if (row >= num_tokens) return;
+
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+    using VT = typename VecType<T>::Type;
+
+    const uint32_t id = ids[row];
+    const T* src = weight + static_cast<size_t>(id) * hidden_size;
+    T* dst = out + row * hidden_size;
+
+    const int num_vecs = hidden_size / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        vec_store(&dst[vi * VEC_SIZE], vec_load(&src[vi * VEC_SIZE]));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}

@@ -163,6 +163,11 @@ enum Opcode : int {
     // pre-allocated by the launcher and indexed into via the
     // pointer table.
     OP_CUTLASS_GEMM_SPLITK = 7,
+    // Token-embedding gather. row[1]: ptr_idx out, row[2]: ptr_idx
+    // weight ([vocab, hidden]), row[3]: ptr_idx input_ids
+    // (uint32_t*), row[4]: hidden_size, row[5]: num_tokens.
+    // No smem, pure gather; CTAs cooperate one-per-row-of-out.
+    OP_EMBED = 8,
     // Reserved for follow-up commits.
     // OP_FI_ATTN_DECODE   = 0x2000,
     // OP_FI_ATTN_PREFILL  = 0x2001,
@@ -358,6 +363,22 @@ __device__ __forceinline__ void run_cutlass_gemm_splitk(const int* row, void* co
     }
 }
 
+// ── EMBED (token-embedding gather) ──────────────────────────────
+// row[1]: ptr_idx out         (T*           [num_tokens, hidden])
+// row[2]: ptr_idx weight      (const T*     [vocab_size, hidden])
+// row[3]: ptr_idx input_ids   (const uint32_t* [num_tokens])
+// row[4]: hidden_size
+// row[5]: num_tokens
+template <typename T>
+__device__ __forceinline__ void run_embed(const int* row, void* const* pt) {
+    T* out                       = reinterpret_cast<T*>(pt[row[1]]);
+    const T* weight              = reinterpret_cast<const T*>(pt[row[2]]);
+    const uint32_t* ids          = reinterpret_cast<const uint32_t*>(pt[row[3]]);
+    int hidden_size              = row[4];
+    int num_tokens               = row[5];
+    dc_embed<T>(out, weight, ids, hidden_size, num_tokens);
+}
+
 // ── GEMV (M=1) ──────────────────────────────────────────────────
 // row[1]: ptr_idx out (= C, [1, N])
 // row[2]: ptr_idx x (= A, [1, K] input vector)
@@ -424,6 +445,9 @@ __global__ void prim_mega_llama_kernel(const int* __restrict__ tape,
                 break;
             case OP_CUTLASS_GEMM_SPLITK:
                 run_cutlass_gemm_splitk(row, pt);
+                break;
+            case OP_EMBED:
+                run_embed<__nv_bfloat16>(row, pt);
                 break;
             // FlashInfer attention arms land in follow-up commits. No `default:` arm — an unknown
             // opcode here means the encoder emitted a row it shouldn't

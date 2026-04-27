@@ -564,6 +564,20 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         for assignment in sfufs.per_workload.values() {
             for impl_id in assignment.impls.values() {
                 let name = library.get(*impl_id).name();
+                // PrimMega DC siblings reuse the host counterpart's
+                // category — same kernel family, only launch_kind
+                // differs. Bucket them as their host peers.
+                let dc_alias = match name {
+                    "dc_rmsnorm" => Some(6),                     // non-gemm
+                    "dc_fused_add_rms_norm" => Some(6),          // non-gemm
+                    "dc_fused_qkv_rope_cache" => Some(3), // cublas (matches host bucket via `fused_` prefix)
+                    n if n.starts_with("dc_cutlass") => Some(4), // cutlass
+                    _ => None,
+                };
+                if let Some(b) = dc_alias {
+                    classes_used[b] = true;
+                    continue;
+                }
                 let bucket = if name.starts_with("flashinfer") {
                     Some(1) // fi
                 } else if name.starts_with("mla_") {
@@ -636,6 +650,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         // the post-solve dispatch and that `prim_mega_compatible()`
         // gates correctly per target. Once the encoder lands, the
         // same predicate flips into the real runtime branch.
+        let sk_axis_active = !args.sk_buckets.is_empty();
         let interp_per_m: String = sfufs
             .per_workload
             .iter()

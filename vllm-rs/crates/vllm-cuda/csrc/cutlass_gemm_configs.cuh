@@ -20,36 +20,35 @@
 //   - LinearCombination<bf16, 8, float, float> epilogue
 //   - GemmIdentityThreadblockSwizzle<>
 //
-// Add a row only after verifying the corresponding host launcher
-// in cutlass_standalone_gemm.cu compiles for the target arch
-// (some tile × stage combos exceed sm89's ~100KB SMEM budget and
-// fail `can_implement` silently — the host launcher's instantiation
-// site is the canary).
-
-#pragma once
-
-// The list. Each row corresponds to a `using Gemm_*` typedef in
-// cutlass_standalone_gemm.cu lines 89–103, 343–348. Subset for
-// Phase 1 — the workhorse tiles cuBLAS picks at typical Llama
-// dims. Deep-pipeline (stages 5+), 32×*, K64, W8, swizzle, silu,
-// splitK, sm90, GEMV variants land in follow-up commits.
+// **Wholesale invariant:** every (TB_M, TB_N, STAGES) tuple in the
+// host's `CUTLASS_TILE_ZOO` (Rust-side, drives `CutlassGemmImpl`
+// registration + CSV cost lookup) appears in this list, and vice
+// versa. Pinned by `dc_zoo_equals_host_zoo` in impl_lib.rs::tests.
+// Drift on either side breaks the invariant at test time.
+//
+// To add a tile here you must (1) add the matching CSV calibration
+// row to `cutlass_<TBM>x<TBN>_s<S>` in the per-target CSV, (2) add
+// the tuple to `CUTLASS_TILE_ZOO` in impl_lib.rs, and (3) add the
+// row below. To remove a tile, do all three in reverse. The host
+// launcher in cutlass_standalone_gemm.cu is the canary for SMEM-
+// fits — `can_implement` failures there mean the tile must be
+// dropped from the zoo entirely (host AND DC), not silently
+// excluded from one side.
 #define CUTLASS_DC_GEMM_LIST(X)                                  \
     /* TB_M  TB_N  TB_K  STAGES  WARP_M  WARP_N  WARP_K */       \
-    X(  64,    64,    32,    4,     32,     32,     32)          \
+    X(  32,    64,    32,    3,     32,     32,     32)          \
+    X(  32,    64,    32,    4,     32,     32,     32)          \
+    X(  32,   128,    32,    3,     32,     64,     32)          \
+    X(  32,   128,    32,    4,     32,     64,     32)          \
+    X(  32,   256,    32,    3,     32,     64,     32)          \
     X(  64,    64,    32,    3,     32,     32,     32)          \
-    X(  64,    64,    32,    2,     32,     32,     32)          \
-    X(  64,   128,    32,    4,     32,     64,     32)          \
+    X(  64,    64,    32,    4,     32,     32,     32)          \
     X(  64,   128,    32,    3,     32,     64,     32)          \
-    X(  64,   128,    32,    2,     32,     64,     32)          \
-    X( 128,    64,    32,    4,     64,     32,     32)          \
+    X(  64,   128,    32,    4,     32,     64,     32)          \
     X( 128,    64,    32,    3,     64,     32,     32)          \
-    X( 128,    64,    32,    2,     64,     32,     32)          \
-    X( 128,   128,    32,    4,     64,     32,     32)          \
+    X( 128,    64,    32,    4,     64,     32,     32)          \
     X( 128,   128,    32,    3,     64,     32,     32)          \
-    X( 128,   128,    32,    2,     64,     32,     32)          \
+    X( 128,   128,    32,    4,     64,     32,     32)          \
     X( 128,   256,    32,    3,     64,     64,     32)          \
-    X( 128,   256,    32,    2,     64,     64,     32)          \
-    X( 256,    64,    32,    4,     64,     32,     32)          \
     X( 256,    64,    32,    3,     64,     32,     32)          \
-    X( 256,    64,    32,    2,     64,     32,     32)          \
-    X( 256,   128,    32,    2,     64,     32,     32)
+    X( 256,    64,    32,    4,     64,     32,     32)

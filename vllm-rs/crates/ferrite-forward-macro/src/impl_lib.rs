@@ -2364,13 +2364,15 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
-    // PrimMega siblings — one per (tile_m, tile_n, stages) tuple
-    // present in BOTH the host CSV-calibrated zoo AND the C++ DC
-    // X-macro list. Each delegates `cost_us` to the host CutlassGemm
-    // sibling, so the SAME CSV row drives both — solver scoring is
-    // apples-to-apples and the only divergence is launch_kind +
-    // handoff cost (which lives at the edge level).
-    for tile in CUTLASS_DC_TILE_ZOO {
+    // PrimMega siblings — one per CUTLASS_TILE_ZOO entry, identical
+    // tile set to the host registration above. Each delegates
+    // `cost_us` to the host CutlassGemm sibling, so the SAME CSV row
+    // drives both — solver scoring is apples-to-apples and the only
+    // divergence is launch_kind + handoff cost (which lives at the
+    // edge level). Drift between host and DC tile sets is impossible
+    // because both walk the same list; the C++ X-macro is pinned to
+    // it by the `dc_zoo_equals_host_zoo` test in this module.
+    for tile in CUTLASS_TILE_ZOO {
         lib.push(Box::new(DcCutlassGemmImpl {
             tile_m: tile.0,
             tile_n: tile.1,
@@ -8355,44 +8357,20 @@ impl Implementation for CutlassGemmImpl {
 
 // ── DcCutlassGemmImpl ────────────────────────────────────────────
 //
-// PrimMega sibling to [`CutlassGemmImpl`]. Each (tile_m, tile_n,
-// stages) tuple registered here corresponds to a typedef +
-// switch-arm pair in `vllm-cuda/csrc/megakernel/prim_mega.cu`'s
-// CUTLASS_DC_GEMM_LIST expansion (`dc_cutlass.cuh` ::
-// `dc_gemm<DcGemm_*>`). `CUTLASS_DC_TILE_ZOO` below pins the
-// overlap between the host CSV-calibrated zoo
-// (`CUTLASS_TILE_ZOO`) and the DC X-macro list — only tuples
-// present in BOTH appear here. DC-only tile shapes (the `s2` deep-
-// pipeline variants currently present only in the C++ X-macro;
-// the GEMV / SplitK / W8 / 32×* / sm90 variants pending
-// follow-up) get registered when their host counterparts ship.
+// PrimMega sibling to [`CutlassGemmImpl`]. Iterates the SAME
+// `CUTLASS_TILE_ZOO` the host registration walks — drift between
+// the DC and host tile sets is structurally impossible because
+// they share the source list. Each (tile_m, tile_n, stages) tuple
+// corresponds to a typedef + switch-arm pair in
+// `vllm-cuda/csrc/megakernel/prim_mega.cu`'s `CUTLASS_DC_GEMM_LIST`
+// expansion (`dc_cutlass.cuh` :: `dc_gemm<DcGemm_*>`); the C++
+// X-macro list is pinned to `CUTLASS_TILE_ZOO` by the
+// `dc_zoo_equals_host_zoo` test below.
 //
 // Cost delegates to CutlassGemmImpl which reads the same CSV row
 // (`cutlass_<TBM>x<TBN>_s<S>`). The DC sibling carries no extra
 // per-tile state; the trait-object wrapper holds (tile_m, tile_n,
 // stages) and constructs a fresh CutlassGemmImpl on every call.
-
-/// (tile_m, tile_n, stages) tuples that exist in BOTH the host
-/// `CUTLASS_TILE_ZOO` AND `prim_mega.cu`'s `CUTLASS_DC_GEMM_LIST`.
-/// Pinned here so a drift on either side surfaces as a missing /
-/// extra zoo entry rather than a runtime mismatch. The host's
-/// `CUTLASS_TILE_ZOO` carries 32×* small-M tiles the DC list
-/// doesn't yet have; the DC list carries `s2` deep-pipeline
-/// variants the host CSV doesn't (yet) calibrate. Intersection
-/// only:
-const CUTLASS_DC_TILE_ZOO: &[(u32, u32, u32)] = &[
-    (64, 64, 3),
-    (64, 64, 4),
-    (64, 128, 3),
-    (64, 128, 4),
-    (128, 64, 3),
-    (128, 64, 4),
-    (128, 128, 3),
-    (128, 128, 4),
-    (128, 256, 3),
-    (256, 64, 3),
-    (256, 64, 4),
-];
 
 #[derive(Debug, Clone)]
 pub struct DcCutlassGemmImpl {
@@ -8417,7 +8395,14 @@ impl Implementation for DcCutlassGemmImpl {
         // tile-shape-keyed `&'static str`. We mirror it under a
         // `dc_` prefix so cost-table / debug logs disambiguate the
         // two siblings while keeping the same per-tile string set.
+        // One arm per CUTLASS_TILE_ZOO entry. Drift caught by
+        // `dc_cutlass_name_covers_full_zoo` test below.
         match (self.tile_m, self.tile_n, self.stages) {
+            (32, 64, 3) => "dc_cutlass_32x64_s3",
+            (32, 64, 4) => "dc_cutlass_32x64_s4",
+            (32, 128, 3) => "dc_cutlass_32x128_s3",
+            (32, 128, 4) => "dc_cutlass_32x128_s4",
+            (32, 256, 3) => "dc_cutlass_32x256_s3",
             (64, 64, 3) => "dc_cutlass_64x64_s3",
             (64, 64, 4) => "dc_cutlass_64x64_s4",
             (64, 128, 3) => "dc_cutlass_64x128_s3",
@@ -13811,9 +13796,10 @@ mod tests {
 
     #[test]
     fn dc_cutlass_gemm_share_opcode_shape() {
-        // Tile-shape tuples must agree per-tile; iterate the DC zoo
-        // and check each pairing.
-        for &(m, n, s) in CUTLASS_DC_TILE_ZOO {
+        // Tile-shape tuples must agree per-tile; iterate the
+        // canonical zoo (DC and host walk the same list) and check
+        // each pairing.
+        for &(m, n, s) in CUTLASS_TILE_ZOO {
             let host = CutlassGemmImpl {
                 tile_m: m,
                 tile_n: n,
@@ -13868,18 +13854,85 @@ mod tests {
         }
     }
 
+    /// Every CUTLASS_TILE_ZOO entry resolves to a non-`unknown`
+    /// `name()` arm on `DcCutlassGemmImpl`. Catches the case where a
+    /// tile is added to the zoo but its name-match arm is forgotten;
+    /// "dc_cutlass_unknown" would silently trash log/cost-table keys.
     #[test]
-    fn dc_cutlass_zoo_is_subset_of_host_zoo() {
-        // Every DC tile must also be in the host zoo so cost lookup
-        // (which delegates to CutlassGemmImpl) finds a CSV row. A
-        // DC-only tile would silently miss CSV → UNCALIBRATED_COST_US
-        // → solver never picks it → dead registration.
-        let host: std::collections::HashSet<_> = CUTLASS_TILE_ZOO.iter().copied().collect();
-        for &dc_tile in CUTLASS_DC_TILE_ZOO {
-            assert!(
-                host.contains(&dc_tile),
-                "DC tile {dc_tile:?} missing from CUTLASS_TILE_ZOO"
+    fn dc_cutlass_name_covers_full_zoo() {
+        for &(m, n, s) in CUTLASS_TILE_ZOO {
+            let dc = DcCutlassGemmImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+            };
+            let name = dc.name();
+            assert_ne!(
+                name, "dc_cutlass_unknown",
+                "CUTLASS_TILE_ZOO entry ({m}, {n}, {s}) has no name() arm \
+                 in DcCutlassGemmImpl"
             );
+            let expected = format!("dc_cutlass_{m}x{n}_s{s}");
+            assert_eq!(name, expected);
         }
+    }
+
+    /// Pins `vllm-cuda/csrc/cutlass_gemm_configs.cuh`'s
+    /// `CUTLASS_DC_GEMM_LIST` to exactly `CUTLASS_TILE_ZOO`. Drift on
+    /// either side surfaces as a test failure here rather than as a
+    /// missing/extra registration the solver silently never picks.
+    /// The C++ X-macro can carry warp-shape columns the Rust list
+    /// omits — we compare on the (TB_M, TB_N, STAGES) projection,
+    /// which is what `CutlassGemmImpl` and `DcCutlassGemmImpl` index
+    /// by.
+    #[test]
+    fn dc_zoo_equals_host_zoo() {
+        const CUH: &str = include_str!("../../vllm-cuda/csrc/cutlass_gemm_configs.cuh");
+        // Parse rows of the form `X( TBM, TBN, TBK, STAGES, …)`.
+        // Take only entries inside the `CUTLASS_DC_GEMM_LIST` macro
+        // body (everything after `#define CUTLASS_DC_GEMM_LIST(X)`
+        // up to the trailing entry without a backslash). The cuh
+        // file currently has only one X-macro list, so a permissive
+        // `X(…)` match suffices.
+        let mut cpp: std::collections::BTreeSet<(u32, u32, u32)> =
+            std::collections::BTreeSet::new();
+        for line in CUH.lines() {
+            let line = line.trim();
+            if !line.starts_with("X(") {
+                continue;
+            }
+            let inner = line
+                .trim_start_matches("X(")
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches(')')
+                .trim();
+            let cols: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+            // Need at least TBM, TBN, TBK, STAGES.
+            if cols.len() < 4 {
+                continue;
+            }
+            let tbm: u32 = cols[0]
+                .parse()
+                .unwrap_or_else(|e| panic!("CUTLASS_DC_GEMM_LIST: bad TB_M `{}`: {e}", cols[0]));
+            let tbn: u32 = cols[1]
+                .parse()
+                .unwrap_or_else(|e| panic!("CUTLASS_DC_GEMM_LIST: bad TB_N `{}`: {e}", cols[1]));
+            let stages: u32 = cols[3]
+                .parse()
+                .unwrap_or_else(|e| panic!("CUTLASS_DC_GEMM_LIST: bad STAGES `{}`: {e}", cols[3]));
+            cpp.insert((tbm, tbn, stages));
+        }
+        let rust: std::collections::BTreeSet<(u32, u32, u32)> =
+            CUTLASS_TILE_ZOO.iter().copied().collect();
+        let cpp_only: Vec<_> = cpp.difference(&rust).copied().collect();
+        let rust_only: Vec<_> = rust.difference(&cpp).copied().collect();
+        assert!(
+            cpp_only.is_empty() && rust_only.is_empty(),
+            "DC tile-zoo drift between Rust CUTLASS_TILE_ZOO and C++ \
+             CUTLASS_DC_GEMM_LIST.\n  C++ has but Rust doesn't: \
+             {cpp_only:?}\n  Rust has but C++ doesn't: {rust_only:?}\n\
+             Both sides must list the same (TB_M, TB_N, STAGES) tuples."
+        );
     }
 }

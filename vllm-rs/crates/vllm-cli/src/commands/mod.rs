@@ -9,6 +9,8 @@ pub mod bench;
 pub mod chat;
 pub mod collect_env;
 pub mod convert;
+#[cfg(feature = "cuda")]
+pub mod ferrite;
 #[cfg(feature = "gce")]
 pub mod gce;
 #[cfg(feature = "k8s")]

@@ -9,11 +9,19 @@ pub use ferrite_forward_macro::forward;
 
 pub mod cpu_golden;
 #[cfg(feature = "cuda")]
+pub mod info;
+#[cfg(feature = "cuda")]
 pub mod instr;
 #[cfg(feature = "cuda")]
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
+
+#[cfg(feature = "cuda")]
+pub use info::{
+    BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep, VariantDump,
+    normalize_slice,
+};
 
 #[cfg(feature = "cuda")]
 pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone};

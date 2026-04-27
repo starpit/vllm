@@ -56,6 +56,50 @@ pub enum Commands {
     /// Live TUI dashboard — monitor a running vllm server.
     #[cfg(feature = "top")]
     Top(TopArgs),
+    /// Ferrite tooling: inspect compiled-in model backbones, etc.
+    #[cfg(feature = "cuda")]
+    Ferrite(FerriteCommand),
+}
+
+/// `vllm ferrite <subcommand>`.
+#[cfg(feature = "cuda")]
+#[derive(Parser, Debug)]
+pub struct FerriteCommand {
+    #[command(subcommand)]
+    pub command: FerriteSubcommand,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Subcommand, Debug)]
+pub enum FerriteSubcommand {
+    /// Print the per-bucket backbone instruction list for compiled
+    /// ferrite variants. Optional positional filters AND-substring
+    /// match against `<arch>/<variant_stem>` — e.g.
+    /// `vllm ferrite info llama 3.2 awq`.
+    Info(FerriteInfoArgs),
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Parser, Debug)]
+pub struct FerriteInfoArgs {
+    /// Color/style output. `auto` uses ANSI when stdout is a tty
+    /// and `NO_COLOR` is unset; `always` forces it on (useful when
+    /// piping into `less -R`); `never` disables.
+    #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
+    pub color: ColorWhen,
+    /// Substring filters. A variant is shown when its
+    /// `<arch>/<variant_stem>` contains every filter (case-
+    /// insensitive). Empty = show every compiled variant.
+    pub filters: Vec<String>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+pub enum ColorWhen {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 /// Arguments for the `serve` subcommand.

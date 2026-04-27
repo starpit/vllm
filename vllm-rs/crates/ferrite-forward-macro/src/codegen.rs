@@ -3455,6 +3455,25 @@ pub fn emit_model(
                 ::ferrite_forward::run_backbone(e.4, wm, ctx, device, e.6, e.7)
             }
         }
+
+        /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
+        /// row, with backbone + lm_head normalized for non-generic
+        /// inspection (no `&Weights`, no GPU). Used by
+        /// `vllm ferrite info` via the inventory registry.
+        #[cfg(feature = "cuda")]
+        pub fn dump() -> ::std::vec::Vec<::ferrite_forward::BucketDump> {
+            FORWARD_TABLE
+                .iter()
+                .map(|e| ::ferrite_forward::BucketDump {
+                    m_min: e.0,
+                    m_max_excl: e.1,
+                    sk_min: e.2,
+                    sk_max_excl: e.3,
+                    backbone: ::ferrite_forward::normalize_slice(e.4),
+                    lm_head: ::ferrite_forward::normalize_slice(e.5),
+                })
+                .collect()
+        }
     }
 }
 
@@ -3515,7 +3534,7 @@ fn emit_shim_model(
         #weights
 
         #[cfg(feature = "cuda")]
-        pub use super::#canonical::{forward, forward_backbone};
+        pub use super::#canonical::{dump, forward, forward_backbone};
     }
 }
 

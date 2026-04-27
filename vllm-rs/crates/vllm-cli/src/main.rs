@@ -59,5 +59,12 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "top")]
         Commands::Top(args) => commands::top::run_top(args).await,
+        #[cfg(feature = "cuda")]
+        Commands::Ferrite(cmd) => {
+            use crate::args::FerriteSubcommand;
+            match cmd.command {
+                FerriteSubcommand::Info(args) => commands::ferrite::run_info(args).await,
+            }
+        }
     }
 }

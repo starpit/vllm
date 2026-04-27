@@ -676,7 +676,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     }
 
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut arch_dispatch_arms: Vec<(Ident, Vec<u64>)> = Vec::new();
+    let mut arch_dispatch_arms: Vec<(Ident, String, Vec<u64>)> = Vec::new();
 
     for (idx, sm) in solved.iter().enumerate() {
         let model_mod = Ident::new(&sm.model.name, Span::call_site());
@@ -706,7 +706,11 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             }
         });
 
-        arch_dispatch_arms.push((model_mod, collect_dispatch_bounds(sm.model)));
+        arch_dispatch_arms.push((
+            model_mod,
+            sm.model.source_stem.clone(),
+            collect_dispatch_bounds(sm.model),
+        ));
     }
 
     // Union of HF `architectures: [..]` strings across every compiled
@@ -786,7 +790,7 @@ fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
 fn emit_arch_dispatcher(
     arch_ident: &Ident,
     hf_arches: &[String],
-    arms: &[(Ident, Vec<u64>)],
+    arms: &[(Ident, String, Vec<u64>)],
 ) -> proc_macro2::TokenStream {
     if arms.is_empty() {
         return quote! {};
@@ -798,7 +802,7 @@ fn emit_arch_dispatcher(
     // would create ambiguity between e.g. `llama32` and `llama_3_2`.
     let variants: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _)| {
+        .map(|(model_ident, _, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! { #variant_ident(#model_ident::Weights) }
         })
@@ -813,7 +817,7 @@ fn emit_arch_dispatcher(
     // the colliding configs.
     let try_fingerprint_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _)| {
+        .map(|(model_ident, _, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
                 if #model_ident::fingerprint_matches(gw, hf) {
@@ -827,7 +831,7 @@ fn emit_arch_dispatcher(
 
     let forward_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _)| {
+        .map(|(model_ident, _, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
                 Weights::#variant_ident(w) => unsafe {
@@ -838,7 +842,7 @@ fn emit_arch_dispatcher(
         .collect();
     let forward_backbone_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _)| {
+        .map(|(model_ident, _, _)| {
             let variant_ident = pascal_case(model_ident);
             quote! {
                 Weights::#variant_ident(w) => unsafe {
@@ -859,7 +863,7 @@ fn emit_arch_dispatcher(
             let method_name = Ident::new(field, Span::call_site());
             let arms_ts: Vec<proc_macro2::TokenStream> = arms
                 .iter()
-                .map(|(model_ident, bounds)| {
+                .map(|(model_ident, _, bounds)| {
                     let variant_ident = pascal_case(model_ident);
                     let idx = DISPATCH_FIELDS
                         .iter()
@@ -889,6 +893,23 @@ fn emit_arch_dispatcher(
     let hf_arch_lits: Vec<proc_macro2::Literal> = hf_arches
         .iter()
         .map(|s| proc_macro2::Literal::string(s))
+        .collect();
+
+    // Per-variant `(stem, dump_fn)` rows for the backbone-dump
+    // registry. Each variant's `mod <model_ident>` emits a
+    // `pub fn dump() -> Vec<BucketDump>`; here we name them so a
+    // single `BackboneDumpRegistration` per arch can iterate them.
+    let dump_rows: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|(model_ident, source_stem, _)| {
+            let stem_lit = proc_macro2::Literal::string(source_stem);
+            quote! {
+                ::ferrite_forward::VariantDump {
+                    variant_stem: #stem_lit,
+                    buckets: #model_ident::dump(),
+                }
+            }
+        })
         .collect();
 
     quote! {
@@ -1015,6 +1036,14 @@ fn emit_arch_dispatcher(
                             as ::std::boxed::Box<dyn ::ferrite_forward::FerriteWeights>)
                     })
                 },
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        ::ferrite_forward::inventory::submit! {
+            ::ferrite_forward::BackboneDumpRegistration {
+                arch_name: #arch_name_lit,
+                dump_all: || vec![ #(#dump_rows),* ],
             }
         }
     }

@@ -185,6 +185,7 @@ struct qkv_rope_append {
 
     struct consumer {
         static __device__ void run(const Globals &g, state<Config> &s) {
+            static_assert(Globals::num_devices == 8, "Fix this function.");
             static_assert(Config::NUM_CONSUMER_WARPS == 8, "Fix this function.");
 
             parsed_instruction inst{s};
@@ -283,6 +284,7 @@ struct qkv_rope_append {
         static __device__ void run(const Globals &g, state<Config> &s) {
             wait(outputs_arrived(s), 0);
 
+            static_assert(Globals::num_devices == 8, "Fix this function.");
             parsed_instruction inst{s};
 
             sv_bf_head_dim *output_vecs[2] = {

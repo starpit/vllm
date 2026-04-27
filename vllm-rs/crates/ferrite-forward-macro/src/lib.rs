@@ -32,7 +32,6 @@ mod codegen;
 mod concurrency;
 mod config;
 mod cost;
-mod cuda_codegen;
 mod emit;
 mod fuf;
 mod impl_lib;

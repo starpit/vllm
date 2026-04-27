@@ -1700,6 +1700,10 @@ impl DeepSeekV2ForCausalLM {
                     intermediate_size: inter,
                     hidden_size: hidden,
                     renormalize: config.norm_topk_prob,
+                    e_score_correction_bias: None,
+                    n_expert_group: 0,
+                    topk_group: 0,
+                    routed_scaling_factor: 1.0,
                 };
 
                 // Shared experts — keep quantized, use GgmlLinear.

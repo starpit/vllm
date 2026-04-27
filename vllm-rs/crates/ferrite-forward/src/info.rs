@@ -440,6 +440,15 @@ impl<W> Instruction<W> {
                     F::LayerKind("DeepSeekV2MoELayer"),
                 ],
             ),
+            Instruction::DeepSeekMoeFp8Block(in_slot, out_slot, layer, _wf) => (
+                "DeepSeekMoeFp8Block",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("DeepSeekV2Fp8BlockMoELayer"),
+                ],
+            ),
             Instruction::CutlassGemm(
                 in_slot,
                 out_slot,

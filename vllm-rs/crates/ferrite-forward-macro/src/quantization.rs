@@ -711,24 +711,28 @@ pub fn storage_format_for_weight(
     // weight that the marlin GEMM kernel consumes. Weights that
     // never reach a Gemm tile (Embedding, RmsNorm, biases) have no
     // quantized representation on disk and must stay Dense.
-    let mut reached_by_gemm = false;
+    //
+    // `OpKind::DeepSeekMoe` carries one logical `moe[layer]` weight
+    // whose underlying experts are matmul-quantizable in V3/Kimi K2
+    // FP8 checkpoints, so it counts as reaching a matmul.
+    let mut reached_by_matmul = false;
     for node in &fuf.nodes {
-        if node.op != OpKind::Gemm {
+        if node.op != OpKind::Gemm && node.op != OpKind::DeepSeekMoe {
             continue;
         }
         for input in &node.inputs {
             if let FufInput::Weight { id: wid, .. } = input
                 && *wid == id
             {
-                reached_by_gemm = true;
+                reached_by_matmul = true;
                 break;
             }
         }
-        if reached_by_gemm {
+        if reached_by_matmul {
             break;
         }
     }
-    if !reached_by_gemm {
+    if !reached_by_matmul {
         return StorageFormat::Dense;
     }
 

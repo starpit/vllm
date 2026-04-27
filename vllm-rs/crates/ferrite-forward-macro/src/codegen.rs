@@ -155,6 +155,21 @@ enum FieldLoad {
         /// Number of groups to select in the first-stage grouped top-k. 0 = disabled.
         topk_group: usize,
     },
+    /// FP8 blockwise-quantized analog of `DeepSeekV2Moe` — DeepSeek-V3
+    /// official 671B and Kimi K2 official checkpoints.
+    DeepSeekV2Fp8BlockMoe {
+        prefix: String,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        use_sigmoid: bool,
+        n_expert_group: usize,
+        topk_group: usize,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -197,6 +212,106 @@ enum MarlinFormat {
     },
 }
 
+/// MoE config bits shared by `DeepSeekV2Moe` and `DeepSeekV2Fp8BlockMoe`
+/// FieldLoad variants. Reads the per-variant config JSON once and falls
+/// back to the model's `bounds` / `scalars` map when a key is absent.
+struct DeepSeekMoeCfg {
+    n_routed_experts: usize,
+    n_shared_experts: usize,
+    top_k: usize,
+    moe_intermediate_size: usize,
+    hidden_size: usize,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f32,
+    use_sigmoid: bool,
+    n_expert_group: usize,
+    topk_group: usize,
+}
+
+fn read_deepseek_moe_cfg(model: &ModelParams) -> DeepSeekMoeCfg {
+    let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+    let n_routed_experts = v
+        .get("n_routed_experts")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| model.bounds.get("n_routed_experts").copied().unwrap_or(64) as usize);
+    let n_shared_experts = v
+        .get("n_shared_experts")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| model.bounds.get("n_shared_experts").copied().unwrap_or(2) as usize);
+    let top_k = v
+        .get("num_experts_per_tok")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| {
+            model
+                .bounds
+                .get("num_experts_per_tok")
+                .copied()
+                .unwrap_or(6) as usize
+        });
+    let moe_intermediate_size = v
+        .get("moe_intermediate_size")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| {
+            model
+                .bounds
+                .get("moe_intermediate_size")
+                .copied()
+                .unwrap_or(1536) as usize
+        });
+    let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+    let norm_topk_prob = v
+        .get("norm_topk_prob")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let routed_scaling_factor = v
+        .get("routed_scaling_factor")
+        .and_then(|x| x.as_f64())
+        .map(|x| x as f32)
+        .unwrap_or_else(|| {
+            model
+                .scalars
+                .get("routed_scaling_factor")
+                .copied()
+                .unwrap_or(1.0) as f32
+        });
+    let use_sigmoid = v
+        .get("scoring_func")
+        .and_then(|x| x.as_str())
+        .map(|s| s == "sigmoid")
+        .unwrap_or(false)
+        && v.get("topk_method")
+            .and_then(|x| x.as_str())
+            .map(|s| s == "noaux_tc")
+            .unwrap_or(false);
+    let n_expert_group = v
+        .get("n_group")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(0);
+    let topk_group = v
+        .get("topk_group")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(0);
+    DeepSeekMoeCfg {
+        n_routed_experts,
+        n_shared_experts,
+        top_k,
+        moe_intermediate_size,
+        hidden_size,
+        norm_topk_prob,
+        routed_scaling_factor,
+        use_sigmoid,
+        n_expert_group,
+        topk_group,
+    }
+}
+
 /// Distill a `WeightAccessor` into its field-load plan. Uses the
 /// accessor's declared `rust_type` + `source_weights` and the
 /// model's config (for `rms_norm_eps` / `tie_word_embeddings`).
@@ -211,6 +326,9 @@ fn plan_field_load(
     let is_deepseek_v2_moe = ty.ends_with("::DeepSeekV2MoELayer")
         || ty == "DeepSeekV2MoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2MoELayer");
+    let is_deepseek_v2_fp8_block_moe = ty.ends_with("::DeepSeekV2Fp8BlockMoELayer")
+        || ty == "DeepSeekV2Fp8BlockMoELayer"
+        || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     let is_rmsnorm =
@@ -455,6 +573,31 @@ fn plan_field_load(
             FieldLoad::Fp8BlockLinear { prefixes }
         } else {
             FieldLoad::Fp8Linear { prefixes }
+        };
+    }
+
+    if is_deepseek_v2_fp8_block_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "DeepSeekV2Fp8BlockMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let cfg = read_deepseek_moe_cfg(model);
+        return FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts: cfg.n_routed_experts,
+            n_shared_experts: cfg.n_shared_experts,
+            top_k: cfg.top_k,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            hidden_size: cfg.hidden_size,
+            norm_topk_prob: cfg.norm_topk_prob,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+            use_sigmoid: cfg.use_sigmoid,
+            n_expert_group: cfg.n_expert_group,
+            topk_group: cfg.topk_group,
         };
     }
 
@@ -1226,7 +1369,10 @@ fn emit_weights_struct(
         // variant.
         let accessor_is_fp8_any = ty.ends_with("::Fp8AnyLinear")
             || ty == "Fp8AnyLinear"
-            || ty.ends_with("layers::Fp8AnyLinear");
+            || ty.ends_with("layers::Fp8AnyLinear")
+            || ty.ends_with("::DeepSeekV2Fp8BlockMoELayer")
+            || ty == "DeepSeekV2Fp8BlockMoELayer"
+            || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
@@ -2510,6 +2656,48 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                let #name = ::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer::load(
+                    gw,
+                    #prefix,
+                    #n_routed_experts,
+                    #n_shared_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #hidden_size,
+                    #norm_topk_prob,
+                    #routed_scaling_factor,
+                    #use_sigmoid,
+                    #n_expert_group,
+                    #topk_group,
+                    __fp8_dtype,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -2818,6 +3006,53 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #use_sigmoid,
                             #n_expert_group,
                             #topk_group,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer::load(
+                            gw,
+                            &#p,
+                            #n_routed_experts,
+                            #n_shared_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #hidden_size,
+                            #norm_topk_prob,
+                            #routed_scaling_factor,
+                            #use_sigmoid,
+                            #n_expert_group,
+                            #topk_group,
+                            __fp8_dtype,
                             stream,
                         )
                     })

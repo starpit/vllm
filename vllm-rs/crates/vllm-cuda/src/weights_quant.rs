@@ -1567,6 +1567,10 @@ pub fn load_fp8_moe_experts(
         intermediate_size,
         hidden_size,
         renormalize,
+        e_score_correction_bias: None,
+        n_expert_group: 0,
+        topk_group: 0,
+        routed_scaling_factor: 1.0,
         #[cfg(feature = "nccl")]
         tp_group: None,
     })
@@ -1798,6 +1802,10 @@ pub fn load_fp8_block_moe_experts(
         intermediate_size: ipp,
         hidden_size,
         renormalize,
+        e_score_correction_bias: None,
+        n_expert_group: 0,
+        topk_group: 0,
+        routed_scaling_factor: 1.0,
         #[cfg(feature = "nccl")]
         tp_group: None,
     })
@@ -2255,6 +2263,10 @@ pub fn load_marlin_moe_layer(
         has_zp,
         b_type_id,
         renormalize,
+        e_score_correction_bias: None,
+        n_expert_group: 0,
+        topk_group: 0,
+        routed_scaling_factor: 1.0,
         #[cfg(feature = "nccl")]
         tp_group: None,
     })

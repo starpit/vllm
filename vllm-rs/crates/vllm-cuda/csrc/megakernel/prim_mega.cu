@@ -34,37 +34,44 @@
 
 #include "../megakernel_ops.cuh"
 
-// CUTLASS DC infrastructure + the typedefs from
-// cutlass_standalone_gemm.cu. We re-include the latter via the
-// `using Gemm_*` aliases below — they're declared at namespace
-// scope in that .cu, so the megakernel needs its own copies (or
-// to share via a header). Phase-1 commits inline the typedefs we
-// use here; later refactor moves the shared aliases to
-// `cutlass_gemm_configs.cuh` (TODO) once the DC list stabilises.
+// CUTLASS DC infrastructure. Tile-config list lives in the shared
+// `cutlass_gemm_configs.cuh`; we expand it three times here — once
+// to declare typedefs, once to populate the `CutlassConfig` enum,
+// and once to build the inner switch in `run_cutlass_gemm`. Single
+// source of truth keeps the three in lockstep.
 #include "../dc_cutlass.cuh"
+#include "../cutlass_gemm_configs.cuh"
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 
 namespace prim_mega_cutlass_configs {
 
-// Mirrors `Gemm_64x128x32_s4` in cutlass_standalone_gemm.cu line 49.
-// Phase-1 smoke-test config; the wholesale fan-out replicates
-// every Gemm_* alias once dc_cutlass.cuh is exercised here.
-using Gemm_64x128x32_s4 = cutlass::gemm::device::Gemm<
-    cutlass::bfloat16_t, cutlass::layout::RowMajor,
-    cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
-    cutlass::bfloat16_t, cutlass::layout::RowMajor,
-    float,
-    cutlass::arch::OpClassTensorOp,
-    cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<64, 128, 32>,
-    cutlass::gemm::GemmShape<32, 64, 32>,
-    cutlass::gemm::GemmShape<16, 8, 16>,
-    cutlass::epilogue::thread::LinearCombination<
-        cutlass::bfloat16_t, 8, float, float>,
-    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-    4>;
+// Expansion #1: typedef per row.
+//
+// Mirrors the `using Gemm_*` aliases in cutlass_standalone_gemm.cu
+// at line 49 (the CUTLASS_GEMM_CONFIG macro body) — same template
+// shape with TB / Warp / instruction / epilogue / swizzle slots.
+// Naming: `DcGemm_<TB_M>x<TB_N>x<TB_K>_s<STAGES>` (Dc prefix to
+// avoid colliding with cutlass_standalone_gemm.cu's `Gemm_*`
+// aliases when both are in scope).
+#define DC_GEMM_TYPEDEF(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K)        \
+    using DcGemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm< \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                          \
+        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                       \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                          \
+        float,                                                                   \
+        cutlass::arch::OpClassTensorOp,                                          \
+        cutlass::arch::Sm80,                                                     \
+        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                              \
+        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                        \
+        cutlass::gemm::GemmShape<16, 8, 16>,                                     \
+        cutlass::epilogue::thread::LinearCombination<                            \
+            cutlass::bfloat16_t, 8, float, float>,                               \
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,            \
+        STAGES>;
+CUTLASS_DC_GEMM_LIST(DC_GEMM_TYPEDEF)
+#undef DC_GEMM_TYPEDEF
 
 }  // namespace prim_mega_cutlass_configs
 
@@ -100,12 +107,16 @@ enum Opcode : int {
     // OP_FI_ATTN_PREFILL  = 0x2001,
 };
 
-// Per-config id space — one entry per CUTLASS template
-// instantiation. The encoder side (interpreters/prim_mega.rs)
-// emits the matching config id in the row's slot[1].
+// Expansion #2: per-config id. Stable ordering — encoder side
+// (interpreters/prim_mega.rs) computes the same id from
+// (TB_M, TB_N, TB_K, STAGES). Add new rows at the end of the list
+// in cutlass_gemm_configs.cuh; never reorder existing rows or the
+// encoder's emitted ids drift.
 enum CutlassConfig : int {
-    CC_GEMM_64x128_s4 = 0,
-    // CC_GEMM_64x64_s4 = 1, ... follow-up commits.
+#define DC_GEMM_ENUM_ENTRY(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K) \
+    CC_GEMM_##TB_M##x##TB_N##x##TB_K##_s##STAGES,
+    CUTLASS_DC_GEMM_LIST(DC_GEMM_ENUM_ENTRY)
+#undef DC_GEMM_ENUM_ENTRY
 };
 
 // Per-arm argument layouts. Each arm owns its slot interpretation;
@@ -225,12 +236,17 @@ __device__ __forceinline__ void run_cutlass_gemm(const int* row, void* const* pt
     char* op_smem = smem + row[9];
     int config_id = row[10];
 
+    // Expansion #3: switch arm per config. Drives off the same
+    // CUTLASS_DC_GEMM_LIST as the typedefs + enum above.
     switch (config_id) {
-        case CC_GEMM_64x128_s4:
-            dc_cutlass::dc_gemm<prim_mega_cutlass_configs::Gemm_64x128x32_s4>(
-                C, A, B, M, N, K, alpha, beta, op_smem);
+#define DC_GEMM_SWITCH_ARM(TB_M, TB_N, TB_K, STAGES, WARP_M, WARP_N, WARP_K) \
+        case CC_GEMM_##TB_M##x##TB_N##x##TB_K##_s##STAGES:                   \
+            dc_cutlass::dc_gemm<                                             \
+                prim_mega_cutlass_configs::DcGemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES>( \
+                C, A, B, M, N, K, alpha, beta, op_smem);                     \
             break;
-        // Follow-up: wholesale config list lands here.
+        CUTLASS_DC_GEMM_LIST(DC_GEMM_SWITCH_ARM)
+#undef DC_GEMM_SWITCH_ARM
     }
 }
 

@@ -142,6 +142,18 @@ pub enum PtrSpec {
 pub enum RuntimeSource {
     /// `f32::to_bits((Weights::<fn_ident>)(W, <layer>).eps) as i32`.
     WeightEpsBits { fn_ident: String, layer: u32 },
+    /// `(Weights::<fn_ident>)(W, <layer>).weight.shape()[dim_idx] as i32`.
+    /// Used for CUTLASS GEMM/GEMV/GEMM-SplitK N/K dimensions, which are
+    /// per-`Weights` shape constants the encoder doesn't know but the
+    /// launcher resolves at call time off the loaded tensor. Convention
+    /// matches `ferrite_kernels::layers::Linear`'s `[out_features,
+    /// in_features]` weight layout: `dim_idx = 0` selects N
+    /// (out_features), `dim_idx = 1` selects K (in_features).
+    WeightShapeDim {
+        fn_ident: String,
+        layer: u32,
+        dim_idx: u8,
+    },
 }
 
 /// One slot of a `[i32; 32]` row. Trailing slots not present in
@@ -603,13 +615,21 @@ fn encode_cutlass_gemm(
     row.push_ptr(PtrSpec::TileSlot(out_slot));
     row.push_ptr(PtrSpec::TileSlot(in_slot));
     row.push_ptr(PtrSpec::Weight {
-        fn_ident,
+        fn_ident: fn_ident.clone(),
         layer,
         field: WeightField::DenseWeight,
     });
     row.push_const(ctx.num_tokens as i32); // M
-    row.push_const(0); // N — TODO step 7: ptr_idx_dim or from accessor
-    row.push_const(0); // K — same
+    row.push_runtime(RuntimeSource::WeightShapeDim {
+        fn_ident: fn_ident.clone(),
+        layer,
+        dim_idx: 0, // N = weight.shape()[0] = out_features
+    });
+    row.push_runtime(RuntimeSource::WeightShapeDim {
+        fn_ident,
+        layer,
+        dim_idx: 1, // K = weight.shape()[1] = in_features
+    });
     row.push_f32_bits(1.0); // alpha
     row.push_f32_bits(beta);
     row.push_const(0); // smem_off
@@ -662,7 +682,7 @@ fn encode_cutlass_gemm_splitk(
     row.push_ptr(PtrSpec::TileSlot(out_slot));
     row.push_ptr(PtrSpec::TileSlot(in_slot));
     row.push_ptr(PtrSpec::Weight {
-        fn_ident,
+        fn_ident: fn_ident.clone(),
         layer,
         field: WeightField::DenseWeight,
     });
@@ -676,8 +696,16 @@ fn encode_cutlass_gemm_splitk(
         row_idx: layer * 1000 + split_k * 100 + tile_m + tile_n,
     }));
     row.push_const(ctx.num_tokens as i32); // M
-    row.push_const(0); // N — TODO step 7
-    row.push_const(0); // K — same
+    row.push_runtime(RuntimeSource::WeightShapeDim {
+        fn_ident: fn_ident.clone(),
+        layer,
+        dim_idx: 0, // N = weight.shape()[0]
+    });
+    row.push_runtime(RuntimeSource::WeightShapeDim {
+        fn_ident,
+        layer,
+        dim_idx: 1, // K = weight.shape()[1]
+    });
     row.push_f32_bits(1.0); // alpha
     row.push_f32_bits(0.0); // beta
     row.push_const(0); // smem_off
@@ -705,12 +733,20 @@ fn encode_cutlass_gemv(
     row.push_ptr(PtrSpec::TileSlot(out_slot));
     row.push_ptr(PtrSpec::TileSlot(in_slot));
     row.push_ptr(PtrSpec::Weight {
-        fn_ident,
+        fn_ident: fn_ident.clone(),
         layer,
         field: WeightField::DenseWeight,
     });
-    row.push_const(0); // N — TODO step 7 (from accessor's weight shape)
-    row.push_const(0); // K — same
+    row.push_runtime(RuntimeSource::WeightShapeDim {
+        fn_ident: fn_ident.clone(),
+        layer,
+        dim_idx: 0, // N = weight.shape()[0]
+    });
+    row.push_runtime(RuntimeSource::WeightShapeDim {
+        fn_ident,
+        layer,
+        dim_idx: 1, // K = weight.shape()[1]
+    });
     row.push_f32_bits(1.0); // alpha
     row.push_f32_bits(0.0); // beta
     row.push_const(0); // smem_off
@@ -1216,6 +1252,159 @@ mod tests {
         assert_eq!(cutlass_gemm_config_id(256, 64, 4), Some(15));
         // Tile not in the zoo → None.
         assert_eq!(cutlass_gemm_config_id(64, 32, 5), None);
+    }
+
+    /// CutlassGemm's N + K slots are emitted as `RowSlot::Runtime(
+    /// WeightShapeDim { dim_idx: 0|1 })`. After
+    /// `assign_ptr_indices`, the row cells become `Const(0)` and the
+    /// runtime_fills list records `(row_idx, slot_idx, source)` so
+    /// the launcher patches them at call time from
+    /// `(weight_fn)(W, layer).weight.shape()[dim_idx]`. The encoder
+    /// can't bake them at codegen because shapes vary per `Weights`
+    /// (Llama-3B vs 7B → distinct N/K), so the slot is held empty
+    /// until launch.
+    ///
+    /// Convention pin: `Linear.weight` is `[out_features=N,
+    /// in_features=K]` so `dim_idx 0 → N`, `dim_idx 1 → K`. Re-
+    /// ordering the launcher's `weight.shape()` indexer without
+    /// flipping this would silently swap M×N×K and produce garbage.
+    #[test]
+    fn cutlass_gemm_n_k_slots_routed_through_weight_shape_dim() {
+        let arch = arch_with_seven_shapes();
+        let inst = op(
+            "CutlassGemm",
+            vec![
+                quote! { 3u32 },
+                quote! { 5u32 },
+                quote! { 0u32 },
+                quote! { Weights::q_proj },
+                quote! { 128u32 },
+                quote! { 128u32 },
+                quote! { 3u32 },
+            ],
+        );
+        let bucket =
+            try_encode_bucket(&arch, &[inst], &ctx_llama_1b()).expect("CutlassGemm has a mega arm");
+        // N at slot 5, K at slot 6 in the OP_CUTLASS_GEMM row.
+        let runtime: Vec<_> = bucket
+            .runtime_fills
+            .iter()
+            .filter(|(r, _, _)| *r == 0)
+            .collect();
+        assert!(
+            runtime.iter().any(|(_, s, src)| {
+                *s == 5
+                    && matches!(src,
+                        RuntimeSource::WeightShapeDim { fn_ident, layer: 0, dim_idx: 0 }
+                        if fn_ident == "q_proj")
+            }),
+            "row 0 slot 5 must be WeightShapeDim{{q_proj, 0, dim_idx=0=N}}",
+        );
+        assert!(
+            runtime.iter().any(|(_, s, src)| {
+                *s == 6
+                    && matches!(src,
+                        RuntimeSource::WeightShapeDim { fn_ident, layer: 0, dim_idx: 1 }
+                        if fn_ident == "q_proj")
+            }),
+            "row 0 slot 6 must be WeightShapeDim{{q_proj, 0, dim_idx=1=K}}",
+        );
+        // Static row cells zero after assign_ptr_indices.
+        assert!(matches!(bucket.rows[0].slots[5], RowSlot::Const(0)));
+        assert!(matches!(bucket.rows[0].slots[6], RowSlot::Const(0)));
+    }
+
+    /// CutlassGemmSplitK's N + K live at slots 6 + 7 (one offset
+    /// further than bare GEMM because slot 4 holds the workspace
+    /// ptr). Same WeightShapeDim contract as bare GEMM. Pin both
+    /// the slot indices and the dim_idx routing — flipping either
+    /// silently mis-shapes the splitK kernel which already pays
+    /// for an extra reduction kernel and isn't tolerant of N/K
+    /// drift.
+    #[test]
+    fn cutlass_gemm_splitk_n_k_routed_through_weight_shape_dim() {
+        let arch = arch_with_seven_shapes();
+        let inst = op(
+            "CutlassGemmSplitK",
+            vec![
+                quote! { 0u32 },
+                quote! { 1u32 },
+                quote! { 0u32 },
+                quote! { Weights::down_proj },
+                quote! { 128u32 },
+                quote! { 128u32 },
+                quote! { 3u32 },
+                quote! { 4u32 },
+            ],
+        );
+        let bucket = try_encode_bucket(&arch, &[inst], &ctx_llama_1b())
+            .expect("CutlassGemmSplitK has a mega arm");
+        let runtime: Vec<_> = bucket
+            .runtime_fills
+            .iter()
+            .filter(|(r, _, _)| *r == 0)
+            .collect();
+        assert!(
+            runtime.iter().any(|(_, s, src)| {
+                *s == 6
+                    && matches!(src,
+                        RuntimeSource::WeightShapeDim { fn_ident, layer: 0, dim_idx: 0 }
+                        if fn_ident == "down_proj")
+            }),
+            "splitK row slot 6 must be WeightShapeDim{{down_proj, 0, dim_idx=0=N}}",
+        );
+        assert!(
+            runtime.iter().any(|(_, s, src)| {
+                *s == 7
+                    && matches!(src,
+                        RuntimeSource::WeightShapeDim { fn_ident, layer: 0, dim_idx: 1 }
+                        if fn_ident == "down_proj")
+            }),
+            "splitK row slot 7 must be WeightShapeDim{{down_proj, 0, dim_idx=1=K}}",
+        );
+    }
+
+    /// CutlassGemv (M=1 singleton) routes N + K through
+    /// WeightShapeDim too — slots 4 + 5 in the OP_GEMV row. The
+    /// encoder doesn't accept a tile_m/tile_n pair (M is implicit 1
+    /// per the kernel) so the only freedom is the weight identity.
+    #[test]
+    fn cutlass_gemv_n_k_routed_through_weight_shape_dim() {
+        let arch = arch_with_seven_shapes();
+        let inst = op(
+            "CutlassGemv",
+            vec![
+                quote! { 0u32 },
+                quote! { 1u32 },
+                quote! { 0u32 },
+                quote! { Weights::lm_head },
+            ],
+        );
+        let bucket =
+            try_encode_bucket(&arch, &[inst], &ctx_llama_1b()).expect("CutlassGemv has a mega arm");
+        let runtime: Vec<_> = bucket
+            .runtime_fills
+            .iter()
+            .filter(|(r, _, _)| *r == 0)
+            .collect();
+        assert!(
+            runtime.iter().any(|(_, s, src)| {
+                *s == 4
+                    && matches!(src,
+                        RuntimeSource::WeightShapeDim { fn_ident, layer: 0, dim_idx: 0 }
+                        if fn_ident == "lm_head")
+            }),
+            "GEMV row slot 4 must be WeightShapeDim{{lm_head, 0, dim_idx=0=N}}",
+        );
+        assert!(
+            runtime.iter().any(|(_, s, src)| {
+                *s == 5
+                    && matches!(src,
+                        RuntimeSource::WeightShapeDim { fn_ident, layer: 0, dim_idx: 1 }
+                        if fn_ident == "lm_head")
+            }),
+            "GEMV row slot 5 must be WeightShapeDim{{lm_head, 0, dim_idx=1=K}}",
+        );
     }
 
     /// CutlassGemmAdd reuses the GEMM body with `beta=1.0`. The

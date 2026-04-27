@@ -41,6 +41,9 @@ use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
 use crate::interpreters::host::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
+use crate::interpreters::prim_mega::{
+    EncodeCtx, emit_prim_mega_launcher, emit_prim_mega_program, try_encode_bucket,
+};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
 
@@ -2904,6 +2907,66 @@ fn bounds_for_wp(model: &ModelParams, wp: crate::solver::WorkloadPoint) -> BTree
     bounds
 }
 
+/// Build the prim_mega [`EncodeCtx`] from the per-workload bounds
+/// map. Bounds are typically populated from `config.json`
+/// (hidden_size / num_attention_heads / head_dim / etc.); the
+/// derived `q_size` / `kv_size` mirror the CUTLASS GEMM convention
+/// where the qkv-projection's `out_features = (q + k + v)_size`.
+/// Missing keys default to 0 — encoder arms that need a non-zero
+/// value (e.g., FusedQkvRopeCache emitting q_size into the row)
+/// will produce a zero literal which the kernel detects.
+fn encode_ctx_from_bounds(
+    bounds: &BTreeMap<String, u64>,
+    wp: crate::solver::WorkloadPoint,
+) -> EncodeCtx {
+    let g = |k: &str| -> u64 { bounds.get(k).copied().unwrap_or(0) };
+    let num_q = g("num_attention_heads");
+    let num_kv = g("num_key_value_heads");
+    let head_dim = g("head_dim");
+    EncodeCtx {
+        num_tokens: wp.num_tokens as u32,
+        hidden_size: g("hidden_size") as u32,
+        q_size: (num_q * head_dim) as u32,
+        kv_size: (num_kv * head_dim) as u32,
+        head_size: head_dim as u32,
+        intermediate_size: g("intermediate_size") as u32,
+    }
+}
+
+/// Try to encode a bucket with the prim_mega encoder. On `Some`,
+/// emit the device-resident program static + launcher fn into
+/// `static_slices`. On `None` (mega-ineligible canonical), no-op.
+///
+/// Both emissions go into the per-arch module's scope so the
+/// launcher's `Weights::<fn>` paths resolve against the canonical's
+/// own `Weights` type. `static_ident` is the program-static name
+/// (e.g., `MEGA_BACKBONE_M_8`); `launcher_ident` is the launcher fn
+/// name (e.g., `prim_mega_backbone_m_8`). Naming is post-hoc — step
+/// 8's dispatch reads both via `format_ident!("prim_mega_…m_{}",
+/// wp)` to find the launcher per workload point.
+fn try_emit_prim_mega(
+    bounds: &BTreeMap<String, u64>,
+    ctx: &EncodeCtx,
+    arch_opcodes: &ArchOpcodes,
+    bucket: &crate::interpreters::host::LoweredBucket,
+    static_ident: &proc_macro2::Ident,
+    launcher_ident: &proc_macro2::Ident,
+    static_slices: &mut Vec<TokenStream>,
+) {
+    let Some(encoded) = try_encode_bucket(arch_opcodes, &bucket.instances, ctx) else {
+        return;
+    };
+    static_slices.push(emit_prim_mega_program(static_ident, &encoded));
+    static_slices.push(emit_prim_mega_launcher(
+        launcher_ident,
+        static_ident,
+        &encoded,
+        &bucket.slot_shapes,
+        bounds,
+        ctx,
+    ));
+}
+
 /// Render the alias-prelude statements for one [`LoweredBucket`].
 /// Each `(dst, src)` becomes `__tiles[dst as usize] =
 /// Some(TileEntry::View { ref_slot: src });`. Aliases are dropped
@@ -3269,6 +3332,15 @@ pub fn emit_model(
     // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
     // bucket only. Non-canonical buckets share their canonical
     // sibling's slices via the FORWARD_TABLE entries below.
+    //
+    // Per canonical, also try the prim_mega encoder. If
+    // `try_encode_bucket` returns `Some` (every op in the bucket
+    // has a mega arm), emit the device-resident program static
+    // (`MEGA_BACKBONE_M_<wp>`) and the launcher fn
+    // (`prim_mega_backbone_m_<wp>`) alongside the host static. Step
+    // 8's dispatch picks one or the other; for now the launcher fn
+    // is emitted with `#[allow(dead_code)]` so the cuda build stays
+    // clean while DC sibling coverage widens.
     let mut static_slices: Vec<TokenStream> = Vec::new();
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
@@ -3287,6 +3359,34 @@ pub fn emit_model(
             &shapes_by_name,
             &lowered.lm_head.instances,
         ));
+
+        // Prim-mega emission. Each bucket attempts encode separately
+        // — backbone may be ineligible (Embed has no arm) while
+        // lm_head is fine (Embed-free), or vice versa. Per the
+        // all-or-nothing pick_interpreter semantics, both must
+        // encode for the canonical to dispatch through PrimMega
+        // wholesale; emitting them independently here means step 8
+        // has both call targets ready when coverage permits.
+        let bounds = bounds_for_wp(model, *wp);
+        let mega_ctx = encode_ctx_from_bounds(&bounds, *wp);
+        try_emit_prim_mega(
+            &bounds,
+            &mega_ctx,
+            &arch_opcodes,
+            &lowered.backbone,
+            &bucket_static_ident("MEGA_BACKBONE_M", *wp),
+            &bucket_static_ident("prim_mega_backbone_m", *wp),
+            &mut static_slices,
+        );
+        try_emit_prim_mega(
+            &bounds,
+            &mega_ctx,
+            &arch_opcodes,
+            &lowered.lm_head,
+            &bucket_static_ident("MEGA_LM_HEAD_M", *wp),
+            &bucket_static_ident("prim_mega_lm_head_m", *wp),
+            &mut static_slices,
+        );
     }
 
     // `sk_axis_active`: true when the model declared `sk_buckets`;

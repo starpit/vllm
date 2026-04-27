@@ -2389,6 +2389,17 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
+    // PrimMega sibling for CutlassGemmAdd. Iterates the same
+    // CUTLASS_TILE_ZOO so drift between host + DC tile sets is
+    // structurally impossible. Same `dc_gemm` C++ template the bare
+    // GEMM uses — the residual-add is a runtime `beta=1.0` only.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(DcCutlassGemmAddImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
     // Closes the small-N/large-K tall-skinny shape class where the
     // standard tile zoo leaves cuBLAS winning. target_compatible
@@ -8489,6 +8500,134 @@ impl Implementation for DcCutlassGemmImpl {
     }
 }
 
+// ── DcCutlassGemmAddImpl ─────────────────────────────────────────
+//
+// PrimMega sibling to [`CutlassGemmAddImpl`]. The host counterpart's
+// kernel is the SAME `device::Gemm` instantiation as the bare GEMM —
+// the residual-add is just a runtime `beta=1.0` epilogue. So no new
+// C++ template is needed: the existing `dc_cutlass.cuh::dc_gemm`
+// template already accepts `beta` as a parameter; the encoder just
+// emits `beta=1.0` at the per-op call site instead of `beta=0.0`.
+//
+// Cost delegates to CutlassGemmAddImpl which reads the dedicated
+// `cutlass_<TBM>x<TBN>_s<S>_add` CSV row (measured at beta=1.0).
+// `target_compatible` mirrors the host's CSV-row gate so a tile
+// without `_add` calibration silently filters out on Ada (and on
+// any target whose CSV is missing the row).
+
+#[derive(Debug, Clone)]
+pub struct DcCutlassGemmAddImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl DcCutlassGemmAddImpl {
+    fn host(&self) -> CutlassGemmAddImpl {
+        CutlassGemmAddImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+    }
+}
+
+impl Implementation for DcCutlassGemmAddImpl {
+    fn name(&self) -> &'static str {
+        // One arm per CUTLASS_TILE_ZOO entry. Drift caught by
+        // `dc_cutlass_gemm_add_name_covers_full_zoo` test below.
+        match (self.tile_m, self.tile_n, self.stages) {
+            (32, 64, 3) => "dc_cutlass_32x64_s3_add",
+            (32, 64, 4) => "dc_cutlass_32x64_s4_add",
+            (32, 128, 3) => "dc_cutlass_32x128_s3_add",
+            (32, 128, 4) => "dc_cutlass_32x128_s4_add",
+            (32, 256, 3) => "dc_cutlass_32x256_s3_add",
+            (64, 64, 3) => "dc_cutlass_64x64_s3_add",
+            (64, 64, 4) => "dc_cutlass_64x64_s4_add",
+            (64, 128, 3) => "dc_cutlass_64x128_s3_add",
+            (64, 128, 4) => "dc_cutlass_64x128_s4_add",
+            (128, 64, 3) => "dc_cutlass_128x64_s3_add",
+            (128, 64, 4) => "dc_cutlass_128x64_s4_add",
+            (128, 128, 3) => "dc_cutlass_128x128_s3_add",
+            (128, 128, 4) => "dc_cutlass_128x128_s4_add",
+            (128, 256, 3) => "dc_cutlass_128x256_s3_add",
+            (256, 64, 3) => "dc_cutlass_256x64_s3_add",
+            (256, 64, 4) => "dc_cutlass_256x64_s4_add",
+            _ => "dc_cutlass_unknown_add",
+        }
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.prim_mega_compatible() && self.host().target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        self.host().workload_constraint()
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        self.host().matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        self.host().cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        self.host().resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::DeviceCallable
+    }
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::Primitive
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        DC_HANDOFFS
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.host().input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        self.host().output_layouts(m)
+    }
+    fn is_compute_bound(&self) -> bool {
+        self.host().is_compute_bound()
+    }
+    fn can_share_kernel_with(&self, _other: &dyn Implementation) -> bool {
+        true
+    }
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        self.host().output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        self.host().consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        self.host().required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        self.host().opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        self.host().fan_out(m, fuf, program, bounds, slots)
+    }
+}
+
 // ── CutlassGemmSplitKImpl ────────────────────────────────────────
 //
 // Singleton Gemm impl backed by CUTLASS `GemmSplitKParallel` — the K
@@ -13874,6 +14013,45 @@ mod tests {
             );
             let expected = format!("dc_cutlass_{m}x{n}_s{s}");
             assert_eq!(name, expected);
+        }
+    }
+
+    /// Sibling pin for `DcCutlassGemmAddImpl`. Same intent as
+    /// `dc_cutlass_name_covers_full_zoo` but for the residual-add
+    /// variant.
+    #[test]
+    fn dc_cutlass_gemm_add_name_covers_full_zoo() {
+        for &(m, n, s) in CUTLASS_TILE_ZOO {
+            let dc = DcCutlassGemmAddImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+            };
+            let name = dc.name();
+            assert_ne!(
+                name, "dc_cutlass_unknown_add",
+                "CUTLASS_TILE_ZOO entry ({m}, {n}, {s}) has no name() arm \
+                 in DcCutlassGemmAddImpl"
+            );
+            let expected = format!("dc_cutlass_{m}x{n}_s{s}_add");
+            assert_eq!(name, expected);
+        }
+    }
+
+    #[test]
+    fn dc_cutlass_gemm_add_share_opcode_shape() {
+        for &(m, n, s) in CUTLASS_TILE_ZOO {
+            let host = CutlassGemmAddImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+            };
+            let dc = DcCutlassGemmAddImpl {
+                tile_m: m,
+                tile_n: n,
+                stages: s,
+            };
+            assert_share_opcode_shape(&host, &dc);
         }
     }
 

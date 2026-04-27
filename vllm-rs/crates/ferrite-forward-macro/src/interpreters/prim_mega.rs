@@ -91,10 +91,32 @@ pub enum WeightField {
 /// once per cooperative launch.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WorkspaceKind {
-    /// `[split_k, M, N]` float scratch for a split-k GEMM
-    /// reduction. Keyed by row index in the program because two
-    /// different split-k rows may want different shapes.
-    SplitKScratch { row_idx: u32 },
+    /// `[split_k, M, N]` `f32` scratch for a split-k GEMM
+    /// reduction. Sized at launch via
+    /// `caching.alloc_tensor(&[split_k * m * n], DType::F32)`.
+    ///
+    /// Sources:
+    /// - `split_k`, `m` — codegen constants. `m` equals
+    ///   [`EncodeCtx::num_tokens`] for this bucket; one launcher fn
+    ///   is emitted per workload point, so M is fixed per launcher.
+    /// - `n` — runtime, resolved by the launcher as
+    ///   `(Weights::<weight_fn_ident>)(W, weight_layer)
+    ///       .weight.shape()[0] as i32`.
+    ///   Mirrors [`RuntimeSource::WeightShapeDim { dim_idx: 0 }`]
+    ///   for consistency with how the row's own N slot is filled.
+    ///
+    /// `key` is a per-row uniqueness tag so two split-k rows with
+    /// different (layer, tile) but the same Eq form still get
+    /// distinct ptr_plan entries (and therefore distinct scratch
+    /// allocations). Today `key = layer * 1000 + split_k * 100 +
+    /// tile_m + tile_n`, picked at encode time.
+    SplitKScratch {
+        key: u32,
+        split_k: u32,
+        m: u32,
+        weight_fn_ident: String,
+        weight_layer: u32,
+    },
 }
 
 /// Forward-context-level pointers (per call, but uniform across
@@ -687,13 +709,16 @@ fn encode_cutlass_gemm_splitk(
         field: WeightField::DenseWeight,
     });
     // workspace — assigned per-row by `WorkspaceKind::SplitKScratch`
-    // because two split-k rows may want different shapes.
+    // because two split-k rows may want different shapes. Carries
+    // its own `(key, split_k, m, weight_fn_ident, weight_layer)`
+    // resolution so the launcher can size the scratch tensor without
+    // looking at the row's own N slot.
     row.push_ptr(PtrSpec::Workspace(WorkspaceKind::SplitKScratch {
-        // row_idx is patched by `assign_ptr_indices` indirectly via
-        // ptr_plan ordering — for the per-row uniqueness we encode
-        // the (tile, split_k, layer) signature into a synthetic id.
-        // Step 7 emits the actual scratch alloc per ptr_plan entry.
-        row_idx: layer * 1000 + split_k * 100 + tile_m + tile_n,
+        key: layer * 1000 + split_k * 100 + tile_m + tile_n,
+        split_k,
+        m: ctx.num_tokens,
+        weight_fn_ident: fn_ident.clone(),
+        weight_layer: layer,
     }));
     row.push_const(ctx.num_tokens as i32); // M
     row.push_runtime(RuntimeSource::WeightShapeDim {
@@ -1464,6 +1489,82 @@ mod tests {
             .filter(|p| matches!(p, PtrSpec::Workspace(_)))
             .collect();
         assert_eq!(workspaces.len(), 2, "two distinct split-k workspaces");
+    }
+
+    /// Each `WorkspaceKind::SplitKScratch` carries its own
+    /// `(split_k, m, weight_fn_ident, weight_layer)` so the launcher
+    /// can size the `f32` scratch as `[split_k * m * n]` without
+    /// peeking at the row's N slot. Pin every field for the two
+    /// distinct rows from `splitk_workspace_per_row`. M is the
+    /// codegen-time `ctx.num_tokens` (one launcher fn per workload
+    /// point, so M is fixed per launcher); split_k differs per row.
+    #[test]
+    fn splitk_workspace_carries_resolved_shape_source() {
+        let arch = arch_with_seven_shapes();
+        let make = |layer: u32, sk: u32| {
+            let layer_lit = proc_macro2::Literal::u32_suffixed(layer);
+            let sk_lit = proc_macro2::Literal::u32_suffixed(sk);
+            op(
+                "CutlassGemmSplitK",
+                vec![
+                    quote! { 0u32 },
+                    quote! { 1u32 },
+                    quote! { #layer_lit },
+                    quote! { Weights::down_proj },
+                    quote! { 128u32 },
+                    quote! { 128u32 },
+                    quote! { 3u32 },
+                    quote! { #sk_lit },
+                ],
+            )
+        };
+        let prog = vec![make(0, 4), make(1, 8)];
+        let ctx = ctx_llama_1b();
+        let bucket =
+            try_encode_bucket(&arch, &prog, &ctx).expect("CutlassGemmSplitK is mega-eligible");
+        let mut workspaces: Vec<&WorkspaceKind> = bucket
+            .ptr_plan
+            .iter()
+            .filter_map(|p| match p {
+                PtrSpec::Workspace(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        // ptr_plan is insertion order; the two rows fan out the same
+        // weight ptr first (one per layer) then a unique workspace.
+        // Sort by (weight_layer, split_k) so the assertion order is
+        // deterministic regardless of how the encoder happens to
+        // dedupe.
+        workspaces.sort_by_key(|w| match w {
+            WorkspaceKind::SplitKScratch {
+                weight_layer,
+                split_k,
+                ..
+            } => (*weight_layer, *split_k),
+        });
+        assert_eq!(workspaces.len(), 2);
+        let WorkspaceKind::SplitKScratch {
+            split_k: sk0,
+            m: m0,
+            weight_fn_ident: wf0,
+            weight_layer: wl0,
+            ..
+        } = workspaces[0];
+        let WorkspaceKind::SplitKScratch {
+            split_k: sk1,
+            m: m1,
+            weight_fn_ident: wf1,
+            weight_layer: wl1,
+            ..
+        } = workspaces[1];
+        assert_eq!(*sk0, 4);
+        assert_eq!(*sk1, 8);
+        assert_eq!(*m0, ctx.num_tokens);
+        assert_eq!(*m1, ctx.num_tokens);
+        assert_eq!(wf0, "down_proj");
+        assert_eq!(wf1, "down_proj");
+        assert_eq!(*wl0, 0);
+        assert_eq!(*wl1, 1);
     }
 
     /// Path-last-segment helper recovers `input_layernorm` from

@@ -32,7 +32,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use proc_macro2::TokenStream;
-use quote::{ToTokens, quote};
+use quote::quote;
 
 use crate::classified::Program;
 use crate::config::ModelParams;
@@ -354,30 +354,18 @@ pub struct LoweredBucket {
     pub final_slot: u32,
 }
 
-/// Variant declarations + arm bodies the macro accumulates across
-/// every bucket of one arch. The per-arch enum + per-arch
-/// interpreter are emitted from these.
+/// Variant shapes the macro accumulates across every bucket of one
+/// arch. Used to drive shape-agreement checking + per-variant
+/// iter-index field discovery for `apply_loop_compression`.
+///
+/// Bodies for each variant live in `ferrite_forward::Instruction::eval`;
+/// nothing per-arch needs the body here.
 #[derive(Default)]
 pub struct ArchOpcodes {
-    /// Variant ident → (shape, interpreter-arm body). First insert
-    /// wins; later inserts of the same variant ident must agree on
-    /// shape (codegen panics on mismatch). Arm body comes from the
-    /// first migrated Impl that owns this variant — same Impl is
-    /// expected to declare the variant identically across arches,
-    /// so duplicates with the same `interpreter_arm` are accepted.
-    by_name: BTreeMap<String, (OpcodeShape, TokenStream)>,
-    /// Variant ident → prelude `let <fname>: <fty> = <value>;` rows
-    /// extracted from the per-row instruction stream by
-    /// [`extract_arch_wide_constants`] (every instance of this
-    /// variant carried the same byte-identical value, so we drop the
-    /// field from the row and rebind it in the arm body).
-    /// [`emit_interpreter`] partitions the entries: tuples that
-    /// appear in 2+ variants lift to ONE fn-scope let in
-    /// `__dispatch_one`; per-variant residuals stay at the top of
-    /// their arm. Avoids ~`N variants × shared lines` of duplicate
-    /// `let cos_sin_fn = Weights::rotary_cos_sin;` boilerplate in
-    /// the expanded source.
-    extracted_prelude: BTreeMap<String, Vec<(syn::Ident, syn::Type, TokenStream)>>,
+    /// Variant ident → shape. First insert wins; later inserts of
+    /// the same variant ident must agree on shape (codegen panics
+    /// on mismatch).
+    by_name: BTreeMap<String, OpcodeShape>,
 }
 
 impl ArchOpcodes {
@@ -385,54 +373,34 @@ impl ArchOpcodes {
         Self::default()
     }
 
-    /// Register a variant declaration + arm body. Panics if the
-    /// same variant ident is registered with a structurally
-    /// different shape.
-    pub fn register(&mut self, shape: OpcodeShape, arm_body: TokenStream) {
+    /// Register a variant shape. Panics if the same variant ident is
+    /// registered with a structurally different shape.
+    pub fn register(&mut self, shape: OpcodeShape) {
         let key = shape.name.to_string();
-        if let Some((existing_shape, _)) = self.by_name.get(&key) {
+        if let Some(existing_shape) = self.by_name.get(&key) {
             assert_shapes_agree(existing_shape, &shape);
             return;
         }
-        self.by_name.insert(key, (shape, arm_body));
+        self.by_name.insert(key, shape);
     }
 
     /// Snapshot of registered variant shapes keyed by variant ident
-    /// string. Includes the universal `Free` variant. Consumed by
-    /// [`emit_bucket_static_slice`] to type-check positional field
-    /// values against the registered shape per bucket.
+    /// string. Includes the universal `Alias` / `Free` / `Loop`
+    /// variants. Consumed by [`emit_bucket_static_slice`] to
+    /// type-check positional field values against the registered
+    /// shape per bucket.
     pub fn shapes_by_name(&self) -> BTreeMap<String, OpcodeShape> {
-        let mut out: BTreeMap<String, OpcodeShape> = self
-            .by_name
-            .iter()
-            .map(|(name, (shape, _))| (name.clone(), shape.clone()))
-            .collect();
+        let mut out: BTreeMap<String, OpcodeShape> = self.by_name.clone();
         out.insert("Alias".to_string(), alias_variant_shape());
         out.insert("Free".to_string(), free_variant_shape());
         out.insert("Loop".to_string(), loop_variant_shape());
         out
     }
 
-    /// In-place mutation of a registered variant's stored shape +
-    /// arm body. Used by [`extract_arch_wide_constants`] to drop
-    /// arch-wide fields from a variant after it's been registered
-    /// across multiple lower_bucket calls.
-    pub fn replace(&mut self, variant_name: &str, shape: OpcodeShape, arm_body: TokenStream) {
-        if let Some(slot) = self.by_name.get_mut(variant_name) {
-            *slot = (shape, arm_body);
-        }
-    }
-
-    /// Read access to (shape, arm_body) for a variant. Used by
-    /// [`extract_arch_wide_constants`].
-    pub fn get(&self, variant_name: &str) -> Option<&(OpcodeShape, TokenStream)> {
-        self.by_name.get(variant_name)
-    }
-
-    /// Iterate (variant_name, (shape, arm_body)). Used by
-    /// [`apply_layer_loop`] to build the per-variant layer-field
+    /// Iterate (variant_name, shape). Used by
+    /// `apply_loop_compression` to build the per-variant layer-field
     /// position map.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &(OpcodeShape, TokenStream))> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &OpcodeShape)> {
         self.by_name.iter()
     }
 }
@@ -594,7 +562,7 @@ pub fn apply_loop_compression(
     use std::collections::HashMap;
 
     let mut iter_idx: HashMap<String, usize> = HashMap::new();
-    for (name, (shape, _)) in arch_opcodes.iter() {
+    for (name, shape) in arch_opcodes.iter() {
         for (i, (fname, _ty)) in shape.fields.iter().enumerate() {
             if fname == iter_index_field_name {
                 iter_idx.insert(name.clone(), i);
@@ -624,425 +592,6 @@ pub fn apply_loop_compression(
     }
     new_instances.extend_from_slice(&lowered.instances[span_end..]);
     lowered.instances = new_instances;
-}
-
-/// Drop fields from variants whose value is byte-identical across
-/// every instance in every lowered bucket. The dropped fields are
-/// rebound at the top of the variant's match-arm body via
-/// `let <fname>: <fty> = <constant_value>;` so the unchanged kernel-
-/// call body inside continues to compile against the same names.
-///
-/// The point: arch-wide knobs like `interleaved: true` /
-/// `cos_sin_fn: Weights::rotary_cos_sin` / `weight_fn:
-/// Weights::self_attn_qkv` ride on a row only because the Impl
-/// emitted them as fields, not because they actually vary. After
-/// this pass they're constants in the arm and the static slice's
-/// rows shrink to just the per-claim parts (slot indices, layer
-/// index, and per-claim accessors that genuinely differ between
-/// claims).
-///
-/// `Free` is excluded — its `slot` field is by construction per-
-/// instance, and `Free` is emitted directly by the codegen rather
-/// than via an Impl, so its arm body isn't an arch_opcodes entry.
-pub fn extract_arch_wide_constants(
-    arch_opcodes: &mut ArchOpcodes,
-    lowereds: &mut [&mut LoweredBucket],
-) {
-    use std::collections::HashMap;
-    // Group every instance index across every lowered bucket by
-    // variant ident. Indices are `(bucket_idx, instance_idx)`.
-    let mut by_variant: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    for (b_idx, lb) in lowereds.iter().enumerate() {
-        for (i_idx, inst) in lb.instances.iter().enumerate() {
-            by_variant
-                .entry(inst.name.to_string())
-                .or_default()
-                .push((b_idx, i_idx));
-        }
-    }
-
-    for (variant_name, locs) in by_variant.iter() {
-        if variant_name == "Free" {
-            continue;
-        }
-        // Snapshot the registered shape + arm body up-front so we
-        // can mutate `extracted_prelude` (a sibling field on
-        // `arch_opcodes`) without holding an immutable borrow.
-        let (shape, arm_body) = match arch_opcodes.get(variant_name) {
-            Some((s, b)) => (s.clone(), b.clone()),
-            None => continue,
-        };
-        let n_fields = shape.fields.len();
-        if n_fields == 0 || locs.is_empty() {
-            continue;
-        }
-
-        // Identify field indices whose value is identical across all
-        // instances of this variant. Compare TokenStream-as-string —
-        // OpInstance values are simple literal-or-path tokens and the
-        // string form is stable.
-        let mut keep: Vec<usize> = (0..n_fields).collect();
-        let mut drop: Vec<(usize, syn::Ident, syn::Type, TokenStream)> = Vec::new();
-        for fi in 0..n_fields {
-            let first = locs[0];
-            let first_val = lowereds[first.0].instances[first.1].field_values[fi].to_string();
-            let all_same = locs
-                .iter()
-                .all(|&(b, i)| lowereds[b].instances[i].field_values[fi].to_string() == first_val);
-            if all_same {
-                let (fname, fty) = &shape.fields[fi];
-                let val = lowereds[first.0].instances[first.1].field_values[fi].clone();
-                drop.push((fi, fname.clone(), fty.clone(), val));
-            }
-        }
-        if drop.is_empty() {
-            continue;
-        }
-        let drop_idxs: std::collections::HashSet<usize> =
-            drop.iter().map(|(i, _, _, _)| *i).collect();
-        keep.retain(|i| !drop_idxs.contains(i));
-
-        // Record the dropped (fname, fty, value) tuples in the
-        // arch-level side map. `emit_interpreter` reads this map to
-        // partition: tuples that appear (with byte-identical type +
-        // value) in 2+ variants lift to ONE fn-scope let in
-        // `__dispatch_one`; per-variant residuals stay at the top
-        // of the arm. The arm body in `arch_opcodes.by_name` is
-        // intentionally the ORIGINAL kernel call here — no prelude
-        // folding — so the partition step has clean inputs.
-        let extracted: Vec<(syn::Ident, syn::Type, TokenStream)> = drop
-            .iter()
-            .map(|(_, fname, fty, val)| (fname.clone(), fty.clone(), val.clone()))
-            .collect();
-        // Append in case multiple extraction passes contribute to
-        // the same variant (today it's called once per arch, but
-        // the API doesn't forbid repeats).
-        arch_opcodes
-            .extracted_prelude
-            .entry(variant_name.clone())
-            .or_default()
-            .extend(extracted);
-
-        // Strip dropped fields from the shape.
-        let new_fields: Vec<(syn::Ident, syn::Type)> = shape
-            .fields
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !drop_idxs.contains(i))
-            .map(|(_, f)| f.clone())
-            .collect();
-        let new_shape = OpcodeShape {
-            name: shape.name.clone(),
-            fields: new_fields,
-        };
-
-        // Body unchanged — emit_interpreter folds the prelude back
-        // (either fn-scope for shared, arm-scope for residual).
-        arch_opcodes.replace(variant_name, new_shape, arm_body);
-
-        // Strip dropped fields from every instance of this variant.
-        for &(b, i) in locs.iter() {
-            lowereds[b].instances[i].field_values = lowereds[b].instances[i]
-                .field_values
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !drop_idxs.contains(i))
-                .map(|(_, v)| v.clone())
-                .collect();
-        }
-    }
-}
-
-impl ArchOpcodes {
-    /// Emit the per-arch opcode enum. Variant order is sorted by
-    /// name for deterministic output. The codegen always appends
-    /// the universal `Alias` and `Free` variants — they are
-    /// codegen-issued (alias prelude + drop pass), not Impl-issued.
-    pub fn emit_enum(&self, enum_ident: &syn::Ident) -> TokenStream {
-        let variants = self.by_name.values().map(|(shape, _)| variant_decl(shape));
-        let alias_variant = variant_decl(&alias_variant_shape());
-        let free_variant = variant_decl(&free_variant_shape());
-        let loop_variant = variant_decl(&loop_variant_shape());
-        quote! {
-            /// Per-arch opcode enum. Variants from solver-picked Impls;
-            /// `Alias` / `Free` / `Loop` always present. `Debug` is
-            /// always derived so `ferrite_forward::trace_enabled()`'s
-            /// runtime trace can pretty-print variants without a
-            /// rebuild.
-            #[derive(Debug, Copy)]
-            #[allow(non_camel_case_types, dead_code)]
-            pub enum #enum_ident {
-                #(#variants,)*
-                #alias_variant,
-                #free_variant,
-                #loop_variant,
-            }
-
-            impl ::core::clone::Clone for #enum_ident {
-                #[inline]
-                fn clone(&self) -> Self { *self }
-            }
-        }
-    }
-
-    /// Emit the per-arch interpreter — a `__dispatch_one` helper
-    /// that matches on a single op (closed over the per-arch enum,
-    /// no `_` arm) and a `__interpret` driver that walks the slice
-    /// honoring `Op::Loop` repeats.
-    ///
-    /// Splitting dispatch from driving lets `Op::Loop` re-use the
-    /// SAME match arms when running its body N times — without
-    /// duplicating the (large) per-Impl arm bodies. The driver loop
-    /// is the only piece that needs to know about `Loop`, `Alias`,
-    /// `Free` control-flow / setup semantics.
-    pub fn emit_interpreter(
-        &self,
-        helper_ident: &syn::Ident,
-        enum_ident: &syn::Ident,
-    ) -> TokenStream {
-        let dispatch_ident = quote::format_ident!("__dispatch_one");
-        // Partition `extracted_prelude` into (shared, per-variant
-        // residual). A tuple (fname, fty, value) is "shared" when
-        // it appears in 2+ variants with byte-identical fty AND
-        // value AND the field name `fname` is associated with that
-        // single value across every variant that extracts it.
-        //
-        // The fname-uniqueness gate is load-bearing: if variant A
-        // extracts `in_slot = 2u32` and variant B extracts
-        // `in_slot = 1u32`, both can't be lifted to fn scope without
-        // shadowing — `let in_slot = 2u32; let in_slot = 1u32;`
-        // would collapse all `in_slot` references to `1u32`. So
-        // either fname is single-valued (lift) or every variant
-        // keeps its own value in the per-arm residual (no lift).
-        //
-        // Why dedup by string: `syn::Type` and `TokenStream` don't
-        // implement Eq; their `to_string()` form is stable for the
-        // simple literal-or-path tokens these prelude lets carry.
-        let mut occurrences: BTreeMap<(String, String, String), usize> = BTreeMap::new();
-        let mut values_per_fname: BTreeMap<String, std::collections::BTreeSet<(String, String)>> =
-            BTreeMap::new();
-        for entries in self.extracted_prelude.values() {
-            // Within one variant, count each (key) at most once
-            // (multiple instances of the variant get extracted into
-            // a single shared row; we don't want the dedup to read
-            // the same row twice here either).
-            let mut seen_in_variant: std::collections::HashSet<(String, String, String)> =
-                std::collections::HashSet::new();
-            for (fname, fty, val) in entries {
-                let fty_s = fty.to_token_stream().to_string();
-                let val_s = val.to_string();
-                let key = (fname.to_string(), fty_s.clone(), val_s.clone());
-                if seen_in_variant.insert(key.clone()) {
-                    *occurrences.entry(key).or_insert(0) += 1;
-                }
-                values_per_fname
-                    .entry(fname.to_string())
-                    .or_default()
-                    .insert((fty_s, val_s));
-            }
-        }
-        let single_valued = |fname: &syn::Ident| -> bool {
-            values_per_fname
-                .get(&fname.to_string())
-                .map(|set| set.len() == 1)
-                .unwrap_or(false)
-        };
-        // Walk one canonical (fname, fty, val) representative per
-        // shared key — a key shared across N variants will be hit
-        // N times, so we dedup the actual emit by inserting into
-        // `shared_lets` at the FIRST occurrence only.
-        //
-        // Drop the type annotation on the emitted let — Rust infers
-        // the type from `val` (fn-item path → fn item, bool / u32
-        // literal → respective primitive, etc.) and arm-body call
-        // sites only need the binding's NAME. Keeping the annotation
-        // would expand multi-line `for<'a> fn(&'a Weights, u32) ->
-        // &'a LinearLayer` types verbatim per binding (~4 lines per
-        // weight_fn / cos_sin_fn declaration).
-        let mut shared_lets: Vec<TokenStream> = Vec::new();
-        let mut emitted_shared: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for entries in self.extracted_prelude.values() {
-            for (fname, _fty, val) in entries {
-                if !single_valued(fname) {
-                    continue;
-                }
-                let key = (
-                    fname.to_string(),
-                    _fty.to_token_stream().to_string(),
-                    val.to_string(),
-                );
-                if occurrences.get(&key).copied().unwrap_or(0) >= 2
-                    && emitted_shared.insert(fname.to_string())
-                {
-                    shared_lets.push(quote! { let #fname = #val; });
-                }
-            }
-        }
-        let arms = self.by_name.iter().map(|(name, (shape, body))| {
-            let var = &shape.name;
-            let pat = variant_pattern(shape);
-            // Per-variant residual prelude: dropped lets that aren't
-            // shared with another variant. These stay at the top of
-            // the arm because they only matter to this body. Same
-            // annotation-drop trick — body call sites use the
-            // binding's name, not its annotated type.
-            let residual: Vec<TokenStream> = self
-                .extracted_prelude
-                .get(name)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter(|(fname, fty, val)| {
-                            // Stays per-arm if EITHER fname is
-                            // multi-valued across variants (can't
-                            // safely lift to fn scope without
-                            // shadow) OR the (fname, fty, val) is
-                            // unique to this variant (not shared).
-                            if !single_valued(fname) {
-                                return true;
-                            }
-                            let key = (
-                                fname.to_string(),
-                                fty.to_token_stream().to_string(),
-                                val.to_string(),
-                            );
-                            occurrences.get(&key).copied().unwrap_or(0) < 2
-                        })
-                        .map(|(fname, _fty, val)| quote! { let #fname = #val; })
-                        .collect()
-                })
-                .unwrap_or_default();
-            // Per-arm `let layer: u32 = __layer + layer;` combines
-            // the runtime iter counter (`__layer`) with the row's
-            // per-row baseline (the destructured `layer` field,
-            // which `apply_loop_compression` set to that row's
-            // iter-0 value). For body rows aligned with the loop's
-            // iter-0 the baseline is 0, so the result is `__l`. For
-            // a row whose iter-0 layer is +k off (e.g., a body's
-            // trailing `input_layernorm` that semantically belongs
-            // to the next layer, baseline=1), the result is `__l+k`.
-            // For non-loop ops the dispatcher passes `__layer=0`,
-            // so the baseline IS the layer (e.g., post-loop
-            // `CutlassGemv(layer=27)` resolves to 27).
-            //
-            // Only emitted when the variant carries a `layer` field;
-            // variants without one would fail to compile because
-            // `layer` wouldn't be in scope to add.
-            let has_layer_field = shape.fields.iter().any(|(fname, _)| fname == "layer");
-            let layer_shadow = if has_layer_field {
-                quote! { let layer: u32 = __layer + layer; }
-            } else {
-                quote! {}
-            };
-            quote! {
-                #enum_ident::#var #pat => {
-                    #layer_shadow
-                    #(#residual)*
-                    #body
-                }
-            }
-        });
-        // Per-op trace, always compiled. Gate at runtime via
-        // `ferrite_forward::trace_enabled()` (set `FERRITE_TRACE=1`
-        // before launch). Disabled cost is one atomic-load + branch
-        // per dispatched op. Pair with `CUDA_LAUNCH_BLOCKING=1` so
-        // trace lines align with kernel completion order.
-        let trace_print = quote! {
-            if ::ferrite_forward::trace_enabled() {
-                let __snap: ::std::vec::Vec<::std::string::String> = __tiles
-                    .iter()
-                    .enumerate()
-                    .map(|(__si, __se)| match __se {
-                        ::std::option::Option::Some(::ferrite_forward::TileEntry::Owned(__t)) => {
-                            let __gt = __t.as_gpu_tensor();
-                            ::std::format!("[{}]O{:?}", __si, __gt.shape())
-                        }
-                        ::std::option::Option::Some(::ferrite_forward::TileEntry::View { ref_slot }) => {
-                            ::std::format!("[{}]V({})", __si, ref_slot)
-                        }
-                        ::std::option::Option::Some(::ferrite_forward::TileEntry::Reshaped { ref_slot, tensor }) => {
-                            ::std::format!("[{}]R{:?}({})", __si, tensor.shape(), ref_slot)
-                        }
-                        ::std::option::Option::None => ::std::format!("[{}]_", __si),
-                    })
-                    .collect();
-                ::std::eprintln!(
-                    "FERRITE l={} {:?} | {}",
-                    __layer,
-                    __op,
-                    __snap.join(" "),
-                );
-            }
-        };
-        quote! {
-            /// Dispatch one op. `__layer` = loop iter index inside
-            /// `Op::Loop`, else 0.
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_arguments, unused_unsafe, unused_variables)]
-            unsafe fn #dispatch_ident(
-                __op: #enum_ident,
-                __layer: u32,
-                __tiles: &mut ::std::vec::Vec<Option<::ferrite_forward::TileEntry>>,
-                wm: &Weights,
-                ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            ) {
-                #trace_print
-                #(#shared_lets)*
-                match __op {
-                    #(#arms,)*
-                    #enum_ident::Alias(dst, src) => {
-                        __tiles[dst as usize] = Some(::ferrite_forward::view(src));
-                    }
-                    #enum_ident::Free(slot) => {
-                        __tiles[slot as usize] = None;
-                    }
-                    #enum_ident::Loop(_, _) => {
-                        unsafe { ::core::hint::unreachable_unchecked() }
-                    }
-                }
-            }
-
-            /// Driver. `Op::Loop(count, body_len)` re-runs the next
-            /// `body_len` ops `count` times via `__dispatch_one`.
-            #[cfg(feature = "cuda")]
-            #[allow(clippy::too_many_arguments)]
-            unsafe fn #helper_ident(
-                __ops: &[#enum_ident],
-                __tiles: &mut ::std::vec::Vec<Option<::ferrite_forward::TileEntry>>,
-                wm: &Weights,
-                ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            ) {
-                let mut __i: usize = 0;
-                while __i < __ops.len() {
-                    match __ops[__i] {
-                        #enum_ident::Loop(count, body_len) => {
-                            let body_start = __i + 1;
-                            let body_end = body_start + body_len as usize;
-                            for __l in 0..count {
-                                for __j in body_start..body_end {
-                                    unsafe {
-                                        #dispatch_ident(
-                                            __ops[__j], __l, __tiles, wm, ctx, device,
-                                        );
-                                    }
-                                }
-                            }
-                            __i = body_end;
-                        }
-                        other => {
-                            unsafe {
-                                #dispatch_ident(other, 0, __tiles, wm, ctx, device);
-                            }
-                            __i += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Emit one per-bucket
@@ -1394,9 +943,10 @@ pub fn lower_bucket(
                     )
                 });
             // Eval bodies live in `ferrite_forward::Instruction::eval`
-            // — register only the shape (used for static-slice
-            // emission); the arm-body slot stays empty.
-            arch_opcodes.register(imp.opcode_shape(), TokenStream::new());
+            // — register only the shape, used for static-slice
+            // emission and `apply_loop_compression`'s per-variant
+            // iter-index field discovery.
+            arch_opcodes.register(imp.opcode_shape());
             instances.extend(emits);
         }
     }
@@ -2042,16 +1592,13 @@ mod tests {
     #[test]
     fn loop_compression_emits_loop_and_keeps_baseline() {
         let mut arch_opcodes = ArchOpcodes::new();
-        arch_opcodes.register(
-            OpcodeShape::new(
-                "Norm",
-                vec![
-                    ("w", syn::parse_quote!(u32)),
-                    ("layer", syn::parse_quote!(u32)),
-                ],
-            ),
-            quote! {},
-        );
+        arch_opcodes.register(OpcodeShape::new(
+            "Norm",
+            vec![
+                ("w", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+            ],
+        ));
         let mut lb = LoweredBucket {
             instances: vec![
                 op("Norm", &["7u32", "0u32"]),
@@ -2083,14 +1630,14 @@ mod tests {
     #[test]
     fn loop_compression_preserves_per_row_baseline() {
         let mut arch_opcodes = ArchOpcodes::new();
-        arch_opcodes.register(
-            OpcodeShape::new("A", vec![("layer", syn::parse_quote!(u32))]),
-            quote! {},
-        );
-        arch_opcodes.register(
-            OpcodeShape::new("B", vec![("layer", syn::parse_quote!(u32))]),
-            quote! {},
-        );
+        arch_opcodes.register(OpcodeShape::new(
+            "A",
+            vec![("layer", syn::parse_quote!(u32))],
+        ));
+        arch_opcodes.register(OpcodeShape::new(
+            "B",
+            vec![("layer", syn::parse_quote!(u32))],
+        ));
         let mut lb = LoweredBucket {
             instances: vec![
                 // iter 0: A@0, B@1
@@ -2130,10 +1677,7 @@ mod tests {
     #[test]
     fn loop_compression_is_noop_without_runs() {
         let mut arch_opcodes = ArchOpcodes::new();
-        arch_opcodes.register(
-            OpcodeShape::new("A", vec![("x", syn::parse_quote!(u32))]),
-            quote! {},
-        );
+        arch_opcodes.register(OpcodeShape::new("A", vec![("x", syn::parse_quote!(u32))]));
         let original = vec![op("A", &["0u32"])];
         let mut lb = LoweredBucket {
             instances: original.clone(),
@@ -2143,343 +1687,5 @@ mod tests {
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 1);
         assert_eq!(lb.instances[0].name.to_string(), "A");
-    }
-
-    /// `ArchOpcodes::emit_enum` produces a Rust enum with one
-    /// variant per registered shape plus the universal `Free`.
-    /// Locks the no-universal-registry contract: the variant set
-    /// is exactly what got registered.
-    #[test]
-    fn arch_opcodes_emit_enum_includes_registered_plus_free() {
-        let mut ops = ArchOpcodes::new();
-        ops.register(
-            OpcodeShape::new(
-                "AttnNorm",
-                vec![
-                    ("layer", syn::parse_quote!(u32)),
-                    ("in_slot", syn::parse_quote!(u32)),
-                    ("out_slot", syn::parse_quote!(u32)),
-                ],
-            ),
-            quote! { /* body */ },
-        );
-        let enum_ident = format_ident!("LlamaOp");
-        let ts = ops.emit_enum(&enum_ident).to_string();
-        assert!(ts.contains("enum LlamaOp"));
-        assert!(ts.contains("AttnNorm"));
-        assert!(ts.contains("Free"));
-        assert!(!ts.contains("__Unmigrated"));
-    }
-
-    /// The codegen-emitted interpreter is a closed match — no `_`
-    /// arm. Locks the design rule that exhaustiveness comes from
-    /// the per-arch enum, not from a runtime catch-all.
-    #[test]
-    fn arch_interpreter_match_has_no_catchall() {
-        let mut ops = ArchOpcodes::new();
-        ops.register(
-            OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
-            quote! {},
-        );
-        let enum_ident = format_ident!("LlamaOp");
-        let helper_ident = format_ident!("__llama_interpret");
-        let ts = ops.emit_interpreter(&helper_ident, &enum_ident).to_string();
-        // No `_ =>` arm.
-        assert!(
-            !ts.contains("_ =>"),
-            "interpreter must be exhaustive over the enum, no catch-all"
-        );
-        // Free arm always present.
-        assert!(ts.contains("LlamaOp :: Free"));
-        // Registered variant present.
-        assert!(ts.contains("LlamaOp :: AttnNorm"));
-        // No unsafe transmute / from_wire.
-        assert!(!ts.contains("transmute"));
-        assert!(!ts.contains("from_wire"));
-    }
-
-    /// `emit_enum` derives `Copy` automatically and impls `Clone`
-    /// manually as `*self`. The default `#[derive(Clone)]` macro
-    /// expands to a verbose AssertParamIsClone bound check per
-    /// variant — ~60 lines for an arch with ~25 variants — that
-    /// shows up in cargo expand and per-monomorphization compile
-    /// work without any runtime benefit (Op is a plain Copy enum;
-    /// Clone IS *self for any Copy type).
-    #[test]
-    fn arch_enum_uses_manual_clone_impl_to_skip_assertparamisclone() {
-        let mut ops = ArchOpcodes::new();
-        ops.register(
-            OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
-            quote! {},
-        );
-        let enum_ident = format_ident!("LlamaOp");
-        let ts = ops.emit_enum(&enum_ident).to_string();
-        // Hand-rolled Clone present with `*self` body.
-        assert!(
-            ts.contains("impl :: core :: clone :: Clone for LlamaOp"),
-            "expected manual Clone impl, got: {ts}"
-        );
-        assert!(ts.contains("fn clone (& self) -> Self { * self }"));
-        // Derive list is `Debug, Copy` — Debug is unconditional so
-        // `ferrite_forward::trace_enabled()`'s runtime trace can
-        // pretty-print variants; Clone is hand-rolled to skip the
-        // AssertParamIsClone expansion.
-        assert!(ts.contains("# [derive (Debug , Copy)]"));
-        assert!(!ts.contains("# [derive (Copy , Clone)]"));
-        assert!(!ts.contains("# [derive (Debug , Copy , Clone)]"));
-    }
-
-    /// `__dispatch_one` emits `let layer: u32 = __layer + layer;`
-    /// once per arm whose variant carries a `layer` field, and
-    /// nothing for arms without one. The shadow combines the
-    /// runtime iter counter with the row's per-row baseline (set by
-    /// `apply_loop_compression`); it's gated on `has_layer_field`
-    /// because adding to a destructured `layer` that doesn't exist
-    /// would fail to compile. Also pins ZERO `let _ = layer;` lines
-    /// — the fn-level `#[allow(unused_variables)]` already covers
-    /// unused-warning suppression.
-    #[test]
-    fn arch_interpreter_drops_layer_drop_lines() {
-        let mut ops = ArchOpcodes::new();
-        ops.register(
-            OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
-            quote! {},
-        );
-        ops.register(
-            OpcodeShape::new("Add", vec![("a_slot", syn::parse_quote!(u32))]),
-            quote! {},
-        );
-        let enum_ident = format_ident!("LlamaOp");
-        let helper_ident = format_ident!("__llama_interpret");
-        let ts = ops.emit_interpreter(&helper_ident, &enum_ident).to_string();
-        // The arm whose variant has a `layer` field emits the
-        // combining shadow; the one without does not. Exactly 1
-        // occurrence is the load-bearing assertion.
-        let shadow_count = ts.matches("let layer : u32 = __layer + layer ;").count();
-        assert_eq!(
-            shadow_count, 1,
-            "expected exactly one `let layer = __layer + layer;` shadow (the variant with a layer field), got {shadow_count}",
-        );
-        assert!(
-            !ts.contains("let _ = layer ;"),
-            "expansion contains redundant `let _ = layer;` lines"
-        );
-        assert!(ts.contains("__layer : u32 , __tiles"));
-        // Body opens with the always-compiled `trace_enabled()`
-        // gate (runtime no-op when `FERRITE_TRACE` is unset). The
-        // match follows. Pin both: trace gate before match, no
-        // residual `let layer = __layer ;` setup at the fn top.
-        let after_open = ts
-            .split_once(", ) { ")
-            .or_else(|| ts.split_once(") { "))
-            .map(|(_, rhs)| rhs)
-            .unwrap_or(&ts);
-        assert!(
-            after_open.starts_with("if :: ferrite_forward :: trace_enabled ()"),
-            "fn body must open with the trace gate, got: {}",
-            &after_open[..after_open.len().min(80)],
-        );
-        assert!(
-            ts.contains("match __op {"),
-            "fn body must contain the match",
-        );
-    }
-
-    /// Registering the same variant ident with structurally
-    /// different fields is a codegen invariant violation.
-    #[test]
-    #[should_panic(expected = "field count mismatch")]
-    fn arch_opcodes_register_panics_on_shape_disagreement() {
-        let mut ops = ArchOpcodes::new();
-        ops.register(
-            OpcodeShape::new("AttnNorm", vec![("layer", syn::parse_quote!(u32))]),
-            quote! {},
-        );
-        ops.register(
-            OpcodeShape::new(
-                "AttnNorm",
-                vec![
-                    ("layer", syn::parse_quote!(u32)),
-                    ("extra", syn::parse_quote!(u32)),
-                ],
-            ),
-            quote! {},
-        );
-    }
-
-    /// `emit_bucket_static_slice` lowers each `OpInstance` to a
-    /// `<EnumName>::<Variant> { f1: <expr>, … }` row. Field-init
-    /// idents come from the shape; field-init exprs come from the
-    /// instance, in declaration order.
-    #[test]
-    fn bucket_static_slice_renders_struct_constructors() {
-        let mut shapes_by_name = BTreeMap::new();
-        shapes_by_name.insert(
-            "AttnNorm".to_string(),
-            OpcodeShape::new(
-                "AttnNorm",
-                vec![
-                    ("layer", syn::parse_quote!(u32)),
-                    ("in_slot", syn::parse_quote!(u32)),
-                    ("out_slot", syn::parse_quote!(u32)),
-                ],
-            ),
-        );
-        shapes_by_name.insert("Free".to_string(), free_variant_shape());
-
-        let instances = vec![
-            OpInstance::new(
-                format_ident!("AttnNorm"),
-                vec![quote! { 0u32 }, quote! { 1u32 }, quote! { 2u32 }],
-            ),
-            free_instance(1),
-        ];
-        let static_ident = format_ident!("FORWARD_M_1");
-        let ts = emit_bucket_static_slice(&static_ident, &shapes_by_name, &instances).to_string();
-        // Rows reference the per-canonical glob-imported variant
-        // constructor. Numeric suffixes are stripped — `0u32` →
-        // `0` — since the variant declaration in
-        // `Instruction<W>` already pins the type. Slice element
-        // type is `__I` (per-canonical alias for
-        // `::ferrite_forward::Instruction<Weights>`).
-        assert!(ts.contains("FORWARD_M_1"));
-        assert!(ts.contains("AttnNorm ("));
-        assert!(ts.contains("0 , 1 , 2"));
-        assert!(ts.contains("Free ("));
-        assert!(ts.contains("(1)"));
-        // No struct-style field labels in the row text.
-        assert!(!ts.contains("layer :"));
-    }
-
-    /// `extract_arch_wide_constants` records dropped (fname, fty,
-    /// value) tuples in `arch_opcodes.extracted_prelude`, and
-    /// `emit_interpreter` partitions them: tuples present in 2+
-    /// variants lift to ONE fn-scope `let` at the top of
-    /// `__dispatch_one`; tuples in only one variant stay at the
-    /// top of that variant's arm body. Without partitioning, every
-    /// arm re-emits identical `let cos_sin_fn = …;` lines and the
-    /// expand picks up N copies of the same Rust source.
-    #[test]
-    fn shared_extracted_prelude_lifts_to_fn_scope_in_dispatch_one() {
-        let mut ops = ArchOpcodes::new();
-        ops.register(
-            OpcodeShape::new(
-                "AttnA",
-                vec![
-                    ("layer", syn::parse_quote!(u32)),
-                    ("interleaved", syn::parse_quote!(bool)),
-                ],
-            ),
-            quote! {},
-        );
-        ops.register(
-            OpcodeShape::new(
-                "AttnB",
-                vec![
-                    ("layer", syn::parse_quote!(u32)),
-                    ("interleaved", syn::parse_quote!(bool)),
-                ],
-            ),
-            quote! {},
-        );
-        ops.register(
-            OpcodeShape::new(
-                "Solo",
-                vec![
-                    ("layer", syn::parse_quote!(u32)),
-                    ("private_flag", syn::parse_quote!(bool)),
-                ],
-            ),
-            quote! {},
-        );
-
-        // `interleaved = true` is shared across AttnA + AttnB → must
-        // lift to fn scope. `private_flag = false` only appears on
-        // Solo → must stay as a per-arm residual.
-        ops.extracted_prelude.insert(
-            "AttnA".to_string(),
-            vec![(
-                format_ident!("interleaved"),
-                syn::parse_quote!(bool),
-                quote! { true },
-            )],
-        );
-        ops.extracted_prelude.insert(
-            "AttnB".to_string(),
-            vec![(
-                format_ident!("interleaved"),
-                syn::parse_quote!(bool),
-                quote! { true },
-            )],
-        );
-        ops.extracted_prelude.insert(
-            "Solo".to_string(),
-            vec![(
-                format_ident!("private_flag"),
-                syn::parse_quote!(bool),
-                quote! { false },
-            )],
-        );
-
-        let enum_ident = format_ident!("LlamaOp");
-        let helper_ident = format_ident!("__llama_interpret");
-        let ts = ops.emit_interpreter(&helper_ident, &enum_ident).to_string();
-
-        // Shared `interleaved = true` lifts to ONE fn-scope let.
-        // The fn-scope let lives between the open-brace of the fn
-        // body and the `match __op {` line. Type annotation is
-        // dropped — Rust infers `bool` from the literal `true`.
-        let dispatch_open = ts
-            .split_once("__layer : u32 ,")
-            .and_then(|(_, rhs)| rhs.split_once("match __op {"))
-            .map(|(prelude, _)| prelude)
-            .expect("__dispatch_one signature must be present");
-        assert!(
-            dispatch_open.contains("let interleaved = true ;"),
-            "shared `interleaved = true` should lift to fn-scope, \
-             got prelude: {dispatch_open}"
-        );
-        // Solo's `private_flag` is NOT shared → stays in its arm.
-        assert!(
-            !dispatch_open.contains("let private_flag"),
-            "private_flag should NOT lift to fn-scope, got: {dispatch_open}"
-        );
-        let solo_arm = ts
-            .split_once("LlamaOp :: Solo")
-            .map(|(_, rhs)| rhs)
-            .expect("Solo arm must be present");
-        // Slice the Solo arm body up to the next variant arm.
-        let solo_body_end = solo_arm.find("LlamaOp ::").unwrap_or(solo_arm.len());
-        let solo_body = &solo_arm[..solo_body_end];
-        assert!(
-            solo_body.contains("let private_flag = false ;"),
-            "Solo's private_flag should stay in its arm, got: {solo_body}"
-        );
-
-        // The shared `interleaved` should appear EXACTLY once at
-        // fn-scope (and zero times in each arm's body — the lifted
-        // binding is in lexical scope already).
-        let interleaved_count = ts.matches("let interleaved = true ;").count();
-        assert_eq!(
-            interleaved_count, 1,
-            "shared `interleaved` should appear once (fn-scope), got {interleaved_count}"
-        );
-    }
-
-    /// `OpInstance.field_values.len()` mismatching `shape.fields.len()`
-    /// fails at lower-time, not silently emitting a wrong row.
-    #[test]
-    #[should_panic(expected = "field_values.len()")]
-    fn bucket_static_slice_panics_on_field_count_mismatch() {
-        let mut shapes_by_name = BTreeMap::new();
-        shapes_by_name.insert(
-            "Bad".to_string(),
-            OpcodeShape::new(
-                "Bad",
-                vec![("a", syn::parse_quote!(u32)), ("b", syn::parse_quote!(u32))],
-            ),
-        );
-        let instances = vec![OpInstance::new(format_ident!("Bad"), vec![quote! { 1u32 }])];
-        let _ = emit_bucket_static_slice(&format_ident!("X"), &shapes_by_name, &instances);
     }
 }

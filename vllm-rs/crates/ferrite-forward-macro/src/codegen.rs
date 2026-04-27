@@ -3202,10 +3202,10 @@ pub fn emit_model(
         let term_emits = term_imp
             .fan_out(&term_match, fuf, program, &bounds, &slots)
             .expect("terminal subgraph's Impl must implement fan_out");
-        // The eval body now lives in `ferrite_forward::Instruction::eval`
-        // — `arch_opcodes` keeps the shape registration for the
-        // static-slice emission path; the arm-body slot is unused.
-        arch_opcodes.register(term_imp.opcode_shape(), TokenStream::new());
+        // Eval body lives in `ferrite_forward::Instruction::eval`
+        // — `arch_opcodes` keeps the shape registration for
+        // `emit_bucket_static_slice`'s shape-checking pass.
+        arch_opcodes.register(term_imp.opcode_shape());
         let lowered_lm = crate::interpreter_codegen::LoweredBucket {
             instances: term_emits,
             num_slots,

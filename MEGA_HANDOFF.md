@@ -381,11 +381,38 @@ reflects the actual landed sequence + remaining gaps.
    - See `feedback_gemm_universal_not_dc_able`. User has declined
      the CUTLASS fork.
 
-⏳ 6. Encoder match in `prim_mega.rs`. Exhaustive over
-   `Instruction<W>` → `[i32; 32]`; no `_` arm; per-bucket
-   `MEGA_PROGRAM_M_<N>` static slice emission with `Loop`
-   unrolled at encode time. Slot conventions match prim_mega.cu
-   (see the per-op docstrings on `run_*` fns).
+🟡 6. Encoder match in `prim_mega.rs`. **Match + IR landed; bucket-
+   level emission to TokenStream lands with step 7.** Closed match
+   over OpInstance variants → [`EncodedRow`] of typed slots:
+   - `RowSlot::{Const(i32), ConstExpr(TokenStream),
+     Ptr(PtrSpec), Runtime(RuntimeSource)}` covers compile-time
+     literals, codegen-time const expressions (e.g.
+     `<Weights as CanonicalParams>::HIDDEN_SIZE as i32`),
+     pointer indirection (deduped post-pass into a `ptr_plan`),
+     and per-call runtime fills (e.g. `eps` from
+     `Weights::<fn>(W,layer).eps`).
+   - Loop unrolling at encode time threads `layer = baseline +
+     iter` through every body row (vendor controller has no LOOP
+     opcode; per `MEGA_HANDOFF.md` §"Loops").
+   - Free / Alias rows skipped (pt[] is fixed for the duration of
+     one cooperative launch).
+   - Variants without an arm explicitly enumerated → `try_encode_
+     bucket` returns `None`, marking canonical mega-ineligible at
+     codegen time. **No `_` catch-all** — adding a new
+     `Instruction<W>` variant in `ferrite-forward/src/instr.rs`
+     surfaces as a `panic!()` at codegen time pointing at the
+     missing arm.
+   - 9 unit tests on synthetic OpInstances cover RmsNorm,
+     CutlassGemm + GemmAdd, GemmSplitK workspace-per-row,
+     Loop-unroll baseline preservation, Free/Alias skip, the
+     "Embed has no arm" rejection path, and X-macro ordering of
+     `cutlass_gemm_config_id` vs the C++ `CUTLASS_DC_GEMM_LIST`.
+   - Slot conventions per prim_mega.cu's `run_*` docstrings +
+     dc_cutlass.cuh's per-template caller contracts.
+   Remaining: per-bucket `MEGA_PROGRAM_M_<N>: &[[i32; 32]]` static
+   emission lands as part of step 7 (the launcher needs to consume
+   `EncodedBucket`'s ptr_plan + runtime_fills regardless, so
+   emission groups naturally with the launcher fn).
 ⏳ 7. Per-arch globals struct emit + launcher fn. Macro emits a
    per-arch globals carrying weight ptrs / kv-cache ptrs / output
    ptr / instruction tape ptr; launcher fn hosts the
@@ -454,20 +481,41 @@ KvmMega). DC coverage is wholesale-per-kernel for every CUTLASS
 family the kernel-level Params allows. Remaining Phase-1 work, in
 rough order of leverage / effort:
 
-1. **Encoder match in `prim_mega.rs` (step 6).** Now unblocked.
-   Emit `[i32; 32]` rows per-bucket as `static MEGA_PROGRAM_M_<N>:
-   &[[i32; 32]] = &[…]`. Slot conventions are pinned per-op by the
-   docstrings on `prim_mega.cu`'s `run_*` fns + `dc_cutlass.cuh`'s
-   per-template caller contracts. The encoder is one exhaustive
-   `match` over `Instruction<W>` variants — variants without an arm
-   mark the canonical mega-ineligible at codegen time (no `_`
-   catch-all, no runtime "refused" returns).
-
-2. **Per-arch globals struct + launcher emission (step 7).** Macro
+1. **Per-arch globals struct + launcher emission (step 7).** Macro
    emits a per-arch globals carrying weight ptrs / kv-cache ptrs /
    output ptr / instruction-tape ptr / SplitK workspace ptrs.
    Launcher fn hosts the `prim_mega_<arch>_launch` extern call
    (already declared in `ferrite-kernels/src/megakernel.rs`).
+   **Consumes the [`EncodedBucket`] step 6 produces** —
+   `assign_ptr_indices` already deduped pointer specs into a stable
+   `ptr_plan: Vec<PtrSpec>` and surfaced runtime-filled slots into
+   `runtime_fills: Vec<(row_idx, slot_idx, RuntimeSource)>`. The
+   launcher needs:
+   - Static `MEGA_PROGRAM_M_<N>: &[[i32; 32]]` from `EncodedRow`s
+     (renders `RowSlot::Const(c)` as `c`, `RowSlot::ConstExpr(ts)`
+     as `ts`, `RowSlot::Ptr` is already resolved to a `Const(idx)`
+     by `assign_ptr_indices`, `RowSlot::Runtime` zeroed and
+     patched per-call).
+   - Static `MEGA_PTR_PLAN_M_<N>` describing how the launcher
+     fills `pt[i]` from `(W, ForwardCtx, tile_table)` — one entry
+     per `PtrSpec` in `ptr_plan`.
+   - Static `MEGA_RUNTIME_FILL_M_<N>` driving the post-copy patch
+     pass on the device tape buffer (rendered `RuntimeSource` ID
+     + the `Weights` accessor + layer).
+   - Workspace allocation pass: walk `ptr_plan` for
+     `PtrSpec::Workspace(SplitKScratch{..})` and pre-alloc per-row
+     scratch from `CachingAllocator`.
+
+2. **TODO step 7: complete CUTLASS GEMM N/K + qkv kv_cache ptrs.**
+   The encoder leaves `N`, `K` slots in `OP_CUTLASS_GEMM` /
+   `OP_CUTLASS_GEMM_SPLITK` rows zeroed because `LinearLayer.weight`
+   shape is per-Weights and not in `OpInstance`. Step 7's launcher
+   resolves them from the same accessor's tensor at call time
+   (similar to runtime_fills, but via N/K-shaped row slots).
+   Likewise `OP_QKV_ROPE_CACHE`'s `ptr_k_cache` / `ptr_v_cache`
+   placeholders use synthesized `kv_cache_<layer>_{k,v}` accessor
+   names that step 7 must intercept via per-arch Weights' KvCache
+   field — these aren't real `Weights::<ident>` paths today.
 
 3. **Step-9 e2e via `FERRITE_FORCE_PRIM_MEGA=1` override.** Don't
    wait on 100% DC coverage to flip the all-or-nothing

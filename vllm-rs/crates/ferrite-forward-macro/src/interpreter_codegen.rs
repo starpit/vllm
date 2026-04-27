@@ -686,28 +686,6 @@ fn strip_int_suffix_str(s: &str) -> Option<&str> {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Render an OpcodeShape as a Rust tuple-style enum-variant
-/// declaration — `Variant(T1, T2, …)`. Tuple-style keeps each
-/// emitted row of a static slice on a single line, so a static
-/// slice with N rows is N lines instead of N × (fields + 2). Field
-/// names are still carried by [`OpcodeShape::fields`] so the match
-/// arm in [`emit_interpreter`] can destructure positionally with
-/// the names — same effect as named-field destructure for arm
-/// bodies, but without the row-level verbosity.
-fn variant_decl(shape: &OpcodeShape) -> TokenStream {
-    let name = &shape.name;
-    let tys = shape.fields.iter().map(|(_fname, fty)| fty);
-    quote! { #name ( #(#tys),* ) }
-}
-
-/// Tuple-style destructure pattern — `(f1, f2, …)`. Bindings are
-/// the field idents from [`OpcodeShape::fields`], so arm bodies
-/// reference each by name.
-fn variant_pattern(shape: &OpcodeShape) -> TokenStream {
-    let names = shape.fields.iter().map(|(fname, _ty)| fname);
-    quote! { ( #(#names),* ) }
-}
-
 fn assert_shapes_agree(a: &OpcodeShape, b: &OpcodeShape) {
     assert_eq!(
         a.name, b.name,
@@ -830,8 +808,8 @@ pub fn loop_instance(count: u32, body_len: u32) -> OpInstance {
 /// Lower one (variant × workload-point) into [`LoweredBucket`].
 /// Walks the same wave/loop the old codegen did, calls each picked
 /// Impl's `fan_out`, interleaves `Free` instances at drop-pass
-/// scheduling points, and accumulates `(OpcodeShape,
-/// interpreter_arm)` registrations into `arch_opcodes`.
+/// scheduling points, and registers each Impl's `OpcodeShape` into
+/// `arch_opcodes` for shape-checking + iter-index discovery.
 ///
 /// `final_tile` is the `(TileId, output_slot)` whose slot index will
 /// be exposed as `LoweredBucket.final_slot`. The full forward passes
@@ -936,8 +914,9 @@ pub fn lower_bucket(
                 .unwrap_or_else(|| {
                     panic!(
                         "Impl `{name}` (id {id}) has no fan_out — unmigrated to host \
-                         interpreter IR. Override `opcode_shape`, `fan_out`, and \
-                         `interpreter_arm` on `{name}`.",
+                         interpreter IR. Override `opcode_shape` + `fan_out` on \
+                         `{name}`, and ensure the matching `Instruction<W>` variant \
+                         exists in `ferrite_forward::instr`.",
                         name = imp.name(),
                         id = imp_id.0,
                     )

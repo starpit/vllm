@@ -2960,10 +2960,8 @@ fn impl_names_for(
 #[allow(clippy::too_many_arguments)]
 /// Emit `impl ::ferrite_forward::CanonicalParams for Weights { … }` —
 /// per-canonical model constants the universal `Instruction::eval`
-/// reads as `W::HEAD_DIM`, `W::INTERMEDIATE_SIZE`, etc. Replaces
-/// what `extract_arch_wide_constants` used to lift to per-canonical
-/// fn-scope lets inside `__dispatch_one`. Default 0 / 0.0 / -1 for
-/// fields the canonical doesn't carry.
+/// reads as `W::HEAD_DIM`, `W::INTERMEDIATE_SIZE`, etc. Default
+/// 0 / 0.0 / -1 for fields the canonical doesn't carry.
 fn emit_canonical_params_impl(model: &ModelParams) -> TokenStream {
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
     let num_q_heads = *model.bounds.get("num_attention_heads").unwrap_or(&0) as u32;

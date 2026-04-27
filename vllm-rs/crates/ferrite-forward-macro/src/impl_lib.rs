@@ -561,12 +561,13 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     // Each Impl owns the shape of its own opcode — variant ident
     // and typed payload fields. The proc-macro, processing one
     // arch's solved FUF, collects shapes from the picked Impls and
-    // codegens a per-arch enum. There is no universal opcode
-    // registry. Adding a kernel is overriding three methods on a
-    // new Impl: `opcode_shape`, `fan_out`, `interpreter_arm`. A new
-    // Impl that forgets to override these fails at codegen time —
-    // `fan_out` returns `None` and `lower_bucket` panics with the
-    // Impl's name.
+    // uses them to type-check static-slice emission. The eval
+    // bodies live in `ferrite_forward::Instruction::eval`; an Impl
+    // adds a kernel by overriding two methods: `opcode_shape` (the
+    // variant declaration matching `Instruction<W>`'s) and
+    // `fan_out` (the per-claim instances). A new Impl that forgets
+    // to override these fails at codegen time — `fan_out` returns
+    // `None` and `lower_bucket` panics with the Impl's name.
 
     /// Variant declaration this Impl contributes to the per-arch
     /// enum. Variant ident + ordered `(field_ident, field_type)`
@@ -1105,10 +1106,9 @@ fn cost_attention(m: &MatchInfo, ctx: &CostCtx) -> f64 {
 }
 
 /// Reference HostCallback impl for `OpKind::Embed`. Hand-written
-/// because the host-interpreter `opcode_shape` / `fan_out` /
-/// `interpreter_arm` overrides each reference an Impl-specific
-/// kernel symbol + weight type that a shared macro can't express
-/// generically.
+/// because the host-interpreter `opcode_shape` / `fan_out`
+/// overrides each reference an Impl-specific kernel symbol +
+/// weight type that a shared macro can't express generically.
 #[derive(Debug, Default)]
 pub struct EmbedRefImpl;
 
@@ -1203,7 +1203,7 @@ impl Implementation for EmbedRefImpl {
 }
 /// Reference HostCallback impl for `OpKind::RmsNorm`. Hand-written
 /// (parallel to [`EmbedRefImpl`]) to expose `opcode_shape` /
-/// `fan_out` / `interpreter_arm` overrides. Per-claim weight
+/// `fan_out` overrides. Per-claim weight
 /// selection — `input_layernorm` vs `post_attention_layernorm`,
 /// each at any layer — rides on the `weight_fn` fn-pointer +
 /// `layer` u32 fields.
@@ -1318,7 +1318,7 @@ impl Implementation for RmsNormRefImpl {
 }
 /// Reference HostCallback impl for `OpKind::LayerNorm`. Hand-written
 /// (parallel to [`RmsNormRefImpl`]) to expose the host-interpreter
-/// `opcode_shape` / `fan_out` / `interpreter_arm` overrides. Same
+/// `opcode_shape` / `fan_out` overrides. Same
 /// per-claim weight selector pattern: `weight_fn` + `layer` fields
 /// pick the right `CohereLayerNorm` accessor at runtime; the variant
 /// declaration is structurally identical for every LayerNorm tile in
@@ -1439,7 +1439,7 @@ impl Implementation for LayerNormRefImpl {
 
 /// Reference HostCallback impl for `OpKind::Gemm`. Hand-written
 /// (parallel to [`RmsNormRefImpl`]) to expose the host-interpreter
-/// `opcode_shape` / `fan_out` / `interpreter_arm` overrides. Bias
+/// `opcode_shape` / `fan_out` overrides. Bias
 /// is handled by [`FusedGemmBiasImpl`]; this Impl claims only the
 /// strict-matmul DSL `gemm()`.
 ///
@@ -1694,10 +1694,10 @@ impl Implementation for ReshapeRefImpl {
         // Hardcoded 4 — mirrors `ferrite_cuda_core::tensor::MAX_DIMS`.
         // The proc-macro crate doesn't depend on `ferrite-cuda-core`
         // (only emits its tokens into consumer code), so the const
-        // isn't reachable from here. The emitted opcode_shape /
-        // interpreter_arm reference `MAX_DIMS` symbolically; if it
-        // ever changes from 4, both this `4` and those tokens must
-        // be updated together.
+        // isn't reachable from here. `Instruction::Reshape`'s
+        // payload (in ferrite-forward) references `MAX_DIMS`
+        // symbolically; if it ever changes from 4, both this `4` and
+        // that variant must be updated together.
         const RESHAPE_MAX_DIMS: usize = 4;
         assert!(
             shape.len() <= RESHAPE_MAX_DIMS,

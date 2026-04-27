@@ -85,15 +85,15 @@ pub fn find_bucket<Op: 'static>(
     &table[0]
 }
 
-/// Runtime gate for the per-op trace the macro emits inside every
-/// `__dispatch_one`. Reads `FERRITE_TRACE` from the environment on
+/// Runtime gate for the per-op trace `Instruction::eval` opens
+/// each match with. Reads `FERRITE_TRACE` from the environment on
 /// the first call and caches the result. Set `FERRITE_TRACE=1`
 /// (or any non-empty, non-"0" value) before launch to enable;
 /// pair with `CUDA_LAUNCH_BLOCKING=1` so the trace lines align
 /// with kernel completion order.
 ///
 /// Unconditionally compiled in — the cost when disabled is one
-/// atomic-load + branch per dispatched op. The Op enum carries
+/// atomic-load + branch per dispatched op. `Instruction<W>` carries
 /// `#[derive(Debug)]` so the trace can pretty-print variants.
 #[inline]
 pub fn trace_enabled() -> bool {

@@ -5855,23 +5855,15 @@ impl Implementation for RopeAppendRefImpl {
             return None;
         }
         // Defer to `FusedQkvRope{Cache,Prefill}Impl` when the
-        // upstream pattern matches: three Gemms (optionally through
-        // a BiasAdd) sharing one activation, uniform bias presence.
-        // Rejecting here mirrors `gemm_is_fusion_partner` on
-        // `CutlassGemmImpl` / `CutlassGemvImpl` — singletons must
-        // never steal a claim the fused impl owns, because their
-        // output layouts don't match what the downstream
-        // `AttentionPrefillContiguousImpl` / `AttentionViaCacheImpl`
-        // expects (fused impls produce contiguous `[T, heads,
-        // head_dim]` K/V; the singleton rotates in-place and leaves
-        // K/V at `[T, heads*head_dim]`).
+        // upstream pattern matches (three Gemms sharing one activation,
+        // optionally through a BiasAdd, uniform bias presence). This
+        // gate is the inverse of `output_layouts` — singletons leave
+        // K/V at `[T, heads*head_dim]` while fused impls produce
+        // `[T, heads, head_dim]`, and the downstream Attention impls
+        // expect the latter when a fused upstream is available.
         if rope_append_has_fused_qkv_upstream(fuf, seed) {
             return None;
         }
-        // Note: deferral to FusedQkvQkNormRopeCacheImpl is OFF because
-        // that impl is not registered in starter_library (correctness
-        // bug, see comment there). Singletons must claim the Qwen3/
-        // Gemma3 RopeAppend tiles unconditionally.
         Some(MatchInfo {
             claimed_tiles: vec![seed],
             boundary_inputs: qkv,
@@ -6799,29 +6791,6 @@ impl CutlassGemmImpl {
     }
 }
 
-/// True if `node`'s output is consumed by any tile of the given op
-/// kind. Used to reject cutlass matches on Gemms that feed a
-/// fusion partner (RopeAppend / Silu / Mul).
-fn output_feeds_op(fuf: &Fuf, tile: TileId, op: OpKind) -> bool {
-    fuf.nodes
-        .iter()
-        .any(|n| n.op == op && consumes_tile(n, tile))
-}
-
-/// True if this Gemm tile is a fusion partner (Q/K/V of a
-/// RopeAppend, or gate/up of the `silu(gate) * up` pattern, or a
-/// bias-carrying gemm whose output feeds a `bias_add`). The cutlass
-/// singletons must never claim these — their fused impls own them
-/// and the downstream chain has no singleton kernel for the
-/// fusion-partner op (Silu/Mul/RopeAppend/BiasAdd).
-fn gemm_is_fusion_partner(fuf: &Fuf, seed: TileId) -> bool {
-    output_feeds_op(fuf, seed, OpKind::RopeAppend)
-        || output_feeds_op(fuf, seed, OpKind::RopeAppendInterleaved)
-        || output_feeds_op(fuf, seed, OpKind::Silu)
-        || output_feeds_op(fuf, seed, OpKind::Mul)
-        || output_feeds_op(fuf, seed, OpKind::BiasAdd)
-}
-
 /// Evaluate the `(M, N, K)` of a Gemm tile for CSV cost lookup.
 /// M comes from the current workload (bounds[`num_tokens`]), N from
 /// the output's last dim, K from the activation-input tile's last
@@ -6889,9 +6858,6 @@ impl Implementation for CutlassGemmImpl {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         // Dense kernel: reject AWQ storage.
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
-            return None;
-        }
-        if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
         Some(info)
@@ -7103,9 +7069,6 @@ impl Implementation for CutlassGemmSplitKImpl {
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
             return None;
         }
-        if gemm_is_fusion_partner(fuf, seed) {
-            return None;
-        }
         Some(info)
     }
 
@@ -7307,9 +7270,6 @@ impl Implementation for CutlassGemmAddImpl {
             return None;
         }
         if !matches!(weight_storage_of(node), Some(StorageFormat::Dense)) {
-            return None;
-        }
-        if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
         // Find a downstream residual-stream Add: both inputs are
@@ -7537,9 +7497,6 @@ impl Implementation for CutlassGemvImpl {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         // Dense kernel: reject AWQ storage.
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
-            return None;
-        }
-        if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
         Some(info)
@@ -8986,13 +8943,6 @@ impl Implementation for Fp8GemmImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         if !is_fp8_gemm(fuf, seed) {
-            return None;
-        }
-        // Defer to `Fp8FusedGemmBiasImpl` when the output feeds a
-        // `BiasAdd` — same pattern as dense `GemmRefImpl` deferring
-        // to `FusedGemmBiasImpl`. Without this, the singleton claims
-        // the Gemm and leaves the downstream BiasAdd tile unclaimed.
-        if output_feeds_op(fuf, seed, OpKind::BiasAdd) {
             return None;
         }
         Some(info)
@@ -11946,11 +11896,20 @@ mod tests {
     }
 
     #[test]
-    fn cutlass_gemm_impl_rejects_fusion_partners() {
-        // CutlassGemmImpl.matches must return None for a Gemm whose
-        // output feeds a RopeAppend / Silu / Mul — picking cutlass
-        // there would break the fused impl's claim on the downstream
-        // kernel chain (those consumers have no singleton kernel).
+    fn cutlass_gemm_impl_matches_when_output_feeds_rope_append() {
+        // Architectural invariant: singletons (CutlassGemm{,SplitK,
+        // Add,v}, GemmRefImpl, Fp8Gemm) MUST match unconditionally on
+        // structural fit — they don't gate on what the downstream
+        // consumer is. The DP solver decides between a multi-tile
+        // fused claim and a chain of singletons by cost + feasibility:
+        //   - When `FusedQkvRopeImpl` matches, it claims [Q,K,V,rope]
+        //     in one multi-tile mask; DP picks it when cheaper.
+        //   - When fused doesn't match (qwen3/gemma3 per-head qk-norm),
+        //     singletons are the only feasible plan and win.
+        // Singleton-side gating ("don't match if output feeds X") was
+        // a hand-coded preference that the DP already encodes via cost
+        // and feasibility — and it was wrong for qwen3 V-proj, where
+        // it forced cuBLAS over a measurably faster CUTLASS variant.
         use crate::classified::{ExternKind, WeightId};
         use crate::fuf::{Fuf, FufInput, FufNode, TileId};
         use crate::shape::Dim;
@@ -11997,8 +11956,9 @@ mod tests {
         };
         let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(
-            imp.matches(&fuf, t1, &profile).is_none(),
-            "cutlass must not match a Gemm whose output feeds RopeAppend",
+            imp.matches(&fuf, t1, &profile).is_some(),
+            "CutlassGemmImpl must match a Gemm structurally regardless of \
+             downstream consumer; fused-vs-singleton is the DP's job",
         );
     }
     // ── FlashInfer attention Impls ───────────────────────────────

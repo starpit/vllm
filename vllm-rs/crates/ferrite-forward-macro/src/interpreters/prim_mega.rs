@@ -48,6 +48,7 @@
 use std::collections::BTreeMap;
 
 use proc_macro2::TokenStream;
+use quote::quote;
 
 use crate::impl_lib::{OpInstance, OpcodeShape};
 use crate::interpreters::host::ArchOpcodes;
@@ -716,6 +717,63 @@ fn encode_cutlass_gemv(
     Some(row)
 }
 
+// ── Program static emission (step 7a) ───────────────────────────
+
+/// Emit a `static <ident>: [[i32; 32]; N] = [...]` from an
+/// already-resolved [`EncodedBucket`]. The C++ kernel reads
+/// `tape + pc * INSTRUCTION_WIDTH` (`prim_mega.cu:401`), so the row
+/// width is pinned to 32 here; trailing slots not present on the
+/// [`EncodedRow`] zero-pad.
+///
+/// Pre-condition: the bucket has been through
+/// [`EncodedBucket::assign_ptr_indices`] — every `RowSlot::Ptr` has
+/// been replaced by `RowSlot::Const(idx)` and every
+/// `RowSlot::Runtime` by `RowSlot::Const(0)` (the launcher patches
+/// the zeroed slot per-call from `runtime_fills`). Encountering an
+/// unresolved variant is a codegen invariant violation; the function
+/// panics so the failure surfaces at macro expansion, not at link
+/// time when the host side ends up writing nonsense into pt[].
+///
+/// This is the static-template half of the launcher: the launcher fn
+/// (step 7b/7c, follow-up commit) consumes the same bucket's
+/// `ptr_plan` + `runtime_fills` to fill `pt[]` and patch the
+/// device-resident copy of this template before kicking the kernel.
+pub fn emit_prim_mega_program(static_ident: &syn::Ident, bucket: &EncodedBucket) -> TokenStream {
+    let n = bucket.rows.len();
+    let rows = bucket.rows.iter().map(|row| {
+        let cells = (0..INSTRUCTION_WIDTH).map(|i| match row.slots.get(i) {
+            Some(RowSlot::Const(c)) => {
+                let lit = proc_macro2::Literal::i32_unsuffixed(*c);
+                quote! { #lit }
+            }
+            Some(RowSlot::ConstExpr(ts)) => quote! { (#ts) },
+            Some(RowSlot::Ptr(spec)) => panic!(
+                "emit_prim_mega_program: unresolved RowSlot::Ptr({:?}) — \
+                 caller must run EncodedBucket::assign_ptr_indices first",
+                spec
+            ),
+            Some(RowSlot::Runtime(src)) => panic!(
+                "emit_prim_mega_program: unresolved RowSlot::Runtime({:?}) — \
+                 caller must run EncodedBucket::assign_ptr_indices first",
+                src
+            ),
+            None => quote! { 0 },
+        });
+        quote! { [ #(#cells),* ] }
+    });
+    // INSTRUCTION_WIDTH is `usize` for indexing; render as a bare
+    // `32` literal here so the static type reads `[[i32; 32]; N]`
+    // verbatim — the kernel contract pins the literal width, not a
+    // suffixed const.
+    let width_lit = proc_macro2::Literal::usize_unsuffixed(INSTRUCTION_WIDTH);
+    let n_lit = proc_macro2::Literal::usize_unsuffixed(n);
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        static #static_ident: [[i32; #width_lit]; #n_lit] = [ #(#rows),* ];
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 /// Parse a TokenStream of shape `<n>u32` or `<n>` (un-suffixed)
@@ -1228,5 +1286,230 @@ mod tests {
         assert_eq!(path_last_segment(&ts), Some("input_layernorm".into()));
         let ts2 = quote! { Weights::nested::deep_field };
         assert_eq!(path_last_segment(&ts2), Some("deep_field".into()));
+    }
+
+    // ── Program static emission (step 7a) ───────────────────────
+
+    /// Build a one-row encoded bucket with the seven mega-eligible
+    /// shapes registered, then `assign_ptr_indices` so emission
+    /// pre-conditions hold. Used by every emission test below.
+    fn rms_norm_bucket() -> EncodedBucket {
+        let arch = arch_with_seven_shapes();
+        let inst = op(
+            "RmsNorm",
+            vec![
+                quote! { 3u32 },
+                quote! { 5u32 },
+                quote! { 0u32 },
+                quote! { Weights::input_layernorm },
+            ],
+        );
+        try_encode_bucket(&arch, &[inst], &ctx_llama_1b()).expect("RmsNorm has a mega arm")
+    }
+
+    fn ident(name: &str) -> syn::Ident {
+        syn::Ident::new(name, Span::call_site())
+    }
+
+    /// Emitted token stream parses as a Rust `static` item with the
+    /// expected outer shape: `[[i32; 32]; N]`. Pin the
+    /// kernel-contract row width here — the C++ side reads
+    /// `tape + pc * 32`.
+    #[test]
+    fn emit_program_renders_static_with_correct_outer_shape() {
+        let bucket = rms_norm_bucket();
+        let ts = emit_prim_mega_program(&ident("MEGA_PROGRAM_M_1"), &bucket);
+        let item: syn::ItemStatic =
+            syn::parse2(ts).expect("emit_prim_mega_program produces a parseable static item");
+        assert_eq!(item.ident, "MEGA_PROGRAM_M_1");
+        let n_lit = proc_macro2::Literal::usize_unsuffixed(bucket.rows.len());
+        let expected_ty: syn::Type = syn::parse_quote!([[i32; 32]; #n_lit]);
+        let actual_ty = &*item.ty;
+        assert_eq!(
+            quote! { #expected_ty }.to_string(),
+            quote! { #actual_ty }.to_string(),
+        );
+    }
+
+    /// Each emitted row has exactly 32 i32 cells, regardless of how
+    /// many slots the encoder pushed. Trailing cells beyond
+    /// `row.slots.len()` zero-pad. Pin the kernel contract.
+    #[test]
+    fn emit_program_pads_rows_to_32_cells() {
+        let bucket = rms_norm_bucket();
+        let ts = emit_prim_mega_program(&ident("MEGA_PROGRAM_M_1"), &bucket);
+        // Render to string, count `,`-separated cells inside the
+        // outermost row literal. The static body is one row of 32
+        // cells; the simplest robust check is to parse the static
+        // and walk the expression tree.
+        let item: syn::ItemStatic = syn::parse2(ts).unwrap();
+        let outer = match &*item.expr {
+            syn::Expr::Array(a) => a,
+            other => panic!("expected outer Expr::Array, got {:?}", other),
+        };
+        assert_eq!(outer.elems.len(), 1, "one row");
+        let row = match &outer.elems[0] {
+            syn::Expr::Array(a) => a,
+            other => panic!("expected row Expr::Array, got {:?}", other),
+        };
+        assert_eq!(
+            row.elems.len(),
+            INSTRUCTION_WIDTH,
+            "row must zero-pad to {INSTRUCTION_WIDTH}"
+        );
+    }
+
+    /// Slot 0 of an RmsNorm row holds OP_RMS_NORM (=1). Pin the
+    /// opcode-render path: i32 literals come through verbatim.
+    #[test]
+    fn emit_program_renders_opcode_in_slot_zero() {
+        let bucket = rms_norm_bucket();
+        let ts = emit_prim_mega_program(&ident("MEGA_PROGRAM_M_1"), &bucket);
+        let item: syn::ItemStatic = syn::parse2(ts).unwrap();
+        let outer = match &*item.expr {
+            syn::Expr::Array(a) => a,
+            _ => unreachable!(),
+        };
+        let row = match &outer.elems[0] {
+            syn::Expr::Array(a) => a,
+            _ => unreachable!(),
+        };
+        let cell0_lit = match &row.elems[0] {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(li),
+                ..
+            }) => li.base10_parse::<i32>().unwrap(),
+            other => panic!("expected int literal at slot 0, got {:?}", other),
+        };
+        assert_eq!(cell0_lit, OP_RMS_NORM);
+    }
+
+    /// `RowSlot::ConstExpr` token streams render verbatim as a
+    /// parenthesized expression. Pin the path the encoder uses for
+    /// per-canonical const-prop (`<Weights as
+    /// CanonicalParams>::HIDDEN_SIZE as i32`); the encoder doesn't
+    /// produce these today, but the emit path must support them
+    /// so step-7 follow-ups can route shape constants through them
+    /// without a new RowSlot variant.
+    #[test]
+    fn emit_program_renders_const_expr_verbatim() {
+        let mut row = EncodedRow::new(OP_NOP);
+        row.push_const_expr(quote! {
+            <Weights as ::ferrite_kernels::canonical::CanonicalParams>::HIDDEN_SIZE as i32
+        });
+        let bucket = EncodedBucket {
+            rows: vec![row],
+            ptr_plan: Vec::new(),
+            runtime_fills: Vec::new(),
+        };
+        let ts = emit_prim_mega_program(&ident("MEGA_PROGRAM_T"), &bucket);
+        let s = ts.to_string();
+        assert!(
+            s.contains("HIDDEN_SIZE"),
+            "ConstExpr token stream must appear verbatim in emitted static; got:\n{s}"
+        );
+    }
+
+    /// After `assign_ptr_indices`, `RowSlot::Runtime(eps)` becomes
+    /// `RowSlot::Const(0)` and gets recorded in `runtime_fills`.
+    /// The emitted static therefore has a literal `0` at the eps
+    /// position; the launcher (step 7b/7c) patches it per call.
+    #[test]
+    fn emit_program_renders_zero_for_runtime_filled_slot() {
+        let bucket = rms_norm_bucket();
+        // Sanity: encoder did record exactly one runtime fill at the
+        // eps position (slot 4) before we go check the emitted const.
+        assert_eq!(bucket.runtime_fills.len(), 1);
+        assert_eq!(
+            bucket.runtime_fills[0],
+            (
+                0,
+                4,
+                RuntimeSource::WeightEpsBits {
+                    fn_ident: "input_layernorm".into(),
+                    layer: 0,
+                }
+            )
+        );
+        let ts = emit_prim_mega_program(&ident("MEGA_PROGRAM_M_1"), &bucket);
+        let item: syn::ItemStatic = syn::parse2(ts).unwrap();
+        let outer = match &*item.expr {
+            syn::Expr::Array(a) => a,
+            _ => unreachable!(),
+        };
+        let row = match &outer.elems[0] {
+            syn::Expr::Array(a) => a,
+            _ => unreachable!(),
+        };
+        let cell4_lit = match &row.elems[4] {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(li),
+                ..
+            }) => li.base10_parse::<i32>().unwrap(),
+            other => panic!("expected int literal at slot 4, got {:?}", other),
+        };
+        assert_eq!(cell4_lit, 0);
+    }
+
+    /// Calling `emit_prim_mega_program` without first running
+    /// `assign_ptr_indices` panics — the resolved-rows pre-condition
+    /// is a hard codegen invariant. Surfaces at macro expansion, not
+    /// at link time when the launcher would otherwise feed garbage
+    /// into pt[]. Pin both branches (Ptr + Runtime).
+    #[test]
+    #[should_panic(expected = "unresolved RowSlot::Ptr")]
+    fn emit_program_panics_on_unresolved_ptr() {
+        let mut row = EncodedRow::new(OP_RMS_NORM);
+        row.push_ptr(PtrSpec::TileSlot(7));
+        let bucket = EncodedBucket {
+            rows: vec![row],
+            ptr_plan: Vec::new(),
+            runtime_fills: Vec::new(),
+        };
+        let _ = emit_prim_mega_program(&ident("MEGA_PROGRAM_T"), &bucket);
+    }
+
+    #[test]
+    #[should_panic(expected = "unresolved RowSlot::Runtime")]
+    fn emit_program_panics_on_unresolved_runtime() {
+        let mut row = EncodedRow::new(OP_RMS_NORM);
+        row.push_runtime(RuntimeSource::WeightEpsBits {
+            fn_ident: "x".into(),
+            layer: 0,
+        });
+        let bucket = EncodedBucket {
+            rows: vec![row],
+            ptr_plan: Vec::new(),
+            runtime_fills: Vec::new(),
+        };
+        let _ = emit_prim_mega_program(&ident("MEGA_PROGRAM_T"), &bucket);
+    }
+
+    /// Multi-row buckets render as `[[..32..], [..32..], ...]` —
+    /// outer length is `bucket.rows.len()`. Pin loop-unrolled
+    /// programs (every per-iter row gets its own outer entry).
+    #[test]
+    fn emit_program_outer_length_matches_rows() {
+        let arch = arch_with_seven_shapes();
+        let body = vec![op(
+            "RmsNorm",
+            vec![
+                quote! { 0u32 },
+                quote! { 1u32 },
+                quote! { 0u32 },
+                quote! { Weights::input_layernorm },
+            ],
+        )];
+        let mut prog: Vec<OpInstance> = vec![loop_instance(4, 1)];
+        prog.extend(body);
+        let bucket = try_encode_bucket(&arch, &prog, &ctx_llama_1b()).unwrap();
+        assert_eq!(bucket.rows.len(), 4);
+        let ts = emit_prim_mega_program(&ident("MEGA_PROGRAM_M_1"), &bucket);
+        let item: syn::ItemStatic = syn::parse2(ts).unwrap();
+        let outer = match &*item.expr {
+            syn::Expr::Array(a) => a,
+            _ => unreachable!(),
+        };
+        assert_eq!(outer.elems.len(), 4);
     }
 }

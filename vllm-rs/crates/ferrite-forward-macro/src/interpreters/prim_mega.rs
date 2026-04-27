@@ -47,11 +47,12 @@
 
 use std::collections::BTreeMap;
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 
 use crate::impl_lib::{OpInstance, OpcodeShape};
 use crate::interpreters::host::ArchOpcodes;
+use crate::shape::{Dim, Shape};
 
 // ── Opcode constants (mirror prim_mega.cu's enum Opcode) ────────
 
@@ -832,6 +833,375 @@ pub fn emit_prim_mega_program(static_ident: &syn::Ident, bucket: &EncodedBucket)
         #[cfg(feature = "cuda")]
         #[allow(dead_code)]
         static #static_ident: [[i32; #width_lit]; #n_lit] = [ #(#rows),* ];
+    }
+}
+
+// ── Launcher emission (step 7b/7c) ──────────────────────────────
+
+/// Resolve a [`Dim`] expression to a concrete `usize` against the
+/// per-canonical `bounds` map. Returns `None` for `Dim::Var` or any
+/// `Dim::Bound(name)` not in `bounds` — the launcher then panics at
+/// runtime instead of silently allocating a wrong-shape tile.
+///
+/// `bounds` is the same `BTreeMap<String, u64>` `lower_bucket`
+/// already takes — typically populated from the model's
+/// `config.json` (hidden_size, num_attention_heads, head_dim, …).
+fn resolve_dim(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<usize> {
+    match dim {
+        Dim::Lit(n) => Some(*n as usize),
+        Dim::Bound(name) => bounds.get(name).map(|&v| v as usize),
+        Dim::Mul(parts) => parts
+            .iter()
+            .try_fold(1usize, |acc, p| resolve_dim(p, bounds).map(|v| acc * v)),
+        Dim::Var(_) => None,
+    }
+}
+
+/// Resolve a whole [`Shape`] to `Vec<usize>`, returning `None` if
+/// any dim is unresolvable.
+fn resolve_shape(shape: &Shape, bounds: &BTreeMap<String, u64>) -> Option<Vec<usize>> {
+    shape.iter().map(|d| resolve_dim(d, bounds)).collect()
+}
+
+/// Parse a synthetic `kv_cache_<layer>_<axis>` accessor name into
+/// `(layer, axis)` where `axis` is `'k'` or `'v'`. Returns `None`
+/// for any other name — the launcher then routes the PtrSpec
+/// through the regular Weights accessor path.
+fn parse_kv_cache_synth(fn_ident: &str) -> Option<(u32, char)> {
+    let rest = fn_ident.strip_prefix("kv_cache_")?;
+    let (layer_str, axis_str) = rest.rsplit_once('_')?;
+    let layer: u32 = layer_str.parse().ok()?;
+    let axis = match axis_str {
+        "k" => 'k',
+        "v" => 'v',
+        _ => return None,
+    };
+    Some((layer, axis))
+}
+
+/// Emit a `pub unsafe fn <fn_ident>(...)` that drives one bucket of
+/// the persistent prim_mega kernel.
+///
+/// Body sections, in order:
+///
+/// 1. **Tile pre-allocation.** `tiles[i] = Some(TileEntry::Owned(
+///    caching.alloc_tensor(&shape, BF16)))` for every slot whose
+///    `slot_shapes[i]` is non-empty. Slots with `Shape::default()`
+///    (un-touched-by-allocator entries) skip — the runtime mega
+///    program never writes to them.
+/// 2. **Workspace allocations.** One `let __ws_<key>` binding per
+///    `WorkspaceKind::SplitKScratch` in the ptr_plan, sized as
+///    `[split_k * m * n] * f32` where `n = (Weights::<weight_fn>)
+///    (wm, weight_layer).weight.shape()[0] as usize`.
+/// 3. **Tape buffer.** `device.caching.alloc_tensor(&[rows*32*4],
+///    U8)` + a `memcpy_htod_async` from `&<static_program_ident>
+///    as *const u8`.
+/// 4. **pt[] host vec.** One `pt_host.push(...)` per `PtrSpec` in
+///    insertion order. Synthetic `kv_cache_<layer>_<axis>` accessor
+///    names route to `fwd.kv_cache.{k_cache,v_cache}(layer)` —
+///    pinned by [`parse_kv_cache_synth`].
+/// 5. **pt[] → device** memcpy.
+/// 6. **Runtime-fill patches.** One memcpy per `runtime_fills`
+///    entry, computing the i32 value from `WeightEpsBits` or
+///    `WeightShapeDim` and writing into the device tape at
+///    `(row * 32 + slot) * 4` bytes.
+/// 7. **Launch.** `prim_mega_llama_launch` with placeholder
+///    `grid_x` / `block_x` / `smem_size` (TODO: derive from
+///    occupancy). Returns the FFI status as `i32`; non-zero panics
+///    so a kernel-launch error doesn't silently corrupt downstream
+///    state.
+///
+/// Pre-condition: `bucket.assign_ptr_indices()` has resolved every
+/// `RowSlot::Ptr` and `RowSlot::Runtime` (same invariant as
+/// [`emit_prim_mega_program`]). The pt[] / runtime-fills the
+/// launcher renders are read off `bucket.ptr_plan` /
+/// `bucket.runtime_fills` directly.
+///
+/// `bounds` is the per-bucket numeric bound map the codegen already
+/// computes (`lower_bucket`'s `bounds: &BTreeMap<String, u64>`).
+/// Threading it through makes every Dim in `slot_shapes` resolvable
+/// at codegen time so the emitted alloc calls use plain integer
+/// literals.
+pub fn emit_prim_mega_launcher(
+    fn_ident: &syn::Ident,
+    static_program_ident: &syn::Ident,
+    bucket: &EncodedBucket,
+    slot_shapes: &[Shape],
+    bounds: &BTreeMap<String, u64>,
+    _ctx: &EncodeCtx,
+) -> TokenStream {
+    let num_slots = slot_shapes.len();
+    let n_rows = bucket.rows.len();
+    let plan_len = bucket.ptr_plan.len();
+    let tape_bytes = n_rows * INSTRUCTION_WIDTH * core::mem::size_of::<i32>();
+
+    // 1. Tile pre-allocation.
+    let tile_alloc_stmts: Vec<TokenStream> = slot_shapes
+        .iter()
+        .enumerate()
+        .map(|(i, shape)| {
+            if shape.is_empty() {
+                return quote! {};
+            }
+            let i_lit = proc_macro2::Literal::usize_unsuffixed(i);
+            match resolve_shape(shape, bounds) {
+                Some(dims) => {
+                    let dim_lits: Vec<_> = dims
+                        .iter()
+                        .map(|&d| proc_macro2::Literal::usize_unsuffixed(d))
+                        .collect();
+                    quote! {
+                        if tiles[#i_lit].is_none() {
+                            tiles[#i_lit] = ::core::option::Option::Some(
+                                ::ferrite_forward::tile_table::TileEntry::Owned(
+                                    device.caching.alloc_tensor(
+                                        &[ #(#dim_lits),* ],
+                                        ::ferrite_cuda_core::DType::BF16,
+                                    )
+                                )
+                            );
+                        }
+                    }
+                }
+                None => quote! {
+                    if tiles[#i_lit].is_none() {
+                        ::core::panic!(
+                            "prim_mega: slot {} has unresolvable shape — \
+                             encoder bug or missing bound",
+                            #i_lit,
+                        );
+                    }
+                },
+            }
+        })
+        .collect();
+
+    // 2. Workspace allocations (split-K scratch).
+    let workspace_locals: Vec<TokenStream> = bucket
+        .ptr_plan
+        .iter()
+        .filter_map(|spec| match spec {
+            PtrSpec::Workspace(WorkspaceKind::SplitKScratch {
+                key,
+                split_k,
+                m,
+                weight_fn_ident,
+                weight_layer,
+            }) => {
+                let ws_ident = syn::Ident::new(&format!("__ws_{key}"), Span::call_site());
+                let weight_path = syn::Ident::new(weight_fn_ident, Span::call_site());
+                let layer_lit = proc_macro2::Literal::u32_unsuffixed(*weight_layer);
+                let m_lit = proc_macro2::Literal::usize_unsuffixed(*m as usize);
+                let split_k_lit = proc_macro2::Literal::usize_unsuffixed(*split_k as usize);
+                Some(quote! {
+                    let #ws_ident = {
+                        let n = (Weights::#weight_path)(wm, #layer_lit)
+                            .weight.shape()[0] as usize;
+                        device.caching.alloc_tensor(
+                            &[#split_k_lit * #m_lit * n],
+                            ::ferrite_cuda_core::DType::F32,
+                        )
+                    };
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    // 4. pt[] host vec construction.
+    let pt_host_pushes: Vec<TokenStream> = bucket
+        .ptr_plan
+        .iter()
+        .map(|spec| match spec {
+            PtrSpec::TileSlot(s) => {
+                let s_lit = proc_macro2::Literal::u32_unsuffixed(*s);
+                quote! {
+                    pt_host.push(
+                        ::ferrite_forward::tile_table::tile_ref(tiles, #s_lit)
+                            .as_gpu_tensor(tiles)
+                            .raw_ptr() as *mut ::core::ffi::c_void,
+                    );
+                }
+            }
+            PtrSpec::Weight {
+                fn_ident,
+                layer,
+                field,
+            } => {
+                if let Some((kv_layer, axis)) = parse_kv_cache_synth(fn_ident) {
+                    let layer_lit = proc_macro2::Literal::u32_unsuffixed(kv_layer);
+                    let getter = match axis {
+                        'k' => quote! { k_cache },
+                        'v' => quote! { v_cache },
+                        _ => unreachable!(),
+                    };
+                    quote! {
+                        pt_host.push(
+                            fwd.kv_cache.#getter(#layer_lit as usize)
+                                .raw_ptr() as *mut ::core::ffi::c_void,
+                        );
+                    }
+                } else {
+                    let weight_path = syn::Ident::new(fn_ident, Span::call_site());
+                    let layer_lit = proc_macro2::Literal::u32_unsuffixed(*layer);
+                    let access = match field {
+                        WeightField::Weight => quote! { .weight.as_gpu_tensor() },
+                        WeightField::DenseWeight => quote! { .dense_weight().as_gpu_tensor() },
+                        WeightField::AsGpuTensor => quote! {},
+                    };
+                    quote! {
+                        pt_host.push(
+                            (Weights::#weight_path)(wm, #layer_lit) #access
+                                .raw_ptr() as *mut ::core::ffi::c_void,
+                        );
+                    }
+                }
+            }
+            PtrSpec::Workspace(WorkspaceKind::SplitKScratch { key, .. }) => {
+                let ws_ident = syn::Ident::new(&format!("__ws_{key}"), Span::call_site());
+                quote! {
+                    pt_host.push(
+                        #ws_ident.as_gpu_tensor().raw_ptr() as *mut ::core::ffi::c_void,
+                    );
+                }
+            }
+            PtrSpec::Forward(ForwardField::Positions) => quote! {
+                pt_host.push(fwd.positions.raw_ptr() as *mut ::core::ffi::c_void);
+            },
+            PtrSpec::Forward(ForwardField::SlotMapping) => quote! {
+                pt_host.push(fwd.slot_mapping.raw_ptr() as *mut ::core::ffi::c_void);
+            },
+        })
+        .collect();
+
+    // 6. Runtime-fill patches.
+    let runtime_patches: Vec<TokenStream> = bucket
+        .runtime_fills
+        .iter()
+        .map(|(row, slot, src)| {
+            let row_lit = proc_macro2::Literal::u32_unsuffixed(*row);
+            let slot_lit = proc_macro2::Literal::u32_unsuffixed(*slot);
+            let value_expr = match src {
+                RuntimeSource::WeightEpsBits { fn_ident, layer } => {
+                    let path = syn::Ident::new(fn_ident, Span::call_site());
+                    let layer_lit = proc_macro2::Literal::u32_unsuffixed(*layer);
+                    quote! {
+                        f32::to_bits((Weights::#path)(wm, #layer_lit).eps) as i32
+                    }
+                }
+                RuntimeSource::WeightShapeDim {
+                    fn_ident,
+                    layer,
+                    dim_idx,
+                } => {
+                    let path = syn::Ident::new(fn_ident, Span::call_site());
+                    let layer_lit = proc_macro2::Literal::u32_unsuffixed(*layer);
+                    let dim_lit = proc_macro2::Literal::usize_unsuffixed(*dim_idx as usize);
+                    quote! {
+                        (Weights::#path)(wm, #layer_lit)
+                            .weight.shape()[#dim_lit] as i32
+                    }
+                }
+            };
+            quote! {
+                {
+                    let __v: i32 = #value_expr;
+                    ::ferrite_cuda_core::driver::memcpy_htod_async(
+                        tape_dev.as_gpu_tensor().raw_ptr().add(
+                            (#row_lit as usize * 32 + #slot_lit as usize)
+                                * ::core::mem::size_of::<i32>(),
+                        ),
+                        &__v as *const i32 as *const u8,
+                        ::core::mem::size_of::<i32>(),
+                        device.compute_stream,
+                    ).expect("prim_mega: runtime-fill memcpy failed");
+                }
+            }
+        })
+        .collect();
+
+    let n_rows_lit = proc_macro2::Literal::usize_unsuffixed(n_rows);
+    let plan_len_lit = proc_macro2::Literal::usize_unsuffixed(plan_len);
+    let num_slots_lit = proc_macro2::Literal::usize_unsuffixed(num_slots);
+    let tape_bytes_lit = proc_macro2::Literal::usize_unsuffixed(tape_bytes);
+
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::missing_safety_doc, clippy::too_many_arguments, dead_code)]
+        pub unsafe fn #fn_ident(
+            wm: &Weights,
+            fwd: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            tiles: &mut ::std::vec::Vec<
+                ::core::option::Option<::ferrite_forward::tile_table::TileEntry>,
+            >,
+        ) {
+            // Resize tile table to bucket's num_slots, padding with None.
+            if tiles.len() < #num_slots_lit {
+                tiles.resize_with(#num_slots_lit, || ::core::option::Option::None);
+            }
+            // 1. Per-slot tile pre-allocation.
+            #(#tile_alloc_stmts)*
+            // 2. Split-K workspaces.
+            #(#workspace_locals)*
+            // 3. Tape buffer (device-resident copy of the static).
+            let tape_dev = device.caching.alloc_tensor(
+                &[#tape_bytes_lit],
+                ::ferrite_cuda_core::DType::U8,
+            );
+            unsafe {
+                ::ferrite_cuda_core::driver::memcpy_htod_async(
+                    tape_dev.as_gpu_tensor().raw_ptr(),
+                    #static_program_ident.as_ptr() as *const u8,
+                    #tape_bytes_lit,
+                    device.compute_stream,
+                ).expect("prim_mega: tape memcpy failed");
+            }
+            // 4. Build host pt[] vec.
+            let mut pt_host: ::std::vec::Vec<*mut ::core::ffi::c_void> =
+                ::std::vec::Vec::with_capacity(#plan_len_lit);
+            #(#pt_host_pushes)*
+            // 5. pt[] → device.
+            let pt_bytes = #plan_len_lit
+                * ::core::mem::size_of::<*mut ::core::ffi::c_void>();
+            let pt_dev = device.caching.alloc_tensor(
+                &[pt_bytes],
+                ::ferrite_cuda_core::DType::U8,
+            );
+            unsafe {
+                ::ferrite_cuda_core::driver::memcpy_htod_async(
+                    pt_dev.as_gpu_tensor().raw_ptr(),
+                    pt_host.as_ptr() as *const u8,
+                    pt_bytes,
+                    device.compute_stream,
+                ).expect("prim_mega: pt[] memcpy failed");
+            }
+            // 6. Runtime-fill patches.
+            unsafe { #(#runtime_patches)* }
+            // 7. Launch. TODO(phase-5): derive grid_x/block_x/smem
+            //    from cudaOccupancyMaxActiveBlocksPerMultiprocessor
+            //    against the picked phase's smem requirement; the
+            //    placeholders below match the H100 SM count and a
+            //    256-thread block but aren't right for every model.
+            let block_x: ::core::primitive::i32 = 256;
+            let grid_x: ::core::primitive::i32 = 132;
+            let smem_size: ::core::primitive::usize = 49152;
+            let rc = unsafe {
+                ::ferrite_kernels::megakernel::prim_mega_llama_launch(
+                    tape_dev.as_gpu_tensor().raw_ptr() as *const ::core::primitive::i32,
+                    #n_rows_lit as ::core::primitive::i32,
+                    pt_dev.as_gpu_tensor().raw_ptr()
+                        as *const *mut ::core::ffi::c_void,
+                    grid_x,
+                    block_x,
+                    smem_size,
+                    device.compute_stream as ::core::primitive::u64,
+                )
+            };
+            if rc != 0 {
+                ::core::panic!("prim_mega_llama_launch returned {}", rc);
+            }
+        }
     }
 }
 
@@ -1801,5 +2171,300 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(outer.elems.len(), 4);
+    }
+
+    // ── Launcher emission (step 7b/7c) ──────────────────────────
+
+    /// `parse_kv_cache_synth` recovers the (layer, axis) pair from
+    /// the encoder's synthetic accessor names. Pin the two valid
+    /// shapes + an obvious non-match.
+    #[test]
+    fn parse_kv_cache_synth_recognizes_known_shapes() {
+        assert_eq!(parse_kv_cache_synth("kv_cache_0_k"), Some((0, 'k')));
+        assert_eq!(parse_kv_cache_synth("kv_cache_31_v"), Some((31, 'v')));
+        assert_eq!(parse_kv_cache_synth("input_layernorm"), None);
+        assert_eq!(parse_kv_cache_synth("kv_cache_3_z"), None);
+        assert_eq!(parse_kv_cache_synth("kv_cache_x_k"), None);
+    }
+
+    /// `resolve_dim` evaluates Dim trees against a numeric bound
+    /// map. Pin the four leaf cases + a Mul product so launcher
+    /// emission has a stable contract for shape resolution.
+    #[test]
+    fn resolve_dim_handles_lit_bound_mul() {
+        let mut bounds: BTreeMap<String, u64> = BTreeMap::new();
+        bounds.insert("hidden_size".into(), 2048);
+        bounds.insert("num_attention_heads".into(), 32);
+        assert_eq!(resolve_dim(&Dim::Lit(7), &bounds), Some(7));
+        assert_eq!(
+            resolve_dim(&Dim::Bound("hidden_size".into()), &bounds),
+            Some(2048)
+        );
+        assert_eq!(
+            resolve_dim(
+                &Dim::Mul(vec![Dim::Lit(4), Dim::Bound("num_attention_heads".into())]),
+                &bounds
+            ),
+            Some(128)
+        );
+        // Missing bound → None (launcher renders a runtime panic).
+        assert_eq!(resolve_dim(&Dim::Bound("missing".into()), &bounds), None);
+    }
+
+    /// One-bucket launcher with no SplitK / KvCache: the emitted
+    /// fn parses as a `pub unsafe fn` with the four-arg signature
+    /// pinned by `MEGA_HANDOFF.md`'s runtime-types decision. This
+    /// is the structural contract the codegen-side dispatch (phase
+    /// 5) depends on.
+    #[test]
+    fn launcher_emits_correct_fn_signature() {
+        let bucket = rms_norm_bucket();
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let slot_shapes: Vec<Shape> = Vec::new(); // no slots in this synthetic
+        let ts = emit_prim_mega_launcher(
+            &ident("prim_mega_backbone_m_1"),
+            &ident("MEGA_PROGRAM_M_1"),
+            &bucket,
+            &slot_shapes,
+            &bounds,
+            &ctx_llama_1b(),
+        );
+        let item: syn::ItemFn =
+            syn::parse2(ts).expect("emit_prim_mega_launcher produces a parseable fn");
+        assert_eq!(item.sig.ident, "prim_mega_backbone_m_1");
+        assert!(item.sig.unsafety.is_some(), "must be `unsafe fn`");
+        assert!(
+            matches!(item.vis, syn::Visibility::Public(_)),
+            "must be `pub`"
+        );
+        // Four args: wm, fwd, device, tiles. Names pinned so the
+        // dispatch site can substitute them positionally.
+        let inputs: Vec<_> = item.sig.inputs.iter().collect();
+        assert_eq!(inputs.len(), 4);
+        let pat_name = |arg: &syn::FnArg| -> String {
+            match arg {
+                syn::FnArg::Typed(pt) => match &*pt.pat {
+                    syn::Pat::Ident(pi) => pi.ident.to_string(),
+                    _ => panic!("unexpected pat shape"),
+                },
+                _ => panic!("self arg not allowed"),
+            }
+        };
+        assert_eq!(pat_name(inputs[0]), "wm");
+        assert_eq!(pat_name(inputs[1]), "fwd");
+        assert_eq!(pat_name(inputs[2]), "device");
+        assert_eq!(pat_name(inputs[3]), "tiles");
+    }
+
+    /// pt[] fills appear in `bucket.ptr_plan` order — every PtrSpec
+    /// produces exactly one `pt_host.push(...)` statement, in
+    /// insertion order. Pin both the count and the kind sequence
+    /// against an RmsNorm bucket so a re-ordering of the plan
+    /// doesn't silently shift the kernel's pt[] indices.
+    #[test]
+    fn launcher_emits_one_pt_push_per_ptr_plan_entry_in_order() {
+        let bucket = rms_norm_bucket();
+        // Sanity: the encoder built three pointers (out_tile,
+        // in_tile, weight) from the RmsNorm row.
+        assert_eq!(bucket.ptr_plan.len(), 3);
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let slot_shapes: Vec<Shape> = Vec::new();
+        let ts = emit_prim_mega_launcher(
+            &ident("prim_mega_backbone_m_1"),
+            &ident("MEGA_PROGRAM_M_1"),
+            &bucket,
+            &slot_shapes,
+            &bounds,
+            &ctx_llama_1b(),
+        );
+        let s = ts.to_string();
+        // Count pt_host.push calls — one per PtrSpec.
+        let push_count = s.matches("pt_host . push").count();
+        assert_eq!(
+            push_count,
+            bucket.ptr_plan.len(),
+            "expected one pt_host.push per ptr_plan entry"
+        );
+        // Tile slot 5 (out) before tile slot 3 (in) before weight
+        // accessor — matches `bucket.ptr_plan` order recorded in
+        // `rms_norm_writes_runtime_fill`.
+        let pos5 = s.find("tile_ref (tiles , 5)").expect("out tile push");
+        let pos3 = s.find("tile_ref (tiles , 3)").expect("in tile push");
+        let posw = s
+            .find("Weights :: input_layernorm")
+            .expect("weight accessor push");
+        assert!(
+            pos5 < pos3 && pos3 < posw,
+            "pt[] fills must appear in ptr_plan insertion order: \
+             out_tile (5) → in_tile (3) → weight accessor; got \
+             out={pos5} in={pos3} weight={posw}",
+        );
+    }
+
+    /// One memcpy_htod patch per `runtime_fills` entry, threaded in
+    /// `(row, slot)` order. The eps fill from RmsNorm lands at row
+    /// 0 / slot 4; the patch must compute `f32::to_bits(...).eps as
+    /// i32`. Pin the value-expression shape so a re-ordering of
+    /// `assign_ptr_indices` doesn't silently switch eps for some
+    /// other scalar.
+    #[test]
+    fn launcher_emits_runtime_patches_for_each_fill() {
+        let bucket = rms_norm_bucket();
+        assert_eq!(bucket.runtime_fills.len(), 1);
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let slot_shapes: Vec<Shape> = Vec::new();
+        let ts = emit_prim_mega_launcher(
+            &ident("prim_mega_backbone_m_1"),
+            &ident("MEGA_PROGRAM_M_1"),
+            &bucket,
+            &slot_shapes,
+            &bounds,
+            &ctx_llama_1b(),
+        );
+        let s = ts.to_string();
+        // Two memcpy_htod_async calls total: tape-template + pt[]
+        // copy + per-runtime-fill (1 here = 3 total). The runtime-fill
+        // patch is the only one that references `to_bits`.
+        let total_memcpys = s.matches("memcpy_htod_async").count();
+        assert_eq!(
+            total_memcpys,
+            2 + bucket.runtime_fills.len(),
+            "expected one memcpy per runtime_fill plus tape + pt[] copies"
+        );
+        assert!(
+            s.contains("f32 :: to_bits"),
+            "eps fill must compute via f32::to_bits"
+        );
+        assert!(
+            s.contains("Weights :: input_layernorm"),
+            "eps source must reference the input_layernorm accessor"
+        );
+    }
+
+    /// SplitK workspace: emits one `let __ws_<key>` binding per
+    /// SplitKScratch ptr_plan entry, sized as `[split_k * m * n]
+    /// f32`. Pin that the launcher resolves N at runtime via
+    /// `weight.shape()[0]` (matches `RuntimeSource::WeightShapeDim
+    /// { dim_idx: 0 }`'s contract for the row's own N slot).
+    #[test]
+    fn launcher_emits_workspace_locals_with_runtime_n() {
+        let arch = arch_with_seven_shapes();
+        let inst = op(
+            "CutlassGemmSplitK",
+            vec![
+                quote! { 0u32 },
+                quote! { 1u32 },
+                quote! { 3u32 },
+                quote! { Weights::down_proj },
+                quote! { 128u32 },
+                quote! { 128u32 },
+                quote! { 3u32 },
+                quote! { 4u32 },
+            ],
+        );
+        let bucket = try_encode_bucket(&arch, &[inst], &ctx_llama_1b())
+            .expect("CutlassGemmSplitK is mega-eligible");
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let slot_shapes: Vec<Shape> = Vec::new();
+        let ts = emit_prim_mega_launcher(
+            &ident("prim_mega_backbone_m_1"),
+            &ident("MEGA_PROGRAM_M_1"),
+            &bucket,
+            &slot_shapes,
+            &bounds,
+            &ctx_llama_1b(),
+        );
+        let s = ts.to_string();
+        let ws_count = s.matches("let __ws_").count();
+        assert_eq!(
+            ws_count, 1,
+            "one workspace per SplitKScratch ptr_plan entry"
+        );
+        assert!(
+            s.contains("Weights :: down_proj"),
+            "workspace must read from the row's accessor"
+        );
+        assert!(
+            s.contains(". weight . shape () [0]"),
+            "workspace N must come from weight.shape()[0]"
+        );
+        assert!(
+            s.contains("DType :: F32"),
+            "workspace dtype must be F32 (split-K reduction scratch)"
+        );
+    }
+
+    /// KvCache synthesized accessors route through
+    /// `fwd.kv_cache.{k_cache,v_cache}` instead of the regular
+    /// `Weights::<fn>` path. Pin both axes — the encoder
+    /// distinguishes them by suffix (`_k` / `_v`) and the launcher
+    /// must dispatch accordingly.
+    #[test]
+    fn launcher_routes_kv_cache_synth_through_fwd_kv_cache() {
+        let arch = arch_with_seven_shapes();
+        let inst = op(
+            "FusedQkvRopeCache",
+            vec![
+                quote! { 0u32 },
+                quote! { 1u32 },
+                quote! { 0u32 },
+                quote! { Weights::qkv_proj },
+                quote! { Weights::rotary },
+                quote! { false },
+                quote! { false },
+            ],
+        );
+        let bucket = try_encode_bucket(&arch, &[inst], &ctx_llama_1b())
+            .expect("FusedQkvRopeCache has a mega arm");
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let slot_shapes: Vec<Shape> = Vec::new();
+        let ts = emit_prim_mega_launcher(
+            &ident("prim_mega_backbone_m_1"),
+            &ident("MEGA_PROGRAM_M_1"),
+            &bucket,
+            &slot_shapes,
+            &bounds,
+            &ctx_llama_1b(),
+        );
+        let s = ts.to_string();
+        assert!(
+            s.contains("fwd . kv_cache . k_cache"),
+            "kv_cache_<L>_k accessor must route to fwd.kv_cache.k_cache(L)"
+        );
+        assert!(
+            s.contains("fwd . kv_cache . v_cache"),
+            "kv_cache_<L>_v accessor must route to fwd.kv_cache.v_cache(L)"
+        );
+    }
+
+    /// Tile pre-allocation: every non-empty `slot_shapes[i]` lowers
+    /// to one `caching.alloc_tensor(&[..], BF16)` call gated by
+    /// `if tiles[i].is_none()`. Empty shapes (sink/un-touched
+    /// slots) skip — the launcher never writes to them.
+    #[test]
+    fn launcher_pre_allocates_per_non_empty_slot() {
+        let bucket = rms_norm_bucket();
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        // Two slots: one non-empty (concrete shape), one empty.
+        let slot_shapes: Vec<Shape> = vec![vec![Dim::Lit(2048)], Shape::new()];
+        let ts = emit_prim_mega_launcher(
+            &ident("prim_mega_backbone_m_1"),
+            &ident("MEGA_PROGRAM_M_1"),
+            &bucket,
+            &slot_shapes,
+            &bounds,
+            &ctx_llama_1b(),
+        );
+        let s = ts.to_string();
+        let alloc_count = s.matches("alloc_tensor (& [2048]").count();
+        assert_eq!(
+            alloc_count, 1,
+            "exactly one tile pre-alloc for the non-empty slot"
+        );
+        // Empty shape must not generate an alloc.
+        assert!(
+            !s.contains("alloc_tensor (& [] ,"),
+            "empty-shape slot must not emit an alloc"
+        );
     }
 }

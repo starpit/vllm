@@ -34,6 +34,40 @@
 
 #include "../megakernel_ops.cuh"
 
+// CUTLASS DC infrastructure + the typedefs from
+// cutlass_standalone_gemm.cu. We re-include the latter via the
+// `using Gemm_*` aliases below — they're declared at namespace
+// scope in that .cu, so the megakernel needs its own copies (or
+// to share via a header). Phase-1 commits inline the typedefs we
+// use here; later refactor moves the shared aliases to
+// `cutlass_gemm_configs.cuh` (TODO) once the DC list stabilises.
+#include "../dc_cutlass.cuh"
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+
+namespace prim_mega_cutlass_configs {
+
+// Mirrors `Gemm_64x128x32_s4` in cutlass_standalone_gemm.cu line 49.
+// Phase-1 smoke-test config; the wholesale fan-out replicates
+// every Gemm_* alias once dc_cutlass.cuh is exercised here.
+using Gemm_64x128x32_s4 = cutlass::gemm::device::Gemm<
+    cutlass::bfloat16_t, cutlass::layout::RowMajor,
+    cutlass::bfloat16_t, cutlass::layout::ColumnMajor,
+    cutlass::bfloat16_t, cutlass::layout::RowMajor,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 128, 32>,
+    cutlass::gemm::GemmShape<32, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<
+        cutlass::bfloat16_t, 8, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    4>;
+
+}  // namespace prim_mega_cutlass_configs
+
 namespace cg = cooperative_groups;
 
 namespace prim_mega {
@@ -53,10 +87,25 @@ enum Opcode : int {
     OP_QKV_ROPE_CACHE = 3,
     OP_SILU_AND_MUL = 4,
     OP_GEMV = 5,
-    // Reserved for follow-up commits — empty arms below trap.
-    // OP_CUTLASS_GEMM_BASE = 0x1000,  // + tile-config index
+    // Generic CUTLASS GEMM dispatch. row[1] is the config id (one
+    // of `CutlassConfig` below); the inner switch in
+    // `run_cutlass_gemm` resolves to the right
+    // `prim_mega_cutlass_configs::Gemm_*` template instantiation.
+    // Phase-1 smoke-test carries one config (s4_64x128); wholesale
+    // fan-out is a follow-up commit driven from
+    // cutlass_standalone_gemm.cu's instantiation list.
+    OP_CUTLASS_GEMM = 6,
+    // Reserved for follow-up commits.
     // OP_FI_ATTN_DECODE   = 0x2000,
     // OP_FI_ATTN_PREFILL  = 0x2001,
+};
+
+// Per-config id space — one entry per CUTLASS template
+// instantiation. The encoder side (interpreters/prim_mega.rs)
+// emits the matching config id in the row's slot[1].
+enum CutlassConfig : int {
+    CC_GEMM_64x128_s4 = 0,
+    // CC_GEMM_64x64_s4 = 1, ... follow-up commits.
 };
 
 // Per-arm argument layouts. Each arm owns its slot interpretation;
@@ -152,6 +201,39 @@ __device__ __forceinline__ void run_silu_and_mul(const int* row, void* const* pt
     dc_silu_and_mul<T>(out, input, d, num_rows);
 }
 
+// ── CUTLASS_GEMM ────────────────────────────────────────────────
+// row[1]: ptr_idx C
+// row[2]: ptr_idx A
+// row[3]: ptr_idx B
+// row[4]: M
+// row[5]: N
+// row[6]: K
+// row[7]: alpha as float-bit pattern
+// row[8]: beta  as float-bit pattern
+// row[9]: smem byte offset within kernel-wide smem
+// row[10]: CutlassConfig id (selects template instantiation)
+__device__ __forceinline__ void run_cutlass_gemm(const int* row, void* const* pt) {
+    extern __shared__ char smem[];
+    void* C       = pt[row[1]];
+    const void* A = pt[row[2]];
+    const void* B = pt[row[3]];
+    int M         = row[4];
+    int N         = row[5];
+    int K         = row[6];
+    float alpha   = __int_as_float(row[7]);
+    float beta    = __int_as_float(row[8]);
+    char* op_smem = smem + row[9];
+    int config_id = row[10];
+
+    switch (config_id) {
+        case CC_GEMM_64x128_s4:
+            dc_cutlass::dc_gemm<prim_mega_cutlass_configs::Gemm_64x128x32_s4>(
+                C, A, B, M, N, K, alpha, beta, op_smem);
+            break;
+        // Follow-up: wholesale config list lands here.
+    }
+}
+
 // ── GEMV (M=1) ──────────────────────────────────────────────────
 // row[1]: ptr_idx out
 // row[2]: ptr_idx x (input vector)
@@ -206,8 +288,10 @@ __global__ void prim_mega_llama_kernel(const int* __restrict__ tape,
             case OP_GEMV:
                 run_gemv<__nv_bfloat16>(row, pt);
                 break;
-            // CUTLASS GEMM tile variants + FlashInfer attention land
-            // in follow-up commits. No `default:` arm — an unknown
+            case OP_CUTLASS_GEMM:
+                run_cutlass_gemm(row, pt);
+                break;
+            // FlashInfer attention arms land in follow-up commits. No `default:` arm — an unknown
             // opcode here means the encoder emitted a row it shouldn't
             // have, and we want the kernel to silently skip rather
             // than corrupt memory. Once every variant has an arm we

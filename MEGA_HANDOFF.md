@@ -10,8 +10,10 @@
 ## Where we are
 
 Phase 1 work order steps 1–5 done + DC siblings partially landed
-+ step 8's trace half. Seven commits on `feat/rust` past the
-host-pivot baseline:
++ step 8 trace half + cost model now picks DC on Hopper / host
+on Ada (principled, not push-order). Tip
+`3f700439f`. Nine commits on `feat/rust` past the host-pivot
+baseline:
 
 - `f7249aaae` — vendor `Megakernels` (throughput@`91eaff262`) +
   `ThunderKittens` (`0b55588d2`) under `vllm-rs/third_party/`.
@@ -59,6 +61,36 @@ host-pivot baseline:
   another `__global__`. `build_megakernels` now pulls the
   FlashInfer headers via the same `with_git_dependency` pin
   (`08ab45d67`) the standalone shim build uses.
+- `cf918daec` + `9b4168ed4` — DC siblings landed via thin-
+  delegation pattern: `DcRmsNormImpl`, `DcFusedAddRmsNormImpl`,
+  `DcFusedQkvRopeCacheImpl`, `DcCutlassGemmImpl × 11 tiles` (the
+  `CUTLASS_TILE_ZOO ∩ CUTLASS_DC_GEMM_LIST` intersection — see
+  `dc_cutlass_zoo_is_subset_of_host_zoo` test for the invariant).
+  Each delegates `matches` / `cost_us` / `fan_out` /
+  `opcode_shape` / etc. to a fresh host-counterpart instance and
+  overrides only the four mega-relevant methods.
+- `1f4bf3192` — step 8 trace half: per-workload `pick_interpreter`
+  decision printed alongside the solve summary (commandr today
+  reports `Host` across every M because DC sibling coverage is
+  too thin for the all-or-nothing tier semantics to flip a whole
+  canonical).
+- `3f700439f` — solver now picks DC siblings on Hopper, host on
+  Ada, **for principled reasons** (not library push-order).
+  Reverse-engineered from `worktree-ferrite-mega/f5918269f`:
+  - `prim_mega_compatible()` tightened from `>= 80` to `>= 90`.
+    Ada's `cg::this_grid().sync()` is ~100us (gmem-atomic spin),
+    Hopper's is ~15us (L2 synchronizer + TMA fences). Ada loses
+    by construction.
+  - `launch_overhead_us(DeviceCallable, _) = 0us` (was
+    `InKernelGridSync`). Wave-level mega-launch cost amortizes
+    over N picks → ~0.5us per pick at N=10, round to zero. The
+    older branch never charged grid-sync per-pick anywhere.
+  - Solver effect: host pays +5us/pick, DC pays +0us/pick. DC
+    wins where feasible; feasibility gates on `>= 90`.
+  - Locked by `cost::tests::solver_picks_dc_siblings_on_h100`
+    (asserts ≥1 DC sibling picked on H100 LLAMA_BODY at M=1) +
+    `predicted_us_includes_launch_overhead` (asserts zero DC
+    picks on L4).
 
 The host interpreter at the parent commit (`8a45b39d6` or later,
 after the seam swap + slot-metadata fix) is the platform.
@@ -283,19 +315,15 @@ reflects the actual landed sequence + remaining gaps.
    `prim_mega_llama_launch` extern call (already declared in
    `ferrite-kernels/src/megakernel.rs`).
 🟡 8. **Wire `pick_interpreter` into codegen post-solve dispatch.**
-   Trace half landed: `lib.rs` now emits a per-workload
-   `interp: M=…→Host|PrimMega|KvmMega` line alongside the existing
-   solve summary, after gathering the SFUF's picked impls and
-   running them through `pick_interpreter`. Confirms DC siblings
-   (`cf918daec` / `9b4168ed4`) flow through correctly:
-   commandr today reports `Host` across every M bucket because
-   the solver's cost-only tiebreak (`solver.rs:434–439` —
-   claim-size DESC, then cost ASC) doesn't bias toward DC at
-   equal cost. Adding a `MegakernelFit`-aware tiebreak after
-   the cost compare would flip at least one bucket to PrimMega
-   without changing what gets picked when costs differ; that
-   tiebreak is a single-commit follow-up, not blocked on the
-   encoder.
+   Trace half landed (`1f4bf3192`): `lib.rs` emits per-workload
+   `interp: M=…→Host|PrimMega|KvmMega` alongside the solve
+   summary. With the cost model now correctly biased
+   (`3f700439f` — DC siblings strictly cheaper than host on
+   sm_90+, gated out on Ada), the trace lights up DC seeds
+   internally even though the canonical-level interpreter
+   selection still reports `Host` everywhere because of sparse
+   DC sibling coverage (every backbone has at least one non-DC
+   pick → all-or-nothing `pick_interpreter` falls through).
    Remaining: emit the actual runtime path (the `if PrimMega
    then …` branch) once the encoder + launcher (steps 6 + 7)
    land and there's a real mega program to call.
@@ -341,6 +369,66 @@ reflects the actual landed sequence + remaining gaps.
    Llama still report `Host` even on H100), so step 9 is gated on
    widening DC siblings to cover every op in at least one arch's
    forward.
+
+## Next session — what to pick up
+
+The cost model is principled now (`3f700439f`), so any of the
+remaining Phase-1 steps unblocks something concrete. In rough
+order of leverage / effort:
+
+1. **Re-evaluate whether PrimMega is worth shipping at all.**
+   The current architecture (whole-forward persistent kernel via
+   opcode-table dispatch in `prim_mega.cu`) is mine, not
+   precedent — the older `worktree-ferrite-mega` branch's
+   `cuda_codegen.rs::generate_megakernel` emitted **one
+   cooperative kernel per layer**, with kernel boundaries
+   between layers. Per-layer vs whole-forward is a wash in the
+   all-DC regime (this branch's tier semantics) but per-layer
+   stays sane under partial coverage and avoids occupancy
+   ceilings. Three options on the table:
+   - Keep PrimMega, redo it per-layer (the working precedent).
+   - Drop PrimMega entirely; KvmMega is the perf path on
+     Hopper anyway (vendored TK templates + mbarrier). The cost
+     model already correctly excludes PrimMega on Ada via the
+     sm_90 gate, so PrimMega's only constituency is "Hopper
+     without TK template authoring" — debatable.
+   - Keep PrimMega as a forced-debug verification path
+     (`FERRITE_FORCE_PRIM_MEGA=1`) for byte-equality testing
+     against host before KvmMega lands.
+   Decision unblocks step 6 (encoder shape depends on whether
+   we're emitting a tape vs inlining per layer).
+
+2. **DC sibling coverage widening.** Today's coverage flips
+   ~10% of seeds on H100; the all-or-nothing tier semantics
+   needs ~100% to actually pick PrimMega for a canonical. The
+   biggest gaps:
+   - `DcCutlassGemvImpl` (M=1 GEMV — its own kernel shape via
+     `gemm::kernel::Gemv`)
+   - `DcFusedQkvRopePrefillImpl`
+   - DC siblings for `FusedGateUpSiluMul` (the load-bearing MLP
+     fusion — covers every layer)
+   - FlashInfer attention DC arm in `prim_mega.cu` + Params
+     marshaling (decode + prefill).
+   Each is mechanical (delegate to host counterpart, override 4
+   methods, add the .cu arm), but FI Params marshaling is a real
+   piece of work. Until coverage hits 100%, the trace stays
+   `Host`-everywhere even on H100.
+
+3. **Wave-level launch counter for cost.rs.** Match the older
+   branch's `cost.rs:90–112`: walk schedule, count `1 launch`
+   per mega wave + `1 launch` per non-mega host pick, multiply
+   by `launch_overhead_us(HostCallback, profile)` once.
+   Improves `predicted_us` accuracy without changing picks
+   (DC's per-pick zero stays zero). Small commit.
+
+4. **Encoder match in `prim_mega.rs` (step 6).** Blocked on
+   decision (1) — encoder shape depends on architecture choice.
+   Most of the test surface for the encoder match is in place
+   (the `Instruction<W>` IR is stable, slot conventions are
+   pinned by `prim_mega.cu`'s per-op docstrings).
+
+Don't let any of these become a yak-shave. (1) is the most
+load-bearing question; resolving it points the rest.
 
 ## Phase 2 — work order (later)
 

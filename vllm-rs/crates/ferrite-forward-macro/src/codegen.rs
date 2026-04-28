@@ -3438,12 +3438,15 @@ pub fn emit_model(
     // FORWARD_TABLE loop below uses it to populate KVM_WRAPPERS.
     let kvm_enabled =
         std::env::var("FERRITE_KVM").ok().as_deref() == Some("1");
+    let kvm_diag =
+        std::env::var("FERRITE_KVM_DIAG").ok().as_deref() == Some("1");
     let mut kvm_wrapper_idents: BTreeMap<
         crate::solver::WorkloadPoint,
         proc_macro2::Ident,
     > = BTreeMap::new();
     let mut kvm_artifacts: Vec<TokenStream> = Vec::new();
     let mut kvm_extern_decl_emitted: HashSet<String> = HashSet::new();
+    let kvm_shapes = arch_opcodes.shapes_by_name();
     if kvm_enabled {
         for (i, wp) in bucket_points.iter().enumerate() {
             if bucket_canonical[i] != *wp {
@@ -3461,13 +3464,30 @@ pub fn emit_model(
             let any_kvm = sfuf.impls.values().any(|imp_id| {
                 lib.get(*imp_id).megakernel_fit() == MegakernelFit::Kvm
             });
+            if kvm_diag {
+                let mix: Vec<String> = sfuf.impls.values()
+                    .map(|imp_id| lib.get(*imp_id).name().to_string())
+                    .collect();
+                eprintln!(
+                    "[FERRITE_KVM_DIAG] {} m={} sk={} any_kvm={} impls={:?}",
+                    model.source_stem, wp.num_tokens, wp.sk_bucket, any_kvm, mix
+                );
+            }
             if !any_kvm {
                 continue;
             }
             let bounds = bounds_for_wp(model, *wp, tp_world_size);
             let dims = match crate::interpreter::kvm::dims_from_bounds(&bounds) {
                 Some(d) => d,
-                None => continue,
+                None => {
+                    if kvm_diag {
+                        eprintln!(
+                            "[FERRITE_KVM_DIAG] {} m={} REJECTED dims_from_bounds",
+                            model.source_stem, wp.num_tokens
+                        );
+                    }
+                    continue;
+                }
             };
             let batch_size = wp.num_tokens as u32;
             let (lowered, _, backbone_slot, terminal_slot) = &canonical_lowered[wp];
@@ -3479,7 +3499,18 @@ pub fn emit_model(
                 batch_size,
             ) {
                 Some(t) => t,
-                None => continue,
+                None => {
+                    if kvm_diag {
+                        let names: Vec<String> = lowered.backbone.instances.iter()
+                            .map(|inst| inst.name.to_string())
+                            .collect();
+                        eprintln!(
+                            "[FERRITE_KVM_DIAG] {} m={} REJECTED backbone-encode names={:?}",
+                            model.source_stem, wp.num_tokens, names
+                        );
+                    }
+                    continue;
+                }
             };
             let lm_tape = match crate::interpreter::kvm::encode_bucket(
                 &lowered.lm_head,
@@ -3487,15 +3518,36 @@ pub fn emit_model(
                 batch_size,
             ) {
                 Some(t) => t,
-                None => continue,
+                None => {
+                    if kvm_diag {
+                        let names: Vec<String> = lowered.lm_head.instances.iter()
+                            .map(|inst| inst.name.to_string())
+                            .collect();
+                        eprintln!(
+                            "[FERRITE_KVM_DIAG] {} m={} REJECTED lm_head-encode names={:?}",
+                            model.source_stem, wp.num_tokens, names
+                        );
+                    }
+                    continue;
+                }
             };
             tape.extend(lm_tape);
+            if kvm_diag {
+                eprintln!(
+                    "[FERRITE_KVM_DIAG] {} m={} ACCEPTED tape_rows={}",
+                    model.source_stem, wp.num_tokens, tape.len()
+                );
+            }
 
             // Per-canonical names. Canonical_name doubles as the C
             // symbol suffix and the .cu filename stem.
             let canonical_name = format!(
                 "{}_m_{}_sk_{}",
-                model.source_stem.replace('-', "_"),
+                model
+                    .source_stem
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>(),
                 wp.num_tokens,
                 wp.sk_bucket
             );
@@ -3534,6 +3586,7 @@ pub fn emit_model(
                 *terminal_slot,
                 &lowered.backbone.instances,
                 &lowered.lm_head.instances,
+                &kvm_shapes,
             ) {
                 kvm_artifacts.push(wrapper);
                 kvm_wrapper_idents.insert(*wp, wrapper_ident);

@@ -35,7 +35,7 @@ use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::Ident;
 
-use crate::impl_lib::OpInstance;
+use crate::impl_lib::{OpInstance, OpcodeShape};
 use crate::interpreter_codegen::LoweredBucket;
 
 pub const INSTRUCTION_WIDTH: usize = 32;
@@ -165,7 +165,16 @@ fn encode_op(
     .max(1) as i32;
 
     match inst.name.to_string().as_str() {
-        "RmsNorm" => {
+        // FusedAddRmsNorm encodes the same rows as a plain RmsNorm
+        // — the "add" half is structural in the megakernel: the
+        // previous op (o_proj or downproj) is a `CutlassGemmAdd`
+        // which fuses the residual add into its accumulator, so by
+        // the time the norm runs the residual stream is already
+        // resident in hidden_states. The fused-add-rms-norm host
+        // Impl claims [add, norm] tiles together; in the TK
+        // universe the same two-tile claim stands but the add tile
+        // produces no kernel work.
+        "RmsNorm" | "FusedAddRmsNorm" => {
             // Per-batch-position fanout. Vendor's
             // `batched_rms_norm` dispatches one warp per row.
             // Role (attn / mlp / lm_head) is positional in the
@@ -657,30 +666,44 @@ pub fn emit_wrapper_fn(
     terminal_slot: u32,
     backbone_instances: &[OpInstance],
     lm_head_instances: &[OpInstance],
+    shapes: &BTreeMap<String, OpcodeShape>,
 ) -> Option<TokenStream> {
     let extern_ident = Ident::new(
         &format!("tk_megakernel_{canonical_name}_launch"),
         Span::call_site(),
     );
 
-    // Walk the lowered IR for accessor `weight_fn` paths.
-    // Field-index conventions follow the host Impl `OpcodeShape`
-    // declarations: weight_fn is at index 3 of every Tk
-    // variant's fields. The wrapper extracts the role-specific
-    // accessor from the per-role OpInstance.
-    let attn_norm = nth_weight(backbone_instances, "RmsNorm", 0)?;
-    let mlp_norm = nth_weight(backbone_instances, "RmsNorm", 1)?;
-    let qkv = first_weight(
+    // Walk the lowered IR for accessor paths. Field index for
+    // weight_fn / cos_sin_fn varies by variant — look it up in
+    // the OpcodeShape registry by field NAME, not by position.
+    // FusedQkvRopePrefill, for instance, has 5 u32s before
+    // weight_fn (in_slot, out_slot, layer, num_q_heads,
+    // num_kv_heads), so weight_fn lives at index 5, not 3.
+    let attn_norm = nth_field(backbone_instances, shapes, "RmsNorm", "weight_fn", 0)?;
+    let mlp_norm = nth_field(backbone_instances, shapes, "RmsNorm", "weight_fn", 1)?;
+    let qkv = first_field(
         backbone_instances,
+        shapes,
         &["FusedQkvRopeCache", "FusedQkvRopePrefill"],
+        "weight_fn",
     )?;
-    let cos_sin = first_cos_sin(backbone_instances)?;
-    let o = nth_weight(backbone_instances, "CutlassGemmAdd", 0)?;
-    let down = nth_weight(backbone_instances, "CutlassGemmAdd", 1)?;
-    let gate_up = first_weight(backbone_instances, &["FusedGateUpSiluMul"])?;
-    let lm_head = first_weight(lm_head_instances, &["CutlassGemm", "Gemm", "CutlassGemv"])?;
-    let lm_head_norm = first_weight(lm_head_instances, &["RmsNorm"])
-        .or_else(|| nth_weight(backbone_instances, "RmsNorm", 2))?;
+    let cos_sin = first_field(
+        backbone_instances,
+        shapes,
+        &["FusedQkvRopeCache", "FusedQkvRopePrefill"],
+        "cos_sin_fn",
+    )?;
+    let o = nth_field(backbone_instances, shapes, "CutlassGemmAdd", "weight_fn", 0)?;
+    let down = nth_field(backbone_instances, shapes, "CutlassGemmAdd", "weight_fn", 1)?;
+    let gate_up = first_field(backbone_instances, shapes, &["FusedGateUpSiluMul"], "weight_fn")?;
+    let lm_head = first_field(
+        lm_head_instances,
+        shapes,
+        &["CutlassGemm", "Gemm", "CutlassGemv"],
+        "weight_fn",
+    )?;
+    let lm_head_norm = first_field(lm_head_instances, shapes, &["RmsNorm"], "weight_fn")
+        .or_else(|| nth_field(backbone_instances, shapes, "RmsNorm", "weight_fn", 2))?;
 
     let num_layers_lit = proc_macro2::Literal::i32_unsuffixed(dims.num_layers as i32);
     let hidden_dim_lit = proc_macro2::Literal::i32_unsuffixed(dims.hidden_dim as i32);
@@ -785,35 +808,45 @@ pub fn emit_wrapper_fn(
     })
 }
 
-fn first_weight(instances: &[OpInstance], names: &[&str]) -> Option<TokenStream> {
+fn field_index_of(shapes: &BTreeMap<String, OpcodeShape>, variant: &str, field: &str) -> Option<usize> {
+    let shape = shapes.get(variant)?;
+    shape
+        .fields
+        .iter()
+        .position(|(name, _ty)| name.to_string() == field)
+}
+
+fn first_field(
+    instances: &[OpInstance],
+    shapes: &BTreeMap<String, OpcodeShape>,
+    names: &[&str],
+    field_name: &str,
+) -> Option<TokenStream> {
     for inst in instances {
         let n = inst.name.to_string();
-        if names.iter().any(|x| *x == n) {
-            return inst.field_values.get(3).cloned();
+        if names.iter().any(|x| *x == n.as_str()) {
+            let idx = field_index_of(shapes, &n, field_name)?;
+            return inst.field_values.get(idx).cloned();
         }
     }
     None
 }
 
-fn nth_weight(instances: &[OpInstance], name: &str, n: usize) -> Option<TokenStream> {
+fn nth_field(
+    instances: &[OpInstance],
+    shapes: &BTreeMap<String, OpcodeShape>,
+    name: &str,
+    field_name: &str,
+    n: usize,
+) -> Option<TokenStream> {
+    let idx = field_index_of(shapes, name, field_name)?;
     let mut k = 0;
     for inst in instances {
         if inst.name == name {
             if k == n {
-                return inst.field_values.get(3).cloned();
+                return inst.field_values.get(idx).cloned();
             }
             k += 1;
-        }
-    }
-    None
-}
-
-fn first_cos_sin(instances: &[OpInstance]) -> Option<TokenStream> {
-    for inst in instances {
-        let n = inst.name.to_string();
-        if n == "FusedQkvRopeCache" || n == "FusedQkvRopePrefill" {
-            // cos_sin_fn is field 4 on FusedQkvRope* OpcodeShapes.
-            return inst.field_values.get(4).cloned();
         }
     }
     None

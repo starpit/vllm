@@ -60,15 +60,50 @@ wrapper.
   `KVM_WRAPPERS[idx]` first; falls through to `ferrite_forward::
   run` when it's `None`.
 
-## What's blocking
+## What's blocking — architectural pivot to low-latency-llama
 
-**Smoke test not run yet.** The .cu file is written, the
-wrapper fn is emitted, KVM_WRAPPERS is populated for m=8 —
-but ferrite-cuda-builder/build.rs needs to pick up the new
-.cu file from `~/.cache/cudaforge/megakernels/` and feed it
-to NVCC. The runtime kvm wrapper expects an
-`extern "C" fn tk_megakernel_<canonical>_launch` symbol; that
-only exists once NVCC compiles the .cu.
+The currently-emitted .cu compiles all the way through
+ThunderKittens + vendor's megakernel runtime + vendor's per-op
+.cu files BUT fails the final aggregate-init of `globals_t`:
+
+```
+no instance of constructor "kittens::pgl<...>" matches the
+argument list (T*, std::nullptr_t, ..., size_t, ...)
+```
+
+Root cause: `cross-gpu-llama/llama.cuh` hardcodes
+`num_devices = 8`, and every weight + activation in its
+`globals_t` is a `kittens::pgl<gl<...>, 8, false>` (parallel
+global layout) — an 8-GPU multicast type that requires an
+**array of 8 device pointers** in its constructor. We pass one.
+Even with 8 duplicate pointers it would still call
+`cuMulticastBindMem` against memory the multicast subsystem
+doesn't own. cross-gpu-llama is intrinsically 8-GPU + Llama-70B.
+
+**Pivot:** target `low-latency-llama` instead — vendored at
+4ea25be0d under `vllm-rs/third_party/megakernels/low-latency-llama/`.
+
+  * Single GPU (no `pgl`, no multicast — every globals_t member
+    is a plain `kittens::gl<...>`).
+  * Hardcoded for **Llama-3.2-1B** exactly (16 layers, 2048
+    hidden, 8192 intermediate, 64 head_dim, 32 attn heads, 8 kv
+    heads — matches the 1B HF config 1:1).
+  * Decode-only — m=1 prediction. Vendor's "low-latency" name
+    means "minimum-overhead next-token decode."
+
+Different opcode set, much more aggressively fused:
+
+  1. `RMS_QKV_MatVecRopeAppend` — claims [norm, q, k, v, rope, cache-write]
+  2. `PartialAttention`
+  3. `AttentionReduction`
+  4. `O_ProjResidual` — claims [o_proj, residual-add]
+  5. `RMS_DoubleMatVecSiLU` — claims [mlp_norm, gate, up, silu_mul]
+  6. `DownProjResidual` — claims [down_proj, residual-add]
+  7. `RMS_LM_Head` — claims [lm_head_norm, lm_head]
+
+The TK Impls registered at 369a6b618 mirror cross-gpu-llama
+opcode boundaries (per-op TK), which is too granular for
+low-latency-llama. Need a re-cut Impl set.
 
 Three remaining items to validate:
 
@@ -106,29 +141,44 @@ encodable (as OP_LM_HEAD). Until a TK decode-matmul_add
 exists OR encode_op gains a body-CutlassGemv arm, m=1 falls
 through to the host interpreter.
 
-### Next concrete step (2d-pre)
+### Next concrete step — re-cut TK Impls for low-latency-llama
 
-ferrite-cuda-builder/build.rs has explicit static kernel
-lists (`vllm_sources`, `marlin_sources`, …) — verified by
-`grep -n "specialized\|read_dir\|cudaforge/megakernels"
-build.rs`. It does not scan `~/.cache/cudaforge/megakernels/`.
-So the per-canonical .cu files the macro writes go nowhere.
+build.rs already scans `~/.cache/cudaforge/megakernels/` (see
+`build_megakernels` in ferrite-cuda-builder/build.rs); since
+4ea25be0d it links the .a conditionally. Compile pipeline is
+fine.
 
-The fix is one of:
+The pivot work, in order:
 
-(a) Add a `read_dir` pass in build.rs that picks up every
-    `.cu` in `~/.cache/cudaforge/megakernels/` and feeds the
-    list into a new cudaforge `.kernels()` group with the
-    vendor include paths configured.
-(b) Have the macro write into one of the existing scanned
-    dirs (e.g. emit into `csrc/megakernels/` and add that
-    dir to vllm_sources). Less hermetic — checks the
-    generated output into csrc/, which feels off — but
-    avoids extending build.rs.
+1. **Replace cross-gpu-llama TK Impls** in
+   `impl_lib.rs:starter_library()`. The seven low-latency-llama
+   opcodes need seven matching multi-tile Impls. The current
+   tk_* set is single-tile and wrong.
 
-(a) is the right answer; (b) is the shortcut.
+2. **Rewrite `interpreter::kvm::encode_op`** to use vendor's
+   #defined opcode numbers (1..7) and the new variant names.
 
-### Then (2d)
+3. **Rewrite `emit_cu_source`** to:
+   * `#include` vendor's `low-latency-llama/llama.cuh` instead
+     of `cross-gpu-llama/llama.cuh`.
+   * Add `third_party/megakernels/low-latency-llama` to the
+     `build_megakernels` include path.
+   * Emit a `globals_t` aggregate-init using the simpler
+     vendor shape (no pgl, no num_devices). All members are
+     `kittens::gl<...>` constructed from `(T*, b, d, r, c)`.
+   * Don't pre-#define the LLAMA_1B_* dims — vendor's
+     llama.cuh hardcodes them and they match Llama-3.2-1B.
+
+4. **Update `emit_wrapper_fn`** + runtime `launch()` to match
+   the simpler arg pack. Drop pgl/multicast scaffolding.
+   Drop the `cudaLaunchCooperativeKernel` if vendor's
+   single-device launcher uses a normal launch — check
+   `low-latency-llama/llama.cu`.
+
+5. **Switch the smoke-test model** to `llama-3.2-1b` (vendor
+   matches its dims 1:1).
+
+### Then (2d-smoke)
 
 Run the smoke test:
 
@@ -171,7 +221,8 @@ KV pool is the next blocker after 2c.
 
 ## Commits on this worktree
 
-* `369a6b618` — step 1: Tk-tier solver Impls.
+* `369a6b618` — step 1: Tk-tier solver Impls (cross-gpu-llama
+  opcodes — needs re-cut for low-latency-llama).
 * `a94d1cb17` — step 2 (scaffold): kvm interpreter modules.
 * `b9ae21c04` — step 2: emit_model hookup behind FERRITE_KVM=1.
 * `b334d1749` — handoff doc (initial, pre-launch-overhead).
@@ -180,6 +231,13 @@ KV pool is the next blocker after 2c.
 * `b361bc9fe` — step 2c: shape-aware field extraction +
   FusedAddRmsNorm encoding + diag.
 * `298837b12` — handoff refresh (m=8 .cu file written).
+* `2cc5bf18d` — handoff refresh (build.rs scan identified).
+* `4ea25be0d` — vendor cross-gpu-llama + ThunderKittens +
+  Hopper NVCC flags. Compile pipeline working through TK +
+  vendor runtime; fails at globals_t aggregate-init due to
+  pgl/multicast.
+* `e035c5999` — vendor low-latency-llama as the right MVP
+  target (single-GPU, Llama-3.2-1B-fit, simpler globals_t).
 
 ## Hard rules (LOAD-BEARING)
 

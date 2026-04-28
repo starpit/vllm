@@ -1,7 +1,7 @@
 # cuBLAS-Freedom Plan — Status
 
 ## Resume point
-Next step: **2** (FusedCublasGemmAddImpl)
+Next step: **3** (Stream-K kernel family)
 
 ## History
 _(append-only log of completed steps, one line each)_
@@ -31,6 +31,24 @@ _(append-only log of completed steps, one line each)_
     Norm→Gemm shapes the analyzer flags but my Impls don't claim.
     Each would need a parallel 3-tile claim Impl following the same
     pattern as FusedAddRmsNormGemm.
+
+- 2026-04-29 00:00 · Step 2 ✓ — landed `FusedCublasGemmAddImpl`
+  (cuBLAS-side peer to `CutlassGemmAddImpl`). Gated on the same
+  `FERRITE_DISABLE_CUBLAS_GEMM` env var as `GemmRefImpl` so Step 5
+  drops every cuBLAS path symmetrically. cuBLAS surface 3325 →
+  3473 (+148 distinct picks; 71 of those are new `Gemm→Add`
+  pairs the analyzer flags). FusedCublasGemmAdd captured 123 raw
+  picks. CutlassGemmAdd raw picks shifted (242 post). The +148
+  regression is unexpected vs the plan's +0 expectation —
+  appears to be a DP cost-tiebreaker interaction at M=2..64
+  cohere-style parallel attn+mlp where my Impl claims one
+  (Gemm,Add) pair and the other shatters into singletons rather
+  than going to CutlassGemmAdd. Not a correctness issue
+  (commandr-1l passes, 1 passed). Inspecting at Step 5 / Step 6
+  may reveal whether this matters at the ship state — with
+  cuBLAS disabled, my Impl is dropped too, and the affected
+  pairs revert to CutlassGemmAdd alone (which is exactly what
+  Step 5 needs).
 
 ## Open blockers
 (none)

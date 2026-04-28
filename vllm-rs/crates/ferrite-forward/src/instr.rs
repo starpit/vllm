@@ -156,6 +156,11 @@ pub enum Instruction<W> {
         u32,
     ),
     Gemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
+    /// cuBLAS-side peer to `CutlassGemmAdd`. cuBLAS GEMM produces a
+    /// delta; `add_inplace` then folds it into the residual buffer.
+    /// Output is the residual upstream's OwnedTensor (aliased via
+    /// the codegen prelude); no `out_slot` payload.
+    FusedCublasGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     FusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
@@ -633,6 +638,23 @@ impl<W: CanonicalParams> Instruction<W> {
                     .cublas
                     .gemm(*v, w.dense_weight(), &mut ctx.device.caching);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, weight_fn, n, k) => unsafe {
+                // cuBLAS gemm(activation, weight) → delta; then
+                // add_inplace folds delta into the residual buffer.
+                // The residual upstream's OwnedTensor is aliased to
+                // the Add tile's slot via the codegen prelude — same
+                // as CutlassGemmAdd.
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("FusedCublasGemmAdd", w.dense_weight(), n, k, tp_active(ctx));
+                let delta = ctx
+                    .device
+                    .cublas
+                    .gemm(*v, w.dense_weight(), &mut ctx.device.caching);
+                kernels::add_inplace(*residual, delta.as_gpu_tensor(), ctx.device.compute_stream);
             },
             Instruction::FusedGemmBias(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;

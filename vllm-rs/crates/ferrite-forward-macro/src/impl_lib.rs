@@ -1815,6 +1815,10 @@ pub fn starter_library() -> ImplementationLibrary {
     // "CUTLASS-only dispatch" vs the DP's default cost-driven mix.
     if std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_none() {
         lib.push(Box::new(GemmRefImpl));
+        // cuBLAS-side peer to CutlassGemmAddImpl. Gated on the same
+        // env var so Step 5's A/B drops every cuBLAS-routing path
+        // symmetrically.
+        lib.push(Box::new(FusedCublasGemmAddImpl));
     }
     lib.push(Box::new(AttentionViaCacheImpl));
     // Reshape is a metadata-only view op synthesized by shape
@@ -9323,6 +9327,245 @@ impl Implementation for CutlassGemmAddImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
+// ── FusedCublasGemmAddImpl ───────────────────────────────────────
+//
+// cuBLAS-side peer to [`CutlassGemmAddImpl`]. Same `(Gemm, Add)`
+// 2-tile claim, but the GEMM step routes through cuBLAS instead of a
+// CUTLASS tile + the add is a separate `add_inplace` BW-bound launch.
+//
+// Closes a structural anomaly the analyzer surfaces: the
+// CutlassGemmAdd peer exists, so when CUTLASS loses the bucket the
+// fusion shatters into `(Cublas-singleton, Add-singleton)` rather
+// than landing as one fused-claim cuBLAS call. Only ~12 picks today
+// (the analyzer's `Gemm→Add (CutlassGemmAdd peer; no cuBLAS peer)`
+// row), but the structural completion matters for Step 5
+// (FERRITE_DISABLE_CUBLAS_GEMM): without this Impl, those 12 picks
+// would route through a `(GemmRefImpl, AddRefImpl)` pair, and
+// `GemmRefImpl` is exactly the Impl Step 5 disables — leaving the
+// pair claimable only by `CutlassGemmAdd` (which can already win
+// these buckets via cost). With this Impl present, the env var
+// gates BOTH the singleton AND the fused cuBLAS peer.
+//
+// Gated on the same `FERRITE_DISABLE_CUBLAS_GEMM` env var as
+// `GemmRefImpl` so Step 5's A/B is symmetric — every cuBLAS-routing
+// path is dropped when the env var is set.
+
+#[derive(Debug, Default)]
+pub struct FusedCublasGemmAddImpl;
+
+impl Implementation for FusedCublasGemmAddImpl {
+    fn name(&self) -> &'static str {
+        "fused_cublas_gemm_add"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Same matcher as CutlassGemmAddImpl: dense Gemm + downstream
+        // residual-stream Add (both Add inputs are Tiles; one is the
+        // Gemm output).
+        let node = fuf.get(seed);
+        if node.op != OpKind::Gemm {
+            return None;
+        }
+        if !matches!(weight_storage_of(node), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        let add_node = fuf.nodes.iter().find(|n| {
+            if n.op != OpKind::Add || n.inputs.len() != 2 {
+                return false;
+            }
+            let all_tiles = n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }));
+            if !all_tiles {
+                return false;
+            }
+            consumes_tile(n, seed)
+        })?;
+        let add_id = add_node.id;
+        let residual_src = add_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, slot } if *id != seed => Some((*id, *slot)),
+            _ => None,
+        })?;
+        let activation_src = first_tile_input(node)?;
+        Some(MatchInfo {
+            claimed_tiles: vec![seed, add_id],
+            boundary_inputs: vec![activation_src.0, residual_src.0],
+            boundary_outputs: vec![add_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // cuBLAS GEMM cost + BW-bound add. Mirrors
+        // CutlassGemmAddImpl's structure but reads "cublas" CSV with
+        // a roofline fallback to keep parity with GemmRefImpl's
+        // measurement scale at uncalibrated shapes.
+        let gemm_tile = m
+            .claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| ctx.fuf.get(*t).op == OpKind::Gemm)
+            .expect("FusedCublasGemmAdd: claim contains a Gemm");
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, ctx.fuf.get(gemm_tile)) else {
+            return UNCALIBRATED_COST_US;
+        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for("cublas", mm, nn, kk)
+            .unwrap_or_else(|| {
+                let flops = 2.0 * mm as f64 * nn as f64 * kk as f64;
+                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+                if peak > 0.0 && flops > 0.0 {
+                    (flops / peak) * 1e6
+                } else {
+                    UNCALIBRATED_COST_US
+                }
+            });
+        // BW-bound add: 2 reads (delta, residual) + 1 write (residual)
+        // over [M, N] bf16.
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * mm as f64 * nn as f64 * BYTES_PER_ELEM;
+        let add_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + add_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Same alias semantics as CutlassGemmAddImpl: the Add's
+        // output aliases the residual upstream OwnedTensor (the
+        // add_inplace kernel mutates it in place).
+        let add_id = claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| fuf.get(*t).op == OpKind::Add)
+            .expect("FusedCublasGemmAdd: claim contains an Add");
+        let gemm_id = claimed_tiles
+            .iter()
+            .copied()
+            .find(|t| fuf.get(*t).op == OpKind::Gemm)
+            .expect("FusedCublasGemmAdd: claim contains a Gemm");
+        let residual_src = fuf.get(add_id).inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, slot } if *id != gemm_id => Some((*id, *slot)),
+            _ => None,
+        });
+        vec![((add_id, 0), residual_src)]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "FusedCublasGemmAdd",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("residual_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedCublasGemmAdd: claim contains a Gemm");
+        let add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Add)
+            .expect("FusedCublasGemmAdd: claim contains an Add");
+        let gemm_node = fuf.get(gemm_id);
+        let (in_id, in_slot) = match gemm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("FusedCublasGemmAdd: gemm input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let (residual_id, residual_in) = fuf
+            .get(add_id)
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } if *id != gemm_id => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("FusedCublasGemmAdd: Add has a non-gemm Tile input (residual)");
+        let residual_idx = slots.of(residual_id, residual_in);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("FusedCublasGemmAdd: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("FusedCublasGemmAdd: gemm (N, K) must resolve from FUF + bounds");
+        Some(vec![OpInstance::new(
+            syn::Ident::new("FusedCublasGemmAdd", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #residual_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
                 quote! { #n },
                 quote! { #k },
             ],

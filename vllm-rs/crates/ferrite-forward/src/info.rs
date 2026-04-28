@@ -276,6 +276,16 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
+            Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, _wf, n, k) => (
+                "FusedCublasGemmAdd",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(residual_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                    F::WeightShape { n, k },
+                ],
+            ),
             Instruction::FusedGemmBias(in_slot, out_slot, layer, _wf) => (
                 "FusedGemmBias",
                 vec![

@@ -2,34 +2,38 @@
 
 **Goal**: drop the cuBLAS dependency from the inference container. CUDA 12's `libcublas.so` + `libcublasLt.so` are ~850 MB combined; on a 3-5 GB inference image that's 17–30% off — enough to materially change Kubernetes cold-start and cluster image cache pressure.
 
-**Branch**: `ff-interpreter`. Tip: `72304b029`.
+**Branch**: `ff-interpreter`. Tip: `812452cff`.
 
 **Target arch**: sm89 (L4 / Ada). sm90+ will be ThunderKittens-based in a separate workstream — none of this code path applies there.
 
-> ⚠️ **Read this first**: The pick counts below are derived from `vllm ferrite info --color never | grep -c …` on commit `72304b029`'s installed CSV. **Do not** repeat what you see here from memory or from older git revisions. Re-run the audit yourself before picking a target — earlier sessions burned hours by trusting stale or speculative numbers ("(in dump)" was once used as a placeholder for an unmeasured count and was later read as if it implied non-zero picks). The verification recipe is in **Audit recipe** below.
+> ⚠️ **Read this first**: The pick counts below are derived from `vllm ferrite info --color never | grep -c …` on commit `812452cff`'s installed CSV. **Do not** repeat what you see here from memory or from older git revisions. Re-run the audit yourself before picking a target — earlier sessions burned hours by trusting stale or speculative numbers ("(in dump)" was once used as a placeholder for an unmeasured count and was later read as if it implied non-zero picks). The verification recipe is in **Audit recipe** below.
 
 ## Status snapshot
 
 cuBLAS-using surface across the 271-variant dense fleet, by Instruction kind:
 
 ```
-Cublas (standalone)           3574
-FusedQkvRopePrefill            699   ← no CUTLASS sibling
-FusedGateUpGeluMul             520   ← partial CUTLASS sibling (752 already migrated)
-FusedGateUpSiluMul             295   ← CUTLASS sibling at 144 picks (BW-bound regime only)
-FusedQkvRopeCache              194   ← no CUTLASS sibling
+Cublas (standalone)           3613
+FusedQkvRopePrefill            604   ← non-biased Prefill: partial CUTLASS sibling
+                                       (129 already migrated, biased qwen2 stays cuBLAS)
+FusedGateUpGeluMul             546   ← partial CUTLASS sibling (752 already migrated)
+FusedGateUpSiluMul             299   ← CUTLASS sibling at 148 picks (BW-bound regime only)
+FusedQkvRopeCache              164   ← non-biased Cache: partial CUTLASS sibling
+                                       (30 already migrated, biased qwen2 stays cuBLAS)
 FusedGemmBias                    0   ← (no claim sites; all bias_add absorbed by FusedQkvRope*)
                               ----
-Total bf16 cuBLAS-using       5282
+Total bf16 cuBLAS-using       5226
 ```
 
 Non-cuBLAS picks (already migrated):
 
 ```
-CutlassGemm (standalone zoo)             1293
+CutlassGemm (standalone zoo)             1319
 CutlassFusedGateUpGeluMul                 752   ← landed 72304b029
+CutlassFusedQkvRopePrefill                129   ← landed 812452cff
 CutlassGemmSplitK + CutlassGemmAdd + Gemv (~1500 combined; not the lever)
-CutlassFusedGateUpSiluMul                 144
+CutlassFusedGateUpSiluMul                 148
+CutlassFusedQkvRopeCache                   30   ← landed 812452cff
 CutlassFusedGemmBias                        0   ← 0 claim sites in fleet today
 ```
 
@@ -44,6 +48,8 @@ FP8 and Marlin paths are large but separate workstreams; not cuBLAS-using.
 | `72304b029` | **`FusedGateUpGeluMul::cost_us` measured cuBLAS, not roofline** | **-752** |
 | `72304b029` | Bias zoo on plain `cutlass::gemm::device::Gemm` (3.21× faster, 0 picks) | 0 |
 | `72304b029` | Megakernels build disabled (cross-worktree cache pollution workaround) | 0 |
+| `ebe3318df` | `FusedQkvRopeCache::cost_us` measured cuBLAS, not roofline (Prefill rides via delegation) | 0 (no peer yet) |
+| `812452cff` | **`CutlassFusedQkvRope{Cache,Prefill}` peers — non-biased path** | **-159 raw / -89 dedup** |
 
 ## The cost-eval bug pattern that's already paid out twice
 
@@ -55,11 +61,21 @@ Already applied:
 - `FusedGateUpSiluMulImpl` in `4a67304ec` (-1127 picks)
 - `FusedGateUpGeluMulImpl` in `72304b029` (-752 picks; doubles as CUTLASS peer landing)
 
-**Strongly suspected, not yet verified**: `FusedQkvRopeCacheImpl` and `FusedQkvRopePrefillImpl` cost_us. If they have the same roofline anti-pattern *and* a CUTLASS peer existed, that's another ~893 picks at the cost of a one-line fix per Impl + a CUTLASS peer per Impl. (No CUTLASS peer exists yet for either; building one is the next major lever.)
+Already applied to QKV-rope (`ebe3318df` + `812452cff`):
+- `FusedQkvRopeCacheImpl::cost_us` cost-eval fix (`ebe3318df`, 0 pick shift alone — no peer existed)
+- `CutlassFusedQkvRope{Cache,Prefill}Impl` peers landed (`812452cff`, -89 dedup picks)
 
-**Check first** before doing kernel work: `grep -A20 'fn cost_us' impl_lib.rs` on the relevant Impl, look for `peak_tflops_fp16` or a `flops / peak * 1e6` pattern. If present, that's the same bug.
+**Check first** before doing kernel work on a fused-cuBLAS Impl: `grep -A20 'fn cost_us' impl_lib.rs` on the relevant Impl, look for `peak_tflops_fp16` or a `flops / peak * 1e6` pattern. If present, that's the same bug. Today the only remaining cuBLAS-peer Impls untouched are: none with the roofline pattern (Cache + Prefill + Silu + Gelu all fixed).
 
 ## What's been built that you can reuse
+
+### CutlassFusedQkvRope{Cache,Prefill} (812452cff) — non-biased
+
+Two new tile-zoo-pickable Impls (one per `CUTLASS_TILE_ZOO` × {Cache, Prefill}). Runtime path: `cutlass::cutlass_gemm(*v, w.dense_weight(), CutlassTile::new(tile_m, tile_n, stages), ...)` produces the packed `[M, q+2*kv]` buffer, then the existing `kernels::fused_qkv_rope_cache* / fused_qkv_rope*` post-pass runs unchanged. **No new .cu file** — reuses the standalone CUTLASS GEMM zoo + the existing rope-cache kernels.
+
+`matches()` delegates to the cuBLAS peer's `matches()` then rejects biased claims via `fused_qkv_claim_is_biased(fuf, &MatchInfo)`. The helper walks the claim's three QKV gemms via `unwrap_gemm_through_bias` — drop the `if biased { return None; }` and the peer immediately becomes biased-capable, but only after the bias-zoo CSV is shape-swept (otherwise it loses to cuBLAS via `UNCALIBRATED_COST_US`).
+
+Captured -89 dedup picks. Verified coherent on `test_cuda_correctness_command_r_1l` (CommandR's interleaved RoPE + non-biased QKV is in scope).
 
 ### CutlassFusedGateUpGeluMul (72304b029)
 
@@ -111,13 +127,25 @@ For the GELU result, the equivalent dedup gives **268 distinct `(arch, layer)` p
 
 ## Levers ranked by current leverage
 
-### A — `FusedQkvRope{Cache,Prefill}` cost-eval bugfix + CUTLASS peer (~1-3 days)
-Apply the same playbook as `4a67304ec` / `72304b029`:
-1. Check `FusedQkvRopeCacheImpl::cost_us` + `FusedQkvRopePrefillImpl::cost_us` for the roofline-FLOPS anti-pattern. If present, replace with measured `cublas` lookup at the packed QKV shape.
-2. Add `CutlassFusedQkvRope{Cache,Prefill}Impl` peers: packed CUTLASS GEMM at `(M, q_size+2*kv_size, hidden)` + `qk_norm_rope_kernels` (or whichever existing rope kernel today's cuBLAS peer's Instruction body calls). Mirror `CutlassFusedGateUpGeluMulImpl`'s tile-zoo-pickable shape.
-3. Add packed-QKV-N rows to `gemm_sweep.rs` per arch (qwen2, qwen3, llama, granite, etc).
+### A (DONE) — `FusedQkvRope{Cache,Prefill}` cost-eval bugfix + CUTLASS peer
+Landed in `ebe3318df` + `812452cff`. Captured -89 dedup picks (-159 raw):
+- 30 (arch, layer) instances fully shifted Cache QKV cuBLAS → CUTLASS.
+- 59 (arch, layer) instances split Prefill QKV between CUTLASS (small-M buckets) and cuBLAS (large-M buckets).
 
-**Estimated**: 893 picks of headroom. Realized capture depends on `cutlass_<tile>(M, qkv_packed, K) vs cublas(M, qkv_packed, K)` at fleet shapes — same dynamic as the GELU win.
+Realized capture is ~14% of the 893-pick headroom estimate. Why the rest stays cuBLAS:
+1. **Biased QKV (qwen2)** is excluded by design — the v1 peer's `matches()` rejects biased claims because the bias-zoo CSV (`cutlass_gemm_bias_<TM>x<TN>_s<S>`) is not yet shape-swept. See lever A2 below.
+2. **Large-M Prefill** still favors cuBLAS at packed-N=q+2·kv shapes; Stream-K (Lever B) is the right tool there.
+3. **Bucket noise** — raw Cublas count rose from 3574 → 3613 with the new peers, but distinct-(arch,layer,N,K) is unchanged at 1224. The new CUTLASS tiles' calibration entries split some buckets. Read dedup, not raw, for honest comparison.
+
+### A2 — Bias-zoo shape-sweep + drop the matcher's bias gate (~1-2 days)
+The `cutlass_gemm_bias` zoo exists (`72304b029`) and beats cuBLAS at one tested shape (M=128, N=K=4096: 68.3 µs vs 73.5 µs, 1.08×). To unlock qwen2's biased QKV picks:
+
+1. Add `cutlass_gemm_bias_<TM>x<TN>_s<S>` rows to `gemm_sweep.rs` across the qwen2 packed-QKV shapes — qwen2-0.5b/1.5b/7b QKV widths × hidden × M-grid.
+2. In `CutlassFusedQkvRope{Cache,Prefill}Impl::matches`, drop the `if fused_qkv_claim_is_biased(fuf, &info) { return None; }` gate.
+3. Add a `biased: bool` field to the opcode shape; runtime branches to `cutlass::cutlass_gemm_bias` when biased and `cutlass::cutlass_gemm` otherwise.
+4. `cost_us` selects between `cutlass_<tile>` and `cutlass_gemm_bias_<tile>` CSV row by inspecting the claim's bias state. (CostCtx doesn't have FUF — this needs a small `MatchInfo` extension or it can be passed as part of the Impl's struct fields.)
+
+**Estimated**: ~80-150 picks (qwen2 fleet × 3 QKV layers × M-buckets). Smaller than A1 because qwen2 is one arch family.
 
 ### B — Stream-K standalone CUTLASS (handoff-original Lever B, 3-5 days)
 CUTLASS 2.10+ ships Stream-K; we have the splitK template family in `cutlass_standalone_gemm.cu`. Currently registered as fixed `split_k ∈ {2,4,8}` variants. Stream-K is *adaptive* — splits K to fill SMs based on workload. Targets the **long-K medium-M** regime (down_proj prefill), part of the 3574 standalone Cublas picks.
@@ -134,14 +162,13 @@ Diagnostic-only. Diff the dumps at the bucket level; identify which buckets chan
 ### F — Feature-gate cuBLAS off and accept perf hit (3-5 days)
 Last step of the project. Only viable after every dense path has a CUTLASS realization (i.e. after A + B + C + E land). Premature today.
 
-## Recommended sequence from `72304b029`
+## Recommended sequence from `812452cff`
 
-1. **D** (~30 min): confirm the +878 Cublas regression is predictor-refit not real.
-2. **A** (~1-3 days): cost-eval bugfix + CUTLASS peer for `FusedQkvRope{Cache,Prefill}`. Same playbook as the GELU fix.
-3. **B** (~3-5 days): Stream-K for standalone Cublas long-K medium-M regime.
-4. **C** (~1-2 weeks): batched-GEMV for lm_head prefill.
-5. **E** (~2-4 weeks): de-cublas `LinearLayer::forward`. Last code work before F.
-6. **F** (~3-5 days): feature-gate cuBLAS off, verify image-size win, ship.
+1. **A2** (~1-2 days): bias-zoo shape-sweep + drop bias gate in `CutlassFusedQkvRope*Impl::matches`. Unblocks qwen2's biased QKV.
+2. **B** (~3-5 days): Stream-K for standalone Cublas long-K medium-M regime AND large-M Prefill QKV (the long-Prefill cuBLAS picks the v1 CUTLASS peer didn't capture).
+3. **C** (~1-2 weeks): batched-GEMV for lm_head prefill.
+4. **E** (~2-4 weeks): de-cublas `LinearLayer::forward`. Last code work before F.
+5. **F** (~3-5 days): feature-gate cuBLAS off, verify image-size win, ship.
 
 ## Audit recipe
 
@@ -161,7 +188,9 @@ cargo build -p vllm-cli --features cuda --release
 
 # 4. Per-kind pick count (the only number that matters)
 for k in Cublas FusedGateUpGeluMul FusedGateUpSiluMul FusedQkvRopeCache FusedQkvRopePrefill \
-         CutlassGemm CutlassFusedGateUpGeluMul CutlassFusedGateUpSiluMul CutlassFusedGemmBias FusedGemmBias; do
+         CutlassGemm CutlassFusedGateUpGeluMul CutlassFusedGateUpSiluMul \
+         CutlassFusedQkvRopeCache CutlassFusedQkvRopePrefill \
+         CutlassFusedGemmBias FusedGemmBias; do
   printf "%-32s %d\n" "$k" "$(grep -c "\b${k}\b" /tmp/dump.txt)"
 done
 ```

@@ -143,6 +143,12 @@ impl<W> Instruction<W> {
             Instruction::Add(delta_slot, residual_slot) => {
                 ("Add", vec![F::Slot(delta_slot), F::Slot(residual_slot)])
             }
+            #[cfg(feature = "nccl")]
+            Instruction::AllReduce(slot) => ("AllReduce", vec![F::Slot(slot)]),
+            #[cfg(feature = "nccl")]
+            Instruction::AllGather(in_slot, out_slot) => {
+                ("AllGather", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
             Instruction::ScalarMul(in_slot, out_slot, scale) => (
                 "ScalarMul",
                 vec![

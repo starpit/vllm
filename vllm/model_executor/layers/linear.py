@@ -17,6 +17,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
+from vllm.model_executor._ferrite_weight_dump import dump as _ferrite_dump
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.batch_invariant import (
     linear_batch_invariant,
@@ -600,6 +601,13 @@ class ColumnParallelLinear(LinearBase):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.{'bias' if loaded_weight.dim() == 1 else 'weight'}",
+            output_dim if output_dim is not None else 0,
+            self.tp_rank,
+            self.tp_size,
+            loaded_weight,
+        )
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -608,6 +616,13 @@ class ColumnParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.{'bias' if param.data.dim() == 1 else 'weight'}",
+            getattr(param, "output_dim", 0),
+            self.tp_rank,
+            self.tp_size,
+            param.data,
+        )
 
     def forward(
         self,
@@ -883,6 +898,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.{'bias' if loaded_weight.dim() == 1 else 'weight'}[shard{loaded_shard_id}]",
+            output_dim if output_dim is not None else 0,
+            self.tp_rank,
+            self.tp_size,
+            loaded_weight,
+        )
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -974,6 +996,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_offset=shard_offset,
             shard_size=shard_size,
             tp_rank=self.tp_rank,
+        )
+        _slice = param.data.narrow(
+            getattr(param, "output_dim", 0), shard_offset, shard_size
+        )
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.weight[shard{loaded_shard_id}]",
+            getattr(param, "output_dim", 0),
+            self.tp_rank,
+            self.tp_size,
+            _slice,
         )
 
 
@@ -1175,6 +1207,16 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_size=shard_size,
             tp_rank=self.tp_rank,
         )
+        _slice = param.data.narrow(
+            getattr(param, "output_dim", 0), shard_offset, shard_size
+        )
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.weight[{loaded_shard_id}]",
+            getattr(param, "output_dim", 0),
+            self.tp_rank,
+            self.tp_size,
+            _slice,
+        )
 
     def weight_loader(
         self,
@@ -1372,6 +1414,13 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.{'bias' if loaded_weight.dim() == 1 else 'weight'}[{loaded_shard_id}]",
+            output_dim if output_dim is not None else 0,
+            self.tp_rank,
+            self.tp_size,
+            loaded_weight,
+        )
 
 
 # --8<-- [start:row_parallel_linear]
@@ -1514,6 +1563,13 @@ class RowParallelLinear(LinearBase):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.{'bias' if loaded_weight.dim() == 1 else 'weight'}",
+            input_dim if input_dim is not None else 1,
+            self.tp_rank,
+            self.tp_size,
+            loaded_weight,
+        )
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -1523,6 +1579,13 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.{'bias' if param.data.dim() == 1 else 'weight'}",
+            getattr(param, "input_dim", 1),
+            self.tp_rank,
+            self.tp_size,
+            param.data,
+        )
 
     def forward(
         self,

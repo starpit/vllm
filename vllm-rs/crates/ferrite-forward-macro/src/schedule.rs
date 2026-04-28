@@ -88,28 +88,57 @@ pub fn schedule(fuf: &Fuf, sfuf: &Assignment) -> Loop {
         }
     }
 
-    // Topological wave assignment. Visit subgraphs in id order
-    // (solver allocates ids in topo order of first-claimed tile,
-    // so deps flow forward — but compute wave via max of predecessor
-    // waves to be safe for multi-tile claims).
+    // Topological wave assignment via memoized DFS. We can't rely on
+    // `SubgraphId` order being topological — the tp-lowering pass
+    // appends `OpKind::AllReduce` tiles at the end of `fuf.nodes`,
+    // so their consumers (e.g. the residual `Add` immediately
+    // downstream) are at LOWER `SubgraphId` than the AllReduce they
+    // depend on. A naïve id-order walk with `unwrap_or(0)` would
+    // assign the consumer to wave 0 and the AllReduce to wave 1+,
+    // inverting topology and triggering a slot-map alias-resolution
+    // panic in `colored_slot_map`.
     let mut wave_of: HashMap<SubgraphId, u32> = HashMap::new();
     let mut max_wave: u32 = 0;
 
-    // Sort subgraphs by id for deterministic iteration. Topological
-    // order by id holds because the solver's forward pass creates
-    // each subgraph only after all its prior tiles were committed.
-    let mut ordered: Vec<SubgraphId> = sfuf.subgraphs().collect();
-    ordered.sort();
+    let ordered: Vec<SubgraphId> = {
+        let mut o: Vec<SubgraphId> = sfuf.subgraphs().collect();
+        o.sort();
+        o
+    };
 
-    for sg in &ordered {
-        let depth = deps[sg]
+    fn depth_of(
+        sg: SubgraphId,
+        deps: &HashMap<SubgraphId, HashSet<SubgraphId>>,
+        wave_of: &mut HashMap<SubgraphId, u32>,
+        on_stack: &mut HashSet<SubgraphId>,
+    ) -> u32 {
+        if let Some(&w) = wave_of.get(&sg) {
+            return w;
+        }
+        if !on_stack.insert(sg) {
+            // Cycle — should never happen in a valid SFUF; fall back
+            // to wave 0 and stop the recursion to avoid stack overflow.
+            return 0;
+        }
+        let preds: Vec<SubgraphId> = deps
+            .get(&sg)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let depth = preds
             .iter()
-            .map(|d| wave_of.get(d).copied().unwrap_or(0) + 1)
+            .map(|&d| depth_of(d, deps, wave_of, on_stack) + 1)
             .max()
             .unwrap_or(0);
-        wave_of.insert(*sg, depth);
-        if depth > max_wave {
-            max_wave = depth;
+        on_stack.remove(&sg);
+        wave_of.insert(sg, depth);
+        depth
+    }
+
+    let mut on_stack: HashSet<SubgraphId> = HashSet::new();
+    for sg in &ordered {
+        let d = depth_of(*sg, &deps, &mut wave_of, &mut on_stack);
+        if d > max_wave {
+            max_wave = d;
         }
     }
 

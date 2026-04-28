@@ -97,6 +97,26 @@ pub enum OpKind {
     /// large pre-softmax magnitudes.
     TanhSoftCap,
     Add,
+    /// Tensor-parallel all-reduce-sum across `tp_world_size` ranks,
+    /// in place. Identity-shape: `(x: [...]) -> [...]`. Never appears
+    /// in any per-arch DSL — produced exclusively by the lowering
+    /// pass that inserts one of these after every `Gemm` whose weight
+    /// has shard-kind `ShardDim1` (row-parallel: `o_proj`,
+    /// `down_proj`). At `tp_world_size = 1` the pass is a no-op so no
+    /// FUF carries this op kind. Lowers to `Instruction::AllReduce`
+    /// (gated under the `nccl` feature on `ferrite-forward`).
+    AllReduce,
+    /// Tensor-parallel all-gather along the LAST dim of one input
+    /// tile across `tp_world_size` ranks. Output shape is the input
+    /// shape with the last dim multiplied by `tp_world_size`. Like
+    /// `AllReduce`, never appears in any DSL — produced exclusively
+    /// by the lowering pass at tp>1. Inserted after the `Gemm` whose
+    /// weight is `lm_head` (vocab-parallel `ShardDim0`): the per-rank
+    /// matmul produces partial logits `[N, vocab/tp]` and the
+    /// AllGather reassembles `[N, vocab]` for the sampler. Mirrors
+    /// Python vLLM's `tensor_model_parallel_all_gather` on the
+    /// `LogitsProcessor` path. Lowers to `Instruction::AllGather`.
+    AllGather,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
     /// Semantically distinct from `Add` — `Add` is same-shape
@@ -192,6 +212,14 @@ impl OpKind {
             Self::MlaSplit => "mla_split",
             Self::MlaAttention => "mla_attention",
             Self::DeepSeekMoe => "deepseek_moe",
+            // No DSL surface — produced only by the post-FUF lowering
+            // pass at tp>1. `from_name` deliberately omits it so a
+            // user can't write `all_reduce(...)` in a `#[forward]`
+            // body; the canonical path is the lowering pass.
+            Self::AllReduce => "all_reduce",
+            // Same DSL-omission story as AllReduce — only the
+            // lowering pass produces this op kind.
+            Self::AllGather => "all_gather",
         }
     }
 }

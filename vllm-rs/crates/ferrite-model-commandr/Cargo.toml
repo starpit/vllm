@@ -8,6 +8,13 @@ description = "Ferrite Commandr architecture (one #[forward] body)"
 [features]
 default = []
 cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+# Tensor-parallel: forwards through to ferrite-forward/nccl, which gates the
+# `Instruction::AllReduce` variant + `ForwardCtx::tp_group` field. Until task
+# #7 emits tp>1 variants, enabling this feature still produces a tp=1 build —
+# the lowering pass remains a no-op and zero `Instruction::AllReduce` literals
+# are emitted. After task #7 turns on, this feature is required for the
+# emitted tp>1 variant modules to compile.
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }

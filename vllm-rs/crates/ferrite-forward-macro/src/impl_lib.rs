@@ -1866,6 +1866,14 @@ pub fn starter_library() -> ImplementationLibrary {
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
     // adds before any LayerNorm. Emits `add_inplace`.
     lib.push(Box::new(AddRefImpl));
+    // Tensor-parallel all-reduce-sum: the only matcher for
+    // `OpKind::AllReduce` nodes the lowering pass inserts after every
+    // row-parallel gemm at tp>1.
+    lib.push(Box::new(AllReduceImpl));
+    // Tensor-parallel all-gather along the last dim: the only matcher
+    // for `OpKind::AllGather` nodes the lowering pass inserts after
+    // the lm_head Gemm at tp>1.
+    lib.push(Box::new(AllGatherImpl));
     // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
     // + RmsNorm. Claimed by the DP in preference to the 2-tile
     // FusedAddRmsNorm + standalone ScalarOffset because it's a
@@ -13154,5 +13162,293 @@ mod tests {
         model.bounds.insert("num_key_value_heads".to_string(), 8);
         model.bounds.insert("head_dim".to_string(), 128);
         model
+    }
+}
+// ── AllReduceImpl ────────────────────────────────────────────────
+//
+// Single-tile impl claiming an `OpKind::AllReduce` node — the
+// row-parallel TP communicator the lowering pass (task #5b/c)
+// inserts after every gemm whose weight has shard-kind `ShardDim1`
+// (`o_proj` / `down_proj`). Maps to `NcclGroup::all_reduce_inplace`
+// via `Instruction::AllReduce(slot)` (gated on `ferrite-forward`'s
+// `nccl` feature).
+//
+// One-tile in-place same-shape: `output_alias` declares the dst
+// slot aliases the input slot, so shape-aware coloring collapses
+// it to the input's slot with no `View` row (validated by
+// `coloring_allreduce_collapses_to_input_slot`). The fused-pair
+// comm-boundary guard is emergent from the FUF dataflow break —
+// any node with an OpKind::AllReduce sitting between a Gemm output
+// and a residual Add naturally fails `consumes_tile(add, gemm)`,
+// rejecting the fusion (validated by
+// `cutlass_gemm_add_does_not_claim_across_intermediate_node`).
+//
+// At `tp_world_size = 1` the lowering pass is a no-op — no FUF
+// node carries `OpKind::AllReduce`, so this Impl never matches and
+// is free in the solver. Always registered in `starter_library()`
+// regardless of build features; `cost_us` returns infinity if the
+// target profile lacks an `all_reduce` cost row, deterring the DP
+// from picking it on uncalibrated targets.
+
+#[derive(Debug, Default)]
+pub struct AllReduceImpl;
+
+impl Implementation for AllReduceImpl {
+    fn name(&self) -> &'static str {
+        "all_reduce"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // No CSV gating — all calibrated and uncalibrated profiles
+        // can run NCCL when `ferrite-forward/nccl` is on. Profiles
+        // without an `all_reduce` cost row use `UNCALIBRATED_COST_US`
+        // as a fallback in `cost_us` so the DP still has a finite
+        // number to compare.
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::AllReduce || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: NCCL all-reduce-sum reads + writes the
+        // tile per rank, and the cross-rank ring-pass amortizes to
+        // ~2x the per-tile bytes at large world sizes. Without a
+        // measured cost row, model as 2x bandwidth-bound on the
+        // local memory subsystem — a coarse upper bound that the DP
+        // uses as a tiebreaker between coverings; the actual NCCL
+        // cost dominates here in practice and is a target-specific
+        // CSV row to be added later. Returns `UNCALIBRATED_COST_US`
+        // when no profile data exists, matching the convention used
+        // by other comm-bound Impls.
+        let m = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * m * hidden * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            UNCALIBRATED_COST_US
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Output aliases the single tile input — `all_reduce_inplace`
+        // mutates the buffer directly, no separate output buffer.
+        let ar_id = claimed_tiles[0];
+        let node = fuf.get(ar_id);
+        let input_src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((ar_id, 0), input_src)]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("AllReduce", vec![("slot", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let ar_id = m.claimed_tiles[0];
+        let node = fuf.get(ar_id);
+        let (input_id, input_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("AllReduce: input 0 must be a Tile (got {other:?})"),
+        };
+        let slot_idx = slots.of(input_id, input_slot);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("AllReduce", proc_macro2::Span::call_site()),
+            vec![quote! { #slot_idx }],
+        )])
+    }
+
+    // No `interpreter_arm` — the universal `Instruction::eval` body
+    // in `ferrite-forward/src/instr.rs` (gated on `feature = "nccl"`)
+    // is the production dispatch path. The trait stopped carrying
+    // `interpreter_arm` after the universal-eval pivot (commit
+    // `de15e035a`); fan_out + opcode_shape are the only codegen
+    // surface an Impl needs to override.
+}
+
+// ── AllGatherImpl ────────────────────────────────────────────────
+//
+// Single-tile impl claiming an `OpKind::AllGather` node — the
+// vocab-parallel TP communicator the lowering pass inserts after
+// the lm_head Gemm at tp>1, since lm_head is `ShardDim0`. Maps to
+// `NcclGroup::all_gather_last_dim` via `Instruction::AllGather(in,
+// out)` (gated on `ferrite-forward`'s `nccl` feature).
+//
+// One input tile, one output tile with a *larger* shape (last dim
+// grows by `tp_world_size`). Unlike `AllReduceImpl`, this Impl
+// does NOT override `output_alias` — the default returns `None`
+// for every output, which is exactly what we want: the coloring
+// pass assigns the output to a fresh slot since it can't share
+// the input's smaller buffer.
+//
+// At `tp_world_size = 1` the lowering pass is a no-op so this
+// Impl never matches and is free in the solver.
+
+#[derive(Debug, Default)]
+pub struct AllGatherImpl;
+
+impl Implementation for AllGatherImpl {
+    fn name(&self) -> &'static str {
+        "all_gather"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // Same convention as `AllReduceImpl` — all profiles can run
+        // NCCL when `ferrite-forward/nccl` is on; uncalibrated
+        // targets fall back to `UNCALIBRATED_COST_US` in `cost_us`.
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::AllGather || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: NCCL all-gather reads the per-rank tile and
+        // writes the gathered tile; the cross-rank ring-pass amortizes
+        // to ~world_size× the per-rank tile bytes. The CSV row for
+        // `all_gather` is target-specific; absent the row this models
+        // it as `world_size * 2` × per-rank bytes, divided by local BW
+        // — coarse upper bound, the DP uses it only as a tiebreaker.
+        let m = ctx.num_tokens() as f64;
+        let vocab = ctx.bounds.get("vocab_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * m * vocab * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            UNCALIBRATED_COST_US
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    // No `output_alias` override — default returns `None` for every
+    // output, which gives the AllGather output a fresh slot
+    // (separate from the smaller input slot). That's the load-bearing
+    // distinction from `AllReduceImpl`, which collapses to the input
+    // slot via shape-aware coloring.
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "AllGather",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let ag_id = m.claimed_tiles[0];
+        let node = fuf.get(ag_id);
+        let (input_id, input_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("AllGather: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_idx = slots.of(input_id, input_slot);
+        let out_idx = slots.of(ag_id, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("AllGather", proc_macro2::Span::call_site()),
+            vec![quote! { #in_idx }, quote! { #out_idx }],
+        )])
     }
 }

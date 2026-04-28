@@ -28,10 +28,11 @@ pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone}
 #[cfg(feature = "cuda")]
 pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_cohere_layer_norm,
-    load_layered_embedding, load_layered_fp8_block_linear, load_layered_fp8_block_linear_concat,
-    load_layered_fp8_linear, load_layered_fp8_linear_concat, load_layered_linear_dense,
-    load_layered_linear_dense_concat, load_layered_marlin_linear,
-    load_layered_marlin_linear_concat, load_layered_rms_norm,
+    load_layered_embedding, load_layered_embedding_sharded, load_layered_fp8_block_linear,
+    load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
+    load_layered_linear_dense, load_layered_linear_dense_concat,
+    load_layered_linear_dense_concat_sharded, load_layered_linear_dense_sharded,
+    load_layered_marlin_linear, load_layered_marlin_linear_concat, load_layered_rms_norm,
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
@@ -210,6 +211,13 @@ mod ctx {
         pub max_seqlen_q: usize,
         pub max_seqlen_k: usize,
         pub kv_cache: &'a KvCachePool,
+        // The TP communicator the `Instruction::AllReduce` arm calls
+        // into. `None` at tp=1 (the lowering pass emits no AllReduce
+        // rows, so the field is never read). `Some(_)` only when
+        // built with `--features nccl` AND the worker constructed an
+        // NCCL group for this rank — see vllm-executor::cuda_worker.
+        #[cfg(feature = "nccl")]
+        pub tp_group: Option<&'a std::sync::Arc<ferrite_cuda_core::NcclGroup>>,
     }
 }
 #[cfg(feature = "cuda")]
@@ -311,6 +319,7 @@ mod dispatcher {
         &mut GpuWeights,
         CUstream,
         usize, // max_model_len — runtime value (CLI --max-model-len or HF config fallback)
+        u8,    // tp_rank — runtime value, must be < tp_world_size
         HfFingerprint<'_>,
     ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>>;
 
@@ -322,6 +331,14 @@ mod dispatcher {
         /// Harvested by the macro from the union of every compiled
         /// model's `config.json` `architectures: [..]` field.
         pub hf_arches: &'static [&'static str],
+        /// Compile-time tensor-parallel world size this registration
+        /// covers. The macro emits one `FerriteArchRegistration` per
+        /// `(arch, tp_world_size)` tuple — at task #7's outer-loop
+        /// fanout that's `{1, 2, 4, 8}` per arch; until then every
+        /// emitted registration is `tp_world_size = 1`. The top-level
+        /// `try_load` matches on this so the runtime tp size picks
+        /// the right pre-compiled variant set.
+        pub tp_world_size: u8,
         /// Try to load the arch's compiled variants. Internally
         /// iterates per-variant fingerprint sniffs. Returns
         /// `Ok(Some(..))` on a variant hit, `Ok(None)` when the arch
@@ -337,21 +354,30 @@ mod dispatcher {
 
     /// Top-level ferrite loader. Walks every `#[forward]`-registered
     /// arch; the first whose `hf_arches` list contains `arch_hint`
+    /// AND whose `tp_world_size` matches the runtime `tp_world_size`
     /// wins and attempts to load. Returns `Ok(None)` when either
-    /// (a) no registered arch claims `arch_hint`, or (b) the arch
-    /// matched by name but no compiled variant's fingerprint sniff
+    /// (a) no registered (arch, tp) pair claims the request, or
+    /// (b) a pair matched but no compiled variant's fingerprint sniff
     /// accepted the live `GpuWeights`. Both cases let the caller
     /// fall back to the hand-written path without hard-failing.
+    ///
+    /// Until task #7's outer-loop fanout lands, every emitted
+    /// registration is at `tp_world_size = 1`, so callers passing
+    /// `tp_world_size > 1` always see `Ok(None)` (and fall back) —
+    /// matching the current behavior, since cuda_worker already gates
+    /// ferrite eligibility on `!use_tp`.
     pub fn try_load(
         gw: &mut GpuWeights,
         stream: CUstream,
         arch_hint: &str,
+        tp_world_size: u8,
+        tp_rank: u8,
         max_model_len: usize,
         hf: HfFingerprint<'_>,
     ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>> {
         for reg in inventory::iter::<FerriteArchRegistration>() {
-            if reg.hf_arches.contains(&arch_hint) {
-                return (reg.try_load)(gw, stream, max_model_len, hf);
+            if reg.hf_arches.contains(&arch_hint) && reg.tp_world_size == tp_world_size {
+                return (reg.try_load)(gw, stream, max_model_len, tp_rank, hf);
             }
         }
         Ok(None)

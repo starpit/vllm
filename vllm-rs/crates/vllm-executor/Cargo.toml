@@ -17,7 +17,7 @@ cuda = [
     "ferrite-models/cuda",
     "ferrite-cuda-core/cuda",
 ]
-nccl = ["cuda", "vllm-cuda/nccl"]
+nccl = ["cuda", "vllm-cuda/nccl", "ferrite-forward/nccl", "ferrite-cuda-core/nccl", "ferrite-models/nccl"]
 guided-decoding = ["vllm-model/guided-decoding"]
 
 [dependencies]

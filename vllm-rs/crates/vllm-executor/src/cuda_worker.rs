@@ -126,6 +126,26 @@ pub struct CudaWorkerConfig {
 /// here.
 pub struct FerriteModel {
     pub weights: Box<dyn ferrite_forward::FerriteWeights>,
+    /// NCCL communicator the worker injects via `set_tp_group` after
+    /// construction. Threaded into `ForwardCtx::tp_group` on every
+    /// forward call — the universal `Instruction::AllReduce` arm
+    /// (gated under `feature = "nccl"`) reads it and dispatches into
+    /// `NcclGroup::all_reduce_inplace`. `None` at tp=1 (the lowering
+    /// pass emits zero AllReduce rows, so the field is never read).
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<std::sync::Arc<vllm_cuda::nccl::NcclGroup>>,
+    /// Tensor-parallel world size baked into the loaded `Weights`
+    /// variant — used to derive the per-rank `num_kv_heads` for KV
+    /// cache allocation. `FerriteWeights::num_key_value_heads()` is
+    /// the *unsharded* config value (sharded values flow through
+    /// `CanonicalParams`); the executor must divide by `tp_world_size`
+    /// here to match hand-written `self_attn.num_kv_heads` (which is
+    /// already sharded) and Python's per-rank `num_kv_heads`. Without
+    /// this, `KvCachePool` is sized with the unsharded head count and
+    /// the per-block stride disagrees with the kernel-side per-rank
+    /// `NUM_KV_HEADS` from `CanonicalParams`, producing decode garbage
+    /// at tp>1.
+    pub tp_world_size: usize,
 }
 
 /// Supported model architectures in the vllm-cuda backend.
@@ -175,7 +195,16 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
-            Self::Ferrite(m) => m.weights.num_key_value_heads() as usize,
+            Self::Ferrite(m) => {
+                // FerriteWeights reports the unsharded config value;
+                // divide by tp_world_size so KvCachePool gets the
+                // per-rank head count, matching hand-written
+                // `self_attn.num_kv_heads` and Python's
+                // `max(1, total // tp_size)`.
+                let total = m.weights.num_key_value_heads() as usize;
+                let tp = m.tp_world_size.max(1);
+                (total / tp).max(1)
+            }
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
@@ -264,6 +293,7 @@ impl CudaModel {
             Self::Qwen3Next(_) => {} // TP not yet supported
             Self::DeepSeekV2(m) => m.set_tp_group(group),
             Self::ModernBert(_) => {} // Encoder: TP not yet supported
+            Self::Ferrite(m) => m.tp_group = Some(group),
         }
     }
 
@@ -346,6 +376,8 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
+                    #[cfg(feature = "nccl")]
+                    tp_group: m.tp_group.as_ref(),
                 };
                 m.weights.forward_backbone(&ctx, device, num_tokens)
             },
@@ -539,6 +571,8 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
+                    #[cfg(feature = "nccl")]
+                    tp_group: m.tp_group.as_ref(),
                 };
                 let logits = m.weights.forward(&ctx, device, num_tokens);
                 match last_token_indices {
@@ -5068,7 +5102,6 @@ impl Worker for CudaWorker {
             || qconfig.is_gptq()
             || qconfig.is_bnb4bit()
             || qconfig.is_fp8())
-            && !use_tp
             && !use_pp
             && !disable_ferrite;
         let ferrite_loaded: Option<CudaModel> = if ferrite_eligible {
@@ -5101,9 +5134,29 @@ impl Worker for CudaWorker {
                 .max_model_len
                 .or(hf_config.max_position_embeddings)
                 .unwrap_or(4096);
-            if let Some(ferrite_weights) =
-                ferrite_forward::try_load(&mut weights, stream, arch.as_str(), max_model_len, hf_fp)
-                    .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward load: {e}")))?
+            // Pass the runtime (tp_world_size, tp_rank) so try_load
+            // picks the matching `(arch, tp)` registration and the
+            // per-(model, tp) emitted `Weights::load` body shards
+            // weights by `tp_rank`. tp>1 is now end-to-end wired:
+            // codegen's shard-kind dispatch (52615e881) routes load
+            // calls through `_sharded` helpers; lowering injects
+            // AllReduce after vocab-parallel Embed (aefa1de37) and
+            // AllGather after lm_head Gemm (8a3ea25bc). At tp=1 every
+            // emitted call site is byte-equivalent to before TP
+            // landed — `_sharded` variants degrade to the unsharded
+            // helpers when world == 1.
+            let ferrite_tp = u8::try_from(tp_world).unwrap_or(1);
+            let ferrite_rank = u8::try_from(tp_rank).unwrap_or(0);
+            if let Some(ferrite_weights) = ferrite_forward::try_load(
+                &mut weights,
+                stream,
+                arch.as_str(),
+                ferrite_tp,
+                ferrite_rank,
+                max_model_len,
+                hf_fp,
+            )
+            .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward load: {e}")))?
             {
                 // Ferrite owns rotary construction: the emitted
                 // `Weights::load` built the RotaryCache (plus any
@@ -5117,6 +5170,9 @@ impl Worker for CudaWorker {
                 );
                 Some(CudaModel::Ferrite(Box::new(FerriteModel {
                     weights: ferrite_weights,
+                    #[cfg(feature = "nccl")]
+                    tp_group: None,
+                    tp_world_size: self.config.tp_world_size,
                 })))
             } else {
                 None

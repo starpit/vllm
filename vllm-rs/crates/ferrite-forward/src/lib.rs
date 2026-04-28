@@ -13,6 +13,8 @@ pub mod info;
 #[cfg(feature = "cuda")]
 pub mod instr;
 #[cfg(feature = "cuda")]
+pub mod kvm_mega;
+#[cfg(feature = "cuda")]
 pub mod loaders;
 pub mod paged_kv;
 #[cfg(feature = "cuda")]

@@ -1832,16 +1832,35 @@ pub fn starter_library() -> ImplementationLibrary {
     // a lone affine-transform gemm that's not a QKV-pre-rope or
     // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
     lib.push(Box::new(FusedGemmBiasImpl));
-    // CUTLASS EVT peer to FusedGemmBiasImpl; bias folded into the
-    // GEMM epilogue via row-broadcast visitor. `target_compatible`
-    // gates on the `cutlass_fused_gemm_bias` CSV row.
-    lib.push(Box::new(CutlassFusedGemmBiasImpl));
+    // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
+    // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
+    // and bias passed as the C operand at ldc=0 (row broadcast). One
+    // Impl per CUTLASS_TILE_ZOO entry, gated per-tile on calibrated
+    // CSV row presence; the DP picks the best tile per workload.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassFusedGemmBiasImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
     // kernel shape. Solver's DP picks whichever has lower calibrated
     // cost per bucket; `target_compatible` gates on CSV row presence.
     lib.push(Box::new(CutlassFusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedGateUpGeluMulImpl));
+    // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
+    // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
+    // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
+    // 2I, K) bucket. One Impl per CUTLASS_TILE_ZOO entry.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     lib.push(Box::new(FusedAddRmsNormImpl));
     // Singleton fallback for residual `Add`s whose downstream is not
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
@@ -2233,25 +2252,60 @@ impl Implementation for FusedGemmBiasImpl {
 
 // ── CutlassFusedGemmBiasImpl ─────────────────────────────────────
 //
-// CUTLASS EVT peer to `FusedGemmBiasImpl`. Same 2-tile
-// `(Gemm, BiasAdd)` claim and same single `LinearLayer` accessor —
-// only the emitted kernel differs: the cuBLAS variant dispatches to
-// `LinearLayer::forward` (which uses `gemm_bias` epilog), while this
-// one calls `cutlass_gemm_bias` (CUTLASS EVT with row-broadcast bias
-// load in the epilogue). DP picks by cost; until the sweep populates
-// the `cutlass_gemm_bias` CSV row this Impl's `target_compatible` is
-// false and cuBLAS wins by default.
+// CUTLASS peer to `FusedGemmBiasImpl`. Same 2-tile `(Gemm, BiasAdd)`
+// claim; emits `cutlass_gemm_bias` (plain `cutlass::gemm::device::Gemm`
+// with `LinearCombination` epilogue, bias passed as C at ldc=0 for row
+// broadcast). One Impl per CUTLASS_TILE_ZOO entry, parameterised by
+// `(tile_m, tile_n, stages)`; per-tile `target_compatible` gates on
+// calibrated CSV row presence so the DP picks the best tile per
+// (workload M, weight N, K) bucket.
 
-#[derive(Debug, Default)]
-pub struct CutlassFusedGemmBiasImpl;
+#[derive(Debug, Clone)]
+pub struct CutlassFusedGemmBiasImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedGemmBiasImpl {
+    fn csv_name(&self) -> &'static str {
+        self.static_name()
+    }
+
+    fn static_name(&self) -> &'static str {
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_gemm_bias_16x64_s3",
+            (16, 64, 4) => "cutlass_gemm_bias_16x64_s4",
+            (16, 128, 3) => "cutlass_gemm_bias_16x128_s3",
+            (16, 128, 4) => "cutlass_gemm_bias_16x128_s4",
+            (32, 64, 3) => "cutlass_gemm_bias_32x64_s3",
+            (32, 64, 4) => "cutlass_gemm_bias_32x64_s4",
+            (32, 128, 3) => "cutlass_gemm_bias_32x128_s3",
+            (32, 128, 4) => "cutlass_gemm_bias_32x128_s4",
+            (32, 256, 3) => "cutlass_gemm_bias_32x256_s3",
+            (64, 64, 3) => "cutlass_gemm_bias_64x64_s3",
+            (64, 64, 4) => "cutlass_gemm_bias_64x64_s4",
+            (64, 128, 3) => "cutlass_gemm_bias_64x128_s3",
+            (64, 128, 4) => "cutlass_gemm_bias_64x128_s4",
+            (128, 64, 3) => "cutlass_gemm_bias_128x64_s3",
+            (128, 64, 4) => "cutlass_gemm_bias_128x64_s4",
+            (128, 128, 3) => "cutlass_gemm_bias_128x128_s3",
+            (128, 128, 4) => "cutlass_gemm_bias_128x128_s4",
+            (128, 256, 3) => "cutlass_gemm_bias_128x256_s3",
+            (256, 64, 3) => "cutlass_gemm_bias_256x64_s3",
+            (256, 64, 4) => "cutlass_gemm_bias_256x64_s4",
+            _ => "cutlass_gemm_bias_unknown",
+        }
+    }
+}
 
 impl Implementation for CutlassFusedGemmBiasImpl {
     fn name(&self) -> &'static str {
-        "cutlass_fused_gemm_bias"
+        self.static_name()
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile.cost_table.has_kernel("cutlass_fused_gemm_bias")
+        profile.cost_table.has_kernel(self.csv_name())
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
@@ -2271,7 +2325,7 @@ impl Implementation for CutlassFusedGemmBiasImpl {
             return f64::INFINITY;
         };
         ctx.profile
-            .cost_us_for("cutlass_fused_gemm_bias", mm, nn, kk)
+            .cost_us_for(self.csv_name(), mm, nn, kk)
             .unwrap_or(UNCALIBRATED_COST_US)
     }
 
@@ -2318,10 +2372,10 @@ impl Implementation for CutlassFusedGemmBiasImpl {
 
     // ── Host-interpreter codegen ────────────────────────────────
     //
-    // Variant `CutlassFusedGemmBias { in_slot, out_slot, layer, weight_fn }`.
-    // Same shape as `FusedGemmBias` but a separate variant ident — the
-    // arm body calls `cutlass_gemm_bias` directly (CUTLASS EVT with
-    // row-broadcast bias load) instead of `LinearLayer::forward`.
+    // Variant `CutlassFusedGemmBias { in_slot, out_slot, layer,
+    // weight_fn, tile_m, tile_n, stages, n, k }`. All zoo entries
+    // share this variant — tile config rides as runtime fields. The
+    // arm body calls `cutlass_gemm_bias(..., CutlassTile::new(...))`.
 
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
@@ -2336,6 +2390,11 @@ impl Implementation for CutlassFusedGemmBiasImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -2345,7 +2404,7 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let gemm_id = *m
@@ -2374,6 +2433,11 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("CutlassFusedGemmBias: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassFusedGemmBias", proc_macro2::Span::call_site()),
             vec![
@@ -2381,6 +2445,11 @@ impl Implementation for CutlassFusedGemmBiasImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }
@@ -2923,6 +2992,233 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
     }
 }
 
+// ── CutlassFusedGateUpGeluMulImpl ────────────────────────────────
+//
+// CUTLASS peer to [`FusedGateUpGeluMulImpl`]. Mirrors the cuBLAS
+// peer's structure exactly: ONE packed CUTLASS GEMM at (M, 2I, K)
+// producing a `[M, 2I]` intermediate buffer, then a BW-bound
+// `gelu_and_mul_fused` elementwise pass producing `[M, I]`. Tile is
+// parameterised so the DP picks the best CUTLASS tile per (M, 2I, K)
+// — one Impl per CUTLASS_TILE_ZOO entry.
+//
+// This is structurally NOT the EVT 2-GEMM design used by
+// `CutlassFusedGateUpSiluMulImpl`; that design wins for BW-bound
+// shapes (small M, modest I/H — granite, llama-1b) but loses for
+// compute-bound shapes (gemma2/gemma3 MLPs). The packed approach is
+// faithful to the cuBLAS peer and wins iff
+// `cutlass_<tile>(M, 2I, K) < cublas(M, 2I, K)`.
+
+#[derive(Debug, Clone)]
+pub struct CutlassFusedGateUpGeluMulImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedGateUpGeluMulImpl {
+    fn csv_name(&self) -> &'static str {
+        // Reuses the standalone CutlassGemm tile names — the GEMM
+        // step is an ordinary cutlass_<TM>x<TN>_s<S> at packed N=2I.
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_16x64_s3",
+            (16, 64, 4) => "cutlass_16x64_s4",
+            (16, 128, 3) => "cutlass_16x128_s3",
+            (16, 128, 4) => "cutlass_16x128_s4",
+            (32, 64, 3) => "cutlass_32x64_s3",
+            (32, 64, 4) => "cutlass_32x64_s4",
+            (32, 128, 3) => "cutlass_32x128_s3",
+            (32, 128, 4) => "cutlass_32x128_s4",
+            (32, 256, 3) => "cutlass_32x256_s3",
+            (64, 64, 3) => "cutlass_64x64_s3",
+            (64, 64, 4) => "cutlass_64x64_s4",
+            (64, 128, 3) => "cutlass_64x128_s3",
+            (64, 128, 4) => "cutlass_64x128_s4",
+            (128, 64, 3) => "cutlass_128x64_s3",
+            (128, 64, 4) => "cutlass_128x64_s4",
+            (128, 128, 3) => "cutlass_128x128_s3",
+            (128, 128, 4) => "cutlass_128x128_s4",
+            (128, 256, 3) => "cutlass_128x256_s3",
+            (256, 64, 3) => "cutlass_256x64_s3",
+            (256, 64, 4) => "cutlass_256x64_s4",
+            _ => "cutlass_unknown",
+        }
+    }
+}
+
+impl Implementation for CutlassFusedGateUpGeluMulImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Same 4-tile (Gemm, Gemm, Gelu, Mul) claim as cuBLAS peer.
+        FusedGateUpGeluMulImpl.matches(fuf, seed, profile)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same cost shape as FusedGateUpGeluMulImpl (cuBLAS peer):
+        //   - one GEMM at packed (M, 2I, K)
+        //   - one BW-bound gelu_and_mul_fused over [M, 2I] → [M, I]
+        // Difference: the GEMM is a calibrated cutlass_<tile> row,
+        // not cublas. The BW-bound piece is identical → comparison
+        // reduces to cutlass_<tile>(M, 2I, K) vs cublas(M, 2I, K).
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
+        let packed_n = 2u32.saturating_mul(intermediate);
+
+        // Reject shapes that this tile can't profitably handle:
+        // packed_n must be a multiple of tile_n (alignment), and the
+        // CSV must have a calibrated row at (M, 2I, K).
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), num_tokens, packed_n, hidden)
+            .unwrap_or(UNCALIBRATED_COST_US);
+
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
+        let elem_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+
+        let _ = m; // claim shape is constant; cost is workload-driven
+        gemm_us + elem_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedGateUpGeluMulImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedGateUpGeluMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("packed_n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let gelu_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gelu)
+            .expect("CutlassFusedGateUpGeluMul: claim contains Gelu");
+        let mul_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("CutlassFusedGateUpGeluMul: claim contains Mul");
+        let gate_id = match fuf.get(gelu_id).inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            other => panic!(
+                "CutlassFusedGateUpGeluMul: Gelu's first input must be a Tile (got {other:?})"
+            ),
+        };
+        let gate_node = fuf.get(gate_id);
+        let (in_id, in_slot) = match gate_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedGateUpGeluMul: gate gemm's first input must be a Tile (got {other:?})"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(mul_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("CutlassFusedGateUpGeluMul: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+
+        // Bake (packed_n=2I, k=H) into the Instruction for the runtime
+        // assert_weight_shape check. Use the gate Gemm's K and 2× the
+        // gate's N; both are static per FUF + bounds.
+        let (gate_n, k) = gemm_nk_from_fuf(fuf, gate_node, bounds)
+            .expect("CutlassFusedGateUpGeluMul: gate (N, K) must resolve from FUF + bounds");
+        let packed_n = gate_n.saturating_mul(2);
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("CutlassFusedGateUpGeluMul", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #packed_n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
 /// Return the `cos_sin_cache` TokenStream for a rope-related tile.
 /// Checks whether the tile (or any tile in `claimed`) carries an
 /// `ExternKind::RotaryLocal` input; if so emits `wm.rotary_local`,
@@ -3022,25 +3318,45 @@ impl Implementation for FusedGateUpGeluMulImpl {
     }
 
     fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Same cost shape as SwiGLU: fused [M × 2I × H] GEMM + a
-        // bandwidth-bound [M, 2I] → [M, I] elementwise pass.
-        let num_tokens = ctx.num_tokens() as f64;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
-        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
-        let flops = 2.0 * num_tokens * (2.0 * intermediate) * hidden;
-        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
-        let gemm_us = if peak > 0.0 && flops > 0.0 {
-            (flops / peak) * 1e6
-        } else {
-            0.0
-        };
+        // Cost = one cuBLAS GEMM at packed (M, 2I, K) + one elementwise
+        // gelu_and_mul pass over [M, 2I] → [M, I].
+        //
+        // Read measured cublas cost from the calibration CSV (predictor
+        // linreg-extrapolates when the exact (M, 2I, K) row isn't
+        // sampled). Fall back to peak-FLOPS roofline only when the
+        // predictor has no signal at all — keeps this Impl on the same
+        // measurement scale as `CutlassFusedGateUpGeluMulImpl`, which
+        // sums measured cutlass CSV rows. This is the GELU twin of the
+        // silu fix in commit 4a67304ec; without it the DP saw a wildly
+        // optimistic roofline cuBLAS path (~8× faster than reality)
+        // and never picked the CUTLASS sibling.
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
+        let packed_n = 2u32.saturating_mul(intermediate);
+
+        let gemm_us = ctx
+            .profile
+            .cost_us_for("cublas", num_tokens, packed_n, hidden)
+            .unwrap_or_else(|| {
+                let flops = 2.0 * (num_tokens as f64) * (packed_n as f64) * (hidden as f64);
+                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+                if peak > 0.0 && flops > 0.0 {
+                    (flops / peak) * 1e6
+                } else {
+                    0.0
+                }
+            });
+
+        // Bandwidth-bound gelu*mul: read 2*M*I, write M*I, bf16 = 2 B.
         let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * num_tokens * intermediate * BYTES_PER_ELEM;
+        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
         let act_mul_us = if bw_gb > 0.0 {
             (bytes / (bw_gb * 1e9)) * 1e6
         } else {
             0.0
         };
+
         gemm_us + act_mul_us
     }
 

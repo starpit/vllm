@@ -515,13 +515,27 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::CutlassFusedGemmBias(in_slot, out_slot, layer, _wf) => (
+            Instruction::CutlassFusedGemmBias(
+                in_slot,
+                out_slot,
+                layer,
+                _wf,
+                tile_m,
+                tile_n,
+                stages,
+                n,
+                k,
+            ) => (
                 "CutlassFusedGemmBias",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("LinearLayer"),
+                    F::ConstU32(tile_m),
+                    F::ConstU32(tile_n),
+                    F::ConstU32(stages),
+                    F::WeightShape { n, k },
                 ],
             ),
             Instruction::CutlassFusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
@@ -531,6 +545,29 @@ impl<W> Instruction<W> {
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("LinearLayer"),
+                ],
+            ),
+            Instruction::CutlassFusedGateUpGeluMul(
+                in_slot,
+                out_slot,
+                layer,
+                _wf,
+                tile_m,
+                tile_n,
+                stages,
+                packed_n,
+                k,
+            ) => (
+                "CutlassFusedGateUpGeluMul",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                    F::ConstU32(tile_m),
+                    F::ConstU32(tile_n),
+                    F::ConstU32(stages),
+                    F::WeightShape { n: packed_n, k },
                 ],
             ),
             Instruction::MarlinGemm(in_slot, out_slot, layer, _wf) => (

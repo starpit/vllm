@@ -32,7 +32,17 @@ use ferrite_kernels::cutlass::{
     cutlass_gemm_128x128_s3_launch, cutlass_gemm_128x128_s4_launch,
     cutlass_gemm_128x128_s4_sk2_launch, cutlass_gemm_128x128_s4_sk4_launch,
     cutlass_gemm_128x128_s4_sk8_launch, cutlass_gemm_128x256_s3_launch,
-    cutlass_gemm_256x64_s3_launch, cutlass_gemm_256x64_s4_launch, cutlass_gemm_bias_launch,
+    cutlass_gemm_256x64_s3_launch, cutlass_gemm_256x64_s4_launch,
+    cutlass_gemm_bias_16x64_s3_launch, cutlass_gemm_bias_16x64_s4_launch,
+    cutlass_gemm_bias_16x128_s3_launch, cutlass_gemm_bias_16x128_s4_launch,
+    cutlass_gemm_bias_32x64_s3_launch, cutlass_gemm_bias_32x64_s4_launch,
+    cutlass_gemm_bias_32x128_s3_launch, cutlass_gemm_bias_32x128_s4_launch,
+    cutlass_gemm_bias_32x256_s3_launch, cutlass_gemm_bias_64x64_s3_launch,
+    cutlass_gemm_bias_64x64_s4_launch, cutlass_gemm_bias_64x128_s3_launch,
+    cutlass_gemm_bias_64x128_s4_launch, cutlass_gemm_bias_128x64_s3_launch,
+    cutlass_gemm_bias_128x64_s4_launch, cutlass_gemm_bias_128x128_s3_launch,
+    cutlass_gemm_bias_128x128_s4_launch, cutlass_gemm_bias_128x256_s3_launch,
+    cutlass_gemm_bias_256x64_s3_launch, cutlass_gemm_bias_256x64_s4_launch,
     cutlass_gemm_silu_mul_launch, cutlass_gemv_launch,
 };
 
@@ -214,6 +224,21 @@ const NK_SHAPES: &[(u32, u32)] = &[
     (1024, 2048), // qwen3-1.7b k/v: num_kv=8, head_dim=128
     (1024, 2560), // qwen3-4b / gemma3-4b k/v
     (1024, 4096), // granite-3.1-8b / qwen3-8b k/v
+    // ── Packed gate-up shapes (N = 2 × intermediate_size) ──
+    //
+    // Required by `CutlassFusedGateUpGeluMulImpl` (and the cuBLAS
+    // peer's `gemm_us` lookup) for arches that pack [gate|up] into
+    // one weight tensor and emit a single GEMM at packed N. Gemma is
+    // the GELU-MLP arch family in the fleet today; silu models use
+    // the EVT 2-GEMM `CutlassFusedGateUpSiluMul` path so don't need
+    // packed-N rows here.
+    (13824, 1152), // gemma3-1b: 2 × 6912 @ H=1152
+    (20480, 2560), // gemma3-4b: 2 × 10240 @ H=2560
+    (30720, 3840), // gemma3-12b: 2 × 15360 @ H=3840
+    (43008, 5376), // gemma3-27b: 2 × 21504 @ H=5376
+    (18432, 2304), // gemma2-2b: 2 × 9216 @ H=2304
+    (28672, 3584), // gemma2-9b: 2 × 14336 @ H=3584
+    (73728, 4608), // gemma2-27b: 2 × 36864 @ H=4608
 ];
 
 /// `num_tokens` grid — matches the solver's default workload sweep.
@@ -489,25 +514,51 @@ fn bench_one_shape(
         .max(0.0);
     println!("cutlass_fused_gate_up_silu_mul,{m},{n},{k},{us:.1}");
 
-    // ── CUTLASS fused GEMM + bias (EVT row-broadcast) ──
+    // ── CUTLASS GEMM + bias zoo (ldc=0 row broadcast) ──
     //
-    // Picked by `CutlassFusedGemmBiasImpl`. Kernel writes
-    // D[M,N] = A @ B^T + bias[N] in one launch; bias is [N] bf16.
+    // One row per tile per workload, mirroring `bench_cutlass!`.
+    // Picked by `CutlassFusedGemmBiasImpl{tile_m, tile_n, stages}`;
+    // DP picks per (M, N, K). Kernel writes D[M,N] = A @ B^T + bias[N]
+    // in one launch via plain `cutlass::gemm::device::Gemm` with
+    // `LinearCombination` epilogue and bias passed as the C operand
+    // at stride 0.
     let bias_n = gpu_alloc_zeros(n as usize * 2);
-    let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
-        cutlass_gemm_bias_launch(
-            c as *mut u16,
-            a as *const u16,
-            b as *const u16,
-            bias_n as *const u16,
-            m_i,
-            n_i,
-            k_i,
-            stream as u64,
-        );
-    }) - launch_overhead_us)
-        .max(0.0);
-    println!("cutlass_fused_gemm_bias,{m},{n},{k},{us:.1}");
+    macro_rules! bench_cutlass_bias {
+        ($($name:literal => $fn:ident),* $(,)?) => {
+            $(
+                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                    $fn(
+                        c as *mut u16, a as *const u16, b as *const u16,
+                        bias_n as *const u16,
+                        m_i, n_i, k_i, stream as u64,
+                    );
+                }) - launch_overhead_us).max(0.0);
+                println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
+            )*
+        };
+    }
+    bench_cutlass_bias!(
+        "cutlass_gemm_bias_16x64_s3"   => cutlass_gemm_bias_16x64_s3_launch,
+        "cutlass_gemm_bias_16x64_s4"   => cutlass_gemm_bias_16x64_s4_launch,
+        "cutlass_gemm_bias_16x128_s3"  => cutlass_gemm_bias_16x128_s3_launch,
+        "cutlass_gemm_bias_16x128_s4"  => cutlass_gemm_bias_16x128_s4_launch,
+        "cutlass_gemm_bias_32x64_s3"   => cutlass_gemm_bias_32x64_s3_launch,
+        "cutlass_gemm_bias_32x64_s4"   => cutlass_gemm_bias_32x64_s4_launch,
+        "cutlass_gemm_bias_32x128_s3"  => cutlass_gemm_bias_32x128_s3_launch,
+        "cutlass_gemm_bias_32x128_s4"  => cutlass_gemm_bias_32x128_s4_launch,
+        "cutlass_gemm_bias_32x256_s3"  => cutlass_gemm_bias_32x256_s3_launch,
+        "cutlass_gemm_bias_64x64_s3"   => cutlass_gemm_bias_64x64_s3_launch,
+        "cutlass_gemm_bias_64x64_s4"   => cutlass_gemm_bias_64x64_s4_launch,
+        "cutlass_gemm_bias_64x128_s3"  => cutlass_gemm_bias_64x128_s3_launch,
+        "cutlass_gemm_bias_64x128_s4"  => cutlass_gemm_bias_64x128_s4_launch,
+        "cutlass_gemm_bias_128x64_s3"  => cutlass_gemm_bias_128x64_s3_launch,
+        "cutlass_gemm_bias_128x64_s4"  => cutlass_gemm_bias_128x64_s4_launch,
+        "cutlass_gemm_bias_128x128_s3" => cutlass_gemm_bias_128x128_s3_launch,
+        "cutlass_gemm_bias_128x128_s4" => cutlass_gemm_bias_128x128_s4_launch,
+        "cutlass_gemm_bias_128x256_s3" => cutlass_gemm_bias_128x256_s3_launch,
+        "cutlass_gemm_bias_256x64_s3"  => cutlass_gemm_bias_256x64_s3_launch,
+        "cutlass_gemm_bias_256x64_s4"  => cutlass_gemm_bias_256x64_s4_launch,
+    );
 
     unsafe {
         sys::cuMemFree_v2(a);

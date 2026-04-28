@@ -148,8 +148,9 @@ pub enum Instruction<W> {
     ),
     CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
-    CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
+    CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
+    CutlassFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     MarlinGemm(u32, u32, u32, WtFn<W, MarlinLinear>),
     MarlinFusedGateUpSiluMul(u32, u32, u32, WtFn<W, MarlinLinear>),
     MarlinFusedGateUpGeluMul(u32, u32, u32, WtFn<W, MarlinLinear>),
@@ -1117,10 +1118,21 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::CutlassFusedGemmBias(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::CutlassFusedGemmBias(
+                in_slot,
+                out_slot,
+                layer,
+                weight_fn,
+                tile_m,
+                tile_n,
+                stages,
+                n,
+                k,
+            ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassFusedGemmBias", w.dense_weight(), n, k);
                 let bias = w.dense_bias().expect(
                     "CutlassFusedGemmBias: LinearLayer has no bias — check safetensors path",
                 );
@@ -1128,6 +1140,7 @@ impl<W: CanonicalParams> Instruction<W> {
                     *v,
                     w.dense_weight(),
                     bias,
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -1151,6 +1164,41 @@ impl<W: CanonicalParams> Instruction<W> {
                     *v,
                     gate_w,
                     up_out,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::CutlassFusedGateUpGeluMul(
+                in_slot,
+                out_slot,
+                layer,
+                weight_fn,
+                tile_m,
+                tile_n,
+                stages,
+                packed_n,
+                k,
+            ) => unsafe {
+                // Mirrors the cuBLAS-peer FusedGateUpGeluMul:
+                //   1. ONE GEMM at packed (M, 2I, K) → [M, 2I] intermediate
+                //   2. gelu_and_mul_fused over [M, 2I] → [M, I]
+                // The GEMM here is a calibrated CUTLASS standalone tile
+                // instead of cuBLAS; the elementwise step is identical.
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassFusedGateUpGeluMul", w.dense_weight(), packed_n, k);
+                let gate_up = cutlass::cutlass_gemm(
+                    *v,
+                    w.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let out = kernels::gelu_and_mul_fused(
+                    *gate_up,
+                    W::INTERMEDIATE_SIZE,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );

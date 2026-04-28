@@ -1141,9 +1141,11 @@ fn emit_arch_dispatcher(
         .map(|a| {
             let model_ident = &a.model_ident;
             let stem_lit = proc_macro2::Literal::string(&a.source_stem);
+            let tp_lit = proc_macro2::Literal::u8_unsuffixed(a.tp_world_size);
             quote! {
                 ::ferrite_forward::VariantDump {
                     variant_stem: #stem_lit,
+                    tp_world_size: #tp_lit,
                     buckets: #model_ident::dump(),
                 }
             }

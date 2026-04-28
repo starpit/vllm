@@ -7,6 +7,19 @@ license.workspace = true
 [lib]
 proc-macro = true
 
+[features]
+default = []
+# Tensor-parallel fanout. When any consumer crate forwards its `nccl`
+# feature into `ferrite-forward-macro/nccl` (every per-arch crate
+# does — see their `nccl = [..., "ferrite-forward-macro/nccl"]`),
+# `compile()` fans out the outer loop over the compile-time set
+# `{1, 2, 4, 8}` and emits per-(variant, tp) modules. Without this
+# feature the macro emits tp=1 only — byte-identical to single-rank
+# builds. Cargo recompiles the macro per-feature-set, so consumers
+# without nccl still get the fast tp=1-only macro and consumers with
+# it get the full fanout — no cross-talk.
+nccl = []
+
 [dependencies]
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

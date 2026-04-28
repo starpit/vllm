@@ -40,36 +40,24 @@ pub struct CostCtx<'a> {
     pub bounds: &'a BTreeMap<String, u64>,
 }
 
-/// Evaluate a `Dim` to a concrete integer using `bounds`. Free
-/// function so non-`CostCtx` callers (e.g. `fan_out`, which only has
-/// `fuf + bounds`) can reuse it without round-tripping through a
-/// CostCtx instance.
-pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
-    match dim {
-        Dim::Lit(n) => Some(*n),
-        Dim::Bound(name) => bounds.get(name).copied(),
-        Dim::Mul(cs) => cs
-            .iter()
-            .map(|c| eval_dim_with(c, bounds))
-            .try_fold(1u64, |acc, v| v.map(|x| acc.saturating_mul(x))),
-        Dim::Var(_) => None,
-    }
-}
-
-pub fn eval_shape_with(shape: &Shape, bounds: &BTreeMap<String, u64>) -> Option<Vec<u64>> {
-    shape.iter().map(|d| eval_dim_with(d, bounds)).collect()
-}
-
 impl CostCtx<'_> {
     /// Evaluate a `Dim` to a concrete integer using `bounds`.
     /// Returns `None` if the dim contains a Var (should not happen
     /// for the standard body after shape inference closes).
     pub fn eval_dim(&self, dim: &Dim) -> Option<u64> {
-        eval_dim_with(dim, self.bounds)
+        match dim {
+            Dim::Lit(n) => Some(*n),
+            Dim::Bound(name) => self.bounds.get(name).copied(),
+            Dim::Mul(cs) => cs
+                .iter()
+                .map(|c| self.eval_dim(c))
+                .try_fold(1u64, |acc, v| v.map(|x| acc.saturating_mul(x))),
+            Dim::Var(_) => None,
+        }
     }
 
     pub fn eval_shape(&self, shape: &Shape) -> Option<Vec<u64>> {
-        eval_shape_with(shape, self.bounds)
+        shape.iter().map(|d| self.eval_dim(d)).collect()
     }
 
     /// Convenience: read `num_tokens` from bounds. Panics if not
@@ -1525,8 +1513,6 @@ impl Implementation for GemmRefImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
-                ("n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -1536,7 +1522,7 @@ impl Implementation for GemmRefImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        bounds: &BTreeMap<String, u64>,
+        _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -1557,8 +1543,6 @@ impl Implementation for GemmRefImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
-            .expect("Gemm: weight (N, K) must resolve from FUF + bounds at fan_out time");
         Some(vec![OpInstance::new(
             syn::Ident::new("Gemm", proc_macro2::Span::call_site()),
             vec![
@@ -1566,8 +1550,6 @@ impl Implementation for GemmRefImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
-                quote! { #n },
-                quote! { #k },
             ],
         )])
     }
@@ -1832,40 +1814,33 @@ pub fn starter_library() -> ImplementationLibrary {
     // a lone affine-transform gemm that's not a QKV-pre-rope or
     // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
     lib.push(Box::new(FusedGemmBiasImpl));
-    // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
-    // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
-    // and bias passed as the C operand at ldc=0 (row broadcast). One
-    // Impl per CUTLASS_TILE_ZOO entry, gated per-tile on calibrated
-    // CSV row presence; the DP picks the best tile per workload.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedGemmBiasImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-    }
+    // CUTLASS EVT peer to FusedGemmBiasImpl; bias folded into the
+    // GEMM epilogue via row-broadcast visitor. `target_compatible`
+    // gates on the `cutlass_fused_gemm_bias` CSV row.
+    lib.push(Box::new(CutlassFusedGemmBiasImpl));
     lib.push(Box::new(FusedGateUpSiluMulImpl));
     // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
     // kernel shape. Solver's DP picks whichever has lower calibrated
     // cost per bucket; `target_compatible` gates on CSV row presence.
     lib.push(Box::new(CutlassFusedGateUpSiluMulImpl));
     lib.push(Box::new(FusedGateUpGeluMulImpl));
-    // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
-    // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
-    // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
-    // 2I, K) bucket. One Impl per CUTLASS_TILE_ZOO entry.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-    }
     lib.push(Box::new(FusedAddRmsNormImpl));
     // Singleton fallback for residual `Add`s whose downstream is not
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
     // adds before any LayerNorm. Emits `add_inplace`.
     lib.push(Box::new(AddRefImpl));
+    // Tensor-parallel all-reduce-sum: the only matcher for
+    // `OpKind::AllReduce` nodes the lowering pass inserts after every
+    // row-parallel gemm at tp>1. At tp=1 this Impl is a no-op (no
+    // FUF carries AllReduce), so it's free in the solver.
+    lib.push(Box::new(AllReduceImpl));
+    // Tensor-parallel all-gather along the last dim: the only matcher
+    // for `OpKind::AllGather` nodes the lowering pass inserts after
+    // the lm_head Gemm at tp>1 (lm_head is vocab-parallel ShardDim0).
+    // Output slot is fresh (last dim grows by tp_world_size), so the
+    // default `output_alias = None` applies — coloring picks a separate
+    // slot from the input. At tp=1 this Impl is a no-op.
+    lib.push(Box::new(AllGatherImpl));
     // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
     // + RmsNorm. Claimed by the DP in preference to the 2-tile
     // FusedAddRmsNorm + standalone ScalarOffset because it's a
@@ -2270,60 +2245,25 @@ impl Implementation for FusedGemmBiasImpl {
 
 // ── CutlassFusedGemmBiasImpl ─────────────────────────────────────
 //
-// CUTLASS peer to `FusedGemmBiasImpl`. Same 2-tile `(Gemm, BiasAdd)`
-// claim; emits `cutlass_gemm_bias` (plain `cutlass::gemm::device::Gemm`
-// with `LinearCombination` epilogue, bias passed as C at ldc=0 for row
-// broadcast). One Impl per CUTLASS_TILE_ZOO entry, parameterised by
-// `(tile_m, tile_n, stages)`; per-tile `target_compatible` gates on
-// calibrated CSV row presence so the DP picks the best tile per
-// (workload M, weight N, K) bucket.
+// CUTLASS EVT peer to `FusedGemmBiasImpl`. Same 2-tile
+// `(Gemm, BiasAdd)` claim and same single `LinearLayer` accessor —
+// only the emitted kernel differs: the cuBLAS variant dispatches to
+// `LinearLayer::forward` (which uses `gemm_bias` epilog), while this
+// one calls `cutlass_gemm_bias` (CUTLASS EVT with row-broadcast bias
+// load in the epilogue). DP picks by cost; until the sweep populates
+// the `cutlass_gemm_bias` CSV row this Impl's `target_compatible` is
+// false and cuBLAS wins by default.
 
-#[derive(Debug, Clone)]
-pub struct CutlassFusedGemmBiasImpl {
-    pub tile_m: u32,
-    pub tile_n: u32,
-    pub stages: u32,
-}
-
-impl CutlassFusedGemmBiasImpl {
-    fn csv_name(&self) -> &'static str {
-        self.static_name()
-    }
-
-    fn static_name(&self) -> &'static str {
-        match (self.tile_m, self.tile_n, self.stages) {
-            (16, 64, 3) => "cutlass_gemm_bias_16x64_s3",
-            (16, 64, 4) => "cutlass_gemm_bias_16x64_s4",
-            (16, 128, 3) => "cutlass_gemm_bias_16x128_s3",
-            (16, 128, 4) => "cutlass_gemm_bias_16x128_s4",
-            (32, 64, 3) => "cutlass_gemm_bias_32x64_s3",
-            (32, 64, 4) => "cutlass_gemm_bias_32x64_s4",
-            (32, 128, 3) => "cutlass_gemm_bias_32x128_s3",
-            (32, 128, 4) => "cutlass_gemm_bias_32x128_s4",
-            (32, 256, 3) => "cutlass_gemm_bias_32x256_s3",
-            (64, 64, 3) => "cutlass_gemm_bias_64x64_s3",
-            (64, 64, 4) => "cutlass_gemm_bias_64x64_s4",
-            (64, 128, 3) => "cutlass_gemm_bias_64x128_s3",
-            (64, 128, 4) => "cutlass_gemm_bias_64x128_s4",
-            (128, 64, 3) => "cutlass_gemm_bias_128x64_s3",
-            (128, 64, 4) => "cutlass_gemm_bias_128x64_s4",
-            (128, 128, 3) => "cutlass_gemm_bias_128x128_s3",
-            (128, 128, 4) => "cutlass_gemm_bias_128x128_s4",
-            (128, 256, 3) => "cutlass_gemm_bias_128x256_s3",
-            (256, 64, 3) => "cutlass_gemm_bias_256x64_s3",
-            (256, 64, 4) => "cutlass_gemm_bias_256x64_s4",
-            _ => "cutlass_gemm_bias_unknown",
-        }
-    }
-}
+#[derive(Debug, Default)]
+pub struct CutlassFusedGemmBiasImpl;
 
 impl Implementation for CutlassFusedGemmBiasImpl {
     fn name(&self) -> &'static str {
-        self.static_name()
+        "cutlass_fused_gemm_bias"
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile.cost_table.has_kernel(self.csv_name())
+        profile.cost_table.has_kernel("cutlass_fused_gemm_bias")
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
@@ -2343,7 +2283,7 @@ impl Implementation for CutlassFusedGemmBiasImpl {
             return f64::INFINITY;
         };
         ctx.profile
-            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .cost_us_for("cutlass_fused_gemm_bias", mm, nn, kk)
             .unwrap_or(UNCALIBRATED_COST_US)
     }
 
@@ -2390,10 +2330,10 @@ impl Implementation for CutlassFusedGemmBiasImpl {
 
     // ── Host-interpreter codegen ────────────────────────────────
     //
-    // Variant `CutlassFusedGemmBias { in_slot, out_slot, layer,
-    // weight_fn, tile_m, tile_n, stages, n, k }`. All zoo entries
-    // share this variant — tile config rides as runtime fields. The
-    // arm body calls `cutlass_gemm_bias(..., CutlassTile::new(...))`.
+    // Variant `CutlassFusedGemmBias { in_slot, out_slot, layer, weight_fn }`.
+    // Same shape as `FusedGemmBias` but a separate variant ident — the
+    // arm body calls `cutlass_gemm_bias` directly (CUTLASS EVT with
+    // row-broadcast bias load) instead of `LinearLayer::forward`.
 
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
@@ -2408,11 +2348,6 @@ impl Implementation for CutlassFusedGemmBiasImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
-                ("tile_m", syn::parse_quote!(u32)),
-                ("tile_n", syn::parse_quote!(u32)),
-                ("stages", syn::parse_quote!(u32)),
-                ("n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -2422,7 +2357,7 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        bounds: &BTreeMap<String, u64>,
+        _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let gemm_id = *m
@@ -2451,11 +2386,6 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let tile_m = self.tile_m;
-        let tile_n = self.tile_n;
-        let stages = self.stages;
-        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
-            .expect("CutlassFusedGemmBias: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassFusedGemmBias", proc_macro2::Span::call_site()),
             vec![
@@ -2463,11 +2393,6 @@ impl Implementation for CutlassFusedGemmBiasImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
             ],
         )])
     }
@@ -2633,39 +2558,24 @@ impl Implementation for FusedGateUpSiluMulImpl {
     }
 
     fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Cost = one cuBLAS GEMM at packed (M, 2I, K) + one elementwise
-        // silu_mul pass over [M, 2I] producing [M, I].
-        //
-        // Read measured cublas cost from the calibration CSV (the
-        // predictor linreg-extrapolates when the exact (M, 2I, K) row
-        // isn't sampled). Fall back to peak-FLOPS roofline only when
-        // the predictor has no signal at all — keeps this Impl on the
-        // same measurement scale as `CutlassFusedGateUpSiluMulImpl`,
-        // which sums measured cutlass CSV rows. Without this parity
-        // the DP saw a wildly optimistic cuBLAS path (8× faster than
-        // reality at llama-7b prefill) and never picked the CUTLASS
-        // sibling.
-        let num_tokens = ctx.num_tokens() as u32;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
-        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
-        let packed_n = 2u32.saturating_mul(intermediate);
+        // Cost = one fused GEMM (M × 2I × H) + one elementwise pass
+        // over the packed [M, 2I] buffer producing [M, I].
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
 
-        let gemm_us = ctx
-            .profile
-            .cost_us_for("cublas", num_tokens, packed_n, hidden)
-            .unwrap_or_else(|| {
-                let flops = 2.0 * (num_tokens as f64) * (packed_n as f64) * (hidden as f64);
-                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
-                if peak > 0.0 && flops > 0.0 {
-                    (flops / peak) * 1e6
-                } else {
-                    0.0
-                }
-            });
+        // Compute-bound GEMM.
+        let flops = 2.0 * num_tokens * (2.0 * intermediate) * hidden;
+        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+        let gemm_us = if peak > 0.0 && flops > 0.0 {
+            (flops / peak) * 1e6
+        } else {
+            0.0
+        };
 
         // Bandwidth-bound silu*mul: read 2*M*I, write M*I, bf16 = 2 B.
         let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
+        let bytes = 3.0 * num_tokens * intermediate * BYTES_PER_ELEM;
         let silu_mul_us = if bw_gb > 0.0 {
             (bytes / (bw_gb * 1e9)) * 1e6
         } else {
@@ -3010,233 +2920,6 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
     }
 }
 
-// ── CutlassFusedGateUpGeluMulImpl ────────────────────────────────
-//
-// CUTLASS peer to [`FusedGateUpGeluMulImpl`]. Mirrors the cuBLAS
-// peer's structure exactly: ONE packed CUTLASS GEMM at (M, 2I, K)
-// producing a `[M, 2I]` intermediate buffer, then a BW-bound
-// `gelu_and_mul_fused` elementwise pass producing `[M, I]`. Tile is
-// parameterised so the DP picks the best CUTLASS tile per (M, 2I, K)
-// — one Impl per CUTLASS_TILE_ZOO entry.
-//
-// This is structurally NOT the EVT 2-GEMM design used by
-// `CutlassFusedGateUpSiluMulImpl`; that design wins for BW-bound
-// shapes (small M, modest I/H — granite, llama-1b) but loses for
-// compute-bound shapes (gemma2/gemma3 MLPs). The packed approach is
-// faithful to the cuBLAS peer and wins iff
-// `cutlass_<tile>(M, 2I, K) < cublas(M, 2I, K)`.
-
-#[derive(Debug, Clone)]
-pub struct CutlassFusedGateUpGeluMulImpl {
-    pub tile_m: u32,
-    pub tile_n: u32,
-    pub stages: u32,
-}
-
-impl CutlassFusedGateUpGeluMulImpl {
-    fn csv_name(&self) -> &'static str {
-        // Reuses the standalone CutlassGemm tile names — the GEMM
-        // step is an ordinary cutlass_<TM>x<TN>_s<S> at packed N=2I.
-        match (self.tile_m, self.tile_n, self.stages) {
-            (16, 64, 3) => "cutlass_16x64_s3",
-            (16, 64, 4) => "cutlass_16x64_s4",
-            (16, 128, 3) => "cutlass_16x128_s3",
-            (16, 128, 4) => "cutlass_16x128_s4",
-            (32, 64, 3) => "cutlass_32x64_s3",
-            (32, 64, 4) => "cutlass_32x64_s4",
-            (32, 128, 3) => "cutlass_32x128_s3",
-            (32, 128, 4) => "cutlass_32x128_s4",
-            (32, 256, 3) => "cutlass_32x256_s3",
-            (64, 64, 3) => "cutlass_64x64_s3",
-            (64, 64, 4) => "cutlass_64x64_s4",
-            (64, 128, 3) => "cutlass_64x128_s3",
-            (64, 128, 4) => "cutlass_64x128_s4",
-            (128, 64, 3) => "cutlass_128x64_s3",
-            (128, 64, 4) => "cutlass_128x64_s4",
-            (128, 128, 3) => "cutlass_128x128_s3",
-            (128, 128, 4) => "cutlass_128x128_s4",
-            (128, 256, 3) => "cutlass_128x256_s3",
-            (256, 64, 3) => "cutlass_256x64_s3",
-            (256, 64, 4) => "cutlass_256x64_s4",
-            _ => "cutlass_unknown",
-        }
-    }
-}
-
-impl Implementation for CutlassFusedGateUpGeluMulImpl {
-    fn name(&self) -> &'static str {
-        self.csv_name()
-    }
-
-    fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile.cost_table.has_kernel(self.csv_name())
-    }
-
-    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
-        // Same 4-tile (Gemm, Gemm, Gelu, Mul) claim as cuBLAS peer.
-        FusedGateUpGeluMulImpl.matches(fuf, seed, profile)
-    }
-
-    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Same cost shape as FusedGateUpGeluMulImpl (cuBLAS peer):
-        //   - one GEMM at packed (M, 2I, K)
-        //   - one BW-bound gelu_and_mul_fused over [M, 2I] → [M, I]
-        // Difference: the GEMM is a calibrated cutlass_<tile> row,
-        // not cublas. The BW-bound piece is identical → comparison
-        // reduces to cutlass_<tile>(M, 2I, K) vs cublas(M, 2I, K).
-        let num_tokens = ctx.num_tokens() as u32;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
-        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
-        let packed_n = 2u32.saturating_mul(intermediate);
-
-        // Reject shapes that this tile can't profitably handle:
-        // packed_n must be a multiple of tile_n (alignment), and the
-        // CSV must have a calibrated row at (M, 2I, K).
-        let gemm_us = ctx
-            .profile
-            .cost_us_for(self.csv_name(), num_tokens, packed_n, hidden)
-            .unwrap_or(UNCALIBRATED_COST_US);
-
-        let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
-        let elem_us = if bw_gb > 0.0 {
-            (bytes / (bw_gb * 1e9)) * 1e6
-        } else {
-            0.0
-        };
-
-        let _ = m; // claim shape is constant; cost is workload-driven
-        gemm_us + elem_us
-    }
-
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
-    }
-
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
-    }
-
-    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
-    }
-
-    fn is_compute_bound(&self) -> bool {
-        true
-    }
-
-    fn required_weights(
-        &self,
-        claimed_tiles: &[TileId],
-        fuf: &Fuf,
-        program: &Program,
-    ) -> Vec<WeightAccessor> {
-        FusedGateUpGeluMulImpl.required_weights(claimed_tiles, fuf, program)
-    }
-
-    fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new(
-            "CutlassFusedGateUpGeluMul",
-            vec![
-                ("in_slot", syn::parse_quote!(u32)),
-                ("out_slot", syn::parse_quote!(u32)),
-                ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                ("tile_m", syn::parse_quote!(u32)),
-                ("tile_n", syn::parse_quote!(u32)),
-                ("stages", syn::parse_quote!(u32)),
-                ("packed_n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
-            ],
-        )
-    }
-
-    fn fan_out(
-        &self,
-        m: &MatchInfo,
-        fuf: &Fuf,
-        program: &Program,
-        bounds: &BTreeMap<String, u64>,
-        slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
-        let gelu_id = *m
-            .claimed_tiles
-            .iter()
-            .find(|t| fuf.get(**t).op == OpKind::Gelu)
-            .expect("CutlassFusedGateUpGeluMul: claim contains Gelu");
-        let mul_id = *m
-            .claimed_tiles
-            .iter()
-            .find(|t| fuf.get(**t).op == OpKind::Mul)
-            .expect("CutlassFusedGateUpGeluMul: claim contains Mul");
-        let gate_id = match fuf.get(gelu_id).inputs.first() {
-            Some(FufInput::Tile { id, .. }) => *id,
-            other => panic!(
-                "CutlassFusedGateUpGeluMul: Gelu's first input must be a Tile (got {other:?})"
-            ),
-        };
-        let gate_node = fuf.get(gate_id);
-        let (in_id, in_slot) = match gate_node.inputs.first() {
-            Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => panic!(
-                "CutlassFusedGateUpGeluMul: gate gemm's first input must be a Tile (got {other:?})"
-            ),
-        };
-        let in_slot_idx = slots.of(in_id, in_slot);
-        let out_slot_idx = slots.of(mul_id, 0);
-        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
-        let acc = accessors
-            .first()
-            .expect("CutlassFusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
-        let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-
-        // Bake (packed_n=2I, k=H) into the Instruction for the runtime
-        // assert_weight_shape check. Use the gate Gemm's K and 2× the
-        // gate's N; both are static per FUF + bounds.
-        let (gate_n, k) = gemm_nk_from_fuf(fuf, gate_node, bounds)
-            .expect("CutlassFusedGateUpGeluMul: gate (N, K) must resolve from FUF + bounds");
-        let packed_n = gate_n.saturating_mul(2);
-        let tile_m = self.tile_m;
-        let tile_n = self.tile_n;
-        let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #packed_n },
-                quote! { #k },
-            ],
-        )])
-    }
-}
-
 /// Return the `cos_sin_cache` TokenStream for a rope-related tile.
 /// Checks whether the tile (or any tile in `claimed`) carries an
 /// `ExternKind::RotaryLocal` input; if so emits `wm.rotary_local`,
@@ -3336,45 +3019,25 @@ impl Implementation for FusedGateUpGeluMulImpl {
     }
 
     fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Cost = one cuBLAS GEMM at packed (M, 2I, K) + one elementwise
-        // gelu_and_mul pass over [M, 2I] → [M, I].
-        //
-        // Read measured cublas cost from the calibration CSV (predictor
-        // linreg-extrapolates when the exact (M, 2I, K) row isn't
-        // sampled). Fall back to peak-FLOPS roofline only when the
-        // predictor has no signal at all — keeps this Impl on the same
-        // measurement scale as `CutlassFusedGateUpGeluMulImpl`, which
-        // sums measured cutlass CSV rows. This is the GELU twin of the
-        // silu fix in commit 4a67304ec; without it the DP saw a wildly
-        // optimistic roofline cuBLAS path (~8× faster than reality)
-        // and never picked the CUTLASS sibling.
-        let num_tokens = ctx.num_tokens() as u32;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
-        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
-        let packed_n = 2u32.saturating_mul(intermediate);
-
-        let gemm_us = ctx
-            .profile
-            .cost_us_for("cublas", num_tokens, packed_n, hidden)
-            .unwrap_or_else(|| {
-                let flops = 2.0 * (num_tokens as f64) * (packed_n as f64) * (hidden as f64);
-                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
-                if peak > 0.0 && flops > 0.0 {
-                    (flops / peak) * 1e6
-                } else {
-                    0.0
-                }
-            });
-
-        // Bandwidth-bound gelu*mul: read 2*M*I, write M*I, bf16 = 2 B.
+        // Same cost shape as SwiGLU: fused [M × 2I × H] GEMM + a
+        // bandwidth-bound [M, 2I] → [M, I] elementwise pass.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as f64;
+        let flops = 2.0 * num_tokens * (2.0 * intermediate) * hidden;
+        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+        let gemm_us = if peak > 0.0 && flops > 0.0 {
+            (flops / peak) * 1e6
+        } else {
+            0.0
+        };
         let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
+        let bytes = 3.0 * num_tokens * intermediate * BYTES_PER_ELEM;
         let act_mul_us = if bw_gb > 0.0 {
             (bytes / (bw_gb * 1e9)) * 1e6
         } else {
             0.0
         };
-
         gemm_us + act_mul_us
     }
 
@@ -3979,6 +3642,295 @@ impl Implementation for AddRefImpl {
         Some(vec![OpInstance::new(
             syn::Ident::new("Add", proc_macro2::Span::call_site()),
             vec![quote! { #delta_idx }, quote! { #residual_idx }],
+        )])
+    }
+}
+
+// ── AllReduceImpl ────────────────────────────────────────────────
+//
+// Single-tile impl claiming an `OpKind::AllReduce` node — the
+// row-parallel TP communicator the lowering pass (task #5b/c)
+// inserts after every gemm whose weight has shard-kind `ShardDim1`
+// (`o_proj` / `down_proj`). Maps to `NcclGroup::all_reduce_inplace`
+// via `Instruction::AllReduce(slot)` (gated on `ferrite-forward`'s
+// `nccl` feature).
+//
+// One-tile in-place same-shape: `output_alias` declares the dst
+// slot aliases the input slot, so shape-aware coloring collapses
+// it to the input's slot with no `View` row (validated by
+// `coloring_allreduce_collapses_to_input_slot`). The fused-pair
+// comm-boundary guard is emergent from the FUF dataflow break —
+// any node with an OpKind::AllReduce sitting between a Gemm output
+// and a residual Add naturally fails `consumes_tile(add, gemm)`,
+// rejecting the fusion (validated by
+// `cutlass_gemm_add_does_not_claim_across_intermediate_node`).
+//
+// At `tp_world_size = 1` the lowering pass is a no-op — no FUF
+// node carries `OpKind::AllReduce`, so this Impl never matches and
+// is free in the solver. Always registered in `starter_library()`
+// regardless of build features; `cost_us` returns infinity if the
+// target profile lacks an `all_reduce` cost row, deterring the DP
+// from picking it on uncalibrated targets.
+
+#[derive(Debug, Default)]
+pub struct AllReduceImpl;
+
+impl Implementation for AllReduceImpl {
+    fn name(&self) -> &'static str {
+        "all_reduce"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // No CSV gating — all calibrated and uncalibrated profiles
+        // can run NCCL when `ferrite-forward/nccl` is on. Profiles
+        // without an `all_reduce` cost row use `UNCALIBRATED_COST_US`
+        // as a fallback in `cost_us` so the DP still has a finite
+        // number to compare.
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::AllReduce || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: NCCL all-reduce-sum reads + writes the
+        // tile per rank, and the cross-rank ring-pass amortizes to
+        // ~2x the per-tile bytes at large world sizes. Without a
+        // measured cost row, model as 2x bandwidth-bound on the
+        // local memory subsystem — a coarse upper bound that the DP
+        // uses as a tiebreaker between coverings; the actual NCCL
+        // cost dominates here in practice and is a target-specific
+        // CSV row to be added later. Returns `UNCALIBRATED_COST_US`
+        // when no profile data exists, matching the convention used
+        // by other comm-bound Impls.
+        let m = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * m * hidden * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            UNCALIBRATED_COST_US
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Output aliases the single tile input — `all_reduce_inplace`
+        // mutates the buffer directly, no separate output buffer.
+        let ar_id = claimed_tiles[0];
+        let node = fuf.get(ar_id);
+        let input_src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((ar_id, 0), input_src)]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("AllReduce", vec![("slot", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let ar_id = m.claimed_tiles[0];
+        let node = fuf.get(ar_id);
+        let (input_id, input_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("AllReduce: input 0 must be a Tile (got {other:?})"),
+        };
+        let slot_idx = slots.of(input_id, input_slot);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("AllReduce", proc_macro2::Span::call_site()),
+            vec![quote! { #slot_idx }],
+        )])
+    }
+
+    // No `interpreter_arm` — the universal `Instruction::eval` body
+    // in `ferrite-forward/src/instr.rs` (gated on `feature = "nccl"`)
+    // is the production dispatch path. The trait stopped carrying
+    // `interpreter_arm` after the universal-eval pivot (commit
+    // `de15e035a`); fan_out + opcode_shape are the only codegen
+    // surface an Impl needs to override.
+}
+
+// ── AllGatherImpl ────────────────────────────────────────────────
+//
+// Single-tile impl claiming an `OpKind::AllGather` node — the
+// vocab-parallel TP communicator the lowering pass inserts after
+// the lm_head Gemm at tp>1, since lm_head is `ShardDim0`. Maps to
+// `NcclGroup::all_gather_last_dim` via `Instruction::AllGather(in,
+// out)` (gated on `ferrite-forward`'s `nccl` feature).
+//
+// One input tile, one output tile with a *larger* shape (last dim
+// grows by `tp_world_size`). Unlike `AllReduceImpl`, this Impl
+// does NOT override `output_alias` — the default returns `None`
+// for every output, which is exactly what we want: the coloring
+// pass assigns the output to a fresh slot since it can't share
+// the input's smaller buffer.
+//
+// At `tp_world_size = 1` the lowering pass is a no-op so this
+// Impl never matches and is free in the solver.
+
+#[derive(Debug, Default)]
+pub struct AllGatherImpl;
+
+impl Implementation for AllGatherImpl {
+    fn name(&self) -> &'static str {
+        "all_gather"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // Same convention as `AllReduceImpl` — all profiles can run
+        // NCCL when `ferrite-forward/nccl` is on; uncalibrated
+        // targets fall back to `UNCALIBRATED_COST_US` in `cost_us`.
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::AllGather || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: NCCL all-gather reads the per-rank tile and
+        // writes the gathered tile; the cross-rank ring-pass amortizes
+        // to ~world_size× the per-rank tile bytes. The CSV row for
+        // `all_gather` is target-specific; absent the row this models
+        // it as `world_size * 2` × per-rank bytes, divided by local BW
+        // — coarse upper bound, the DP uses it only as a tiebreaker.
+        let m = ctx.num_tokens() as f64;
+        let vocab = ctx.bounds.get("vocab_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * m * vocab * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            UNCALIBRATED_COST_US
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    // No `output_alias` override — default returns `None` for every
+    // output, which gives the AllGather output a fresh slot
+    // (separate from the smaller input slot). That's the load-bearing
+    // distinction from `AllReduceImpl`, which collapses to the input
+    // slot via shape-aware coloring.
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "AllGather",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let ag_id = m.claimed_tiles[0];
+        let node = fuf.get(ag_id);
+        let (input_id, input_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("AllGather: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_idx = slots.of(input_id, input_slot);
+        let out_idx = slots.of(ag_id, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("AllGather", proc_macro2::Span::call_site()),
+            vec![quote! { #in_idx }, quote! { #out_idx }],
         )])
     }
 }
@@ -6222,15 +6174,23 @@ impl Implementation for RopeAppendRefImpl {
             return None;
         }
         // Defer to `FusedQkvRope{Cache,Prefill}Impl` when the
-        // upstream pattern matches (three Gemms sharing one activation,
-        // optionally through a BiasAdd, uniform bias presence). This
-        // gate is the inverse of `output_layouts` — singletons leave
-        // K/V at `[T, heads*head_dim]` while fused impls produce
-        // `[T, heads, head_dim]`, and the downstream Attention impls
-        // expect the latter when a fused upstream is available.
+        // upstream pattern matches: three Gemms (optionally through
+        // a BiasAdd) sharing one activation, uniform bias presence.
+        // Rejecting here mirrors `gemm_is_fusion_partner` on
+        // `CutlassGemmImpl` / `CutlassGemvImpl` — singletons must
+        // never steal a claim the fused impl owns, because their
+        // output layouts don't match what the downstream
+        // `AttentionPrefillContiguousImpl` / `AttentionViaCacheImpl`
+        // expects (fused impls produce contiguous `[T, heads,
+        // head_dim]` K/V; the singleton rotates in-place and leaves
+        // K/V at `[T, heads*head_dim]`).
         if rope_append_has_fused_qkv_upstream(fuf, seed) {
             return None;
         }
+        // Note: deferral to FusedQkvQkNormRopeCacheImpl is OFF because
+        // that impl is not registered in starter_library (correctness
+        // bug, see comment there). Singletons must claim the Qwen3/
+        // Gemma3 RopeAppend tiles unconditionally.
         Some(MatchInfo {
             claimed_tiles: vec![seed],
             boundary_inputs: qkv,
@@ -7665,14 +7625,6 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
 const UNCALIBRATED_COST_US: f64 = 1.0e9;
 
 const CUTLASS_TILE_ZOO: &[(u32, u32, u32)] = &[
-    // tile_m=16 — minimum threadblock M with sm80 tensor cores. Targets
-    // small-M tall-skinny lm_head + QKV regimes where M ∈ [8, 16] and
-    // larger tile_m wastes most of the threadblock's M dimension.
-    // (16, 256) excluded — CUTLASS thread-map div-by-zero at that aspect.
-    (16, 64, 3),
-    (16, 64, 4),
-    (16, 128, 3),
-    (16, 128, 4),
     (32, 64, 3),
     (32, 64, 4),
     (32, 128, 3),
@@ -7709,10 +7661,6 @@ impl CutlassGemmImpl {
     fn static_name(&self) -> &'static str {
         // Names are compile-time-known per CUTLASS_TILE_ZOO entry.
         match (self.tile_m, self.tile_n, self.stages) {
-            (16, 64, 3) => "cutlass_16x64_s3",
-            (16, 64, 4) => "cutlass_16x64_s4",
-            (16, 128, 3) => "cutlass_16x128_s3",
-            (16, 128, 4) => "cutlass_16x128_s4",
             (32, 64, 3) => "cutlass_32x64_s3",
             (32, 64, 4) => "cutlass_32x64_s4",
             (32, 128, 3) => "cutlass_32x128_s3",
@@ -7734,45 +7682,51 @@ impl CutlassGemmImpl {
     }
 }
 
+/// True if `node`'s output is consumed by any tile of the given op
+/// kind. Used to reject cutlass matches on Gemms that feed a
+/// fusion partner (RopeAppend / Silu / Mul).
+fn output_feeds_op(fuf: &Fuf, tile: TileId, op: OpKind) -> bool {
+    fuf.nodes
+        .iter()
+        .any(|n| n.op == op && consumes_tile(n, tile))
+}
+
+/// True if this Gemm tile is a fusion partner (Q/K/V of a
+/// RopeAppend, or gate/up of the `silu(gate) * up` pattern, or a
+/// bias-carrying gemm whose output feeds a `bias_add`). The cutlass
+/// singletons must never claim these — their fused impls own them
+/// and the downstream chain has no singleton kernel for the
+/// fusion-partner op (Silu/Mul/RopeAppend/BiasAdd).
+fn gemm_is_fusion_partner(fuf: &Fuf, seed: TileId) -> bool {
+    output_feeds_op(fuf, seed, OpKind::RopeAppend)
+        || output_feeds_op(fuf, seed, OpKind::RopeAppendInterleaved)
+        || output_feeds_op(fuf, seed, OpKind::Silu)
+        || output_feeds_op(fuf, seed, OpKind::Mul)
+        || output_feeds_op(fuf, seed, OpKind::BiasAdd)
+}
+
 /// Evaluate the `(M, N, K)` of a Gemm tile for CSV cost lookup.
 /// M comes from the current workload (bounds[`num_tokens`]), N from
 /// the output's last dim, K from the activation-input tile's last
 /// dim.
 fn gemm_mnk(ctx: &CostCtx, node: &crate::fuf::FufNode) -> Option<(u32, u32, u32)> {
     let m = ctx.num_tokens() as u32;
-    let (n, k) = gemm_nk_from_fuf(ctx.fuf, node, ctx.bounds)?;
-    Some((m, n, k))
-}
-
-/// Static (N, K) of a Gemm tile from its FUF node + variable bounds.
-/// `N` is the tile's output last dim (out_features); `K` is the
-/// input's last dim (in_features). Available to `fan_out` impls so
-/// they can bake weight shape into the emitted `Instruction` for the
-/// runtime shape-assert that guards against loader/codegen drift.
-fn gemm_nk_from_fuf(
-    fuf: &Fuf,
-    node: &crate::fuf::FufNode,
-    bounds: &BTreeMap<String, u64>,
-) -> Option<(u32, u32)> {
-    let out_shape = node
-        .outputs
-        .first()
-        .and_then(|s| eval_shape_with(s, bounds))?;
+    let out_shape = node.outputs.first().and_then(|s| ctx.eval_shape(s))?;
     if out_shape.len() != 2 {
         return None;
     }
     let n = *out_shape.last()? as u32;
     let k = node.inputs.iter().find_map(|inp| match inp {
         FufInput::Tile { id, slot } => {
-            let up = fuf.get(*id);
+            let up = ctx.fuf.get(*id);
             up.outputs
                 .get(*slot as usize)
-                .and_then(|s| eval_shape_with(s, bounds))
+                .and_then(|s| ctx.eval_shape(s))
                 .and_then(|v| v.last().copied())
         }
         _ => None,
     })? as u32;
-    Some((n, k))
+    Some((m, n, k))
 }
 
 impl Implementation for CutlassGemmImpl {
@@ -7801,6 +7755,9 @@ impl Implementation for CutlassGemmImpl {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         // Dense kernel: reject AWQ storage.
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
         Some(info)
@@ -7873,8 +7830,6 @@ impl Implementation for CutlassGemmImpl {
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
-                ("n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -7884,7 +7839,7 @@ impl Implementation for CutlassGemmImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        bounds: &BTreeMap<String, u64>,
+        _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -7905,8 +7860,6 @@ impl Implementation for CutlassGemmImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
-            .expect("CutlassGemm: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemm", proc_macro2::Span::call_site()),
             vec![
@@ -7917,8 +7870,6 @@ impl Implementation for CutlassGemmImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
-                quote! { #n },
-                quote! { #k },
             ],
         )])
     }
@@ -8012,6 +7963,9 @@ impl Implementation for CutlassGemmSplitKImpl {
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
             return None;
         }
+        if gemm_is_fusion_partner(fuf, seed) {
+            return None;
+        }
         Some(info)
     }
 
@@ -8074,8 +8028,6 @@ impl Implementation for CutlassGemmSplitKImpl {
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
                 ("split_k", syn::parse_quote!(u32)),
-                ("n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -8085,7 +8037,7 @@ impl Implementation for CutlassGemmSplitKImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        bounds: &BTreeMap<String, u64>,
+        _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -8107,8 +8059,6 @@ impl Implementation for CutlassGemmSplitKImpl {
         let tile_n = self.tile_n;
         let stages = self.stages;
         let split_k = self.split_k;
-        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
-            .expect("CutlassGemmSplitK: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemmSplitK", proc_macro2::Span::call_site()),
             vec![
@@ -8120,8 +8070,6 @@ impl Implementation for CutlassGemmSplitKImpl {
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #split_k },
-                quote! { #n },
-                quote! { #k },
             ],
         )])
     }
@@ -8165,10 +8113,6 @@ impl CutlassGemmAddImpl {
 
     fn impl_name(&self) -> &'static str {
         match (self.tile_m, self.tile_n, self.stages) {
-            (16, 64, 3) => "cutlass_16x64_s3_add",
-            (16, 64, 4) => "cutlass_16x64_s4_add",
-            (16, 128, 3) => "cutlass_16x128_s3_add",
-            (16, 128, 4) => "cutlass_16x128_s4_add",
             (32, 64, 3) => "cutlass_32x64_s3_add",
             (32, 64, 4) => "cutlass_32x64_s4_add",
             (32, 128, 3) => "cutlass_32x128_s3_add",
@@ -8217,6 +8161,9 @@ impl Implementation for CutlassGemmAddImpl {
             return None;
         }
         if !matches!(weight_storage_of(node), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
         // Find a downstream residual-stream Add: both inputs are
@@ -8349,8 +8296,6 @@ impl Implementation for CutlassGemmAddImpl {
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
-                ("n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -8360,7 +8305,7 @@ impl Implementation for CutlassGemmAddImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        bounds: &BTreeMap<String, u64>,
+        _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let gemm_id = *m
@@ -8399,8 +8344,6 @@ impl Implementation for CutlassGemmAddImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
-            .expect("CutlassGemmAdd: gemm (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemmAdd", proc_macro2::Span::call_site()),
             vec![
@@ -8411,8 +8354,6 @@ impl Implementation for CutlassGemmAddImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
-                quote! { #n },
-                quote! { #k },
             ],
         )])
     }
@@ -8444,6 +8385,9 @@ impl Implementation for CutlassGemvImpl {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         // Dense kernel: reject AWQ storage.
         if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        if gemm_is_fusion_partner(fuf, seed) {
             return None;
         }
         Some(info)
@@ -8504,8 +8448,6 @@ impl Implementation for CutlassGemvImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
-                ("n", syn::parse_quote!(u32)),
-                ("k", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -8515,7 +8457,7 @@ impl Implementation for CutlassGemvImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        bounds: &BTreeMap<String, u64>,
+        _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         let tile = m.claimed_tiles[0];
@@ -8533,8 +8475,6 @@ impl Implementation for CutlassGemvImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
-            .expect("CutlassGemv: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassGemv", proc_macro2::Span::call_site()),
             vec![
@@ -8542,8 +8482,6 @@ impl Implementation for CutlassGemvImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
-                quote! { #n },
-                quote! { #k },
             ],
         )])
     }
@@ -9890,6 +9828,13 @@ impl Implementation for Fp8GemmImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
         if !is_fp8_gemm(fuf, seed) {
+            return None;
+        }
+        // Defer to `Fp8FusedGemmBiasImpl` when the output feeds a
+        // `BiasAdd` — same pattern as dense `GemmRefImpl` deferring
+        // to `FusedGemmBiasImpl`. Without this, the singleton claims
+        // the Gemm and leaves the downstream BiasAdd tile unclaimed.
+        if output_feeds_op(fuf, seed, OpKind::BiasAdd) {
             return None;
         }
         Some(info)
@@ -12843,20 +12788,11 @@ mod tests {
     }
 
     #[test]
-    fn cutlass_gemm_impl_matches_when_output_feeds_rope_append() {
-        // Architectural invariant: singletons (CutlassGemm{,SplitK,
-        // Add,v}, GemmRefImpl, Fp8Gemm) MUST match unconditionally on
-        // structural fit — they don't gate on what the downstream
-        // consumer is. The DP solver decides between a multi-tile
-        // fused claim and a chain of singletons by cost + feasibility:
-        //   - When `FusedQkvRopeImpl` matches, it claims [Q,K,V,rope]
-        //     in one multi-tile mask; DP picks it when cheaper.
-        //   - When fused doesn't match (qwen3/gemma3 per-head qk-norm),
-        //     singletons are the only feasible plan and win.
-        // Singleton-side gating ("don't match if output feeds X") was
-        // a hand-coded preference that the DP already encodes via cost
-        // and feasibility — and it was wrong for qwen3 V-proj, where
-        // it forced cuBLAS over a measurably faster CUTLASS variant.
+    fn cutlass_gemm_impl_rejects_fusion_partners() {
+        // CutlassGemmImpl.matches must return None for a Gemm whose
+        // output feeds a RopeAppend / Silu / Mul — picking cutlass
+        // there would break the fused impl's claim on the downstream
+        // kernel chain (those consumers have no singleton kernel).
         use crate::classified::{ExternKind, WeightId};
         use crate::fuf::{Fuf, FufInput, FufNode, TileId};
         use crate::shape::Dim;
@@ -12903,11 +12839,378 @@ mod tests {
         };
         let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(
-            imp.matches(&fuf, t1, &profile).is_some(),
-            "CutlassGemmImpl must match a Gemm structurally regardless of \
-             downstream consumer; fused-vs-singleton is the DP's job",
+            imp.matches(&fuf, t1, &profile).is_none(),
+            "cutlass must not match a Gemm whose output feeds RopeAppend",
         );
     }
+    /// `AllReduceImpl::matches` claims any `OpKind::AllReduce` node
+    /// with exactly one tile input — and rejects any other shape.
+    /// At tp=1 the lowering pass produces zero AllReduce FufNodes,
+    /// so the matcher is a no-op in the solver; this test pins the
+    /// claim shape so a future regression that mistakenly claims
+    /// AllReduce on a malformed FUF (zero or >1 tile inputs) gets
+    /// caught at compile time of the test.
+    #[test]
+    fn all_reduce_impl_claims_single_tile_input_only() {
+        use crate::classified::ExternKind;
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::shape::Dim;
+
+        let shape = || vec![Dim::Lit(4), Dim::Lit(16)];
+        let make_fuf = |ar_inputs: Vec<FufInput>| Fuf {
+            nodes: vec![
+                // upstream activation
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape()],
+                },
+                // the AllReduce node under test
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::AllReduce,
+                    inputs: ar_inputs,
+                    outputs: vec![shape()],
+                },
+            ],
+        };
+        let imp = AllReduceImpl;
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+
+        // Well-formed: one tile input → claims itself.
+        let good = make_fuf(vec![FufInput::Tile {
+            id: TileId(0),
+            slot: 0,
+        }]);
+        let m = imp
+            .matches(&good, TileId(1), &profile)
+            .expect("AllReduce with one tile input must be claimed by AllReduceImpl");
+        assert_eq!(m.claimed_tiles, vec![TileId(1)]);
+        assert_eq!(m.boundary_inputs, vec![TileId(0)]);
+        assert_eq!(m.boundary_outputs, vec![TileId(1)]);
+
+        // Zero inputs: rejected.
+        let zero = make_fuf(vec![]);
+        assert!(
+            imp.matches(&zero, TileId(1), &profile).is_none(),
+            "AllReduce with no inputs must be rejected",
+        );
+
+        // Two tile inputs: rejected (the lowering pass only ever
+        // emits 1-input AllReduces; this catches accidental FUF
+        // construction from a future hand-written test).
+        let two = make_fuf(vec![
+            FufInput::Tile {
+                id: TileId(0),
+                slot: 0,
+            },
+            FufInput::Tile {
+                id: TileId(0),
+                slot: 0,
+            },
+        ]);
+        assert!(
+            imp.matches(&two, TileId(1), &profile).is_none(),
+            "AllReduce with >1 inputs must be rejected",
+        );
+
+        // Output_alias points the AllReduce dst at its input — the
+        // load-bearing in-place collapse for shape-aware coloring.
+        let aliases = imp.output_alias(&[TileId(1)], &good);
+        assert_eq!(aliases, vec![((TileId(1), 0), Some((TileId(0), 0)))]);
+    }
+
+    /// `AllGatherImpl` mirrors `AllReduceImpl` in claim shape (single
+    /// tile input → claims itself) but inverts the `output_alias`
+    /// invariant: AllGather's output is *larger* than its input
+    /// (last dim grows by `tp_world_size`), so it must NOT alias the
+    /// input slot. The default `output_alias` returns `None` for
+    /// every output, which the coloring pass interprets as "give
+    /// this output its own fresh slot".
+    ///
+    /// This test pins both the matcher AND the no-alias property —
+    /// a regression that overrode `output_alias` to point at the
+    /// input slot would silently corrupt `[N, vocab/tp]` writes by
+    /// pushing them into a `[N, vocab/tp]` buffer where the runtime
+    /// expects a `[N, vocab]` allocation; first symptom is a
+    /// segfault or shape-mismatch in the sampler downstream of the
+    /// emitted forward.
+    #[test]
+    fn all_gather_impl_claims_single_tile_input_with_fresh_output_slot() {
+        use crate::classified::ExternKind;
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::shape::Dim;
+
+        let in_shape = || vec![Dim::Lit(4), Dim::Lit(16)]; // per-rank logits [N, V/tp]
+        let out_shape = || vec![Dim::Lit(4), Dim::Lit(32)]; // gathered logits [N, V]
+        let make_fuf = |ag_inputs: Vec<FufInput>| Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Gemm, // stand-in for the lm_head Gemm
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![in_shape()],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::AllGather,
+                    inputs: ag_inputs,
+                    outputs: vec![out_shape()],
+                },
+            ],
+        };
+        let imp = AllGatherImpl;
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+
+        // Well-formed: one tile input → claims itself.
+        let good = make_fuf(vec![FufInput::Tile {
+            id: TileId(0),
+            slot: 0,
+        }]);
+        let m = imp
+            .matches(&good, TileId(1), &profile)
+            .expect("AllGather with one tile input must be claimed by AllGatherImpl");
+        assert_eq!(m.claimed_tiles, vec![TileId(1)]);
+        assert_eq!(m.boundary_inputs, vec![TileId(0)]);
+        assert_eq!(m.boundary_outputs, vec![TileId(1)]);
+
+        // Zero inputs: rejected.
+        let zero = make_fuf(vec![]);
+        assert!(
+            imp.matches(&zero, TileId(1), &profile).is_none(),
+            "AllGather with no inputs must be rejected",
+        );
+
+        // Two tile inputs: rejected (lowering pass only ever emits
+        // 1-input AllGathers).
+        let two = make_fuf(vec![
+            FufInput::Tile {
+                id: TileId(0),
+                slot: 0,
+            },
+            FufInput::Tile {
+                id: TileId(0),
+                slot: 0,
+            },
+        ]);
+        assert!(
+            imp.matches(&two, TileId(1), &profile).is_none(),
+            "AllGather with >1 inputs must be rejected",
+        );
+
+        // Output_alias must give the AllGather output its OWN slot
+        // (alias = None). Inverts AllReduce's in-place collapse —
+        // overriding this would mis-size the output buffer.
+        let aliases = imp.output_alias(&[TileId(1)], &good);
+        assert_eq!(
+            aliases,
+            vec![((TileId(1), 0), None)],
+            "AllGather output must NOT alias its input — \
+             output is `tp_world_size`× larger along the last dim",
+        );
+    }
+
+    /// Comm-boundary guard: when the lowering pass (task #5) inserts
+    /// an `AllReduce` node between a row-parallel `Gemm` (e.g.
+    /// `o_proj` / `down_proj`) and its residual `Add`,
+    /// `CutlassGemmAddImpl::matches()` must NOT claim them as a
+    /// fused (Gemm, Add) subgraph. The `cutlass_gemm_add` epilogue
+    /// fuses the residual addition into the gemm's beta=1.0 path —
+    /// at tp>1 that would mix pre-reduce per-rank gemm outputs into
+    /// the residual stream BEFORE the all-reduce sum reconciled
+    /// across ranks → silently wrong math.
+    ///
+    /// The guard is emergent from `consumes_tile(add, gemm)` in
+    /// `matches()`: with an intermediate AllReduce node, the
+    /// residual `Add` consumes the AllReduce's output, not the
+    /// Gemm's, so `consumes_tile` returns false and the fusion is
+    /// rejected. This test pins that property explicitly so a
+    /// future `matches()` change (e.g. following alias chains across
+    /// in-place ops) can't reintroduce the cross-AllReduce fusion.
+    ///
+    /// Models the AllReduce as a 1-input Add (`OpKind::AllReduce`
+    /// will land alongside the lowering pass in task #5). The
+    /// `inputs.len() != 2` guard inside `matches()` keeps that stub
+    /// from being claimed as the residual Add itself.
+    #[test]
+    fn cutlass_gemm_add_does_not_claim_across_intermediate_node() {
+        use crate::classified::{ExternKind, WeightId};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::shape::Dim;
+
+        let t_act = TileId(0); // attention output (activation)
+        let t_resid = TileId(1); // residual stream
+        let t_gemm = TileId(2); // o_proj output (row-parallel)
+        let t_ar = TileId(3); // AllReduce stub output
+        let t_add = TileId(4); // residual Add (would-be fusion partner)
+
+        let shape = || vec![Dim::Lit(4), Dim::Lit(16)];
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: t_act,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape()],
+                },
+                FufNode {
+                    id: t_resid,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape()],
+                },
+                FufNode {
+                    id: t_gemm,
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile { id: t_act, slot: 0 },
+                        FufInput::Weight {
+                            id: WeightId(0),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![shape()],
+                },
+                // AllReduce stub — same shape, single tile input.
+                // 1-input Add is shape-distinct from the residual
+                // Add (which has 2 tile inputs); CutlassGemmAddImpl's
+                // `n.inputs.len() != 2` filter rejects this node as
+                // a fusion partner directly.
+                FufNode {
+                    id: t_ar,
+                    op: OpKind::Add, // OpKind::AllReduce lands with task #5
+                    inputs: vec![FufInput::Tile {
+                        id: t_gemm,
+                        slot: 0,
+                    }],
+                    outputs: vec![shape()],
+                },
+                // Residual Add — 2-tile inputs, but consumes the
+                // AllReduce output, not the Gemm output, so
+                // consumes_tile(t_add, t_gemm) is false.
+                FufNode {
+                    id: t_add,
+                    op: OpKind::Add,
+                    inputs: vec![
+                        FufInput::Tile { id: t_ar, slot: 0 },
+                        FufInput::Tile {
+                            id: t_resid,
+                            slot: 0,
+                        },
+                    ],
+                    outputs: vec![shape()],
+                },
+            ],
+        };
+        let imp = CutlassGemmAddImpl {
+            tile_m: 128,
+            tile_n: 128,
+            stages: 4,
+        };
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        assert!(
+            imp.matches(&fuf, t_gemm, &profile).is_none(),
+            "CutlassGemmAdd must not fuse across an AllReduce edge — \
+             cross-rank residual mixing would be silently wrong at tp>1",
+        );
+    }
+
+    /// Comm-boundary guard, FusedAddRmsNorm flavor: same rationale
+    /// as `cutlass_gemm_add_does_not_claim_across_intermediate_node`,
+    /// but for the (Add, RmsNorm) fusion. The lowering pass inserts
+    /// AllReduce after a row-parallel gemm, BEFORE the residual Add
+    /// — so the existing (Add, RmsNorm) chain post-Add is unaffected.
+    /// This test models the relevant negative case: AllReduce between
+    /// the Add and the RmsNorm. That topology shouldn't normally
+    /// arise from the design's "AllReduce after row-parallel gemm"
+    /// rule, but the matches() walk should still refuse it on
+    /// principle — `consumes_tile(rmsnorm, add)` is false.
+    #[test]
+    fn fused_add_rms_norm_does_not_claim_across_intermediate_node() {
+        use crate::classified::{ExternKind, WeightId};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::shape::Dim;
+
+        let t_d = TileId(0); // delta
+        let t_r = TileId(1); // residual
+        let t_add = TileId(2); // the Add seed
+        let t_ar = TileId(3); // AllReduce stub
+        let t_rms = TileId(4); // RmsNorm — would-be fusion partner
+
+        let shape = || vec![Dim::Lit(4), Dim::Lit(16)];
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: t_d,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape()],
+                },
+                FufNode {
+                    id: t_r,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape()],
+                },
+                FufNode {
+                    id: t_add,
+                    op: OpKind::Add,
+                    inputs: vec![
+                        FufInput::Tile { id: t_d, slot: 0 },
+                        FufInput::Tile { id: t_r, slot: 0 },
+                    ],
+                    outputs: vec![shape()],
+                },
+                FufNode {
+                    id: t_ar,
+                    op: OpKind::Add, // OpKind::AllReduce stub
+                    inputs: vec![FufInput::Tile { id: t_add, slot: 0 }],
+                    outputs: vec![shape()],
+                },
+                FufNode {
+                    id: t_rms,
+                    op: OpKind::RmsNorm,
+                    inputs: vec![
+                        FufInput::Tile { id: t_ar, slot: 0 },
+                        FufInput::Weight {
+                            id: WeightId(0),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![shape()],
+                },
+            ],
+        };
+        let imp = FusedAddRmsNormImpl;
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        assert!(
+            imp.matches(&fuf, t_add, &profile).is_none(),
+            "FusedAddRmsNorm must not fuse across an intermediate \
+             tile — the RmsNorm reads from AllReduce, not from Add",
+        );
+    }
+
     // ── FlashInfer attention Impls ───────────────────────────────
 
     /// Build a minimal `TargetProfile` with only the cost rows we
@@ -12926,7 +13229,6 @@ mod tests {
             memory_bandwidth_gbps: 300.0,
             shared_memory_per_sm_kb: 100,
             cost_table,
-            kernel_fits: std::collections::HashMap::new(),
         }
     }
 

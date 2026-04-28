@@ -460,6 +460,14 @@ class VocabParallelEmbedding(CustomOp):
         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
+        from vllm.model_executor._ferrite_weight_dump import dump as _ferrite_dump
+        _ferrite_dump(
+            f"{getattr(self, 'prefix', '?')}.weight",
+            output_dim,
+            get_tensor_model_parallel_rank(),
+            self.tp_size,
+            loaded_weight,
+        )
 
     def forward_native(self, input_):
         if self.tp_size > 1:

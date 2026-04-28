@@ -73,17 +73,6 @@ pub enum NormalizedField {
     /// `"MarlinLinear"`, `"Bnb4bitLinear"`, `"Fp8AnyLinear"`,
     /// `"CohereLayerNorm"`, `"Embedding"`, `"DeepSeekV2MoELayer"`.
     LayerKind(&'static str),
-    /// Static weight matrix shape for a GEMM-class step, captured at
-    /// codegen time from the FUF's `eval_shape`. `n` is output dim
-    /// (LinearLayer's out_features), `k` is reduction dim
-    /// (in_features). M is workload-dependent — the dump consumer
-    /// derives it from the bucket's `m_min..m_max_excl`.
-    ///
-    /// Emitted by simple-GEMM Instruction variants only (one matmul,
-    /// one weight) — `Gemm`, `CutlassGemm`, `CutlassGemmSplitK`,
-    /// `CutlassGemmAdd`, `CutlassGemv`. Fused QKV / GateUp variants
-    /// have multiple participating shapes and don't emit this.
-    WeightShape { n: u32, k: u32 },
     /// `CosSinFn<W>` — the rotary cos/sin table accessor. Carries
     /// no other identity at this layer (different rope tables come
     /// from per-variant `CanonicalParams` consts, not the slice).
@@ -143,6 +132,12 @@ impl<W> Instruction<W> {
             Instruction::Add(delta_slot, residual_slot) => {
                 ("Add", vec![F::Slot(delta_slot), F::Slot(residual_slot)])
             }
+            #[cfg(feature = "nccl")]
+            Instruction::AllReduce(slot) => ("AllReduce", vec![F::Slot(slot)]),
+            #[cfg(feature = "nccl")]
+            Instruction::AllGather(in_slot, out_slot) => {
+                ("AllGather", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
             Instruction::ScalarMul(in_slot, out_slot, scale) => (
                 "ScalarMul",
                 vec![
@@ -183,14 +178,13 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::Gemm(in_slot, out_slot, layer, _wf, n, k) => (
+            Instruction::Gemm(in_slot, out_slot, layer, _wf) => (
                 "Gemm",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("LinearLayer"),
-                    F::WeightShape { n, k },
                 ],
             ),
             Instruction::FusedGemmBias(in_slot, out_slot, layer, _wf) => (
@@ -434,17 +428,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("DeepSeekV2MoELayer"),
                 ],
             ),
-            Instruction::CutlassGemm(
-                in_slot,
-                out_slot,
-                layer,
-                _wf,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => (
+            Instruction::CutlassGemm(in_slot, out_slot, layer, _wf, tile_m, tile_n, stages) => (
                 "CutlassGemm",
                 vec![
                     F::Slot(in_slot),
@@ -454,7 +438,6 @@ impl<W> Instruction<W> {
                     F::ConstU32(tile_m),
                     F::ConstU32(tile_n),
                     F::ConstU32(stages),
-                    F::WeightShape { n, k },
                 ],
             ),
             Instruction::CutlassGemmSplitK(
@@ -466,8 +449,6 @@ impl<W> Instruction<W> {
                 tile_n,
                 stages,
                 split_k,
-                n,
-                k,
             ) => (
                 "CutlassGemmSplitK",
                 vec![
@@ -479,7 +460,6 @@ impl<W> Instruction<W> {
                     F::ConstU32(tile_n),
                     F::ConstU32(stages),
                     F::ConstU32(split_k),
-                    F::WeightShape { n, k },
                 ],
             ),
             Instruction::CutlassGemmAdd(
@@ -490,8 +470,6 @@ impl<W> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
-                n,
-                k,
             ) => (
                 "CutlassGemmAdd",
                 vec![
@@ -502,40 +480,24 @@ impl<W> Instruction<W> {
                     F::ConstU32(tile_m),
                     F::ConstU32(tile_n),
                     F::ConstU32(stages),
-                    F::WeightShape { n, k },
                 ],
             ),
-            Instruction::CutlassGemv(in_slot, out_slot, layer, _wf, n, k) => (
+            Instruction::CutlassGemv(in_slot, out_slot, layer, _wf) => (
                 "CutlassGemv",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("LinearLayer"),
-                    F::WeightShape { n, k },
                 ],
             ),
-            Instruction::CutlassFusedGemmBias(
-                in_slot,
-                out_slot,
-                layer,
-                _wf,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => (
+            Instruction::CutlassFusedGemmBias(in_slot, out_slot, layer, _wf) => (
                 "CutlassFusedGemmBias",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("LinearLayer"),
-                    F::ConstU32(tile_m),
-                    F::ConstU32(tile_n),
-                    F::ConstU32(stages),
-                    F::WeightShape { n, k },
                 ],
             ),
             Instruction::CutlassFusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
@@ -931,8 +893,7 @@ mod tests {
 
     #[test]
     fn cutlass_gemm_add_keeps_tile_consts() {
-        let i: Instruction<W> =
-            Instruction::CutlassGemmAdd(5, 6, 0, linear_wf, 128, 128, 3, 4096, 11008);
+        let i: Instruction<W> = Instruction::CutlassGemmAdd(5, 6, 0, linear_wf, 128, 128, 3);
         let n = i.normalize();
         assert_eq!(n.kind, "CutlassGemmAdd");
         assert_eq!(
@@ -945,7 +906,6 @@ mod tests {
                 NormalizedField::ConstU32(128),
                 NormalizedField::ConstU32(128),
                 NormalizedField::ConstU32(3),
-                NormalizedField::WeightShape { n: 4096, k: 11008 },
             ]
         );
     }

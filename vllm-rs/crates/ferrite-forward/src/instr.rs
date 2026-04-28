@@ -82,6 +82,14 @@ pub type CosSinFn<W> = for<'a> fn(&'a W, u32) -> GpuTensor;
 /// row in a per-canonical static slice on a single line of cargo
 /// expand. Field order per variant matches the per-Impl
 /// `OpcodeShape::fields` order in `impl_lib.rs`.
+///
+/// `Debug` is hand-written below (not derived) so the impl avoids
+/// a `W: Debug` bound. `#[derive(Debug)]` is conservative — it
+/// adds `where W: Debug` for any type parameter appearing in any
+/// field, even when the only such fields are fn pointers (which
+/// are `Debug` regardless of their arg types). The manual impl
+/// just prints the variant name + the integer slot/index args,
+/// which is what the FERRITE_TRACE trace actually wants.
 #[allow(clippy::type_complexity)]
 pub enum Instruction<W> {
     Embed(u32, WtFn<W, Embedding>),
@@ -89,12 +97,31 @@ pub enum Instruction<W> {
     LayerNorm(u32, u32, u32, WtFn<W, CohereLayerNorm>),
     Reshape(u32, u32, [u32; MAX_DIMS], [u8; MAX_DIMS], u8),
     Add(u32, u32),
+    /// Tensor-parallel all-reduce of one tile, in place. Emitted by
+    /// the macro's TP-lowering pass after every gemm whose weight
+    /// has shard-kind `ShardDim1` (row-parallel: o_proj, down_proj).
+    /// One-tile in-place — same shape on input and output, so
+    /// shape-aware coloring collapses it to the input slot with no
+    /// `View` row. At tp=1 the lowering pass emits zero of these.
+    #[cfg(feature = "nccl")]
+    AllReduce(u32),
+    /// Tensor-parallel all-gather along the LAST dim of one input
+    /// tile. Output is allocated fresh (shape: input shape with
+    /// last dim multiplied by `tp_world_size`); coloring assigns it
+    /// a separate slot from the input. Emitted by the lowering
+    /// pass after the lm_head Gemm at tp>1, since lm_head is
+    /// vocab-parallel (`ShardDim0`) — per-rank output is
+    /// `[N, vocab/tp]` and the full `[N, vocab]` for the sampler is
+    /// reassembled here. Maps to `NcclGroup::all_gather_last_dim`.
+    /// At tp=1 the lowering pass emits zero of these.
+    #[cfg(feature = "nccl")]
+    AllGather(u32, u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
     FusedAddRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
     FusedAddRmsNormWithOffset(u32, u32, u32, f32, WtFn<W, RmsNorm>),
     ScalarOffsetRmsNorm(u32, u32, u32, f32, WtFn<W, RmsNorm>),
-    Gemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
+    Gemm(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
@@ -133,22 +160,11 @@ pub enum Instruction<W> {
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32, CosSinFn<W>),
     DeepSeekMoe(u32, u32, u32, WtFn<W, DeepSeekV2MoELayer>),
-    CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassGemmSplitK(
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
-    CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
-    CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
+    CutlassGemmSplitK(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32),
+    CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
+    CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>),
+    CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
     CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     CutlassFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassFusedQkvRopeCache(
@@ -211,32 +227,240 @@ impl<W> Clone for Instruction<W> {
     }
 }
 
-/// Assert a runtime weight tensor's `[N, K]` shape matches the
-/// codegen-time constants the `Instruction` was emitted with. The
-/// constants come from the FUF's `eval_shape` at solve time; the
-/// runtime tensor is whatever `WtFn` resolved to from the loaded
-/// safetensors. A mismatch means the loader produced a weight whose
-/// shape disagrees with the model the solver compiled against —
-/// silent shape drift here corrupts every output. Real `assert!`,
-/// not `debug_assert!`, because release builds need to fail loud
-/// rather than march on with a K-mismatch.
-#[track_caller]
-fn assert_weight_shape(
-    op: &'static str,
-    weight: ferrite_cuda_core::tensor::GpuTensor,
-    n: u32,
-    k: u32,
-) {
-    let actual_n = weight.dim(0) as u32;
-    let actual_k = weight.dim(1) as u32;
-    assert_eq!(
-        actual_n, n,
-        "{op}: weight N (out_features) mismatch — runtime={actual_n} codegen={n}"
-    );
-    assert_eq!(
-        actual_k, k,
-        "{op}: weight K (in_features) mismatch — runtime={actual_k} codegen={k}"
-    );
+impl<W> std::fmt::Debug for Instruction<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Local macro: print variant name + integer slot/index args
+        // via `f.debug_tuple(name).field(...).finish()`. Skips the
+        // fn-pointer `WtFn` / `CosSinFn` fields and the `[u32; MAX_DIMS]`
+        // bake arrays — neither is informative in trace logs.
+        macro_rules! d {
+            ($name:expr $(, $field:expr)* $(,)?) => {{
+                let mut t = f.debug_tuple($name);
+                $(t.field(&$field);)*
+                t.finish()
+            }};
+        }
+        match self {
+            Instruction::Embed(out, _) => d!("Embed", out),
+            Instruction::RmsNorm(in_, out, layer, _) => d!("RmsNorm", in_, out, layer),
+            Instruction::LayerNorm(in_, out, layer, _) => d!("LayerNorm", in_, out, layer),
+            Instruction::Reshape(in_, out, _, _, ndim) => d!("Reshape", in_, out, ndim),
+            Instruction::Add(delta, residual) => d!("Add", delta, residual),
+            #[cfg(feature = "nccl")]
+            Instruction::AllReduce(slot) => d!("AllReduce", slot),
+            #[cfg(feature = "nccl")]
+            Instruction::AllGather(in_, out) => d!("AllGather", in_, out),
+            Instruction::ScalarMul(in_, out, scale) => d!("ScalarMul", in_, out, scale),
+            Instruction::TanhSoftCap(in_, out) => d!("TanhSoftCap", in_, out),
+            Instruction::FusedAddRmsNorm(delta, residual, layer, _) => {
+                d!("FusedAddRmsNorm", delta, residual, layer)
+            }
+            Instruction::FusedAddRmsNormWithOffset(delta, residual, layer, offset, _) => {
+                d!("FusedAddRmsNormWithOffset", delta, residual, layer, offset)
+            }
+            Instruction::ScalarOffsetRmsNorm(in_, out, layer, offset, _) => {
+                d!("ScalarOffsetRmsNorm", in_, out, layer, offset)
+            }
+            Instruction::Gemm(in_, out, layer, _) => d!("Gemm", in_, out, layer),
+            Instruction::FusedGemmBias(in_, out, layer, _) => {
+                d!("FusedGemmBias", in_, out, layer)
+            }
+            Instruction::FusedGateUpSiluMul(in_, out, layer, _) => {
+                d!("FusedGateUpSiluMul", in_, out, layer)
+            }
+            Instruction::FusedGateUpGeluMul(in_, out, layer, _) => {
+                d!("FusedGateUpGeluMul", in_, out, layer)
+            }
+            Instruction::FusedQkvRopeCache(in_, out, layer, _, _, intl, lr) => {
+                d!("FusedQkvRopeCache", in_, out, layer, intl, lr)
+            }
+            Instruction::FusedQkvQkNormRopeCache(
+                in_,
+                out,
+                layer,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                eps_q,
+                eps_k,
+            ) => {
+                d!("FusedQkvQkNormRopeCache", in_, out, layer, eps_q, eps_k)
+            }
+            Instruction::FusedQkvRopePrefill(in_, q_out, k_out, v_out, layer, _, _, intl, lr) => {
+                d!(
+                    "FusedQkvRopePrefill",
+                    in_,
+                    q_out,
+                    k_out,
+                    v_out,
+                    layer,
+                    intl,
+                    lr
+                )
+            }
+            Instruction::AttentionViaCache(in_, out, layer, _, intl) => {
+                d!("AttentionViaCache", in_, out, layer, intl)
+            }
+            Instruction::AttentionPrefillContiguous(q, k, v, out, intl) => {
+                d!("AttentionPrefillContiguous", q, k, v, out, intl)
+            }
+            Instruction::SlidingAttentionViaCache(in_, out, layer, _, intl) => {
+                d!("SlidingAttentionViaCache", in_, out, layer, intl)
+            }
+            Instruction::SlidingAttentionPrefillContiguous(q, k, v, out, intl) => {
+                d!("SlidingAttentionPrefillContiguous", q, k, v, out, intl)
+            }
+            Instruction::FlashInferAttentionDecode(in_, out, layer, _, sm_scale_idx, intl) => {
+                d!(
+                    "FlashInferAttentionDecode",
+                    in_,
+                    out,
+                    layer,
+                    sm_scale_idx,
+                    intl
+                )
+            }
+            Instruction::FlashInferAttentionPrefill(q, k, v, out, layer, sm_scale_idx, intl) => {
+                d!(
+                    "FlashInferAttentionPrefill",
+                    q,
+                    k,
+                    v,
+                    out,
+                    layer,
+                    sm_scale_idx,
+                    intl
+                )
+            }
+            Instruction::RopeAppend(q, k, v, q_out, k_out, v_out, layer, _, intl) => {
+                d!("RopeAppend", q, k, v, q_out, k_out, v_out, layer, intl)
+            }
+            Instruction::MlaSplit(in_, kv_out, k_pe_out) => {
+                d!("MlaSplit", in_, kv_out, k_pe_out)
+            }
+            Instruction::MlaAttention(q, kv, k_pe, out, layer, _) => {
+                d!("MlaAttention", q, kv, k_pe, out, layer)
+            }
+            Instruction::DeepSeekMoe(in_, out, layer, _) => {
+                d!("DeepSeekMoe", in_, out, layer)
+            }
+            Instruction::CutlassGemm(in_, out, layer, _, tm, tn, st) => {
+                d!("CutlassGemm", in_, out, layer, tm, tn, st)
+            }
+            Instruction::CutlassGemmSplitK(in_, out, layer, _, tm, tn, st, sk) => {
+                d!("CutlassGemmSplitK", in_, out, layer, tm, tn, st, sk)
+            }
+            Instruction::CutlassGemmAdd(in_, out, layer, _, tm, tn, st) => {
+                d!("CutlassGemmAdd", in_, out, layer, tm, tn, st)
+            }
+            Instruction::CutlassGemv(in_, out, layer, _) => {
+                d!("CutlassGemv", in_, out, layer)
+            }
+            Instruction::CutlassFusedGemmBias(in_, out, layer, _) => {
+                d!("CutlassFusedGemmBias", in_, out, layer)
+            }
+            Instruction::CutlassFusedGateUpSiluMul(in_, out, layer, _) => {
+                d!("CutlassFusedGateUpSiluMul", in_, out, layer)
+            }
+            Instruction::MarlinGemm(in_, out, layer, _) => {
+                d!("MarlinGemm", in_, out, layer)
+            }
+            Instruction::MarlinFusedGateUpSiluMul(in_, out, layer, _) => {
+                d!("MarlinFusedGateUpSiluMul", in_, out, layer)
+            }
+            Instruction::MarlinFusedGateUpGeluMul(in_, out, layer, _) => {
+                d!("MarlinFusedGateUpGeluMul", in_, out, layer)
+            }
+            Instruction::MarlinFusedQkvRopeCache(in_, out, layer, _, _) => {
+                d!("MarlinFusedQkvRopeCache", in_, out, layer)
+            }
+            Instruction::MarlinFusedQkvRopePrefill(in_, q, k, v, layer, _, _) => {
+                d!("MarlinFusedQkvRopePrefill", in_, q, k, v, layer)
+            }
+            Instruction::Bnb4Gemm(in_, out, layer, _) => d!("Bnb4Gemm", in_, out, layer),
+            Instruction::Bnb4FusedGateUpSiluMul(in_, out, layer, _) => {
+                d!("Bnb4FusedGateUpSiluMul", in_, out, layer)
+            }
+            Instruction::Bnb4FusedGateUpGeluMul(in_, out, layer, _) => {
+                d!("Bnb4FusedGateUpGeluMul", in_, out, layer)
+            }
+            Instruction::Bnb4FusedQkvRopeCache(in_, out, layer, _, _) => {
+                d!("Bnb4FusedQkvRopeCache", in_, out, layer)
+            }
+            Instruction::Bnb4FusedQkvRopePrefill(in_, q, k, v, layer, _, _) => {
+                d!("Bnb4FusedQkvRopePrefill", in_, q, k, v, layer)
+            }
+            Instruction::Fp8Gemm(in_, out, layer, _) => d!("Fp8Gemm", in_, out, layer),
+            Instruction::Fp8FusedGemmBias(in_, out, layer, _) => {
+                d!("Fp8FusedGemmBias", in_, out, layer)
+            }
+            Instruction::Fp8FusedGateUpSiluMul(in_, out, layer, _) => {
+                d!("Fp8FusedGateUpSiluMul", in_, out, layer)
+            }
+            Instruction::Fp8FusedGateUpGeluMul(in_, out, layer, _) => {
+                d!("Fp8FusedGateUpGeluMul", in_, out, layer)
+            }
+            Instruction::Fp8FusedQkvRopeCache(in_, out, layer, _, _) => {
+                d!("Fp8FusedQkvRopeCache", in_, out, layer)
+            }
+            Instruction::Fp8FusedQkvRopePrefill(in_, q, k, v, layer, _, _) => {
+                d!("Fp8FusedQkvRopePrefill", in_, q, k, v, layer)
+            }
+            Instruction::Loop(body_len, count) => d!("Loop", body_len, count),
+            Instruction::Alias(dst, src) => d!("Alias", dst, src),
+            Instruction::Free(slot) => d!("Free", slot),
+        }
+    }
+}
+
+/// Detail-trace helper. Dumps the first `n` elements of a GpuTensor
+/// to stderr as f32 (decoded from bf16 / f32 — fp16 not supported,
+/// returns silently). Synchronizes the stream before reading so the
+/// values are post-kernel. Use sparingly under `FERRITE_TRACE` —
+/// each call costs a stream-sync + small DtoH.
+///
+/// # Safety
+///
+/// `t.raw_ptr()` must be live GPU memory; `stream` must be live;
+/// caller must hold tile-table invariants.
+unsafe fn dump_tile_head(tag: &str, t: GpuTensor, stream: ferrite_cuda_core::CUstream, n: usize) {
+    use ferrite_cuda_core::DType;
+    use ferrite_cuda_core::driver;
+    let n = n.min(t.numel());
+    let elem_bytes: usize = match t.dtype() {
+        DType::F32 => 4,
+        DType::BF16 => 2,
+        _ => return,
+    };
+    let bytes = n * elem_bytes;
+    if bytes == 0 {
+        return;
+    }
+    let mut buf: Vec<u8> = vec![0u8; bytes];
+    unsafe {
+        driver::stream_synchronize(stream).expect("dump sync pre");
+        driver::memcpy_dtoh_async(buf.as_mut_ptr(), t.raw_ptr(), bytes, stream).expect("dump dtoh");
+        driver::stream_synchronize(stream).expect("dump sync post");
+    }
+    let vals: Vec<f32> = match t.dtype() {
+        DType::F32 => buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        DType::BF16 => buf
+            .chunks_exact(2)
+            // bf16 IS the upper 16 bits of an f32 — shift-left bitcast.
+            .map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                f32::from_bits((bits as u32) << 16)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    eprintln!("[ferrite] {tag} shape={:?} head={:?}", t.shape(), vals);
 }
 
 impl<W: CanonicalParams> Instruction<W> {
@@ -248,11 +472,66 @@ impl<W: CanonicalParams> Instruction<W> {
     /// GPU memory; `ctx.device.compute_stream` is live.
     #[allow(clippy::too_many_lines)]
     pub unsafe fn eval(&self, ctx: &mut InterpreterCtx<'_, W>) {
+        // Per-op trace (FERRITE_TRACE=1). Restored after the
+        // de15e035a universal-eval pivot dropped the per-arch
+        // `__dispatch_one` callers of the (now-orphaned) `trace_op`
+        // helper. `trace_enabled()` short-circuits on the cached
+        // env-var read, so the cost when disabled is one atomic
+        // load + branch per dispatched op. The rank prefix
+        // (`r=N/W`) is added when an NcclGroup is attached
+        // (tp_world_size > 1) so per-rank lines are distinguishable
+        // when stderr from every worker process interleaves.
+        if crate::trace_enabled() {
+            #[cfg(feature = "nccl")]
+            let rank_prefix: String = ctx
+                .fwd
+                .tp_group
+                .map(|g| format!(" r={}/{}", g.rank(), g.world_size()))
+                .unwrap_or_default();
+            #[cfg(not(feature = "nccl"))]
+            let rank_prefix: &str = "";
+            eprintln!("[ferrite{}] l={} {:?}", rank_prefix, ctx.layer_offset, self);
+        }
         match *self {
             Instruction::Embed(out_slot, weight_fn) => unsafe {
-                let out = kernels::embedding_gather(
-                    (weight_fn)(ctx.wm, 0u32).weight,
+                let weight = (weight_fn)(ctx.wm, 0u32).weight;
+                // At tp=1 the embed weight covers the full vocab and
+                // vocab_offset is 0 — the mask never trips. At tp>1
+                // the weight is the per-rank `[vocab/tp, hidden]`
+                // shard; vocab_offset = rank * vocab_per_rank gives
+                // each rank a disjoint slice of the global vocab.
+                // Per-Embed call follows with an AllReduce-sum
+                // (injected by tp_lowering when shard-kind for the
+                // embed weight is ShardDim0).
+                let vocab_per_rank = weight.dim(0) as u32;
+                #[cfg(feature = "nccl")]
+                let vocab_offset = ctx
+                    .fwd
+                    .tp_group
+                    .map(|g| (g.rank() as u32) * vocab_per_rank)
+                    .unwrap_or(0);
+                #[cfg(not(feature = "nccl"))]
+                let vocab_offset: u32 = 0;
+                if crate::trace_enabled() {
+                    // Detail-trace for the embed mask params.
+                    // Surfaces (vocab_offset, vocab_per_rank, num_tokens,
+                    // weight_rows) per-rank so an off-by-one or
+                    // wrong-rank issue is visible without re-running.
+                    let nt = (*ctx.fwd.input_ids).dim(0);
+                    eprintln!(
+                        "[ferrite] Embed.mask vocab_offset={} vocab_per_rank={} \
+                         weight.dim(0)={} num_tokens={}",
+                        vocab_offset,
+                        vocab_per_rank,
+                        weight.dim(0),
+                        nt,
+                    );
+                }
+                let out = kernels::embedding_gather_masked(
+                    weight,
                     *ctx.fwd.input_ids,
+                    vocab_offset,
+                    vocab_per_rank,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -307,6 +586,77 @@ impl<W: CanonicalParams> Instruction<W> {
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 kernels::add_inplace(*residual, *delta, ctx.device.compute_stream);
             },
+            #[cfg(feature = "nccl")]
+            Instruction::AllReduce(slot) => unsafe {
+                let v = tile_ref(ctx.tiles, slot).as_view(ctx.tiles);
+                let group = ctx.fwd.tp_group.expect(
+                    "Instruction::AllReduce reached eval but \
+                     ForwardCtx::tp_group is None — caller must \
+                     attach an NcclGroup at tp_world_size > 1",
+                );
+                if crate::trace_enabled() {
+                    let gt = tile_ref(ctx.tiles, slot).as_gpu_tensor(ctx.tiles);
+                    dump_tile_head(
+                        &format!("AllReduce(slot={}) PRE  r={}", slot, group.rank()),
+                        gt,
+                        ctx.device.compute_stream,
+                        8,
+                    );
+                }
+                // fp32-promoted AllReduce — matches Python vLLM's
+                // `custom_all_reduce.cuh` precision (upcast bf16 →
+                // fp32, sum in fp32, downcast). NCCL's native bf16
+                // sum drifts ~1 ULP per call; over 73 AllReduces /
+                // forward on Qwen2.5-3B that's enough to push the
+                // sampler past confidence thresholds.
+                let gt = tile_ref(ctx.tiles, slot).as_gpu_tensor(ctx.tiles);
+                let _ = v;
+                group
+                    .all_reduce_inplace_promote(gt, &mut ctx.device.caching)
+                    .expect("NCCL all_reduce_inplace_promote failed");
+                if crate::trace_enabled() {
+                    let gt = tile_ref(ctx.tiles, slot).as_gpu_tensor(ctx.tiles);
+                    dump_tile_head(
+                        &format!("AllReduce(slot={}) POST r={}", slot, group.rank()),
+                        gt,
+                        ctx.device.compute_stream,
+                        8,
+                    );
+                }
+            },
+            #[cfg(feature = "nccl")]
+            Instruction::AllGather(in_slot, out_slot) => unsafe {
+                let v = tile_ref(ctx.tiles, in_slot).as_gpu_tensor(ctx.tiles);
+                let group = ctx.fwd.tp_group.expect(
+                    "Instruction::AllGather reached eval but \
+                     ForwardCtx::tp_group is None — caller must \
+                     attach an NcclGroup at tp_world_size > 1",
+                );
+                if crate::trace_enabled() {
+                    dump_tile_head(
+                        &format!(
+                            "AllGather(in={in_slot},out={out_slot}) PRE  r={}",
+                            group.rank(),
+                        ),
+                        v,
+                        ctx.device.compute_stream,
+                        8,
+                    );
+                }
+                let out = group.all_gather_last_dim(v, &mut ctx.device.caching);
+                if crate::trace_enabled() {
+                    dump_tile_head(
+                        &format!(
+                            "AllGather(in={in_slot},out={out_slot}) POST r={}",
+                            group.rank(),
+                        ),
+                        out.as_gpu_tensor(),
+                        ctx.device.compute_stream,
+                        16,
+                    );
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
             Instruction::ScalarMul(in_slot, out_slot, scale) => {
                 let owned = take_owned(ctx.tiles, in_slot);
                 unsafe {
@@ -337,6 +687,20 @@ impl<W: CanonicalParams> Instruction<W> {
                     w.eps,
                     ctx.device.compute_stream,
                 );
+                if crate::trace_enabled() {
+                    // Residual hidden-state at layer boundary —
+                    // identical between tp=1 and tp=2 iff
+                    // computation is correct through this point.
+                    // Bisect by diffing tp=1 vs tp=2 traces at
+                    // matching layer indices.
+                    let res_gt = tile_ref(ctx.tiles, residual_slot).as_gpu_tensor(ctx.tiles);
+                    dump_tile_head(
+                        &format!("FusedAddRmsNorm.residual layer={layer}"),
+                        res_gt,
+                        ctx.device.compute_stream,
+                        8,
+                    );
+                }
             },
             Instruction::FusedAddRmsNormWithOffset(
                 delta_slot,
@@ -372,11 +736,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Gemm(in_slot, out_slot, layer, weight_fn, n, k) => unsafe {
+            Instruction::Gemm(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("Gemm", w.dense_weight(), n, k);
                 let out = ctx
                     .device
                     .cublas
@@ -404,6 +767,14 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                if crate::trace_enabled() && layer == 0 {
+                    let wt = w.dense_weight();
+                    eprintln!(
+                        "[ferrite] gate_up_proj.weight layer=0 shape={:?} INTERMEDIATE_SIZE={}",
+                        wt.shape(),
+                        W::INTERMEDIATE_SIZE,
+                    );
+                }
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -453,6 +824,17 @@ impl<W: CanonicalParams> Instruction<W> {
                         w.dense_bias().is_some(),
                         "FusedQkvRopeCache: DSL `bias_add` on QKV claimed but \
                          packed LinearLayer has no bias — check safetensors path"
+                    );
+                }
+                if crate::trace_enabled() && layer == 0 {
+                    let wt = w.dense_weight();
+                    let bias_dim = w.dense_bias().map(|b| b.dim(0));
+                    eprintln!(
+                        "[ferrite] qkv_proj.weight layer=0 shape={:?} Q_SIZE={} KV_SIZE={} bias_dim0={:?}",
+                        wt.shape(),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        bias_dim,
                     );
                 }
                 let qkv_packed = w.forward(
@@ -611,6 +993,17 @@ impl<W: CanonicalParams> Instruction<W> {
                             w.dense_bias().is_some(),
                             "FusedQkvRopePrefill: DSL `bias_add` on QKV claimed but \
                              packed LinearLayer has no bias — check safetensors path"
+                        );
+                    }
+                    if crate::trace_enabled() && layer == 0 {
+                        let wt = w.dense_weight();
+                        let bias_dim = w.dense_bias().map(|b| b.dim(0));
+                        eprintln!(
+                            "[ferrite] qkv_proj.weight (prefill) layer=0 shape={:?} Q_SIZE={} KV_SIZE={} bias_dim0={:?}",
+                            wt.shape(),
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            bias_dim,
                         );
                     }
                     let qkv_packed = w.forward(
@@ -1068,13 +1461,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
-                n,
-                k,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemm", w.dense_weight(), n, k);
                 let out = cutlass::cutlass_gemm(
                     *v,
                     w.dense_weight(),
@@ -1093,13 +1483,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_n,
                 stages,
                 split_k,
-                n,
-                k,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemmSplitK", w.dense_weight(), n, k);
                 let out = cutlass::cutlass_gemm_splitk(
                     *v,
                     w.dense_weight(),
@@ -1117,14 +1504,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
-                n,
-                k,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemmAdd", w.dense_weight(), n, k);
                 cutlass::cutlass_gemm_add(
                     *v,
                     w.dense_weight(),
@@ -1133,11 +1517,10 @@ impl<W: CanonicalParams> Instruction<W> {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::CutlassGemv(in_slot, out_slot, layer, weight_fn, n, k) => unsafe {
+            Instruction::CutlassGemv(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemv", w.dense_weight(), n, k);
                 let out = cutlass::cutlass_gemv(
                     *v,
                     w.dense_weight(),
@@ -1146,21 +1529,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::CutlassFusedGemmBias(
-                in_slot,
-                out_slot,
-                layer,
-                weight_fn,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => unsafe {
+            Instruction::CutlassFusedGemmBias(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassFusedGemmBias", w.dense_weight(), n, k);
                 let bias = w.dense_bias().expect(
                     "CutlassFusedGemmBias: LinearLayer has no bias — check safetensors path",
                 );
@@ -1168,7 +1540,6 @@ impl<W: CanonicalParams> Instruction<W> {
                     *v,
                     w.dense_weight(),
                     bias,
-                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -2023,7 +2394,20 @@ pub unsafe fn run<W: CanonicalParams>(
         run_slice(backbone, &mut ctx);
         run_slice(lm_head, &mut ctx);
     }
-    take_owned(&mut tiles, terminal_slot)
+    let out = take_owned(&mut tiles, terminal_slot);
+    if crate::trace_enabled() {
+        let gt = out.as_gpu_tensor();
+        // FORWARD return — the [N, vocab] logits going to the
+        // sampler. Identical for ferrite tp=1 vs tp=2 (and vs
+        // hand-written) iff the model is computing correctly. A
+        // tp=1-vs-tp=2 diff at this point isolates whether the
+        // bug is in the layer stack (values diverge) vs the
+        // sampler / downstream (values agree but output bogus).
+        unsafe {
+            dump_tile_head("forward.return", gt, device.compute_stream, 16);
+        }
+    }
+    out
 }
 
 /// Backbone-only run: returns a memcpy'd backbone tile so it

@@ -1370,6 +1370,87 @@ mod tests {
         );
     }
 
+    /// `Instruction::AllReduce` (the row-parallel TP communicator)
+    /// is one-tile in-place same-shape — its output IS the input
+    /// buffer post-mutation, just like `cutlass_gemm_add` /
+    /// `fused_add_rms_norm`. Coloring must place the AllReduce
+    /// output at the same slot as its input, no `View` indirection.
+    /// At runtime this lets `NcclGroup::all_reduce_inplace` operate
+    /// directly on the tile slot the gemm output landed in, with no
+    /// alias-row preamble in the bucket slice.
+    ///
+    /// Shape is the realistic gemm-output shape `[N, H]` with H>1
+    /// rather than `[1]` — `coloring_disjoint_lifetimes_dont_share_
+    /// across_shapes` is the load-bearing bug-driven test for shape
+    /// partitioning, and pinning AllReduce on a non-trivial shape
+    /// keeps both invariants in scope when something here regresses.
+    #[test]
+    fn coloring_allreduce_collapses_to_input_slot() {
+        let f = Fuf {
+            nodes: vec![
+                // gemm output (row-parallel weight, e.g. o_proj or
+                // down_proj). Shape [N=4, H=16] stands in for the
+                // post-attention or post-MLP residual stream.
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Gemm,
+                    inputs: vec![],
+                    outputs: vec![vec![Dim::Lit(4), Dim::Lit(16)]],
+                },
+                // AllReduce in-place: output aliases gemm output,
+                // same shape. This is the shape the lowering pass
+                // (task #5) emits at every ShardDim1 weight at tp>1.
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Add, // OpKind::AllReduce will land with task #5
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![vec![Dim::Lit(4), Dim::Lit(16)]],
+                },
+                // Downstream consumer (e.g. residual-add) reads via
+                // the alias.
+                FufNode {
+                    id: TileId(2),
+                    op: OpKind::Add,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(1),
+                        slot: 0,
+                    }],
+                    outputs: vec![vec![Dim::Lit(4), Dim::Lit(16)]],
+                },
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let id_plain = lib.push(Box::new(StubImpl {
+            name: "stub",
+            alias_to: None,
+            consumes: vec![],
+        }));
+        let id_all_reduce = lib.push(Box::new(StubImpl {
+            name: "all_reduce",
+            // Same-shape in-place: dst slot 0 aliases gemm output.
+            alias_to: Some((TileId(0), 0)),
+            consumes: vec![],
+        }));
+        let sfuf = linear_assignment(
+            &[TileId(0), TileId(1), TileId(2)],
+            &[id_plain, id_all_reduce, id_plain],
+        );
+        let lp = linear_loop(3);
+        let protected: HashSet<(TileId, u8)> = HashSet::new();
+        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+
+        assert_eq!(
+            sm.of(TileId(0), 0),
+            sm.of(TileId(1), 0),
+            "AllReduce dst must share slot with input — in-place \
+             same-shape, no View row, NCCL all_reduce_inplace \
+             operates on the gemm output tile directly",
+        );
+    }
+
     /// Different-shape alias keeps its own slot: dst and source have
     /// distinct colors so the runtime can hold a `View { ref_slot:
     /// source_color }` entry at the dst slot. Models `Reshape` —

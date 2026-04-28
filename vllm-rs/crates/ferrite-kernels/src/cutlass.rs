@@ -63,50 +63,6 @@ impl CutlassTile {
 // entry here.
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
-    pub fn cutlass_gemm_16x64_s3_launch(
-        c: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        beta: f32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_16x64_s4_launch(
-        c: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        beta: f32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_16x128_s3_launch(
-        c: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        beta: f32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_16x128_s4_launch(
-        c: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        alpha: f32,
-        beta: f32,
-        stream: u64,
-    ) -> i32;
     pub fn cutlass_gemm_32x64_s3_launch(
         c: *mut u16,
         a: *const u16,
@@ -466,208 +422,10 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
 
-    // ── Bias-add GEMM zoo ──
-    //
-    // `cutlass_gemm_bias_<TB_M>x<TB_N>_s<STAGES>_launch`. Computes
-    // `D[M,N] = A[M,K] @ B[N,K]^T + bias[N]` in one launch, where
-    // `bias` is `[N]` bf16 broadcast across rows.
-    //
-    // Backed by `cutlass::gemm::device::Gemm` (same template family
-    // as the standalone tile zoo) with `LinearCombination` epilogue +
-    // ldc=0 broadcast — the bias rides as the C operand at stride 0.
-    // Tile zoo mirrors `CUTLASS_TILE_ZOO` in
-    // ferrite-forward-macro/src/impl_lib.rs.
-    pub fn cutlass_gemm_bias_16x64_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_16x64_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_16x128_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_16x128_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_32x64_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_32x64_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_32x128_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_32x128_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_32x256_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_64x64_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_64x64_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_64x128_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_64x128_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_128x64_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_128x64_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_128x128_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_128x128_s4_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_128x256_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_256x64_s3_launch(
-        d: *mut u16,
-        a: *const u16,
-        b: *const u16,
-        bias: *const u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_bias_256x64_s4_launch(
+    /// Fused GEMM + bias broadcast via CUTLASS 2.x EVT.
+    /// Computes `D[M,N] = A[M,K] @ B[N,K]^T + bias[N]`; `bias` is
+    /// broadcast across the M axis in the epilogue.
+    pub fn cutlass_gemm_bias_launch(
         d: *mut u16,
         a: *const u16,
         b: *const u16,
@@ -687,10 +445,6 @@ type CutlassLaunchFn =
 #[cfg(feature = "cuda")]
 fn launch_fn_for(tile: CutlassTile) -> CutlassLaunchFn {
     match (tile.tile_m, tile.tile_n, tile.stages) {
-        (16, 64, 3) => cutlass_gemm_16x64_s3_launch,
-        (16, 64, 4) => cutlass_gemm_16x64_s4_launch,
-        (16, 128, 3) => cutlass_gemm_16x128_s3_launch,
-        (16, 128, 4) => cutlass_gemm_16x128_s4_launch,
         (32, 64, 3) => cutlass_gemm_32x64_s3_launch,
         (32, 64, 4) => cutlass_gemm_32x64_s4_launch,
         (32, 128, 3) => cutlass_gemm_32x128_s3_launch,
@@ -966,52 +720,13 @@ pub unsafe fn cutlass_gemv(
     out
 }
 
-/// Bias-add launch fn type — same prototype as the per-tile externs
-/// in `cutlass_gemm_bias.cu`.
-#[cfg(feature = "cuda")]
-type CutlassBiasLaunchFn =
-    unsafe extern "C" fn(*mut u16, *const u16, *const u16, *const u16, i32, i32, i32, u64) -> i32;
-
-#[cfg(feature = "cuda")]
-fn launch_fn_for_bias(tile: CutlassTile) -> CutlassBiasLaunchFn {
-    match (tile.tile_m, tile.tile_n, tile.stages) {
-        (16, 64, 3) => cutlass_gemm_bias_16x64_s3_launch,
-        (16, 64, 4) => cutlass_gemm_bias_16x64_s4_launch,
-        (16, 128, 3) => cutlass_gemm_bias_16x128_s3_launch,
-        (16, 128, 4) => cutlass_gemm_bias_16x128_s4_launch,
-        (32, 64, 3) => cutlass_gemm_bias_32x64_s3_launch,
-        (32, 64, 4) => cutlass_gemm_bias_32x64_s4_launch,
-        (32, 128, 3) => cutlass_gemm_bias_32x128_s3_launch,
-        (32, 128, 4) => cutlass_gemm_bias_32x128_s4_launch,
-        (32, 256, 3) => cutlass_gemm_bias_32x256_s3_launch,
-        (64, 64, 3) => cutlass_gemm_bias_64x64_s3_launch,
-        (64, 64, 4) => cutlass_gemm_bias_64x64_s4_launch,
-        (64, 128, 3) => cutlass_gemm_bias_64x128_s3_launch,
-        (64, 128, 4) => cutlass_gemm_bias_64x128_s4_launch,
-        (128, 64, 3) => cutlass_gemm_bias_128x64_s3_launch,
-        (128, 64, 4) => cutlass_gemm_bias_128x64_s4_launch,
-        (128, 128, 3) => cutlass_gemm_bias_128x128_s3_launch,
-        (128, 128, 4) => cutlass_gemm_bias_128x128_s4_launch,
-        (128, 256, 3) => cutlass_gemm_bias_128x256_s3_launch,
-        (256, 64, 3) => cutlass_gemm_bias_256x64_s3_launch,
-        (256, 64, 4) => cutlass_gemm_bias_256x64_s4_launch,
-        other => panic!(
-            "cutlass_gemm_bias: unsupported tile {:?} — add its extern + csv entry",
-            other,
-        ),
-    }
-}
-
-/// Fused GEMM + bias broadcast.
+/// Fused GEMM + bias broadcast in a single CUTLASS EVT kernel.
 ///
 /// Computes `D[M, N] = A @ W^T + bias` where:
 /// - `a` is `[M, K]` bf16 activation,
 /// - `weight` is `[N, K]` bf16 weight (row-major, cuBLAS-convention),
 /// - `bias` is `[N]` bf16 per-column bias,
 /// - output `D` is `[M, N]` bf16 allocated fresh.
-///
-/// `tile` selects the threadblock variant; the DP solver picks per
-/// (M, N, K) workload from calibrated CSV rows.
 ///
 /// # Safety
 /// All inputs must be valid GPU bf16 memory with the shapes claimed
@@ -1021,7 +736,6 @@ pub unsafe fn cutlass_gemm_bias(
     a: ferrite_cuda_core::tensor::GpuTensor,
     weight: ferrite_cuda_core::tensor::GpuTensor,
     bias: ferrite_cuda_core::tensor::GpuTensor,
-    tile: CutlassTile,
     alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
     stream: cudarc::driver::sys::CUstream,
 ) -> ferrite_cuda_core::alloc::OwnedTensor {
@@ -1034,9 +748,8 @@ pub unsafe fn cutlass_gemm_bias(
     let n = weight.dim(0);
     let k = a.dim(1);
     let out = alloc.alloc_tensor(&[m, n], a.dtype());
-    let launch = launch_fn_for_bias(tile);
     let rc = unsafe {
-        launch(
+        cutlass_gemm_bias_launch(
             out.as_mut_ptr::<u16>(),
             a.as_ptr::<u16>(),
             weight.as_ptr::<u16>(),
@@ -1047,7 +760,7 @@ pub unsafe fn cutlass_gemm_bias(
             stream as u64,
         )
     };
-    debug_assert_eq!(rc, 0, "cutlass_gemm_bias {:?} returned {}", tile, rc);
+    debug_assert_eq!(rc, 0, "cutlass_gemm_bias returned {}", rc);
     out
 }
 

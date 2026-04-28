@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Embedding gather kernel: out[i] = weight[input_ids[i]]
+// Embedding gather kernel with tensor-parallel vocab-shard masking.
 //
-// Simple: one thread per (token, dim) element.
+// At tp=1 the shard covers the full vocab: vocab_offset = 0,
+// vocab_per_rank = vocab_size; the mask never trips and behavior is
+// identical to a plain gather. At tp>1 each rank's `weight` tensor
+// is a [vocab_size/tp, hidden_size] slice; tokens outside this rank's
+// [vocab_offset, vocab_offset + vocab_per_rank) range get zero-filled
+// rows so the cross-rank AllReduce-sum produces exactly one
+// embedding contribution per token (from the rank that owns it).
+// Mirrors Python vLLM's VocabParallelEmbedding.forward_native — see
+// `get_masked_input_and_mask` + `output_parallel.masked_fill_(mask, 0)`.
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -10,10 +18,12 @@
 template<typename T>
 __global__ void embedding_gather_kernel(
     T* __restrict__ out,           // [num_tokens, hidden_size]
-    const T* __restrict__ weight,  // [vocab_size, hidden_size]
-    const uint32_t* __restrict__ ids,  // [num_tokens]
+    const T* __restrict__ weight,  // [vocab_per_rank, hidden_size]
+    const uint32_t* __restrict__ ids,  // [num_tokens] (global ids)
     int hidden_size,
-    int num_tokens
+    int num_tokens,
+    uint32_t vocab_offset,
+    uint32_t vocab_per_rank
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_tokens * hidden_size;
@@ -22,8 +32,15 @@ __global__ void embedding_gather_kernel(
     int token = idx / hidden_size;
     int dim = idx % hidden_size;
     uint32_t id = ids[token];
+    // Underflow on `id < vocab_offset` is fine — `local_id` becomes a
+    // huge unsigned value that fails the `< vocab_per_rank` check.
+    uint32_t local_id = id - vocab_offset;
 
-    out[token * hidden_size + dim] = weight[id * hidden_size + dim];
+    if (id < vocab_offset || local_id >= vocab_per_rank) {
+        out[token * hidden_size + dim] = T(0);
+    } else {
+        out[token * hidden_size + dim] = weight[local_id * hidden_size + dim];
+    }
 }
 
 // Vectorized version: 128-bit loads (8 x f16/bf16 or 4 x f32)
@@ -33,7 +50,9 @@ __global__ void embedding_gather_vec_kernel(
     const T* __restrict__ weight,
     const uint32_t* __restrict__ ids,
     int hidden_size,
-    int num_tokens
+    int num_tokens,
+    uint32_t vocab_offset,
+    uint32_t vocab_per_rank
 ) {
     using VecT = typename std::conditional<sizeof(T) * VEC_SIZE == 16, int4,
                   typename std::conditional<sizeof(T) * VEC_SIZE == 8, int2, int>::type>::type;
@@ -46,10 +65,21 @@ __global__ void embedding_gather_vec_kernel(
     int token = vec_idx / vec_hidden;
     int dim_vec = vec_idx % vec_hidden;
     uint32_t id = ids[token];
+    uint32_t local_id = id - vocab_offset;
 
-    const VecT* w_vec = reinterpret_cast<const VecT*>(weight + id * hidden_size);
     VecT* o_vec = reinterpret_cast<VecT*>(out + token * hidden_size);
-    o_vec[dim_vec] = w_vec[dim_vec];
+    if (id < vocab_offset || local_id >= vocab_per_rank) {
+        // Zero-fill this rank's contribution for an out-of-range token.
+        VecT zero;
+        // Zero-init via memset on the vector type — works for int / int2 / int4.
+        for (int b = 0; b < (int)sizeof(VecT) / 4; b++) {
+            reinterpret_cast<int*>(&zero)[b] = 0;
+        }
+        o_vec[dim_vec] = zero;
+    } else {
+        const VecT* w_vec = reinterpret_cast<const VecT*>(weight + local_id * hidden_size);
+        o_vec[dim_vec] = w_vec[dim_vec];
+    }
 }
 
 #define LAUNCH_GATHER(T, VEC)                                                  \
@@ -60,12 +90,14 @@ __global__ void embedding_gather_vec_kernel(
         int blocks = (total + threads - 1) / threads;                           \
         if (hidden_size % (VEC) == 0) {                                         \
             embedding_gather_vec_kernel<T, VEC><<<blocks, threads, 0, stream>>>( \
-                (T*)out, (const T*)weight, ids, hidden_size, num_tokens);        \
+                (T*)out, (const T*)weight, ids, hidden_size, num_tokens,         \
+                vocab_offset, vocab_per_rank);                                   \
         } else {                                                                \
             total = num_tokens * hidden_size;                                    \
             blocks = (total + threads - 1) / threads;                           \
             embedding_gather_kernel<T><<<blocks, threads, 0, stream>>>(          \
-                (T*)out, (const T*)weight, ids, hidden_size, num_tokens);        \
+                (T*)out, (const T*)weight, ids, hidden_size, num_tokens,         \
+                vocab_offset, vocab_per_rank);                                   \
         }                                                                       \
     } while (0)
 
@@ -73,21 +105,27 @@ extern "C" {
 
 void embedding_gather_f16(
     void* out, const void* weight, const uint32_t* ids,
-    int hidden_size, int num_tokens, cudaStream_t stream
+    int hidden_size, int num_tokens,
+    uint32_t vocab_offset, uint32_t vocab_per_rank,
+    cudaStream_t stream
 ) {
     LAUNCH_GATHER(__half, 8);  // 8 x f16 = 128 bits
 }
 
 void embedding_gather_bf16(
     void* out, const void* weight, const uint32_t* ids,
-    int hidden_size, int num_tokens, cudaStream_t stream
+    int hidden_size, int num_tokens,
+    uint32_t vocab_offset, uint32_t vocab_per_rank,
+    cudaStream_t stream
 ) {
     LAUNCH_GATHER(__nv_bfloat16, 8);
 }
 
 void embedding_gather_f32(
     void* out, const void* weight, const uint32_t* ids,
-    int hidden_size, int num_tokens, cudaStream_t stream
+    int hidden_size, int num_tokens,
+    uint32_t vocab_offset, uint32_t vocab_per_rank,
+    cudaStream_t stream
 ) {
     LAUNCH_GATHER(float, 4);  // 4 x f32 = 128 bits
 }

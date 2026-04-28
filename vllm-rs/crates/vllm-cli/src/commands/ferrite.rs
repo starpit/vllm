@@ -156,14 +156,6 @@ struct Cluster<'a> {
     labels: Vec<String>,
     backbone: &'a [NormalizedStep],
     lm_head: &'a [NormalizedStep],
-    /// Union of `m_min..m_max_excl` across every clustered bucket.
-    /// Most clusters have a single M-range so this matches the
-    /// header label exactly; clusters that merge multiple M-ranges
-    /// (same structural picks at different M) widen to the union.
-    /// Used by the GEMM-line shape annotation so each row reads
-    /// `(M=…,N=…,K=…)` self-containedly without scanning the header.
-    m_min: u64,
-    m_max_excl: u64,
 }
 
 fn print_variant<W: Write>(
@@ -185,15 +177,11 @@ fn print_variant<W: Write>(
             .find(|c| same_shape(c.backbone, &b.backbone) && same_shape(c.lm_head, &b.lm_head))
         {
             c.labels.push(label);
-            c.m_min = c.m_min.min(b.m_min);
-            c.m_max_excl = c.m_max_excl.max(b.m_max_excl);
         } else {
             clusters.push(Cluster {
                 labels: vec![label],
                 backbone: &b.backbone,
                 lm_head: &b.lm_head,
-                m_min: b.m_min,
-                m_max_excl: b.m_max_excl,
             });
         }
     }
@@ -219,11 +207,10 @@ fn print_variant<W: Write>(
                 c.lm_head.len()
             ))
         )?;
-        let m_range = Some((c.m_min, c.m_max_excl));
         writeln!(out, "  {}", style.bold("backbone"))?;
-        print_tree(out, c.backbone, "  ", style, &widths, m_range)?;
+        print_tree(out, c.backbone, "  ", style, &widths)?;
         writeln!(out, "  {}", style.bold("lm_head"))?;
-        print_tree(out, c.lm_head, "  ", style, &widths, m_range)?;
+        print_tree(out, c.lm_head, "  ", style, &widths)?;
     }
     Ok(())
 }
@@ -282,10 +269,6 @@ struct RowFields {
     layer: String,   // "L=15" or "" when no Layer field
     kernels: String, // "<RmsNorm>" or "<LinearLayer+RmsNorm>" or ""
     rope: bool,
-    /// "(N=128256,K=4096)" for GEMM-class steps, "" otherwise. Lives
-    /// in its own column so cuBLAS-vs-CUTLASS analyses can read shape
-    /// alongside slot pattern without cross-referencing model config.
-    shape: String,
 }
 
 #[derive(Default)]
@@ -294,7 +277,6 @@ struct Widths {
     slots: usize,
     layer: usize,
     kernels: usize,
-    shape: usize,
     /// Deepest tree nesting any non-loop row appears at. Top-level
     /// rows are depth 0; loop bodies are depth 1. Used to expand the
     /// kind column on shallow rows so the slots/layer/kernels
@@ -305,35 +287,28 @@ struct Widths {
 fn compute_widths(clusters: &[Cluster<'_>]) -> Widths {
     let mut w = Widths::default();
     for c in clusters {
-        let m_range = Some((c.m_min, c.m_max_excl));
         for steps in [c.backbone, c.lm_head] {
-            measure_steps(steps, 0, &mut w, m_range);
+            measure_steps(steps, 0, &mut w);
         }
     }
     w
 }
 
-fn measure_steps(
-    steps: &[NormalizedStep],
-    depth: usize,
-    w: &mut Widths,
-    m_range: Option<(u64, u64)>,
-) {
+fn measure_steps(steps: &[NormalizedStep], depth: usize, w: &mut Widths) {
     let mut i = 0;
     while i < steps.len() {
         let s = &steps[i];
         if s.kind == "Loop" {
             let body_len = loop_body_len(s);
             let body_end = (i + 1 + body_len).min(steps.len());
-            measure_steps(&steps[i + 1..body_end], depth + 1, w, m_range);
+            measure_steps(&steps[i + 1..body_end], depth + 1, w);
             i = body_end;
         } else {
-            let r = render_fields(s, m_range);
+            let r = render_fields(s);
             w.kind = w.kind.max(r.kind.chars().count());
             w.slots = w.slots.max(r.slots.chars().count());
             w.layer = w.layer.max(r.layer.chars().count());
             w.kernels = w.kernels.max(r.kernels.chars().count());
-            w.shape = w.shape.max(r.shape.chars().count());
             w.max_depth = w.max_depth.max(depth);
             i += 1;
         }
@@ -351,33 +326,17 @@ fn display_kind(kind: &str) -> &str {
     }
 }
 
-/// Format the cluster's M-range as it appears in shape annotations.
-/// Single-M clusters (`m_min + 1 == m_max_excl`) render as `M=N`;
-/// multi-M as `M=lo..hi` with `∞` for the open upper bound. Matches
-/// the bucket label convention used in the header.
-fn fmt_m_range(m_min: u64, m_max_excl: u64) -> String {
-    if m_min + 1 == m_max_excl {
-        format!("M={m_min}")
-    } else if m_max_excl == u64::MAX {
-        format!("M={m_min}..∞")
-    } else {
-        format!("M={m_min}..{m_max_excl}")
-    }
-}
-
-fn render_fields(step: &NormalizedStep, m_range: Option<(u64, u64)>) -> RowFields {
+fn render_fields(step: &NormalizedStep) -> RowFields {
     let mut slots: Vec<String> = Vec::new();
     let mut layer: Option<u32> = None;
     let mut kernels: Vec<&'static str> = Vec::new();
     let mut has_rope = false;
-    let mut weight_shape: Option<(u32, u32)> = None;
     for f in &step.fields {
         match f {
             NormalizedField::Slot(s) => slots.push(format!("s{s}")),
             NormalizedField::Layer(l) => layer = Some(*l),
             NormalizedField::LayerKind(k) => kernels.push(k),
             NormalizedField::RopeCosSin => has_rope = true,
-            NormalizedField::WeightShape { n, k } => weight_shape = Some((*n, *k)),
             _ => {}
         }
     }
@@ -395,36 +354,26 @@ fn render_fields(step: &NormalizedStep, m_range: Option<(u64, u64)>) -> RowField
     } else {
         format!("<{}>", kernels.join("+"))
     };
-    let shape_str = match (weight_shape, m_range) {
-        (Some((n, k)), Some((m_min, m_max_excl))) => {
-            format!("({},N={n},K={k})", fmt_m_range(m_min, m_max_excl))
-        }
-        (Some((n, k)), None) => format!("(N={n},K={k})"),
-        (None, _) => String::new(),
-    };
     RowFields {
         kind: display_kind(step.kind).to_string(),
         slots: slots_str,
         layer: layer_str,
         kernels: kernels_str,
         rope: has_rope,
-        shape: shape_str,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn print_tree<W: Write>(
     out: &mut W,
     steps: &[NormalizedStep],
     indent: &str,
     style: &Style,
     widths: &Widths,
-    m_range: Option<(u64, u64)>,
 ) -> io::Result<()> {
     let tops = top_level_indices(steps);
     for (i, &idx) in tops.iter().enumerate() {
         let is_last = i + 1 == tops.len();
-        render_node(out, steps, idx, indent, is_last, 0, style, widths, m_range)?;
+        render_node(out, steps, idx, indent, is_last, 0, style, widths)?;
     }
     Ok(())
 }
@@ -467,7 +416,6 @@ fn render_node<W: Write>(
     depth: usize,
     style: &Style,
     widths: &Widths,
-    m_range: Option<(u64, u64)>,
 ) -> io::Result<()> {
     let s = &steps[idx];
     let connector = if is_last { "└─ " } else { "├─ " };
@@ -495,7 +443,6 @@ fn render_node<W: Write>(
                 depth + 1,
                 style,
                 widths,
-                m_range,
             )?;
         }
     } else {
@@ -508,7 +455,7 @@ fn render_node<W: Write>(
         writeln!(
             out,
             "{prefix}{connector}{}",
-            format_row_styled(s, style, widths, extra, m_range)
+            format_row_styled(s, style, widths, extra)
         )?;
     }
     Ok(())
@@ -523,9 +470,8 @@ fn format_row_styled(
     style: &Style,
     widths: &Widths,
     extra_pad: usize,
-    m_range: Option<(u64, u64)>,
 ) -> String {
-    let r = render_fields(step, m_range);
+    let r = render_fields(step);
 
     // Right-pad each segment to its column width with spaces, then
     // wrap the visible text in style codes. `extra_pad` extends the
@@ -535,24 +481,20 @@ fn format_row_styled(
     let slots_padded = pad_right(&r.slots, widths.slots);
     let layer_padded = pad_right(&r.layer, widths.layer);
     let kernels_padded = pad_right(&r.kernels, widths.kernels);
-    let shape_padded = pad_right(&r.shape, widths.shape);
 
     let kind_styled = style.kind(&kind_padded);
     let slots_styled = style.dim(&slots_padded);
     let layer_styled = style.dim(&layer_padded);
     let kernels_styled = style.dim(&kernels_padded);
-    let shape_styled = style.dim(&shape_padded);
     let rope_styled = if r.rope {
         style.dim("rope")
     } else {
         " ".repeat(4)
     };
 
-    format!(
-        "{kind_styled}  {slots_styled}  {layer_styled}  {kernels_styled}  {shape_styled}  {rope_styled}"
-    )
-    .trim_end()
-    .to_string()
+    format!("{kind_styled}  {slots_styled}  {layer_styled}  {kernels_styled}  {rope_styled}")
+        .trim_end()
+        .to_string()
 }
 
 fn pad_right(s: &str, width: usize) -> String {

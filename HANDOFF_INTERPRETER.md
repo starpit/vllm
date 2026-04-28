@@ -1,10 +1,18 @@
 # ff-interpreter — handoff
 
-> Branch `ff-interpreter`. Read this whole file before changing
+> Branch `worktree-ff-tp`. Read this whole file before changing
 > anything. ff4 stencil rewrite is dead. The seam swap +
 > universal-`Instruction<W>` pivot + FORWARD_TABLE dispatch +
-> per-bucket slot metadata + dedup_quant_sig fix are all in. The
-> branch is fold-ready pending a curated golden re-sweep — see §6.
+> per-bucket slot metadata + dedup_quant_sig fix are all in.
+> Tensor-parallel **fanout is active** at `--features nccl`
+> (foundation 8 commits + activation 6 commits, tip = `85ef0006f`):
+> macro fans out every variant over `{1, 2, 4, 8}`, emits per-tp
+> modules with sharded `<W as CanonicalParams>::…` constants +
+> `OpKind::AllReduce` rows + per-tp `inventory::submit!`. At
+> default `--features cuda` (no nccl), behavior is byte-identical
+> to pre-TP — see §4 for what's still ahead before live tp>1
+> works (loader sharding + commandr-tp=2 verify). The branch is
+> fold-ready pending a curated golden re-sweep — see §6.
 >
 > The original size lever ("compress per-canonical Op enum +
 > __dispatch_one") was solved by lifting *everything codegen-
@@ -14,11 +22,18 @@
 
 ## Where we are
 
-The branch sits at `82a46a7b9` (446 commits ahead of `main`).
-Eleven model crates build, the curated 6-arch golden subset shows
-15/17 pass (two qwen3 failures are the pre-existing per-head
-QK-norm divergence; see §6), and the macro-test suite is **207/207
-green**.
+The branch sits at `85ef0006f` (461 commits ahead of `main`).
+Eleven model crates build under both default `--features cuda` and
+`--features nccl` (10 of 11 spot-checked at nccl this session;
+deepseek-v2 is similar enough to v3 that it's expected to pass),
+the curated 6-arch golden subset shows 15/17 pass (two qwen3
+failures are the pre-existing per-head QK-norm divergence; see §6),
+and the macro-test suite is **194/194 green** under both
+`cargo test -p ferrite-forward-macro --lib` and
+`--lib --features nccl` (the larger pre-TP count of 207/207 dropped
+after the unrelated `1dcea5ce1`/`7eb8e995b` cleanup excised dead
+pivot machinery; the TP foundation + activation added 12 new tests
+total to that smaller baseline).
 
 ### Architectural pivot (the big one, since `5a8301a86`)
 
@@ -103,6 +118,60 @@ tensor → server panicked at startup. The fix adds
 (`q:fp8-block` / `q:fp8-std` / `q:awq` / `q:gptq` / `q:bnb4` /
 `q:dense`) threaded into the dedup signature. Covered by 4 unit
 tests in `lib.rs::tests`.
+
+### Tensor-parallel — activation phase landed (tip `d11085d0b`)
+
+The TP rollout is now ACTIVE at `--features nccl`. 14 commits total:
+8 foundation (since `f7edb7032`) + 6 activation (since `64946efba`).
+At default `--features cuda` (no nccl), behavior is byte-identical
+to pre-TP — only tp=1 modules emit. At `--features nccl`,
+`compile()` fans out every variant over `{1, 2, 4, 8}` and emits
+per-tp modules with sharded `<W as CanonicalParams>::…` constants
++ `OpKind::AllReduce` rows after every row-parallel gemm + one
+`FerriteArchRegistration` per `(arch, tp)` tuple.
+
+**Activation commits:**
+
+| Commit       | Lands |
+|--------------|---|
+| `64946efba`  | `SolvedModel.tp_world_size: u8` field threaded into `dedup_signature` + `tp_lowering::insert_all_reduces`. Pinned by `tp_world_sizes_pick_separate_canonicals`. |
+| `ee0cdb9f8`  | `FerriteArchRegistration.tp_world_size: u8` + `try_load(arch_hint, tp_world_size)` matching. cuda_worker passes runtime tp. |
+| `09c6c1262`  | `nccl` cargo feature on every per-arch crate forwards down through `ferrite-forward/nccl` → `ferrite-forward-macro/nccl` (next commit) → kernels/cuda-core. ferrite-models umbrella + vllm-executor forward too. |
+| `b8c25e5d2`  | `emit_canonical_params_impl(model, tp)` floor-divides column-parallel dims (`num_q_heads`, `num_kv_heads`, `intermediate_size`, `q_size`, `kv_size`) by tp. 3 tests pin tp=1 identity, tp=2, tp=8. |
+| `889c44b2f`  | The big one. `compile()` outer loop iterates `[1, 2, 4, 8]` when `cfg!(feature = "nccl")`. `_tp{N}` suffix on per-(model, tp) idents. Indivisible (variant, tp) tuples skipped with stderr line. `DispatchArm` struct + `Weights::load(.., tp_world_size: u8)` with per-tp match arms + per-tp `inventory::submit!`. `ferrite-forward-macro/Cargo.toml` gains its own `nccl = []` feature so cargo recompiles the proc-macro per-feature-set. |
+| `d11085d0b`  | Schedule fix uncovered by activation: lowering breaks the "SubgraphId order = topological order" invariant (AllReduce tiles get high TileId but their consumers sit at low TileId). Replaced linear-walk wave assignment with memoized DFS topo. O(N+E). Surfaced as a slot-map alias-resolution panic on mistral / qwen2; commandr dodged (DSL terminal is scalar mul, not row-parallel gemm). |
+
+**Foundation commits:**
+
+| Commit       | Lands |
+|--------------|---|
+| `f7edb7032`  | `Instruction::AllReduce(u32)` variant + eval arm + `ForwardCtx::tp_group` field, all gated on a new `nccl` cargo feature on `ferrite-forward`. Stub `Self::Ferrite` arm in `cuda_worker::set_tp_group`. |
+| `a43b2ccda`  | `dedup_tp_sig(u8) → "tp:N"` threaded into `SolvedModel::dedup_signature` as a `tp:1` constant. 3 unit tests on `dedup_quant_sig_*` precedent. |
+| `624ca9fea`  | `coloring_allreduce_collapses_to_input_slot` regression tripwire. |
+| `bc6444445`  | `cutlass_gemm_add_does_not_claim_across_intermediate_node` + `fused_add_rms_norm_*` — the comm-boundary guard is **emergent** from `consumes_tile(add, gemm)` chain-break; no explicit solver code change needed. |
+| `cc75942f7`  | `OpKind::AllReduce` variant + `shape::apply_signature`/`weight_arg_ranks` arms + `AllReduceImpl` registered in `starter_library()`. |
+| `a02ff0b7b`  | `tp_lowering` module + `insert_all_reduces` skeleton with no-op fast path at tp=1. Wired into `compile()` between `unroll` and `solve`. |
+| `0565162c1`  | `shard_kind_for_weight_path` (HF-standard names) + actual insertion logic at tp>1: append AllReduce node, rewire all consumers of gemm output. 3 tests. |
+| `03ce7668e`  | `FerriteModel.tp_group` field; `set_tp_group` arm assigns into it; both `ForwardCtx` construction sites pass `tp_group: m.tp_group.as_ref()`. Runtime plumbing connected end-to-end. |
+
+Result: `cargo check -p vllm-executor` clean under both
+`--features cuda` (variant absent, no NCCL dep) and `--features
+nccl` (variant + tp_group present). Macro test suite: 194/194 pass
+under both `--features ""` and `--features nccl`. At runtime, tp=1
+forward calls still read-then-discard the `tp_group` field on every
+`ForwardCtx` — the AllReduce eval arm is unreachable because the
+lowering pass emits zero rows at tp=1. **At runtime tp>1, the
+fanout is inert until task #6 (loader sharding) lands** — the
+emitted `Weights::load_tp{N}` paths run, but the safetensors load
+returns full-rank tensors that don't match the sharded
+`CanonicalParams` sizes. See "What's left §4" below.
+
+Verified `--features nccl` compile on commandr, mistral, qwen2,
+llama, gemma2, gemma3, phi3, qwen3, granite, deepseek-v3 (10 of 11
+arches). Skip-at-indivisible warnings appear on variants with
+heads / intermediate not divisible by tp (qwen2.5-7b's 28 heads at
+tp=8, SmolLM's 3 KV heads at any tp>3, etc.) — those (variant, tp)
+tuples drop out and the umbrella build still succeeds.
 
 ### Upstream rebase that landed mid-branch
 
@@ -206,7 +275,33 @@ fail. Tracked separately. The fp8 path on qwen3 (commit
 the way, which is now fixed and tested — but the QK-norm
 divergence sits underneath.
 
-### 4. Optional follow-ups noted along the way
+### 4. Tensor-parallel — runtime verify still ahead
+
+Task #7 (canonical fanout) landed this session along with the
+schedule-topo fix it surfaced. The macro side of TP is now a full
+fanout; what remains is the runtime weight-loading path and the
+correctness verify on a real model. Read memory
+`project_tp_design_notes` for the full commit map.
+
+**Task #6 — loader sharding.** Per-arch shard-kind table
+(`shard_kind_for_weight_path` from `tp_lowering`) reused for
+load-time slicing. `(rank, world)`-aware tensor load that slices
+Dim0 for column-parallel weights (q/k/v/gate/up), Dim1 for
+row-parallel (o/down), Replicate otherwise. Bias on row-parallel
+layers moves post-AllReduce, replicated (only matters for arches
+with linear bias — Llama doesn't, some Qwen2 / Granite variants
+do; 4th-decimal divergence from Python vLLM at tp>1 if missed).
+KV replication when `num_kv_heads < tp_size` (Llama3-8B at tp=16
+etc.). Two pending tests: `loader_shards_dim0_for_qkv_dim1_for_o_proj
+_at_tp_2` and `kv_replication_when_num_kv_heads_lt_tp_size`.
+
+**Task #9 — verify on commandr at tp=2.** Per memory
+`feedback_smallest_model_for_verify`. End-to-end: build vllm-cli
+with `--features nccl`, run `vllm chat` with `--tensor-parallel-size
+2` on commandr (943 expanded lines vs llama's 36025), then run the
+curated golden subset at TP=2. Depends on #7 + #6.
+
+### 5. Optional follow-ups noted along the way
 
 - **Type-level shapes.** `TensorView<S: Shape>` with const-
   generic dims would have caught the in-flight shape-mismatch
@@ -226,7 +321,8 @@ divergence sits underneath.
     emitted Weights `impl CanonicalParams` plants the literals
     that the eval match reads as `<W>::HEAD_DIM` etc.
   - `pub enum Instruction<W>` — 52 tuple variants (49 Impls +
-    Loop/Alias/Free). Manual `Copy`/`Clone` impls (no `W: Copy`
+    Loop/Alias/Free) plus `AllReduce(u32)` cfg-gated on
+    `feature = "nccl"`. Manual `Copy`/`Clone` impls (no `W: Copy`
     bound), no `Debug` derive. Tuple variants intentional —
     struct variants would balloon emitted size.
   - `unsafe fn run<W>(backbone, lm_head, …)` and
@@ -248,6 +344,28 @@ divergence sits underneath.
     loop so call sites collapse to one fn call.
   - `dedup_quant_sig(method)` (private) — stable per-FieldLoad-
     arm string for cross-variant canonical hashing.
+  - `dedup_tp_sig(tp_world_size)` (private) — TP analog of
+    `dedup_quant_sig`. Threaded into `SolvedModel::dedup_signature`
+    as `dedup_tp_sig(self.tp_world_size)`. Pinned by 3 unit tests
+    + `tp_world_sizes_pick_separate_canonicals` end-to-end.
+  - `tp_lowering::insert_all_reduces(fuf, program, tp_world_size)`
+    — FUF-lowering pass. Walks every `OpKind::Gemm`, looks up the
+    weight via `program.weights.path(...)`, and at tp>1 appends
+    `OpKind::AllReduce` after every `ShardDim1` weight, rewiring
+    every consumer of the gemm output to the new tile. Wired into
+    `compile()` between `unroll` and `solve` with `tp_world_size`
+    from the SolvedModel. Five tests cover shard-kind table +
+    tp=1 no-op + tp>1 insertion + column-parallel skip + degenerate
+    empty-FUF. **Caveat:** appending AllReduce nodes at high TileId
+    breaks the historical "SubgraphId order = topological order"
+    invariant — `schedule.rs` was rewritten to memoized DFS topo
+    in `d11085d0b` to handle this. Future passes that care about
+    that invariant should use the schedule's wave assignment.
+  - `AllReduceImpl` (impl_lib.rs) — single-tile claim of any
+    `OpKind::AllReduce`, output_alias collapses dst to input slot
+    (so shape-aware coloring places the AllReduce row at the
+    gemm output's slot with no `View`). No `interpreter_arm` —
+    the universal eval arm in `instr.rs` is the dispatch path.
   - `trace_enabled()` — `OnceLock<bool>` reading `FERRITE_TRACE`
     env var. The eval match opens with the always-compiled
     `if ferrite_forward::trace_enabled() { … }` block; setting
@@ -305,12 +423,23 @@ Re-read this file. Verify:
 
 - [ ] `cargo build -p ferrite-forward-macro` clean.
 - [ ] `cargo test -p ferrite-forward-macro --lib` shows
-      **207 pass / 0 fail** (4 of those are the new
-      `tests::dedup_quant_sig_*` regression tests + the
-      end-to-end `fp8_block_and_std_pick_separate_canonicals`).
+      **194 pass / 0 fail** (drops from the larger pre-TP 207
+      after `1dcea5ce1`/`7eb8e995b`'s dead-pivot excision; the
+      4 `tests::dedup_quant_sig_*` regression tests +
+      `fp8_block_and_std_pick_separate_canonicals` +
+      `tp_world_sizes_pick_separate_canonicals` + 3
+      `canonical_params_at_tp_eq_*` + 5 `tp_lowering::tests::*`
+      live in the current count).
+- [ ] `cargo test -p ferrite-forward-macro --lib --features nccl`
+      ALSO 194/194 (cargo recompiles the proc-macro per-feature-set;
+      both feature configurations must stay green).
 - [ ] `cargo build -p ferrite-models --features cuda` clean
-      (umbrella for every per-arch crate). Use
+      (umbrella for every per-arch crate, default tp=1 only). Use
       `FERRITE_MODELS=<stem>` to iterate fast on a single arch.
+- [ ] `cargo build -p ferrite-models --features nccl` clean
+      (umbrella, fans out tp ∈ {1,2,4,8}). Indivisible
+      (variant, tp) tuples drop with stderr `skip tp=N` lines —
+      this is expected, not a regression.
 - [ ] `cargo fmt` clean and `cargo clippy --all-targets
       -D warnings` clean on every touched crate (per
       `feedback_fmt_clippy_before_commit`).

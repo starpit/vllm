@@ -1172,6 +1172,7 @@ pub(crate) enum WeightsEmitMode<'a> {
 
 /// Emit the `Weights` struct definition (or alias) + its `load` +
 /// `fingerprint_matches` free fns.
+#[allow(clippy::too_many_arguments)]
 fn emit_weights_struct(
     program: &Program,
     fuf: &Fuf,
@@ -1180,6 +1181,7 @@ fn emit_weights_struct(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
+    tp_world_size: u8,
 ) -> TokenStream {
     let accessors = match collect_accessors(program, fuf, sfufs, lib) {
         Ok(a) => a,
@@ -1362,7 +1364,7 @@ fn emit_weights_struct(
 
     let lets: Vec<TokenStream> = groups
         .iter()
-        .map(|g| emit_group_let(g, &plan_by_name, model))
+        .map(|g| emit_group_let(g, &plan_by_name, model, tp_world_size))
         .collect();
 
     // Shared-per-model Marlin prelude: one workspace allocation
@@ -1962,6 +1964,11 @@ fn emit_weights_struct(
 
             /// Canonical load body. `marlin_storage` lets AWQ/GPTQ/CT
             /// variants share one compiled copy; ignored elsewhere.
+            /// `tp_rank` is the runtime rank-id (0..tp_world_size);
+            /// the bake `tp_world_size` literal lives on `<W as
+            /// CanonicalParams>::…` divisor constants and on the
+            /// per-(model, tp) emitted `_sharded` loader call sites
+            /// (task #5).
             #[cfg(feature = "cuda")]
             #[allow(clippy::too_many_lines, clippy::not_unsafe_ptr_arg_deref, unused_variables)]
             pub fn load_with(
@@ -1969,6 +1976,7 @@ fn emit_weights_struct(
                 stream: ::ferrite_cuda_core::CUstream,
                 max_model_len: usize,
                 marlin_storage: ::ferrite_kernels::layers_quant::MarlinFormat,
+                tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
                 #packed_splits_prelude
                 #marlin_prelude
@@ -1992,8 +2000,9 @@ fn emit_weights_struct(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
                 max_model_len: usize,
+                tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                load_with(gw, stream, max_model_len, #marlin_fmt)
+                load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
@@ -2009,8 +2018,9 @@ fn emit_weights_struct(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
                 stream: ::ferrite_cuda_core::CUstream,
                 max_model_len: usize,
+                tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt)
+                super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
             }
         },
     }
@@ -2237,11 +2247,29 @@ fn layered_suffix(layer0_prefix: &str) -> &str {
 /// literal, so no runtime `format!` machinery is needed). The
 /// returned tokens include the trailing `;` and the leading
 /// `let #name = …`.
-fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad) -> TokenStream {
+fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) -> TokenStream {
+    use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
+    let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+    let sharded = tp_world_size > 1;
     match plan {
-        FieldLoad::Embedding(prefix) => quote! {
-            let #name = ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?;
-        },
+        FieldLoad::Embedding(prefix) => {
+            // Embed paths route to vocab-parallel `_sharded` at tp>1
+            // (matches Python vLLM `VocabParallelEmbedding`). Non-
+            // embed names that happen to deserialize through the
+            // `Embedding` FieldLoad arm fall back to `Replicate`.
+            let kind = shard_kind_for_dotted_prefix(prefix);
+            if sharded && kind == ShardKind::ShardDim0 {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Embedding::load_sharded(
+                        gw, #prefix, tp_rank as usize, #tp_world_lit as usize,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::Embedding::load(gw, #prefix)?;
+                }
+            }
+        }
         FieldLoad::RmsNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
         },
@@ -2250,16 +2278,58 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad) -> TokenStream {
                 gw, #prefix, #eps,
             )?;
         },
-        FieldLoad::LinearDense(prefix) => quote! {
-            let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;
-        },
-        FieldLoad::LinearConcat(prefixes) => quote! {
-            let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
-                gw,
-                &[ #(#prefixes),* ],
-                stream,
-            )?;
-        },
+        FieldLoad::LinearDense(prefix) => {
+            // Per-Linear shard kind: q/k/v/gate/up/lm_head/embed →
+            // ShardDim0 (column / vocab parallel); o/down → ShardDim1
+            // (row parallel); else Replicate. lm_head's shard is what
+            // makes Python's tied-weights case self-consistent — since
+            // both embed_tokens and lm_head end up dim-0-sharded, the
+            // tied `Linear::new(embed.weight, None)` in
+            // `LinearTiedToEmbedding` below sees an already-sharded
+            // weight without further work.
+            let kind = shard_kind_for_dotted_prefix(prefix);
+            match (sharded, kind) {
+                (true, ShardKind::ShardDim0) => quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_sharded(
+                        gw, #prefix, 0usize, tp_rank as usize, #tp_world_lit as usize,
+                    )?;
+                },
+                (true, ShardKind::ShardDim1) => quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_sharded(
+                        gw, #prefix, 1usize, tp_rank as usize, #tp_world_lit as usize,
+                    )?;
+                },
+                _ => quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;
+                },
+            }
+        }
+        FieldLoad::LinearConcat(prefixes) => {
+            // Fused QKV / gate_up are always column-parallel — no
+            // row-parallel concat exists in any current arch. The
+            // sharded helper packs each source's per-rank slice into
+            // one contiguous buffer; biases follow column-parallel
+            // rule (sliced along dim 0 too).
+            if sharded {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat_sharded(
+                        gw,
+                        &[ #(#prefixes),* ],
+                        stream,
+                        tp_rank as usize,
+                        #tp_world_lit as usize,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
+                        gw,
+                        &[ #(#prefixes),* ],
+                        stream,
+                    )?;
+                }
+            }
+        }
         FieldLoad::LinearTiedToEmbedding(embed_ident) => quote! {
             // Tied embedding: lm_head reuses the
             // `#embed_ident` field's weight tensor. Shape
@@ -2453,6 +2523,7 @@ fn emit_group_let(
     group: &AccessorGroup<'_>,
     plans: &std::collections::BTreeMap<String, &FieldLoad>,
     model: &ModelParams,
+    tp_world_size: u8,
 ) -> TokenStream {
     match group.kind {
         AccessorGroupKind::Unindexed => {
@@ -2462,7 +2533,7 @@ fn emit_group_let(
                 .get(&acc.name.to_string())
                 .copied()
                 .expect("unindexed accessor missing from plan map");
-            emit_unindexed_let(&base_ident, plan)
+            emit_unindexed_let(&base_ident, plan, tp_world_size)
         }
         AccessorGroupKind::LayeredSparse => {
             // Each entry keeps its per-layer field name and gets
@@ -2477,7 +2548,7 @@ fn emit_group_let(
                         .get(&acc.name.to_string())
                         .copied()
                         .expect("sparse-layered accessor missing from plan map");
-                    emit_unindexed_let(&acc.name, plan)
+                    emit_unindexed_let(&acc.name, plan, tp_world_size)
                 })
                 .collect();
             quote! { #(#lets)* }
@@ -2501,7 +2572,7 @@ fn emit_group_let(
             // `entries.len()`, and the static-slice rows only ever
             // index 0..n_layers, so partial coverage is fine.
             let n_layers = group.entries.len() as u32;
-            let call = emit_layered_load_body(plan, n_layers);
+            let call = emit_layered_load_body(plan, n_layers, tp_world_size);
             let _ = model;
             quote! {
                 let #base_ident = #call;
@@ -2522,13 +2593,30 @@ fn emit_group_let(
 /// `DeepSeekV2Moe` falls through to a layered-MoE helper still
 /// emitted inline (only DeepSeek arches use it; not worth a helper
 /// crossing the ferrite-forward / ferrite-kernels seam).
-fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32) -> TokenStream {
+fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) -> TokenStream {
+    use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
     let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
+    let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
+    let sharded = tp_world_size > 1;
     match plan {
         FieldLoad::Embedding(prefix) => {
             let suffix = layered_suffix(prefix);
-            quote! {
-                ::ferrite_forward::load_layered_embedding(gw, #n_lit, #suffix)?
+            // Embedding is vocab-parallel at tp>1 (matches Python
+            // VocabParallelEmbedding). Layered embed accessors don't
+            // exist in any current arch but the helper is here for
+            // codegen uniformity; non-`embed_tokens` last segments
+            // fall back to the unsharded path.
+            let kind = shard_kind_for_dotted_prefix(prefix);
+            if sharded && kind == ShardKind::ShardDim0 {
+                quote! {
+                    ::ferrite_forward::load_layered_embedding_sharded(
+                        gw, #n_lit, #suffix, tp_rank as usize, #tp_world_lit as usize,
+                    )?
+                }
+            } else {
+                quote! {
+                    ::ferrite_forward::load_layered_embedding(gw, #n_lit, #suffix)?
+                }
             }
         }
         FieldLoad::RmsNorm(prefix, eps) => {
@@ -2545,19 +2633,46 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32) -> TokenStream {
         }
         FieldLoad::LinearDense(prefix) => {
             let suffix = layered_suffix(prefix);
-            quote! {
-                ::ferrite_forward::load_layered_linear_dense(gw, #n_lit, #suffix)?
+            let kind = shard_kind_for_dotted_prefix(prefix);
+            match (sharded, kind) {
+                (true, ShardKind::ShardDim0) => quote! {
+                    ::ferrite_forward::load_layered_linear_dense_sharded(
+                        gw, #n_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit as usize,
+                    )?
+                },
+                (true, ShardKind::ShardDim1) => quote! {
+                    ::ferrite_forward::load_layered_linear_dense_sharded(
+                        gw, #n_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit as usize,
+                    )?
+                },
+                _ => quote! {
+                    ::ferrite_forward::load_layered_linear_dense(gw, #n_lit, #suffix)?
+                },
             }
         }
         FieldLoad::LinearConcat(prefixes) => {
             let suffixes: Vec<&str> = prefixes.iter().map(|p| layered_suffix(p)).collect();
-            quote! {
-                ::ferrite_forward::load_layered_linear_dense_concat(
-                    gw,
-                    #n_lit,
-                    &[ #(#suffixes),* ],
-                    stream,
-                )?
+            // Always column-parallel — no row-parallel concat exists.
+            if sharded {
+                quote! {
+                    ::ferrite_forward::load_layered_linear_dense_concat_sharded(
+                        gw,
+                        #n_lit,
+                        &[ #(#suffixes),* ],
+                        stream,
+                        tp_rank as usize,
+                        #tp_world_lit as usize,
+                    )?
+                }
+            } else {
+                quote! {
+                    ::ferrite_forward::load_layered_linear_dense_concat(
+                        gw,
+                        #n_lit,
+                        &[ #(#suffixes),* ],
+                        stream,
+                    )?
+                }
             }
         }
         FieldLoad::LinearTiedToEmbedding(_) => panic!(
@@ -2875,19 +2990,38 @@ struct CanonicalLowered {
 
 /// Resolve the `(TileId, u8)` whose `OwnedTensor` is the backbone's
 /// "return value" — the input the terminal `gemm(<tile>, lm_head)`
-/// would have read. Panics if the FUF doesn't end in a tile-input
-/// terminal, since `forward_backbone` has no defined behavior for
-/// architectures whose terminal is anything other than `gemm(...,
+/// would have read. At tp>1 the lowering pass inserts an
+/// `OpKind::AllGather` after the lm_head Gemm; the AllGather
+/// becomes the new last node, so we walk one hop back to recover
+/// the lm_head Gemm before reading its hidden-state input.
+/// Panics if the resulting "lm_head Gemm" doesn't have a tile-input
+/// first arg, since `forward_backbone` has no defined behavior for
+/// architectures whose terminal is anything other than `gemm(<tile>,
 /// lm_head)`.
 fn backbone_output_for(fuf: &Fuf) -> (TileId, u8) {
     let last_node = fuf
         .nodes
         .last()
         .expect("FUF must be non-empty to emit a forward fn");
-    match last_node.inputs.first() {
+    let lm_head_node = if last_node.op == crate::classified::OpKind::AllGather {
+        // tp>1: skip past the AllGather to the lm_head Gemm whose
+        // hidden-state input we're after. AllGather has exactly one
+        // tile input (its source Gemm) by construction.
+        let lm_head_id = match last_node.inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            _ => panic!(
+                "tp>1 AllGather: first input must be a Tile (got {:?})",
+                last_node.inputs.first(),
+            ),
+        };
+        fuf.get(lm_head_id)
+    } else {
+        last_node
+    };
+    match lm_head_node.inputs.first() {
         Some(FufInput::Tile { id, slot }) => (*id, *slot),
         _ => panic!(
-            "forward_backbone: terminal tile's first input is not a Tile \
+            "forward_backbone: lm_head Gemm's first input is not a Tile \
              (DSL must end in `gemm(<tile>, lm_head)`)"
         ),
     }
@@ -2962,11 +3096,27 @@ fn impl_names_for(
 /// per-canonical model constants the universal `Instruction::eval`
 /// reads as `W::HEAD_DIM`, `W::INTERMEDIATE_SIZE`, etc. Default
 /// 0 / 0.0 / -1 for fields the canonical doesn't carry.
-fn emit_canonical_params_impl(model: &ModelParams) -> TokenStream {
+///
+/// `tp_world_size` shards the column-parallel dims (`num_q_heads`,
+/// `num_kv_heads`, `intermediate_size`) by `tp_world_size` — each
+/// rank owns `1/tp` of those dims. The sharded values flow into the
+/// emitted `Instruction::eval` body as `<W as CanonicalParams>::…`
+/// constants, so kernel launches at tp>1 see the per-rank sizes
+/// automatically. At `tp_world_size = 1` (every emission until task
+/// #7's outer-loop fanout lands) sharding is identity — output is
+/// byte-identical to single-rank builds.
+///
+/// Caller is responsible for ensuring `tp_world_size` evenly divides
+/// every column-parallel dim (KV replication when
+/// `num_kv_heads < tp_size` is task #6's loader-sharding work);
+/// `compile()` skips a `(variant, tp)` tuple when divisibility fails.
+fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenStream {
+    let tp = tp_world_size as u32;
+    let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
-    let num_q_heads = *model.bounds.get("num_attention_heads").unwrap_or(&0) as u32;
-    let num_kv_heads = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32;
-    let intermediate_size = *model.bounds.get("intermediate_size").unwrap_or(&0) as usize;
+    let num_q_heads = (*model.bounds.get("num_attention_heads").unwrap_or(&0) as u32) / tp;
+    let num_kv_heads = (*model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32) / tp;
+    let intermediate_size = (*model.bounds.get("intermediate_size").unwrap_or(&0) as usize) / tp_us;
     let q_size = (num_q_heads as usize) * (head_dim as usize);
     let kv_size = (num_kv_heads as usize) * (head_dim as usize);
     let kv_lora_rank = *model.bounds.get("kv_lora_rank").unwrap_or(&0) as usize;
@@ -3074,9 +3224,19 @@ pub fn emit_model(
     lib: &ImplementationLibrary,
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical_override: Option<&Ident>,
+    tp_world_size: u8,
 ) -> TokenStream {
     if let Some(canonical) = canonical_override {
-        return emit_shim_model(program, fuf, sfufs, lib, model, manifest, canonical);
+        return emit_shim_model(
+            program,
+            fuf,
+            sfufs,
+            lib,
+            model,
+            manifest,
+            canonical,
+            tp_world_size,
+        );
     }
     let weights = emit_weights_struct(
         program,
@@ -3086,6 +3246,7 @@ pub fn emit_model(
         model,
         manifest,
         WeightsEmitMode::Canonical,
+        tp_world_size,
     );
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
@@ -3247,7 +3408,7 @@ pub fn emit_model(
     // expanded source (without it prettyplease wraps
     // `::ferrite_forward::Instruction::<Weights>::Variant(…)` over
     // 3-4 lines per row).
-    let canonical_params_impl = emit_canonical_params_impl(model);
+    let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /
@@ -3507,6 +3668,7 @@ fn _unused(_: OpKind) {}
 ///   re-emit. rustc doesn't re-monomorphize `pub use` paths, so
 ///   the canonical's release-optimized forward is called directly
 ///   through this module without additional LLVM work.
+#[allow(clippy::too_many_arguments)]
 fn emit_shim_model(
     program: &Program,
     fuf: &Fuf,
@@ -3515,6 +3677,7 @@ fn emit_shim_model(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical: &Ident,
+    tp_world_size: u8,
 ) -> TokenStream {
     let weights = emit_weights_struct(
         program,
@@ -3524,6 +3687,7 @@ fn emit_shim_model(
         model,
         manifest,
         WeightsEmitMode::Shim { canonical },
+        tp_world_size,
     );
 
     // Per-bucket fn surfaces are gone — dispatch lives on the
@@ -3543,6 +3707,135 @@ mod tests {
     use super::*;
     use crate::impl_lib::WeightAccessor;
     use quote::format_ident;
+
+    /// Helper: build a minimal `ModelParams` from raw bound values
+    /// for canonical-params shard tests. Only the fields
+    /// `emit_canonical_params_impl` actually reads are populated;
+    /// everything else gets a sensible default.
+    fn shard_test_model(
+        num_attention_heads: u64,
+        num_key_value_heads: u64,
+        head_dim: u64,
+        intermediate_size: u64,
+    ) -> crate::config::ModelParams {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut bounds: BTreeMap<String, u64> = BTreeMap::new();
+        bounds.insert("num_attention_heads".into(), num_attention_heads);
+        bounds.insert("num_key_value_heads".into(), num_key_value_heads);
+        bounds.insert("head_dim".into(), head_dim);
+        bounds.insert("intermediate_size".into(), intermediate_size);
+        crate::config::ModelParams {
+            name: "shard_test".into(),
+            source_stem: "shard-test".into(),
+            source_path: PathBuf::new(),
+            bounds,
+            scalars: BTreeMap::new(),
+            quantization: None,
+            tie_word_embeddings: false,
+            architectures: Vec::new(),
+            extra_tracked_paths: Vec::new(),
+            rope_scaling: None,
+            rope_scaling_hash: None,
+        }
+    }
+
+    /// `emit_canonical_params_impl` at `tp_world_size = 1` is
+    /// identity — bounds flow through unchanged. Pinning this so
+    /// task #7's outer-loop fanout cannot accidentally regress the
+    /// single-rank build (which is every per-arch-crate build under
+    /// `--features cuda` until activation lands).
+    #[test]
+    fn canonical_params_at_tp_eq_1_is_identity() {
+        // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
+        // head_dim=128, intermediate=11008.
+        let m = shard_test_model(32, 32, 128, 11008);
+        let ts = emit_canonical_params_impl(&m, 1).to_string();
+        // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
+        assert!(
+            ts.contains("NUM_Q_HEADS : u32 = 32"),
+            "tp=1 must keep NUM_Q_HEADS = 32; got {ts}"
+        );
+        assert!(
+            ts.contains("NUM_KV_HEADS : u32 = 32"),
+            "tp=1 must keep NUM_KV_HEADS = 32; got {ts}"
+        );
+        assert!(
+            ts.contains("INTERMEDIATE_SIZE : usize = 11008"),
+            "tp=1 must keep INTERMEDIATE_SIZE = 11008; got {ts}"
+        );
+        assert!(
+            ts.contains("Q_SIZE : usize = 4096"),
+            "tp=1 must keep Q_SIZE = 4096; got {ts}"
+        );
+    }
+
+    /// `emit_canonical_params_impl` at `tp_world_size = 2` shards
+    /// every column-parallel dim by 2. The kernel-launch sizes that
+    /// flow through `<W as CanonicalParams>::…` constants in the
+    /// emitted `Instruction::eval` body MUST be the per-rank values
+    /// — nothing else in the compiled body is tp-aware.
+    #[test]
+    fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
+        let m = shard_test_model(32, 32, 128, 11008);
+        let ts = emit_canonical_params_impl(&m, 2).to_string();
+        assert!(
+            ts.contains("NUM_Q_HEADS : u32 = 16"),
+            "tp=2 must shard NUM_Q_HEADS to 16; got {ts}"
+        );
+        assert!(
+            ts.contains("NUM_KV_HEADS : u32 = 16"),
+            "tp=2 must shard NUM_KV_HEADS to 16; got {ts}"
+        );
+        assert!(
+            ts.contains("INTERMEDIATE_SIZE : usize = 5504"),
+            "tp=2 must shard INTERMEDIATE_SIZE to 5504; got {ts}"
+        );
+        // Q_SIZE = (32/2) * 128 = 2048
+        assert!(
+            ts.contains("Q_SIZE : usize = 2048"),
+            "tp=2 must compute Q_SIZE from sharded heads to 2048; got {ts}"
+        );
+        assert!(
+            ts.contains("KV_SIZE : usize = 2048"),
+            "tp=2 must compute KV_SIZE from sharded heads to 2048; got {ts}"
+        );
+        // HEAD_DIM is per-head and never sharded.
+        assert!(
+            ts.contains("HEAD_DIM : u32 = 128"),
+            "tp=2 must keep HEAD_DIM = 128; got {ts}"
+        );
+    }
+
+    /// `emit_canonical_params_impl` at `tp_world_size = 8` shards
+    /// every column-parallel dim by 8. Pins the floor-divide
+    /// behavior on a value that's the upper bound of the compile-
+    /// time set — the compile() outer-loop fanout in task #7 stops
+    /// at tp=8 by default, so this is the largest case that ever
+    /// reaches emit.
+    #[test]
+    fn canonical_params_at_tp_eq_8_shards_column_parallel_dims() {
+        // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
+        // head_dim=128, intermediate=14336.
+        let m = shard_test_model(32, 8, 128, 14336);
+        let ts = emit_canonical_params_impl(&m, 8).to_string();
+        // 32 / 8 = 4
+        assert!(
+            ts.contains("NUM_Q_HEADS : u32 = 4"),
+            "tp=8 must shard NUM_Q_HEADS to 4; got {ts}"
+        );
+        // 8 / 8 = 1
+        assert!(
+            ts.contains("NUM_KV_HEADS : u32 = 1"),
+            "tp=8 must shard NUM_KV_HEADS to 1; got {ts}"
+        );
+        // 14336 / 8 = 1792
+        assert!(
+            ts.contains("INTERMEDIATE_SIZE : usize = 1792"),
+            "tp=8 must shard INTERMEDIATE_SIZE to 1792; got {ts}"
+        );
+    }
 
     #[test]
     fn split_base_layer_recognizes_layered_and_unlayered_names() {
@@ -3878,7 +4171,7 @@ mod tests {
     #[test]
     fn emit_layered_load_body_uses_layer_template_for_rmsnorm() {
         let plan = FieldLoad::RmsNorm("model.layers.0.input_layernorm".to_string(), 1e-5);
-        let ts = emit_layered_load_body(&plan, 32).to_string();
+        let ts = emit_layered_load_body(&plan, 32, 1).to_string();
         // Delegates to the load_layered_rms_norm helper in
         // ferrite-forward. The closure / collect / Vec annotation
         // the loop used to emit per accessor are now owned by the
@@ -3910,7 +4203,7 @@ mod tests {
             "model.layers.0.self_attn.k_proj".to_string(),
             "model.layers.0.self_attn.v_proj".to_string(),
         ]);
-        let ts = emit_layered_load_body(&plan, 32).to_string();
+        let ts = emit_layered_load_body(&plan, 32, 1).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_concat"),
             "expected helper call, got: {ts}"
@@ -3922,5 +4215,103 @@ mod tests {
         assert!(!ts.contains("__p_0"));
         assert!(!ts.contains(". as_str ()"));
         assert!(!ts.contains("| layer :"));
+    }
+
+    /// At `tp_world_size = 1` every emitted load call must be
+    /// byte-identical to the pre-task-#5 build — the existing tests
+    /// above pin one direction (helper presence + suffix bake), this
+    /// one pins the negative: the `_sharded` variant must NOT appear.
+    /// Defends against a future regression that drops the `tp == 1`
+    /// short-circuit and silently routes the dense build through
+    /// `_sharded` with `world = 1`.
+    #[test]
+    fn emit_layered_load_body_at_tp_eq_1_emits_no_sharded_call() {
+        let plans: &[FieldLoad] = &[
+            FieldLoad::LinearDense("model.layers.0.self_attn.q_proj".to_string()),
+            FieldLoad::LinearDense("model.layers.0.self_attn.o_proj".to_string()),
+            FieldLoad::LinearDense("model.layers.0.input_layernorm".to_string()),
+            FieldLoad::LinearConcat(vec![
+                "model.layers.0.self_attn.q_proj".to_string(),
+                "model.layers.0.self_attn.k_proj".to_string(),
+                "model.layers.0.self_attn.v_proj".to_string(),
+            ]),
+            FieldLoad::Embedding("model.layers.0.embed_tokens".to_string()),
+        ];
+        for plan in plans {
+            let ts = emit_layered_load_body(plan, 32, 1).to_string();
+            assert!(
+                !ts.contains("_sharded"),
+                "tp=1 must never emit a `_sharded` helper call (got: {ts})",
+            );
+            assert!(
+                !ts.contains("tp_rank"),
+                "tp=1 must not reference `tp_rank` (got: {ts})",
+            );
+        }
+    }
+
+    /// At tp>1, layered `LinearDense` accessors route to the sharded
+    /// helper with the right `dim` baked in: column-parallel
+    /// (q/k/v/gate/up) → `dim = 0`; row-parallel (o/down) → `dim = 1`.
+    /// The shard kind comes from the prefix's last segment via
+    /// `tp_lowering::shard_kind_for_dotted_prefix`. A regression that
+    /// flipped the dim or routed q_proj as row-parallel would mismatch
+    /// the FUF's sharded `<W>::*` constants → kernel shape error at
+    /// the first per-rank gemm; this test catches that at codegen time.
+    #[test]
+    fn emit_layered_load_body_at_tp_gt_1_dispatches_by_shard_kind() {
+        // Column-parallel (ShardDim0): q_proj. Expect `dim = 0` lit.
+        let q = FieldLoad::LinearDense("model.layers.0.self_attn.q_proj".to_string());
+        let ts = emit_layered_load_body(&q, 32, 2).to_string();
+        assert!(
+            ts.contains("load_layered_linear_dense_sharded"),
+            "tp=2 q_proj must route to sharded helper (got: {ts})",
+        );
+        assert!(
+            ts.contains("0usize"),
+            "q_proj must be dim=0 column-parallel (got: {ts})",
+        );
+        assert!(ts.contains("tp_rank"));
+
+        // Row-parallel (ShardDim1): o_proj. Expect `dim = 1` lit.
+        let o = FieldLoad::LinearDense("model.layers.0.self_attn.o_proj".to_string());
+        let ts = emit_layered_load_body(&o, 32, 2).to_string();
+        assert!(
+            ts.contains("load_layered_linear_dense_sharded"),
+            "tp=2 o_proj must route to sharded helper (got: {ts})",
+        );
+        assert!(
+            ts.contains("1usize"),
+            "o_proj must be dim=1 row-parallel (got: {ts})",
+        );
+
+        // Replicate (norm, etc.): NO sharded helper, even at tp>1.
+        let n = FieldLoad::LinearDense("model.layers.0.input_layernorm".to_string());
+        let ts = emit_layered_load_body(&n, 32, 2).to_string();
+        assert!(
+            !ts.contains("_sharded"),
+            "Replicate path must not route to sharded helper at tp>1 (got: {ts})",
+        );
+
+        // Concat (always column-parallel) → `_concat_sharded`. Bakes
+        // `world` literal but no `dim` arg (concat-sharded is always
+        // dim=0 internally).
+        let c = FieldLoad::LinearConcat(vec![
+            "model.layers.0.mlp.gate_proj".to_string(),
+            "model.layers.0.mlp.up_proj".to_string(),
+        ]);
+        let ts = emit_layered_load_body(&c, 32, 4).to_string();
+        assert!(
+            ts.contains("load_layered_linear_dense_concat_sharded"),
+            "tp=4 gate_up concat must route to concat_sharded (got: {ts})",
+        );
+        // The macro bakes `tp_world_size` as an unsuffixed integer
+        // literal cast to `usize` (e.g. `4 as usize`). Asserting on
+        // the bare `4 as usize` token sequence — the unsuffixed form
+        // is `proc_macro2::Literal::u8_unsuffixed`'s contract.
+        assert!(
+            ts.contains("4 as usize"),
+            "expected `4 as usize` for baked tp_world_size literal (got: {ts})",
+        );
     }
 }

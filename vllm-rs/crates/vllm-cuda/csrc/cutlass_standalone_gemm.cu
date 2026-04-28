@@ -484,6 +484,19 @@ CUTLASS_SPLITK( 32,  64, 32, 32, 32, 32, 4, 4)
 CUTLASS_SPLITK_LAUNCH_ONLY(32, 64, 4, 8)
 CUTLASS_SPLITK_LAUNCH_ONLY(32, 64, 4, 16)
 
+// tile_m=16 splitK — small-M long-K regime (M=8 + K≥8192).
+// Diagnostic on f44eb134a flagged 347 borderline picks losing to
+// cuBLAS by 1-8% in this regime; existing splitK starts at tile_m=64
+// (12.5% utilization at M=8) so these tiles fill the gap. Same warp
+// shape as standalone CUTLASS_GEMM(16, 64/128, _, 16, _, _, 4) above.
+CUTLASS_SPLITK( 16,  64, 32, 16, 32, 32, 4, 2)
+CUTLASS_SPLITK_LAUNCH_ONLY(16, 64, 4, 4)
+CUTLASS_SPLITK_LAUNCH_ONLY(16, 64, 4, 8)
+
+CUTLASS_SPLITK( 16, 128, 32, 16, 64, 32, 4, 2)
+CUTLASS_SPLITK_LAUNCH_ONLY(16, 128, 4, 4)
+CUTLASS_SPLITK_LAUNCH_ONLY(16, 128, 4, 8)
+
 // Additional splitK configs to close cuBLAS gaps at M=128/1024
 CUTLASS_SPLITK(128, 128, 32, 64, 32, 32, 4, 2)
 CUTLASS_SPLITK_LAUNCH_ONLY(128, 128, 4, 4)

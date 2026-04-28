@@ -160,7 +160,7 @@ pub enum Instruction<W> {
     CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
+    CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
     CutlassFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassFusedQkvRopeCache(
         u32,
@@ -1264,7 +1264,15 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::CutlassFusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::CutlassFusedGateUpSiluMul(
+                in_slot,
+                out_slot,
+                layer,
+                weight_fn,
+                tile_m,
+                tile_n,
+                stages,
+            ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
@@ -1274,7 +1282,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let up_out = cutlass::cutlass_gemm(
                     *v,
                     up_w,
-                    cutlass::CutlassTile::new(128, 128, 3),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );

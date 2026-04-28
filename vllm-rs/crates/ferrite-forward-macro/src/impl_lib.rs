@@ -1848,7 +1848,17 @@ pub fn starter_library() -> ImplementationLibrary {
     // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
     // kernel shape. Solver's DP picks whichever has lower calibrated
     // cost per bucket; `target_compatible` gates on CSV row presence.
-    lib.push(Box::new(CutlassFusedGateUpSiluMulImpl));
+    // Parameterized over CUTLASS_TILE_ZOO so the up-projection GEMM
+    // tile is DP-pickable rather than hardcoded — the previous
+    // hardcoded `cutlass_128x128_s3` lost to small-M tiles after the
+    // tile_m=16 splitK additions, breaking SiLU MLP fusions.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassFusedGateUpSiluMulImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     lib.push(Box::new(FusedGateUpGeluMulImpl));
     // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
     // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
@@ -2848,18 +2858,52 @@ fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
 // same contiguous backing buffer, so there is no duplicate weight
 // memory relative to the cuBLAS-packed peer.
 
-#[derive(Debug, Default)]
-pub struct CutlassFusedGateUpSiluMulImpl;
+#[derive(Debug, Clone)]
+pub struct CutlassFusedGateUpSiluMulImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedGateUpSiluMulImpl {
+    /// CSV name for the up-projection GEMM tile.
+    fn up_csv_name(&self) -> &'static str {
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_16x64_s3",
+            (16, 64, 4) => "cutlass_16x64_s4",
+            (16, 128, 3) => "cutlass_16x128_s3",
+            (16, 128, 4) => "cutlass_16x128_s4",
+            (32, 64, 3) => "cutlass_32x64_s3",
+            (32, 64, 4) => "cutlass_32x64_s4",
+            (32, 128, 3) => "cutlass_32x128_s3",
+            (32, 128, 4) => "cutlass_32x128_s4",
+            (32, 256, 3) => "cutlass_32x256_s3",
+            (64, 64, 3) => "cutlass_64x64_s3",
+            (64, 64, 4) => "cutlass_64x64_s4",
+            (64, 128, 3) => "cutlass_64x128_s3",
+            (64, 128, 4) => "cutlass_64x128_s4",
+            (128, 64, 3) => "cutlass_128x64_s3",
+            (128, 64, 4) => "cutlass_128x64_s4",
+            (128, 128, 3) => "cutlass_128x128_s3",
+            (128, 128, 4) => "cutlass_128x128_s4",
+            (128, 256, 3) => "cutlass_128x256_s3",
+            (256, 64, 3) => "cutlass_256x64_s3",
+            (256, 64, 4) => "cutlass_256x64_s4",
+            _ => "cutlass_unknown",
+        }
+    }
+}
 
 impl Implementation for CutlassFusedGateUpSiluMulImpl {
     fn name(&self) -> &'static str {
-        "cutlass_fused_gate_up_silu_mul"
+        self.up_csv_name()
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile
-            .cost_table
-            .has_kernel("cutlass_fused_gate_up_silu_mul")
+        profile.cost_table.has_kernel(self.up_csv_name())
+            && profile
+                .cost_table
+                .has_kernel("cutlass_fused_gate_up_silu_mul")
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
@@ -2871,9 +2915,14 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         // Two launches:
-        //   (a) up GEMM — a standalone cutlass 128×128×s3 GEMM of
-        //       shape `(M, I, H)`; captured in the `cutlass_128x128_s3`
-        //       CSV row (the tile hard-coded in `emit_call`).
+        //   (a) up GEMM — a standalone CUTLASS tile (parameterized by
+        //       this Impl's `tile_m`/`tile_n`/`stages`) at shape
+        //       `(M, I, H)`. One Impl per `CUTLASS_TILE_ZOO` entry —
+        //       the DP picks the best tile per bucket. Previously
+        //       hardcoded to `cutlass_128x128_s3`, which left the
+        //       SiLU peer uncompetitive at small M after the tile zoo
+        //       gained tile_m=16 splitK options that beat 128x128 on
+        //       small-M shapes.
         //   (b) gate GEMM + SiLU + Mul EVT — shape `(M, I, H)`;
         //       captured in the `cutlass_fused_gate_up_silu_mul` row,
         //       which includes the epilogue's aux-load of `[M, I]`
@@ -2893,7 +2942,7 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
         let mm = ctx.num_tokens() as u32;
         let up_us = ctx
             .profile
-            .cost_us_for("cutlass_128x128_s3", mm, nn, kk)
+            .cost_us_for(self.up_csv_name(), mm, nn, kk)
             .unwrap_or(UNCALIBRATED_COST_US);
         let fused_us = ctx
             .profile
@@ -2963,6 +3012,9 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -3007,6 +3059,9 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
         Some(vec![OpInstance::new(
             syn::Ident::new("CutlassFusedGateUpSiluMul", proc_macro2::Span::call_site()),
             vec![
@@ -3014,6 +3069,9 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
             ],
         )])
     }
@@ -7966,6 +8024,13 @@ const CUTLASS_SPLITK_ZOO: &[(u32, u32, u32, u32)] = &[
     (128, 128, 4, 2),
     (128, 128, 4, 4),
     (128, 128, 4, 8),
+    // tile_m=16 splitK — small-M long-K regime (M=8 + K≥8192).
+    (16, 64, 4, 2),
+    (16, 64, 4, 4),
+    (16, 64, 4, 8),
+    (16, 128, 4, 2),
+    (16, 128, 4, 4),
+    (16, 128, 4, 8),
 ];
 
 #[derive(Debug, Clone)]
@@ -7995,6 +8060,12 @@ impl CutlassGemmSplitKImpl {
             (128, 128, 4, 2) => "cutlass_128x128_s4_split2",
             (128, 128, 4, 4) => "cutlass_128x128_s4_split4",
             (128, 128, 4, 8) => "cutlass_128x128_s4_split8",
+            (16, 64, 4, 2) => "cutlass_16x64_s4_split2",
+            (16, 64, 4, 4) => "cutlass_16x64_s4_split4",
+            (16, 64, 4, 8) => "cutlass_16x64_s4_split8",
+            (16, 128, 4, 2) => "cutlass_16x128_s4_split2",
+            (16, 128, 4, 4) => "cutlass_16x128_s4_split4",
+            (16, 128, 4, 8) => "cutlass_16x128_s4_split8",
             _ => "cutlass_splitk_unknown",
         }
     }

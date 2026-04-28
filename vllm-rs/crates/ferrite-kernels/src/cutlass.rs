@@ -439,6 +439,80 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
 
+    // tile_m=16 splitK — small-M long-K regime (M=8 + K≥8192).
+    pub fn cutlass_gemm_16x64_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x64_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x64_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+
     pub fn cutlass_gemv_launch(
         c: *mut u16,
         a: *const u16,
@@ -820,6 +894,12 @@ fn launch_fn_for_splitk(tile: CutlassSplitKTile) -> CutlassSplitKLaunchFn {
         (128, 128, 4, 2) => cutlass_gemm_128x128_s4_sk2_launch,
         (128, 128, 4, 4) => cutlass_gemm_128x128_s4_sk4_launch,
         (128, 128, 4, 8) => cutlass_gemm_128x128_s4_sk8_launch,
+        (16, 64, 4, 2) => cutlass_gemm_16x64_s4_sk2_launch,
+        (16, 64, 4, 4) => cutlass_gemm_16x64_s4_sk4_launch,
+        (16, 64, 4, 8) => cutlass_gemm_16x64_s4_sk8_launch,
+        (16, 128, 4, 2) => cutlass_gemm_16x128_s4_sk2_launch,
+        (16, 128, 4, 4) => cutlass_gemm_16x128_s4_sk4_launch,
+        (16, 128, 4, 8) => cutlass_gemm_16x128_s4_sk8_launch,
         other => panic!(
             "cutlass splitk: unsupported tile {:?} — add its extern + csv entry",
             other,

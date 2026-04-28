@@ -544,13 +544,24 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::CutlassFusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::CutlassFusedGateUpSiluMul(
+                in_slot,
+                out_slot,
+                layer,
+                _wf,
+                tile_m,
+                tile_n,
+                stages,
+            ) => (
                 "CutlassFusedGateUpSiluMul",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("LinearLayer"),
+                    F::ConstU32(tile_m),
+                    F::ConstU32(tile_n),
+                    F::ConstU32(stages),
                 ],
             ),
             Instruction::CutlassFusedGateUpGeluMul(

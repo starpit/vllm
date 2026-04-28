@@ -7,6 +7,148 @@
 > mega builds on top of its `Instruction<W>` IR + `static
 > BACKBONE_M_<N>: &[Instruction<W>]` slices without modification.
 
+## STATE 2026-04-28 — P2-4b step 5 done; step 6 (Rust launcher wire-up) is next
+
+Tip `a53da44ef` (post-rebase onto `dd206d1f9`). 250/254 tests pass
+on `cargo test -p ferrite-forward-macro --release`; the 4 failures
+are pre-existing on HEAD (`dc_zoo_equals_host_zoo`,
+`dc_cutlass_*_name_covers_full_zoo`, `swiglu_mlp_claimed_as_fused_
+subgraph_per_layer`) and unrelated to mega.
+
+### What's green right now
+
+- **`libmegakernels.a` builds end-to-end on H100** (172 MB, 108 .o):
+  107 `T tk_megakernel_<canonical>_launch` symbols + `prim_mega.o`.
+  Verify: `nm libmegakernels.a | grep "T tk_megakernel_.*_launch$"
+  | wc -l` → `107`.
+- **Build invocation that works:**
+  ```
+  PATH=/usr/local/cuda-12.9/bin:$PATH \
+  CUDA_PATH=/usr/local/cuda-12.9 \
+  FERRITE_GPU=h100 CUDA_ARCH=90 \
+    cargo build -p ferrite-cuda-builder --features cuda
+  ```
+  Both env vars matter: `FERRITE_GPU=h100` makes the proc-macro emit
+  KvmMega tape (gates `target_profile.kvm_compatible()`); `CUDA_ARCH=90`
+  makes `ferrite-cuda-builder/build.rs::detect_cuda_arch` use sm_90a
+  (the cudaforge auto-suffix path) instead of falling back to
+  nvidia-smi → sm_89 on this L4 dev box and corrupting the .o cache.
+- **Per-canonical `.cu` emission lives in
+  `~/.cache/cudaforge/megakernels/tk_megakernel_<canonical>.cu`**,
+  written by `kvm_mega::write_kvm_cu_to_cache` during proc-macro
+  expansion of every model crate that has a kvm-eligible bucket.
+  `build_megakernels` scans that dir + `crates/vllm-cuda/csrc/
+  megakernel/` and feeds both into a single nvcc → `libmegakernels.a`
+  invocation.
+- **Launcher body** (`tk_megakernel_<canonical>_launch`) takes ~50
+  flat C-friendly args (per-field raw pointers + scalar shape ints),
+  aggregate-inits `llama_70b_globals` mirroring `globals_t<>`
+  (llama.cuh:230–292), sets
+  `cudaFuncAttributeMaxDynamicSharedMemorySize`, launches
+  `mk<llama_config, llama_70b_globals, ops...><<<grid, block, smem,
+  stream>>>(g)`, returns `(int)cudaGetLastError()`. Today nothing
+  *calls* it from Rust — that's step 6.
+
+### Critical invariants worth knowing before touching anything
+
+- **Vendor `globals_t::num_devices` was hardcoded `8`.** Patched in
+  `5f715530e` (now `a53da44ef`) to `LLAMA_NUM_DEVICES`. Without this,
+  `kv_cache_t = gl<bf16, -1, -1, num_kv_heads/num_devices, ...>` goes
+  to `r=0` for any model with `num_kv_heads<8` (deepseek-v3-tiny,
+  gemma3-1b, smollm2) and TK's `gl<>` static_asserts fail at NVCC.
+- **`ferrite-cuda-builder` depends on `ferrite-models`** in
+  `[dependencies]` (not `[build-dependencies]`). With cargo's
+  pipelined compilation, `build_megakernels` *can* run before the
+  proc-macro for every model crate has finished writing its `.cu` to
+  the cache — empirically observed during this session. **First
+  build after a `cargo clean` may compile a partial set of `.cu`
+  files; a second `cargo build` picks the rest up via
+  rerun-if-changed.** If you see `libmegakernels.manifest`
+  containing only `prim_mega.o` after a build that should have
+  written 107 launcher symbols, this is the cause. The
+  `cargo:warning=build_megakernels picking up N cu files` warning in
+  `build.rs` makes this surface immediately.
+- **`kvm_kernel_dims_from_bounds` returns `Option<KvmKernelDims>`**;
+  canonicals that fail vendor static_asserts (`head_dim % 32 != 0`,
+  `num_kv_heads % num_devices != 0`, `kv_col_start % 2 != 0`,
+  `hidden_dim % 256 != 0`, `intermediate_dim/num_devices % 256 != 0`)
+  return `None` and silently skip `.cu` emission. That's how we
+  avoid feeding NVCC source it would reject.
+- **`pick_interpreter` returns KvmMega only if every picked Impl
+  is Kvm-fit.** Today the cost CSV doesn't favor KvmFit Impls over
+  the host counterparts (KvmFit Impls delegate to host), so even
+  with `kvm_compatible() = true` the cost summary shows every
+  bucket as `→Host`. That's expected — emission of `.cu` files
+  happens independently of `pick_interpreter` (gated only on
+  `kvm_compatible()`), so the build is still exercising every
+  KvmFit encoder arm.
+
+### Step 6 — Rust-side launcher wire-up (next)
+
+Symbols exist in `libmegakernels.a`; nothing calls them. The
+mechanical work:
+
+1. **`KvmMegaLauncher<W>` fn-ptr type.** New type in
+   `crates/ferrite-forward/src/lib.rs`, parallel to
+   `PrimMegaLauncher<W>`. Signature has to match the C launcher's
+   ~50-arg shape (or wrap it C-side first to take a single
+   globals-equivalent struct — see tradeoff below).
+2. **`extern "C"` decls per canonical.** `codegen.rs` already emits
+   per-canonical `.cu`; alongside it, emit the matching `extern
+   "C"` block in the per-canonical Rust module.
+3. **`LAUNCHER_TABLE` second slot.** Today emitted as
+   `&[(Option<__PrimMegaLauncher>, Option<__PrimMegaLauncher>)]`
+   (see codegen.rs ~3140 for the existing PrimMega entry). Extend
+   to a third slot for KvmMega: `(Option<__PrimMegaLauncher>,
+   Option<__PrimMegaLauncher>, Option<__KvmMegaLauncher>)` — or
+   restructure as a struct. Per-bucket `Some(_)` only when the
+   canonical's `kvm_emitted_any` was set during codegen (already
+   tracked in `codegen.rs:3475`).
+4. **`FERRITE_FORCE_KVM_MEGA` env gate.** `kvm_mega_forced()` in
+   `ferrite-forward/src/lib.rs` mirroring `prim_mega_forced()`;
+   `forward()` / `forward_backbone()` add a third branch on top
+   of the existing `prim_mega_forced()` check.
+5. **Globals-marshaling at the call site.** The launcher's ~50
+   args correspond to specific `Weights<W>` / `ForwardCtx<W>`
+   accessors. Per-field threading at the Rust call site is
+   tedious but mechanical; `kvm_mega::emit_kvm_cu_source` is the
+   reference for which arg comes from where.
+
+**Tradeoff to think about up front:** match the C signature
+arg-for-arg in Rust, vs. C-side wrap into a single-`globals_t*`
+launcher and pass an opaque `*const c_void` plus a small set of
+scalar shape ints. The wrapper path is fewer Rust changes per
+canonical and more robust to vendor schema drift, but adds a
+trivial C struct + serializer per arch. Start with arg-for-arg if
+the per-arch surface stays under one screen of generated Rust;
+otherwise wrap.
+
+**Verification once step 6 lands:** set
+`FERRITE_FORCE_KVM_MEGA=1` and run vllm chat on
+Llama-3.2-1B-instruct (smallest fully-KvmFit-eligible canonical;
+`commandr` is smaller for dim-only verification per
+`feedback_smallest_model_for_verify` but isn't kvm-eligible
+without P2-3 expansion). "capital of France is Paris" coherent =
+P2-4b done. P2-5 (multi-arch coverage validation) and P2-6
+(multi-GPU `OPCODE_Barrier_Inc` / `OPCODE_AllDeviceBarrier`)
+follow.
+
+### Open follow-ups (not blockers for step 6)
+
+- **`kv_cache_t` page count.** `globals_t::num_devices = 1` patch
+  (TP=1) makes the gl<>-r dim work for `num_kv_heads<8`, but the
+  kernel runtime path still does `kv_offset * RT::cols` arithmetic
+  that assumed 8-way sharding. Spot-check on Llama-3.2-1B once
+  step 6 calls the launcher.
+- **Cost CSV doesn't favor Kvm Impls.** Adding KvmFit cost rows
+  (or halving the per-row cost vs. host as a placeholder) is
+  what flips `pick_interpreter` to actually return KvmMega for
+  a bucket. Today every bucket reads `→Host` even though the .cu
+  is built. This blocks `pick_interpreter`-driven dispatch (but
+  not `FERRITE_FORCE_KVM_MEGA`-driven dispatch).
+
+---
+
 ## PIVOT 2026-04-27 — KvmMega is now the perf path
 
 Tip `af4e8a13c`. **Phase 1 (PrimMega-as-perf-path) is closed; we

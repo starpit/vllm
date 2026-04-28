@@ -1372,6 +1372,181 @@ pub fn emit_kvm_extern_decl(canonical_name: &str) -> TokenStream {
     }
 }
 
+// ── Per-bucket marshaling wrapper emission ──────────────────────
+
+/// Emit a per-bucket `kvm_mega_<canonical>_m_<wp>` wrapper fn
+/// matching `KvmMegaLauncher<Weights>`. The wrapper extracts
+/// layered-weight base pointers from `Weights<W>` accessors,
+/// builds the three arg structs the runtime helper takes, calls
+/// `ferrite_forward::kvm_mega::launch_kvm_mega`, and places the
+/// returned `(hidden, logits)` `OwnedTensor`s into the
+/// dispatcher's `tiles[backbone_slot]` / `tiles[terminal_slot]`
+/// slots.
+///
+/// One wrapper per (canonical, bucket) — the tape static
+/// `KVM_FULL_M_<wp>` is per-bucket but the C extern launcher fn
+/// is per-canonical. The wrapper hands the canonical's
+/// `tk_megakernel_<canonical>_launch` symbol (cast to
+/// [`KvmExternLaunch`]) and the bucket's `KVM_FULL_M_<wp>` slice
+/// to the runtime helper.
+///
+/// `dims` is what `kvm_kernel_dims_from_bounds` returns for the
+/// canonical — same dims that get baked into the .cu file.
+/// `batch_size` is computed at runtime from `ctx.cu_seqlens_q`
+/// (see Wrapper body below); the bucket's `wp.num_tokens` is the
+/// worst-case M for eligibility, NOT what we pass to vendor's
+/// `globals_t::batch_size`.
+///
+/// **Known divergence (MVP shim).** Vendor's
+/// `rope_table_t = gl<float, 1, 1, max_pos, head_dim>` is full-
+/// width per row; ferrite's `RotaryCache::cos_sin_cache` is
+/// half-width `[max_pos, head_dim/2]`. The MVP wrapper passes
+/// the half-width pointer to vendor for both `d_rope_cos` and
+/// `d_rope_sin` — vendor will read OOB-shape data and produce
+/// wrong logits. This is intentional: it gets us through the
+/// launch path so downstream issues (kernel asserts, paged-KV
+/// indexing) surface independent of RoPE. See MEGA_HANDOFF.md
+/// "Vendor-fork roadmap" for the planned fix (load-time
+/// full-width materialization on `Weights`, then a vendor
+/// patch that reads half-width directly).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_kvm_mega_launcher(
+    fn_ident: &syn::Ident,
+    canonical_name: &str,
+    static_full_ident: &syn::Ident,
+    dims: &KvmKernelDims,
+    backbone_slot: u32,
+    terminal_slot: u32,
+    vocab_size: u32,
+) -> TokenStream {
+    use quote::quote;
+    let extern_ident = syn::Ident::new(
+        &format!("tk_megakernel_{canonical_name}_launch"),
+        proc_macro2::Span::call_site(),
+    );
+    let num_layers_lit = proc_macro2::Literal::i32_unsuffixed(dims.num_layers as i32);
+    let hidden_dim_lit = proc_macro2::Literal::i32_unsuffixed(dims.hidden_dim as i32);
+    let head_dim_lit = proc_macro2::Literal::i32_unsuffixed(dims.head_dim as i32);
+    let num_attn_heads_lit = proc_macro2::Literal::i32_unsuffixed(dims.num_attention_heads as i32);
+    let intermediate_dim_lit = proc_macro2::Literal::i32_unsuffixed(dims.intermediate_dim as i32);
+    let num_devices_lit = proc_macro2::Literal::i32_unsuffixed(dims.num_devices as i32);
+    let vocab_size_lit = proc_macro2::Literal::i32_unsuffixed(vocab_size as i32);
+    let matmul_out_lit = proc_macro2::Literal::i32_unsuffixed(dims.matmul_out_block_size as i32);
+    let matmul_batch_lit =
+        proc_macro2::Literal::i32_unsuffixed(dims.matmul_batch_block_size as i32);
+    let kv_page_size_lit = proc_macro2::Literal::i32_unsuffixed(dims.kv_page_size as i32);
+    // attn_scale = 1 / sqrt(head_dim), baked at codegen so the
+    // wrapper doesn't pay a sqrt at every call site.
+    let attn_scale = 1.0_f32 / (dims.head_dim as f32).sqrt();
+    let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
+    let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(backbone_slot);
+    let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(terminal_slot);
+
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
+        unsafe fn #fn_ident(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            tiles: &mut ::std::vec::Vec<
+                ::core::option::Option<::ferrite_forward::TileEntry>,
+            >,
+        ) {
+            // Layered-weight base pointers — layer-0 raw_ptr equals
+            // the contiguous-block base because of `loaders::load_layered_*`.
+            let qkv_w = (Weights::self_attn_qkv_proj)(wm, 0).dense_weight();
+            let attn_norm_w = (Weights::input_layernorm)(wm, 0).weight;
+            let o_w = (Weights::self_attn_o_proj)(wm, 0).dense_weight();
+            let mlp_norm_w = (Weights::post_attention_layernorm)(wm, 0).weight;
+            let up_w = (Weights::mlp_up_proj)(wm, 0).dense_weight();
+            let gate_w = (Weights::mlp_gate_proj)(wm, 0).dense_weight();
+            let down_w = (Weights::mlp_down_proj)(wm, 0).dense_weight();
+            // Final RmsNorm + lm_head are single-layer. Naming
+            // mirrors the DSL: `norm` is the model-final norm,
+            // `lm_head` is the final matmul.
+            let lm_head_norm_w = (Weights::norm)(wm, 0).weight;
+            let lm_head_w = (Weights::lm_head)(wm, 0).dense_weight();
+
+            // RoPE — MVP shim: pass the half-width cos_sin_cache as
+            // both cos and sin pointers. Vendor's full-width access
+            // pattern will read past the half-width buffer and
+            // produce wrong logits; the launch itself still
+            // succeeds, which is what we need to debug downstream
+            // issues. See MEGA_HANDOFF.md "Vendor-fork roadmap".
+            let rope_combined = (Weights::rotary_cos_sin)(wm, 0);
+            let max_pos_runtime = rope_combined.shape()[0] as i32;
+
+            let weight_ptrs = ::ferrite_forward::kvm_mega::KvmWeightPtrs {
+                qkv: qkv_w.raw_ptr(),
+                qkv_r: qkv_w.shape()[0] as i32,
+                attn_norm: attn_norm_w.raw_ptr(),
+                o: o_w.raw_ptr(),
+                o_r: o_w.shape()[0] as i32,
+                mlp_norm: mlp_norm_w.raw_ptr(),
+                up: up_w.raw_ptr(),
+                up_r: up_w.shape()[0] as i32,
+                gate: gate_w.raw_ptr(),
+                gate_r: gate_w.shape()[0] as i32,
+                down: down_w.raw_ptr(),
+                down_r: down_w.shape()[0] as i32,
+                lm_head_norm: lm_head_norm_w.raw_ptr(),
+                lm_head: lm_head_w.raw_ptr(),
+                lm_head_r: lm_head_w.shape()[0] as i32,
+            };
+            let rope = ::ferrite_forward::kvm_mega::KvmRopePtrs {
+                cos: rope_combined.raw_ptr(),
+                sin: rope_combined.raw_ptr(), // TODO(vendor-fork): half-width
+                max_pos: max_pos_runtime,
+            };
+
+            // batch_size is the actual call's seq count, not the
+            // bucket's worst-case M. cu_seqlens_q has length
+            // num_seqs+1 — derive num_seqs from it.
+            let batch_size_runtime = (ctx.cu_seqlens_q.numel() as i32 - 1).max(1);
+            let rms_norm_eps = (Weights::input_layernorm)(wm, 0).eps;
+
+            let shape = ::ferrite_forward::kvm_mega::KvmShapeConfig {
+                num_layers: #num_layers_lit,
+                hidden_dim: #hidden_dim_lit,
+                head_dim: #head_dim_lit,
+                num_attention_heads: #num_attn_heads_lit,
+                intermediate_dim: #intermediate_dim_lit,
+                num_devices: #num_devices_lit,
+                batch_size: batch_size_runtime,
+                vocab_size: #vocab_size_lit,
+                matmul_out_block_size: #matmul_out_lit,
+                matmul_batch_block_size: #matmul_batch_lit,
+                kv_page_size: #kv_page_size_lit,
+                attn_scale: #attn_scale_lit,
+                rms_norm_eps,
+            };
+
+            let (hidden, logits) = unsafe {
+                ::ferrite_forward::kvm_mega::launch_kvm_mega(
+                    #extern_ident as ::ferrite_forward::kvm_mega::KvmExternLaunch,
+                    ctx,
+                    device,
+                    &#static_full_ident,
+                    weight_ptrs,
+                    rope,
+                    shape,
+                )
+            }
+            .expect("kvm_mega launch failed");
+
+            // Place outputs into the dispatcher's tile slots.
+            // `forward_backbone` reads `tiles[backbone_slot]`;
+            // `forward` reads `tiles[terminal_slot]` via
+            // `take_owned`.
+            tiles[#backbone_slot_lit as usize] =
+                ::core::option::Option::Some(::ferrite_forward::TileEntry::Owned(hidden));
+            tiles[#terminal_slot_lit as usize] =
+                ::core::option::Option::Some(::ferrite_forward::TileEntry::Owned(logits));
+        }
+    }
+}
+
 // ── Helpers (private) ───────────────────────────────────────────
 
 /// Extract a `u32` literal from a TokenStream that's expected to

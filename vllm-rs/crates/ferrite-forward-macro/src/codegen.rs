@@ -3486,6 +3486,11 @@ pub fn emit_model(
     // the bucket-level pair to be `Some(_)`; partial encoding is an
     // ineligible canonical at the all-or-nothing tier semantics.
     let mut prim_mega_emitted: HashMap<crate::solver::WorkloadPoint, (bool, bool)> = HashMap::new();
+    // Per-bucket "did the KVM_FULL_M_<wp> tape encode successfully"
+    // bit. Both halves (backbone + lm_head) must encode; partial
+    // emission would leave the wrapper with a half-tape it can't
+    // run.
+    let mut kvm_emitted: HashMap<crate::solver::WorkloadPoint, bool> = HashMap::new();
     let mut kvm_emitted_any = false;
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
@@ -3555,6 +3560,7 @@ pub fn emit_model(
                 &kvm_ctx,
                 &mut static_slices,
             );
+            kvm_emitted.insert(*wp, kvm_full_ok);
             if kvm_full_ok {
                 kvm_emitted_any = true;
             }
@@ -3574,6 +3580,13 @@ pub fn emit_model(
     // symbols are actually compiled into libmegakernels.a; the
     // step-6c marshaling wrapper will be the first caller.
     let mut kvm_extern_decls: Vec<TokenStream> = Vec::new();
+    // `Some` when the canonical's dims satisfy vendor's
+    // static_asserts; this is the gate for emitting the per-
+    // canonical .cu, the extern decl, and the per-bucket
+    // marshaling wrappers below. Threaded through to the
+    // LAUNCHER_TABLE construction so it can flip the kvm slot.
+    let mut kvm_canonical_dims: Option<kvm_mega::KvmKernelDims> = None;
+    let mut kvm_canonical_vocab_size: u32 = 0;
     if kvm_emitted_any {
         let canonical_bounds = bounds_for_wp(model, *bucket_points.first().unwrap());
         // Only write a .cu file if the canonical's dims satisfy
@@ -3590,6 +3603,12 @@ pub fn emit_model(
                 );
             }
             kvm_extern_decls.push(kvm_mega::emit_kvm_extern_decl(&model.name));
+            // Pull vocab_size from bounds for the wrapper's
+            // `KvmShapeConfig.vocab_size` literal. Bounds carry it
+            // as `vocab_size` per the model manifest.
+            kvm_canonical_vocab_size =
+                canonical_bounds.get("vocab_size").copied().unwrap_or(0) as u32;
+            kvm_canonical_dims = Some(dims);
         }
     }
 
@@ -3732,7 +3751,33 @@ pub fn emit_model(
         } else {
             quote! { ::core::option::Option::None, ::core::option::Option::None }
         };
-        let kvm_slot = quote! { ::core::option::Option::None };
+        // Kvm-mega slot. Emit a per-bucket marshaling wrapper +
+        // flip the slot to `Some(<wrapper>)` when:
+        //   1. the canonical has a `.cu` written (static_asserts
+        //      passed) — `kvm_canonical_dims.is_some()`;
+        //   2. this specific bucket's tape encoded successfully
+        //      — `kvm_emitted[wp] == true`.
+        // Both must hold for the wrapper to compile and run.
+        let kvm_slot = match (
+            kvm_canonical_dims.as_ref(),
+            kvm_emitted.get(&canonical).copied(),
+        ) {
+            (Some(dims), Some(true)) => {
+                let wrapper_ident = bucket_static_ident("kvm_mega", canonical);
+                let static_full_ident = bucket_static_ident("KVM_FULL_M", canonical);
+                static_slices.push(kvm_mega::emit_kvm_mega_launcher(
+                    &wrapper_ident,
+                    &model.name,
+                    &static_full_ident,
+                    dims,
+                    *backbone_slot_b,
+                    *terminal_slot_b,
+                    kvm_canonical_vocab_size,
+                ));
+                quote! { ::core::option::Option::Some(#wrapper_ident) }
+            }
+            _ => quote! { ::core::option::Option::None },
+        };
         launcher_table_entries.push(quote! { ( #prim_pair, #kvm_slot ), });
     }
 

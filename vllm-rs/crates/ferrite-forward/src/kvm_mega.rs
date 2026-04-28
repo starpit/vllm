@@ -196,37 +196,35 @@ const NUM_TIMING_ROWS: i32 = 16384;
 
 /// The runtime-side workhorse for one KvmMega forward call. The
 /// per-canonical `kvm_mega_<canonical>_m_<wp>` wrapper
-/// (codegen-emitted) hands us:
+/// (codegen-emitted) hands us the extern launcher fn pointer,
+/// the bucket's `KVM_FULL_M_<wp>` tape, weight/RoPE pointers
+/// and shape constants. We allocate per-call scratch, build the
+/// paged-KV CSR, and invoke the launcher.
 ///
-/// - the per-canonical extern launcher fn pointer
-///   (`tk_megakernel_<canonical>_launch`);
-/// - the bucket's `KVM_FULL_M_<wp>` tape static plus its
-///   `_BACKBONE_LEN` / `_LM_HEAD_LEN` consts;
-/// - layered-weight + RoPE base pointers extracted from
-///   `Weights<W>` accessors;
-/// - canonical shape constants baked from bounds.
+/// On success we return the two `OwnedTensor`s the dispatch
+/// code (`forward` / `forward_backbone`) consumes via
+/// `tiles[backbone_slot]` and `tiles[terminal_slot]`:
 ///
-/// We allocate per-call scratch (Bar, timings, global
-/// instruction index, device tape, and the ~7 activation
-/// buffers vendor's `globals_t` carries); build the paged-KV
-/// CSR via `paged_kv::device::build_paged_kv_metadata_on_device`;
-/// and call the extern launcher with the full ~50-arg arg list.
+/// * `hidden_states` — the post-final-norm activation buffer
+///   the megakernel writes (filled before the lm_head matmul).
+///   `forward_backbone` returns this directly.
+/// * `logits` — the lm_head output. `forward` returns this.
 ///
-/// All allocations use the device's caching allocator
-/// (`OwnedTensor`) so scratch is freed on return; the only
-/// stream-ordered work surviving past this fn is the launcher
-/// itself, on the device's compute stream.
+/// All other scratch (Bar, timings, q_post_rope, etc.) is
+/// caching-allocator-owned and freed on return — we
+/// `stream_synchronize` at the end so the kernel has finished
+/// reading from each block before its `Drop` runs.
 ///
 /// # Safety
 /// - Every pointer in `weights` / `rope` must be a valid
-///   contiguous device allocation matching the shape vendor
-///   expects (see [`crate::loaders`]).
+///   contiguous device allocation matching vendor's expected
+///   shape (see [`crate::loaders`]).
 /// - `extern_launch` must be the per-canonical
 ///   `tk_megakernel_<canonical>_launch` whose `globals_t`
 ///   template parameters match `shape`.
 /// - `ctx` must outlive the launch; the kernel reads from KV
-///   cache, RoPE tables, and the activation scratch synchronously
-///   on the compute stream.
+///   cache, RoPE tables, and the activation scratch
+///   synchronously on the compute stream.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_kvm_mega(
     extern_launch: KvmExternLaunch,
@@ -236,7 +234,7 @@ pub unsafe fn launch_kvm_mega(
     weights: KvmWeightPtrs,
     rope: KvmRopePtrs,
     shape: KvmShapeConfig,
-) -> Result<()> {
+) -> Result<(OwnedTensor, OwnedTensor)> {
     let pool = ctx.kv_cache;
     let kv_total_pages = (pool.num_layers * pool.num_blocks) as i32;
     let kv_page_size_runtime = pool.block_size as i32;
@@ -397,22 +395,22 @@ pub unsafe fn launch_kvm_mega(
     // a usable logits tile).
     unsafe { driver::stream_synchronize(stream)? };
 
-    // Explicit drops are no-ops semantically but make the
-    // lifetime intent obvious to readers — every scratch
-    // tensor outlives the kernel because we synced above.
+    // Explicit drops on the throwaway scratch — semantic
+    // no-ops but make the lifetime intent obvious. Every
+    // scratch tensor outlives the kernel because we synced
+    // above. `hidden_states` and `logits` are returned to the
+    // caller (placed into `tiles` by the wrapper).
     drop(tape_owned);
     drop(timings);
-    drop(hidden_states);
     drop(rms_rope_intermediates);
     drop(rms_gate_intermediates);
     drop(q_post_rope);
     drop(attn_out);
     drop(silu_out);
     drop(rms_lm_head_intermediates);
-    drop(logits);
     drop(device_paged);
     // `bar` and `global_instr_idx` are plain `GpuTensor`
     // (Copy / leaked from `alloc_gpu_tensor_zeroed`); no Drop
     // hazard.
-    Ok(())
+    Ok((hidden_states, logits))
 }

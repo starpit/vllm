@@ -1884,6 +1884,24 @@ pub fn starter_library() -> ImplementationLibrary {
     // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
     lib.push(Box::new(FusedQkvRopeCacheImpl));
     lib.push(Box::new(FusedQkvRopePrefillImpl));
+    // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
+    // followed by the same fused_qkv_rope_cache / fused_qkv_rope
+    // post-pass. One Impl per CUTLASS_TILE_ZOO entry per variant;
+    // target_compatible gates each on calibrated CSV row presence.
+    // matches() rejects biased claims (qwen2 keeps cuBLAS until the
+    // bias-zoo CSV is shape-swept).
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassFusedQkvRopeCacheImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+        lib.push(Box::new(CutlassFusedQkvRopePrefillImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     // FusedQkvQkNormRopeCacheImpl (three-gemm + fused qk_norm_rope +
     // cache) is staged in this crate but intentionally NOT registered.
     // The 3-gemm emit_call produces incorrect numerics on Qwen3/Gemma3
@@ -6618,6 +6636,570 @@ impl Implementation for FusedQkvRopePrefillImpl {
                 quote! { Weights::#cos_sin_ident },
                 quote! { #biased },
                 quote! { #interleaved },
+            ],
+        )])
+    }
+}
+
+// ── CutlassFusedQkvRope{Cache,Prefill}Impl ──────────────────────
+//
+// CUTLASS peers to the cuBLAS `FusedQkvRope{Cache,Prefill}Impl` —
+// same 4-or-7-tile claim, same boundary inputs/outputs, same
+// runtime post-GEMM step (rope+paged-cache write for Cache,
+// rope+contiguous-Q/K/V for Prefill). The only structural change
+// vs the cuBLAS peer is the GEMM kernel: a calibrated
+// `cutlass_<TM>x<TN>_s<S>` standalone-zoo tile in place of cuBLAS.
+//
+// Tile-zoo-pickable: one Impl per `CUTLASS_TILE_ZOO` entry,
+// `target_compatible` gated on calibrated CSV row presence —
+// uncalibrated targets silently fall back to the cuBLAS peer.
+//
+// Bias gating: the v1 Impl rejects biased claims in `matches`. The
+// bias-zoo CSV (`cutlass_gemm_bias_<TM>x<TN>_s<S>`) is not yet
+// shape-swept across the QKV regime, so a biased pick would race
+// against `UNCALIBRATED_COST_US` and silently lose to cuBLAS.
+// Qwen2's biased QKV consequently keeps the cuBLAS path until the
+// bias-zoo sweep lands.
+
+/// True iff the claim's three QKV gemms are wrapped in `BiasAdd`
+/// (Qwen2/Qwen3-style explicit QKV bias).
+fn fused_qkv_claim_is_biased(fuf: &Fuf, info: &MatchInfo) -> bool {
+    let Some(rope_id) = info
+        .claimed_tiles
+        .iter()
+        .find(|t| is_rope_append_op(fuf.get(**t).op))
+        .copied()
+    else {
+        return false;
+    };
+    let rope_node = fuf.get(rope_id);
+    let qkv_raw: Vec<TileId> = rope_node
+        .inputs
+        .iter()
+        .take(3)
+        .filter_map(|i| match i {
+            FufInput::Tile { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    qkv_raw
+        .iter()
+        .filter_map(|t| unwrap_gemm_through_bias(fuf, *t))
+        .next()
+        .is_some_and(|(_, bias)| bias.is_some())
+}
+
+#[derive(Debug, Clone)]
+pub struct CutlassFusedQkvRopeCacheImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedQkvRopeCacheImpl {
+    fn csv_name(&self) -> &'static str {
+        // Reuses the standalone CutlassGemm tile names — the GEMM
+        // step is an ordinary cutlass_<TM>x<TN>_s<S> at packed
+        // N=q+2*kv.
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_16x64_s3",
+            (16, 64, 4) => "cutlass_16x64_s4",
+            (16, 128, 3) => "cutlass_16x128_s3",
+            (16, 128, 4) => "cutlass_16x128_s4",
+            (32, 64, 3) => "cutlass_32x64_s3",
+            (32, 64, 4) => "cutlass_32x64_s4",
+            (32, 128, 3) => "cutlass_32x128_s3",
+            (32, 128, 4) => "cutlass_32x128_s4",
+            (32, 256, 3) => "cutlass_32x256_s3",
+            (64, 64, 3) => "cutlass_64x64_s3",
+            (64, 64, 4) => "cutlass_64x64_s4",
+            (64, 128, 3) => "cutlass_64x128_s3",
+            (64, 128, 4) => "cutlass_64x128_s4",
+            (128, 64, 3) => "cutlass_128x64_s3",
+            (128, 64, 4) => "cutlass_128x64_s4",
+            (128, 128, 3) => "cutlass_128x128_s3",
+            (128, 128, 4) => "cutlass_128x128_s4",
+            (128, 256, 3) => "cutlass_128x256_s3",
+            (256, 64, 3) => "cutlass_256x64_s3",
+            (256, 64, 4) => "cutlass_256x64_s4",
+            _ => "cutlass_unknown",
+        }
+    }
+}
+
+impl Implementation for CutlassFusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        FusedQkvRopeCacheImpl.workload_constraint()
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = FusedQkvRopeCacheImpl.matches(fuf, seed, profile)?;
+        if fused_qkv_claim_is_biased(fuf, &info) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same shape as FusedQkvRopeCacheImpl::cost_us (cuBLAS peer):
+        //   - one GEMM at packed (M, q+2*kv, hidden)
+        //   - one BW-bound rope+cache pass over the same buffer
+        // Difference: the GEMM is a calibrated cutlass_<tile> row,
+        // not cublas. Reduces to cutlass_<tile>(M, packed_n, K) vs
+        // cublas(M, packed_n, K).
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
+        let num_kv_heads = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
+        let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let packed_n = num_q_heads
+            .saturating_add(2u32.saturating_mul(num_kv_heads))
+            .saturating_mul(head_dim);
+
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), num_tokens, packed_n, hidden)
+            .unwrap_or(UNCALIBRATED_COST_US);
+
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * (num_tokens as f64) * (packed_n as f64) * BYTES_PER_ELEM;
+        let rope_cache_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+
+        let _ = m;
+        gemm_us + rope_cache_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        FusedQkvRopeCacheImpl.output_alias(claimed_tiles, fuf)
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedQkvRopeCache",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+                ("interleaved", syn::parse_quote!(bool)),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("packed_n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
+            .expect("CutlassFusedQkvRopeCache: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
+        let layer = rope_kv_cache_layer(rope_node).expect(
+            "CutlassFusedQkvRopeCache: RopeAppend has a KvCache extern with concrete layer index",
+        ) as u32;
+
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("CutlassFusedQkvRopeCache: claim guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        // matches() rejected biased claims; runtime does not handle bias.
+        debug_assert!(
+            resolved[0].1.is_none(),
+            "CutlassFusedQkvRopeCache: matches() should have rejected biased claim",
+        );
+
+        let q_gemm_id = resolved[0].0;
+        let q_gemm_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_gemm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedQkvRopeCache: q_gemm's first input must be a Tile (got {other:?})"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(rope_id, 0);
+
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("CutlassFusedQkvRopeCache: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "CutlassFusedQkvRopeCache: weight_layer ({weight_layer}) and \
+             kv_cache layer ({layer}) disagree — DSL bug"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+
+        // Bake (packed_n=q+2*kv, k=hidden) for runtime weight-shape assert.
+        // packed_n derives from arch-level `Weights::*_SIZE` at runtime,
+        // but we re-derive it here from FUF + bounds for the claim's q
+        // gemm so the assert can fire at codegen time if loader output
+        // disagrees with FUF expectations.
+        let (q_n, k) = gemm_nk_from_fuf(fuf, q_gemm_node, bounds)
+            .expect("CutlassFusedQkvRopeCache: q gemm (N, K) must resolve from FUF + bounds");
+        let num_kv_heads = bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
+        let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let kv_size = num_kv_heads.saturating_mul(head_dim);
+        let packed_n = q_n.saturating_add(kv_size.saturating_mul(2));
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("CutlassFusedQkvRopeCache", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
+                quote! { #interleaved },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #packed_n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CutlassFusedQkvRopePrefillImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedQkvRopePrefillImpl {
+    fn csv_name(&self) -> &'static str {
+        CutlassFusedQkvRopeCacheImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for CutlassFusedQkvRopePrefillImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        FusedQkvRopePrefillImpl.workload_constraint()
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = FusedQkvRopePrefillImpl.matches(fuf, seed, profile)?;
+        if fused_qkv_claim_is_biased(fuf, &info) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same flops + bandwidth model as the decode-fused variant;
+        // the kernel split is different but the work is the same.
+        CutlassFusedQkvRopeCacheImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedQkvRopePrefillImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedQkvRopePrefill",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("q_out_slot", syn::parse_quote!(u32)),
+                ("k_out_slot", syn::parse_quote!(u32)),
+                ("v_out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+                ("interleaved", syn::parse_quote!(bool)),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("packed_n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
+            .expect("CutlassFusedQkvRopePrefill: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("CutlassFusedQkvRopePrefill: RopeAppend has a KvCache extern with layer index")
+            as u32;
+
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("CutlassFusedQkvRopePrefill: claim guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        debug_assert!(
+            resolved[0].1.is_none(),
+            "CutlassFusedQkvRopePrefill: matches() should have rejected biased claim",
+        );
+
+        let q_gemm_id = resolved[0].0;
+        let q_gemm_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_gemm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("CutlassFusedQkvRopePrefill: q_gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let q_out = slots.of(rope_id, 0);
+        let k_out = slots.of(rope_id, 1);
+        let v_out = slots.of(rope_id, 2);
+
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("CutlassFusedQkvRopePrefill: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "CutlassFusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+
+        let (q_n, k) = gemm_nk_from_fuf(fuf, q_gemm_node, bounds)
+            .expect("CutlassFusedQkvRopePrefill: q gemm (N, K) must resolve from FUF + bounds");
+        let num_kv_heads = bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
+        let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let kv_size = num_kv_heads.saturating_mul(head_dim);
+        let packed_n = q_n.saturating_add(kv_size.saturating_mul(2));
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("CutlassFusedQkvRopePrefill", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #q_out },
+                quote! { #k_out },
+                quote! { #v_out },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
+                quote! { #interleaved },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #packed_n },
+                quote! { #k },
             ],
         )])
     }

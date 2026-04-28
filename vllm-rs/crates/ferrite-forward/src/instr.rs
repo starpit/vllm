@@ -151,6 +151,34 @@ pub enum Instruction<W> {
     CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     CutlassFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    CutlassFusedQkvRopeCache(
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        CosSinFn<W>,
+        bool,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
+    CutlassFusedQkvRopePrefill(
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        CosSinFn<W>,
+        bool,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
     MarlinGemm(u32, u32, u32, WtFn<W, MarlinLinear>),
     MarlinFusedGateUpSiluMul(u32, u32, u32, WtFn<W, MarlinLinear>),
     MarlinFusedGateUpGeluMul(u32, u32, u32, WtFn<W, MarlinLinear>),
@@ -1204,6 +1232,166 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
+            Instruction::CutlassFusedQkvRopeCache(
+                in_slot,
+                out_slot,
+                layer,
+                weight_fn,
+                cos_sin_fn,
+                interleaved,
+                tile_m,
+                tile_n,
+                stages,
+                packed_n,
+                k,
+            ) => unsafe {
+                // Mirrors the cuBLAS-peer FusedQkvRopeCache: ONE GEMM at
+                // packed (M, q+2*kv, K) → fused_qkv_rope_cache* writing
+                // K/V to the paged cache and returning rotated Q. The
+                // GEMM here is a calibrated CUTLASS standalone tile
+                // instead of cuBLAS; the rope+cache step is identical.
+                //
+                // Non-biased only — claim is gated to `biased=false` in
+                // CutlassFusedQkvRopeCacheImpl::matches; qwen2's biased
+                // QKV stays on the cuBLAS peer until the bias-zoo CSV
+                // gains shape-swept rows.
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                assert_weight_shape("CutlassFusedQkvRopeCache", w.dense_weight(), packed_n, k);
+                let qkv_packed = cutlass::cutlass_gemm(
+                    *v,
+                    w.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let out = if interleaved {
+                    kernels::fused_qkv_interleaved_rope_cache(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        *ctx.fwd.slot_mapping,
+                        *ctx.fwd.kv_cache.k_cache(layer as usize),
+                        *ctx.fwd.kv_cache.v_cache(layer as usize),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                } else if ctx.fwd.kv_cache.is_fp8() {
+                    kernels::fused_qkv_rope_cache_fp8(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        *ctx.fwd.slot_mapping,
+                        *ctx.fwd.kv_cache.k_cache(layer as usize),
+                        *ctx.fwd.kv_cache.v_cache(layer as usize),
+                        ctx.fwd.kv_cache.k_scale_ptr(layer as usize),
+                        ctx.fwd.kv_cache.v_scale_ptr(layer as usize),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                } else {
+                    kernels::fused_qkv_rope_cache(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        *ctx.fwd.slot_mapping,
+                        *ctx.fwd.kv_cache.k_cache(layer as usize),
+                        *ctx.fwd.kv_cache.v_cache(layer as usize),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                };
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::CutlassFusedQkvRopePrefill(
+                in_slot,
+                q_out_slot,
+                k_out_slot,
+                v_out_slot,
+                layer,
+                weight_fn,
+                cos_sin_fn,
+                interleaved,
+                tile_m,
+                tile_n,
+                stages,
+                packed_n,
+                k_dim,
+            ) => {
+                let layer = ctx.layer_offset + layer;
+                let (q, k_tensor, v_out) = unsafe {
+                    let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                    let w = (weight_fn)(ctx.wm, layer);
+                    assert_weight_shape(
+                        "CutlassFusedQkvRopePrefill",
+                        w.dense_weight(),
+                        packed_n,
+                        k_dim,
+                    );
+                    let qkv_packed = cutlass::cutlass_gemm(
+                        *view_in,
+                        w.dense_weight(),
+                        cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    );
+                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    if interleaved {
+                        kernels::fused_qkv_interleaved_rope(
+                            *qkv_packed,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            W::NUM_KV_HEADS as usize,
+                            W::HEAD_DIM as usize,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    } else {
+                        kernels::fused_qkv_rope(
+                            *qkv_packed,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            W::NUM_KV_HEADS as usize,
+                            W::HEAD_DIM as usize,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    }
+                };
+                unsafe {
+                    ah::write_kv_cache(
+                        k_tensor.view(),
+                        v_out.view(),
+                        ctx.fwd.slot_mapping,
+                        ctx.fwd.kv_cache,
+                        layer as usize,
+                        ctx.device.compute_stream,
+                    );
+                }
+                ctx.tiles[q_out_slot as usize] = Some(TileEntry::Owned(q));
+                ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k_tensor));
+                ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
+            }
             Instruction::MarlinGemm(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);

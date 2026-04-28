@@ -14,6 +14,7 @@ pub mod info;
 pub mod instr;
 #[cfg(feature = "cuda")]
 pub mod loaders;
+pub mod paged_kv;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
 

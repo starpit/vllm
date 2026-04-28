@@ -3449,11 +3449,19 @@ pub fn emit_model(
             if bucket_canonical[i] != *wp {
                 continue;
             }
+            // Eligibility: at least one solver-picked Impl in the
+            // SFUF must be a TK Impl (otherwise there's nothing to
+            // hand off to the megakernel), AND `encode_bucket` must
+            // succeed on the lowered IR (the encoder rejects any
+            // op variant the megakernel can't run, including non-Tk
+            // matmul/norm picks). Structural variants (Embed,
+            // Reshape, Free, Alias) encode to empty row sets and
+            // don't gate eligibility.
             let sfuf = &sfufs.per_workload[wp];
-            let all_kvm = sfuf.impls.values().all(|imp_id| {
+            let any_kvm = sfuf.impls.values().any(|imp_id| {
                 lib.get(*imp_id).megakernel_fit() == MegakernelFit::Kvm
             });
-            if !all_kvm {
+            if !any_kvm {
                 continue;
             }
             let bounds = bounds_for_wp(model, *wp, tp_world_size);

@@ -559,6 +559,12 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         }
     }
 
+    println!(
+        "cargo:warning=build_megakernels picking up {} cu files (cache + tree) from {}",
+        megakernel_cus.len(),
+        megakernel_cache.display()
+    );
+
     if megakernel_cus.is_empty() {
         return;
     }

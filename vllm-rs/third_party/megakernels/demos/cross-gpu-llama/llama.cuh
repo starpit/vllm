@@ -155,7 +155,11 @@ template <typename config, int _num_hidden_layers, int _hidden_dim, int _interme
           int _num_attention_heads, int _num_kv_heads, int _kv_page_size, int _prefill_kv_block_size,
           int _decode_kv_block_size, int _matmul_out_block_size, int _matmul_batch_block_size, int _sm_count>
 struct globals_t {
-    constexpr static int num_devices = 8;
+    // Vendor hardcoded `num_devices = 8`. We honor the LLAMA_NUM_DEVICES
+    // macro instead so TP=1 (and other shardings) get a kv_cache_t with
+    // r=num_kv_heads/num_devices >= 1. Without this, models with
+    // num_kv_heads<8 hit `static_assert(cdim<0>)` in TK gl<>.
+    constexpr static int num_devices = LLAMA_NUM_DEVICES;
 
     constexpr static int num_hidden_layers = _num_hidden_layers;
     constexpr static int matmul_out_block_size = _matmul_out_block_size;

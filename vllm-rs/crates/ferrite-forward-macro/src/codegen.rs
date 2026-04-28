@@ -2977,27 +2977,74 @@ fn kvm_encode_ctx_from_bounds(
 /// the kvm-specific block sizes / page sizes (matched to
 /// `third_party/megakernels/demos/cross-gpu-llama/llama.cuh:26-75`).
 /// `sm_count` defaults to 132 (H100); kvm doesn't run on Ada/below.
+/// Returns `Some(dims)` when the canonical's bounds satisfy
+/// vendor cross-gpu-llama's structural constraints, `None` to skip
+/// emission (canonical falls through to host).
+///
+/// Constraints checked (each comes from a static_assert in vendor):
+///   - `2 * head_dim == matmul_out_block_size` (qkv_rope_append.cu)
+///   - `(num_attention_heads / num_generated_heads / num_devices) % 2 == 0`
+///     (KV_COL_START divisibility, qkv_rope_append.cu:15)
+///   - `hidden_dim % (PIPELINE_K_DIM * INPUT_PIPELINE_STAGES) == 0`
+///     i.e., `hidden_dim % 256 == 0` (matmul_pipeline.cuh:16)
+///   - `intermediate_dim / num_devices % 256 == 0` (same, in MLP path)
 fn kvm_kernel_dims_from_bounds(
     bounds: &BTreeMap<String, u64>,
     canonical_name: &str,
-) -> kvm_mega::KvmKernelDims {
+) -> Option<kvm_mega::KvmKernelDims> {
     let g = |k: &str| -> u64 { bounds.get(k).copied().unwrap_or(0) };
     let _ = canonical_name;
-    kvm_mega::KvmKernelDims {
+    let head_dim = g("head_dim") as u32;
+    let num_attention_heads = g("num_attention_heads") as u32;
+    let num_kv_heads = g("num_key_value_heads") as u32;
+    let hidden_dim = g("hidden_size") as u32;
+    let intermediate_dim = g("intermediate_size") as u32;
+    let matmul_out_block_size = 2 * head_dim;
+    let num_devices: u32 = 1;
+    let num_generated_heads = matmul_out_block_size / head_dim.max(1); // == 2 by contract
+
+    // Sanity checks against vendor's static_asserts.
+    if head_dim == 0 || num_generated_heads != 2 {
+        return None;
+    }
+    // qkv_rope_append.cu:179 — `static_assert(head_dim % 32 == 0)`.
+    if !head_dim.is_multiple_of(32) {
+        return None;
+    }
+    // llama.cuh kv_cache_t = gl<bf16, -1, -1, num_kv_heads/num_devices, ...>
+    // — gl<> static_asserts that compile-time dim != 0. With our patched
+    // `num_devices = LLAMA_NUM_DEVICES` (= num_devices below) the divisor
+    // is num_devices, so num_kv_heads must be a positive multiple.
+    if num_kv_heads == 0 || !num_kv_heads.is_multiple_of(num_devices) {
+        return None;
+    }
+    let kv_col_start = num_attention_heads / num_generated_heads / num_devices;
+    if !kv_col_start.is_multiple_of(2) {
+        return None;
+    }
+    const PIPELINE_K_TIMES_STAGES: u32 = 64 * 4; // = 256
+    if !hidden_dim.is_multiple_of(PIPELINE_K_TIMES_STAGES) {
+        return None;
+    }
+    if !(intermediate_dim / num_devices).is_multiple_of(PIPELINE_K_TIMES_STAGES) {
+        return None;
+    }
+
+    Some(kvm_mega::KvmKernelDims {
         num_layers: g("num_hidden_layers") as u32,
-        hidden_dim: g("hidden_size") as u32,
-        intermediate_dim: g("intermediate_size") as u32,
-        head_dim: g("head_dim") as u32,
-        num_attention_heads: g("num_attention_heads") as u32,
-        num_kv_heads: g("num_key_value_heads") as u32,
+        hidden_dim,
+        intermediate_dim,
+        head_dim,
+        num_attention_heads,
+        num_kv_heads,
         kv_page_size: 128,
         prefill_kv_block_size: 128,
         decode_kv_block_size: 16,
-        matmul_out_block_size: 2 * g("head_dim") as u32, // matches vendor's 2*head_dim contract
+        matmul_out_block_size,
         matmul_batch_block_size: 128,
-        num_devices: 1,
+        num_devices,
         sm_count: 132,
-    }
+    })
 }
 
 /// Try to encode a bucket with the kvm_mega encoder. On `Some`,
@@ -3520,13 +3567,19 @@ pub fn emit_model(
     // libmegakernels.a build.
     if kvm_emitted_any {
         let canonical_bounds = bounds_for_wp(model, *bucket_points.first().unwrap());
-        let dims = kvm_kernel_dims_from_bounds(&canonical_bounds, &model.name);
-        let cu_source = kvm_mega::emit_kvm_cu_source(&model.name, &dims);
-        if let Err(e) = kvm_mega::write_kvm_cu_to_cache(&model.name, &cu_source) {
-            panic!(
-                "kvm_mega: failed to write per-canonical .cu file for `{}`: {}",
-                model.name, e
-            );
+        // Only write a .cu file if the canonical's dims satisfy
+        // vendor's static_asserts. Canonicals that don't (head/dim
+        // ratios, hidden/intermediate divisibility) silently fall
+        // through — emitting a .cu we know NVCC will reject would
+        // break the libmegakernels.a build for the whole workspace.
+        if let Some(dims) = kvm_kernel_dims_from_bounds(&canonical_bounds, &model.name) {
+            let cu_source = kvm_mega::emit_kvm_cu_source(&model.name, &dims);
+            if let Err(e) = kvm_mega::write_kvm_cu_to_cache(&model.name, &cu_source) {
+                panic!(
+                    "kvm_mega: failed to write per-canonical .cu file for `{}`: {}",
+                    model.name, e
+                );
+            }
         }
     }
 

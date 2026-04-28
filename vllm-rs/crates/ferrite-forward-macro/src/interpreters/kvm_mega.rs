@@ -1015,36 +1015,161 @@ pub fn emit_kvm_cu_source(canonical_name: &str, dims: &KvmKernelDims) -> String 
     // block above is what validates vendor's framework accepts our
     // per-arch dims.
 
-    // extern "C" launcher stub. First-pass: just validates the
-    // template instantiation chain by taking the symbol's address
-    // (forces NVCC to emit the kernel into the .a) and returning 0.
-    // The real body — construct globals_t<> from raw pointers and
-    // launch `mk<...><<<grid, block, smem>>>(g)` — lands in P2-4b
-    // step 5 once the per-field plumbing is wired.
+    // extern "C" launcher: takes flat C-friendly args (raw pointers
+    // + scalar shape ints), constructs the per-canonical
+    // `llama_70b_globals` struct via aggregate init mirroring vendor
+    // pyutils.cuh's `bind_kernel` pattern, sets the dynamic SMEM
+    // attribute, and launches `mk<>><<<grid, block, smem, stream>>>(g)`.
+    //
+    // Argument order matches the field order in `globals_t<>`
+    // (llama.cuh:230-292). Each gl<> field receives `(ptr, B, D, H, W)`
+    // for runtime-dim positions; compile-time dims are passed through
+    // the template params and ignored at the constructor.
+    //
+    // NOTE: this is the C++ "launch mechanics" wire — Rust-side
+    // plumbing (LAUNCHER_TABLE entry, KvmMegaLauncher fn-ptr,
+    // `FERRITE_FORCE_KVM_MEGA` env gate) lands in P2-4b step 6. The
+    // body here compiles into libmegakernels.a so the linker has a
+    // symbol to bind once the Rust caller is wired.
     out.push_str(&format!(
-        "extern \"C\" int tk_megakernel_{}_launch() {{\n\
-         \x20   // Force-instantiate `mk<llama_config, llama_70b_globals, ops...>`\n\
-         \x20   // by taking its address. Without this, NVCC dead-code-strips\n\
-         \x20   // the template and libmegakernels.a has no symbol for the\n\
-         \x20   // launcher to call.\n\
-         \x20   auto kernel_addr = &mk<\n\
+        "extern \"C\" int tk_megakernel_{}_launch(\n\
+         \x20   // VM machinery (instruction tape + timing buffer +\n\
+         \x20   // global atomic counter + per-op semaphore array).\n\
+         \x20   void* d_bar, int bar_d0, int bar_d1, int bar_d2, int bar_d3,\n\
+         \x20   void* d_instructions, int num_instructions,\n\
+         \x20   void* d_timings, int num_timing_rows,\n\
+         \x20   void* d_global_instruction_index,\n\
+         \x20   // Weights: 9 layered tensors, each [num_layers, R, hidden_dim]\n\
+         \x20   // or [num_layers, R, intermediate_dim/num_devices]. All bf16.\n\
+         \x20   void* d_qkv_weights, int qkv_R,\n\
+         \x20   void* d_attn_norm_weights,\n\
+         \x20   void* d_o_weights, int o_R,\n\
+         \x20   void* d_mlp_norm_weights,\n\
+         \x20   void* d_up_weights, int up_R,\n\
+         \x20   void* d_gate_weights, int gate_R,\n\
+         \x20   void* d_down_weights, int down_R,\n\
+         \x20   void* d_lm_head_norm_weights,\n\
+         \x20   void* d_lm_head_weights, int lm_head_R,\n\
+         \x20   // Paged KV cache: [num_layers*num_pages, page_size, num_kv_heads/num_devices, head_dim].\n\
+         \x20   void* d_k_cache, int kv_total_pages, int kv_page_size_runtime,\n\
+         \x20   void* d_v_cache,\n\
+         \x20   // Rope tables: [max_pos, head_dim] floats.\n\
+         \x20   void* d_rope_cos, int max_pos,\n\
+         \x20   void* d_rope_sin,\n\
+         \x20   // Activations: hidden_states + intermediates.\n\
+         \x20   void* d_hidden_states, int batch_size_arg,\n\
+         \x20   void* d_rms_rope_intermediates,\n\
+         \x20   void* d_rms_gate_intermediates,\n\
+         \x20   void* d_q_post_rope,\n\
+         \x20   void* d_attn_out,\n\
+         \x20   void* d_silu_out,\n\
+         \x20   void* d_rms_lm_head_intermediates,\n\
+         \x20   void* d_logits, int vocab_size_arg,\n\
+         \x20   // Per-call paged-KV metadata (int32 vectors).\n\
+         \x20   void* d_position_ids, int num_position_ids,\n\
+         \x20   void* d_kv_append_indices,\n\
+         \x20   void* d_prefill_qo_indptr, int num_prefill_qo,\n\
+         \x20   void* d_prefill_kv_indptr,\n\
+         \x20   void* d_prefill_kv_indices, int num_prefill_kv_indices,\n\
+         \x20   void* d_prefill_kv_last_page_len,\n\
+         \x20   void* d_decode_kv_indptr, int num_decode_seqs,\n\
+         \x20   void* d_decode_kv_indices, int num_decode_kv_indices,\n\
+         \x20   void* d_decode_kv_last_page_len,\n\
+         \x20   // Scalars.\n\
+         \x20   float attn_scale, float rms_norm_eps,\n\
+         \x20   int num_pages, int num_prefill_tokens,\n\
+         \x20   int dev_idx,\n\
+         \x20   // CUDA stream (raw pointer cast to cudaStream_t).\n\
+         \x20   void* raw_stream\n\
+         ) {{\n\
+         \x20   using kittens::bf16;\n\
+         \x20   cudaStream_t stream = reinterpret_cast<cudaStream_t>(raw_stream);\n\
+         \x20\n\
+         \x20   // Aggregate-init globals_t<>. Field order MUST match\n\
+         \x20   // llama.cuh's `globals_t` member declaration order. Each\n\
+         \x20   // gl<> takes `(T*, B, D, H, W)`; compile-time dims are\n\
+         \x20   // pulled from the template, runtime dims (-1 in template)\n\
+         \x20   // are filled here.\n\
+         \x20   llama_70b_globals g {{\n\
+         \x20       // Bar (gl_as_pgl wrapping gl<uint, -1, -1, -1, -1>).\n\
+         \x20       // gl_as_pgl inherits gl's constructor via `using GL::GL`,\n\
+         \x20       // so the brace-init takes the gl<> args directly.\n\
+         \x20       {{ static_cast<uint*>(d_bar), (size_t)bar_d0, (size_t)bar_d1, (size_t)bar_d2, (size_t)bar_d3 }},\n\
+         \x20       // instructions: gl<int, 1, 1, -1, INSTRUCTION_WIDTH>.\n\
+         \x20       {{ static_cast<int*>(d_instructions), nullptr, nullptr, num_instructions, nullptr }},\n\
+         \x20       // timings: gl<int, 1, 1, -1, TIMING_WIDTH>.\n\
+         \x20       {{ static_cast<int*>(d_timings), nullptr, nullptr, num_timing_rows, nullptr }},\n\
+         \x20       // global_instruction_index: gl<int, 1, 1, 1, 1>.\n\
+         \x20       {{ static_cast<int*>(d_global_instruction_index), nullptr, nullptr, nullptr, nullptr }},\n\
+         \x20       // qkv_weights: gl<bf16, 1, -1, -1, hidden_dim>.\n\
+         \x20       {{ static_cast<bf16*>(d_qkv_weights), nullptr, LLAMA_NUM_LAYERS, qkv_R, nullptr }},\n\
+         \x20       // attn_norm_weights: gl<bf16, 1, 1, -1, hidden_dim>.\n\
+         \x20       {{ static_cast<bf16*>(d_attn_norm_weights), nullptr, nullptr, LLAMA_NUM_LAYERS, nullptr }},\n\
+         \x20       // o_weights: gl<bf16, 1, -1, -1, hidden_dim>.\n\
+         \x20       {{ static_cast<bf16*>(d_o_weights), nullptr, LLAMA_NUM_LAYERS, o_R, nullptr }},\n\
+         \x20       // mlp_norm_weights.\n\
+         \x20       {{ static_cast<bf16*>(d_mlp_norm_weights), nullptr, nullptr, LLAMA_NUM_LAYERS, nullptr }},\n\
+         \x20       // up_weights / gate_weights: gl<bf16, 1, -1, -1, hidden_dim>.\n\
+         \x20       {{ static_cast<bf16*>(d_up_weights), nullptr, LLAMA_NUM_LAYERS, up_R, nullptr }},\n\
+         \x20       {{ static_cast<bf16*>(d_gate_weights), nullptr, LLAMA_NUM_LAYERS, gate_R, nullptr }},\n\
+         \x20       // down_weights: gl<bf16, 1, -1, -1, intermediate_dim/num_devices>.\n\
+         \x20       {{ static_cast<bf16*>(d_down_weights), nullptr, LLAMA_NUM_LAYERS, down_R, nullptr }},\n\
+         \x20       // lm_head_norm_weights / lm_head_weights.\n\
+         \x20       {{ static_cast<bf16*>(d_lm_head_norm_weights), nullptr, nullptr, 1, nullptr }},\n\
+         \x20       {{ static_cast<bf16*>(d_lm_head_weights), nullptr, 1, lm_head_R, nullptr }},\n\
+         \x20       // k_cache / v_cache: gl<bf16, -1, -1, num_kv_heads/num_devices, head_dim>.\n\
+         \x20       {{ static_cast<bf16*>(d_k_cache), kv_total_pages, kv_page_size_runtime, nullptr, nullptr }},\n\
+         \x20       {{ static_cast<bf16*>(d_v_cache), kv_total_pages, kv_page_size_runtime, nullptr, nullptr }},\n\
+         \x20       // rope tables.\n\
+         \x20       {{ static_cast<float*>(d_rope_cos), nullptr, nullptr, max_pos, nullptr }},\n\
+         \x20       {{ static_cast<float*>(d_rope_sin), nullptr, nullptr, max_pos, nullptr }},\n\
+         \x20       // hidden_states (gl_as_pgl wrapper).\n\
+         \x20       {{ static_cast<bf16*>(d_hidden_states), nullptr, nullptr, (size_t)batch_size_arg, nullptr }},\n\
+         \x20       // rms_rope_intermediates / rms_gate_intermediates (gl_as_pgl).\n\
+         \x20       {{ static_cast<bf16*>(d_rms_rope_intermediates), nullptr, nullptr, (size_t)batch_size_arg, nullptr }},\n\
+         \x20       {{ static_cast<bf16*>(d_rms_gate_intermediates), nullptr, nullptr, (size_t)batch_size_arg, nullptr }},\n\
+         \x20       // q_post_rope (plain gl).\n\
+         \x20       {{ static_cast<bf16*>(d_q_post_rope), nullptr, nullptr, (size_t)batch_size_arg, (size_t)(LLAMA_NUM_ATTENTION_HEADS * LLAMA_HEAD_DIM) }},\n\
+         \x20       // attn_out (gl_as_pgl).\n\
+         \x20       {{ static_cast<bf16*>(d_attn_out), nullptr, nullptr, (size_t)batch_size_arg, nullptr }},\n\
+         \x20       // silu_out (plain gl).\n\
+         \x20       {{ static_cast<bf16*>(d_silu_out), nullptr, nullptr, (size_t)batch_size_arg, nullptr }},\n\
+         \x20       // rms_lm_head_intermediates (gl_as_pgl when LLAMA_BROADCAST_LM_HEAD_NORM).\n\
+         \x20       {{ static_cast<bf16*>(d_rms_lm_head_intermediates), nullptr, nullptr, (size_t)batch_size_arg, nullptr }},\n\
+         \x20       // logits.\n\
+         \x20       {{ static_cast<bf16*>(d_logits), nullptr, nullptr, batch_size_arg, vocab_size_arg }},\n\
+         \x20       // Paged-KV metadata (int32 vectors of length runtime).\n\
+         \x20       {{ static_cast<int*>(d_position_ids), nullptr, nullptr, nullptr, num_position_ids }},\n\
+         \x20       {{ static_cast<int*>(d_kv_append_indices), nullptr, nullptr, nullptr, num_position_ids }},\n\
+         \x20       {{ static_cast<int*>(d_prefill_qo_indptr), nullptr, nullptr, nullptr, num_prefill_qo }},\n\
+         \x20       {{ static_cast<int*>(d_prefill_kv_indptr), nullptr, nullptr, nullptr, num_prefill_qo }},\n\
+         \x20       {{ static_cast<int*>(d_prefill_kv_indices), nullptr, nullptr, nullptr, num_prefill_kv_indices }},\n\
+         \x20       {{ static_cast<int*>(d_prefill_kv_last_page_len), nullptr, nullptr, nullptr, num_prefill_qo }},\n\
+         \x20       {{ static_cast<int*>(d_decode_kv_indptr), nullptr, nullptr, nullptr, num_decode_seqs }},\n\
+         \x20       {{ static_cast<int*>(d_decode_kv_indices), nullptr, nullptr, nullptr, num_decode_kv_indices }},\n\
+         \x20       {{ static_cast<int*>(d_decode_kv_last_page_len), nullptr, nullptr, nullptr, num_decode_seqs }},\n\
+         \x20       attn_scale, rms_norm_eps, num_pages, batch_size_arg, num_prefill_tokens,\n\
+         \x20       dev_idx,\n\
+         \x20   }};\n\
+         \x20\n\
+         \x20   // Force template instantiation + grab kernel address.\n\
+         \x20   auto kernel = &mk<\n\
          \x20       llama_config, llama_70b_globals,\n\
-         \x20       ops::attn_norm_op,\n\
-         \x20       ops::qkv_rope_append_op,\n\
-         \x20       ops::attention_decode_op,\n\
-         \x20       ops::attention_prefill_op,\n\
-         \x20       ops::o_proj_op,\n\
-         \x20       ops::mlp_norm_op,\n\
-         \x20       ops::gate_silu_op,\n\
-         \x20       ops::up_matmul_op,\n\
+         \x20       ops::attn_norm_op, ops::qkv_rope_append_op,\n\
+         \x20       ops::attention_decode_op, ops::attention_prefill_op,\n\
+         \x20       ops::o_proj_op, ops::mlp_norm_op,\n\
+         \x20       ops::gate_silu_op, ops::up_matmul_op,\n\
          \x20       ops::downproj_op,\n\
-         \x20       ops::lm_head_norm_op,\n\
-         \x20       ops::lm_head_op,\n\
-         \x20       ops::barrier_inc_op,\n\
-         \x20       ops::all_device_barrier_op>;\n\
-         \x20   (void)kernel_addr;\n\
-         \x20   // P2-4b step 5: build globals_t<> + launch.\n\
-         \x20   return 0;\n\
+         \x20       ops::lm_head_norm_op, ops::lm_head_op,\n\
+         \x20       ops::barrier_inc_op, ops::all_device_barrier_op>;\n\
+         \x20\n\
+         \x20   int dynamic_smem = (int)g.dynamic_shared_memory();\n\
+         \x20   cudaError_t err = cudaFuncSetAttribute(\n\
+         \x20       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem);\n\
+         \x20   if (err != cudaSuccess) return (int)err;\n\
+         \x20\n\
+         \x20   kernel<<<g.grid(), g.block(), dynamic_smem, stream>>>(g);\n\
+         \x20   return (int)cudaGetLastError();\n\
          }}\n",
         canonical_name,
     ));
@@ -1798,8 +1923,10 @@ mod tests {
         assert!(src.contains("attention_decode_op"));
         assert!(src.contains("attention_prefill_op"));
         assert!(src.contains("all_device_barrier_op"));
-        // extern "C" launcher entry exists.
-        assert!(src.contains("extern \"C\" int tk_megakernel_llama_3p2_1b_launch()"));
+        // extern "C" launcher entry exists. Signature now takes per-
+        // field raw pointers + scalar shapes (matches globals_t<>
+        // aggregate-init), so just check the symbol name + return type.
+        assert!(src.contains("extern \"C\" int tk_megakernel_llama_3p2_1b_launch("));
         // Canonical name is in the header comment for traceability.
         assert!(src.contains("`llama_3p2_1b`"));
     }

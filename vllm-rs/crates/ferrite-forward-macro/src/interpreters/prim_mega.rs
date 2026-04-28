@@ -2496,8 +2496,8 @@ mod tests {
             "workspace must read from the row's accessor"
         );
         assert!(
-            s.contains(". weight . shape () [0]"),
-            "workspace N must come from weight.shape()[0]"
+            s.contains(". dense_weight () . shape () [0]"),
+            "workspace N must come from dense_weight().shape()[0]"
         );
         assert!(
             s.contains("DType :: F32"),

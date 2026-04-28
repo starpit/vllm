@@ -482,7 +482,10 @@ impl AttackSurfaceReport {
             // absorbed by a fusion (overlap_by_regime tracks the
             // double-subtractions).
             writeln!(out)?;
-            writeln!(out, "Cumulative landing projection (fusions, then kernel families)")?;
+            writeln!(
+                out,
+                "Cumulative landing projection (fusions, then kernel families)"
+            )?;
             let mut residual = total;
             writeln!(
                 out,
@@ -521,10 +524,7 @@ impl AttackSurfaceReport {
                 writeln!(
                     out,
                     "  +{:<27}  {:>6}  (-{} unique; {} were also fusion-absorbable)",
-                    "StreamK (small/mid-M long-K)",
-                    residual,
-                    stream_k_unique,
-                    stream_k_overlap
+                    "StreamK (small/mid-M long-K)", residual, stream_k_unique, stream_k_overlap
                 )?;
             }
             let simt_total = self
@@ -543,10 +543,7 @@ impl AttackSurfaceReport {
                 writeln!(
                     out,
                     "  +{:<27}  {:>6}  (-{} unique; {} were also fusion-absorbable)",
-                    "SIMT (small-M short-K)",
-                    residual,
-                    simt_unique,
-                    simt_overlap
+                    "SIMT (small-M short-K)", residual, simt_unique, simt_overlap
                 )?;
             }
             writeln!(
@@ -588,23 +585,23 @@ impl AttackSurfaceReport {
                 }
                 let pct = pct_of(c, g_total);
                 writeln!(out, "  {:>5}  {:>4.0}%   {}", c, pct, regime)?;
-                if let Some(samples) = self.samples_g_regime.get(regime) {
-                    if let Some(s) = samples.first() {
-                        let cb = s.cublas_us.map(|v| format!("{:.1}", v)).unwrap_or_default();
-                        let alt = s.alt_us.map(|v| format!("{:.1}", v)).unwrap_or_default();
-                        let kn = s.alt_kernel.as_deref().unwrap_or("?");
-                        writeln!(
-                            out,
-                            "             e.g. {} M={} N={} K={}  cb={}µs alt={}µs ({})",
-                            short_arch(&s.arch),
-                            s.grid_m,
-                            s.n,
-                            s.k,
-                            cb,
-                            alt,
-                            kn
-                        )?;
-                    }
+                if let Some(samples) = self.samples_g_regime.get(regime)
+                    && let Some(s) = samples.first()
+                {
+                    let cb = s.cublas_us.map(|v| format!("{:.1}", v)).unwrap_or_default();
+                    let alt = s.alt_us.map(|v| format!("{:.1}", v)).unwrap_or_default();
+                    let kn = s.alt_kernel.as_deref().unwrap_or("?");
+                    writeln!(
+                        out,
+                        "             e.g. {} M={} N={} K={}  cb={}µs alt={}µs ({})",
+                        short_arch(&s.arch),
+                        s.grid_m,
+                        s.n,
+                        s.k,
+                        cb,
+                        alt,
+                        kn
+                    )?;
                 }
             }
         }

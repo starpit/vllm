@@ -105,6 +105,56 @@ pub enum Instruction<W> {
     FusedAddRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
     FusedAddRmsNormWithOffset(u32, u32, u32, f32, WtFn<W, RmsNorm>),
     ScalarOffsetRmsNorm(u32, u32, u32, f32, WtFn<W, RmsNorm>),
+    /// Norm→Gemm fusion: `cutlass_gemm(rms_norm(in), gemm_w)`. The
+    /// CUTLASS tile is bucket-pickable per `CUTLASS_TILE_ZOO` entry.
+    /// Reuses existing `kernels::rms_norm` + `cutlass::cutlass_gemm`
+    /// — no new .cu file. Matches body norms whose only downstream
+    /// consumer is a single dense Gemm.
+    FusedRmsNormGemm(
+        u32,
+        u32,
+        u32,
+        WtFn<W, RmsNorm>,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
+    /// LayerNorm→Gemm sibling for Cohere-style architectures.
+    FusedLayerNormGemm(
+        u32,
+        u32,
+        u32,
+        WtFn<W, CohereLayerNorm>,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
+    /// (Add, RmsNorm, Gemm) 3-tile fusion. Claim shape captures
+    /// the lm_head canonical pattern `x = x + delta; logits =
+    /// lm_head(rmsnorm(x))`. Runtime: `fused_add_rms_norm_inplace`
+    /// then `cutlass_gemm`. The Add's residual update is exposed as
+    /// a TensorView aliasing the residual upstream OwnedTensor (same
+    /// alias semantics as `FusedAddRmsNorm`); the Gemm output is a
+    /// fresh OwnedTensor.
+    FusedAddRmsNormGemm(
+        u32,
+        u32,
+        u32,
+        u32,
+        WtFn<W, RmsNorm>,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
     Gemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     FusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
@@ -451,6 +501,123 @@ impl<W: CanonicalParams> Instruction<W> {
                     w.weight,
                     w.eps,
                     offset,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::FusedRmsNormGemm(
+                in_slot,
+                out_slot,
+                layer,
+                norm_wf,
+                gemm_wf,
+                tile_m,
+                tile_n,
+                stages,
+                n,
+                k,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let nw = (norm_wf)(ctx.wm, layer);
+                let gw = (gemm_wf)(ctx.wm, layer);
+                assert_weight_shape("FusedRmsNormGemm", gw.dense_weight(), n, k, tp_active(ctx));
+                let normed = kernels::rms_norm(
+                    *v,
+                    nw.weight,
+                    nw.eps,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let out = cutlass::cutlass_gemm(
+                    normed.as_gpu_tensor(),
+                    gw.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::FusedLayerNormGemm(
+                in_slot,
+                out_slot,
+                layer,
+                norm_wf,
+                gemm_wf,
+                tile_m,
+                tile_n,
+                stages,
+                n,
+                k,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let nw = (norm_wf)(ctx.wm, layer);
+                let gw = (gemm_wf)(ctx.wm, layer);
+                assert_weight_shape(
+                    "FusedLayerNormGemm",
+                    gw.dense_weight(),
+                    n,
+                    k,
+                    tp_active(ctx),
+                );
+                let normed = kernels::cohere_layer_norm(
+                    *v,
+                    nw.weight,
+                    nw.eps,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let out = cutlass::cutlass_gemm(
+                    normed.as_gpu_tensor(),
+                    gw.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::FusedAddRmsNormGemm(
+                delta_slot,
+                residual_slot,
+                out_slot,
+                layer,
+                norm_wf,
+                gemm_wf,
+                tile_m,
+                tile_n,
+                stages,
+                n,
+                k,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
+                let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
+                let nw = (norm_wf)(ctx.wm, layer);
+                let gw = (gemm_wf)(ctx.wm, layer);
+                assert_weight_shape(
+                    "FusedAddRmsNormGemm",
+                    gw.dense_weight(),
+                    n,
+                    k,
+                    tp_active(ctx),
+                );
+                // After this kernel: delta buffer = normed output;
+                // residual buffer = updated residual. The residual
+                // alias is set up by the codegen prelude (TileEntry::View
+                // on (add_id, 0) → residual upstream).
+                let (normed_view, _) = kernels::fused_add_rms_norm_inplace(
+                    *delta,
+                    *residual,
+                    nw.weight,
+                    nw.eps,
+                    ctx.device.compute_stream,
+                );
+                let out = cutlass::cutlass_gemm(
+                    normed_view,
+                    gw.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );

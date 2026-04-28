@@ -1872,6 +1872,30 @@ pub fn starter_library() -> ImplementationLibrary {
         }));
     }
     lib.push(Box::new(FusedAddRmsNormImpl));
+    // Norm→Gemm fusion family: captures the lm_head + body Norm→Gemm
+    // patterns the analyzer's fusion-gap report flagged as the
+    // dominant cuBLAS surface. Three claim shapes — (RmsNorm, Gemm)
+    // 2-tile, (LayerNorm, Gemm) 2-tile, (Add, RmsNorm, Gemm) 3-tile.
+    // Tile-zoo-pickable; one Impl per CUTLASS_TILE_ZOO entry per
+    // shape. matches() rejects multi-consumer norms so FusedQkvRope*
+    // / FusedGateUp* keep claiming the body QKV / gate-up patterns.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(FusedRmsNormGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+        lib.push(Box::new(FusedLayerNormGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+        lib.push(Box::new(FusedAddRmsNormGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     // Singleton fallback for residual `Add`s whose downstream is not
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
     // adds before any LayerNorm. Emits `add_inplace`.
@@ -4281,6 +4305,814 @@ impl Implementation for FusedAddRmsNormImpl {
                 quote! { #residual_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── FusedRmsNormGemmImpl / FusedLayerNormGemmImpl / FusedAddRmsNormGemmImpl ──
+//
+// Norm→Gemm fusion family. Captures the 1095 lm_head + 563 body
+// `Norm→Gemm` cuBLAS picks identified by `attack_surface.rs`'s
+// fusion-gap analyzer. Three claim shapes:
+//
+//   1. (RmsNorm, Gemm)         — body norm whose only consumer is a
+//                                 single Gemm. Most arches.
+//   2. (LayerNorm, Gemm)       — Cohere-style. Same shape as (1) but
+//                                 different norm kernel + weight type.
+//   3. (Add, RmsNorm, Gemm)    — residual-stream norm followed by a
+//                                 single-consumer Gemm. Lm_head's
+//                                 canonical shape (`x = x + mlp; x_n =
+//                                 norm(x); logits = lm_head(x_n)`).
+//                                 3-tile size beats FusedAddRmsNormImpl
+//                                 in the DP's claim-size-DESC sort.
+//
+// All three are tile-zoo-pickable: one Impl per `CUTLASS_TILE_ZOO`
+// entry. The runtime arm runs the existing norm kernel + the
+// existing `cutlass::cutlass_gemm` — no new .cu file. The fusion is
+// at the CLAIM level: by claiming the Gemm together with its upstream
+// norm, the cost model can compare `(norm + cutlass_<tile>)` against
+// `(norm-singleton + cuBLAS-Gemm)` at the bucket level rather than
+// forcing the DP to evaluate them as independent steps.
+//
+// The DP picks naturally: claim-size-DESC means 3-tile fires before
+// 2-tile, and within each, the lowest cost wins. multi-consumer norms
+// (RmsNorm feeding Q+K+V — body residual stream) are rejected so
+// FusedQkvRope* still claims them.
+
+#[derive(Debug, Clone)]
+pub struct FusedRmsNormGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl FusedRmsNormGemmImpl {
+    fn csv_name(&self) -> &'static str {
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "cutlass_16x64_s3",
+            (16, 64, 4) => "cutlass_16x64_s4",
+            (16, 128, 3) => "cutlass_16x128_s3",
+            (16, 128, 4) => "cutlass_16x128_s4",
+            (32, 64, 3) => "cutlass_32x64_s3",
+            (32, 64, 4) => "cutlass_32x64_s4",
+            (32, 128, 3) => "cutlass_32x128_s3",
+            (32, 128, 4) => "cutlass_32x128_s4",
+            (32, 256, 3) => "cutlass_32x256_s3",
+            (64, 64, 3) => "cutlass_64x64_s3",
+            (64, 64, 4) => "cutlass_64x64_s4",
+            (64, 128, 3) => "cutlass_64x128_s3",
+            (64, 128, 4) => "cutlass_64x128_s4",
+            (128, 64, 3) => "cutlass_128x64_s3",
+            (128, 64, 4) => "cutlass_128x64_s4",
+            (128, 128, 3) => "cutlass_128x128_s3",
+            (128, 128, 4) => "cutlass_128x128_s4",
+            (128, 256, 3) => "cutlass_128x256_s3",
+            (256, 64, 3) => "cutlass_256x64_s3",
+            (256, 64, 4) => "cutlass_256x64_s4",
+            _ => "cutlass_unknown",
+        }
+    }
+}
+
+/// Match a (Norm, Gemm) pair seeded on the Norm. Norm's output (slot
+/// 0) must be consumed by exactly one tile, which must be a dense
+/// `OpKind::Gemm` taking the Norm at its first input. Returns
+/// `(norm_id, gemm_id)` or `None`.
+fn match_norm_gemm_pair(
+    fuf: &Fuf,
+    norm_seed: TileId,
+    norm_kind: OpKind,
+) -> Option<(TileId, TileId)> {
+    let norm_node = fuf.get(norm_seed);
+    if norm_node.op != norm_kind {
+        return None;
+    }
+    if let Some(s) = weight_storage_of(norm_node)
+        && !matches!(s, StorageFormat::Dense)
+    {
+        return None;
+    }
+    // Collect consumers of `norm_seed`'s slot 0.
+    let mut consumers = fuf.nodes.iter().filter(|n| consumes_tile(n, norm_seed));
+    let only = consumers.next()?;
+    if consumers.next().is_some() {
+        return None;
+    }
+    if only.op != OpKind::Gemm {
+        return None;
+    }
+    if !matches!(weight_storage_of(only), Some(StorageFormat::Dense)) {
+        return None;
+    }
+    // Gemm's first tile input must be the Norm (slot 0).
+    match first_tile_input(only) {
+        Some((id, slot)) if id == norm_seed && slot == 0 => {}
+        _ => return None,
+    }
+    Some((norm_seed, only.id))
+}
+
+/// Roofline FLOPs cost — the same fallback `GemmRefImpl::cost_us`
+/// (via `cost_gemm`) uses when the cuBLAS CSV row is missing. Used
+/// by every fused-Gemm peer below at uncalibrated shapes
+/// (lm_head's vocab-N rows are not swept) so cuBLAS-vs-fusion stays
+/// on a single measurement scale rather than comparing roofline
+/// (cuBLAS) against `UNCALIBRATED_COST_US` (CUTLASS).
+fn cutlass_gemm_roofline_us(ctx: &CostCtx, m: u32, n: u32, k: u32) -> f64 {
+    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+    let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+    if peak > 0.0 && flops > 0.0 {
+        (flops / peak) * 1e6
+    } else {
+        UNCALIBRATED_COST_US
+    }
+}
+
+impl Implementation for FusedRmsNormGemmImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let (norm_id, gemm_id) = match_norm_gemm_pair(fuf, seed, OpKind::RmsNorm)?;
+        let norm_node = fuf.get(norm_id);
+        let activation_in = first_tile_input(norm_node)?.0;
+        let mut claimed = [norm_id, gemm_id];
+        claimed.sort();
+        Some(MatchInfo {
+            claimed_tiles: claimed.to_vec(),
+            boundary_inputs: vec![activation_in],
+            boundary_outputs: vec![gemm_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedRmsNormGemm: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        // Match cuBLAS's measurement scale: prefer calibrated CSV row;
+        // fall back to roofline when uncalibrated (lm_head vocab-N).
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
+        // Norm BW-bound cost: read input + read weight + write normed.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = (2.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        let norm_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + norm_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Deterministic order: norm accessor first, gemm accessor second.
+        let mut out = Vec::new();
+        for &kind in &[OpKind::RmsNorm, OpKind::Gemm] {
+            for &tid in claimed_tiles {
+                let node = fuf.get(tid);
+                if node.op != kind {
+                    continue;
+                }
+                for input in &node.inputs {
+                    if let FufInput::Weight { id, index, .. } = input {
+                        let name = weight_field_name(program, *id, *index);
+                        out.push(WeightAccessor {
+                            name,
+                            rust_type: rust_type_for_weight_consumed_by(node.op),
+                            source_weights: vec![(*id, *index)],
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "FusedRmsNormGemm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let norm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("FusedRmsNormGemm: claim contains RmsNorm");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedRmsNormGemm: claim contains Gemm");
+        let norm_node = fuf.get(norm_id);
+        let gemm_node = fuf.get(gemm_id);
+        let (in_id, in_slot) = match norm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("FusedRmsNormGemm: norm's first input must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(gemm_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("FusedRmsNormGemm: required_weights[0] (norm)");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("FusedRmsNormGemm: required_weights[1] (gemm)");
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _gemm_layer) = split_base_layer(&gemm_acc.name.to_string());
+        // Both accessors should share the same layer offset (or be
+        // un-layered together). We bake the norm's layer; the gemm's
+        // layer at codegen time must match — un-layered accessors
+        // resolve to layer=0 per emit_weights_accessor_methods's
+        // contract.
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("FusedRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("FusedRmsNormGemm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FusedLayerNormGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl FusedLayerNormGemmImpl {
+    fn csv_name(&self) -> &'static str {
+        FusedRmsNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for FusedLayerNormGemmImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let (norm_id, gemm_id) = match_norm_gemm_pair(fuf, seed, OpKind::LayerNorm)?;
+        let norm_node = fuf.get(norm_id);
+        let activation_in = first_tile_input(norm_node)?.0;
+        let mut claimed = [norm_id, gemm_id];
+        claimed.sort();
+        Some(MatchInfo {
+            claimed_tiles: claimed.to_vec(),
+            boundary_inputs: vec![activation_in],
+            boundary_outputs: vec![gemm_id],
+        })
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedLayerNormGemm: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        // CohereLayerNorm: read input + write normed + read weight (no bias).
+        let bytes = (2.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        let norm_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + norm_us
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Deterministic order: norm accessor first, gemm accessor second.
+        let mut out = Vec::new();
+        for &kind in &[OpKind::LayerNorm, OpKind::Gemm] {
+            for &tid in claimed_tiles {
+                let node = fuf.get(tid);
+                if node.op != kind {
+                    continue;
+                }
+                for input in &node.inputs {
+                    if let FufInput::Weight { id, index, .. } = input {
+                        let name = weight_field_name(program, *id, *index);
+                        out.push(WeightAccessor {
+                            name,
+                            rust_type: rust_type_for_weight_consumed_by(node.op),
+                            source_weights: vec![(*id, *index)],
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "FusedLayerNormGemm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers::CohereLayerNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let norm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::LayerNorm)
+            .expect("FusedLayerNormGemm: claim contains LayerNorm");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedLayerNormGemm: claim contains Gemm");
+        let norm_node = fuf.get(norm_id);
+        let gemm_node = fuf.get(gemm_id);
+        let (in_id, in_slot) = match norm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("FusedLayerNormGemm: norm's first input must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(gemm_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("FusedLayerNormGemm: required_weights[0]");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("FusedLayerNormGemm: required_weights[1]");
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("FusedLayerNormGemm: gemm (N, K) must resolve from FUF + bounds");
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("FusedLayerNormGemm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FusedAddRmsNormGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl FusedAddRmsNormGemmImpl {
+    fn csv_name(&self) -> &'static str {
+        FusedRmsNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for FusedAddRmsNormGemmImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Seed at the residual-stream Add (same shape as
+        // FusedAddRmsNormImpl). Both Add inputs must be tiles.
+        let add_node = fuf.get(seed);
+        if add_node.op != OpKind::Add {
+            return None;
+        }
+        if !add_node
+            .inputs
+            .iter()
+            .all(|i| matches!(i, FufInput::Tile { .. }))
+        {
+            return None;
+        }
+        // Find an immediate RmsNorm consumer.
+        let rmsnorm_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::RmsNorm && consumes_tile(n, seed))?;
+        let rmsnorm_id = rmsnorm_node.id;
+        // RmsNorm's only consumer must be a single dense Gemm with
+        // RmsNorm as its first tile input.
+        let mut consumers = fuf.nodes.iter().filter(|n| consumes_tile(n, rmsnorm_id));
+        let only = consumers.next()?;
+        if consumers.next().is_some() {
+            return None;
+        }
+        if only.op != OpKind::Gemm {
+            return None;
+        }
+        if !matches!(weight_storage_of(only), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        match first_tile_input(only) {
+            Some((id, slot)) if id == rmsnorm_id && slot == 0 => {}
+            _ => return None,
+        }
+        let gemm_id = only.id;
+        let mut claimed = [seed, rmsnorm_id, gemm_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let boundary_inputs: Vec<TileId> = add_node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        // Both the Add output (residual update — for downstream
+        // residual stream) and the Gemm output (the matmul result)
+        // are externally visible.
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs,
+            boundary_outputs: vec![seed, gemm_id],
+        })
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedAddRmsNormGemm: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
+        // fused_add_rms_norm BW-bound: 2 reads (delta, residual) + 2
+        // writes (residual, normed) + weight read.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = (4.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        let norm_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + norm_us
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Deterministic order: norm accessor first, gemm accessor second.
+        let mut out = Vec::new();
+        for &kind in &[OpKind::RmsNorm, OpKind::Gemm] {
+            for &tid in claimed_tiles {
+                let node = fuf.get(tid);
+                if node.op != kind {
+                    continue;
+                }
+                for input in &node.inputs {
+                    if let FufInput::Weight { id, index, .. } = input {
+                        let name = weight_field_name(program, *id, *index);
+                        out.push(WeightAccessor {
+                            name,
+                            rust_type: rust_type_for_weight_consumed_by(node.op),
+                            source_weights: vec![(*id, *index)],
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // The fused_add_rms_norm kernel mutates the residual buffer
+        // in place; the Add tile's slot 0 is a TensorView aliasing
+        // the residual upstream OwnedTensor (same convention as
+        // FusedAddRmsNormImpl). The Gemm output is a fresh
+        // OwnedTensor allocated by cutlass_gemm — no alias needed
+        // (omitted entries default to None).
+        let add_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Add)
+            .expect("FusedAddRmsNormGemm: claim contains Add");
+        let add_node = fuf.get(add_id);
+        let residual_src = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("FusedAddRmsNormGemm: Add input 1 (residual) must be a Tile"),
+        };
+        vec![((add_id, 0), Some(residual_src))]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "FusedAddRmsNormGemm",
+            vec![
+                ("delta_slot", syn::parse_quote!(u32)),
+                ("residual_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Add)
+            .expect("FusedAddRmsNormGemm: claim contains Add");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("FusedAddRmsNormGemm: claim contains Gemm");
+        let add_node = fuf.get(add_id);
+        let gemm_node = fuf.get(gemm_id);
+        let (delta_id, delta_in_slot) = match add_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("FusedAddRmsNormGemm: Add input 0 (delta) must be a Tile (got {other:?})")
+            }
+        };
+        let (residual_id, residual_in_slot) = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("FusedAddRmsNormGemm: Add input 1 (residual) must be a Tile (got {other:?})")
+            }
+        };
+        let delta_idx = slots.of(delta_id, delta_in_slot);
+        let residual_idx = slots.of(residual_id, residual_in_slot);
+        let out_slot_idx = slots.of(gemm_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("FusedAddRmsNormGemm: required_weights[0]");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("FusedAddRmsNormGemm: required_weights[1]");
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("FusedAddRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("FusedAddRmsNormGemm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #delta_idx },
+                quote! { #residual_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
             ],
         )])
     }

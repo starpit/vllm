@@ -545,20 +545,51 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
 
     let arch = detect_cuda_arch();
     let arch_num: u32 = arch.parse().unwrap_or(89);
-    let std_flag = if arch_num >= 90 {
-        "-std=c++20"
+    // Vendor megakernel requires c++20 unconditionally (uses
+    // c++20 concept syntax + std::is_same_v in concepts).
+    let std_flag = "-std=c++20";
+    // Hopper-specific arch tag — matches vendor's Makefile
+    // (`-DKITTENS_HOPPER -arch=sm_90a`). sm_90 (no `a`) lacks the
+    // tcgen / wgmma intrinsics ThunderKittens uses.
+    let (gencode, kittens_arch_define) = if arch_num >= 100 {
+        (
+            format!("-gencode=arch=compute_{arch}a,code=sm_{arch}a"),
+            "-DKITTENS_HOPPER -DKITTENS_BLACKWELL",
+        )
+    } else if arch_num >= 90 {
+        (
+            "-gencode=arch=compute_90a,code=sm_90a".to_string(),
+            "-DKITTENS_HOPPER",
+        )
+    } else if arch_num >= 80 {
+        (
+            format!("-gencode=arch=compute_{arch},code=sm_{arch}"),
+            "-DKITTENS_A100",
+        )
     } else {
-        "-std=c++17"
+        (
+            format!("-gencode=arch=compute_{arch},code=sm_{arch}"),
+            "-DKITTENS_4090",
+        )
     };
 
     // The megakernel .cu files include megakernel_ops.cuh from vllm-cuda/csrc.
     const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
 
+    // Vendored megakernel + ThunderKittens sources. Both are
+    // header-only-ish and live under
+    // `vllm-rs/third_party/{megakernels,thunderkittens}/`. The
+    // per-canonical .cu files emitted by
+    // ferrite_forward_macro::interpreter::kvm `#include` vendor
+    // files by bare name; these include paths resolve them.
     let mut mk_builder = cudaforge::KernelBuilder::new();
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
         .include_path("../../crates/vllm-cuda/csrc")
+        .include_path("../../third_party/thunderkittens/include")
+        .include_path("../../third_party/megakernels/include")
+        .include_path("../../third_party/megakernels/cross-gpu-llama")
         .with_cutlass(Some(CUTLASS_COMMIT));
     mk_builder
         .arg(std_flag)
@@ -566,11 +597,13 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("--use_fast_math")
         .arg("--expt-extended-lambda")
         .arg("--expt-relaxed-constexpr")
+        .arg("-forward-unknown-to-host-compiler")
         .arg("-DNDEBUG")
+        .arg(kittens_arch_define)
         .arg("-Xcompiler=-fPIC")
         .arg("-Xcompiler=-fno-strict-aliasing")
         .arg("-Xcompiler=-Wno-psabi")
-        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .arg(&gencode)
         .arg("-lineinfo")
         .build_lib(format!("{cache_dir}/libmegakernels.a"))
         .expect("failed to build megakernel .cu files");

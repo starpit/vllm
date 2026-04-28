@@ -24,8 +24,15 @@ is one playback strategy, the GPU megakernel is another.
 | 1. Solver Impls | done | `369a6b618` |
 | 2a. Scaffold (mod + types) | done | `a94d1cb17` |
 | 2b. emit_model hookup (FERRITE_KVM gated) | done | `b9ae21c04` |
-| 2c. Solver actually picks TK | NOT done | — |
-| 2d. Smoke test | NOT run | — |
+| 2c. Solver picks TK (launch overhead + class) | done | `36b3c7d55` |
+| 2c'. Field extraction + FusedAddRmsNorm encoding | done | `b361bc9fe` |
+| 2d. Smoke test (NVCC + chat) | NOT run | — |
+
+llama-3.2-3b m=8 prefill bucket now produces
+`~/.cache/cudaforge/megakernels/tk_megakernel_llama_3_2_3b_m_8_sk_128.cu`
++ a `kvm_wrapper_m_8_sk_128` fn + a populated `KVM_WRAPPERS`
+slot. The dispatcher routes m=8 prefill calls through the
+wrapper.
 
 ## What's wired
 
@@ -55,7 +62,32 @@ is one playback strategy, the GPU megakernel is another.
 
 ## What's blocking
 
-**The solver isn't picking the TK Impls.**
+**Smoke test not run yet.** The .cu file is written, the
+wrapper fn is emitted, KVM_WRAPPERS is populated for m=8 —
+but ferrite-cuda-builder/build.rs needs to pick up the new
+.cu file from `~/.cache/cudaforge/megakernels/` and feed it
+to NVCC. The runtime kvm wrapper expects an
+`extern "C" fn tk_megakernel_<canonical>_launch` symbol; that
+only exists once NVCC compiles the .cu.
+
+Three remaining items to validate:
+
+1. ferrite-cuda-builder picks up .cu files from
+   ~/.cache/cudaforge/megakernels/. If it doesn't already,
+   that's the next code change.
+2. NVCC compiles vendor's mk<...> template with the bounds
+   `dims_from_bounds` baked in. Vendor's static_asserts
+   must pass. Llama-3.2-3b's hidden=3072 is a multiple of
+   256, intermediate=8192/1=8192 is a multiple of 256, so
+   the asserts should pass.
+3. The runtime helper's KV-cache layout assumption (single
+   contiguous `(layer × num_blocks × …)` slab) doesn't match
+   ferrite's per-layer KvCachePool. For a single-layer
+   smoke run this is fine (we pass the layer-0 view). For
+   multi-layer correctness, a parallel kvm-only KV pool is
+   needed.
+
+**Decode bucket (m=1) is still kvm-INELIGIBLE.**
 
 A clean build with `FERRITE_KVM=1 FERRITE_GPU=h100
 FERRITE_MODELS=llama-3.2-3b cargo build -p ferrite-model-llama
@@ -65,37 +97,37 @@ prints `… fa2 cublas cutlass non-gemm` — no `kvm` tag.
 `KVM_WRAPPERS` is not emitted and `forward()` keeps the original
 `find_bucket + run` body.
 
-### Root cause (suspected)
+The decode bucket m=1 has `cutlass_gemv` picked for o_proj
+(there's no TK decode-matmul_add — `tk_cutlass_32x64_s4_add`
+only matches at prefill). The encoder rejects CutlassGemv
+inside the body because the megakernel has no structural
+opcode for it; only the lm_head's terminal CutlassGemv is
+encodable (as OP_LM_HEAD). Until a TK decode-matmul_add
+exists OR encode_op gains a body-CutlassGemv arm, m=1 falls
+through to the host interpreter.
 
-Each Tk Impl in `impl_lib.rs:starter_library()` overrides
-`launch_kind` to `LaunchKind::DeviceCallable` and `megakernel_fit`
-to `MegakernelFit::Kvm`, but inherits `cost_us` from its host
-counterpart. The solver's DP doesn't apply any
-DeviceCallable-specific discount — `grep "launch_overhead\|
-device_callable" solver.rs` returns no hits. So Tk and host
-costs are identical, the DP picks the first registered one (the
-host Impl, which is registered earlier), and Tk never wins.
+### Next concrete step (2d)
 
-The comment in `impl_lib.rs:2090-2093` claims the savings live
-in "the per-pick `launch_overhead_us` term" — which doesn't
-exist in `solver.rs`. The wiring is missing.
+Run the smoke test:
 
-### Next concrete step (2c)
+```
+ulimit -v 16777216
+FERRITE_KVM=1 FERRITE_GPU=h100 FERRITE_MODELS=llama-3.2-3b \
+  cargo build -p vllm-cli --features cuda --release -j 2
+```
 
-Add a per-pick launch-overhead term in the solver's cost
-evaluation: `LaunchKind::HostCallback` adds ~5 µs, `DeviceCallable`
-adds 0 µs. Two-line patch in solver.rs's per-Impl cost loop;
-matches the design comment in `impl_lib.rs:2090-2093`. **Do
-NOT** lower individual TK Impls' `cost_us` — that's the
-kind of special-case hack the user has explicitly forbidden
-("DP solver — no hand-coded fusion preferences"). The whole
-point is that DeviceCallable wins **principledly** because
-launch overhead is real and the cost model finally accounts
-for it.
+Expected outcomes (in order of likely failure):
 
-After that, rebuild llama-3.2-3b with FERRITE_KVM=1, expect
-the per-arch line to show `kvm` in the tag list, and run the
-smoke test (2d).
+1. **NVCC link-step failure** — `tk_megakernel_<...>_launch`
+   undefined. Means ferrite-cuda-builder/build.rs isn't
+   scanning ~/.cache/cudaforge/megakernels/. Fix: add the
+   dir to its scan list.
+2. **NVCC compile failure** on the .cu — vendor static_assert
+   trip. Inspect; either fix dims_from_bounds or relax the
+   assert.
+3. **Build succeeds, runtime panic in launch()** —
+   KvCachePool layout doesn't match. For a 1-layer dummy,
+   pass; for real llama, need the parallel kvm-only KV pool.
 
 ## Smoke test (2d)
 

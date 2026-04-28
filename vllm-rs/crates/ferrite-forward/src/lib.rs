@@ -155,6 +155,56 @@ pub fn prim_mega_forced() -> bool {
     })
 }
 
+/// Kvm-mega launcher fn pointer type. Each canonical that survives
+/// the kvm-eligibility checks (vendor static_asserts in
+/// `kvm_kernel_dims_from_bounds`) emits a single per-canonical
+/// `kvm_mega_<canonical>` wrapper fn alongside the per-arch
+/// `tk_megakernel_<canonical>.cu` source. The wrapper marshals
+/// `Weights<W>` / `ForwardCtx<W>` accessors into the ~50 flat C
+/// args the vendored `tk_megakernel_<canonical>_launch` extern fn
+/// takes, then launches.
+///
+/// Same Rust-side shape as [`PrimMegaLauncher`]: the `LAUNCHER_TABLE`
+/// stores it as `Option<KvmMegaLauncher<Weights>>` per bucket so
+/// dispatch can branch off `kvm_mega_forced()` (and, eventually, a
+/// cost-driven `pick_interpreter` decision). Unlike PrimMega, KvmMega
+/// is per-CANONICAL (one launcher covers backbone + lm_head in a
+/// single kernel call), so every bucket of an eligible canonical
+/// stores the same fn-ptr in its kvm slot.
+///
+/// `tiles` is owned by the caller — the launcher pre-allocates per-
+/// slot `OwnedTensor`s into it, runs the cooperative kernel, and
+/// returns. The caller `take_owned`s the terminal slot afterward,
+/// matching `run`'s shape.
+#[cfg(feature = "cuda")]
+pub type KvmMegaLauncher<W> = unsafe fn(
+    &W,
+    &ForwardCtx,
+    &mut ferrite_cuda_core::device::GpuDevice,
+    &mut Vec<Option<TileEntry>>,
+);
+
+/// Runtime gate for forcing KvmMega dispatch. Reads
+/// `FERRITE_FORCE_KVM_MEGA` once and caches; set to a non-empty,
+/// non-"0" value to force every canonical bucket whose kvm launcher
+/// is emitted to route through it. Mirrors [`prim_mega_forced`] but
+/// targets the third LAUNCHER_TABLE slot.
+///
+/// Forcing onto a bucket whose kvm launcher slot is `None` panics
+/// at the dispatch site (loud failure beats silent host fallback
+/// when we're trying to validate the launcher path).
+#[cfg(feature = "cuda")]
+#[inline]
+pub fn kvm_mega_forced() -> bool {
+    use std::sync::OnceLock;
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("FERRITE_FORCE_KVM_MEGA")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Runtime gate for the per-op trace `Instruction::eval` opens
 /// each match with. Reads `FERRITE_TRACE` from the environment on
 /// the first call and caches the result. Set `FERRITE_TRACE=1`

@@ -3703,18 +3703,27 @@ pub fn emit_model(
         // Parallel launcher entry. Both backbone and lm_head must
         // have encoded for the bucket to be PrimMega-eligible at the
         // canonical level — partial coverage falls through to host.
+        // The third slot is the per-canonical KvmMega launcher: a
+        // single fn covers backbone + lm_head (the vendored TK
+        // megakernel does both in one kernel call), so every bucket
+        // of an eligible canonical stores the same fn-ptr. Today the
+        // wrapper isn't emitted yet (P2-4b step 6b), so the kvm slot
+        // is always `None`; the dispatch branch panics if forced
+        // onto an ineligible bucket — loud failure over silent host
+        // fallback while the kvm path is being validated.
         let (bb_ok, lm_ok) = prim_mega_emitted
             .get(&canonical)
             .copied()
             .unwrap_or((false, false));
-        let launcher_entry = if bb_ok && lm_ok {
+        let prim_pair = if bb_ok && lm_ok {
             let bb_launcher = bucket_static_ident("prim_mega_backbone_m", canonical);
             let lm_launcher = bucket_static_ident("prim_mega_lm_head_m", canonical);
-            quote! { (::core::option::Option::Some(#bb_launcher), ::core::option::Option::Some(#lm_launcher)), }
+            quote! { ::core::option::Option::Some(#bb_launcher), ::core::option::Option::Some(#lm_launcher) }
         } else {
-            quote! { (::core::option::Option::None, ::core::option::Option::None), }
+            quote! { ::core::option::Option::None, ::core::option::Option::None }
         };
-        launcher_table_entries.push(launcher_entry);
+        let kvm_slot = quote! { ::core::option::Option::None };
+        launcher_table_entries.push(quote! { ( #prim_pair, #kvm_slot ), });
     }
 
     // FORWARD_TABLE — one row per bucket. `__B` aliases the
@@ -3731,18 +3740,25 @@ pub fn emit_model(
     };
 
     // LAUNCHER_TABLE — parallel to FORWARD_TABLE, one row per bucket.
-    // Each row is `(Option<bb_launcher>, Option<lm_launcher>)`. Step-8
-    // dispatch picks one or the other based on `prim_mega_forced()`
-    // (and, eventually, the cost-driven `pick_interpreter` decision).
+    // Each row is `(Option<bb_launcher>, Option<lm_launcher>,
+    // Option<kvm_launcher>)`. Dispatch picks the prim_mega pair when
+    // `prim_mega_forced()` is set, the kvm singleton when
+    // `kvm_mega_forced()` is set; otherwise the host interpreter
+    // runs (and, eventually, the cost-driven `pick_interpreter`
+    // decision routes through the same table).
     let launcher_table = quote! {
         #[cfg(feature = "cuda")]
         #[allow(non_camel_case_types, dead_code)]
         type __PrimMegaLauncher = ::ferrite_forward::PrimMegaLauncher<Weights>;
         #[cfg(feature = "cuda")]
+        #[allow(non_camel_case_types, dead_code)]
+        type __KvmMegaLauncher = ::ferrite_forward::KvmMegaLauncher<Weights>;
+        #[cfg(feature = "cuda")]
         #[allow(dead_code)]
         static LAUNCHER_TABLE: &[(
             ::core::option::Option<__PrimMegaLauncher>,
             ::core::option::Option<__PrimMegaLauncher>,
+            ::core::option::Option<__KvmMegaLauncher>,
         )] = &[
             #(#launcher_table_entries)*
         ];
@@ -3762,13 +3778,13 @@ pub fn emit_model(
         #launcher_table
 
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
-        /// run the picked interpreter. `FERRITE_FORCE_PRIM_MEGA=1`
-        /// routes any bucket whose LAUNCHER_TABLE entry is `Some(_)`
-        /// through the prim_mega launcher; partial coverage (only one
-        /// of backbone/lm_head encoded) is treated as ineligible at
-        /// the canonical level and falls through to the host
-        /// interpreter. Forced + ineligible panics — silent fallback
-        /// would mask launcher correctness regressions.
+        /// run the picked interpreter. `FERRITE_FORCE_KVM_MEGA=1`
+        /// takes precedence over `FERRITE_FORCE_PRIM_MEGA=1`; both
+        /// route any bucket whose corresponding LAUNCHER_TABLE slot
+        /// is `Some(_)` through the matching launcher and panic
+        /// loudly if the slot is `None` (partial coverage / kvm-
+        /// ineligible canonical). Without either env var the host
+        /// interpreter runs.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -3781,8 +3797,26 @@ pub fn emit_model(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
             let e = &FORWARD_TABLE[bidx];
+            if ::ferrite_forward::kvm_mega_forced() {
+                match &LAUNCHER_TABLE[bidx].2 {
+                    ::core::option::Option::Some(kv) => {
+                        let mut tiles: ::std::vec::Vec<
+                            ::core::option::Option<::ferrite_forward::TileEntry>,
+                        > = (0..e.6).map(|_| ::core::option::Option::None).collect();
+                        unsafe { (kv)(wm, ctx, device, &mut tiles); }
+                        return ::ferrite_forward::take_owned(&mut tiles, e.8);
+                    }
+                    ::core::option::Option::None => ::core::panic!(
+                        "FERRITE_FORCE_KVM_MEGA set but bucket {bidx} has no \
+                         kvm_mega launcher (canonical was kvm-ineligible at \
+                         codegen — see kvm_kernel_dims_from_bounds, or the \
+                         Rust marshaling wrapper has not yet been emitted \
+                         for this canonical)",
+                    ),
+                }
+            }
             if ::ferrite_forward::prim_mega_forced() {
-                match &LAUNCHER_TABLE[bidx] {
+                match (&LAUNCHER_TABLE[bidx].0, &LAUNCHER_TABLE[bidx].1) {
                     (::core::option::Option::Some(bb), ::core::option::Option::Some(lm)) => {
                         let mut tiles: ::std::vec::Vec<
                             ::core::option::Option<::ferrite_forward::TileEntry>,
@@ -3819,8 +3853,49 @@ pub fn emit_model(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
             let e = &FORWARD_TABLE[bidx];
+            if ::ferrite_forward::kvm_mega_forced() {
+                match &LAUNCHER_TABLE[bidx].2 {
+                    ::core::option::Option::Some(kv) => {
+                        // Kvm-mega covers backbone + lm_head in one
+                        // kernel call. forward_backbone wants only
+                        // the backbone slot, so we run the full
+                        // launcher and DtoD-copy the backbone tile —
+                        // same pattern as the prim_mega backbone path
+                        // below. Wasting the lm_head work is the
+                        // tradeoff for not maintaining a separate
+                        // backbone-only mega TU; revisit if profiling
+                        // shows it dominates.
+                        let mut tiles: ::std::vec::Vec<
+                            ::core::option::Option<::ferrite_forward::TileEntry>,
+                        > = (0..e.6).map(|_| ::core::option::Option::None).collect();
+                        unsafe { (kv)(wm, ctx, device, &mut tiles); }
+                        let bb_view = unsafe {
+                            ::ferrite_forward::tile_ref(&tiles, e.7).as_view(&tiles)
+                        };
+                        let bb_shape: ::std::vec::Vec<usize> = bb_view
+                            .shape()
+                            .iter()
+                            .map(|&d| d as usize)
+                            .collect();
+                        let bb_out = device.caching.alloc_tensor(&bb_shape, bb_view.dtype());
+                        unsafe {
+                            ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                                bb_out.raw_ptr(),
+                                bb_view.raw_ptr() as *const u8,
+                                bb_view.size_bytes(),
+                                device.compute_stream,
+                            ).expect("forward_backbone: kvm_mega DtoD copy");
+                        }
+                        return bb_out;
+                    }
+                    ::core::option::Option::None => ::core::panic!(
+                        "FERRITE_FORCE_KVM_MEGA set but bucket {bidx} has no \
+                         kvm_mega launcher",
+                    ),
+                }
+            }
             if ::ferrite_forward::prim_mega_forced() {
-                match &LAUNCHER_TABLE[bidx] {
+                match (&LAUNCHER_TABLE[bidx].0, &LAUNCHER_TABLE[bidx].1) {
                     (::core::option::Option::Some(bb), _) => {
                         let mut tiles: ::std::vec::Vec<
                             ::core::option::Option<::ferrite_forward::TileEntry>,

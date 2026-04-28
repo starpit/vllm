@@ -194,6 +194,13 @@ pub struct AttackSurfaceReport {
     pub g_by_regime: HashMap<&'static str, u64>,
     /// `shape_regime → up to N samples`.
     pub samples_g_regime: HashMap<&'static str, Vec<PickSample>>,
+    /// Picks that land in BOTH a fusion-gap reason AND a tile-family
+    /// regime (i.e. the >5% class). Used for the cumulative-fusion
+    /// projection's overlap correction: applying both
+    /// fusion-authoring AND a tile-family kernel removes each such
+    /// pick once, not twice. Indexed by regime so we can credit the
+    /// kernel-family work appropriately.
+    pub overlap_by_regime: HashMap<&'static str, u64>,
     /// `margin_class → up to N samples`.
     pub samples_margin: HashMap<&'static str, Vec<PickSample>>,
     /// `fusion_gap_reason → up to N samples`.
@@ -325,6 +332,17 @@ impl AttackSurfaceReport {
                     .entry(reason)
                     .or_default()
                     .push_if_under(self.max_samples_per_class, sample);
+            }
+
+            // Fusion ∩ regime overlap: picks that BOTH a fusion claim
+            // would absorb AND a tile-family kernel would close.
+            // Without tracking this, a naive projection of
+            // (residual − fusion_count − regime_count) double-subtracts
+            // these. Recorded only for >5% picks (where regime is
+            // assigned).
+            if cls == "g_gt_5.00" && gap.is_some() {
+                let regime = classify_regime(grid_m, n, k);
+                *self.overlap_by_regime.entry(regime).or_default() += 1;
             }
         }
     }
@@ -458,13 +476,17 @@ impl AttackSurfaceReport {
             }
 
             // Cumulative-fusion projection: assume each fusion lands
-            // in declared order and count residual picks.
+            // in declared order and count residual picks. Then layer
+            // tile-family additions (Stream-K, etc.) for the remaining
+            // >5% picks, subtracting only the picks NOT already
+            // absorbed by a fusion (overlap_by_regime tracks the
+            // double-subtractions).
             writeln!(out)?;
-            writeln!(out, "Cumulative fusion-landing projection")?;
+            writeln!(out, "Cumulative landing projection (fusions, then kernel families)")?;
             let mut residual = total;
             writeln!(
                 out,
-                "  starting residual  {:>6}  (current cuBLAS surface)",
+                "  starting residual            {:>6}  (current cuBLAS surface)",
                 residual
             )?;
             for reason in &fg_order {
@@ -472,15 +494,64 @@ impl AttackSurfaceReport {
                 residual = residual.saturating_sub(c);
                 writeln!(
                     out,
-                    "  +{:<28}  {:>6}  (-{} picks)",
+                    "  +{:<27}  {:>6}  (-{})",
                     short_reason_tag(reason),
                     residual,
                     c
                 )?;
             }
+            // Then tile-family additions on the remaining >5% picks.
+            // For each regime, count = g_by_regime[regime] minus the
+            // overlap (already subtracted by the fusion landings).
+            let stream_k_regimes = [
+                "small-M long-K (Stream-K target)",
+                "mid-M long-K (Stream-K target)",
+            ];
+            let stream_k_total: u64 = stream_k_regimes
+                .iter()
+                .map(|r| self.g_by_regime.get(*r).copied().unwrap_or(0))
+                .sum();
+            let stream_k_overlap: u64 = stream_k_regimes
+                .iter()
+                .map(|r| self.overlap_by_regime.get(*r).copied().unwrap_or(0))
+                .sum();
+            let stream_k_unique = stream_k_total.saturating_sub(stream_k_overlap);
+            if stream_k_unique > 0 {
+                residual = residual.saturating_sub(stream_k_unique);
+                writeln!(
+                    out,
+                    "  +{:<27}  {:>6}  (-{} unique; {} were also fusion-absorbable)",
+                    "StreamK (small/mid-M long-K)",
+                    residual,
+                    stream_k_unique,
+                    stream_k_overlap
+                )?;
+            }
+            let simt_total = self
+                .g_by_regime
+                .get("small-M short-K (SIMT/tile_m=8 target)")
+                .copied()
+                .unwrap_or(0);
+            let simt_overlap = self
+                .overlap_by_regime
+                .get("small-M short-K (SIMT/tile_m=8 target)")
+                .copied()
+                .unwrap_or(0);
+            let simt_unique = simt_total.saturating_sub(simt_overlap);
+            if simt_unique > 0 {
+                residual = residual.saturating_sub(simt_unique);
+                writeln!(
+                    out,
+                    "  +{:<27}  {:>6}  (-{} unique; {} were also fusion-absorbable)",
+                    "SIMT (small-M short-K)",
+                    residual,
+                    simt_unique,
+                    simt_overlap
+                )?;
+            }
             writeln!(
                 out,
-                "  remaining {} picks: kernel-quality work (mostly >5% gap; see margin g_gt_5.00).",
+                "  remaining {} picks: large-M compute-bound + mid-M short-K — accept under feature-gate, or hand-CUDA per-arch.",
                 residual
             )?;
         }

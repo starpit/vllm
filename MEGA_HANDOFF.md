@@ -7,38 +7,112 @@
 > mega builds on top of its `Instruction<W>` IR + `static
 > BACKBONE_M_<N>: &[Instruction<W>]` slices without modification.
 
-## STATE 2026-04-28 (PM) — P2-4b steps 6a + 6b-i done; step 6c (marshaling wrapper) is next
+## STATE 2026-04-28 (late) — P2-4b 6c-i…6c-iii-d-1 done; 6c-iii-d-2 (codegen wrapper + flip) is next
 
-Tip `ec8992109` (this doc itself). Three commits past
-`4c71d603f`:
+Tip `0aa7c4fd8`. Five commits past `e2f9b1eaf`:
 
-- **`50d4f3888`** — step 6a: `KvmMegaLauncher<W>` fn-ptr type +
-  `kvm_mega_forced()` env gate in `ferrite-forward/src/lib.rs`.
-  `LAUNCHER_TABLE` row extended from 2-tuple to 3-tuple
-  `(Option<__PrimMegaLauncher>, Option<__PrimMegaLauncher>,
-  Option<__KvmMegaLauncher>)`. Kvm dispatch branch added in both
-  `forward()` and `forward_backbone()`, taking precedence over
-  prim_mega when forced; panics loudly on `Some(_)` slot mismatch.
-  Kvm slot is `None` for every bucket today — no caller exists yet.
-- **`3b9b836ba`** — step 6b-i: per-canonical Rust `unsafe extern
-  "C"` decl emission for `tk_megakernel_<canonical>_launch` via
-  new `kvm_mega::emit_kvm_extern_decl`. Gated identically to the
-  `.cu` write
-  (`kvm_emitted_any && kvm_kernel_dims_from_bounds.is_some()`)
-  so the linker only ever sees declarations whose symbols
-  actually exist in libmegakernels.a. Decl currently has no
-  caller (the wrapper that fills it is step 6c).
-- **`ec8992109`** — this doc, refreshed: rewrites STATE +
-  replaces the stale "Step 6 — Rust-side launcher wire-up"
-  punch list with the 6c work order below.
+- **`08ac9b98c`** — 6c-i: replace per-bucket `KVM_BACKBONE_M_<wp>`
+  + `KVM_LM_HEAD_M_<wp>` tape statics with one concatenated
+  `KVM_FULL_M_<wp>` (backbone rows then lm_head rows) plus
+  `_BACKBONE_LEN` / `_LM_HEAD_LEN` length consts. Pure codegen
+  refactor; same 107 .cu files re-emitted. New unit test
+  `emit_kvm_full_program_concatenates_with_split_lens` passes;
+  total macro suite now 251/255 (4 pre-existing fails).
+- **`0dd0e0ce0`** — 6c-ii: `paged_kv` module in
+  `ferrite-forward` with the pure host-side CSR builder
+  `build_paged_kv_metadata_from_host`. Seven unit tests cover
+  prefill / decode / mixed / panic-ordering edges. Algorithm
+  ported from vendor `tp_generate.py` + `test_prefill.py`.
+- **`7c177562b`** — 6c-iii-a: `KvCachePool::new` now does ONE
+  `mem_alloc` per K and per V (`bytes_per_layer * num_layers`)
+  with per-layer `GpuTensor` views. Per-layer `mem_alloc` was
+  incompatible with vendor's
+  `kv_cache_t = gl<bf16, -1, -1, num_kv_heads, head_dim>` which
+  strides across the layer dim. Two new accessors
+  `k_cache_base_ptr()` / `v_cache_base_ptr()`.
+- **`395d869a5`** — 6c-iii-b: layered loaders
+  (`load_layered_rms_norm`, `load_layered_linear_dense`,
+  `load_layered_linear_dense_concat`) now allocate ONE
+  `[L, R, H]` block per accessor and `take_into` each layer.
+  Falls back to per-layer load on packed-source synthesis
+  (Phi-3), bias presence, or non-uniform shape — none of which
+  are kvm-eligible anyway. Same Vec<…> API to callers.
+  `ferrite-model-llama` (fast path) and `ferrite-model-phi3`
+  (fallback path) both build clean.
+- **`cde7fe8c7`** — 6c-iii-c: cuda-gated
+  `paged_kv::device::build_paged_kv_metadata_on_device` —
+  D2H/H2D wrapper around the 6c-ii host helper. Returns
+  `DevicePagedKv` with nine owned int32 tensors + six scalar
+  C-arg ints. ~10 KB of round-trip traffic per forward call.
+- **`0aa7c4fd8`** — 6c-iii-d-1: `kvm_mega::launch_kvm_mega`
+  runtime helper in `ferrite-forward`. Takes the per-canonical
+  extern launcher fn pointer, the bucket's `KVM_FULL_M_<wp>`
+  tape, three arg structs (`KvmWeightPtrs`, `KvmRopePtrs`,
+  `KvmShapeConfig`); allocates Bar / timings / scratch via
+  caching allocator, H2Ds the tape, calls
+  `build_paged_kv_metadata_on_device`, fires the extern
+  launcher with the full ~50-arg list. `stream_synchronize`s at
+  the end so OwnedTensor scratch lifetimes outlive the kernel
+  (caching allocator is not stream-aware). No callers yet.
 
-250/254 tests pass on `cargo test -p ferrite-forward-macro
+  Working-tree dirty (uncommitted): `launch_kvm_mega` signature
+  changed to return `(OwnedTensor, OwnedTensor)` for
+  (hidden_states, logits) so the codegen wrapper from 6c-iii-d-2
+  can place them into the dispatcher's `tiles` slots. Will land
+  bundled with the wrapper commit.
+
+251/255 tests pass on `cargo test -p ferrite-forward-macro
 --release`; the 4 failures are pre-existing on HEAD
 (`dc_zoo_equals_host_zoo`, `dc_cutlass_*_name_covers_full_zoo`,
 `swiglu_mlp_claimed_as_fused_subgraph_per_layer`) and unrelated
 to mega.
 
-### Step 6c — per-canonical marshaling wrapper (next)
+### Step 6c-iii-d-2 — per-canonical wrapper codegen + LAUNCHER_TABLE flip (next)
+
+Add `kvm_mega::emit_kvm_mega_launcher` to
+`crates/ferrite-forward-macro/src/interpreters/kvm_mega.rs`.
+For each (canonical, bucket) of every kvm-eligible canonical,
+emit a `kvm_mega_<canonical>_m_<wp>` Rust wrapper fn that:
+
+1. Extracts layered-weight base pointers from `Weights<W>`
+   accessors (`(Weights::self_attn_qkv_proj)(wm, 0).dense_weight()`,
+   etc.) — relies on the layer-0-base-equals-block-base
+   invariant established by 6c-iii-b.
+2. Pulls the kvm-compat full-width RoPE pointers from the
+   canonical's Weights (see vendor-fork roadmap below for why
+   these exist as separate fields and the path to deleting them).
+3. Builds `KvmWeightPtrs` / `KvmRopePtrs` / `KvmShapeConfig`
+   structs, with shape constants baked from `kvm_kernel_dims_from_bounds`
+   and `batch_size` / `vocab_size` derived at runtime
+   (`batch_size = ctx.cu_seqlens_q.numel() - 1`, NOT
+   `wp.num_tokens` — the bucket worst-case is fine for
+   eligibility but the actual call's batch is the seq count).
+4. Calls `launch_kvm_mega(..)`.
+5. Places returned `(hidden, logits)` `OwnedTensor`s into
+   `tiles[backbone_slot]` / `tiles[terminal_slot]` as
+   `TileEntry::Owned`.
+
+The wrapper is per-bucket because the tape static
+`KVM_FULL_M_<wp>` is per-bucket, but the C extern fn is per-
+canonical. ~108 canonicals × ~5 buckets ≈ ~540 wrappers; emit
+each as ~30 lines of Rust delegating to `launch_kvm_mega` —
+~16k LoC total, comfortable below the codegen-size cliff.
+
+Then in codegen.rs's `LAUNCHER_TABLE` build loop, replace the
+kvm-slot `None` with `Some(kvm_mega_<canonical>_m_<wp>)` for
+every bucket of an eligible canonical.
+
+Codegen emission also needs to: at model-load time, for kvm-
+eligible canonicals, allocate the two full-width RoPE tables
+(`kvm_rope_cos_full` / `kvm_rope_sin_full`, `[max_pos, head_dim]`)
+and D2D-mirror the half-width values into both halves of each
+row. See vendor-fork roadmap below for the deletion plan.
+
+After this lands → step 6c-iii-e: H100 smoke test
+(`FERRITE_FORCE_KVM_MEGA=1 vllm chat -m
+meta-llama/Llama-3.2-1B-Instruct`).
+
+### Step 6c — per-canonical marshaling wrapper (REFERENCE — most done; see 6c-iii-d-2 in STATE for current entry point)
 
 **Goal.** Emit `kvm_mega_<canonical>` as a `KvmMegaLauncher<Weights>`
 fn that fills the ~50 C args with values from `Weights<W>` /
@@ -48,6 +122,11 @@ the `LAUNCHER_TABLE` kvm slot from `None` to `Some(kvm_mega_<canonical>)`
 for every bucket of an eligible canonical. After this lands,
 `FERRITE_FORCE_KVM_MEGA=1 vllm chat …` exercises the kvm path
 end-to-end.
+
+**Status.** Decomposition below is complete through 6c-iii-d-1.
+The remaining piece (codegen wrapper + LAUNCHER_TABLE flip) is
+6c-iii-d-2 in STATE; the argument categories below remain useful
+reference for what each emitted wrapper marshals.
 
 **Why it's bigger than 6a/6b-i.** Previous handoff text claimed
 `tk_paged_kv` and `tk_instructions` modules existed in
@@ -310,6 +389,61 @@ barrier opcodes) follow.
   a bucket. Today every bucket reads `→Host` even though the .cu
   is built. This blocks `pick_interpreter`-driven dispatch (but
   not `FERRITE_FORCE_KVM_MEGA`-driven dispatch).
+
+### Vendor-fork roadmap (we are already maintaining a fork)
+
+Vendor's `~/Megakernels/demos/cross-gpu-llama` is in-tree and
+patchable. We've already landed one patch (`a53da44ef`,
+`globals_t::num_devices` 8 → `LLAMA_NUM_DEVICES`); more are
+inevitable. Tracked here so the "MVP shim vs vendor-correct"
+choice for each isn't relitigated every session.
+
+- **RoPE table layout — MVP shim, vendor patch later.** Vendor's
+  `rope_table_t = gl<float, 1, 1, max_pos, head_dim>` is full-
+  width per row; vendor's `apply_rope_inplace` does
+  `warp::mul(input, input, rope_cos)` over the whole `head_dim`.
+  Ferrite's `RotaryCache::cos_cache` is `[max_pos, head_dim/2]`,
+  which is what the math actually wants — RoPE rotates pairs
+  `(x_i, x_{i+head_dim/2})` using one (cos, sin) per pair, so
+  there are only `head_dim/2` distinct angles per position.
+  Vendor's full-width is just the half-width values mirrored,
+  i.e. wasted bandwidth even for vendor.
+
+  **MVP path (step 6c-iii-d-2)**: per-canonical Weights for
+  kvm-eligible canonicals load TWO extra GpuTensors
+  (`kvm_rope_cos_full` / `kvm_rope_sin_full`, both `[max_pos,
+  head_dim]` f32) at model load time, populated by D2D-mirroring
+  the half-width cache. ~32 MB per arch one-time. The kvm
+  marshaling wrapper hands the pointers to vendor with no
+  per-call cost. Clearly labeled `// vendor-compat, delete when
+  vendor patched`.
+
+  **For-real path (later)**: patch
+  `Megakernels/demos/cross-gpu-llama/qkv_rope_append.cu` so the
+  rope kernel reads `[max_pos, head_dim/2]` and broadcasts each
+  cos/sin across the rotation pair. Then: delete the per-arch
+  `kvm_rope_*_full` fields, the load-time mirroring code, and
+  the wrapper's pointer extraction shim. Net effect after the
+  vendor patch: zero ferrite-side concession to vendor's layout.
+
+- **`globals_t::num_devices` hardcoding (already patched).**
+  See `~/Megakernels/...` patch `a53da44ef` — this is already
+  load-bearing for any model with `num_kv_heads < 8`. Keep
+  patched as long as our fork lives.
+
+- **Bar buffer dim-3 conventions.** Vendor's
+  `barriers[layer, opcode-1, batch_block, out_block]` indexing
+  encodes vendor's specific opcode set. Ferrite sizes Bar
+  conservatively in `kvm_mega::bar_dims` (16 opcode slots, etc).
+  When vendor adds opcodes or changes the indexing convention,
+  bar_dims needs to track. Not a blocker today.
+
+- **Eight-way TP hardcoding (other fields).** Per
+  `~/Megakernels/CLAUDE.md` and the existing patch in
+  `a53da44ef`, several `_per_dev` reductions are still
+  derivation-from-`num_devices` rather than parameterized. Will
+  bite at TP > 1 — same fork, same deletion path, future
+  session's problem.
 
 ---
 

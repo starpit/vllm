@@ -81,13 +81,33 @@ Single-shape benchmark at M=128, N=K=4096: 219.1 µs → **68.3 µs** (3.21×, b
 
 `gemm_sweep.rs` now emits cublas + cutlass-tile rows at `(M, 2*intermediate_size, hidden_size)` for every gemma2/gemma3 fleet variant (13824–73728 packed N). The predictor's linreg fits these directly, eliminating the roofline fall-back at gemma MLP shapes. If you add a new packed-cuBLAS path for any other arch family, mirror this pattern (add `(packed_n, hidden)` rows for that arch's MLP).
 
-## Known regression to investigate
+## Audit gotcha: bucket-row counts vs logical-pick counts
 
-Standalone `Cublas` picks went **up** 2696 → 3574 (+878) and `FusedQkvRopePrefill` went up 454 → 699 (+245) between the pre-`72304b029` audit (`/tmp/dump_after.txt`) and the post-`72304b029` audit (`/tmp/dump_solver_fix.txt`). Two suspect causes:
-- **Predictor-refit artifact**: the new packed-N CSV rows changed the linreg fit globally; some standalone-GEMM buckets now extrapolate cublas as cheaper than they previously did (acceptable if real, but worth confirming).
-- **Re-routing from the GELU fix**: the freed gate-up GELU tiles may be claimed by other cuBLAS-using fusions before reaching CUTLASS-peer alternatives.
+`grep -c Cublas dump.txt` counts **per-(arch, layer, M-bucket) rows**, not distinct logical picks. When the CSV gains calibration density — adding new shape rows, or sweeping more M values — the predictor's cost gradient sharpens along the M axis and the solver responds by subdividing M-buckets. A single `(M=64..∞)` bucket becomes `(M=64..512)`/`(M=512..4096)`/`(M=4096..∞)` etc. Same workload, more rows in the dump. **The raw `grep -c` count goes up even though no logical pick changed.**
 
-**Not yet investigated.** The 752 pick GELU win is unambiguous; the +878 standalone-Cublas number is concerning enough to verify before adding more leverage on top. Diagnostic recipe in **Audit recipe** below.
+This caught the post-`72304b029` audit:
+
+| Metric | Pre-72304b029 | Post-72304b029 | Δ |
+|---|---|---|---|
+| `grep -c Cublas` (raw rows) | 2696 | 3574 | **+878** ← misleading |
+| Distinct `(arch, layer, N, K)` | 1231 | 1224 | −7 ← actual |
+| Bucket headers total | 1023 | 889 | −134 |
+
+The +878 raw-row delta read as a regression but is entirely bucket multiplication from the new gemma packed-N rows. Logical Cublas picks are flat-to-marginally-down.
+
+**For fair before/after comparison after a CSV change**, use the dedup recipe:
+
+```bash
+awk '/^═/{arch=$0; next} /\<Cublas\>/{
+  if(match($0, /N=[0-9]+,K=[0-9]+/)) nk=substr($0, RSTART, RLENGTH)
+  if(match($0, /L=[0-9]+/)) layer=substr($0, RSTART, RLENGTH); else layer="L=?"
+  key=arch"|"layer"|"nk; if(!seen[key]++) c++
+} END{print c}' /tmp/dump.txt
+```
+
+Note `\<Cublas\>` not `\bCublas\b` — gawk's word-boundary on this system rejects `\b` but accepts the `\<…\>` form.
+
+For the GELU result, the equivalent dedup gives **268 distinct `(arch, layer)` pairs** migrated cuBLAS → CUTLASS (across the 752 bucket-rows reported by raw grep). Both numbers are real measures, but they answer different questions: 752 = how many M-bucket workloads pick CUTLASS, 268 = how many layer instances have CUTLASS active in at least one bucket.
 
 ## Levers ranked by current leverage
 

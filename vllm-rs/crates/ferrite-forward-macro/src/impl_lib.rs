@@ -5010,26 +5010,44 @@ impl Implementation for FusedQkvRopeCacheImpl {
     }
 
     fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        let m = ctx.num_tokens() as f64;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
-        let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as f64;
-        let num_kv_heads = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as f64;
-        let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as f64;
-        // q_size = num_q_heads * head_dim; kv_size = num_kv_heads * head_dim.
-        let n = (num_q_heads + 2.0 * num_kv_heads) * head_dim;
+        // Cost = one cuBLAS GEMM at packed (M, q_size+2*kv_size, hidden)
+        // + one bandwidth-bound rope+cache pass.
+        //
+        // Read measured cublas cost from the calibration CSV (the
+        // predictor linreg-extrapolates when the exact (M, packed_n, K)
+        // row isn't sampled). Fall back to peak-FLOPS roofline only
+        // when the predictor has no signal — same shape as the
+        // GateUp{Silu,Gelu}Mul peers. The roofline is ~8× optimistic
+        // vs measured cuBLAS, so without this parity any future
+        // `CutlassFusedQkvRope*` peer (whose GEMM cost reads measured
+        // CUTLASS rows) would lose every DP race despite being faster.
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
+        let num_kv_heads = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
+        let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        // packed_n = (q_size + 2*kv_size) = (num_q + 2*num_kv) * head_dim.
+        let packed_n = num_q_heads
+            .saturating_add(2u32.saturating_mul(num_kv_heads))
+            .saturating_mul(head_dim);
 
-        let flops = 2.0 * m * n * hidden;
-        let peak = ctx.profile.peak_tflops_fp16 * 1e12;
-        let gemm_us = if peak > 0.0 && flops > 0.0 {
-            (flops / peak) * 1e6
-        } else {
-            0.0
-        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for("cublas", num_tokens, packed_n, hidden)
+            .unwrap_or_else(|| {
+                let flops = 2.0 * (num_tokens as f64) * (packed_n as f64) * (hidden as f64);
+                let peak = ctx.profile.peak_tflops_fp16 * 1e12;
+                if peak > 0.0 && flops > 0.0 {
+                    (flops / peak) * 1e6
+                } else {
+                    0.0
+                }
+            });
 
         // Rope + cache write: bandwidth-bound, read packed QKV +
         // write rotated Q + K/V to cache.
         let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = 3.0 * m * n * BYTES_PER_ELEM;
+        let bytes = 3.0 * (num_tokens as f64) * (packed_n as f64) * BYTES_PER_ELEM;
         let rope_cache_us = if bw_gb > 0.0 {
             (bytes / (bw_gb * 1e9)) * 1e6
         } else {

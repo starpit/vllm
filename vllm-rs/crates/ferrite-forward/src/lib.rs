@@ -17,6 +17,8 @@ pub mod instr;
 #[cfg(feature = "cuda")]
 pub mod loaders;
 #[cfg(feature = "cuda")]
+pub mod interpreter;
+#[cfg(feature = "cuda")]
 pub mod tile_table;
 
 #[cfg(feature = "cuda")]

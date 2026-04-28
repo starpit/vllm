@@ -35,6 +35,7 @@ mod cost;
 mod emit;
 mod fuf;
 mod impl_lib;
+mod interpreter;
 mod interpreter_codegen;
 mod parse;
 mod quantization;

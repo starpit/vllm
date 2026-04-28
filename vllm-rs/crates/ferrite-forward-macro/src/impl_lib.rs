@@ -2024,27 +2024,28 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(MlaAttentionImpl));
     lib.push(Box::new(DeepSeekMoeRefImpl));
 
-    // FlashInfer paged attention — one Decode + one Prefill Impl per
-    // tuple in FLASHINFER_CONFIG_SET (see `ferrite-cuda-builder`). Each
-    // variant's `target_compatible` gates on whether the calibrated CSV
-    // has a row for its (head_dim, softcap) family, so targets without
-    // the FlashInfer tuple (either uncompiled or uncalibrated) silently
-    // fall back to the FA2 attention Impls above. Keep in sync with
-    // `FLASHINFER_CONFIG_SET` — adding a tuple there without mirroring
-    // it here leaves the Impl unreachable; removing a tuple without
-    // mirroring leaves the Impl with no matching extern symbols.
-    for &head_dim in &[64u32, 128, 256] {
-        for &use_softcap in &[false, true] {
-            lib.push(Box::new(FlashInferAttentionDecodeImpl {
-                head_dim,
-                use_logits_soft_cap: use_softcap,
-            }));
-            lib.push(Box::new(FlashInferAttentionPrefillImpl {
-                head_dim,
-                use_logits_soft_cap: use_softcap,
-            }));
-        }
-    }
+    // FlashInfer paged attention is disabled fleet-wide pending a fix
+    // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
+    // (`flashinfer/attention/persistent.cuh:641`) hit at tp>1 with
+    // `num_kv_heads = 1` (Qwen2.5-3B sharded). The DP solver falls
+    // back to the FA2 / gather-into-contiguous attention path. Re-enable
+    // by restoring the push loop below once the FlashInfer-side fix
+    // lands; `FLASHINFER_CONFIG_SET` in `ferrite-cuda-builder` and the
+    // extern-symbol bindings in `ferrite-kernels::flashinfer` still
+    // exist, so flipping this back on is a single block-uncomment.
+    //
+    // for &head_dim in &[64u32, 128, 256] {
+    //     for &use_softcap in &[false, true] {
+    //         lib.push(Box::new(FlashInferAttentionDecodeImpl {
+    //             head_dim,
+    //             use_logits_soft_cap: use_softcap,
+    //         }));
+    //         lib.push(Box::new(FlashInferAttentionPrefillImpl {
+    //             head_dim,
+    //             use_logits_soft_cap: use_softcap,
+    //         }));
+    //     }
+    // }
     lib
 }
 

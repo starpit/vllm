@@ -7715,6 +7715,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "crossterm",
  "dotenvy",
+ "ferrite-cuda-targets",
  "ferrite-forward",
  "futures-util",
  "hf-hub",

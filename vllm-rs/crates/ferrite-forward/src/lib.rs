@@ -7,6 +7,8 @@
 
 pub use ferrite_forward_macro::forward;
 
+#[cfg(feature = "cuda")]
+pub mod attack_surface;
 pub mod cpu_golden;
 #[cfg(feature = "cuda")]
 pub mod info;

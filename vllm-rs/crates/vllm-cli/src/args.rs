@@ -87,6 +87,16 @@ pub struct FerriteInfoArgs {
     /// piping into `less -R`); `never` disables.
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     pub color: ColorWhen,
+    /// Run cuBLAS-pick analysis instead of the per-bucket backbone
+    /// dump: for every `Cublas` Gemm pick, classify by margin vs.
+    /// the best non-cuBLAS standalone-GEMM kernel and identify
+    /// fusion-gap reasons (Gemm→Add / Norm→Gemm / Gemm→ScalarMul /
+    /// lm_head). Uses the bundled cost CSV for exact-row lookups.
+    #[arg(short = 'c', long = "cublas-analysis")]
+    pub cublas_analysis: bool,
+    /// With `-c/--cublas-analysis`, also print a per-arch breakdown.
+    #[arg(long, requires = "cublas_analysis")]
+    pub per_arch: bool,
     /// Substring filters. A variant is shown when its
     /// `<arch>/<variant_stem>` contains every filter (case-
     /// insensitive). Empty = show every compiled variant.

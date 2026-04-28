@@ -22,6 +22,7 @@
 
 use std::io::{self, BufWriter, IsTerminal, Write};
 
+use ferrite_forward::attack_surface::{AttackSurfaceReport, CostTable};
 use ferrite_forward::{BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep};
 
 use crate::args::{ColorWhen, FerriteInfoArgs};
@@ -48,6 +49,22 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
     let needles: Vec<String> = args.filters.iter().map(|s| s.to_lowercase()).collect();
     let style = Style::resolve(args.color);
 
+    // Resolve the active GPU profile + parse its cost CSV ONCE before
+    // the per-arch walk. The `attack_surface` aggregator threads it
+    // through every bucket; the normal info dump ignores it.
+    let cost_table = if args.cublas_analysis {
+        let profile = ferrite_cuda_targets::detect()
+            .map(|p| (p.name, p.cost_csv))
+            .unwrap_or((
+                ferrite_cuda_targets::L4_SM89.name,
+                ferrite_cuda_targets::L4_SM89.cost_csv,
+            ));
+        Some((profile.0, CostTable::parse(profile.1)))
+    } else {
+        None
+    };
+    let mut surface = AttackSurfaceReport::new(3);
+
     let mut shown = 0usize;
     for reg in ferrite_forward::inventory::iter::<BackboneDumpRegistration> {
         let arch = reg.arch_name;
@@ -65,14 +82,28 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
             if !needles.iter().all(|n| key.contains(n)) {
                 continue;
             }
-            print_variant(
-                out,
-                arch,
-                variant.variant_stem,
-                variant.tp_world_size,
-                &variant.buckets,
-                &style,
-            )?;
+            // Backbone print is suppressed in --attack-surface mode so
+            // the analysis report isn't buried under tens of thousands
+            // of step lines.
+            if !args.cublas_analysis {
+                print_variant(
+                    out,
+                    arch,
+                    variant.variant_stem,
+                    variant.tp_world_size,
+                    &variant.buckets,
+                    &style,
+                )?;
+            }
+            if let Some((_, cost_table)) = &cost_table {
+                let arch_label = format!(
+                    "{arch} / {} · tp={}",
+                    variant.variant_stem, variant.tp_world_size
+                );
+                for bucket in &variant.buckets {
+                    surface.analyze_bucket(&arch_label, bucket, cost_table);
+                }
+            }
             shown += 1;
         }
     }
@@ -87,6 +118,14 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
                 args.filters
             )?;
         }
+    }
+    if let Some((profile_name, _)) = &cost_table {
+        writeln!(
+            out,
+            "\n(attack surface against profile `{profile_name}` — \
+             override with FERRITE_GPU=l4|l40s|h100)"
+        )?;
+        surface.print(out, args.per_arch)?;
     }
     out.flush()
 }

@@ -106,7 +106,29 @@ encodable (as OP_LM_HEAD). Until a TK decode-matmul_add
 exists OR encode_op gains a body-CutlassGemv arm, m=1 falls
 through to the host interpreter.
 
-### Next concrete step (2d)
+### Next concrete step (2d-pre)
+
+ferrite-cuda-builder/build.rs has explicit static kernel
+lists (`vllm_sources`, `marlin_sources`, …) — verified by
+`grep -n "specialized\|read_dir\|cudaforge/megakernels"
+build.rs`. It does not scan `~/.cache/cudaforge/megakernels/`.
+So the per-canonical .cu files the macro writes go nowhere.
+
+The fix is one of:
+
+(a) Add a `read_dir` pass in build.rs that picks up every
+    `.cu` in `~/.cache/cudaforge/megakernels/` and feeds the
+    list into a new cudaforge `.kernels()` group with the
+    vendor include paths configured.
+(b) Have the macro write into one of the existing scanned
+    dirs (e.g. emit into `csrc/megakernels/` and add that
+    dir to vllm_sources). Less hermetic — checks the
+    generated output into csrc/, which feels off — but
+    avoids extending build.rs.
+
+(a) is the right answer; (b) is the shortcut.
+
+### Then (2d)
 
 Run the smoke test:
 
@@ -116,16 +138,12 @@ FERRITE_KVM=1 FERRITE_GPU=h100 FERRITE_MODELS=llama-3.2-3b \
   cargo build -p vllm-cli --features cuda --release -j 2
 ```
 
-Expected outcomes (in order of likely failure):
+Expected next failure modes (after 2d-pre is fixed):
 
-1. **NVCC link-step failure** — `tk_megakernel_<...>_launch`
-   undefined. Means ferrite-cuda-builder/build.rs isn't
-   scanning ~/.cache/cudaforge/megakernels/. Fix: add the
-   dir to its scan list.
-2. **NVCC compile failure** on the .cu — vendor static_assert
+1. **NVCC compile failure** on the .cu — vendor static_assert
    trip. Inspect; either fix dims_from_bounds or relax the
    assert.
-3. **Build succeeds, runtime panic in launch()** —
+2. **Build succeeds, runtime panic in launch()** —
    KvCachePool layout doesn't match. For a 1-layer dummy,
    pass; for real llama, need the parallel kvm-only KV pool.
 
@@ -156,6 +174,12 @@ KV pool is the next blocker after 2c.
 * `369a6b618` — step 1: Tk-tier solver Impls.
 * `a94d1cb17` — step 2 (scaffold): kvm interpreter modules.
 * `b9ae21c04` — step 2: emit_model hookup behind FERRITE_KVM=1.
+* `b334d1749` — handoff doc (initial, pre-launch-overhead).
+* `36b3c7d55` — step 2c: launch-overhead term + tk_ kernel-class.
+* `fb8dae8bf` — step 2c: relax kvm-eligibility to any_kvm.
+* `b361bc9fe` — step 2c: shape-aware field extraction +
+  FusedAddRmsNorm encoding + diag.
+* `298837b12` — handoff refresh (m=8 .cu file written).
 
 ## Hard rules (LOAD-BEARING)
 

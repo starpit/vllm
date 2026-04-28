@@ -15032,10 +15032,10 @@ mod tests {
             .count();
         // 7 singletons (Embed, RmsNorm, FusedQkvRopeCache,
         // FusedQkvRopePrefill, FusedGateUpSiluMul, AttentionViaCache,
-        // AttentionPrefillContiguous) + 16 CutlassGemm tiles + 16
-        // CutlassGemmAdd tiles + 6 FlashInfer decode + 6 FlashInfer
-        // prefill = 51.
-        assert_eq!(kvm_count, 7 + 16 + 16 + 6 + 6, "Kvm Impl count drift");
+        // AttentionPrefillContiguous) + 2 × CUTLASS_TILE_ZOO (Gemm
+        // and GemmAdd) + 6 FlashInfer decode + 6 FlashInfer prefill.
+        let expected = 7 + 2 * CUTLASS_TILE_ZOO.len() + 6 + 6;
+        assert_eq!(kvm_count, expected, "Kvm Impl count drift");
     }
 
     /// Kvm Impls gate on `profile.kvm_compatible()` (sm_90+). On H100

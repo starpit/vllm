@@ -1015,8 +1015,39 @@ pub fn emit_kvm_cu_source(canonical_name: &str, dims: &KvmKernelDims) -> String 
     // block above is what validates vendor's framework accepts our
     // per-arch dims.
 
-    // P2-4b step 3 will add the `extern \"C\"` launcher body.
-    out.push_str("// extern \"C\" int tk_megakernel_..._launch(...) lands in P2-4b step 3.\n");
+    // extern "C" launcher stub. First-pass: just validates the
+    // template instantiation chain by taking the symbol's address
+    // (forces NVCC to emit the kernel into the .a) and returning 0.
+    // The real body — construct globals_t<> from raw pointers and
+    // launch `mk<...><<<grid, block, smem>>>(g)` — lands in P2-4b
+    // step 5 once the per-field plumbing is wired.
+    out.push_str(&format!(
+        "extern \"C\" int tk_megakernel_{}_launch() {{\n\
+         \x20   // Force-instantiate `mk<llama_config, llama_70b_globals, ops...>`\n\
+         \x20   // by taking its address. Without this, NVCC dead-code-strips\n\
+         \x20   // the template and libmegakernels.a has no symbol for the\n\
+         \x20   // launcher to call.\n\
+         \x20   auto kernel_addr = &mk<\n\
+         \x20       llama_config, llama_70b_globals,\n\
+         \x20       ops::attn_norm_op,\n\
+         \x20       ops::qkv_rope_append_op,\n\
+         \x20       ops::attention_decode_op,\n\
+         \x20       ops::attention_prefill_op,\n\
+         \x20       ops::o_proj_op,\n\
+         \x20       ops::mlp_norm_op,\n\
+         \x20       ops::gate_silu_op,\n\
+         \x20       ops::up_matmul_op,\n\
+         \x20       ops::downproj_op,\n\
+         \x20       ops::lm_head_norm_op,\n\
+         \x20       ops::lm_head_op,\n\
+         \x20       ops::barrier_inc_op,\n\
+         \x20       ops::all_device_barrier_op>;\n\
+         \x20   (void)kernel_addr;\n\
+         \x20   // P2-4b step 5: build globals_t<> + launch.\n\
+         \x20   return 0;\n\
+         }}\n",
+        canonical_name,
+    ));
 
     out
 }
@@ -1767,6 +1798,8 @@ mod tests {
         assert!(src.contains("attention_decode_op"));
         assert!(src.contains("attention_prefill_op"));
         assert!(src.contains("all_device_barrier_op"));
+        // extern "C" launcher entry exists.
+        assert!(src.contains("extern \"C\" int tk_megakernel_llama_3p2_1b_launch()"));
         // Canonical name is in the header comment for traceability.
         assert!(src.contains("`llama_3p2_1b`"));
     }

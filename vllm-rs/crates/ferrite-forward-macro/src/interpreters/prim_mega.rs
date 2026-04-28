@@ -1024,10 +1024,15 @@ pub fn emit_prim_mega_launcher(
                 let layer_lit = proc_macro2::Literal::u32_unsuffixed(*weight_layer);
                 let m_lit = proc_macro2::Literal::usize_unsuffixed(*m as usize);
                 let split_k_lit = proc_macro2::Literal::usize_unsuffixed(*split_k as usize);
+                // SplitK workspace is only used for GEMM via LinearLayer
+                // accessors; `.dense_weight()` returns GpuTensor with the
+                // [out_features, in_features] shape. (`.weight` is on
+                // `Embedding` / `RmsNorm`; LinearLayer is an enum without
+                // a direct field.)
                 Some(quote! {
                     let #ws_ident = {
                         let n = (Weights::#weight_path)(wm, #layer_lit)
-                            .weight.shape()[0] as usize;
+                            .dense_weight().shape()[0] as usize;
                         device.caching.alloc_tensor(
                             &[#split_k_lit * #m_lit * n],
                             ::ferrite_cuda_core::DType::F32,
@@ -1075,9 +1080,19 @@ pub fn emit_prim_mega_launcher(
                 } else {
                     let weight_path = syn::Ident::new(fn_ident, Span::call_site());
                     let layer_lit = proc_macro2::Literal::u32_unsuffixed(*layer);
+                    // `.weight.as_gpu_tensor()`: accessor returns
+                    // `&Embedding` / `&RmsNorm`, both have `.weight:
+                    // OwnedTensor` and OwnedTensor::as_gpu_tensor()
+                    // produces a GpuTensor.
+                    // `.dense_weight()`: accessor returns
+                    // `&LinearLayer` (an enum); `.dense_weight()`
+                    // returns GpuTensor directly — no further
+                    // conversion needed.
+                    // `AsGpuTensor`: accessor already returns
+                    // GpuTensor by value.
                     let access = match field {
                         WeightField::Weight => quote! { .weight.as_gpu_tensor() },
-                        WeightField::DenseWeight => quote! { .dense_weight().as_gpu_tensor() },
+                        WeightField::DenseWeight => quote! { .dense_weight() },
                         WeightField::AsGpuTensor => quote! {},
                     };
                     quote! {
@@ -1131,9 +1146,12 @@ pub fn emit_prim_mega_launcher(
                     let path = syn::Ident::new(fn_ident, Span::call_site());
                     let layer_lit = proc_macro2::Literal::u32_unsuffixed(*layer);
                     let dim_lit = proc_macro2::Literal::usize_unsuffixed(*dim_idx as usize);
+                    // WeightShapeDim is only emitted for CUTLASS GEMM
+                    // family — always a LinearLayer accessor. Use
+                    // `.dense_weight()` not `.weight`.
                     quote! {
                         (Weights::#path)(wm, #layer_lit)
-                            .weight.shape()[#dim_lit] as i32
+                            .dense_weight().shape()[#dim_lit] as i32
                     }
                 }
             };

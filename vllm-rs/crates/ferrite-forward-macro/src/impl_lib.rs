@@ -162,6 +162,27 @@ pub enum LaunchKind {
     DeviceCallable,
 }
 
+/// Whether an implementation is structurally compatible with the
+/// vendored ThunderKittens megakernel (`cross-gpu-llama`). The
+/// solver uses this in conjunction with [`LaunchKind`] to decide
+/// which interpreter path runs a forward call. An impl tagged
+/// [`MegakernelFit::Kvm`] declares "I am a TK opcode the
+/// megakernel will execute"; the encoder maps its `OpInstance`
+/// into a tape row, the dispatcher routes through the megakernel
+/// launcher.
+///
+/// Impls without a TK-side counterpart return [`MegakernelFit::None`]
+/// (the default) — they only run on the host interpreter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MegakernelFit {
+    /// Cannot run inside the megakernel. Default for every impl
+    /// not explicitly tagged.
+    None,
+    /// Runs as a TK opcode inside the vendored
+    /// `tk_megakernel_<canonical>_launch` persistent kernel.
+    Kvm,
+}
+
 /// Synchronization mechanism that conveys data between two
 /// implementations on a producer→consumer dependency edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -468,6 +489,15 @@ pub trait Implementation: fmt::Debug + Send + Sync {
 
     /// How this implementation is launched / scheduled.
     fn launch_kind(&self) -> LaunchKind;
+
+    /// Whether this impl is a TK opcode runnable inside the
+    /// vendored ThunderKittens megakernel. Default: `None`
+    /// (host-only). Tk-tier impls override to
+    /// [`MegakernelFit::Kvm`] so the encoder + dispatcher can
+    /// route through the megakernel.
+    fn megakernel_fit(&self) -> MegakernelFit {
+        MegakernelFit::None
+    }
 
     /// The handoff mechanisms this impl can use to **receive** its
     /// boundary inputs from upstream.
@@ -2128,7 +2158,374 @@ pub fn starter_library() -> ImplementationLibrary {
     //         }));
     //     }
     // }
+
+    // ── Tk-tier Impls ───────────────────────────────────────────────
+    //
+    // One Impl per ThunderKittens opcode in vendor's
+    // `cross-gpu-llama/llama.cu` `OPS_LIST`. Each delegates its
+    // matching / cost / fan_out to the existing host counterpart
+    // (same subgraph shape, same emitted `OpInstance` name, same
+    // weight accessors), but overrides four trait surfaces to
+    // mark itself as TK-megakernel-fit:
+    //
+    //   * `target_compatible`: `profile.kvm_compatible()` — sm_90+.
+    //   * `launch_kind`: `DeviceCallable` — runs inside a persistent
+    //     megakernel, no per-pick host launch boundary (saves ~5us
+    //     vs the host counterpart's `HostCallback`/`RegularLaunch`
+    //     in the per-pick `launch_overhead_us` term).
+    //   * `megakernel_fit`: `Kvm` — the encoder + dispatcher use
+    //     this to route a forward through the megakernel launcher.
+    //   * `supported_*_handoffs`: in-kernel handoffs (`Mbarrier`,
+    //     `SyncThreads`) — boundaries between TK opcodes are intra-
+    //     kernel, not stream-level.
+    //
+    // The cost on a tied (M, N, K) triple between a Tk-tier impl
+    // and its host peer is identical at the `cost_us` layer; the
+    // ~5us launch-overhead delta in `solver::solve_one`'s phase 1
+    // is what flips the DP toward Tk on Hopper. Where a host
+    // alternative has a meaningfully lower compute cost (e.g.
+    // CutlassGemmSplitK at large M), the host path may still win
+    // — the solver is doing its job.
+    lib.push(Box::new(TkRmsNormImpl));
+    lib.push(Box::new(TkAttentionViaCacheImpl));
+    lib.push(Box::new(TkAttentionPrefillContiguousImpl));
+    lib.push(Box::new(TkFusedQkvRopeCacheImpl));
+    lib.push(Box::new(TkFusedQkvRopePrefillImpl));
+    lib.push(Box::new(TkFusedGateUpSiluMulImpl));
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(TkCutlassGemmAddImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(TkCutlassGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     lib
+}
+
+// ── Tk-tier Impl definitions ────────────────────────────────────
+//
+// Each `Tk<Name>Impl` is a thin wrapper around its host
+// counterpart. The trait body delegates everything except the
+// four override points documented in the registration block
+// above (target_compatible / launch_kind / megakernel_fit /
+// supported_*_handoffs).
+
+const TK_HANDOFFS: &[Handoff] = &[Handoff::Mbarrier, Handoff::SyncThreads];
+
+#[derive(Debug, Default)]
+pub struct TkRmsNormImpl;
+
+impl Implementation for TkRmsNormImpl {
+    fn name(&self) -> &'static str { "tk_rmsnorm" }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && RmsNormRefImpl.target_compatible(profile)
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        RmsNormRefImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        RmsNormRefImpl.cost_us(m, ctx)
+    }
+    fn resources(&self, m: &MatchInfo) -> Resources {
+        RmsNormRefImpl.resources(m)
+    }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        RmsNormRefImpl.input_layouts(m)
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        RmsNormRefImpl.output_layouts(m)
+    }
+    fn opcode_shape(&self) -> OpcodeShape { RmsNormRefImpl.opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        RmsNormRefImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        RmsNormRefImpl.required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TkAttentionViaCacheImpl;
+
+impl Implementation for TkAttentionViaCacheImpl {
+    fn name(&self) -> &'static str { "tk_attention_via_cache" }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && AttentionViaCacheImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { AttentionViaCacheImpl.workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        AttentionViaCacheImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { AttentionViaCacheImpl.cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { AttentionViaCacheImpl.resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { AttentionViaCacheImpl.input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { AttentionViaCacheImpl.output_layouts(m) }
+    fn opcode_shape(&self) -> OpcodeShape { AttentionViaCacheImpl.opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        AttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        AttentionViaCacheImpl.required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TkAttentionPrefillContiguousImpl;
+
+impl Implementation for TkAttentionPrefillContiguousImpl {
+    fn name(&self) -> &'static str { "tk_attention_prefill_contiguous" }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && AttentionPrefillContiguousImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { AttentionPrefillContiguousImpl.workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        AttentionPrefillContiguousImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { AttentionPrefillContiguousImpl.cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { AttentionPrefillContiguousImpl.resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { AttentionPrefillContiguousImpl.input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { AttentionPrefillContiguousImpl.output_layouts(m) }
+    fn opcode_shape(&self) -> OpcodeShape { AttentionPrefillContiguousImpl.opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        AttentionPrefillContiguousImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        AttentionPrefillContiguousImpl.required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TkFusedQkvRopeCacheImpl;
+
+impl Implementation for TkFusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str { "tk_fused_qkv_rope_cache" }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && FusedQkvRopeCacheImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { FusedQkvRopeCacheImpl.workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        FusedQkvRopeCacheImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { FusedQkvRopeCacheImpl.cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { FusedQkvRopeCacheImpl.resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { FusedQkvRopeCacheImpl.input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { FusedQkvRopeCacheImpl.output_layouts(m) }
+    fn opcode_shape(&self) -> OpcodeShape { FusedQkvRopeCacheImpl.opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        FusedQkvRopeCacheImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        FusedQkvRopeCacheImpl.required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TkFusedQkvRopePrefillImpl;
+
+impl Implementation for TkFusedQkvRopePrefillImpl {
+    fn name(&self) -> &'static str { "tk_fused_qkv_rope_prefill" }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && FusedQkvRopePrefillImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { FusedQkvRopePrefillImpl.workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        FusedQkvRopePrefillImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { FusedQkvRopePrefillImpl.cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { FusedQkvRopePrefillImpl.resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { FusedQkvRopePrefillImpl.input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { FusedQkvRopePrefillImpl.output_layouts(m) }
+    fn opcode_shape(&self) -> OpcodeShape { FusedQkvRopePrefillImpl.opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        FusedQkvRopePrefillImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        FusedQkvRopePrefillImpl.required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TkFusedGateUpSiluMulImpl;
+
+impl Implementation for TkFusedGateUpSiluMulImpl {
+    fn name(&self) -> &'static str { "tk_fused_gate_up_silu_mul" }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && FusedGateUpSiluMulImpl.target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { FusedGateUpSiluMulImpl.workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        FusedGateUpSiluMulImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { FusedGateUpSiluMulImpl.cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { FusedGateUpSiluMulImpl.resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { FusedGateUpSiluMulImpl.input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { FusedGateUpSiluMulImpl.output_layouts(m) }
+    fn opcode_shape(&self) -> OpcodeShape { FusedGateUpSiluMulImpl.opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        FusedGateUpSiluMulImpl.required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TkCutlassGemmAddImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl TkCutlassGemmAddImpl {
+    fn host(&self) -> CutlassGemmAddImpl {
+        CutlassGemmAddImpl { tile_m: self.tile_m, tile_n: self.tile_n, stages: self.stages }
+    }
+}
+
+impl Implementation for TkCutlassGemmAddImpl {
+    fn name(&self) -> &'static str {
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "tk_cutlass_16x64_s3_add",
+            (16, 64, 4) => "tk_cutlass_16x64_s4_add",
+            (16, 128, 3) => "tk_cutlass_16x128_s3_add",
+            (16, 128, 4) => "tk_cutlass_16x128_s4_add",
+            (32, 64, 3) => "tk_cutlass_32x64_s3_add",
+            (32, 64, 4) => "tk_cutlass_32x64_s4_add",
+            (32, 128, 3) => "tk_cutlass_32x128_s3_add",
+            (32, 128, 4) => "tk_cutlass_32x128_s4_add",
+            (32, 256, 3) => "tk_cutlass_32x256_s3_add",
+            (64, 64, 3) => "tk_cutlass_64x64_s3_add",
+            (64, 64, 4) => "tk_cutlass_64x64_s4_add",
+            (64, 128, 3) => "tk_cutlass_64x128_s3_add",
+            (64, 128, 4) => "tk_cutlass_64x128_s4_add",
+            (128, 64, 3) => "tk_cutlass_128x64_s3_add",
+            (128, 64, 4) => "tk_cutlass_128x64_s4_add",
+            (128, 128, 3) => "tk_cutlass_128x128_s3_add",
+            (128, 128, 4) => "tk_cutlass_128x128_s4_add",
+            (128, 256, 3) => "tk_cutlass_128x256_s3_add",
+            (256, 64, 3) => "tk_cutlass_256x64_s3_add",
+            (256, 64, 4) => "tk_cutlass_256x64_s4_add",
+            _ => "tk_cutlass_unknown_add",
+        }
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && self.host().target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { self.host().workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        self.host().matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { self.host().cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { self.host().resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { self.host().input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { self.host().output_layouts(m) }
+    fn is_compute_bound(&self) -> bool { self.host().is_compute_bound() }
+    fn opcode_shape(&self) -> OpcodeShape { self.host().opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        self.host().fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        self.host().required_weights(claimed, fuf, program)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TkCutlassGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl TkCutlassGemmImpl {
+    fn host(&self) -> CutlassGemmImpl {
+        CutlassGemmImpl { tile_m: self.tile_m, tile_n: self.tile_n, stages: self.stages }
+    }
+}
+
+impl Implementation for TkCutlassGemmImpl {
+    fn name(&self) -> &'static str {
+        match (self.tile_m, self.tile_n, self.stages) {
+            (16, 64, 3) => "tk_cutlass_16x64_s3",
+            (16, 64, 4) => "tk_cutlass_16x64_s4",
+            (16, 128, 3) => "tk_cutlass_16x128_s3",
+            (16, 128, 4) => "tk_cutlass_16x128_s4",
+            (32, 64, 3) => "tk_cutlass_32x64_s3",
+            (32, 64, 4) => "tk_cutlass_32x64_s4",
+            (32, 128, 3) => "tk_cutlass_32x128_s3",
+            (32, 128, 4) => "tk_cutlass_32x128_s4",
+            (32, 256, 3) => "tk_cutlass_32x256_s3",
+            (64, 64, 3) => "tk_cutlass_64x64_s3",
+            (64, 64, 4) => "tk_cutlass_64x64_s4",
+            (64, 128, 3) => "tk_cutlass_64x128_s3",
+            (64, 128, 4) => "tk_cutlass_64x128_s4",
+            (128, 64, 3) => "tk_cutlass_128x64_s3",
+            (128, 64, 4) => "tk_cutlass_128x64_s4",
+            (128, 128, 3) => "tk_cutlass_128x128_s3",
+            (128, 128, 4) => "tk_cutlass_128x128_s4",
+            (128, 256, 3) => "tk_cutlass_128x256_s3",
+            (256, 64, 3) => "tk_cutlass_256x64_s3",
+            (256, 64, 4) => "tk_cutlass_256x64_s4",
+            _ => "tk_cutlass_unknown",
+        }
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.kvm_compatible() && self.host().target_compatible(profile)
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint { self.host().workload_constraint() }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        self.host().matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 { self.host().cost_us(m, ctx) }
+    fn resources(&self, m: &MatchInfo) -> Resources { self.host().resources(m) }
+    fn launch_kind(&self) -> LaunchKind { LaunchKind::DeviceCallable }
+    fn megakernel_fit(&self) -> MegakernelFit { MegakernelFit::Kvm }
+    fn supported_input_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn supported_output_handoffs(&self) -> &[Handoff] { TK_HANDOFFS }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> { self.host().input_layouts(m) }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> { self.host().output_layouts(m) }
+    fn is_compute_bound(&self) -> bool { self.host().is_compute_bound() }
+    fn opcode_shape(&self) -> OpcodeShape { self.host().opcode_shape() }
+    fn fan_out(&self, m: &MatchInfo, fuf: &Fuf, program: &Program, bounds: &BTreeMap<String, u64>, slots: &SlotMap) -> Option<Vec<OpInstance>> {
+        self.host().fan_out(m, fuf, program, bounds, slots)
+    }
+    fn required_weights(&self, claimed: &[TileId], fuf: &Fuf, program: &Program) -> Vec<WeightAccessor> {
+        self.host().required_weights(claimed, fuf, program)
+    }
 }
 
 // ── FusedGemmBiasImpl ────────────────────────────────────────────

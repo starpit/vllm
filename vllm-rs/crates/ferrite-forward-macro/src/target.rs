@@ -108,6 +108,13 @@ impl TargetProfile {
     pub fn cost_us_for(&self, kernel: &str, m: u32, n: u32, k: u32) -> Option<f64> {
         self.cost_table.get(kernel, m, n, k)
     }
+
+    /// Whether this target is structurally compatible with the
+    /// vendored ThunderKittens megakernel (`cross-gpu-llama`).
+    /// True for sm_90+ (Hopper). Gates the Tk-tier Impl set.
+    pub fn kvm_compatible(&self) -> bool {
+        self.compute_capability >= 90
+    }
 }
 
 /// Build a `TargetProfile` from a `ferrite-cuda-targets` profile

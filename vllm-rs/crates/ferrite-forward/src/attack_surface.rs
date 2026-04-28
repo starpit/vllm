@@ -185,6 +185,15 @@ pub struct AttackSurfaceReport {
     /// no_csv_data" — those resolve in one shot from the fusion side
     /// without any cost-table calibration work.
     pub xtab: HashMap<(&'static str, &'static str), u64>,
+    /// `shape_regime → count` for picks in the `g_gt_5.00` class.
+    /// Disambiguates the >5% losses: which are tile-family gaps
+    /// (Stream-K territory, SIMT-small-M territory) vs genuinely
+    /// hard for the existing zoo. `gpu_cost_sweep` calibrates EVERY
+    /// CUTLASS tile per swept shape, so >5% picks are not a sweep
+    /// coverage problem (that lands in `no_csv_data` instead).
+    pub g_by_regime: HashMap<&'static str, u64>,
+    /// `shape_regime → up to N samples`.
+    pub samples_g_regime: HashMap<&'static str, Vec<PickSample>>,
     /// `margin_class → up to N samples`.
     pub samples_margin: HashMap<&'static str, Vec<PickSample>>,
     /// `fusion_gap_reason → up to N samples`.
@@ -263,6 +272,25 @@ impl AttackSurfaceReport {
                 .entry(cls)
                 .or_default() += 1;
             *self.by_arch_total.entry(arch.to_string()).or_default() += 1;
+
+            if cls == "g_gt_5.00" {
+                let regime = classify_regime(grid_m, n, k);
+                *self.g_by_regime.entry(regime).or_default() += 1;
+                let regime_sample = PickSample {
+                    arch: arch.to_string(),
+                    layer,
+                    grid_m,
+                    n,
+                    k,
+                    cublas_us: cb,
+                    alt_us: alt.map(|(u, _)| u),
+                    alt_kernel: alt.map(|(_, k)| k.to_string()),
+                };
+                self.samples_g_regime
+                    .entry(regime)
+                    .or_default()
+                    .push_if_under(self.max_samples_per_class, regime_sample);
+            }
 
             let sample = PickSample {
                 arch: arch.to_string(),
@@ -457,6 +485,59 @@ impl AttackSurfaceReport {
             )?;
         }
 
+        // ── g_gt_5.00 by shape regime ──────────────────────────────
+        //
+        // Disambiguates the >5% class: picks where cuBLAS beats the
+        // best CUTLASS tile by >5%. NOT a sweep coverage gap (those
+        // land in `no_csv_data`); these have all 44 cutlass tiles
+        // measured and cuBLAS still wins. The regime tag identifies
+        // which tile family (Stream-K, SIMT-small-M, etc.) would
+        // close the gap, vs which picks are genuinely beyond the
+        // current zoo's reach.
+        let g_total: u64 = self.g_by_regime.values().sum();
+        if g_total > 0 {
+            writeln!(out)?;
+            writeln!(
+                out,
+                ">5% picks ({}) by shape regime — *which* tile family would close each",
+                g_total
+            )?;
+            let regime_order = [
+                "M=1",
+                "small-M long-K (Stream-K target)",
+                "small-M short-K (SIMT/tile_m=8 target)",
+                "mid-M long-K (Stream-K target)",
+                "mid-M short-K",
+                "large-M (compute-bound)",
+            ];
+            for regime in regime_order {
+                let c = self.g_by_regime.get(regime).copied().unwrap_or(0);
+                if c == 0 {
+                    continue;
+                }
+                let pct = pct_of(c, g_total);
+                writeln!(out, "  {:>5}  {:>4.0}%   {}", c, pct, regime)?;
+                if let Some(samples) = self.samples_g_regime.get(regime) {
+                    if let Some(s) = samples.first() {
+                        let cb = s.cublas_us.map(|v| format!("{:.1}", v)).unwrap_or_default();
+                        let alt = s.alt_us.map(|v| format!("{:.1}", v)).unwrap_or_default();
+                        let kn = s.alt_kernel.as_deref().unwrap_or("?");
+                        writeln!(
+                            out,
+                            "             e.g. {} M={} N={} K={}  cb={}µs alt={}µs ({})",
+                            short_arch(&s.arch),
+                            s.grid_m,
+                            s.n,
+                            s.k,
+                            cb,
+                            alt,
+                            kn
+                        )?;
+                    }
+                }
+            }
+        }
+
         // ── Per-arch-family rollup ─────────────────────────────────
         //
         // The variant label is `<family> / <variant_stem> · tp=N` —
@@ -597,6 +678,36 @@ fn grid_m_for(m_min: u64, m_max_excl: u64) -> u32 {
     // Bucket smaller than any grid step (rare); fall back to the
     // bucket's lo so the lookup still has a chance.
     m_min.min(u32::MAX as u64) as u32
+}
+
+/// Bucket a `(M, N, K)` shape into a kernel-regime tag. Used to
+/// disambiguate the `g_gt_5.00` class — picks where cuBLAS beats
+/// every CUTLASS tile in the zoo by >5%. The regime tells us which
+/// kernel family (if any) would close the gap:
+///
+///   M=1                — decode / lm_head; CutlassGemv handles it
+///                        unless N is huge (vocab projection).
+///   small-M long-K     — M ≤ 16, K ≥ 8192. Stream-K's sweet spot.
+///   small-M other      — M ≤ 16, K < 8192. Tall-skinny needs
+///                        SIMT-style kernels (tile_m=8).
+///   mid-M long-K       — M ∈ [32, 512], K ≥ 8192. Stream-K helps.
+///   mid-M other        — M ∈ [32, 512], K < 8192.
+///   large-M            — M ≥ 1024. Compute-bound; tile zoo is
+///                        already well-tuned here.
+fn classify_regime(m: u32, _n: u32, k: u32) -> &'static str {
+    if m == 1 {
+        "M=1"
+    } else if m <= 16 && k >= 8192 {
+        "small-M long-K (Stream-K target)"
+    } else if m <= 16 {
+        "small-M short-K (SIMT/tile_m=8 target)"
+    } else if m <= 512 && k >= 8192 {
+        "mid-M long-K (Stream-K target)"
+    } else if m <= 512 {
+        "mid-M short-K"
+    } else {
+        "large-M (compute-bound)"
+    }
 }
 
 fn margin_class(cublas_us: f64, alt_us: f64) -> &'static str {

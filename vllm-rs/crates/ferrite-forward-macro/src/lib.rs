@@ -42,6 +42,7 @@ mod schedule;
 mod shape;
 mod solver;
 mod target;
+mod tp_lowering;
 mod viz_dump;
 mod weights_manifest;
 
@@ -241,6 +242,38 @@ pub(crate) fn ferrite_debug() -> bool {
         .unwrap_or(false)
 }
 
+/// Stable per-tp-world-size discriminator threaded into
+/// `dedup_signature` so the canonical-equivalence-class hash splits
+/// the (variant × tp) fanout — a model compiled at tp=1 cannot share
+/// a canonical with the same model compiled at tp=2 because the
+/// emitted body sees different sharded `INTERMEDIATE_SIZE` /
+/// `NUM_ATTENTION_HEADS` / `NUM_KEY_VALUE_HEADS` constants on
+/// `<W as CanonicalParams>` and (for ShardDim1 weights) inserts
+/// `Instruction::AllReduce` rows the tp=1 body lacks.
+///
+/// Compile-time set: `{1, 2, 4, 8}` (+16 behind the future
+/// `tp-frontier` feature for NVL72-class models). Past 16 is rare
+/// enough to keep behind a cargo feature gate.
+fn dedup_tp_sig(tp_world_size: u8) -> String {
+    format!("tp:{tp_world_size}")
+}
+
+/// Adaptive µs-to-string formatter for build-log scoring lines.
+/// Used by the per-M score emission landed in the activation phase
+/// (`889c44b2f`); kept as `#[allow(dead_code)]` for the foundation
+/// commits that introduce it before the consumer lands during
+/// the rebase replay.
+#[allow(dead_code)]
+fn fmt_us(us: f64) -> String {
+    if us < 1000.0 {
+        format!("{us:.0}µs")
+    } else if us < 100_000.0 {
+        format!("{:.1}ms", us / 1000.0)
+    } else {
+        format!("{:.0}ms", us / 1000.0)
+    }
+}
+
 fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path::PathBuf, String> {
     // Per-arch crates own their JSONs under `configs/` next to
     // `Cargo.toml` — fast path for the standard layout.
@@ -425,6 +458,28 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
         sfufs: solver::WorkloadAssignments,
         loops: schedule::WorkloadLoops,
         stub_items: proc_macro2::TokenStream,
+        /// Tensor-parallel world size this model was solved at. The
+        /// (variant × tp) fanout constructs one SolvedModel per
+        /// (model, tp_world_size) pair. At `tp_world_size = 1` (every
+        /// emission when `CARGO_FEATURE_NCCL` is unset) sharding is
+        /// identity. Threaded into `dedup_signature` so the
+        /// canonical-equivalence-class hash keeps each tp on its own
+        /// canonical, and into the `tp_lowering::insert_all_reduces`
+        /// call so the FUF receives a row-parallel AllReduce only
+        /// when it should.
+        tp_world_size: u8,
+        /// Per-(model, tp) Rust-ident form of the emitted module. At
+        /// tp=1 this is `model.name` verbatim (preserves the
+        /// `ferrite_models::<arch>::<model>::Weights` path callers
+        /// already use); at tp>1 it gets a `_tp{N}` suffix.
+        mod_name: String,
+        /// Per-(model, tp) HF-form stem used as the alphabetical
+        /// canonical-selection key inside `compute_canonical_variants`.
+        /// At tp=1 = `model.source_stem`; at tp>1 it's
+        /// `format!("{}_tp{}", model.source_stem, tp_world_size)` so
+        /// every member of a tp-N equivalence class shares the suffix
+        /// and within-class ordering is preserved.
+        canon_stem: String,
     }
 
     impl HasSolvedSig for SolvedModel<'_> {
@@ -459,6 +514,16 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             parts.push(dedup_quant_sig(
                 self.model.quantization.as_ref().map(|qc| &qc.method),
             ));
+            // Tensor-parallel canonicalization axis. The
+            // SolvedModel.tp_world_size field is the per-(model, tp)
+            // discriminator; until task #7's outer-loop fanout lands
+            // every SolvedModel has `tp_world_size = 1`, so every
+            // dedup string still ends in `tp:1`. When the fanout
+            // turns on, two SolvedModels of the same model at tp=1
+            // vs tp=2 hash to different signatures and pick separate
+            // canonicals — pinned by `tp_world_sizes_pick_separate_
+            // canonicals`.
+            parts.push(dedup_tp_sig(self.tp_world_size));
             // SFUF per (num_tokens, sk_bucket) point: which Impl runs
             // at each subgraph. Identical SFUFs → each impl's
             // `emit_call` produces identical output at identical
@@ -474,166 +539,284 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             parts.join("|")
         }
         fn source_stem(&self) -> &str {
-            &self.model.source_stem
+            &self.canon_stem
         }
         fn model_name(&self) -> &str {
-            &self.model.name
+            &self.mod_name
         }
     }
 
-    let mut solved: Vec<SolvedModel<'_>> = Vec::with_capacity(models.len());
+    // Compile-time tp set per project_tp_design_notes. The per-arch
+    // crate's `nccl` cargo feature transitively enables
+    // `ferrite-forward-macro/nccl`, recompiling THIS proc-macro with
+    // its own `nccl` feature on. `cfg!(feature = "nccl")` then reads
+    // `true` at expand time and the macro fans out every variant
+    // over `{1, 2, 4, 8}`. Without it, only tp=1 emits —
+    // byte-identical to the pre-fanout build. (Cargo caches the
+    // proc-macro per-feature-set, so consumers without nccl still
+    // get the fast tp=1-only macro.)
+    let nccl_enabled = cfg!(feature = "nccl");
+    let tp_set: &[u8] = if nccl_enabled { &[1, 2, 4, 8] } else { &[1] };
 
-    for model in &models {
-        let model_cfg = cfg::build_cfg(&classified, model)
-            .map_err(|e| syn::Error::new(args.span, format!("cfg [{}]: {e}", model.source_stem)))?;
-        let mut model_fuf = fuf::unroll(&model_cfg, &inferred).map_err(|e| {
-            syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
-        })?;
-        model_fuf.annotate_storage_formats(&classified, model);
+    let mut solved: Vec<SolvedModel<'_>> = Vec::with_capacity(models.len() * tp_set.len());
 
-        let t_solve = std::time::Instant::now();
-        let mut sfufs = solver::solve(
-            &model_fuf,
-            &library,
-            &target_profile,
-            &inferred,
-            &model.bounds,
-            &args.workloads,
-            &args.sk_buckets,
-        )
-        .map_err(|e| syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem)))?;
-        let d_solve = t_solve.elapsed();
+    for &tp_world_size in tp_set {
+        for model in &models {
+            // Skip (variant, tp) tuples whose column-parallel dims don't
+            // divide evenly. KV replication when `num_kv_heads < tp_size`
+            // is task #6's loader-sharding work — until then, an
+            // indivisible KV head count drops the (variant, tp) tuple
+            // from emission rather than baking a `NUM_KV_HEADS = 0`
+            // canonical that would silently fail at runtime. Hits e.g.
+            // SmolLM-135M (3 KV heads) at tp ∈ {2, 4, 8}, Llama 3.2-1B
+            // (8 KV heads) at tp=16 (not in the default set).
+            if tp_world_size > 1 {
+                let na = *model.bounds.get("num_attention_heads").unwrap_or(&1);
+                let nkv = *model.bounds.get("num_key_value_heads").unwrap_or(&1);
+                let inter = *model.bounds.get("intermediate_size").unwrap_or(&1);
+                let tp = tp_world_size as u64;
+                if na % tp != 0 || nkv % tp != 0 || inter % tp != 0 {
+                    eprintln!(
+                        "  ferrite · {variant:<30} · skip tp={tp_world_size} (heads={na}/{nkv}, inter={inter} not divisible)",
+                        variant = model.source_stem,
+                    );
+                    continue;
+                }
+            }
 
-        let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
-        cost::refresh_predicted_us(
-            &model_fuf,
-            &mut sfufs,
-            &loops,
-            &library,
-            &target_profile,
-            &model.bounds,
-        );
+            // Per-(model, tp) ident form. tp=1 keeps the existing names
+            // verbatim so callers' `ferrite_models::<arch>::<model>::Weights`
+            // paths stay valid; tp>1 gets a `_tp{N}` suffix.
+            let mod_name = if tp_world_size == 1 {
+                model.name.clone()
+            } else {
+                format!("{}_tp{}", model.name, tp_world_size)
+            };
+            let canon_stem = if tp_world_size == 1 {
+                model.source_stem.clone()
+            } else {
+                format!("{}_tp{}", model.source_stem, tp_world_size)
+            };
 
-        let max_waves = loops
-            .per_workload
-            .values()
-            .map(|l| l.num_waves())
-            .max()
-            .unwrap_or(0);
-        // Set of kernel classes seen across every workload point.
-        // Classification must be TOTAL: any impl name that doesn't
-        // map to a known class fails the build, prompting us to add
-        // the kernel to the explicit table.
-        //
-        // Three semantic axes:
-        //   - attention backend: fa2 / fi / mla
-        //   - GEMM backend (pure or fused-with-GEMM): cublas /
-        //     cutlass / marlin. fp8 folds into cutlass (uses
-        //     `cutlass_scaled_mm_with_bias`); bnb4 folds into cublas
-        //     (dequant + cuBLAS matmul).
-        //   - non-gemm: kernels that are neither attention nor
-        //     GEMM-bearing — element-wise, reshapes, residual adds,
-        //     standalone norms. Surfaced because their existence is
-        //     usually a "why didn't we fuse this?" signal.
-        const CLASS_LABELS: [&str; 7] = [
-            "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm",
-        ];
-        // Names that are non-gemm despite a `fused_` prefix (norm-
-        // side fusions with no matmul). Listed explicitly so the
-        // generic `fused_` → cublas fallback below doesn't capture
-        // them.
-        const NON_GEMM_NAMES: &[&str] = &[
-            "embed_ref",
-            "rmsnorm_ref",
-            "layer_norm_ref",
-            "add_ref",
-            "reshape_ref",
-            "rope_append_ref",
-            "scalar_mul_inplace",
-            "scalar_offset_rms_norm",
-            "tanh_softcap_inplace",
-            "softcap",
-            "nosoftcap",
-            "deepseek_moe_ref",
-            "fused_add_rms_norm",
-            "fused_add_rms_norm_with_offset",
-        ];
-        let mut classes_used = [false; 7];
-        let mut unknown_names: std::collections::BTreeSet<&'static str> =
-            std::collections::BTreeSet::new();
-        for assignment in sfufs.per_workload.values() {
-            for impl_id in assignment.impls.values() {
-                let name = library.get(*impl_id).name();
-                let bucket = if name.starts_with("flashinfer") {
-                    Some(1) // fi
-                } else if name.starts_with("mla_") {
-                    Some(2) // mla
-                } else if name.starts_with("attention_")
-                    || name.starts_with("sliding_attention_")
-                    || name.starts_with("fa2_")
-                {
-                    Some(0) // fa2
-                } else if name.starts_with("marlin") {
-                    Some(5) // marlin
-                } else if name.starts_with("fp8") {
-                    Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
-                } else if name.starts_with("bnb4") {
-                    Some(3) // cublas (bnb4 dequant + cuBLAS matmul)
-                } else if name.starts_with("cutlass") {
-                    Some(4) // cutlass
-                } else if NON_GEMM_NAMES.contains(&name) {
-                    Some(6) // non-gemm
-                } else if name.starts_with("fused_") || name == "gemm_ref" {
-                    Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
-                } else {
-                    None
-                };
-                match bucket {
-                    Some(b) => classes_used[b] = true,
-                    None => {
-                        unknown_names.insert(name);
+            let model_cfg = cfg::build_cfg(&classified, model).map_err(|e| {
+                syn::Error::new(args.span, format!("cfg [{}]: {e}", model.source_stem))
+            })?;
+            let mut model_fuf = fuf::unroll(&model_cfg, &inferred).map_err(|e| {
+                syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
+            })?;
+            model_fuf.annotate_storage_formats(&classified, model);
+            // Tensor-parallel lowering pass. At tp=1 (every existing
+            // SolvedModel until task #7's canonical fanout lands) this is
+            // a strict no-op — the FUF flowing into the solver is
+            // byte-identical to single-rank builds.
+            tp_lowering::insert_all_reduces(&mut model_fuf, &classified, tp_world_size);
+            tp_lowering::insert_lm_head_allgather(&mut model_fuf, &classified, tp_world_size);
+
+            // At tp>1, the runtime weight tensors are per-rank shards
+            // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
+            // o/down halve dim 1). The codegen-baked weight shapes
+            // (`assert_weight_shape` checks them at every Gemm-class
+            // eval) must match those per-rank shapes, so the solver
+            // and `gemm_nk_from_fuf` (which evaluates symbolic
+            // `Shape` against bounds) need a sharded view of
+            // `num_attention_heads / num_key_value_heads /
+            // intermediate_size`. tp=1 keeps the unsharded bounds
+            // verbatim — byte-identical to the pre-fanout build.
+            let solve_bounds = if tp_world_size > 1 {
+                let mut b = model.bounds.clone();
+                let tp = tp_world_size as u64;
+                for k in [
+                    "num_attention_heads",
+                    "num_key_value_heads",
+                    "intermediate_size",
+                ] {
+                    if let Some(v) = b.get_mut(k) {
+                        *v = (*v / tp).max(1);
+                    }
+                }
+                b
+            } else {
+                model.bounds.clone()
+            };
+            let t_solve = std::time::Instant::now();
+            let mut sfufs = solver::solve(
+                &model_fuf,
+                &library,
+                &target_profile,
+                &inferred,
+                &solve_bounds,
+                &args.workloads,
+                &args.sk_buckets,
+            )
+            .map_err(|e| {
+                syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem))
+            })?;
+            let d_solve = t_solve.elapsed();
+
+            let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
+            cost::refresh_predicted_us(
+                &model_fuf,
+                &mut sfufs,
+                &loops,
+                &library,
+                &target_profile,
+                &solve_bounds,
+            );
+
+            let max_waves = loops
+                .per_workload
+                .values()
+                .map(|l| l.num_waves())
+                .max()
+                .unwrap_or(0);
+            // Kernel-class summary lifted from HEAD (`9189c3147`).
+            // Classification must be TOTAL: any impl name that doesn't
+            // map to a known class fails the build, prompting us to
+            // add the kernel to the explicit table.
+            //
+            // Three semantic axes:
+            //   - attention backend: fa2 / fi / mla
+            //   - GEMM backend (pure or fused-with-GEMM): cublas /
+            //     cutlass / marlin. fp8 folds into cutlass (uses
+            //     `cutlass_scaled_mm_with_bias`); bnb4 folds into
+            //     cublas (dequant + cuBLAS matmul).
+            //   - non-gemm: kernels that are neither attention nor
+            //     GEMM-bearing — element-wise, reshapes, residual
+            //     adds, standalone norms. Surfaced because their
+            //     existence is usually a "why didn't we fuse this?"
+            //     signal.
+            const CLASS_LABELS: [&str; 8] = [
+                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm",
+            ];
+            // Names that are non-gemm despite a `fused_` prefix
+            // (norm-side fusions with no matmul).
+            const NON_GEMM_NAMES: &[&str] = &[
+                "embed_ref",
+                "rmsnorm_ref",
+                "layer_norm_ref",
+                "add_ref",
+                "reshape_ref",
+                "rope_append_ref",
+                "scalar_mul_inplace",
+                "scalar_offset_rms_norm",
+                "tanh_softcap_inplace",
+                "softcap",
+                "nosoftcap",
+                "deepseek_moe_ref",
+                "fused_add_rms_norm",
+                "fused_add_rms_norm_with_offset",
+            ];
+            let mut classes_used = [false; 8];
+            let mut unknown_names: std::collections::BTreeSet<&'static str> =
+                std::collections::BTreeSet::new();
+            for assignment in sfufs.per_workload.values() {
+                for impl_id in assignment.impls.values() {
+                    let name = library.get(*impl_id).name();
+                    let bucket = if name.starts_with("flashinfer") {
+                        Some(1) // fi
+                    } else if name.starts_with("mla_") {
+                        Some(2) // mla
+                    } else if name.starts_with("attention_")
+                        || name.starts_with("sliding_attention_")
+                        || name.starts_with("fa2_")
+                    {
+                        Some(0) // fa2
+                    } else if name.starts_with("marlin") {
+                        Some(5) // marlin
+                    } else if name.starts_with("fp8") {
+                        Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
+                    } else if name.starts_with("bnb4") {
+                        Some(3) // cublas (bnb4 dequant + cuBLAS matmul)
+                    } else if name.starts_with("cutlass") {
+                        Some(4) // cutlass
+                    } else if NON_GEMM_NAMES.contains(&name) {
+                        Some(6) // non-gemm
+                    } else if name == "all_reduce" || name == "all_gather" {
+                        // Tensor-parallel collectives inserted by
+                        // `tp_lowering` at tp>1 (AllReduce after
+                        // row-parallel gemms + vocab-parallel embed;
+                        // AllGather after lm_head). Maps to NCCL —
+                        // semantically distinct from compute kernels.
+                        Some(7) // comm
+                    } else if name.starts_with("fused_") || name == "gemm_ref" {
+                        Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
+                    } else {
+                        None
+                    };
+                    match bucket {
+                        Some(b) => classes_used[b] = true,
+                        None => {
+                            unknown_names.insert(name);
+                        }
                     }
                 }
             }
-        }
-        if !unknown_names.is_empty() {
-            return Err(syn::Error::new(
-                args.span,
-                format!(
-                    "[{}] kernel-class summary: no class assigned for impl name(s): {}. \
-                     Add a class (or extend an existing prefix) in lib.rs.",
-                    model.source_stem,
-                    unknown_names.iter().copied().collect::<Vec<_>>().join(", "),
-                ),
-            ));
-        }
-        let kernel_mix: String = classes_used
-            .iter()
-            .zip(CLASS_LABELS.iter())
-            .filter(|(seen, _)| **seen)
-            .map(|(_, label)| format!(" {label}"))
-            .collect();
-        let solve_ms_part = if ferrite_debug() {
-            format!(" · {:>3} ms", d_solve.as_millis())
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "  ferrite · {variant:<30} · {tiles:>4} tiles · {waves:>3} waves{solve_ms_part} ·{kernel_mix}",
-            variant = model.source_stem,
-            tiles = model_fuf.len(),
-            waves = max_waves,
-        );
+            if !unknown_names.is_empty() {
+                return Err(syn::Error::new(
+                    args.span,
+                    format!(
+                        "[{}] kernel-class summary: no class assigned for impl name(s): {}. \
+                         Add a class (or extend an existing prefix) in lib.rs.",
+                        model.source_stem,
+                        unknown_names.iter().copied().collect::<Vec<_>>().join(", "),
+                    ),
+                ));
+            }
+            let kernel_mix: String = classes_used
+                .iter()
+                .zip(CLASS_LABELS.iter())
+                .filter(|(seen, _)| **seen)
+                .map(|(_, label)| format!(" {label}"))
+                .collect();
+            // Per-M scoring: gated on FERRITE_DEBUG so the default
+            // build log stays terse (one line per (variant, tp)).
+            let per_m_part: String = if ferrite_debug() {
+                let sk_axis_active = sfufs.per_workload.keys().any(|wp| wp.sk_bucket != 0);
+                sfufs
+                    .per_workload
+                    .iter()
+                    .map(|(wp, a)| {
+                        if sk_axis_active {
+                            format!(
+                                " M={}sk={}→{}",
+                                wp.num_tokens,
+                                wp.sk_bucket,
+                                fmt_us(a.predicted_us)
+                            )
+                        } else {
+                            format!(" M={}→{}", wp.num_tokens, fmt_us(a.predicted_us))
+                        }
+                    })
+                    .collect()
+            } else {
+                String::new()
+            };
+            let solve_ms_part = if ferrite_debug() {
+                format!(" · {:>3} ms", d_solve.as_millis())
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "  ferrite · {variant:<30} · {tiles:>4} tiles · {waves:>3} waves{solve_ms_part} · tp={tp:<1} ·{kernel_mix}{per_m_part}",
+                variant = canon_stem,
+                tp = tp_world_size,
+                tiles = model_fuf.len(),
+                waves = max_waves,
+            );
 
-        let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
+            let stub_items = emit_model_stub_items(&model_fuf, &sfufs, &loops);
 
-        solved.push(SolvedModel {
-            model,
-            fuf: model_fuf,
-            sfufs,
-            loops,
-            stub_items,
-        });
+            solved.push(SolvedModel {
+                model,
+                fuf: model_fuf,
+                sfufs,
+                loops,
+                stub_items,
+                tp_world_size,
+                mod_name,
+                canon_stem,
+            });
+        }
     }
 
     // Cross-variant forward-fn dedup. Key each variant by its
@@ -676,10 +859,10 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     }
 
     let mut per_model_ts: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut arch_dispatch_arms: Vec<(Ident, String, Vec<u64>)> = Vec::new();
+    let mut arch_dispatch_arms: Vec<DispatchArm> = Vec::new();
 
     for (idx, sm) in solved.iter().enumerate() {
-        let model_mod = Ident::new(&sm.model.name, Span::call_site());
+        let model_mod = Ident::new(&sm.mod_name, Span::call_site());
         let canonical_ident = &canonical_for[&idx];
         let is_canonical = *canonical_ident == model_mod;
         let canonical_override = if is_canonical {
@@ -697,6 +880,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             &library,
             &manifest,
             canonical_override.as_ref(),
+            sm.tp_world_size,
         );
         let stub_items = &sm.stub_items;
         per_model_ts.push(quote! {
@@ -706,11 +890,12 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             }
         });
 
-        arch_dispatch_arms.push((
-            model_mod,
-            sm.model.source_stem.clone(),
-            collect_dispatch_bounds(sm.model),
-        ));
+        arch_dispatch_arms.push(DispatchArm {
+            model_ident: model_mod,
+            source_stem: sm.model.source_stem.clone(),
+            bounds: collect_dispatch_bounds(sm.model),
+            tp_world_size: sm.tp_world_size,
+        });
     }
 
     // Union of HF `architectures: [..]` strings across every compiled
@@ -758,6 +943,29 @@ const DISPATCH_FIELDS: &[&str] = &[
     "vocab_size",
 ];
 
+/// One row of the arch-dispatch table — a single (variant, tp)
+/// tuple. The compile-loop builds one of these per (model, tp) pair
+/// the outer-loop fanout produced; the dispatcher uses them to build
+/// the unified `Weights` enum, the per-tp `inventory::submit!` blocks,
+/// and the per-variant `BackboneDumpRegistration` rows for
+/// `vllm ferrite info`.
+struct DispatchArm {
+    model_ident: Ident,
+    /// Source-config stem (e.g. `"qwen2.5-3b"`). Same for every tp
+    /// of the same model — used as the variant_stem label in
+    /// `BackboneDumpRegistration::dump_all` so `vllm ferrite info`
+    /// can print human-readable model names regardless of the
+    /// `_tp{N}`-suffixed module path.
+    source_stem: String,
+    /// Values aligned with [`DISPATCH_FIELDS`] — read by the
+    /// per-arch accessor methods on the dispatcher's `Weights`
+    /// enum. Same for every tp of the same model (the FerriteWeights
+    /// trait surface is the un-sharded model config — sharded values
+    /// flow through `<W as CanonicalParams>` instead).
+    bounds: Vec<u64>,
+    tp_world_size: u8,
+}
+
 fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
     DISPATCH_FIELDS
         .iter()
@@ -790,40 +998,61 @@ fn collect_dispatch_bounds(model: &config::ModelParams) -> Vec<u64> {
 fn emit_arch_dispatcher(
     arch_ident: &Ident,
     hf_arches: &[String],
-    arms: &[(Ident, String, Vec<u64>)],
+    arms: &[DispatchArm],
 ) -> proc_macro2::TokenStream {
     if arms.is_empty() {
         return quote! {};
     }
 
     // Variant ident = PascalCase of the model ident (e.g.
-    // `llama_3_2_1b` → `Llama_3_2_1b`). Keep the underscores — they
-    // carry meaning (dotted-version components) and collapsing them
+    // `llama_3_2_1b` → `Llama_3_2_1b`, `llama_3_2_1b_tp2` →
+    // `Llama_3_2_1b_Tp2`). Keep the underscores — they carry meaning
+    // (dotted-version components, tp suffix) and collapsing them
     // would create ambiguity between e.g. `llama32` and `llama_3_2`.
     let variants: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _, _)| {
-            let variant_ident = pascal_case(model_ident);
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
             quote! { #variant_ident(#model_ident::Weights) }
         })
         .collect();
 
-    // Auto-detect `load` body: try each variant's
-    // `fingerprint_matches` in declaration order; first match wins.
-    // Variants that share a fingerprint (e.g. two Llama configs that
-    // agree on every bound AND quant flag — today only rope params
-    // would differ) resolve to the earliest declared — a known
-    // limitation; authors with that collision should drop one of
-    // the colliding configs.
-    let try_fingerprint_arms: Vec<proc_macro2::TokenStream> = arms
+    // Distinct tp values across all arms, in ascending order. One
+    // `inventory::submit!` per value; one match arm in `Weights::load`
+    // per value. At nccl-disabled this is just `[1]` and the dispatcher
+    // is byte-identical to the pre-fanout build.
+    let mut tp_values: Vec<u8> = arms.iter().map(|a| a.tp_world_size).collect();
+    tp_values.sort_unstable();
+    tp_values.dedup();
+
+    // Per-tp `Weights::load` match arms. For each tp value, walk only
+    // the arms whose `tp_world_size` matches — the closure inside
+    // `inventory::submit!` passes its own tp constant, so the runtime
+    // never iterates wrong-tp variants. Variants that share a
+    // fingerprint within a tp group resolve to the earliest declared.
+    let load_match_arms: Vec<proc_macro2::TokenStream> = tp_values
         .iter()
-        .map(|(model_ident, _, _)| {
-            let variant_ident = pascal_case(model_ident);
+        .map(|tp| {
+            let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
+            let arms_for_tp: Vec<proc_macro2::TokenStream> = arms
+                .iter()
+                .filter(|a| a.tp_world_size == *tp)
+                .map(|a| {
+                    let variant_ident = pascal_case(&a.model_ident);
+                    let model_ident = &a.model_ident;
+                    quote! {
+                        if #model_ident::fingerprint_matches(gw, hf) {
+                            return Ok(Some(Self::#variant_ident(
+                                #model_ident::load(gw, stream, max_model_len, tp_rank)?,
+                            )));
+                        }
+                    }
+                })
+                .collect();
             quote! {
-                if #model_ident::fingerprint_matches(gw, hf) {
-                    return Ok(Some(Self::#variant_ident(
-                        #model_ident::load(gw, stream, max_model_len)?,
-                    )));
+                #tp_lit => {
+                    #(#arms_for_tp)*
                 }
             }
         })
@@ -831,8 +1060,9 @@ fn emit_arch_dispatcher(
 
     let forward_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _, _)| {
-            let variant_ident = pascal_case(model_ident);
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
             quote! {
                 Weights::#variant_ident(w) => unsafe {
                     #model_ident::forward(w, ctx, device, num_tokens)
@@ -842,8 +1072,9 @@ fn emit_arch_dispatcher(
         .collect();
     let forward_backbone_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, _, _)| {
-            let variant_ident = pascal_case(model_ident);
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
             quote! {
                 Weights::#variant_ident(w) => unsafe {
                     #model_ident::forward_backbone(w, ctx, device, num_tokens)
@@ -856,20 +1087,23 @@ fn emit_arch_dispatcher(
     // constant from the matched model's bounds. Consumers (e.g.
     // vllm-executor's CudaModel enum) delegate their own accessor
     // arms to these, replacing N duplicated `m.model.layers[0].foo`
-    // walks with a single method call.
+    // walks with a single method call. Trait surface is un-sharded
+    // — kernel launches read sharded values via `<W as
+    // CanonicalParams>::…` instead, so every (variant, tp) pair of
+    // the same model returns the same num_attention_heads / etc.
     let accessor_methods: Vec<proc_macro2::TokenStream> = DISPATCH_FIELDS
         .iter()
         .map(|field| {
             let method_name = Ident::new(field, Span::call_site());
             let arms_ts: Vec<proc_macro2::TokenStream> = arms
                 .iter()
-                .map(|(model_ident, _, bounds)| {
-                    let variant_ident = pascal_case(model_ident);
+                .map(|a| {
+                    let variant_ident = pascal_case(&a.model_ident);
                     let idx = DISPATCH_FIELDS
                         .iter()
                         .position(|f| f == field)
                         .expect("field in DISPATCH_FIELDS");
-                    let val = proc_macro2::Literal::u64_unsuffixed(bounds[idx]);
+                    let val = proc_macro2::Literal::u64_unsuffixed(a.bounds[idx]);
                     quote! { Weights::#variant_ident(_) => #val, }
                 })
                 .collect();
@@ -899,14 +1133,48 @@ fn emit_arch_dispatcher(
     // registry. Each variant's `mod <model_ident>` emits a
     // `pub fn dump() -> Vec<BucketDump>`; here we name them so a
     // single `BackboneDumpRegistration` per arch can iterate them.
+    // Iterates over EVERY (model, tp) tuple — `vllm ferrite info`
+    // shows each tp variant separately (the per-tp module's `dump()`
+    // reflects the sharded canonical's bucket layout).
     let dump_rows: Vec<proc_macro2::TokenStream> = arms
         .iter()
-        .map(|(model_ident, source_stem, _)| {
-            let stem_lit = proc_macro2::Literal::string(source_stem);
+        .map(|a| {
+            let model_ident = &a.model_ident;
+            let stem_lit = proc_macro2::Literal::string(&a.source_stem);
             quote! {
                 ::ferrite_forward::VariantDump {
                     variant_stem: #stem_lit,
                     buckets: #model_ident::dump(),
+                }
+            }
+        })
+        .collect();
+
+    // Per-tp inventory submission. Each closure passes its own tp
+    // constant into `Weights::load(...)`; the matching arm there
+    // walks only the tp-N variants. The submit! block is a static
+    // initializer — N submissions at compile time, walked once at
+    // runtime by `ferrite_forward::try_load(arch_hint, tp_world_size)`.
+    let inventory_submits: Vec<proc_macro2::TokenStream> = tp_values
+        .iter()
+        .map(|tp| {
+            let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
+            quote! {
+                #[cfg(feature = "cuda")]
+                ::ferrite_forward::inventory::submit! {
+                    ::ferrite_forward::FerriteArchRegistration {
+                        arch_name: #arch_name_lit,
+                        hf_arches: &[#(#hf_arch_lits),*],
+                        tp_world_size: #tp_lit,
+                        try_load: |gw, stream, max_model_len, tp_rank, hf| {
+                            Weights::load(
+                                gw, stream, max_model_len, hf, #tp_lit, tp_rank,
+                            ).map(|opt| {
+                                opt.map(|w| ::std::boxed::Box::new(w)
+                                    as ::std::boxed::Box<dyn ::ferrite_forward::FerriteWeights>)
+                            })
+                        },
+                    }
                 }
             }
         })
@@ -942,8 +1210,13 @@ fn emit_arch_dispatcher(
                 stream: ::ferrite_cuda_core::CUstream,
                 max_model_len: usize,
                 hf: ::ferrite_forward::HfFingerprint<'_>,
+                tp_world_size: u8,
+                tp_rank: u8,
             ) -> ::anyhow::Result<Option<Self>> {
-                #(#try_fingerprint_arms)*
+                match tp_world_size {
+                    #(#load_match_arms)*
+                    _ => {}
+                }
                 Ok(None)
             }
         }
@@ -1025,20 +1298,19 @@ fn emit_arch_dispatcher(
             }
         }
 
-        #[cfg(feature = "cuda")]
-        ::ferrite_forward::inventory::submit! {
-            ::ferrite_forward::FerriteArchRegistration {
-                arch_name: #arch_name_lit,
-                hf_arches: &[#(#hf_arch_lits),*],
-                try_load: |gw, stream, max_model_len, hf| {
-                    Weights::load(gw, stream, max_model_len, hf).map(|opt| {
-                        opt.map(|w| ::std::boxed::Box::new(w)
-                            as ::std::boxed::Box<dyn ::ferrite_forward::FerriteWeights>)
-                    })
-                },
-            }
-        }
+        // One `FerriteArchRegistration` per distinct tp value across
+        // the compiled (variant, tp) tuples. Each closure passes its
+        // own tp constant into `Weights::load(...)` so the matching
+        // arm there walks only the tp-N variants. At nccl-disabled
+        // this expands to a single submission with `tp_world_size:
+        // 1u8` — byte-identical to the pre-fanout build.
+        #(#inventory_submits)*
 
+        // One `BackboneDumpRegistration` per arch, fanning out over
+        // every (model, tp) variant via `dump_rows`. Independent of
+        // the per-tp `FerriteArchRegistration` above — `vllm ferrite
+        // info` walks this registry separately, with no runtime GPU
+        // or weight loading.
         #[cfg(feature = "cuda")]
         ::ferrite_forward::inventory::submit! {
             ::ferrite_forward::BackboneDumpRegistration {
@@ -1165,6 +1437,47 @@ mod tests {
         assert_ne!(dedup_quant_sig(Some(&awq_a)), dedup_quant_sig(Some(&gptq)));
     }
 
+    /// `dedup_tp_sig` must give different strings for different
+    /// tp_world_size values so the (variant × tp) fanout's canonical
+    /// hash separates them. Mirrors
+    /// `dedup_quant_sig_separates_fp8_block_from_fp8_std`'s shape.
+    #[test]
+    fn dedup_tp_sig_separates_each_compile_time_tp() {
+        // Compile-time set per project_tp_design_notes is {1,2,4,8}.
+        let sigs: Vec<String> = [1u8, 2, 4, 8].iter().map(|t| dedup_tp_sig(*t)).collect();
+        for i in 0..sigs.len() {
+            for j in (i + 1)..sigs.len() {
+                assert_ne!(
+                    sigs[i],
+                    sigs[j],
+                    "tp={} and tp={} must hash to different signatures",
+                    [1, 2, 4, 8][i],
+                    [1, 2, 4, 8][j],
+                );
+            }
+        }
+    }
+
+    /// `dedup_tp_sig(n)` is deterministic — same input → same output
+    /// across calls. Cargo's incremental cache hashes the dedup
+    /// signature, so non-determinism would force spurious rebuilds.
+    #[test]
+    fn dedup_tp_sig_is_deterministic() {
+        for tp in [1u8, 2, 4, 8, 16] {
+            assert_eq!(dedup_tp_sig(tp), dedup_tp_sig(tp));
+        }
+    }
+
+    /// `dedup_tp_sig` format is `tp:<n>` — pinning this so the
+    /// signature stays human-readable in cargo expand and golden
+    /// diffs, matching the `q:`/`b:`/`r:`/`w:` prefixes already
+    /// used by the other dedup parts.
+    #[test]
+    fn dedup_tp_sig_format() {
+        assert_eq!(dedup_tp_sig(1), "tp:1");
+        assert_eq!(dedup_tp_sig(8), "tp:8");
+    }
+
     /// BNB4 has its own FieldLoad arm (`Bnb4bitLinear::load`),
     /// distinct from FP8 / Marlin / Dense.
     #[test]
@@ -1175,6 +1488,64 @@ mod tests {
         };
         let dense = None;
         assert_ne!(dedup_quant_sig(Some(&bnb)), dedup_quant_sig(dense));
+    }
+
+    /// `compute_canonical_variants` end-to-end on the (variant × tp)
+    /// fanout: two SolvedModels of the same variant compiled at
+    /// different `tp_world_size` values must NOT collapse to one
+    /// canonical. The dedup string differs only in the `tp:N` part,
+    /// which is enough to keep them in separate equivalence classes.
+    /// This is the regression for task #7's outer-loop fanout — a
+    /// future change that drops `dedup_tp_sig(self.tp_world_size)`
+    /// from the dedup string would fail this test.
+    #[test]
+    fn tp_world_sizes_pick_separate_canonicals() {
+        struct Fake {
+            sig: String,
+            stem: String,
+            name: String,
+        }
+        impl HasSolvedSig for Fake {
+            fn dedup_signature(&self) -> String {
+                self.sig.clone()
+            }
+            fn source_stem(&self) -> &str {
+                &self.stem
+            }
+            fn model_name(&self) -> &str {
+                &self.name
+            }
+        }
+        // Same variant compiled at tp=1, 2, 4, 8 — every other
+        // dedup part identical, only `tp:N` differs.
+        let solved = vec![
+            Fake {
+                sig: format!("x|{}", dedup_tp_sig(1)),
+                stem: "command-r-1l".into(),
+                name: "command_r_1l".into(),
+            },
+            Fake {
+                sig: format!("x|{}", dedup_tp_sig(2)),
+                stem: "command-r-1l_tp2".into(),
+                name: "command_r_1l_tp2".into(),
+            },
+            Fake {
+                sig: format!("x|{}", dedup_tp_sig(4)),
+                stem: "command-r-1l_tp4".into(),
+                name: "command_r_1l_tp4".into(),
+            },
+            Fake {
+                sig: format!("x|{}", dedup_tp_sig(8)),
+                stem: "command-r-1l_tp8".into(),
+                name: "command_r_1l_tp8".into(),
+            },
+        ];
+        let map = compute_canonical_variants(&solved);
+        // Each tp picks its own variant as canonical — no collapse.
+        assert_eq!(map[&0].to_string(), "command_r_1l");
+        assert_eq!(map[&1].to_string(), "command_r_1l_tp2");
+        assert_eq!(map[&2].to_string(), "command_r_1l_tp4");
+        assert_eq!(map[&3].to_string(), "command_r_1l_tp8");
     }
 
     /// `compute_canonical_variants` end-to-end: with the q-sig

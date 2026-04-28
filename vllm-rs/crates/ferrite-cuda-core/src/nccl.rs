@@ -137,6 +137,63 @@ impl NcclGroup {
         self.world_size
     }
 
+    /// In-place all-reduce (sum) with **fp32 accumulation** for bf16
+    /// tensors. Mirrors Python vLLM's `custom_all_reduce.cuh`
+    /// precision: upcast bf16 → fp32 → NCCL all-reduce in fp32 →
+    /// downcast fp32 → bf16. Avoids the ~1 ULP per-reduce drift of
+    /// NCCL's native bf16 sum which compounds over ~73 AllReduces
+    /// per Qwen2.5-3B forward and produces wrong sampled tokens on
+    /// small models.
+    ///
+    /// For non-bf16 tensors (fp32, fp16, …) falls through to the
+    /// native [`Self::all_reduce_inplace`] (no precision difference
+    /// to capture for fp32; fp16 path could be added similarly).
+    ///
+    /// Allocates a transient fp32 buffer from `alloc` (caching
+    /// allocator returns it to the pool when the OwnedTensor drops),
+    /// so amortized cost is one alloc + two extra kernel passes
+    /// per call.
+    ///
+    /// # Safety
+    /// `tensor.raw_ptr()` must be live GPU memory; `alloc`'s stream
+    /// must equal the NCCL group's stream so the upcast / NCCL /
+    /// downcast sequence respects stream order.
+    pub unsafe fn all_reduce_inplace_promote(
+        &self,
+        tensor: GpuTensor,
+        alloc: &mut CachingAllocator,
+    ) -> Result<()> {
+        if is_nccl_suppressed() {
+            return Ok(());
+        }
+        if tensor.dtype() != DType::BF16 {
+            return unsafe { self.all_reduce_inplace(tensor) };
+        }
+        let numel = tensor.numel();
+        let shape: Vec<usize> = (0..tensor.ndim()).map(|i| tensor.dim(i)).collect();
+        let fp32 = alloc.alloc_tensor(&shape, DType::F32);
+        let fp32_ptr = fp32.as_gpu_tensor().raw_ptr();
+        let n_i32 = i32::try_from(numel).expect("all_reduce numel exceeds i32::MAX");
+        unsafe {
+            bf16_to_fp32(tensor.raw_ptr() as *const u8, fp32_ptr, n_i32, self.stream);
+            nccl_result::all_reduce(
+                fp32_ptr as *const c_void,
+                fp32_ptr as *mut c_void,
+                numel,
+                nccl_sys::ncclDataType_t::ncclFloat32,
+                nccl_sys::ncclRedOp_t::ncclSum,
+                self.comm,
+                self.stream as nccl_sys::cudaStream_t,
+            )
+            .map_err(|e| anyhow::anyhow!("ncclAllReduce (fp32) failed: {:?}", e))?;
+            fp32_to_bf16(fp32_ptr as *const u8, tensor.raw_ptr(), n_i32, self.stream);
+        }
+        // `fp32` OwnedTensor drops here — caching allocator pools the
+        // buffer for the next AllReduce on a same-shape tensor.
+        drop(fp32);
+        Ok(())
+    }
+
     /// In-place all-reduce (sum) on a GpuTensor.
     ///
     /// The tensor is modified in place. All ranks must call with tensors of
@@ -344,6 +401,12 @@ unsafe extern "C" {
         world_size: i32,
         stream: CUstream,
     );
+    /// bf16 → fp32 elementwise upcast. Used by
+    /// `all_reduce_inplace_promote` to do fp32-precision NCCL
+    /// reduction on bf16 tensors.
+    fn bf16_to_fp32(src: *const u8, dst: *mut u8, n: i32, stream: CUstream);
+    /// fp32 → bf16 elementwise downcast. Pair of `bf16_to_fp32`.
+    fn fp32_to_bf16(src: *const u8, dst: *mut u8, n: i32, stream: CUstream);
 }
 
 impl Drop for NcclGroup {

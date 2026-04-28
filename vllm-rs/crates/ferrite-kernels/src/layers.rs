@@ -94,6 +94,71 @@ impl Linear {
         Ok(Self::new(weight, bias))
     }
 
+    /// Load a tensor-parallel slice of `{prefix}.weight` (and bias)
+    /// per Python vLLM's `ColumnParallelLinear` (`dim = 0`,
+    /// column-parallel) and `RowParallelLinear` (`dim = 1`,
+    /// row-parallel) conventions.
+    ///
+    /// - **`dim == 0` (column-parallel: `q_proj`, `k_proj`, `v_proj`,
+    ///   `gate_proj`, `up_proj`, `lm_head`, `embed_tokens`).** The
+    ///   weight is sliced along its output dim (dim 0 of the
+    ///   `[out, in]` matrix). The bias, if present, is also sliced
+    ///   along dim 0 — each rank holds its own contiguous chunk.
+    ///   Mirrors Python `ColumnParallelLinear.weight_loader` →
+    ///   `loaded_weight.narrow(output_dim=0, ...)`.
+    ///
+    /// - **`dim == 1` (row-parallel: `o_proj`, `down_proj`).** The
+    ///   weight is sliced along its input dim (dim 1 of the
+    ///   `[out, in]` matrix). The bias is **replicated full-size on
+    ///   rank 0 only**, `None` on other ranks. The forward path adds
+    ///   bias before the cross-rank `AllReduce`-sum, which produces
+    ///   exactly one bias contribution to the residual stream —
+    ///   mirrors Python `RowParallelLinear.forward` line 1543:
+    ///   `bias_ = None if (self.tp_rank > 0 ...) else self.bias`.
+    ///
+    /// `world == 1` is supported and degrades to the unsharded
+    /// `Self::load` semantics (bias is loaded on rank 0, which is
+    /// the only rank). `dim` must be 0 or 1 — anything else panics.
+    pub fn load_sharded(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        dim: usize,
+        rank: usize,
+        world: usize,
+    ) -> Result<Self> {
+        assert!(
+            dim < 2,
+            "Linear::load_sharded: dim must be 0 or 1, got {dim}"
+        );
+        let weight_name = format!("{prefix}.weight");
+        let bias_name = format!("{prefix}.bias");
+
+        if !weights.contains(&weight_name) {
+            try_synthesize_packed_slice(weights, prefix)?;
+        }
+
+        let weight = weights.take_shard(&weight_name, dim, rank, world)?;
+        let bias = if weights.contains(&bias_name) {
+            if dim == 0 {
+                // Column-parallel: bias shards along dim 0 too.
+                Some(weights.take_shard(&bias_name, 0, rank, world)?)
+            } else {
+                // Row-parallel: bias is replicated full-size on rank 0,
+                // None on other ranks. The bias entry stays unconsumed
+                // in `weights` on rank > 0 — its mmap page is freed
+                // when `GpuWeights` drops.
+                if rank == 0 {
+                    Some(weights.take(&bias_name)?)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self::new(weight, bias))
+    }
+
     /// Forward: y = x @ W^T (+ bias)
     ///
     /// `x`: `[num_tokens, in_features]`
@@ -595,6 +660,26 @@ impl LinearLayer {
         Ok(Self::Dense(Linear::load(weights, prefix)?))
     }
 
+    /// Tensor-parallel sharded dense linear load. See
+    /// [`Linear::load_sharded`] for the full bias/dim semantics —
+    /// this is the `LinearLayer` wrapper. Used by codegen at tp>1
+    /// when [`crate::ferrite_forward_macro::tp_lowering::shard_kind_for_weight_path`]
+    /// reports the prefix's last segment is column-parallel
+    /// (`dim = 0`) or row-parallel (`dim = 1`). Pass `(rank, world)`
+    /// from the runtime; `world == 1` short-circuits to the same
+    /// behavior as `load_dense` plus shard-kind-aware bias rules.
+    pub fn load_dense_sharded(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        dim: usize,
+        rank: usize,
+        world: usize,
+    ) -> Result<Self> {
+        Ok(Self::Dense(Linear::load_sharded(
+            weights, prefix, dim, rank, world,
+        )?))
+    }
+
     /// Load several dense linear layers and concatenate along the
     /// out-feature dim (dim 0 of the weight matrix), returning one
     /// packed `LinearLayer::Dense`.
@@ -717,6 +802,161 @@ impl LinearLayer {
             for (i, bn) in bias_names.iter().enumerate() {
                 unsafe {
                     weights.take_into(bn, bptr.add(boff), stream)?;
+                }
+                boff += per_bias_bytes[i];
+            }
+            Some(unsafe { GpuTensor::new(bptr, &[total_bias_bytes / elem], dtype) })
+        } else {
+            None
+        };
+
+        Ok(Self::Dense(Linear::new(packed_weight, packed_bias)))
+    }
+
+    /// Tensor-parallel sharded variant of [`Self::load_dense_concat`].
+    /// Used by codegen at tp>1 for the fused QKV / gate_up
+    /// projections, which are always column-parallel (`ShardDim0`)
+    /// — no row-parallel concat exists in any current arch.
+    ///
+    /// Each source weight is sliced along its output dim (`dim 0` of
+    /// the `[out, in]` matrix) to `[out / world, in]`, then concatenated
+    /// along that same dim 0 into one packed `[(sum out_i) / world, in]`
+    /// GPU buffer. Biases follow the column-parallel rule (sliced
+    /// along dim 0 too) — matches Python `MergedColumnParallelLinear`
+    /// / `QKVParallelLinear` weight loaders.
+    ///
+    /// `world == 1` short-circuits to byte-equivalent behavior with
+    /// `Self::load_dense_concat`. Each source's `out` dim must be
+    /// divisible by `world` — the macro's outer-loop fanout already
+    /// `skip`s indivisible (variant, tp) tuples (per the activation
+    /// commit `889c44b2f`), so this is a runtime invariant the
+    /// compile-time set guarantees, not a per-call assertion.
+    pub fn load_dense_concat_sharded(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        stream: cudarc::driver::sys::CUstream,
+        rank: usize,
+        world: usize,
+    ) -> Result<Self> {
+        if prefixes.is_empty() {
+            anyhow::bail!("load_dense_concat_sharded: empty prefix list");
+        }
+
+        // Same packed-source fallback as the unsharded path.
+        for p in prefixes {
+            if !weights.contains(&format!("{p}.weight")) {
+                try_synthesize_packed_slice(weights, p)?;
+            }
+        }
+
+        // Resolve unsharded shapes/dtype from CPU-side metadata,
+        // then divide each source's out dim by `world` to get the
+        // per-rank packed shape.
+        let mut shapes_dtypes: Vec<(Vec<usize>, ferrite_cuda_core::dtype::DType)> =
+            Vec::with_capacity(prefixes.len());
+        for p in prefixes {
+            let weight_name = format!("{p}.weight");
+            let (shape, dtype) = weights
+                .tensor_info(&weight_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {weight_name}"))?;
+            if shape.len() != 2 {
+                anyhow::bail!(
+                    "load_dense_concat_sharded: `{weight_name}` has rank {}, expected 2",
+                    shape.len(),
+                );
+            }
+            shapes_dtypes.push((shape.to_vec(), dtype));
+        }
+
+        let hidden = shapes_dtypes[0].0[1];
+        let dtype = shapes_dtypes[0].1;
+        for (i, (shape, dt)) in shapes_dtypes.iter().enumerate() {
+            if shape[1] != hidden {
+                anyhow::bail!(
+                    "load_dense_concat_sharded: `{}` has in_features {}, expected {}",
+                    prefixes[i],
+                    shape[1],
+                    hidden,
+                );
+            }
+            if *dt != dtype {
+                anyhow::bail!(
+                    "load_dense_concat_sharded: `{}` has dtype {:?}, expected {:?}",
+                    prefixes[i],
+                    dt,
+                    dtype,
+                );
+            }
+        }
+
+        let elem = dtype.size_bytes();
+        // Per-rank packed shape: each source's out dim / world.
+        let per_rank_outs: Vec<usize> = shapes_dtypes.iter().map(|(s, _)| s[0] / world).collect();
+        let total_out: usize = per_rank_outs.iter().sum();
+        let total_bytes = total_out * hidden * elem;
+
+        let ptr = unsafe { ferrite_cuda_core::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
+        let mut offset_bytes: usize = 0;
+        for (i, p) in prefixes.iter().enumerate() {
+            let weight_name = format!("{p}.weight");
+            let bytes = per_rank_outs[i] * hidden * elem;
+            unsafe {
+                weights.take_shard_into(
+                    &weight_name,
+                    0,
+                    rank,
+                    world,
+                    ptr.add(offset_bytes),
+                    stream,
+                )?;
+            }
+            offset_bytes += bytes;
+        }
+        let packed_weight = unsafe { GpuTensor::new(ptr, &[total_out, hidden], dtype) };
+
+        // Biases: column-parallel concat shards each bias along dim 0
+        // — same rule as the weight. Either all sources have a bias
+        // or none of them do (matches the unsharded contract).
+        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+        let packed_bias = if weights.contains(&bias_names[0]) {
+            for bn in &bias_names {
+                if !weights.contains(bn) {
+                    anyhow::bail!(
+                        "load_dense_concat_sharded: inconsistent bias — `{}` exists but `{bn}` is missing",
+                        bias_names[0],
+                    );
+                }
+            }
+            // Per-rank bias bytes mirror per-rank weight outs (bias
+            // shape is `[out_i]` unsharded → `[out_i / world]` per rank).
+            let mut per_bias_bytes: Vec<usize> = Vec::with_capacity(bias_names.len());
+            let mut total_bias_bytes = 0usize;
+            for (i, bn) in bias_names.iter().enumerate() {
+                let (bshape, bdt) = weights
+                    .tensor_info(bn)
+                    .ok_or_else(|| anyhow::anyhow!("bias metadata missing: {bn}"))?;
+                if bdt != dtype {
+                    anyhow::bail!(
+                        "load_dense_concat_sharded: bias `{bn}` dtype {:?} != weight dtype {:?}",
+                        bdt,
+                        dtype,
+                    );
+                }
+                // Ignore unsharded `bshape` here — per-rank bytes are
+                // derived from the matched weight's per-rank out dim
+                // (already validated as `out_i / world` above).
+                let _ = bshape;
+                let b = per_rank_outs[i] * elem;
+                per_bias_bytes.push(b);
+                total_bias_bytes += b;
+            }
+            let bptr = unsafe { ferrite_cuda_core::driver::mem_alloc(total_bias_bytes)? };
+            weights.record_alloc(bptr, total_bias_bytes);
+            let mut boff = 0usize;
+            for (i, bn) in bias_names.iter().enumerate() {
+                unsafe {
+                    weights.take_shard_into(bn, 0, rank, world, bptr.add(boff), stream)?;
                 }
                 boff += per_bias_bytes[i];
             }
@@ -914,6 +1154,24 @@ impl Embedding {
     pub fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let weight = weights.take(&weight_name)?;
+        Ok(Self::new(weight))
+    }
+
+    /// Vocab-parallel sharded load — slices the embedding table
+    /// along dim 0 (`vocab_size`) so each rank holds
+    /// `[vocab_size / world, hidden_size]`. Mirrors Python vLLM's
+    /// `VocabParallelEmbedding` (the same scheme `ParallelLMHead`
+    /// inherits, which is what makes `tie_weights` self-consistent
+    /// at tp>1 — both sharded slices come from the same dim-0 cut).
+    /// `world == 1` degrades to the same shape `Self::load` produces.
+    pub fn load_sharded(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        rank: usize,
+        world: usize,
+    ) -> Result<Self> {
+        let weight_name = format!("{prefix}.weight");
+        let weight = weights.take_shard(&weight_name, 0, rank, world)?;
         Ok(Self::new(weight))
     }
 

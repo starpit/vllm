@@ -89,6 +89,17 @@ pub enum Instruction<W> {
     LayerNorm(u32, u32, u32, WtFn<W, CohereLayerNorm>),
     Reshape(u32, u32, [u32; MAX_DIMS], [u8; MAX_DIMS], u8),
     Add(u32, u32),
+    /// Tensor-parallel all-reduce-sum on the slot in place. Inserted
+    /// by the lowering pass after every gemm whose weight is
+    /// row-parallel (`ShardDim1`) and after the vocab-parallel embed.
+    /// At tp=1 the lowering pass emits zero of these.
+    #[cfg(feature = "nccl")]
+    AllReduce(u32),
+    /// Tensor-parallel all-gather along the last dim: `(in_slot, out_slot)`.
+    /// Inserted by the lowering pass after the lm_head Gemm at tp>1
+    /// (lm_head is vocab-parallel `ShardDim0`).
+    #[cfg(feature = "nccl")]
+    AllGather(u32, u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
     FusedAddRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
@@ -220,13 +231,27 @@ impl<W> Clone for Instruction<W> {
 /// silent shape drift here corrupts every output. Real `assert!`,
 /// not `debug_assert!`, because release builds need to fail loud
 /// rather than march on with a K-mismatch.
+///
+/// At tp>1 the codegen-time (n, k) reflects the *unsharded* model
+/// because shape inference unifies `num_q_heads * head_dim` with
+/// `hidden_size` (numerically equal in most arches), losing the
+/// distinction between sharded-axis dims and replicated-axis dims.
+/// The runtime tensor is per-rank-sharded by the loader, so the
+/// numbers legitimately disagree at tp>1. Skip the check there;
+/// the kernel itself uses the runtime tensor's shapes directly,
+/// so the assertion is purely a sanity check that's only sound at
+/// tp=1.
 #[track_caller]
 fn assert_weight_shape(
     op: &'static str,
     weight: ferrite_cuda_core::tensor::GpuTensor,
     n: u32,
     k: u32,
+    tp_active: bool,
 ) {
+    if tp_active {
+        return;
+    }
     let actual_n = weight.dim(0) as u32;
     let actual_k = weight.dim(1) as u32;
     assert_eq!(
@@ -237,6 +262,22 @@ fn assert_weight_shape(
         actual_k, k,
         "{op}: weight K (in_features) mismatch — runtime={actual_k} codegen={k}"
     );
+}
+
+/// Whether a TP group is attached on this forward pass (i.e. tp>1).
+/// Used by `assert_weight_shape` to skip its check at tp>1 where
+/// runtime per-rank shapes legitimately disagree with the codegen's
+/// unified-bounds shapes.
+#[inline]
+fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
+    #[cfg(feature = "nccl")]
+    {
+        _ctx.fwd.tp_group.is_some()
+    }
+    #[cfg(not(feature = "nccl"))]
+    {
+        false
+    }
 }
 
 impl<W: CanonicalParams> Instruction<W> {
@@ -250,9 +291,29 @@ impl<W: CanonicalParams> Instruction<W> {
     pub unsafe fn eval(&self, ctx: &mut InterpreterCtx<'_, W>) {
         match *self {
             Instruction::Embed(out_slot, weight_fn) => unsafe {
-                let out = kernels::embedding_gather(
-                    (weight_fn)(ctx.wm, 0u32).weight,
+                let weight = (weight_fn)(ctx.wm, 0u32).weight;
+                // At tp=1 the embed weight covers the full vocab and
+                // vocab_offset is 0 — the mask never trips. At tp>1
+                // the weight is the per-rank `[vocab/tp, hidden]`
+                // shard; vocab_offset = rank * vocab_per_rank gives
+                // each rank a disjoint slice of the global vocab.
+                // Per-Embed call follows with an AllReduce-sum
+                // (injected by tp_lowering when shard-kind for the
+                // embed weight is ShardDim0).
+                let vocab_per_rank = weight.dim(0) as u32;
+                #[cfg(feature = "nccl")]
+                let vocab_offset = ctx
+                    .fwd
+                    .tp_group
+                    .map(|g| (g.rank() as u32) * vocab_per_rank)
+                    .unwrap_or(0);
+                #[cfg(not(feature = "nccl"))]
+                let vocab_offset: u32 = 0;
+                let out = kernels::embedding_gather_masked(
+                    weight,
                     *ctx.fwd.input_ids,
+                    vocab_offset,
+                    vocab_per_rank,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -306,6 +367,29 @@ impl<W: CanonicalParams> Instruction<W> {
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 kernels::add_inplace(*residual, *delta, ctx.device.compute_stream);
+            },
+            #[cfg(feature = "nccl")]
+            Instruction::AllReduce(slot) => unsafe {
+                let group = ctx.fwd.tp_group.expect(
+                    "Instruction::AllReduce reached eval but \
+                     ForwardCtx::tp_group is None — caller must \
+                     attach an NcclGroup at tp_world_size > 1",
+                );
+                let gt = tile_ref(ctx.tiles, slot).as_gpu_tensor(ctx.tiles);
+                group
+                    .all_reduce_inplace_promote(gt, &mut ctx.device.caching)
+                    .expect("NCCL all_reduce_inplace_promote failed");
+            },
+            #[cfg(feature = "nccl")]
+            Instruction::AllGather(in_slot, out_slot) => unsafe {
+                let group = ctx.fwd.tp_group.expect(
+                    "Instruction::AllGather reached eval but \
+                     ForwardCtx::tp_group is None — caller must \
+                     attach an NcclGroup at tp_world_size > 1",
+                );
+                let v = tile_ref(ctx.tiles, in_slot).as_gpu_tensor(ctx.tiles);
+                let out = group.all_gather_last_dim(v, &mut ctx.device.caching);
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::ScalarMul(in_slot, out_slot, scale) => {
                 let owned = take_owned(ctx.tiles, in_slot);
@@ -376,7 +460,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("Gemm", w.dense_weight(), n, k);
+                assert_weight_shape("Gemm", w.dense_weight(), n, k, tp_active(ctx));
                 let out = ctx
                     .device
                     .cublas
@@ -1074,7 +1158,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemm", w.dense_weight(), n, k);
+                assert_weight_shape("CutlassGemm", w.dense_weight(), n, k, tp_active(ctx));
                 let out = cutlass::cutlass_gemm(
                     *v,
                     w.dense_weight(),
@@ -1099,7 +1183,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemmSplitK", w.dense_weight(), n, k);
+                assert_weight_shape("CutlassGemmSplitK", w.dense_weight(), n, k, tp_active(ctx));
                 let out = cutlass::cutlass_gemm_splitk(
                     *v,
                     w.dense_weight(),
@@ -1124,7 +1208,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemmAdd", w.dense_weight(), n, k);
+                assert_weight_shape("CutlassGemmAdd", w.dense_weight(), n, k, tp_active(ctx));
                 cutlass::cutlass_gemm_add(
                     *v,
                     w.dense_weight(),
@@ -1137,7 +1221,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassGemv", w.dense_weight(), n, k);
+                assert_weight_shape("CutlassGemv", w.dense_weight(), n, k, tp_active(ctx));
                 let out = cutlass::cutlass_gemv(
                     *v,
                     w.dense_weight(),
@@ -1160,7 +1244,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassFusedGemmBias", w.dense_weight(), n, k);
+                assert_weight_shape(
+                    "CutlassFusedGemmBias",
+                    w.dense_weight(),
+                    n,
+                    k,
+                    tp_active(ctx),
+                );
                 let bias = w.dense_bias().expect(
                     "CutlassFusedGemmBias: LinearLayer has no bias — check safetensors path",
                 );
@@ -1216,7 +1306,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassFusedGateUpGeluMul", w.dense_weight(), packed_n, k);
+                assert_weight_shape(
+                    "CutlassFusedGateUpGeluMul",
+                    w.dense_weight(),
+                    packed_n,
+                    k,
+                    tp_active(ctx),
+                );
                 let gate_up = cutlass::cutlass_gemm(
                     *v,
                     w.dense_weight(),
@@ -1258,7 +1354,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                assert_weight_shape("CutlassFusedQkvRopeCache", w.dense_weight(), packed_n, k);
+                assert_weight_shape(
+                    "CutlassFusedQkvRopeCache",
+                    w.dense_weight(),
+                    packed_n,
+                    k,
+                    tp_active(ctx),
+                );
                 let qkv_packed = cutlass::cutlass_gemm(
                     *v,
                     w.dense_weight(),
@@ -1341,6 +1443,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         w.dense_weight(),
                         packed_n,
                         k_dim,
+                        tp_active(ctx),
                     );
                     let qkv_packed = cutlass::cutlass_gemm(
                         *view_in,

@@ -363,6 +363,29 @@ pub fn apply_signature(
         OpKind::Gelu => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
+        // AllReduce is identity-shape one-input — same constraint
+        // as Silu / Gelu, just with the all-reduce-sum semantics
+        // tracked at the OpKind level. Never inserted by any DSL;
+        // the lowering pass produces it post-FUF-build, so this arm
+        // exists only to keep `apply_signature` total.
+        OpKind::AllReduce => sig_unary_elementwise(solver, inputs, op),
+        // AllGather's output shape is the input shape with the last
+        // dim multiplied by `tp_world_size` — not expressible as a
+        // pure function of the input Shape alone (depends on the
+        // current build's `tp_world_size` literal). Like `Reshape`,
+        // the lowering pass writes the concrete output shape onto
+        // the `FufNode` directly when constructing it; the FUF-level
+        // shape unifier never re-derives it. If something ever
+        // reaches this arm via `apply_signature`, it's a compiler
+        // bug — return an explicit error instead of a silent lie.
+        OpKind::AllGather => Err(ShapeError::BadArgs {
+            op: OpKind::AllGather,
+            reason: "apply_signature should not be called on AllGather; \
+                     the lowering pass sets FufNode.outputs[0] to \
+                     `[..in_shape with last_dim * tp_world_size]` \
+                     directly when inserting the node post-FUF-build"
+                .into(),
+        }),
         OpKind::BiasAdd => sig_bias_add(solver, inputs),
         OpKind::Mul => sig_binary_elementwise(solver, inputs, op),
         // Reshape's output shape is stored on `Program::reshape_targets`
@@ -684,6 +707,10 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gelu => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::Add => &[],
+        // AllReduce takes one activation input, no tensor weight.
+        OpKind::AllReduce => &[],
+        // AllGather takes one activation input, no tensor weight.
+        OpKind::AllGather => &[],
         OpKind::BiasAdd => &[(1, 1)],
         OpKind::Mul => &[],
         OpKind::Reshape => &[],

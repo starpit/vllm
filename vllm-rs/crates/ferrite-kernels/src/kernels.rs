@@ -440,13 +440,22 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Embedding gather
+    // Embedding gather with vocab-shard masking. At tp=1 callers pass
+    // (vocab_offset=0, vocab_per_rank=weight.dim(0)) and the kernel
+    // degrades to a plain gather. At tp>1 each rank's `weight` is the
+    // [vocab_per_rank, hidden] slice; tokens outside [vocab_offset,
+    // vocab_offset+vocab_per_rank) get zero-filled output rows so the
+    // post-Embed AllReduce-sum produces exactly one contribution per
+    // token from the rank that owns its embedding. Mirrors Python
+    // VocabParallelEmbedding's masked-input + masked_fill_ pattern.
     fn embedding_gather_f16(
         out: *mut u16,
         weight: *const u16,
         ids: *const u32,
         hidden_size: i32,
         num_tokens: i32,
+        vocab_offset: u32,
+        vocab_per_rank: u32,
         stream: CUstream,
     );
     fn embedding_gather_bf16(
@@ -455,6 +464,8 @@ unsafe extern "C" {
         ids: *const u32,
         hidden_size: i32,
         num_tokens: i32,
+        vocab_offset: u32,
+        vocab_per_rank: u32,
         stream: CUstream,
     );
     fn embedding_gather_f32(
@@ -463,6 +474,8 @@ unsafe extern "C" {
         ids: *const u32,
         hidden_size: i32,
         num_tokens: i32,
+        vocab_offset: u32,
+        vocab_per_rank: u32,
         stream: CUstream,
     );
 
@@ -2360,7 +2373,12 @@ pub unsafe fn mla_slice_attn_output(
 // Embedding Gather
 // ---------------------------------------------------------------------------
 
-/// Embedding gather: out[i] = weight[input_ids[i]]
+/// Embedding gather: `out[i] = weight[input_ids[i]]`. Convenience
+/// wrapper for the unsharded (tp=1, hand-written models, etc.) case
+/// — delegates to [`embedding_gather_masked`] with
+/// `(vocab_offset = 0, vocab_per_rank = weight.dim(0))`. Existing
+/// call sites in vllm-cuda hand-written models stay byte-equivalent
+/// to before tensor-parallel landed.
 ///
 /// * `weight`: `[vocab_size, hidden_size]`
 /// * `input_ids`: `[num_tokens]` (U32)
@@ -2368,6 +2386,29 @@ pub unsafe fn mla_slice_attn_output(
 pub unsafe fn embedding_gather(
     weight: GpuTensor,
     input_ids: GpuTensor,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let vocab_per_rank = weight.dim(0) as u32;
+    unsafe { embedding_gather_masked(weight, input_ids, 0, vocab_per_rank, alloc, stream) }
+}
+
+/// Embedding gather with vocab-shard masking, used by ferrite at
+/// tp>1. Each rank's `weight` is the `[vocab_size / world, hidden]`
+/// slice; tokens outside `[vocab_offset, vocab_offset + vocab_per_rank)`
+/// get zero-filled output rows so the cross-rank AllReduce-sum (which
+/// the lowering pass injects when the embed weight's shard-kind is
+/// `ShardDim0`) yields exactly one embedding contribution per token
+/// from the rank that owns it. At tp=1 (`vocab_offset = 0`,
+/// `vocab_per_rank = weight.dim(0)`) the mask never trips and the
+/// output is byte-identical to `embedding_gather`. Mirrors Python
+/// vLLM's `VocabParallelEmbedding.forward_native`'s masked-input +
+/// `masked_fill_(mask, 0)` pattern.
+pub unsafe fn embedding_gather_masked(
+    weight: GpuTensor,
+    input_ids: GpuTensor,
+    vocab_offset: u32,
+    vocab_per_rank: u32,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
@@ -2382,6 +2423,8 @@ pub unsafe fn embedding_gather(
             input_ids.as_ptr(),
             hidden_size as i32,
             num_tokens as i32,
+            vocab_offset,
+            vocab_per_rank,
             stream,
         ),
         DType::BF16 => embedding_gather_bf16(
@@ -2390,6 +2433,8 @@ pub unsafe fn embedding_gather(
             input_ids.as_ptr(),
             hidden_size as i32,
             num_tokens as i32,
+            vocab_offset,
+            vocab_per_rank,
             stream,
         ),
         DType::F32 => embedding_gather_f32(
@@ -2398,6 +2443,8 @@ pub unsafe fn embedding_gather(
             input_ids.as_ptr(),
             hidden_size as i32,
             num_tokens as i32,
+            vocab_offset,
+            vocab_per_rank,
             stream,
         ),
         _ => panic!("embedding_gather: unsupported dtype {:?}", weight.dtype()),

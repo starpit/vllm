@@ -55,6 +55,26 @@ pub fn load_layered_embedding(
         .collect()
 }
 
+/// Vocab-parallel layered Embedding load. Mirrors
+/// [`load_layered_embedding`] but slices each layer's embedding
+/// table along dim 0 (`vocab_size`) per `(rank, world)`. No
+/// layered Embedding accessor exists in any current arch — this
+/// helper is here for symmetry with the other `_sharded` helpers
+/// and so the codegen macro can route every layered FieldLoad
+/// through a `_sharded` variant uniformly. Per Python vLLM's
+/// `VocabParallelEmbedding`.
+pub fn load_layered_embedding_sharded(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffix: &str,
+    rank: usize,
+    world: usize,
+) -> Result<Vec<Embedding>> {
+    (0..n_layers)
+        .map(|layer| Embedding::load_sharded(gw, &layer_weight_path(layer, suffix), rank, world))
+        .collect()
+}
+
 pub fn load_layered_rms_norm(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -87,6 +107,25 @@ pub fn load_layered_linear_dense(
         .collect()
 }
 
+/// Tensor-parallel layered dense Linear load. See
+/// [`ferrite_kernels::layers::Linear::load_sharded`] for the per-
+/// dim bias semantics. Used by codegen at tp>1: column-parallel
+/// (q/k/v/gate/up) → `dim = 0`; row-parallel (o/down) → `dim = 1`.
+pub fn load_layered_linear_dense_sharded(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffix: &str,
+    dim: usize,
+    rank: usize,
+    world: usize,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            LinearLayer::load_dense_sharded(gw, &layer_weight_path(layer, suffix), dim, rank, world)
+        })
+        .collect()
+}
+
 pub fn load_layered_linear_dense_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -98,6 +137,26 @@ pub fn load_layered_linear_dense_concat(
             let paths = concat_paths_for_layer(layer, suffixes);
             let refs = as_str_refs(&paths);
             LinearLayer::load_dense_concat(gw, &refs, stream)
+        })
+        .collect()
+}
+
+/// Tensor-parallel column-parallel concat (no `dim` arg — fused
+/// QKV / gate_up are always column-parallel; see
+/// [`ferrite_kernels::layers::LinearLayer::load_dense_concat_sharded`]).
+pub fn load_layered_linear_dense_concat_sharded(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffixes: &[&str],
+    stream: CUstream,
+    rank: usize,
+    world: usize,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(layer, suffixes);
+            let refs = as_str_refs(&paths);
+            LinearLayer::load_dense_concat_sharded(gw, &refs, stream, rank, world)
         })
         .collect()
 }

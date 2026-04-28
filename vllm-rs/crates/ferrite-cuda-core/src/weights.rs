@@ -1291,6 +1291,7 @@ impl GpuWeights {
         let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
+        dump_shard_head(name, dim, rank, world_size, &shard_shape, dtype, data);
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
         self.gpu_allocs
             .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
@@ -1322,6 +1323,7 @@ impl GpuWeights {
         let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
+        dump_shard_head(name, dim, rank, world_size, &shard_shape, dtype, data);
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
 
         Ok(size_bytes)
@@ -1403,6 +1405,86 @@ impl GpuWeights {
         let data = cpu_ref.data().to_vec();
         Ok((data, cpu_ref.shape, cpu_ref.dtype))
     }
+}
+
+/// FERRITE_WEIGHT_DUMP=1: print first 8 elements of the shard plus first 8
+/// of the LAST row (catches dim=1 striding bugs that look right at row 0).
+/// Output is one line: tag, name, dim/rank/world, shape, head bf16-bits hex,
+/// head f32 values, tail-row bf16-bits hex, tail-row f32 values. Designed to
+/// diff against an equivalent Python print of `param.data.flatten()[:8]` and
+/// `param.data[-1, :8]` after the loader has applied its narrow().
+fn dump_shard_head(
+    name: &str,
+    dim: usize,
+    rank: usize,
+    world: usize,
+    shape: &[usize],
+    dtype: DType,
+    data: *const u8,
+) {
+    if std::env::var("FERRITE_WEIGHT_DUMP").ok().as_deref() != Some("1") {
+        return;
+    }
+    if !matches!(dtype, DType::BF16 | DType::F16 | DType::F32) {
+        return;
+    }
+    let total: usize = shape.iter().product();
+    let head_n = 8.min(total);
+    if head_n == 0 {
+        return;
+    }
+    let mut head_f32 = vec![0f32; head_n];
+    unsafe {
+        let head_bytes = std::slice::from_raw_parts(data, head_n * dtype.size_bytes());
+        read_to_f32(head_bytes, dtype, &mut head_f32);
+    }
+    let head_bits: Vec<String> = (0..head_n)
+        .map(|i| match dtype {
+            DType::BF16 | DType::F16 => {
+                format!("{:04x}", unsafe { *(data.add(i * 2) as *const u16) })
+            }
+            DType::F32 => format!("{:08x}", unsafe { *(data.add(i * 4) as *const u32) }),
+            _ => unreachable!(),
+        })
+        .collect();
+    let head_vals: Vec<String> = head_f32.iter().map(|v| format!("{v:+.6e}")).collect();
+    let mut tail_part = String::new();
+    if shape.len() == 2 && shape[0] > 1 {
+        let cols = shape[1];
+        let last_row = shape[0] - 1;
+        let row_off = last_row * cols * dtype.size_bytes();
+        let tail_n = 8.min(cols);
+        let mut tail_f32 = vec![0f32; tail_n];
+        unsafe {
+            let tail_bytes =
+                std::slice::from_raw_parts(data.add(row_off), tail_n * dtype.size_bytes());
+            read_to_f32(tail_bytes, dtype, &mut tail_f32);
+        }
+        let tail_bits: Vec<String> = (0..tail_n)
+            .map(|i| match dtype {
+                DType::BF16 | DType::F16 => format!("{:04x}", unsafe {
+                    *(data.add(row_off + i * 2) as *const u16)
+                }),
+                DType::F32 => format!("{:08x}", unsafe {
+                    *(data.add(row_off + i * 4) as *const u32)
+                }),
+                _ => unreachable!(),
+            })
+            .collect();
+        let tail_vals: Vec<String> = tail_f32.iter().map(|v| format!("{v:+.6e}")).collect();
+        tail_part = format!(
+            " tail_row={last_row} tail_bits=[{}] tail_vals=[{}]",
+            tail_bits.join(","),
+            tail_vals.join(","),
+        );
+    }
+    eprintln!(
+        "[ferrite-weight-dump] name={name} dim={dim} rank={rank}/{world} shape={shape:?} \
+         head_bits=[{}] head_vals=[{}]{}",
+        head_bits.join(","),
+        head_vals.join(","),
+        tail_part,
+    );
 }
 
 impl Drop for GpuWeights {

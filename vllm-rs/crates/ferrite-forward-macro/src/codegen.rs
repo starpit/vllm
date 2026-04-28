@@ -3565,6 +3565,12 @@ pub fn emit_model(
     // a canonical with FusedAddRmsNorm or Marlin* IR variants), skip
     // — writing a .cu we know NVCC will choke on would break the
     // libmegakernels.a build.
+    // Per-canonical Rust extern "C" decl for
+    // `tk_megakernel_<canonical>_launch`. Gated identically to the
+    // .cu write so the linker only ever sees declarations whose
+    // symbols are actually compiled into libmegakernels.a; the
+    // step-6c marshaling wrapper will be the first caller.
+    let mut kvm_extern_decls: Vec<TokenStream> = Vec::new();
     if kvm_emitted_any {
         let canonical_bounds = bounds_for_wp(model, *bucket_points.first().unwrap());
         // Only write a .cu file if the canonical's dims satisfy
@@ -3580,6 +3586,7 @@ pub fn emit_model(
                     model.name, e
                 );
             }
+            kvm_extern_decls.push(kvm_mega::emit_kvm_extern_decl(&model.name));
         }
     }
 
@@ -3772,6 +3779,8 @@ pub fn emit_model(
         #instruction_alias
 
         #(#static_slices)*
+
+        #(#kvm_extern_decls)*
 
         #forward_table
 

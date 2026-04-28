@@ -49,6 +49,7 @@
 #![allow(dead_code)]
 
 use proc_macro2::TokenStream;
+use quote::quote;
 use syn::Lit;
 
 use crate::impl_lib::OpInstance;
@@ -1200,6 +1201,110 @@ pub fn write_kvm_cu_to_cache(
     let path = cache_dir.join(format!("tk_megakernel_{canonical_name}.cu"));
     std::fs::write(&path, source)?;
     Ok(path)
+}
+
+/// Emit the Rust `unsafe extern "C"` decl matching the per-canonical
+/// `tk_megakernel_<canonical>_launch` symbol from
+/// [`emit_kvm_cu_source`]. The signature mirrors the C launcher's
+/// ~50-arg shape exactly — every `void*` is `*mut c_void`, every
+/// `int` is `i32`, every `float` is `f32`, return is `i32`. Argument
+/// names match the C side for cross-reference.
+///
+/// Emission is gated on the same condition as
+/// [`write_kvm_cu_to_cache`]: callers must verify
+/// `kvm_emitted_any && kvm_kernel_dims_from_bounds(...).is_some()`
+/// before emitting, otherwise the linker will fail to resolve a
+/// symbol that was never written into `libmegakernels.a`.
+///
+/// `#[allow(dead_code, non_snake_case, clippy::too_many_arguments)]`
+/// is set so the decl compiles cleanly until the per-canonical
+/// marshaling wrapper (P2-4b step 6c) calls it; `non_snake_case`
+/// covers the `qkv_R` / `o_R` / etc. arg names that mirror the C
+/// side's compile-time reduction-dim parameters.
+pub fn emit_kvm_extern_decl(canonical_name: &str) -> TokenStream {
+    let fn_ident = syn::Ident::new(
+        &format!("tk_megakernel_{canonical_name}_launch"),
+        proc_macro2::Span::call_site(),
+    );
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code, non_snake_case, clippy::too_many_arguments)]
+        unsafe extern "C" {
+            pub fn #fn_ident(
+                // VM machinery (instruction tape + timing buffer +
+                // global atomic counter + per-op semaphore array).
+                d_bar: *mut ::core::ffi::c_void,
+                bar_d0: ::core::primitive::i32,
+                bar_d1: ::core::primitive::i32,
+                bar_d2: ::core::primitive::i32,
+                bar_d3: ::core::primitive::i32,
+                d_instructions: *mut ::core::ffi::c_void,
+                num_instructions: ::core::primitive::i32,
+                d_timings: *mut ::core::ffi::c_void,
+                num_timing_rows: ::core::primitive::i32,
+                d_global_instruction_index: *mut ::core::ffi::c_void,
+                // Weights: 9 layered tensors.
+                d_qkv_weights: *mut ::core::ffi::c_void,
+                qkv_R: ::core::primitive::i32,
+                d_attn_norm_weights: *mut ::core::ffi::c_void,
+                d_o_weights: *mut ::core::ffi::c_void,
+                o_R: ::core::primitive::i32,
+                d_mlp_norm_weights: *mut ::core::ffi::c_void,
+                d_up_weights: *mut ::core::ffi::c_void,
+                up_R: ::core::primitive::i32,
+                d_gate_weights: *mut ::core::ffi::c_void,
+                gate_R: ::core::primitive::i32,
+                d_down_weights: *mut ::core::ffi::c_void,
+                down_R: ::core::primitive::i32,
+                d_lm_head_norm_weights: *mut ::core::ffi::c_void,
+                d_lm_head_weights: *mut ::core::ffi::c_void,
+                lm_head_R: ::core::primitive::i32,
+                // Paged KV cache.
+                d_k_cache: *mut ::core::ffi::c_void,
+                kv_total_pages: ::core::primitive::i32,
+                kv_page_size_runtime: ::core::primitive::i32,
+                d_v_cache: *mut ::core::ffi::c_void,
+                // Rope tables.
+                d_rope_cos: *mut ::core::ffi::c_void,
+                max_pos: ::core::primitive::i32,
+                d_rope_sin: *mut ::core::ffi::c_void,
+                // Activations.
+                d_hidden_states: *mut ::core::ffi::c_void,
+                batch_size_arg: ::core::primitive::i32,
+                d_rms_rope_intermediates: *mut ::core::ffi::c_void,
+                d_rms_gate_intermediates: *mut ::core::ffi::c_void,
+                d_q_post_rope: *mut ::core::ffi::c_void,
+                d_attn_out: *mut ::core::ffi::c_void,
+                d_silu_out: *mut ::core::ffi::c_void,
+                d_rms_lm_head_intermediates: *mut ::core::ffi::c_void,
+                d_logits: *mut ::core::ffi::c_void,
+                vocab_size_arg: ::core::primitive::i32,
+                // Per-call paged-KV metadata (int32 vectors).
+                d_position_ids: *mut ::core::ffi::c_void,
+                num_position_ids: ::core::primitive::i32,
+                d_kv_append_indices: *mut ::core::ffi::c_void,
+                d_prefill_qo_indptr: *mut ::core::ffi::c_void,
+                num_prefill_qo: ::core::primitive::i32,
+                d_prefill_kv_indptr: *mut ::core::ffi::c_void,
+                d_prefill_kv_indices: *mut ::core::ffi::c_void,
+                num_prefill_kv_indices: ::core::primitive::i32,
+                d_prefill_kv_last_page_len: *mut ::core::ffi::c_void,
+                d_decode_kv_indptr: *mut ::core::ffi::c_void,
+                num_decode_seqs: ::core::primitive::i32,
+                d_decode_kv_indices: *mut ::core::ffi::c_void,
+                num_decode_kv_indices: ::core::primitive::i32,
+                d_decode_kv_last_page_len: *mut ::core::ffi::c_void,
+                // Scalars.
+                attn_scale: ::core::primitive::f32,
+                rms_norm_eps: ::core::primitive::f32,
+                num_pages: ::core::primitive::i32,
+                num_prefill_tokens: ::core::primitive::i32,
+                dev_idx: ::core::primitive::i32,
+                // CUDA stream (raw pointer cast to cudaStream_t).
+                raw_stream: *mut ::core::ffi::c_void,
+            ) -> ::core::primitive::i32;
+        }
+    }
 }
 
 // ── Helpers (private) ───────────────────────────────────────────

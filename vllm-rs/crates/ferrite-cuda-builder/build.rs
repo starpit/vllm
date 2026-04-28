@@ -548,30 +548,6 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // Vendor megakernel requires c++20 unconditionally (uses
     // c++20 concept syntax + std::is_same_v in concepts).
     let std_flag = "-std=c++20";
-    // Hopper-specific arch tag — matches vendor's Makefile
-    // (`-DKITTENS_HOPPER -arch=sm_90a`). sm_90 (no `a`) lacks the
-    // tcgen / wgmma intrinsics ThunderKittens uses.
-    let (gencode, kittens_arch_define) = if arch_num >= 100 {
-        (
-            format!("-gencode=arch=compute_{arch}a,code=sm_{arch}a"),
-            "-DKITTENS_HOPPER -DKITTENS_BLACKWELL",
-        )
-    } else if arch_num >= 90 {
-        (
-            "-gencode=arch=compute_90a,code=sm_90a".to_string(),
-            "-DKITTENS_HOPPER",
-        )
-    } else if arch_num >= 80 {
-        (
-            format!("-gencode=arch=compute_{arch},code=sm_{arch}"),
-            "-DKITTENS_A100",
-        )
-    } else {
-        (
-            format!("-gencode=arch=compute_{arch},code=sm_{arch}"),
-            "-DKITTENS_4090",
-        )
-    };
 
     // The megakernel .cu files include megakernel_ops.cuh from vllm-cuda/csrc.
     const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
@@ -586,25 +562,36 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
+        // cudaforge's compute_cap auto-suffixes 'a' for sm_90+
+        // (Hopper requires sm_90a for __cluster_dims__ etc.).
+        .compute_cap(arch_num as usize)
         .include_path("../../crates/vllm-cuda/csrc")
-        .include_path("../../third_party/thunderkittens/include")
-        .include_path("../../third_party/megakernels/include")
         .include_path("../../third_party/megakernels/cross-gpu-llama")
+        .include_path("../../third_party/megakernels/include")
+        .include_path("../../third_party/thunderkittens/include")
         .with_cutlass(Some(CUTLASS_COMMIT));
-    mk_builder
+    mk_builder = mk_builder
         .arg(std_flag)
         .arg("-O3")
         .arg("--use_fast_math")
         .arg("--expt-extended-lambda")
         .arg("--expt-relaxed-constexpr")
-        .arg("-forward-unknown-to-host-compiler")
         .arg("-DNDEBUG")
-        .arg(kittens_arch_define)
         .arg("-Xcompiler=-fPIC")
         .arg("-Xcompiler=-fno-strict-aliasing")
         .arg("-Xcompiler=-Wno-psabi")
-        .arg(&gencode)
-        .arg("-lineinfo")
+        .arg("-lineinfo");
+    // KITTENS_* arch flag — vendor's Makefile sets these per GPU.
+    // ThunderKittens 2.0 gates wgmma + paged-KV TMA descriptors
+    // on these.
+    if arch_num >= 100 {
+        mk_builder = mk_builder.arg("-DKITTENS_BLACKWELL");
+    } else if arch_num >= 90 {
+        mk_builder = mk_builder.arg("-DKITTENS_HOPPER");
+    } else if arch_num >= 89 {
+        mk_builder = mk_builder.arg("-DKITTENS_4090");
+    }
+    mk_builder
         .build_lib(format!("{cache_dir}/libmegakernels.a"))
         .expect("failed to build megakernel .cu files");
 

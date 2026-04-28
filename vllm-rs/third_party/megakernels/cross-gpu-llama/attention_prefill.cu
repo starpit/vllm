@@ -9,9 +9,14 @@ struct attention_prefill {
     static constexpr int NUM_STAGES = 2;
     static constexpr int GQA_RATIO = Globals::num_attention_heads / Globals::num_kv_heads;
     static constexpr int NUM_ATTN_HEADS_PER_DEVICE = Globals::num_attention_heads / Globals::num_devices;
-    static_assert(NUM_ATTN_HEADS_PER_DEVICE == 8, "Fix");
-
-    static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
+    // Vendor asserts pinned to Llama-70B at TP=8 (NUM_ATTN_HEADS_PER_DEVICE
+    // = 64/8 = 8, GQA_RATIO = 64/8 = 8). Relaxed: surrounding code
+    // parameterizes via heads_per_dev = num_attention_heads /
+    // num_devices (line 368) and GQA_RATIO is used as a runtime
+    // bound (line 381). Register tiles are 16-row capacity, so
+    // GQA_RATIO upper bound is 16.
+    static_assert(NUM_ATTN_HEADS_PER_DEVICE >= 1, "must be positive");
+    static_assert(GQA_RATIO >= 1 && GQA_RATIO <= 16, "GQA_RATIO must fit in 16-row register tiles");
 
     static constexpr int head_dim = Globals::head_dim;
     static constexpr int kv_page_size = Globals::kv_page_size;
@@ -24,7 +29,7 @@ struct attention_prefill {
     using attn_bf_rt = rt_bf<16, kv_page_size>;
     using max_vec_rv = col_vec<rt_fl<16, head_dim>>;
     using norm_vec_rv = col_vec<rt_fl<16, head_dim>>;
-    using head_vec_sv = sv_bf<128>;
+    using head_vec_sv = sv_bf<head_dim>;
 
     struct prefill_instruction {
         int layer_idx;
@@ -345,7 +350,7 @@ struct attention_prefill {
             warp::store(O(s, warpid()), O_reg);
             group<8>::sync(0);
 
-            rv_fl<128> out_vecs[16];
+            rv_fl<head_dim> out_vecs[16];
 #pragma unroll
             for (int i = 0; i < 16; i++) {
                 warp::load(out_vecs[i], O(s, warpid()), {i, 0});

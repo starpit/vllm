@@ -22,27 +22,59 @@
 #define OPCODE_Barrier_Inc 12
 #define OPCODE_AllDeviceBarrier 13
 
+// Per-arch overrides via #ifndef guards: the macro-generated
+// tk_megakernel_<arch>.cu file `#defines` these BEFORE this file is
+// included, so the guards prevent vendor's Llama-70B defaults from
+// stomping on the per-arch values.
+#ifndef LLAMA_NUM_LAYERS
 #define LLAMA_NUM_LAYERS 80
+#endif
+#ifndef LLAMA_HIDDEN_DIM
 #define LLAMA_HIDDEN_DIM 8192
+#endif
+#ifndef LLAMA_INTERMEDIATE_DIM
 #define LLAMA_INTERMEDIATE_DIM 28672
+#endif
+#ifndef LLAMA_HEAD_DIM
 #define LLAMA_HEAD_DIM 128
+#endif
+#ifndef LLAMA_NUM_ATTENTION_HEADS
 #define LLAMA_NUM_ATTENTION_HEADS 64
+#endif
+#ifndef LLAMA_NUM_KV_HEADS
 #define LLAMA_NUM_KV_HEADS 8
-#define LLAMA_KV_PAGE_SIZE 128 /*128*/
+#endif
+#ifndef LLAMA_KV_PAGE_SIZE
+#define LLAMA_KV_PAGE_SIZE 128
+#endif
+#ifndef LLAMA_PREFILL_KV_BLOCK_SIZE
 #define LLAMA_PREFILL_KV_BLOCK_SIZE 128
+#endif
+#ifndef LLAMA_DECODE_KV_BLOCK_SIZE
 #define LLAMA_DECODE_KV_BLOCK_SIZE 16
+#endif
+#ifndef LLAMA_MATMUL_OUT_BLOCK_SIZE
 #define LLAMA_MATMUL_OUT_BLOCK_SIZE 256
+#endif
 
+#ifndef LLAMA_MATMUL_BATCH_BLOCK_SIZE
 #ifdef KITTENS_BLACKWELL
 #define LLAMA_MATMUL_BATCH_BLOCK_SIZE 256
 #else
 #define LLAMA_MATMUL_BATCH_BLOCK_SIZE 128
 #endif
+#endif
 
+#ifndef SM_COUNT
 #ifdef KITTENS_BLACKWELL
 #define SM_COUNT 148
 #else
 #define SM_COUNT 132
+#endif
+#endif
+
+#ifndef LLAMA_NUM_DEVICES
+#define LLAMA_NUM_DEVICES 8
 #endif
 
 struct base_llama_config {
@@ -104,11 +136,30 @@ struct llama_config : public base_llama_config {
     static constexpr bool TIMING_RECORD_ENABLED = false;
 };
 
+// gl_as_pgl: thin wrapper that makes a `kittens::gl<>` look like
+// vendor's old `kittens::pgl<>` for TP=1 use. The op code in
+// cross-gpu-llama uses `g.field[g.dev_idx]` syntax (pgl array
+// indexing); this wrapper supplies operator[] returning self for any
+// device index. For TP>1, this needs to be replaced with a TK 2.x-
+// compatible pgl typedef carrying multicast TMA descriptors.
+template<typename GL>
+struct gl_as_pgl : public GL {
+    using _GL = GL;
+    static constexpr int num_devices = 1;
+    using GL::GL;
+    __host__ __device__ const GL &operator[](int) const { return *this; }
+    __host__ __device__       GL &operator[](int)       { return *this; }
+};
+
 template <typename config, int _num_hidden_layers, int _hidden_dim, int _intermediate_dim, int _head_dim,
           int _num_attention_heads, int _num_kv_heads, int _kv_page_size, int _prefill_kv_block_size,
           int _decode_kv_block_size, int _matmul_out_block_size, int _matmul_batch_block_size, int _sm_count>
 struct globals_t {
-    constexpr static int num_devices = 8;
+    // Vendor hardcoded `num_devices = 8`. We honor the LLAMA_NUM_DEVICES
+    // macro instead so TP=1 (and other shardings) get a kv_cache_t with
+    // r=num_kv_heads/num_devices >= 1. Without this, models with
+    // num_kv_heads<8 hit `static_assert(cdim<0>)` in TK gl<>.
+    constexpr static int num_devices = LLAMA_NUM_DEVICES;
 
     constexpr static int num_hidden_layers = _num_hidden_layers;
     constexpr static int matmul_out_block_size = _matmul_out_block_size;
@@ -132,17 +183,31 @@ struct globals_t {
     using weights_big_indim_t =
         kittens::gl<kittens::bf16, 1, -1, -1, intermediate_dim / num_devices, kittens::st_bf<256, 64>>;
 
-    using activations_t = kittens::gl<kittens::bf16, 1, 1, -1, -1, kittens::sv_bf<hidden_dim>, kittens::st_bf<16, 128>,
+    // Vendor literal 128 in `st_bf<16, 128>` is head_dim — parameterized
+    // here. The 64s in `st_bf<64, 64>` and `st_bf<16, 64>` are kept as
+    // literals because they're vendor-tuned tile shapes (kv-block /
+    // pipeline-depth specific) that aren't head_dim-derived.
+    using activations_t = kittens::gl<kittens::bf16, 1, 1, -1, -1, kittens::sv_bf<hidden_dim>, kittens::st_bf<16, head_dim>,
                                       kittens::st_bf<64, 64>, kittens::sv_bf<head_dim>, kittens::st_bf<16, 64>>;
 
-    using activations_parallel_t =
-        kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
-                                 kittens::sv_bf<hidden_dim>, kittens::st_bf<64, 256>, kittens::sv_bf<head_dim>>,
-                     num_devices, false, false>;
+    // Vendor cross-gpu-llama was written against ThunderKittens 1.x's
+    // `pgl<>` signature (4 booleans). TK 2.x's pgl is
+    // `pgl<_GL, NUM_DEVICES, MULTICAST, ...TMA_Types>` and rejects
+    // bool literals after the multicast flag. For TP=1 we don't need
+    // multi-GPU multicast at all — the op code references
+    // `g.field[g.dev_idx]` syntax which only needs operator[] on the
+    // type. `gl_as_pgl<GL>` (defined below) supplies that, returning
+    // self for any device index. For TP>1 a TK 2.x-compatible pgl
+    // typedef is needed; pin behind `#if num_devices > 1` later.
+    using activations_parallel_inner_t =
+        kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
+                    kittens::sv_bf<hidden_dim>, kittens::st_bf<64, 256>, kittens::sv_bf<head_dim>>;
+    using activations_parallel_t = gl_as_pgl<activations_parallel_inner_t>;
 
-    using activations_parallel_mc_t =
-        kittens::pgl<kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>>, num_devices, true, true,
-                     kittens::sv_bf<hidden_dim>>;
+    using activations_parallel_mc_inner_t =
+        kittens::gl<kittens::bf16, 1, 1, -1, hidden_dim, kittens::st_bf<64, 64>,
+                    kittens::sv_bf<hidden_dim>>;
+    using activations_parallel_mc_t = gl_as_pgl<activations_parallel_mc_inner_t>;
 
     using activations_big_indim_t =
         kittens::gl<kittens::bf16, 1, 1, -1, intermediate_dim / num_devices, kittens::st_bf<64, 256>,
@@ -160,8 +225,10 @@ struct globals_t {
                                    // kittens::tma::descriptor<kittens::st_bf<16, 128>, 0>,
                                    kittens::sv_bf<head_dim>>;
 
-    using barriers = kittens::pgl<kittens::gl<uint, -1, -1, -1, -1>, num_devices,
-                                  false>;  // no need to initialize multicast
+    // TK 2.x pgl signature change — see activations_parallel_t comment
+    // above. For TP=1 wrap the inner gl in gl_as_pgl.
+    using barriers_inner_t = kittens::gl<uint, -1, -1, -1, -1>;
+    using barriers = gl_as_pgl<barriers_inner_t>;
 
     // vm stuff
     barriers Bar;

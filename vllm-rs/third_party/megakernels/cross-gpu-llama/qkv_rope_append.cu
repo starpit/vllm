@@ -14,7 +14,17 @@ struct qkv_rope_append {
     static constexpr int NUM_ITERS = Globals::hidden_dim / PIPELINE_K_DIM;
     static_assert(KV_COL_START % 2 == 0, "Fix");
 
-    static_assert(Globals::head_dim == 128, "Head dim must be 128.");
+    // Vendor pinned head_dim to 128 (Llama-70B). Relaxed: surrounding
+    // code is parameterized below via Globals::head_dim. Constraints
+    // that remain real:
+    //  - num_generated_heads (= matmul_out_block_size / head_dim) must
+    //    be 2 for the K/V split (output_vecs[0]=K, output_vecs[1]=V at
+    //    the storer). Pin this with a separate assert.
+    //  - head_dim % 32 == 0 (already asserted in apply_rope_inplace).
+    static constexpr int num_generated_heads_assert =
+        Globals::matmul_out_block_size / Globals::head_dim;
+    static_assert(num_generated_heads_assert == 2,
+                  "matmul_out_block_size must equal 2*head_dim (the K/V split assumes 2 heads per QKV col)");
 
     using sv_fl_head_dim = sv_fl<Globals::head_dim>;
     using sv_bf_head_dim = sv_bf<Globals::head_dim>;
@@ -90,7 +100,10 @@ struct qkv_rope_append {
             parsed_instruction inst{s};
 
             semaphore &rope_arrived_sem = rope_arrived(s);
-            tma::expect_bytes(rope_arrived_sem, sizeof(float) * 128 * 256 / WARP_THREADS);
+            // matmul_batch_block_size tokens × (cos + sin) × head_dim
+            // floats; vendor literal 128*256 = 128 * 2 * 128 (= mbbs * 2*head_dim).
+            tma::expect_bytes(rope_arrived_sem,
+                              sizeof(float) * Globals::matmul_batch_block_size * 2 * Globals::head_dim / WARP_THREADS);
 
             matmul_pipeline::template loader_loop(s, g, inst.layer);
             s.loader_record(LOAD2_EVENT);
@@ -185,7 +198,12 @@ struct qkv_rope_append {
 
     struct consumer {
         static __device__ void run(const Globals &g, state<Config> &s) {
-            static_assert(Globals::num_devices == 8, "Fix this function.");
+            // Original `static_assert(num_devices == 8)` was a vendor
+            // "tested only with 8" marker — the consumer body uses
+            // num_devices only via Globals::num_attention_heads /
+            // Globals::num_devices through the matmul_pipeline + KV_COL_START
+            // (already parameterized). NUM_CONSUMER_WARPS=8 stays;
+            // base_llama_config pins it.
             static_assert(Config::NUM_CONSUMER_WARPS == 8, "Fix this function.");
 
             parsed_instruction inst{s};
@@ -193,7 +211,9 @@ struct qkv_rope_append {
             using matmul_rt = rt_fl<16, 256>;
             using matmul_st = st_fl<16, 256>;
 
-            rv_fl<128> out_vecs[16][2];
+            // Vendor literal 128 = head_dim: each output_vec slot holds
+            // one head's worth of floats.
+            rv_fl<Globals::head_dim> out_vecs[16][2];
 
             matmul_rt out_fl = matmul_pipeline::matmul_loop<6>(s, g);
 
@@ -224,7 +244,9 @@ struct qkv_rope_append {
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     warp::load(out_vecs[i][0], convert_tile, {i, 0});
-                    warp::load(out_vecs[i][1], convert_tile, {i, 128});
+                    // Vendor literal 128 = head_dim: convert_tile is
+                    // 16xmatmul_out_block_size; head 1 starts at column head_dim.
+                    warp::load(out_vecs[i][1], convert_tile, {i, Globals::head_dim});
                 }
                 group<8>::sync(0);
             } else {
@@ -234,7 +256,9 @@ struct qkv_rope_append {
 #pragma unroll
                 for (int i = 0; i < 16; i++) {
                     warp::load(out_vecs[i][0], convert_tile, {i, 0});
-                    warp::load(out_vecs[i][1], convert_tile, {i, 128});
+                    // Vendor literal 128 = head_dim: convert_tile is
+                    // 16xmatmul_out_block_size; head 1 starts at column head_dim.
+                    warp::load(out_vecs[i][1], convert_tile, {i, Globals::head_dim});
                 }
             }
 
@@ -284,7 +308,14 @@ struct qkv_rope_append {
         static __device__ void run(const Globals &g, state<Config> &s) {
             wait(outputs_arrived(s), 0);
 
-            static_assert(Globals::num_devices == 8, "Fix this function.");
+            // Original `static_assert(num_devices == 8)` was paired with
+            // `kv_head_idx_on_this_gpu = 0` which assumed exactly one
+            // KV head per device. Generalized below to
+            // `inst.local_col - KV_COL_START`, which equals 0 in vendor's
+            // tested Llama-70B@TP=8 case (KV_COL_START=4, single KV col
+            // at col=4) and varies 0..(num_kv_heads/num_devices - 1) for
+            // multi-KV-head-per-device configs (e.g. Llama-70B@TP=1
+            // has 8 KV cols at 4..11 → kv_head_idx 0..7).
             parsed_instruction inst{s};
 
             sv_bf_head_dim *output_vecs[2] = {
@@ -318,7 +349,11 @@ struct qkv_rope_append {
                         auto page_idx = append_idx / Globals::kv_page_size;
                         auto offset_in_page = append_idx % Globals::kv_page_size;
 
-                        auto kv_head_idx_on_this_gpu = 0;
+                        // Generalized from vendor's hardcoded 0 (which
+                        // assumed 1 KV head per device). KV cols start at
+                        // KV_COL_START; each KV col handles one (K, V)
+                        // pair for one KV head on this device.
+                        auto kv_head_idx_on_this_gpu = inst.local_col - KV_COL_START;
 
                         tma::store_async(
                             g.k_cache, first_vec,

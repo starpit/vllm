@@ -3,7 +3,10 @@
 using namespace kittens;
 using namespace megakernel;
 
-// Masked load for Q
+// Masked load for Q.
+// Vendor literal `kv_offset * 128` was a head_dim=128 stride; replaced
+// with the register tile's column count (= head_dim by construction
+// for q_rt = rt_bf<16, head_dim>) so this works for head_dim != 128.
 template <int axis, ducks::rt::row_layout RT, ducks::gl::all GL, ducks::coord::tile COORD = coord<RT>>
 __device__ inline static void masked_q_warp_load(RT &dst, const GL &src, const COORD &idx, int num_kv_heads) {
     using T2 = RT::dtype;
@@ -12,6 +15,8 @@ __device__ inline static void masked_q_warp_load(RT &dst, const GL &src, const C
 #ifdef KITTENS_HOPPER
     static_assert(!std::is_same_v<T2, fp8e4m3_4> && !std::is_same_v<T2, fp8e5m2_4>, "Unsupported type for load/store");
 #endif
+
+    constexpr int head_dim_stride = RT::cols;
 
     U *src_ptr = (U *)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
@@ -23,9 +28,9 @@ __device__ inline static void masked_q_warp_load(RT &dst, const GL &src, const C
         for (int j = 0; j < dst.width; j++) {
             int col = j * dst.tile_size_col + 2 * (warp_laneid % 4);
             dst.tiles[0][j].data[0] =
-                base_types::convertor<T2, U2>::convert(*(U2 *)(&src_ptr[kv_offset * 128 + col + 0]));
+                base_types::convertor<T2, U2>::convert(*(U2 *)(&src_ptr[kv_offset * head_dim_stride + col + 0]));
             dst.tiles[0][j].data[2] =
-                base_types::convertor<T2, U2>::convert(*(U2 *)(&src_ptr[kv_offset * 128 + col + 8]));
+                base_types::convertor<T2, U2>::convert(*(U2 *)(&src_ptr[kv_offset * head_dim_stride + col + 8]));
         }
     }
 }
@@ -36,9 +41,15 @@ struct attention_decode {
     static constexpr int NUM_STAGES = 3;
     static constexpr int GQA_RATIO = Globals::num_attention_heads / Globals::num_kv_heads;
     static constexpr int NUM_ATTN_HEADS_PER_DEVICE = Globals::num_attention_heads / Globals::num_devices;
-    static_assert(NUM_ATTN_HEADS_PER_DEVICE == 8, "Fix");
-
-    static_assert(GQA_RATIO == 8, "GQA_RATIO must be 8.");
+    // Original vendor asserts pinned NUM_ATTN_HEADS_PER_DEVICE and
+    // GQA_RATIO to 8 (Llama-70B at TP=8 shape). Relaxed: surrounding
+    // code parameterizes both — register tiles are 16-row with
+    // "only GQA_RATIO rows used" (lines below), masked_q_warp_load
+    // takes GQA_RATIO at runtime (consumer warp), and the q_head_idx
+    // loops bound on < GQA_RATIO. Upper bound is 16 (register tile
+    // row capacity). Allows us to target Llama-3.2-1B (GQA=4) etc.
+    static_assert(NUM_ATTN_HEADS_PER_DEVICE >= 1, "must be positive");
+    static_assert(GQA_RATIO >= 1 && GQA_RATIO <= 16, "GQA_RATIO must fit in 16-row register tiles");
     static_assert(NUM_STAGES <= Config::NUM_PAGES, "Not enough pages. Time to actually use full pages.");
 
     static constexpr int head_dim = Globals::head_dim;
@@ -394,7 +405,7 @@ struct attention_decode {
             uint8_t(*O_smem) = reinterpret_cast<uint8_t *>(s.pages[s.pid(5)].data);  // reusing last V page
 
             store_8_rows<false>(
-                reinterpret_cast<sv_bf<128> *>(O_smem + seq_id * Globals::head_dim * GQA_RATIO * sizeof(bf16)),
+                reinterpret_cast<sv_bf<head_dim> *>(O_smem + seq_id * Globals::head_dim * GQA_RATIO * sizeof(bf16)),
                 O_reg);  // just store, no add.
 
             warp::sync();
@@ -410,7 +421,7 @@ struct attention_decode {
             constexpr int heads_per_dev = Globals::num_attention_heads / Globals::num_devices;
 
             int O_page = s.pid(5);
-            sv_bf<128>(*O_smem) = reinterpret_cast<sv_bf<128> *>(s.pages[O_page].data);  // reusing last V page
+            sv_bf<head_dim>(*O_smem) = reinterpret_cast<sv_bf<head_dim> *>(s.pages[O_page].data);  // reusing last V page
 
             int num_seqs = get_num_seqs_in_instruction(s);
 

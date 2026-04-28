@@ -9,7 +9,8 @@
 
 ## STATE 2026-04-28 (PM) — P2-4b steps 6a + 6b-i done; step 6c (marshaling wrapper) is next
 
-Tip `3b9b836ba`. Two commits past `4c71d603f`:
+Tip `ec8992109` (this doc itself). Three commits past
+`4c71d603f`:
 
 - **`50d4f3888`** — step 6a: `KvmMegaLauncher<W>` fn-ptr type +
   `kvm_mega_forced()` env gate in `ferrite-forward/src/lib.rs`.
@@ -27,6 +28,9 @@ Tip `3b9b836ba`. Two commits past `4c71d603f`:
   so the linker only ever sees declarations whose symbols
   actually exist in libmegakernels.a. Decl currently has no
   caller (the wrapper that fills it is step 6c).
+- **`ec8992109`** — this doc, refreshed: rewrites STATE +
+  replaces the stale "Step 6 — Rust-side launcher wire-up"
+  punch list with the 6c work order below.
 
 250/254 tests pass on `cargo test -p ferrite-forward-macro
 --release`; the 4 failures are pre-existing on HEAD
@@ -282,10 +286,10 @@ own commits, justified line-by-line.
 - 3-slot `LAUNCHER_TABLE` + kvm dispatch branches in
   `forward()` / `forward_backbone()`:
   `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs` ~ln
-  3735–3905.
+  3756–3905.
 - Per-canonical extern "C" decl emitter:
   `vllm-rs/crates/ferrite-forward-macro/src/interpreters/kvm_mega.rs::emit_kvm_extern_decl`
-  (called from `codegen.rs` ~ln 3585).
+  (called from `codegen.rs` ~ln 3589).
 
 After step 6c lands, the verification path is:
 `FERRITE_FORCE_KVM_MEGA=1 vllm chat -m

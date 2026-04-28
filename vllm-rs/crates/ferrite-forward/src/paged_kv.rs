@@ -207,6 +207,203 @@ pub fn build_paged_kv_metadata_from_host(inputs: PagedKvHostInputs<'_>) -> Paged
     out
 }
 
+// ── Device-side wrapper (cuda only) ────────────────────────────
+
+/// Cuda-gated runtime wrapper around
+/// [`build_paged_kv_metadata_from_host`]. Does the D2H of the
+/// `ForwardCtx` paging-state tensors, runs the pure host helper,
+/// then H2Ds each output vector into a fresh `OwnedTensor` from
+/// the device's caching allocator. The resulting
+/// [`device::DevicePagedKv`] holds nine owned int32 tensors the
+/// kvm marshaling wrapper passes directly into the
+/// `tk_megakernel_<canonical>_launch` C entry point.
+///
+/// The seven CSR vectors are tiny — `O(num_seqs)` to
+/// `O(total_q_tokens)`, each i32 — so D2H/H2D round-trip cost is
+/// in the microseconds. Long term this should move to a device-
+/// side build (or a `ForwardCtx` refactor that surfaces the
+/// engine's host-side ints directly) but for the smoke-test path
+/// the round-trip is harmless.
+#[cfg(feature = "cuda")]
+pub mod device {
+    use super::{PagedKvHostInputs, PagedKvMetadata, build_paged_kv_metadata_from_host};
+    use anyhow::Result;
+    use ferrite_cuda_core::alloc::OwnedTensor;
+    use ferrite_cuda_core::device::GpuDevice;
+    use ferrite_cuda_core::driver;
+    use ferrite_cuda_core::dtype::DType;
+    use ferrite_cuda_core::tensor::TensorView;
+
+    /// Owned device tensors for the seven int32 vectors plus the
+    /// two combined per-token vectors. Ordered to match the
+    /// vendored launcher's `int32_vector_t` argument order.
+    pub struct DevicePagedKv {
+        pub position_ids: OwnedTensor,
+        pub kv_append_indices: OwnedTensor,
+        pub prefill_qo_indptr: OwnedTensor,
+        pub prefill_kv_indptr: OwnedTensor,
+        pub prefill_kv_indices: OwnedTensor,
+        pub prefill_kv_last_page_len: OwnedTensor,
+        pub decode_kv_indptr: OwnedTensor,
+        pub decode_kv_indices: OwnedTensor,
+        pub decode_kv_last_page_len: OwnedTensor,
+        /// `int num_prefill_qo` C arg — equal to
+        /// `prefill_qo_indptr` length minus 1 (number of prefill
+        /// seqs) per vendor convention. Surfaced separately
+        /// because the launcher takes it as a scalar.
+        pub num_prefill_seqs: i32,
+        /// `int num_prefill_tokens` C arg.
+        pub num_prefill_tokens: i32,
+        /// `int num_decode_seqs` C arg.
+        pub num_decode_seqs: i32,
+        /// `int num_prefill_kv_indices` C arg — flat length of
+        /// `prefill_kv_indices`.
+        pub num_prefill_kv_indices: i32,
+        /// `int num_decode_kv_indices` C arg.
+        pub num_decode_kv_indices: i32,
+        /// `int num_position_ids` C arg.
+        pub num_position_ids: i32,
+    }
+
+    /// D2H one int32 device tensor into a fresh host `Vec<i32>`
+    /// on `stream`. Caller is responsible for syncing `stream`
+    /// before reading the buffer; we issue all five D2Hs on the
+    /// same stream and sync once afterwards.
+    unsafe fn d2h_int32(
+        view: TensorView<'_>,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> Result<Vec<i32>> {
+        debug_assert_eq!(view.dtype(), DType::I32);
+        let n = view.numel();
+        let mut buf = vec![0i32; n];
+        if n == 0 {
+            return Ok(buf);
+        }
+        let bytes = n * 4;
+        unsafe {
+            driver::memcpy_dtoh_async(
+                buf.as_mut_ptr() as *mut u8,
+                view.raw_ptr() as *const u8,
+                bytes,
+                stream,
+            )?;
+        }
+        Ok(buf)
+    }
+
+    /// Allocate an int32 `OwnedTensor` of length `n` and H2D
+    /// `data.len() * 4` bytes from `data` into it. Length is
+    /// taken from `data`; `n` is the tensor's logical first-axis
+    /// dim (used for the shape). `data.len()` may exceed the
+    /// useful prefix; only the first `n` ints are copied. (We
+    /// never use this in that mode — the assert keeps us honest.)
+    unsafe fn h2d_int32(device: &mut GpuDevice, data: &[i32]) -> OwnedTensor {
+        // Always allocate at least 1 element so vendor's
+        // `gl<>` constructor doesn't see a null backing pointer
+        // for empty CSR slices (decode-only batches' prefill
+        // vectors, etc.).
+        let logical_n = data.len().max(1);
+        let owned = device.caching.alloc_tensor(&[logical_n], DType::I32);
+        if !data.is_empty() {
+            let dst = owned.as_gpu_tensor().raw_ptr();
+            let bytes = data.len() * 4;
+            unsafe {
+                let _ = driver::memcpy_htod_async(
+                    dst,
+                    data.as_ptr() as *const u8,
+                    bytes,
+                    device.compute_stream,
+                );
+            }
+        }
+        owned
+    }
+
+    /// D2H paging state from a `ForwardCtx`-shaped argument bundle,
+    /// run the pure host helper, then H2D the seven CSR vectors
+    /// into freshly allocated `OwnedTensor`s.
+    ///
+    /// Uses the device's `compute_stream` for both directions and
+    /// inserts a `stream_synchronize` between D2H and the host
+    /// build so the buffers are valid by the time we read them.
+    /// The H2Ds are async on the same stream — the caller is
+    /// responsible for ensuring the launcher fires on a stream
+    /// ordered after these copies (using `compute_stream` makes
+    /// this automatic for the immediate launcher dispatch).
+    ///
+    /// `page_size` comes from the ferrite-side `KvCachePool`
+    /// (`block_size`); it must equal vendor's compile-time
+    /// `LLAMA_KV_PAGE_SIZE` for the canonical the launcher
+    /// dispatches into.
+    pub fn build_paged_kv_metadata_on_device(
+        device: &mut GpuDevice,
+        block_table: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        positions: TensorView<'_>,
+        page_size: i32,
+    ) -> Result<DevicePagedKv> {
+        // D2H all five inputs on the compute stream, then sync
+        // it once so every host buffer is valid before we walk
+        // them.
+        let stream = device.compute_stream;
+        let host_block_table = unsafe { d2h_int32(block_table, stream)? };
+        let host_seqused_k = unsafe { d2h_int32(seqused_k, stream)? };
+        let host_cu_seqlens_q = unsafe { d2h_int32(cu_seqlens_q, stream)? };
+        let host_slot_mapping = unsafe { d2h_int32(slot_mapping, stream)? };
+        let host_positions = unsafe { d2h_int32(positions, stream)? };
+        unsafe { driver::stream_synchronize(stream)? };
+
+        // block_table is `[num_seqs, max_blocks_per_seq]`; vendor's
+        // CSR build needs the row stride.
+        debug_assert_eq!(block_table.ndim(), 2);
+        let max_blocks_per_seq = block_table.dim(1);
+
+        let metadata: PagedKvMetadata = build_paged_kv_metadata_from_host(PagedKvHostInputs {
+            cu_seqlens_q: &host_cu_seqlens_q,
+            seqused_k: &host_seqused_k,
+            block_table: &host_block_table,
+            slot_mapping: &host_slot_mapping,
+            positions: &host_positions,
+            page_size,
+            max_blocks_per_seq,
+        });
+
+        let num_prefill_seqs = (metadata.prefill_qo_indptr.len().saturating_sub(1)) as i32;
+        let num_decode_seqs = (metadata.decode_kv_indptr.len().saturating_sub(1)) as i32;
+        let num_prefill_kv_indices = metadata.prefill_kv_indices.len() as i32;
+        let num_decode_kv_indices = metadata.decode_kv_indices.len() as i32;
+        let num_position_ids = metadata.position_ids.len() as i32;
+        let num_prefill_tokens = metadata.num_prefill_tokens;
+
+        // H2D each output vector. Order matches DevicePagedKv's
+        // field declaration; we drop the temporaries into the
+        // struct as we go.
+        Ok(DevicePagedKv {
+            position_ids: unsafe { h2d_int32(device, &metadata.position_ids) },
+            kv_append_indices: unsafe { h2d_int32(device, &metadata.kv_append_indices) },
+            prefill_qo_indptr: unsafe { h2d_int32(device, &metadata.prefill_qo_indptr) },
+            prefill_kv_indptr: unsafe { h2d_int32(device, &metadata.prefill_kv_indptr) },
+            prefill_kv_indices: unsafe { h2d_int32(device, &metadata.prefill_kv_indices) },
+            prefill_kv_last_page_len: unsafe {
+                h2d_int32(device, &metadata.prefill_kv_last_page_len)
+            },
+            decode_kv_indptr: unsafe { h2d_int32(device, &metadata.decode_kv_indptr) },
+            decode_kv_indices: unsafe { h2d_int32(device, &metadata.decode_kv_indices) },
+            decode_kv_last_page_len: unsafe {
+                h2d_int32(device, &metadata.decode_kv_last_page_len)
+            },
+            num_prefill_seqs,
+            num_prefill_tokens,
+            num_decode_seqs,
+            num_prefill_kv_indices,
+            num_decode_kv_indices,
+            num_position_ids,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

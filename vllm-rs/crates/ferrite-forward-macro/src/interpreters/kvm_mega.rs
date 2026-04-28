@@ -873,6 +873,71 @@ pub fn emit_kvm_program(
     }
 }
 
+/// Emit a single concatenated tape static for one bucket of one
+/// canonical: `static <ident>: [[i32; 32]; N_BACKBONE + N_LM_HEAD]`,
+/// backbone rows first, lm_head rows second.
+///
+/// The C launcher (`tk_megakernel_<canonical>_launch`) takes one
+/// `(d_instructions, num_instructions)` pair, so the per-canonical
+/// marshaling wrapper concatenates backbone + lm_head into one
+/// device tape per invocation. Doing the concatenation at codegen
+/// time (instead of at runtime via two `cudaMemcpyAsync` into one
+/// buffer) keeps the wrapper trivial and lets the host-side bytes
+/// live in a single static.
+///
+/// Alongside the data static this emits two `usize` consts:
+/// `<ident>_BACKBONE_LEN` and `<ident>_LM_HEAD_LEN`, so the
+/// wrapper can split the tape if it needs to launch the
+/// backbone and lm_head programs separately.
+pub fn emit_kvm_full_program(
+    static_ident: &syn::Ident,
+    backbone: &KvmEncodedBucket,
+    lm_head: &KvmEncodedBucket,
+) -> proc_macro2::TokenStream {
+    use quote::quote;
+    let n_bb = backbone.rows.len();
+    let n_lm = lm_head.rows.len();
+    let n_total = n_bb + n_lm;
+    let row_iter = |rows: &[KvmEncodedRow]| -> Vec<proc_macro2::TokenStream> {
+        rows.iter()
+            .map(|row| {
+                let cells = row.payload.iter().map(|v| {
+                    let lit = proc_macro2::Literal::i32_unsuffixed(*v);
+                    quote! { #lit }
+                });
+                quote! { [ #(#cells),* ] }
+            })
+            .collect()
+    };
+    let bb_rows = row_iter(&backbone.rows);
+    let lm_rows = row_iter(&lm_head.rows);
+    let width_lit = proc_macro2::Literal::usize_unsuffixed(INSTRUCTION_WIDTH);
+    let n_total_lit = proc_macro2::Literal::usize_unsuffixed(n_total);
+    let n_bb_lit = proc_macro2::Literal::usize_unsuffixed(n_bb);
+    let n_lm_lit = proc_macro2::Literal::usize_unsuffixed(n_lm);
+    let bb_len_ident = syn::Ident::new(
+        &format!("{}_BACKBONE_LEN", static_ident),
+        static_ident.span(),
+    );
+    let lm_len_ident = syn::Ident::new(
+        &format!("{}_LM_HEAD_LEN", static_ident),
+        static_ident.span(),
+    );
+    quote! {
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        static #static_ident: [[i32; #width_lit]; #n_total_lit] = [
+            #(#bb_rows,)* #(#lm_rows,)*
+        ];
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        const #bb_len_ident: usize = #n_bb_lit;
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        const #lm_len_ident: usize = #n_lm_lit;
+    }
+}
+
 // ── Per-canonical .cu source generation ────────────────────────
 
 /// Per-canonical kernel dimensions. These become `LLAMA_*` macro
@@ -1992,6 +2057,87 @@ mod tests {
         let ts = emit_kvm_program(&static_ident, &bucket);
         let item: syn::ItemStatic = syn::parse2(ts).expect("renders as a parseable static item");
         assert_eq!(item.ident, "KVM_TEST");
+    }
+
+    /// `emit_kvm_full_program` concatenates two buckets into one
+    /// tape static and emits split-length consts. Verify the data
+    /// static has `N_BACKBONE + N_LM_HEAD` rows in backbone-first
+    /// order, and that the two `_LEN` consts read back the input
+    /// row counts.
+    #[test]
+    fn emit_kvm_full_program_concatenates_with_split_lens() {
+        let arch = arch_with_norm_and_gemm_add();
+        // Mirror what production codegen feeds in:
+        //  - `backbone` is the per-layer body the host interpreter
+        //    runs in a loop. Its bucket form for kvm uses the
+        //    classifier's "2L+1 norms, 2L gemm_adds" alternation —
+        //    matching `emit_kvm_program_renders_static_array`.
+        //  - `lm_head` is the final matmul (`cutlass_gemm` against
+        //    `Weights::lm_head`) — matching
+        //    `cutlass_gemm_emits_lm_head_with_layer_pinned`.
+        let backbone_prog = vec![
+            rms_norm_inst(0, 1, 0, "Weights::input_layernorm"),
+            gemm_add_inst(2, 3, 0, "Weights::self_attn_o_proj", 128, 128, 3),
+            rms_norm_inst(4, 5, 0, "Weights::post_attention_layernorm"),
+            gemm_add_inst(6, 7, 0, "Weights::mlp_down_proj", 128, 128, 3),
+            rms_norm_inst(8, 9, 0, "Weights::norm"),
+        ];
+        let lm_head_prog = vec![cutlass_gemm_inst(0, 1, 0, "Weights::lm_head", 128, 128, 3)];
+        let mut ctx = ctx_llama_1b();
+        ctx.batch_size = 8;
+        ctx.matmul_batch_block_size = 8;
+        ctx.vocab_size = 32_768; // 128 × 256, integer-clean for lm_head
+        let bb = try_encode_bucket(&arch, &backbone_prog, &ctx, None).unwrap();
+        let lm = try_encode_bucket(&arch, &lm_head_prog, &ctx, None).unwrap();
+        let n_bb = bb.rows.len();
+        let n_lm = lm.rows.len();
+        let static_ident = Ident::new("KVM_FULL_TEST", Span::call_site());
+        let ts = emit_kvm_full_program(&static_ident, &bb, &lm);
+
+        // The TokenStream should parse as one static item plus two
+        // const items in this order.
+        let parsed: syn::File = syn::parse2(quote::quote! {
+            #ts
+        })
+        .expect("renders as parseable items");
+        assert_eq!(parsed.items.len(), 3, "expected 1 static + 2 consts");
+        let data_item = match &parsed.items[0] {
+            syn::Item::Static(s) => s,
+            other => panic!("first item not static: {:?}", other),
+        };
+        assert_eq!(data_item.ident, "KVM_FULL_TEST");
+        // Outer array length literal is the third token of `[[i32;
+        // 32]; N]`. Easier path: re-render and string-search.
+        let rendered = ts.to_string();
+        assert!(
+            rendered.contains(&format!("; {}usize]", n_bb + n_lm))
+                || rendered.contains(&format!("; {}]", n_bb + n_lm)),
+            "expected outer array length {} in: {}",
+            n_bb + n_lm,
+            rendered
+        );
+        assert!(
+            rendered.contains("KVM_FULL_TEST_BACKBONE_LEN"),
+            "missing _BACKBONE_LEN const: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("KVM_FULL_TEST_LM_HEAD_LEN"),
+            "missing _LM_HEAD_LEN const: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains(&format!(": usize = {}", n_bb)),
+            "expected backbone len {} const: {}",
+            n_bb,
+            rendered
+        );
+        assert!(
+            rendered.contains(&format!(": usize = {}", n_lm)),
+            "expected lm_head len {} const: {}",
+            n_lm,
+            rendered
+        );
     }
 
     /// `emit_kvm_cu_source` produces a string with arch-specific

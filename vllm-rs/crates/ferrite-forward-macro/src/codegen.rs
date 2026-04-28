@@ -3047,25 +3047,28 @@ fn kvm_kernel_dims_from_bounds(
     })
 }
 
-/// Try to encode a bucket with the kvm_mega encoder. On `Some`,
-/// emit the device-resident program static into `static_slices`
-/// and return `true`. On `None` (kvm-ineligible), no-op.
-///
-/// Launcher emission isn't done yet (P2-4b — needs per-arch
-/// `globals_t` + extern entry point); this just emits the tape
-/// array so the encoder integrates with codegen.
-fn try_emit_kvm_mega(
+/// Try to encode both backbone and lm_head buckets with the
+/// kvm_mega encoder and emit one concatenated tape static
+/// (`KVM_FULL_M_<wp>`) plus its split-length consts
+/// (`<ident>_BACKBONE_LEN`, `<ident>_LM_HEAD_LEN`). Returns
+/// `true` on success; `false` if either bucket is kvm-ineligible
+/// (since both halves are required to run the kvm megakernel
+/// end-to-end, partial emission would just produce dead bytes).
+fn try_emit_kvm_mega_full(
     arch_opcodes: &ArchOpcodes,
-    bucket: &crate::interpreters::host::LoweredBucket,
+    backbone: &crate::interpreters::host::LoweredBucket,
+    lm_head: &crate::interpreters::host::LoweredBucket,
     static_ident: &proc_macro2::Ident,
     ctx: &kvm_mega::EncodeCtx,
     static_slices: &mut Vec<TokenStream>,
 ) -> bool {
-    let Some(encoded) = kvm_mega::try_encode_bucket(arch_opcodes, &bucket.instances, ctx, None)
-    else {
+    let Some(bb) = kvm_mega::try_encode_bucket(arch_opcodes, &backbone.instances, ctx, None) else {
         return false;
     };
-    static_slices.push(kvm_mega::emit_kvm_program(static_ident, &encoded));
+    let Some(lm) = kvm_mega::try_encode_bucket(arch_opcodes, &lm_head.instances, ctx, None) else {
+        return false;
+    };
+    static_slices.push(kvm_mega::emit_kvm_full_program(static_ident, &bb, &lm));
     true
 }
 
@@ -3538,21 +3541,21 @@ pub fn emit_model(
         // no .cu file written.
         if target_profile.kvm_compatible() {
             let kvm_ctx = kvm_encode_ctx_from_bounds(&bounds, *wp);
-            let kvm_bb_ok = try_emit_kvm_mega(
+            // Concatenated `KVM_FULL_M_<wp>` static. The C launcher
+            // takes one (d_instructions, num_instructions) pair, so
+            // the tape is single-static at the codegen layer; the
+            // emitter also produces `_BACKBONE_LEN` / `_LM_HEAD_LEN`
+            // consts so the marshaling wrapper can split the tape
+            // if it ends up launching the two programs separately.
+            let kvm_full_ok = try_emit_kvm_mega_full(
                 &arch_opcodes,
                 &lowered.backbone,
-                &bucket_static_ident("KVM_BACKBONE_M", *wp),
-                &kvm_ctx,
-                &mut static_slices,
-            );
-            let kvm_lm_ok = try_emit_kvm_mega(
-                &arch_opcodes,
                 &lowered.lm_head,
-                &bucket_static_ident("KVM_LM_HEAD_M", *wp),
+                &bucket_static_ident("KVM_FULL_M", *wp),
                 &kvm_ctx,
                 &mut static_slices,
             );
-            if kvm_bb_ok || kvm_lm_ok {
+            if kvm_full_ok {
                 kvm_emitted_any = true;
             }
         }

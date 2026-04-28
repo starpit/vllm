@@ -173,10 +173,18 @@ pub struct AttackSurfaceReport {
     pub by_margin: HashMap<&'static str, u64>,
     /// `arch → margin_class → count`.
     pub by_arch: HashMap<String, HashMap<&'static str, u64>>,
-    /// `fusion_gap_reason → count`. A pick can land in ≥0 reasons;
-    /// the script-side heuristic is replaced here by
-    /// neighbor-walking the actual `NormalizedStep` stream.
+    /// `arch → total picks` (sum across margin classes).
+    pub by_arch_total: HashMap<String, u64>,
+    /// `fusion_gap_reason → count`. Each pick is in at most one reason.
     pub by_fusion_gap: HashMap<&'static str, u64>,
+    /// `fusion_gap_reason → set of distinct (n, k) shapes` — proxy
+    /// for kernel-authoring work the fusion would need to cover.
+    pub fusion_gap_shapes: HashMap<&'static str, HashSet<(u32, u32)>>,
+    /// `(fusion_gap_reason, margin_class) → count`. Cross-tab so
+    /// readers can see e.g. "all 1095 lm_head picks are in
+    /// no_csv_data" — those resolve in one shot from the fusion side
+    /// without any cost-table calibration work.
+    pub xtab: HashMap<(&'static str, &'static str), u64>,
     /// `margin_class → up to N samples`.
     pub samples_margin: HashMap<&'static str, Vec<PickSample>>,
     /// `fusion_gap_reason → up to N samples`.
@@ -254,6 +262,7 @@ impl AttackSurfaceReport {
                 .or_default()
                 .entry(cls)
                 .or_default() += 1;
+            *self.by_arch_total.entry(arch.to_string()).or_default() += 1;
 
             let sample = PickSample {
                 arch: arch.to_string(),
@@ -279,6 +288,11 @@ impl AttackSurfaceReport {
             let gap = classify_fusion_gap(prev_kind, next_kind, is_lm_head);
             if let Some(reason) = gap {
                 *self.by_fusion_gap.entry(reason).or_default() += 1;
+                *self.xtab.entry((reason, cls)).or_default() += 1;
+                self.fusion_gap_shapes
+                    .entry(reason)
+                    .or_default()
+                    .insert((n, k));
                 self.samples_fusion_gap
                     .entry(reason)
                     .or_default()
@@ -287,9 +301,8 @@ impl AttackSurfaceReport {
         }
     }
 
-    /// Render the report to `out`. `per_arch` enables the trailing
-    /// per-arch margin breakdown (most useful when prioritizing
-    /// kernel work for a specific arch family).
+    /// Render the report to `out`. `per_arch` opens an additional
+    /// per-arch breakdown after the main report.
     pub fn print<W: Write>(&self, out: &mut W, per_arch: bool) -> io::Result<()> {
         let total: u64 = self.by_margin.values().sum();
         writeln!(out)?;
@@ -298,96 +311,194 @@ impl AttackSurfaceReport {
             "═══ cuBLAS attack surface ─ {} distinct (arch, layer, N, K, M-grid) picks",
             total
         )?;
-        writeln!(out)?;
 
-        // Margin summary.
-        writeln!(out, "  margin class    count       %")?;
         let cls_order: Vec<&'static str> = MARGIN_BUCKETS
             .iter()
             .map(|(k, _)| *k)
             .chain([NO_ALT, NO_CSV])
             .collect();
+
+        // ── Margin breakdown ────────────────────────────────────────
+        writeln!(out)?;
+        writeln!(out, "Margin (cuBLAS faster than best non-cuBLAS by …)")?;
+        writeln!(out, "  class             count    %    note")?;
+        let margin_notes: HashMap<&'static str, &'static str> = [
+            ("a_le_0.25", "would flip with a cost-eval ε bias"),
+            ("d_le_1.00", "could flip with new tile-zoo entries"),
+            ("g_gt_5.00", "cuBLAS truly faster — needs new kernel"),
+            (NO_CSV, "neither side calibrated (mostly lm_head)"),
+        ]
+        .into_iter()
+        .collect();
         for cls in &cls_order {
             let c = self.by_margin.get(*cls).copied().unwrap_or(0);
             if c == 0 {
                 continue;
             }
-            let pct = if total > 0 {
-                100.0 * (c as f64) / (total as f64)
-            } else {
-                0.0
-            };
-            writeln!(out, "  {:<14} {:>6}  {:>5.1}%", cls, c, pct)?;
+            let pct = pct_of(c, total);
+            let note = margin_notes.get(*cls).copied().unwrap_or("");
+            writeln!(out, "  {:<14}  {:>6}  {:>4.1}%   {}", cls, c, pct, note)?;
         }
 
+        // ── Fusion-gap rollup with shape-distinct counts ───────────
+        let fg_total: u64 = self.by_fusion_gap.values().sum();
+        // Stable order: largest absorption first so the dominant
+        // opportunity is at the top.
+        let fg_order_raw = [
+            fusion_gap::LM_HEAD,
+            fusion_gap::NORM_GEMM,
+            fusion_gap::GEMM_SCALARMUL,
+            fusion_gap::GEMM_ADD,
+        ];
+        let fg_order: Vec<&'static str> = fg_order_raw
+            .into_iter()
+            .filter(|r| self.by_fusion_gap.get(*r).copied().unwrap_or(0) > 0)
+            .collect();
+
+        if fg_total > 0 {
+            writeln!(out)?;
+            writeln!(
+                out,
+                "Fusion-gap — picks absorbable by adding a fusion claim"
+            )?;
+            writeln!(
+                out,
+                "  count   shapes  reason  ({} of {} picks = {:.1}%)",
+                fg_total,
+                total,
+                pct_of(fg_total, total)
+            )?;
+            for reason in &fg_order {
+                let c = self.by_fusion_gap.get(*reason).copied().unwrap_or(0);
+                let shapes = self
+                    .fusion_gap_shapes
+                    .get(*reason)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+                writeln!(out, "  {:>5}   {:>6}  {}", c, shapes, reason)?;
+            }
+
+            // Cross-tab: fusion-gap × margin class. Surfaces double
+            // wins (lm_head picks that ALSO live in no_csv_data — one
+            // fusion drops them, no calibration needed).
+            writeln!(out)?;
+            writeln!(out, "Fusion-gap × margin (where the absorbable picks live)")?;
+            // Pick the margin classes with non-trivial counts to show.
+            let xtab_cls: Vec<&'static str> = cls_order
+                .iter()
+                .copied()
+                .filter(|cls| {
+                    fg_order
+                        .iter()
+                        .any(|r| self.xtab.get(&(r, cls)).copied().unwrap_or(0) > 0)
+                })
+                .collect();
+            if !xtab_cls.is_empty() {
+                let header_cells: Vec<String> = xtab_cls
+                    .iter()
+                    .map(|c| short_margin_label(c).to_string())
+                    .collect();
+                writeln!(
+                    out,
+                    "  {:<28}  {}",
+                    "reason",
+                    header_cells
+                        .iter()
+                        .map(|s| format!("{:>10}", s))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )?;
+                for reason in &fg_order {
+                    let cells: Vec<String> = xtab_cls
+                        .iter()
+                        .map(|cls| self.xtab.get(&(reason, cls)).copied().unwrap_or(0))
+                        .map(|v| {
+                            if v == 0 {
+                                format!("{:>10}", "·")
+                            } else {
+                                format!("{:>10}", v)
+                            }
+                        })
+                        .collect();
+                    writeln!(
+                        out,
+                        "  {:<28}  {}",
+                        short_reason_label(reason),
+                        cells.join(" ")
+                    )?;
+                }
+            }
+
+            // Cumulative-fusion projection: assume each fusion lands
+            // in declared order and count residual picks.
+            writeln!(out)?;
+            writeln!(out, "Cumulative fusion-landing projection")?;
+            let mut residual = total;
+            writeln!(
+                out,
+                "  starting residual  {:>6}  (current cuBLAS surface)",
+                residual
+            )?;
+            for reason in &fg_order {
+                let c = self.by_fusion_gap.get(*reason).copied().unwrap_or(0);
+                residual = residual.saturating_sub(c);
+                writeln!(
+                    out,
+                    "  +{:<28}  {:>6}  (-{} picks)",
+                    short_reason_tag(reason),
+                    residual,
+                    c
+                )?;
+            }
+            writeln!(
+                out,
+                "  remaining {} picks: kernel-quality work (mostly >5% gap; see margin g_gt_5.00).",
+                residual
+            )?;
+        }
+
+        // ── Top arches by cuBLAS load ──────────────────────────────
         writeln!(out)?;
-        writeln!(out, "  Sample picks per margin class")?;
+        writeln!(out, "Top 10 arches by cuBLAS pick count")?;
+        let mut arches: Vec<(&String, u64)> = self
+            .by_arch_total
+            .iter()
+            .map(|(a, c)| (a, *c))
+            .collect();
+        arches.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        for (arch, count) in arches.iter().take(10) {
+            writeln!(out, "  {:>5}  {}", count, arch)?;
+        }
+
+        // ── Sample picks (compact, one per class) ──────────────────
+        writeln!(out)?;
+        writeln!(out, "Sample picks per margin class (one each)")?;
         for cls in &cls_order {
             let samples = match self.samples_margin.get(*cls) {
                 Some(v) if !v.is_empty() => v,
                 _ => continue,
             };
-            writeln!(out, "    [{}]", cls)?;
-            for s in samples {
-                let arch_short = short_arch(&s.arch);
-                let cb_str = match s.cublas_us {
-                    Some(v) => format!("{:>7.1}", v),
-                    None => "      ?".to_string(),
-                };
-                let alt_str = match s.alt_us {
-                    Some(v) => format!("{:>7.1}", v),
-                    None => "      ?".to_string(),
-                };
-                let alt_name = s.alt_kernel.as_deref().unwrap_or("(none)");
-                writeln!(
-                    out,
-                    "      {:<32} L={:<2} M={:<5} N={:<6} K={:<6}  cb={}  alt={}  ({})",
-                    arch_short, s.layer, s.grid_m, s.n, s.k, cb_str, alt_str, alt_name,
-                )?;
-            }
-        }
-
-        // Fusion-gap section.
-        let fg_total: u64 = self.by_fusion_gap.values().sum();
-        if fg_total > 0 {
-            writeln!(out)?;
+            let s = &samples[0];
+            let arch_short = short_arch(&s.arch);
+            let cb_str = match s.cublas_us {
+                Some(v) => format!("{:>7.1}", v),
+                None => "      ?".to_string(),
+            };
+            let alt_str = match s.alt_us {
+                Some(v) => format!("{:>7.1}", v),
+                None => "      ?".to_string(),
+            };
+            let alt_name = s.alt_kernel.as_deref().unwrap_or("(none)");
             writeln!(
                 out,
-                "  Fusion-gap ─ {} picks would be absorbed by a fusion claim",
-                fg_total
+                "  [{:<11}] {:<32} L={:<2} M={:<4} N={:<6} K={:<6} cb={} alt={} ({})",
+                cls, arch_short, s.layer, s.grid_m, s.n, s.k, cb_str, alt_str, alt_name,
             )?;
-            // Stable order: declaration order in `fusion_gap` mod.
-            let fg_order = [
-                fusion_gap::GEMM_ADD,
-                fusion_gap::NORM_GEMM,
-                fusion_gap::GEMM_SCALARMUL,
-                fusion_gap::LM_HEAD,
-            ];
-            for reason in fg_order {
-                let c = self.by_fusion_gap.get(reason).copied().unwrap_or(0);
-                if c == 0 {
-                    continue;
-                }
-                writeln!(out, "    {:>5}  {}", c, reason)?;
-                if let Some(samples) = self.samples_fusion_gap.get(reason) {
-                    for s in samples.iter().take(2) {
-                        writeln!(
-                            out,
-                            "             {} L={} M={} N={} K={}",
-                            short_arch(&s.arch),
-                            s.layer,
-                            s.grid_m,
-                            s.n,
-                            s.k
-                        )?;
-                    }
-                }
-            }
         }
 
         if per_arch {
             writeln!(out)?;
-            writeln!(out, "  Per-arch breakdown")?;
+            writeln!(out, "Per-arch breakdown")?;
             let mut arches: Vec<(&String, &HashMap<&'static str, u64>)> =
                 self.by_arch.iter().collect();
             arches.sort_by(|a, b| {
@@ -401,18 +512,69 @@ impl AttackSurfaceReport {
                     continue;
                 }
                 writeln!(out)?;
-                writeln!(out, "    {} ({} picks)", arch, total)?;
+                writeln!(out, "  {} ({} picks)", arch, total)?;
                 for cls in &cls_order {
                     let c = classes.get(*cls).copied().unwrap_or(0);
                     if c == 0 {
                         continue;
                     }
-                    writeln!(out, "      {:<14} {:>5}", cls, c)?;
+                    writeln!(out, "    {:<14} {:>5}", cls, c)?;
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+fn pct_of(num: u64, denom: u64) -> f64 {
+    if denom == 0 {
+        0.0
+    } else {
+        100.0 * (num as f64) / (denom as f64)
+    }
+}
+
+fn short_margin_label(cls: &str) -> &str {
+    match cls {
+        "a_le_0.25" => "≤0.25%",
+        "b_le_0.50" => "≤0.5%",
+        "c_le_0.75" => "≤0.75%",
+        "d_le_1.00" => "≤1%",
+        "e_le_2.00" => "≤2%",
+        "f_le_5.00" => "≤5%",
+        "g_gt_5.00" => ">5%",
+        NO_ALT => "no_alt",
+        NO_CSV => "no_data",
+        other => other,
+    }
+}
+
+fn short_reason_label(reason: &str) -> &str {
+    if reason == fusion_gap::LM_HEAD {
+        "lm_head: Norm→Gemm[→ScalarMul]"
+    } else if reason == fusion_gap::NORM_GEMM {
+        "Norm→Gemm"
+    } else if reason == fusion_gap::GEMM_SCALARMUL {
+        "Gemm→ScalarMul"
+    } else if reason == fusion_gap::GEMM_ADD {
+        "Gemm→Add"
+    } else {
+        reason
+    }
+}
+
+fn short_reason_tag(reason: &str) -> &str {
+    if reason == fusion_gap::LM_HEAD {
+        "FusedLmHead"
+    } else if reason == fusion_gap::NORM_GEMM {
+        "FusedNormGemm"
+    } else if reason == fusion_gap::GEMM_SCALARMUL {
+        "FusedGemmScalarMul"
+    } else if reason == fusion_gap::GEMM_ADD {
+        "FusedGemmAdd-cublas-peer"
+    } else {
+        reason
     }
 }
 

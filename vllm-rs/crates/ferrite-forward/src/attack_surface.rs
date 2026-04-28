@@ -457,17 +457,25 @@ impl AttackSurfaceReport {
             )?;
         }
 
-        // ── Top arches by cuBLAS load ──────────────────────────────
+        // ── Per-arch-family rollup ─────────────────────────────────
+        //
+        // The variant label is `<family> / <variant_stem> · tp=N` —
+        // collapse on `<family>` to surface the dominant arch
+        // families without drowning the report in per-variant
+        // proliferation (gemma3-27b-it / -fp8 / -ct-int4 / etc are
+        // all the same kernel-shape problem).
+        let mut by_family: HashMap<String, u64> = HashMap::new();
+        for (label, count) in &self.by_arch_total {
+            let family = label.split('/').next().unwrap_or(label).trim().to_string();
+            *by_family.entry(family).or_default() += count;
+        }
         writeln!(out)?;
-        writeln!(out, "Top 10 arches by cuBLAS pick count")?;
-        let mut arches: Vec<(&String, u64)> = self
-            .by_arch_total
-            .iter()
-            .map(|(a, c)| (a, *c))
-            .collect();
-        arches.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-        for (arch, count) in arches.iter().take(10) {
-            writeln!(out, "  {:>5}  {}", count, arch)?;
+        writeln!(out, "cuBLAS picks by arch family")?;
+        let mut families: Vec<(String, u64)> = by_family.into_iter().collect();
+        families.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (family, count) in &families {
+            let pct = pct_of(*count, total);
+            writeln!(out, "  {:>5}  {:>5.1}%   {}", count, pct, family)?;
         }
 
         // ── Sample picks (compact, one per class) ──────────────────

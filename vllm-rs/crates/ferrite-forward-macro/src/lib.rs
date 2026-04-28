@@ -579,6 +579,24 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                     classes_used[b] = true;
                     continue;
                 }
+                // KvmFit Impls — same kernel family as host counterpart,
+                // only launch_kind differs. Bucket as host peers.
+                let kvm_alias = match name {
+                    "kvm_embed" | "kvm_rmsnorm" => Some(6), // non-gemm
+                    "kvm_fused_qkv_rope_cache"
+                    | "kvm_fused_qkv_rope_prefill"
+                    | "kvm_fused_gate_up_silu_mul" => Some(3), // cublas (host fused_*)
+                    "kvm_attention_via_cache" | "kvm_attention_prefill_contiguous" => Some(0), // fa2
+                    "kvm_flashinfer_attention_decode" | "kvm_flashinfer_attention_prefill" => {
+                        Some(1) // fi
+                    }
+                    n if n.starts_with("kvm_cutlass") => Some(4), // cutlass
+                    _ => None,
+                };
+                if let Some(b) = kvm_alias {
+                    classes_used[b] = true;
+                    continue;
+                }
                 let bucket = if name.starts_with("flashinfer") {
                     Some(1) // fi
                 } else if name.starts_with("mla_") {

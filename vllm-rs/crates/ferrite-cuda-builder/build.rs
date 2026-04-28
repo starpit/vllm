@@ -585,6 +585,10 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
+        // Compute cap drives -arch=sm_<N>a (cudaforge auto-suffixes
+        // 'a' for sm_90+). Without 'a' NVCC rejects __cluster_dims__
+        // on the megakernel mk<> template.
+        .compute_cap(arch_num as usize)
         .include_path("../../crates/vllm-cuda/csrc")
         // Vendor cross-gpu-llama (KvmMega) — per-canonical
         // tk_megakernel_<arch>.cu files emitted by `forward!` at
@@ -602,7 +606,7 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
             vec!["include"],
             /*recurse_submodules=*/ false,
         );
-    mk_builder
+    mk_builder = mk_builder
         .arg(std_flag)
         .arg("-O3")
         .arg("--use_fast_math")
@@ -612,8 +616,20 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("-Xcompiler=-fPIC")
         .arg("-Xcompiler=-fno-strict-aliasing")
         .arg("-Xcompiler=-Wno-psabi")
-        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
-        .arg("-lineinfo")
+        // -arch flag set via compute_cap() above (cudaforge handles
+        // the sm_Na suffix for Hopper+).
+        .arg("-lineinfo");
+    // KITTENS_* arch flags (vendor's Makefile sets these per GPU).
+    // ThunderKittens 2.0 gates mm_ABt / warpgroup ops + paged-KV TMA
+    // descriptors on these macros.
+    if arch_num >= 100 {
+        mk_builder = mk_builder.arg("-DKITTENS_BLACKWELL");
+    } else if arch_num >= 90 {
+        mk_builder = mk_builder.arg("-DKITTENS_HOPPER");
+    } else if arch_num >= 89 {
+        mk_builder = mk_builder.arg("-DKITTENS_4090");
+    }
+    mk_builder
         .build_lib(format!("{cache_dir}/libmegakernels.a"))
         .expect("failed to build megakernel .cu files");
 

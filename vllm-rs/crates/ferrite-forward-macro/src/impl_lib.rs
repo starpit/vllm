@@ -15038,24 +15038,32 @@ mod tests {
         assert_eq!(kvm_count, 7 + 16 + 16 + 6 + 6, "Kvm Impl count drift");
     }
 
-    /// Today every Kvm Impl gates on `profile.kvm_compatible()`,
-    /// which returns `false` until the launcher (P2-4) lands. Pin
-    /// that none of them are target-compatible on H100, so the
-    /// solver can't pick them by accident.
+    /// Kvm Impls gate on `profile.kvm_compatible()` (sm_90+). On H100
+    /// they're target-compatible *if* their host counterpart also is;
+    /// on L4 (Ada) they all stay incompatible.
     #[test]
-    fn kvm_fit_impls_solver_infeasible_until_launcher_lands() {
-        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::H100_SM90);
+    fn kvm_fit_impls_target_compatible_on_h100_not_on_l4() {
+        let h100 = crate::target::from_profile_def(&ferrite_cuda_targets::H100_SM90);
+        let l4 = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         let lib = starter_library();
+        let mut h100_compatible_count = 0;
         for (_, imp) in lib.iter_enumerated() {
             if imp.megakernel_fit() == MegakernelFit::Kvm {
                 assert!(
-                    !imp.target_compatible(&profile),
-                    "Kvm Impl `{}` should be target-incompatible until \
-                     `kvm_compatible()` flips in P2-4",
+                    !imp.target_compatible(&l4),
+                    "Kvm Impl `{}` should be incompatible on L4 (sm_89)",
                     imp.name()
                 );
+                if imp.target_compatible(&h100) {
+                    h100_compatible_count += 1;
+                }
             }
         }
+        assert!(
+            h100_compatible_count > 0,
+            "expected at least one Kvm Impl to be H100-compatible after \
+             kvm_compatible() activated"
+        );
     }
 
     #[test]

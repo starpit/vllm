@@ -363,10 +363,10 @@ impl TargetProfile {
     /// Whether this target supports the KVM megakernel — i.e. has
     /// the vendored `~/Megakernels` template instantiated for it
     /// AND meets the sm≥90 floor that ThunderKittens 2.0 requires.
-    /// See `MEGA_HANDOFF.md` Phase 2. Returns `false` until KVM
-    /// authoring lands.
+    /// Hopper+ only. Activates the KvmFit Impl tier + per-canonical
+    /// .cu emission + NVCC compile of cross-gpu-llama op set.
     pub fn kvm_compatible(&self) -> bool {
-        false
+        self.compute_capability >= 90
     }
 }
 

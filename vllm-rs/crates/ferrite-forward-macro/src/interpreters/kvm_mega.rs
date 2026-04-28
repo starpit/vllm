@@ -378,7 +378,17 @@ fn encode_op_arm(
             layer_offset,
             ctx,
         )?)),
-        "CutlassGemm" => Some(Some(encode_cutlass_gemm_lm_head(inst, layer_offset, ctx)?)),
+        // CutlassGemm at LM_Head position — see encode_cutlass_gemm_lm_head
+        // for "LM_Head only" rationale.
+        // Gemm and CutlassGemv also appear at LM_Head when the solver
+        // picks GemmRefImpl (cuBLAS) or CutlassGemvImpl (M=1 GEMV path)
+        // for the LM_Head proj. They produce the same OPCODE_LM_Head
+        // row layout. Mid-bucket Gemm/CutlassGemv would be a structural
+        // anomaly — solver should always pick a fused alternative for
+        // body Gemms; this arm trusts the lm_head bucket isolation.
+        "CutlassGemm" | "Gemm" | "CutlassGemv" => {
+            Some(Some(encode_cutlass_gemm_lm_head(inst, layer_offset, ctx)?))
+        }
         "AttentionViaCache" | "FlashInferAttentionDecode" => {
             Some(Some(encode_attention_decode(inst, layer_offset, ctx)?))
         }
@@ -401,7 +411,6 @@ fn encode_op_arm(
         | "FusedAddRmsNorm"
         | "FusedAddRmsNormWithOffset"
         | "ScalarOffsetRmsNorm"
-        | "Gemm"
         | "FusedGemmBias"
         | "FusedGateUpGeluMul"
         | "FusedQkvQkNormRopeCache"
@@ -412,7 +421,6 @@ fn encode_op_arm(
         | "MlaAttention"
         | "DeepSeekMoe"
         | "CutlassGemmSplitK"
-        | "CutlassGemv"
         | "CutlassFusedGemmBias"
         | "CutlassFusedGateUpSiluMul"
         | "MarlinGemm"
@@ -692,9 +700,9 @@ fn encode_cutlass_gemm_lm_head(
     // single LM_Head call (post-loop).
     let _layer_baseline = parse_u32_literal(&inst.field_values[2])?;
     let _ = layer_offset;
-    let _tile_m = parse_u32_literal(&inst.field_values[4])?;
-    let _tile_n = parse_u32_literal(&inst.field_values[5])?;
-    let _stages = parse_u32_literal(&inst.field_values[6])?;
+    // tile_m/tile_n/stages exist on CutlassGemm only; Gemm and
+    // CutlassGemv have just (in, out, layer, weight_fn). Kernel
+    // doesn't read these regardless, so optional.
 
     let num_batch_blocks = (ctx.batch_size / ctx.matmul_batch_block_size) as i32;
     let num_logit_blocks = (ctx.vocab_size / ctx.matmul_out_block_size) as i32;
@@ -953,8 +961,16 @@ pub fn emit_kvm_cu_source(canonical_name: &str, dims: &KvmKernelDims) -> String 
     // headers themselves — vendor's Makefile force-includes pch.cuh
     // (`-include pch.cuh`) to prepend kittens.cuh + megakernel.cuh.
     // We do the prepend explicitly here.
+    //
+    // <cuda.h> first: kittens vmm.cuh uses CUDA Driver API
+    // (CUmemAllocationHandleType, cuMulticastCreate, etc) which
+    // come from the driver header. kittens.cuh itself includes
+    // it via `#ifndef KITTENS_NO_HOST` gate, but explicit include
+    // here is defensive.
     out.push_str(
-        "#include \"kittens.cuh\"\n\
+        "#include <cuda.h>\n\
+         #include <cuda_runtime.h>\n\
+         #include \"kittens.cuh\"\n\
          #include \"megakernel.cuh\"\n\n\
          #include \"llama.cuh\"\n\
          #include \"batched_rms_norm.cu\"\n\
@@ -992,26 +1008,12 @@ pub fn emit_kvm_cu_source(canonical_name: &str, dims: &KvmKernelDims) -> String 
          };\n\n"
     );
 
-    // Force template instantiation by referencing `mk<...>` as a
-    // type alias. If the templates don't compile at the per-arch
-    // dims, NVCC fails here.
-    out.push_str(
-        "using mk_kernel_t = mk<\n\
-         \x20   llama_config, llama_70b_globals,\n\
-         \x20   ops::attn_norm_op,\n\
-         \x20   ops::qkv_rope_append_op,\n\
-         \x20   ops::attention_decode_op,\n\
-         \x20   ops::attention_prefill_op,\n\
-         \x20   ops::o_proj_op,\n\
-         \x20   ops::mlp_norm_op,\n\
-         \x20   ops::gate_silu_op,\n\
-         \x20   ops::up_matmul_op,\n\
-         \x20   ops::downproj_op,\n\
-         \x20   ops::lm_head_norm_op,\n\
-         \x20   ops::lm_head_op,\n\
-         \x20   ops::barrier_inc_op,\n\
-         \x20   ops::all_device_barrier_op>;\n\n",
-    );
+    // Note: `mk<...>` is a __global__ function template, not a type
+    // — can't be aliased. Template instantiation happens naturally
+    // when the launcher fn (P2-4b step 4) calls
+    // `mk<...><<<grid, block, smem>>>(g)`. For step 2 the op alias
+    // block above is what validates vendor's framework accepts our
+    // per-arch dims.
 
     // P2-4b step 3 will add the `extern \"C\"` launcher body.
     out.push_str("// extern \"C\" int tk_megakernel_..._launch(...) lands in P2-4b step 3.\n");
@@ -1760,12 +1762,11 @@ mod tests {
         assert!(src.contains("#define SM_COUNT 132"));
         assert!(src.contains("#include \"llama.cuh\""));
         assert!(src.contains("#include \"qkv_rope_append.cu\""));
-        assert!(src.contains("using mk_kernel_t = mk<"));
-        assert!(src.contains("ops::attn_norm_op"));
-        assert!(src.contains("ops::qkv_rope_append_op"));
-        assert!(src.contains("ops::attention_decode_op"));
-        assert!(src.contains("ops::attention_prefill_op"));
-        assert!(src.contains("ops::all_device_barrier_op"));
+        assert!(src.contains("attn_norm_op"));
+        assert!(src.contains("qkv_rope_append_op"));
+        assert!(src.contains("attention_decode_op"));
+        assert!(src.contains("attention_prefill_op"));
+        assert!(src.contains("all_device_barrier_op"));
         // Canonical name is in the header comment for traceability.
         assert!(src.contains("`llama_3p2_1b`"));
     }

@@ -52,11 +52,27 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
     for reg in ferrite_forward::inventory::iter::<BackboneDumpRegistration> {
         let arch = reg.arch_name;
         for variant in (reg.dump_all)() {
-            let key = format!("{arch}/{}", variant.variant_stem).to_lowercase();
+            // Include `tp=N` in the substring-match key so callers can
+            // filter on it the same way they filter on arch/variant
+            // (e.g. `vllm ferrite info qwen 2.5 3b tp=2`). At
+            // --features cuda (no nccl) every variant is tp=1, so
+            // including the token doesn't disturb existing filters.
+            let key = format!(
+                "{arch}/{}/tp={}",
+                variant.variant_stem, variant.tp_world_size
+            )
+            .to_lowercase();
             if !needles.iter().all(|n| key.contains(n)) {
                 continue;
             }
-            print_variant(out, arch, variant.variant_stem, &variant.buckets, &style)?;
+            print_variant(
+                out,
+                arch,
+                variant.variant_stem,
+                variant.tp_world_size,
+                &variant.buckets,
+                &style,
+            )?;
             shown += 1;
         }
     }
@@ -170,11 +186,16 @@ fn print_variant<W: Write>(
     out: &mut W,
     arch: &str,
     stem: &str,
+    tp_world_size: u8,
     buckets: &[BucketDump],
     style: &Style,
 ) -> io::Result<()> {
     writeln!(out)?;
-    writeln!(out, "{}", style.bold(&format!("══ {arch} / {stem} ══")))?;
+    writeln!(
+        out,
+        "{}",
+        style.bold(&format!("══ {arch} / {stem} · tp={tp_world_size} ══"))
+    )?;
 
     // First-occurrence-preserving cluster pass.
     let mut clusters: Vec<Cluster<'_>> = Vec::new();

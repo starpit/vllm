@@ -851,6 +851,12 @@ pub struct BucketDump {
 #[derive(Clone, Debug)]
 pub struct VariantDump {
     pub variant_stem: &'static str,
+    /// Tensor-parallel world size this variant was compiled for. At
+    /// `--features nccl` the macro emits one `VariantDump` per (model,
+    /// tp) tuple in `{1, 2, 4, 8}`; at default `--features cuda` only
+    /// tp=1 is emitted. `vllm ferrite info` displays this on each row
+    /// and includes it in its substring filter as `tp=N`.
+    pub tp_world_size: u8,
     pub buckets: Vec<BucketDump>,
 }
 

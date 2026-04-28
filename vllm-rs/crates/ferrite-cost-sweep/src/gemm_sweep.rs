@@ -239,6 +239,38 @@ const NK_SHAPES: &[(u32, u32)] = &[
     (18432, 2304), // gemma2-2b: 2 × 9216 @ H=2304
     (28672, 3584), // gemma2-9b: 2 × 14336 @ H=3584
     (73728, 4608), // gemma2-27b: 2 × 36864 @ H=4608
+    // ── Gemma2 o_proj + down_proj ──
+    //
+    // Diagnostic on 812452cff showed 719 standalone-Cublas picks at
+    // these shapes uncalibrated (linreg extrapolating). Adding rows
+    // gives the predictor exact anchors at gemma2 shapes for both
+    // cuBLAS and the standalone CUTLASS tile zoo.
+    (2304, 2048),  // gemma2-2b o_proj: hidden=2304, q_size=2048
+    (2304, 9216),  // gemma2-2b down: hidden=2304, intermediate=9216
+    (3584, 4096),  // gemma2-9b o_proj: hidden=3584, q_size=4096
+    (3584, 14336), // gemma2-9b down: hidden=3584, intermediate=14336
+    (4608, 4096),  // gemma2-27b o_proj: hidden=4608, q_size=4096
+    (4608, 36864), // gemma2-27b down: hidden=4608, intermediate=36864
+    // ── Qwen2 / Qwen2.5 long-tail (1.5B, 7B, 72B + 14B/32B) ──
+    (1536, 8960),  // qwen2-1.5b down: hidden=1536, intermediate=8960
+    (3584, 3584),  // qwen2-7b o_proj: hidden=q_size=3584
+    (3584, 18944), // qwen2-7b down: hidden=3584, intermediate=18944
+    (8192, 29568), // qwen2-72b down: hidden=8192, intermediate=29568
+    (5120, 13824), // qwen2.5-14b down: hidden=5120, intermediate=13824
+    (5120, 27648), // qwen2.5-32b down: hidden=5120, intermediate=27648
+    // ── Phi-3-medium / Phi-4 / Mistral-Nemo / Llama-2-13B ──
+    (5120, 5120),  // square: hidden=q_size=5120 (phi3-medium o, llama2-13b o)
+    (5120, 4096),  // mistral-nemo q_proj: q_size=5120, hidden=4096
+    (5120, 14336), // mistral-nemo down: hidden=5120, intermediate=14336
+    (5120, 17920), // phi-3-medium / phi-4 down
+    // ── DeepSeek-V3 (bzantium) + V2/V3 academic ──
+    (576, 7168),   // deepseek-v3 q_a_proj
+    (1536, 7168),  // deepseek-v3 q_b_proj
+    (7168, 16384), // deepseek-v3 gate|up packed half
+    (7168, 18432), // deepseek-v3 down half
+    (24576, 1536), // deepseek-v3 q_b_to_q
+    (32768, 512),  // deepseek-v3 long-K MLA
+    (2048, 10944), // deepseek-v2-lite / v3-academic-9b down
 ];
 
 /// `num_tokens` grid — matches the solver's default workload sweep.

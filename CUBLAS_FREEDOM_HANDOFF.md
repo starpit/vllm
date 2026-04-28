@@ -2,146 +2,165 @@
 
 **Goal**: drop the cuBLAS dependency from the inference container. CUDA 12's `libcublas.so` + `libcublasLt.so` are ~850 MB combined; on a 3-5 GB inference image that's 17–30% off — enough to materially change Kubernetes cold-start and cluster image cache pressure.
 
-**Branch**: `ff-interpreter` (this worktree). Tip: pending commit on top of `5cbd6f2d0`.
+**Branch**: `ff-interpreter`. Tip: `72304b029`.
 
 **Target arch**: sm89 (L4 / Ada). sm90+ will be ThunderKittens-based in a separate workstream — none of this code path applies there.
 
+> ⚠️ **Read this first**: The pick counts below are derived from `vllm ferrite info --color never | grep -c …` on commit `72304b029`'s installed CSV. **Do not** repeat what you see here from memory or from older git revisions. Re-run the audit yourself before picking a target — earlier sessions burned hours by trusting stale or speculative numbers ("(in dump)" was once used as a placeholder for an unmeasured count and was later read as if it implied non-zero picks). The verification recipe is in **Audit recipe** below.
+
 ## Status snapshot
 
+cuBLAS-using surface across the 271-variant dense fleet, by Instruction kind:
+
 ```
-standalone Cublas picks:          3250 → 2758   (-492, -15%)
-fused-gate-up cuBLAS-using picks: 1498 →  302   (-1196, -80%)
-all-cuBLAS-using surface:         (~10148 baseline) → ~9020 across 271 variants
-CutlassFusedGateUpSiluMul picks:    0 →  124   (broke the zero-pick floor)
+Cublas (standalone)           3574
+FusedQkvRopePrefill            699   ← no CUTLASS sibling
+FusedGateUpGeluMul             520   ← partial CUTLASS sibling (752 already migrated)
+FusedGateUpSiluMul             295   ← CUTLASS sibling at 144 picks (BW-bound regime only)
+FusedQkvRopeCache              194   ← no CUTLASS sibling
+FusedGemmBias                    0   ← (no claim sites; all bias_add absorbed by FusedQkvRope*)
+                              ----
+Total bf16 cuBLAS-using       5282
 ```
 
-| Commit | Lever | Δ (cuBLAS-using) |
+Non-cuBLAS picks (already migrated):
+
+```
+CutlassGemm (standalone zoo)             1293
+CutlassFusedGateUpGeluMul                 752   ← landed 72304b029
+CutlassGemmSplitK + CutlassGemmAdd + Gemv (~1500 combined; not the lever)
+CutlassFusedGateUpSiluMul                 144
+CutlassFusedGemmBias                        0   ← 0 claim sites in fleet today
+```
+
+FP8 and Marlin paths are large but separate workstreams; not cuBLAS-using.
+
+| Commit | Lever | Notes |
 |---|---|---|
 | `9f89f2d3e` | Delete `gemm_is_fusion_partner` heuristic — DP solves naturally | -469 |
 | `1d570158d` | tile_m=16 CUTLASS variants + recalibrated L4 CSV | -125 |
 | `a5ad45609` | 2-param linear regression predictor (correctness, not pick-shifter) | +33 |
-| _pending_ | `FusedGateUpSiluMul::cost_us` measured cuBLAS, not roofline-peak | **-1127** |
-| Plus infra: `33cc08517` shape annotation, `28d545f88` M-range in info | | |
+| `4a67304ec` | `FusedGateUpSiluMul::cost_us` measured cuBLAS, not roofline | -1127 |
+| `72304b029` | **`FusedGateUpGeluMul::cost_us` measured cuBLAS, not roofline** | **-752** |
+| `72304b029` | Bias zoo on plain `cutlass::gemm::device::Gemm` (3.21× faster, 0 picks) | 0 |
+| `72304b029` | Megakernels build disabled (cross-worktree cache pollution workaround) | 0 |
 
-The -1127 fix replaced an 8×-optimistic roofline (peak FP16 FLOPS) with the calibrated cuBLAS row at the packed `(M, 2I, K)`. The cuBLAS path was being preferred over CutlassFused-* and over honest singleton chains because its cost looked free; once it's honest, 124 picks find the CUTLASS-fused sibling and ~1000 picks route to non-cuBLAS singleton chains where the cuBLAS-fused path was simply the wrong choice.
+## The cost-eval bug pattern that's already paid out twice
 
-The +33 from the linreg predictor is the predictor being honest: at memory-bound shapes cuBLAS legitimately has a slightly better fitted DRAM saturation slope. The eff-scale + clamp predictor was hiding that with a tiebreak that papered over physics. The new fit doesn't flip picks for free, but it correctly distinguishes kernels at extrapolation — necessary for any future kernel work to actually win in the solver.
+`FusedGateUp{Silu,Gelu,…}MulImpl::cost_us` and `FusedQkvRope{Cache,Prefill}Impl::cost_us` (the cuBLAS peers) compute the GEMM cost as `cublas(M, packed_N, K) + bw_bound_elementwise`. The original code used **roofline FLOPS** (`peak_tflops_fp16`) for the GEMM step — ~8× optimistic vs measured cuBLAS. The CUTLASS peers were always reading measured CSV rows, so the DP saw `roofline-cublas << measured-cutlass` and never picked the CUTLASS path.
 
-## What's left: 2689 picks by pattern
+**The fix is identical in every case**: replace the roofline call with `ctx.profile.cost_us_for("cublas", num_tokens, packed_n, hidden)` and keep the roofline as a fall-back when the predictor has no signal.
 
+Already applied:
+- `FusedGateUpSiluMulImpl` in `4a67304ec` (-1127 picks)
+- `FusedGateUpGeluMulImpl` in `72304b029` (-752 picks; doubles as CUTLASS peer landing)
+
+**Strongly suspected, not yet verified**: `FusedQkvRopeCacheImpl` and `FusedQkvRopePrefillImpl` cost_us. If they have the same roofline anti-pattern *and* a CUTLASS peer existed, that's another ~893 picks at the cost of a one-line fix per Impl + a CUTLASS peer per Impl. (No CUTLASS peer exists yet for either; building one is the next major lever.)
+
+**Check first** before doing kernel work: `grep -A20 'fn cost_us' impl_lib.rs` on the relevant Impl, look for `peak_tflops_fp16` or a `flops / peak * 1e6` pattern. If present, that's the same bug.
+
+## What's been built that you can reuse
+
+### CutlassFusedGateUpGeluMul (72304b029)
+
+Mirrors the cuBLAS-peer structure exactly: ONE packed CUTLASS GEMM at `(M, 2I, K)` writing `[M, 2I]`, then `gelu_and_mul_fused_bf16` BW-bound elementwise. **No new .cu file** — reuses the standalone CUTLASS zoo + the existing activation kernel. Tile-zoo-pickable like `CutlassGemmImpl`; one Impl per `CUTLASS_TILE_ZOO` entry.
+
+This is the **right architectural pattern** for any "packed-GEMM-then-elementwise" cuBLAS-using fusion. Use it as the template for `CutlassFusedQkvRope*` and any other peer you build. Earlier in the same session a `cutlass_2x_gemm`-based 2-GEMM EVT design was tried (analogous to `CutlassFusedGateUpSiluMul`) and reverted — it captures **zero picks for gemma** because gemma's MLP shapes are compute-bound, where the 2-GEMM-EVT scaffolding loses 18% to packed cuBLAS. The packed-CUTLASS approach matches cuBLAS's structure and wins iff `cutlass_<tile>(M, 2I, K) < cublas(M, 2I, K)`.
+
+### Bias zoo on plain `cutlass::gemm::device::Gemm` (72304b029)
+
+`cutlass_gemm_bias.cu` was rewritten off `scaled_mm_c2x.cuh` (`DefaultGemmWithVisitor` + `ThreadblockSwizzleStreamK` + EVT visitor tree + `AlignmentCD=4`) onto plain `cutlass::gemm::device::Gemm` + `LinearCombination` + `GemmIdentityThreadblockSwizzle` + alignment 8. **The bias is passed as the C operand at `ldc=0`** so the standard GEMM API gives row-broadcast for free — no custom epilogue, no visitor tree.
+
+Single-shape benchmark at M=128, N=K=4096: 219.1 µs → **68.3 µs** (3.21×, beats cuBLAS at 73.5 µs).
+
+**Captures zero picks today** because no model in the fleet emits a `(Gemm, BiasAdd)` lone pair — qwen2 is the only arch using `bias_add` and its three Q/K/V `bias_add` tiles are all claimed by `FusedQkvRopeCache/Prefill`. Retained because:
+1. Proof-of-concept that `ldc=0` bias-broadcast works on the standalone-Gemm template family — directly reusable when building the missing CUTLASS-fused QKV-rope kernels (where qwen2's biases live).
+2. If a model with a bias_add outside QKV rope ever joins the fleet, this is ready to capture it.
+
+### Sweep: packed-N rows for gemma
+
+`gemm_sweep.rs` now emits cublas + cutlass-tile rows at `(M, 2*intermediate_size, hidden_size)` for every gemma2/gemma3 fleet variant (13824–73728 packed N). The predictor's linreg fits these directly, eliminating the roofline fall-back at gemma MLP shapes. If you add a new packed-cuBLAS path for any other arch family, mirror this pattern (add `(packed_n, hidden)` rows for that arch's MLP).
+
+## Known regression to investigate
+
+Standalone `Cublas` picks went **up** 2696 → 3574 (+878) and `FusedQkvRopePrefill` went up 454 → 699 (+245) between the pre-`72304b029` audit (`/tmp/dump_after.txt`) and the post-`72304b029` audit (`/tmp/dump_solver_fix.txt`). Two suspect causes:
+- **Predictor-refit artifact**: the new packed-N CSV rows changed the linreg fit globally; some standalone-GEMM buckets now extrapolate cublas as cheaper than they previously did (acceptable if real, but worth confirming).
+- **Re-routing from the GELU fix**: the freed gate-up GELU tiles may be claimed by other cuBLAS-using fusions before reaching CUTLASS-peer alternatives.
+
+**Not yet investigated.** The 752 pick GELU win is unambiguous; the +878 standalone-Cublas number is concerning enough to verify before adding more leverage on top. Diagnostic recipe in **Audit recipe** below.
+
+## Levers ranked by current leverage
+
+### A — `FusedQkvRope{Cache,Prefill}` cost-eval bugfix + CUTLASS peer (~1-3 days)
+Apply the same playbook as `4a67304ec` / `72304b029`:
+1. Check `FusedQkvRopeCacheImpl::cost_us` + `FusedQkvRopePrefillImpl::cost_us` for the roofline-FLOPS anti-pattern. If present, replace with measured `cublas` lookup at the packed QKV shape.
+2. Add `CutlassFusedQkvRope{Cache,Prefill}Impl` peers: packed CUTLASS GEMM at `(M, q_size+2*kv_size, hidden)` + `qk_norm_rope_kernels` (or whichever existing rope kernel today's cuBLAS peer's Instruction body calls). Mirror `CutlassFusedGateUpGeluMulImpl`'s tile-zoo-pickable shape.
+3. Add packed-QKV-N rows to `gemm_sweep.rs` per arch (qwen2, qwen3, llama, granite, etc).
+
+**Estimated**: 893 picks of headroom. Realized capture depends on `cutlass_<tile>(M, qkv_packed, K) vs cublas(M, qkv_packed, K)` at fleet shapes — same dynamic as the GELU win.
+
+### B — Stream-K standalone CUTLASS (handoff-original Lever B, 3-5 days)
+CUTLASS 2.10+ ships Stream-K; we have the splitK template family in `cutlass_standalone_gemm.cu`. Currently registered as fixed `split_k ∈ {2,4,8}` variants. Stream-K is *adaptive* — splits K to fill SMs based on workload. Targets the **long-K medium-M** regime (down_proj prefill), part of the 3574 standalone Cublas picks.
+
+### C — Small-M batched-GEMV SIMT kernel (1-2 weeks)
+The lm_head prefill regime needs a fundamentally different algorithm at M ∈ [2, 32] tall-skinny. Hand-CUDA, sm89-specific. Mirrors the existing `cutlass_gemv` (M=1) but with M mapped to thread-block outer-dim. **Reference**: prior small-M work may exist in `worktree-ferrite-mega` per memory `feedback_check_older_mega_branch` — check before writing from scratch.
+
+### D — Investigate +878 Cublas / +245 FusedQkvRopePrefill regression (~30 min)
+Diagnostic-only. Diff the dumps at the bucket level; identify which buckets changed pick. If predictor-refit, accept and move on. If real bug, fix before A.
+
+### E — `LinearLayer::forward` de-cublas (Lever D from prior handoff, ~1-2 weeks per peer)
+`LinearLayer::forward` is the entry point that 5 fused cuBLAS-peer Impls (Gate-up, Qkv-rope, etc.) call. Replacing its cuBLAS branch with CUTLASS would eliminate the cuBLAS dep across all of them at once — but it's load-bearing for shapes where cuBLAS legitimately wins. Best done after CUTLASS-peer Impls exist for every fused pattern.
+
+### F — Feature-gate cuBLAS off and accept perf hit (3-5 days)
+Last step of the project. Only viable after every dense path has a CUTLASS realization (i.e. after A + B + C + E land). Premature today.
+
+## Recommended sequence from `72304b029`
+
+1. **D** (~30 min): confirm the +878 Cublas regression is predictor-refit not real.
+2. **A** (~1-3 days): cost-eval bugfix + CUTLASS peer for `FusedQkvRope{Cache,Prefill}`. Same playbook as the GELU fix.
+3. **B** (~3-5 days): Stream-K for standalone Cublas long-K medium-M regime.
+4. **C** (~1-2 weeks): batched-GEMV for lm_head prefill.
+5. **E** (~2-4 weeks): de-cublas `LinearLayer::forward`. Last code work before F.
+6. **F** (~3-5 days): feature-gate cuBLAS off, verify image-size win, ship.
+
+## Audit recipe
+
+**Always run this on every change** — don't trust narrative pick counts.
+
+```bash
+# 1. Re-sweep on L4
+CUDA_PATH=/usr/local/cuda-12.9 cargo run -p ferrite-cost-sweep --features cuda --release --bin gpu_cost_sweep > /tmp/cost.csv
+
+# 2. Install CSV + force ferrite-cuda-targets rebuild (cargo doesn't always notice CSV-only changes)
+cp /tmp/cost.csv vllm-rs/crates/ferrite-cuda-targets/profiles/cost_l4_sm89.csv
+touch vllm-rs/crates/ferrite-cuda-targets/src/lib.rs
+
+# 3. Build vllm-cli, dump audit
+cargo build -p vllm-cli --features cuda --release
+./target/release/vllm ferrite info --color never > /tmp/dump.txt
+
+# 4. Per-kind pick count (the only number that matters)
+for k in Cublas FusedGateUpGeluMul FusedGateUpSiluMul FusedQkvRopeCache FusedQkvRopePrefill \
+         CutlassGemm CutlassFusedGateUpGeluMul CutlassFusedGateUpSiluMul CutlassFusedGemmBias FusedGemmBias; do
+  printf "%-32s %d\n" "$k" "$(grep -c "\b${k}\b" /tmp/dump.txt)"
+done
 ```
-tall-skinny / small prefill (M=2..)         454   11 archs   lm_head, vocab-N
-long-K / small prefill (M=2..)              364   10 archs   down_proj, K=4×N
-square-ish / large prefill (M=512..)        337    4 archs   o_proj at large M
-square-ish / huge prefill (M=4096..)        255    5 archs   o_proj at huge M
-square-ish / small prefill (M=2..)          241    7 archs   o_proj at small M
-moderate-K / large prefill (M=512..)        178    2 archs   gate-up
-long-K / huge prefill (M=4096..)            180    8 archs   down_proj huge
-moderate-K / med prefill (M=64..)           138    3 archs
-long-K / large prefill (M=512..)            136    5 archs
-long-K / med prefill (M=64..)               126    6 archs
-... + ~250 long-tail picks
-```
 
-**Two real gaps**, measured directly from the L4 CSV (not predictor inference):
+If you're tempted to act on a number from this doc without re-running the audit: don't.
 
-1. **Small-M tall-skinny** (lm_head prefill, M=2..32, vocab N): cuBLAS ~5-7% faster than best CUTLASS at calibrated similar shapes. cuBLASLt has small-M tall-skinny dispatch heuristics the static tile zoo lacks.
+## Tools
 
-2. **Long-K medium-M** (down_proj at M=64..512, K=4×N): cuBLAS 7-22% faster (worst at M=128). Static SplitK={2,4,8} grid doesn't match cuBLAS's adaptive K-split.
-
-The "square-ish" buckets (~830 picks) are mostly noise-band (cuBLAS ≤1-3% faster) — they'd flip with a feature gate at minimal perf cost.
-
-## The actual surface — much bigger than "Cublas" picks suggest
-
-`grep device.cublas vllm-rs/crates/ferrite-{kernels,forward}/src/` returns **19 references**. Most aren't `GemmRefImpl` — they're fused impls calling `LinearLayer::forward` which calls cuBLAS internally. Pick-count by cuBLAS-using kind across the 271-variant dense fleet:
-
-| Fusion / kind | Picks | Has CUTLASS sibling? | DP picks the CUTLASS sibling? |
-|---|---|---|---|
-| `Cublas` (standalone Gemm) | 2689 | Yes (CutlassGemm zoo) | 1042 — sometimes |
-| `FusedGateUpGeluMul` | 2950 | **No (missing)** | n/a |
-| `FusedQkvRopePrefill` | 1905 | **No (missing)** | n/a |
-| `FusedGateUpSiluMul` | 1498 | Yes (`CutlassFusedGateUpSiluMul`) | **0 picks** |
-| `FusedQkvRopeCache` | 1106 | **No (missing)** | n/a |
-| `FusedGemmBias` | (in dump) | Yes (`CutlassFusedGemmBias`) | **0 picks** |
-
-**Total cuBLAS-using picks: ~10,148** (dense fleet). The 2689 standalone-Gemm picks I'd been tracking are ~26% of the actual surface.
-
-Worse: where CUTLASS fused siblings exist (`CutlassFusedGemmBias`, `CutlassFusedGateUpSiluMul`), **they're at zero picks across the fleet**. The DP isn't picking them. Either their `cost_us` is higher than the cuBLAS path on every shape (a calibration or model issue), their `matches` gate excludes most cases, or some other mechanism is silencing them. **This is a cheap-to-investigate, potentially-huge-lever item.**
-
-**Investigated 2026-04-27.** The zero-pick story for `CutlassFusedGateUpSiluMul` was a pure cost-model bug: `FusedGateUpSiluMulImpl::cost_us` (the cuBLAS peer) used roofline peak-FP16 FLOPS instead of the measured `cublas` CSV row, while the CUTLASS sibling used measured cutlass rows. At llama-7b prefill the roofline gave ~95 µs vs measured ~825 µs — 8× optimistic. After fixing the cost call to `cost_us_for("cublas", M, 2I, K)`: CutlassFusedGateUpSiluMul jumps from 0 → 124 picks, FusedGateUpSiluMul drops from 1498 → 302, and ~1000 picks correctly migrate to non-cuBLAS singleton chains. **CutlassFusedGateUpSiluMul itself is a competitive kernel — the design (2 GEMMs at I + EVT silu_mul vs cuBLAS's 1 packed GEMM at 2I) costs ~18% more than cuBLAS-packed at compute-bound shapes; that's not a kernel-quality issue, just a regime where cuBLAS happens to win narrowly.**
-
-`CutlassFusedGemmBias` is a different story and remains at zero picks. The cost model was already apples-to-apples (both peers use measured CSV rows). The kernel itself is genuinely ~3× slower than cuBLAS+bias_add at compute-bound shapes (e.g. M=128 N=4096 K=4096: cublas=70 µs, cutlass_fused_gemm_bias=219 µs, plain cutlass_128x128_s3=66.9 µs). The kernel template uses `cutlass_2x_gemm` from `scaled_mm_c2x.cuh` — the same scaffolding as FP8 quant scaled GEMMs — and likely carries broadcast-overhead that doesn't apply to the bf16 bias-add case. **Re-implementing on the same template family as the plain CUTLASS singleton (no `scaled_mm_c2x.cuh`) is the right next step here.**
-
-To actually drop `libcublas`:
-
-1. **Diagnose the zero-pick CUTLASS-fused situation.** First and cheapest. Plausibly a calibration miss (their CSV rows are missing or under-fit) or a solver gate (`gemm_is_fusion_partner`-class issue we haven't found yet). Could be 2700+ picks freed at near-zero cost.
-2. **Write the missing CUTLASS-fused impls** for GateUpGelu, QkvRopeCache, QkvRopePrefill. ~6000 picks. Real epilogue-kernel work but the pattern is established by the existing CUTLASS-fused pair.
-3. **Standalone-Gemm kernel work** (Levers B/C below) — closes the residual ~700 picks where cuBLAS legitimately wins.
-
-`LinearLayer::forward` would still link `libcublas` until step 1+2 actually have all-CUTLASS picks fleet-wide AND we drop the cuBLAS branch from `LinearLayer::forward` itself. The cargo feature gate is the LAST step, after every dense path has a CUTLASS realization.
-
-## Bigger levers, ranked by effort × impact
-
-### Lever A — Just feature-gate cuBLAS off and accept 5-22% perf hit (3-5 days)
-The audit shows ~830 picks are noise-band, ~1100 picks have predictor extrapolation behind them, ~700 picks are real gaps. If we accept whatever the DP picks when cuBLAS is unavailable, perf drops on the long-tail by 5-22%. Decode is unaffected (already CutlassGemv). Prefill latency goes up modestly.
-
-**Win**: ~850 MB image-size, immediate. Image-size goal achieved.
-**Cost**: degraded prefill perf on the patterns above; per-arch verification needed; some fused impls might need to be rewired (the surface-area issue above).
-**Effort**: ~1 week, mostly de-link work + correctness verify on the fleet.
-
-### Lever B — Stream-K Implementation (3-5 days)
-CUTLASS 2.10+ ships Stream-K; we have it in `cutlass_standalone_gemm.cu` (search for `CUTLASS_SPLITK`). Currently registered as fixed `split_k ∈ {2,4,8}` variants. Stream-K is *adaptive* — splits K to fill SMs based on workload. Targets the **long-K medium-M** regime (down_proj prefill).
-
-**Effort breakdown**: register `cutlass_streamk_*` Impls in `impl_lib.rs`, add CSV calibration sweep rows, verify pick on commandr.
-**Estimated picks closed**: ~400 (down_proj across M-buckets).
-
-### Lever C — Small-M batched-GEMV SIMT kernel (1-2 weeks)
-The lm_head prefill regime needs a fundamentally different algorithm: stream B once, accumulate M output rows in shared memory. Hand-CUDA, sm89-specific. Mirrors the existing `cutlass_gemv` (M=1) but with M ∈ [2, 32] mapped to thread-block outer-dim.
-
-**Reference**: there may be precedent in `worktree-ferrite-mega` per memory `feedback_check_older_mega_branch`. Check first.
-**Estimated picks closed**: 454 lm_head + a chunk of small-M square-ish.
-
-### Lever D — Drop ALL cuBLAS-using fused impls (1-2 weeks)
-Replace `LinearLayer::forward`'s cuBLAS path with CUTLASS, propagate to the 9 fused-impl downstreams. Some have CUTLASS-only siblings (`CutlassFusedGemmBiasImpl`, `CutlassFusedGateUpSiluMulImpl`); others don't. Implies extending the CUTLASS impl set.
-
-**Win**: this is the actual prerequisite for Lever A's de-link. Without it, even feature-gating `GemmRefImpl` off doesn't shrink the image.
-**Estimated picks closed**: lots of "Cublas" labels actually represent FusedGemmBias-via-cublas, so this could be the biggest single lever.
-
-### Lever E — Triton or hand-PTX (out of scope, noted for completeness)
-~Same as Lever C but in a higher-level DSL. Triton's runtime is hundreds of MB, defeats image-size goal. Hand-PTX is sm-version-coupled. Stay in CUDA C++ / CUTLASS.
-
-### Recommended sequence
-
-Given the new finding that CUTLASS-fused siblings exist with zero picks AND that fused impls are 75%+ of the cuBLAS-using surface, the order should be:
-
-1. **Diagnose zero-pick CutlassFused-\* (1-2 days).** Why aren't they winning? If it's a fixable solver/calibration issue, this is the single biggest lever — could free 2700+ picks for free. Look at: cost ordering at the workload points, registration order, any `matches` gate, CSV row presence for their kernel names.
-2. **Lever D variant — write CUTLASS-fused for the three missing patterns (1-2 weeks each).** GateUpGeluMul, QkvRopeCache, QkvRopePrefill. Patterns established by existing siblings.
-3. **Lever B (Stream-K, 3-5 days).** Closes long-K medium-M down_proj gap (~700 picks).
-4. **Lever C (small-M tall-skinny SIMT kernel, 1-2 weeks).** Closes lm_head prefill (~454 picks).
-5. **Lever A (feature gate + de-link, 3-5 days).** After dense paths have all-CUTLASS picks, gate cuBLAS off and verify image-size win.
-
-Total realistic budget: **5-8 weeks** of focused work. Step 1 alone could change the budget significantly — if the zero-pick CutlassFused-\* turn out to be a one-line solver fix, we'd jump from 26% solved to 75%+ solved overnight.
-
-## Tools we built this session (still useful)
-
-- **`vllm ferrite info`** now emits `(M=…,N=…,K=…)` per GEMM line. Bucket header keeps precise per-bucket labels; line-level annotation is the cluster's M-union. Pipe into `/tmp/classify_cublas.py` for pattern analysis.
-- **`/tmp/classify_cublas.py`** — buckets cuBLAS picks by shape aspect (tall-skinny / long-K / square / moderate) × M-range. Run against a fresh dump after any change.
-- **`/tmp/borderline_cublas.py`** — for each cuBLAS pick, compares against best non-cuBLAS in CSV; classifies as `clear_win` / `borderline` / `non_cublas_faster` / `no_csv_data`. Threshold-sweepable.
-- **Linear regression predictor** — extrapolates honestly. Held-out test pins it within 3×.
+- **`vllm ferrite info`** emits `(M=…,N=…,K=…)` per Cublas/standalone-GEMM line. Pipe into `/tmp/classify_cublas.py` for shape-bucket analysis. Note: fused-pattern Instructions (`FusedGateUpGeluMul`, `FusedQkvRopePrefill`, etc.) do **not** carry shape annotations — derive from `<arch>` + `bounds`.
+- **`/tmp/classify_cublas.py`** — buckets cuBLAS picks by shape aspect (tall-skinny / long-K / square / moderate) × M-range.
+- **`/tmp/borderline_cublas.py`** — for each cuBLAS pick, compares against best non-cuBLAS in CSV; classifies as `clear_win` / `borderline` / `non_cublas_faster` / `no_csv_data`.
+- **Linear regression predictor** in `target.rs` — extrapolates honestly, held-out test pins it within 3×.
 - **Runtime shape assertions** — every Gemm-class Instruction's eval body asserts the runtime weight shape matches the codegen-time `(N, K)`. Catches loader/codegen drift loud.
 
-## Verification setup
+## Verification quirks
 
-- Cost-sweep on L4: `CUDA_PATH=/usr/local/cuda-12.9 cargo run -p ferrite-cost-sweep --features cuda --release --bin gpu_cost_sweep > /tmp/cost_l4_new.csv`. ~3-5 min on this hardware. Replace `vllm-rs/crates/ferrite-cuda-targets/profiles/cost_l4_sm89.csv` to install. **Touch `vllm-rs/crates/ferrite-cuda-targets/src/lib.rs` after to force ferrite-cuda-targets rebuild** — cargo doesn't always notice CSV-only changes.
-- After kernel changes: clear `/home/moosevan/.cache/cudaforge/vllm-cuda/libcutlass_standalone_gemm.{a,manifest}` + the `.o` files to force CUDA recompile. Stale-cache memory: `feedback_cudaforge_cache.md`.
-- `vllm chat` correctness on commandr (per `feedback_smallest_model_for_verify.md`).
-- Audit run: `vllm-rs/target/release/vllm ferrite info --color never > /tmp/dump.txt && grep -c 'Cublas ' /tmp/dump.txt`.
-
-## Open decisions for next session
-
-1. **Lever ordering** — A first (ship image-size, accept perf hit) or C first (kernel work, then ship)? Strategic call.
-2. **Perf-regression tolerance** — fail CI on >X% prefill latency vs current? Need a number to design Lever A around.
-3. **Whether to write Lever D (cuBLAS-free fused impls) as one PR or per-impl** — it's many lines but each impl is small. Per-impl is incrementally landable.
+- **Cudaforge cache stomp**: `~/.cache/cudaforge/vllm-cuda/` is shared across worktrees. If another claude in another worktree builds `cutlass_gemm_bias` from a different .cu, your `.a` gets overwritten with their symbol set. Per `feedback_cudaforge_cache.md`: when seeing `undefined reference: cutlass_gemm_bias_<TILE>_launch`, `rm libcutlass_gemm_bias.*` + touch the .cu to force re-build.
+- **Megakernels build is disabled on this branch** (`build_megakernels` short-circuits). Required because the same shared cache dir is populated by another worktree's session with `.cu` files that `#include "llama.cuh"`, which doesn't exist on our include path. Re-enable only if this branch needs to ship megakernels — until then leave it off.
+- **`vllm chat` correctness on commandr** is the oracle for any correctness-affecting change (per `feedback_smallest_model_for_verify.md`, `feedback_no_run_chat.md`). Wrap in `timeout 30s`.
 
 ## Memory pointers
 
@@ -150,3 +169,5 @@ Total realistic budget: **5-8 weeks** of focused work. Step 1 alone could change
 - `feedback_cudaforge_cache` — clear stale `.a` files after kernel edits
 - `feedback_check_older_mega_branch` — prior small-M kernel work may exist in `worktree-ferrite-mega`
 - `feedback_no_run_chat` — `vllm chat` is the correctness oracle, with timeout
+- `feedback_read_data_before_claiming_bottleneck` — measure first, pattern-match second
+- `feedback_show_dont_tell` — structural claims need real-input tests, not synthetic ones

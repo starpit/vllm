@@ -686,8 +686,8 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             //     adds, standalone norms. Surfaced because their
             //     existence is usually a "why didn't we fuse this?"
             //     signal.
-            const CLASS_LABELS: [&str; 8] = [
-                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm",
+            const CLASS_LABELS: [&str; 9] = [
+                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm", "kvm",
             ];
             // Names that are non-gemm despite a `fused_` prefix
             // (norm-side fusions with no matmul).
@@ -707,13 +707,15 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
             ];
-            let mut classes_used = [false; 8];
+            let mut classes_used = [false; 9];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
                 std::collections::BTreeSet::new();
             for assignment in sfufs.per_workload.values() {
                 for impl_id in assignment.impls.values() {
                     let name = library.get(*impl_id).name();
-                    let bucket = if name.starts_with("flashinfer") {
+                    let bucket = if name.starts_with("tk_") {
+                        Some(8) // kvm — TK megakernel opcodes
+                    } else if name.starts_with("flashinfer") {
                         Some(1) // fi
                     } else if name.starts_with("mla_") {
                         Some(2) // mla

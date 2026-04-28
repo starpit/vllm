@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::classified::OpKind;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
-use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchInfo};
+use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, LaunchKind, MatchInfo};
 use crate::shape::{Inferred, Shape, extern_shape};
 use crate::target::TargetProfile;
 
@@ -407,7 +407,26 @@ fn solve_one(
             {
                 continue;
             }
-            let cost = imp.cost_us(info, &ctx);
+            // Per-pick launch-overhead term. HostCallback picks pay
+            // a CUDA dispatch + cuLaunchKernel (~5 µs on H100/L4 per
+            // ferrite-forward-macro/src/impl_lib.rs:2090-2093 design
+            // comment); DeviceCallable picks run inside an enclosing
+            // megakernel and pay zero per-pick. Without this term
+            // every DeviceCallable Impl ties on cost with its
+            // HostCallback counterpart and the DP picks the
+            // first-registered one — so TK Impls (which override
+            // launch_kind to DeviceCallable but inherit cost_us
+            // from their host counterparts) never win. The term is
+            // a property of the launch model, not of any specific
+            // Impl, so it lives here in the central cost evaluator.
+            const HOST_LAUNCH_OVERHEAD_US: f64 = 5.0;
+            let launch_overhead = match imp.launch_kind() {
+                LaunchKind::HostCallback | LaunchKind::RegularLaunch => {
+                    HOST_LAUNCH_OVERHEAD_US
+                }
+                LaunchKind::DeviceCallable | LaunchKind::CooperativeLaunch => 0.0,
+            };
+            let cost = imp.cost_us(info, &ctx) + launch_overhead;
             if !cost.is_finite() {
                 return Err(SolveError::UnreachableCost {
                     tile: node.id,

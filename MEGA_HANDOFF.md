@@ -7,13 +7,205 @@
 > mega builds on top of its `Instruction<W>` IR + `static
 > BACKBONE_M_<N>: &[Instruction<W>]` slices without modification.
 
-## STATE 2026-04-28 — P2-4b step 5 done; step 6 (Rust launcher wire-up) is next
+## STATE 2026-04-28 (PM) — P2-4b steps 6a + 6b-i done; step 6c (marshaling wrapper) is next
 
-Tip `a53da44ef` (post-rebase onto `dd206d1f9`). 250/254 tests pass
-on `cargo test -p ferrite-forward-macro --release`; the 4 failures
-are pre-existing on HEAD (`dc_zoo_equals_host_zoo`,
-`dc_cutlass_*_name_covers_full_zoo`, `swiglu_mlp_claimed_as_fused_
-subgraph_per_layer`) and unrelated to mega.
+Tip `3b9b836ba`. Two commits past `4c71d603f`:
+
+- **`50d4f3888`** — step 6a: `KvmMegaLauncher<W>` fn-ptr type +
+  `kvm_mega_forced()` env gate in `ferrite-forward/src/lib.rs`.
+  `LAUNCHER_TABLE` row extended from 2-tuple to 3-tuple
+  `(Option<__PrimMegaLauncher>, Option<__PrimMegaLauncher>,
+  Option<__KvmMegaLauncher>)`. Kvm dispatch branch added in both
+  `forward()` and `forward_backbone()`, taking precedence over
+  prim_mega when forced; panics loudly on `Some(_)` slot mismatch.
+  Kvm slot is `None` for every bucket today — no caller exists yet.
+- **`3b9b836ba`** — step 6b-i: per-canonical Rust `unsafe extern
+  "C"` decl emission for `tk_megakernel_<canonical>_launch` via
+  new `kvm_mega::emit_kvm_extern_decl`. Gated identically to the
+  `.cu` write
+  (`kvm_emitted_any && kvm_kernel_dims_from_bounds.is_some()`)
+  so the linker only ever sees declarations whose symbols
+  actually exist in libmegakernels.a. Decl currently has no
+  caller (the wrapper that fills it is step 6c).
+
+250/254 tests pass on `cargo test -p ferrite-forward-macro
+--release`; the 4 failures are pre-existing on HEAD
+(`dc_zoo_equals_host_zoo`, `dc_cutlass_*_name_covers_full_zoo`,
+`swiglu_mlp_claimed_as_fused_subgraph_per_layer`) and unrelated
+to mega.
+
+### Step 6c — per-canonical marshaling wrapper (next)
+
+**Goal.** Emit `kvm_mega_<canonical>` as a `KvmMegaLauncher<Weights>`
+fn that fills the ~50 C args with values from `Weights<W>` /
+`ForwardCtx<W>` accessors, then calls the
+`tk_megakernel_<canonical>_launch` symbol declared in 6b-i. Flip
+the `LAUNCHER_TABLE` kvm slot from `None` to `Some(kvm_mega_<canonical>)`
+for every bucket of an eligible canonical. After this lands,
+`FERRITE_FORCE_KVM_MEGA=1 vllm chat …` exercises the kvm path
+end-to-end.
+
+**Why it's bigger than 6a/6b-i.** Previous handoff text claimed
+`tk_paged_kv` and `tk_instructions` modules existed in
+`crates/ferrite-forward/src/` from earlier ports — they don't.
+Both were ripped out in commits `d22cba7bf` and `8587caddd`
+(originated from the forbidden worktree-ferrite-mega; vendor
+scheduler.py is the source of truth, not the hand-Rust port).
+Step 6c rebuilds the host-side helpers from scratch under our
+own commits, justified line-by-line.
+
+**Argument categories** (see C signature in
+`kvm_mega::emit_kvm_cu_source` ~ln 1035):
+
+1. **Tape (`d_instructions`, `num_instructions`).** Use the
+   IR-emitted `KVM_BACKBONE_M_<wp>` + `KVM_LM_HEAD_M_<wp>`
+   static slices from `emit_kvm_program` (already landed). The
+   wrapper memcpys the concatenated bytes to a per-call device
+   tape buffer. **Open Q:** the C launcher takes ONE tape; we
+   emit two per bucket (backbone + lm_head). Either concatenate
+   at codegen time into one `KVM_FULL_M_<wp>` static and emit
+   that, or memcpy them sequentially into one device buffer.
+   Concatenation at codegen is cleaner; lands as a small
+   change to `emit_kvm_program` + the codegen call site.
+
+2. **Per-call device scratch (`d_bar`, `d_timings`,
+   `d_global_instruction_index`).** Sized from kernel dims. The
+   `Bar` array is a per-op semaphore buffer; the C globals's
+   gl<> dims (bar_d0..d3) come from the tape's instruction
+   count. `d_timings` is a debug timing buffer (`num_timing_rows
+   * TIMING_WIDTH * sizeof(int)`). `d_global_instruction_index`
+   is one int initialized to 0. Allocate via
+   `device.caching.alloc_tensor` (zero-init for the global
+   index — needs a memset_async helper or a one-int memcpy).
+
+3. **Layered weights (`d_qkv_weights, qkv_R, …`).** Map vendor's
+   fused-tensor names to ferrite's `Weights` accessors. The C
+   side wants:
+   - `qkv_weights` — vendor expects ONE concat-Q+K+V tensor.
+     Ferrite's llama already concats: `self_attn_qkv_proj`
+     accessor returns the fused tensor (verify by grepping the
+     emitted Weights struct on llama_3_2_1b: search for
+     `qkv_proj` field declarations).
+   - `up_weights` / `gate_weights` — separate accessors
+     (`mlp_up_proj`, `mlp_gate_proj`). Vendor takes them
+     separate — no fusion needed.
+   - `down_weights`, `attn_norm_weights` (= `input_layernorm`),
+     `mlp_norm_weights` (= `post_attention_layernorm`),
+     `o_weights` (= `self_attn_o_proj`),
+     `lm_head_norm_weights` (= `norm`),
+     `lm_head_weights` (= `lm_head`).
+
+   Each accessor is `(Weights::<name>)(wm, layer)` returning
+   `&LinearLayer` / `&RmsNorm` / `&Embedding`. The wrapper
+   needs the FIRST layer's pointer for layered weights — TK's
+   `gl<>` carries `[num_layers, R, hidden]` so passing
+   layer-0's raw_ptr gives the base of the contiguous block.
+   **Verify** layered weights are stored contiguously (i.e.,
+   `Vec<LinearLayer>` allocation behavior). If not, codegen
+   needs to bake a contiguous-block load for kvm-eligible
+   canonicals (single safetensors load for the full
+   `[L, R, H]` tensor instead of per-layer).
+   `R` parameters (`qkv_R`, `o_R`, `up_R`, etc.) are runtime
+   shape dims — derive from `.dense_weight().shape()[0]` per
+   `prim_mega::emit_prim_mega_launcher`'s
+   `WeightShapeDim` precedent.
+
+4. **KV cache (`d_k_cache`, `d_v_cache`, `kv_total_pages`,
+   `kv_page_size_runtime`).** `ForwardCtx::kv_cache:
+   &KvCachePool` exposes per-layer `k_cache(layer)` and
+   `v_cache(layer)`; the C side takes ONE base pointer for all
+   layers, so we need `k_cache(0).raw_ptr()` and the pool to
+   guarantee contiguous-across-layers layout (currently it
+   is — `KvCachePool` allocates one big `[L*P, page_size,
+   num_kv_heads, head_dim]` block). `kv_total_pages` =
+   `pool.num_pages()`; `kv_page_size_runtime` =
+   `pool.page_size()`.
+
+5. **RoPE tables (`d_rope_cos`, `d_rope_sin`, `max_pos`).**
+   `Weights::rotary_cos_sin(0)` — already exists per the
+   `pub fn rotary_cos_sin(&self, _layer: u32)` arm at
+   codegen.rs:1884. Returns the `(cos, sin)` GpuTensor pair.
+   `max_pos` = first-axis length.
+
+6. **Per-call activations (`d_hidden_states`,
+   `d_rms_rope_intermediates`, `d_rms_gate_intermediates`,
+   `d_q_post_rope`, `d_attn_out`, `d_silu_out`,
+   `d_rms_lm_head_intermediates`, `d_logits`).** Allocated
+   per-call via `device.caching.alloc_tensor`. Shapes derive
+   from `EncodeCtx`:
+   - `hidden_states`, `rms_rope_intermediates`,
+     `rms_gate_intermediates`, `attn_out`,
+     `rms_lm_head_intermediates` → `[batch_size, hidden_dim]`
+     bf16.
+   - `q_post_rope` → `[batch_size, num_attention_heads * head_dim]`
+     bf16.
+   - `silu_out` → `[batch_size, intermediate_dim / num_devices]`
+     bf16.
+   - `logits` → `[batch_size, vocab_size]` bf16.
+
+   `batch_size_arg` and `vocab_size_arg` are scalar ints.
+
+7. **Paged-KV CSR metadata (`d_position_ids`,
+   `d_kv_append_indices`, prefill+decode `qo_indptr` /
+   `kv_indptr` / `kv_indices` / `kv_last_page_len`).** This is
+   the rebuild-from-scratch piece. Today ferrite's
+   `ForwardCtx` carries `block_table` (decode), `seqused_k`
+   (decode), `cu_seqlens_q` (prefill), `slot_mapping` (cache
+   write indices). We need to derive vendor's CSR triples per
+   call:
+   - `prefill_qo_indptr` = `cu_seqlens_q` (prefill side, drop
+     decode-only entries).
+   - `prefill_kv_indptr` / `prefill_kv_indices` /
+     `prefill_kv_last_page_len` — derived by walking
+     `block_table[prefill_seqs]` and computing prefix sums.
+     D2H copy of `block_table` + `seqused_k`, host-side build,
+     H2D back. Vendor's
+     `Megakernels/demos/cross-gpu-llama/python/host_helpers.py`
+     (or equivalent) is the algorithmic reference; the
+     forbidden branch's `tk_paged_kv::build_decode_metadata`
+     was a port of the same — re-derive from vendor source,
+     not from that branch.
+   - Decode side same shape, decode-only seqs.
+   - `kv_append_indices` ≈ `slot_mapping` after a vendor-
+     specific transform (page index = slot / page_size,
+     intra-page position = slot % page_size, packed as one int
+     per token).
+   - `position_ids` = `ctx.positions` (length =
+     `num_position_ids`).
+
+   D2H/H2D round-trips are unavoidable for CSR build (block
+   table is device-side); pipeline them on a side stream so
+   the kernel can launch without waiting for compute_stream
+   sync. Land as a new `kvm_mega::build_paged_kv_metadata`
+   helper in `ferrite-forward` (NOT proc-macro — runtime
+   code), called from the per-canonical wrapper.
+
+8. **Scalars (`attn_scale`, `rms_norm_eps`, `num_pages`,
+   `num_prefill_tokens`, `dev_idx`).** `attn_scale` = `1 /
+   sqrt(head_dim)` baked at codegen time as a `f32` literal.
+   `rms_norm_eps` from `Weights::input_layernorm(0).eps`.
+   `num_pages` = `kv_cache.num_pages()` (already computed for
+   `kv_total_pages`). `num_prefill_tokens` = `ctx.cu_seqlens_q`
+   prefill-side accumulation. `dev_idx` = `0` (TP=1).
+
+9. **Stream (`raw_stream`).** `device.compute_stream as *mut
+   c_void`.
+
+**Suggested decomposition into commits.**
+
+- **6c-i.** Concatenate per-bucket `KVM_BACKBONE_M_<wp>` +
+  `KVM_LM_HEAD_M_<wp>` into a single `KVM_FULL_M_<wp>` static
+  in `emit_kvm_program` / `try_emit_kvm_mega`. Pure codegen
+  refactor; tape contents change shape only (bytes are the
+  concatenation).
+- **6c-ii.** Add `kvm_mega::build_paged_kv_metadata` in
+  `ferrite-forward`. Pure host-side helper, unit-testable
+  with synthetic block tables. Reference vendor source
+  (`~/Megakernels/...`), not the forbidden branch.
+- **6c-iii.** Emit `kvm_mega_<canonical>` wrapper fn in
+  codegen + flip `LAUNCHER_TABLE` slot. End-to-end smoke test
+  with `FERRITE_FORCE_KVM_MEGA=1 vllm chat -m
+  meta-llama/Llama-3.2-1B-Instruct` on H100.
 
 ### What's green right now
 
@@ -83,57 +275,25 @@ subgraph_per_layer`) and unrelated to mega.
   `kvm_compatible()`), so the build is still exercising every
   KvmFit encoder arm.
 
-### Step 6 — Rust-side launcher wire-up (next)
+### Steps 6a + 6b-i (done) — pointers to current state
 
-Symbols exist in `libmegakernels.a`; nothing calls them. The
-mechanical work:
+- `KvmMegaLauncher<W>` fn-ptr type + `kvm_mega_forced()`:
+  `vllm-rs/crates/ferrite-forward/src/lib.rs`.
+- 3-slot `LAUNCHER_TABLE` + kvm dispatch branches in
+  `forward()` / `forward_backbone()`:
+  `vllm-rs/crates/ferrite-forward-macro/src/codegen.rs` ~ln
+  3735–3905.
+- Per-canonical extern "C" decl emitter:
+  `vllm-rs/crates/ferrite-forward-macro/src/interpreters/kvm_mega.rs::emit_kvm_extern_decl`
+  (called from `codegen.rs` ~ln 3585).
 
-1. **`KvmMegaLauncher<W>` fn-ptr type.** New type in
-   `crates/ferrite-forward/src/lib.rs`, parallel to
-   `PrimMegaLauncher<W>`. Signature has to match the C launcher's
-   ~50-arg shape (or wrap it C-side first to take a single
-   globals-equivalent struct — see tradeoff below).
-2. **`extern "C"` decls per canonical.** `codegen.rs` already emits
-   per-canonical `.cu`; alongside it, emit the matching `extern
-   "C"` block in the per-canonical Rust module.
-3. **`LAUNCHER_TABLE` second slot.** Today emitted as
-   `&[(Option<__PrimMegaLauncher>, Option<__PrimMegaLauncher>)]`
-   (see codegen.rs ~3140 for the existing PrimMega entry). Extend
-   to a third slot for KvmMega: `(Option<__PrimMegaLauncher>,
-   Option<__PrimMegaLauncher>, Option<__KvmMegaLauncher>)` — or
-   restructure as a struct. Per-bucket `Some(_)` only when the
-   canonical's `kvm_emitted_any` was set during codegen (already
-   tracked in `codegen.rs:3475`).
-4. **`FERRITE_FORCE_KVM_MEGA` env gate.** `kvm_mega_forced()` in
-   `ferrite-forward/src/lib.rs` mirroring `prim_mega_forced()`;
-   `forward()` / `forward_backbone()` add a third branch on top
-   of the existing `prim_mega_forced()` check.
-5. **Globals-marshaling at the call site.** The launcher's ~50
-   args correspond to specific `Weights<W>` / `ForwardCtx<W>`
-   accessors. Per-field threading at the Rust call site is
-   tedious but mechanical; `kvm_mega::emit_kvm_cu_source` is the
-   reference for which arg comes from where.
+After step 6c lands, the verification path is:
+`FERRITE_FORCE_KVM_MEGA=1 vllm chat -m
+meta-llama/Llama-3.2-1B-Instruct` on H100 → "capital of France is
+Paris" coherent. P2-5 (multi-arch coverage) and P2-6 (multi-GPU
+barrier opcodes) follow.
 
-**Tradeoff to think about up front:** match the C signature
-arg-for-arg in Rust, vs. C-side wrap into a single-`globals_t*`
-launcher and pass an opaque `*const c_void` plus a small set of
-scalar shape ints. The wrapper path is fewer Rust changes per
-canonical and more robust to vendor schema drift, but adds a
-trivial C struct + serializer per arch. Start with arg-for-arg if
-the per-arch surface stays under one screen of generated Rust;
-otherwise wrap.
-
-**Verification once step 6 lands:** set
-`FERRITE_FORCE_KVM_MEGA=1` and run vllm chat on
-Llama-3.2-1B-instruct (smallest fully-KvmFit-eligible canonical;
-`commandr` is smaller for dim-only verification per
-`feedback_smallest_model_for_verify` but isn't kvm-eligible
-without P2-3 expansion). "capital of France is Paris" coherent =
-P2-4b done. P2-5 (multi-arch coverage validation) and P2-6
-(multi-GPU `OPCODE_Barrier_Inc` / `OPCODE_AllDeviceBarrier`)
-follow.
-
-### Open follow-ups (not blockers for step 6)
+### Open follow-ups (not blockers for step 6c)
 
 - **`kv_cache_t` page count.** `globals_t::num_devices = 1` patch
   (TP=1) makes the gl<>-r dim work for `num_kv_heads<8`, but the

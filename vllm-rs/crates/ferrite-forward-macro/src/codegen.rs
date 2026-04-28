@@ -39,7 +39,7 @@ use syn::Ident;
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
+use crate::impl_lib::{ImplementationLibrary, MegakernelFit, WeightAccessor};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
@@ -3426,6 +3426,126 @@ pub fn emit_model(
         crate::interpreter_codegen::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
     }
 
+    // ── KVM interpreter hookup (gated on FERRITE_KVM=1) ──
+    //
+    // For each canonical, check kvm-eligibility — every solver-
+    // picked Impl in the canonical's SFUF must have
+    // `MegakernelFit::Kvm`. For each eligible canonical: encode the
+    // (post-loop-compression) bucket into a tape, emit per-canonical
+    // tape static + extern decl + Rust marshaling wrapper, and
+    // write the per-canonical .cu source into the cudaforge cache.
+    // Stash the wrapper fn ident keyed by canonical wp; the
+    // FORWARD_TABLE loop below uses it to populate KVM_WRAPPERS.
+    let kvm_enabled =
+        std::env::var("FERRITE_KVM").ok().as_deref() == Some("1");
+    let mut kvm_wrapper_idents: BTreeMap<
+        crate::solver::WorkloadPoint,
+        proc_macro2::Ident,
+    > = BTreeMap::new();
+    let mut kvm_artifacts: Vec<TokenStream> = Vec::new();
+    let mut kvm_extern_decl_emitted: HashSet<String> = HashSet::new();
+    if kvm_enabled {
+        for (i, wp) in bucket_points.iter().enumerate() {
+            if bucket_canonical[i] != *wp {
+                continue;
+            }
+            let sfuf = &sfufs.per_workload[wp];
+            let all_kvm = sfuf.impls.values().all(|imp_id| {
+                lib.get(*imp_id).megakernel_fit() == MegakernelFit::Kvm
+            });
+            if !all_kvm {
+                continue;
+            }
+            let bounds = bounds_for_wp(model, *wp, tp_world_size);
+            let dims = match crate::interpreter::kvm::dims_from_bounds(&bounds) {
+                Some(d) => d,
+                None => continue,
+            };
+            let batch_size = wp.num_tokens as u32;
+            let (lowered, _, backbone_slot, terminal_slot) = &canonical_lowered[wp];
+
+            // Encode backbone + lm_head into one tape.
+            let mut tape = match crate::interpreter::kvm::encode_bucket(
+                &lowered.backbone,
+                &dims,
+                batch_size,
+            ) {
+                Some(t) => t,
+                None => continue,
+            };
+            let lm_tape = match crate::interpreter::kvm::encode_bucket(
+                &lowered.lm_head,
+                &dims,
+                batch_size,
+            ) {
+                Some(t) => t,
+                None => continue,
+            };
+            tape.extend(lm_tape);
+
+            // Per-canonical names. Canonical_name doubles as the C
+            // symbol suffix and the .cu filename stem.
+            let canonical_name = format!(
+                "{}_m_{}_sk_{}",
+                model.source_stem.replace('-', "_"),
+                wp.num_tokens,
+                wp.sk_bucket
+            );
+            let tape_static_ident =
+                bucket_static_ident("KVM_TAPE_M", *wp);
+            let wrapper_ident = format_ident!(
+                "kvm_wrapper_m_{}_sk_{}",
+                wp.num_tokens,
+                wp.sk_bucket
+            );
+
+            // Tape static.
+            kvm_artifacts.push(crate::interpreter::kvm::emit_tape_static(
+                &tape_static_ident,
+                &tape,
+            ));
+
+            // Extern decl — once per canonical_name.
+            if kvm_extern_decl_emitted.insert(canonical_name.clone()) {
+                kvm_artifacts
+                    .push(crate::interpreter::kvm::emit_extern_decl(&canonical_name));
+            }
+
+            // Wrapper fn — borrows accessors from Weights, builds
+            // the C arg pack, calls the extern launcher.
+            let vocab_size = *bounds
+                .get("vocab_size")
+                .unwrap_or(&0u64) as u32;
+            if let Some(wrapper) = crate::interpreter::kvm::emit_wrapper_fn(
+                &wrapper_ident,
+                &canonical_name,
+                &tape_static_ident,
+                &dims,
+                vocab_size,
+                *backbone_slot,
+                *terminal_slot,
+                &lowered.backbone.instances,
+                &lowered.lm_head.instances,
+            ) {
+                kvm_artifacts.push(wrapper);
+                kvm_wrapper_idents.insert(*wp, wrapper_ident);
+
+                // Per-canonical .cu source. Side effect: writes
+                // into ~/.cache/cudaforge/megakernels/. The
+                // ferrite-cuda-builder build.rs picks every .cu
+                // in that dir up and feeds it to NVCC.
+                let cu = crate::interpreter::kvm::emit_cu_source(
+                    &canonical_name,
+                    &dims,
+                );
+                let _ = crate::interpreter::kvm::write_cu_to_cache(
+                    &canonical_name,
+                    &cu,
+                );
+            }
+        }
+    }
+
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row on a single line of
     // expanded source (without it prettyplease wraps
@@ -3593,6 +3713,67 @@ pub fn emit_model(
         };
     };
 
+    // KVM_WRAPPERS — parallel to FORWARD_TABLE; each row is
+    // `Some(per-canonical wrapper fn)` for a kvm-eligible bucket
+    // or `None` to fall through to the host interpreter. Only
+    // emitted when at least one canonical was kvm-eligible.
+    let kvm_wrappers_emit = if kvm_enabled && !kvm_wrapper_idents.is_empty() {
+        let rows = bucket_points.iter().enumerate().map(|(i, _wp)| {
+            let canonical = bucket_canonical[i];
+            match kvm_wrapper_idents.get(&canonical) {
+                Some(ident) => quote! { ::core::option::Option::Some(#ident as _), },
+                None => quote! { ::core::option::Option::None, },
+            }
+        });
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(non_camel_case_types)]
+            type __KvmWrapper = ::ferrite_forward::interpreter::kvm::KvmWrapperFn<Weights>;
+            #[cfg(feature = "cuda")]
+            static KVM_WRAPPERS: &[::core::option::Option<__KvmWrapper>] = &[
+                #(#rows)*
+            ];
+        }
+    } else {
+        quote! {}
+    };
+
+    let forward_body = if kvm_enabled && !kvm_wrapper_idents.is_empty() {
+        quote! {
+            let n = FORWARD_TABLE.len();
+            let sk = ctx.max_seqlen_k as u64;
+            let mut idx = 0usize;
+            while idx < n {
+                let e = &FORWARD_TABLE[idx];
+                if e.0 <= num_tokens && num_tokens < e.1 && e.2 <= sk && sk < e.3 {
+                    break;
+                }
+                idx += 1;
+            }
+            if idx == n { idx = 0; }
+            let e = &FORWARD_TABLE[idx];
+            if let ::core::option::Option::Some(wrapper) = KVM_WRAPPERS[idx] {
+                let mut tiles: ::std::vec::Vec<
+                    ::core::option::Option<::ferrite_forward::TileEntry>,
+                > = (0..e.6).map(|_| ::core::option::Option::None).collect();
+                unsafe { wrapper(wm, ctx, device, &mut tiles); }
+                return ::ferrite_forward::take_owned(&mut tiles, e.8);
+            }
+            unsafe {
+                ::ferrite_forward::run(e.4, e.5, wm, ctx, device, e.6, e.8)
+            }
+        }
+    } else {
+        quote! {
+            let e = ::ferrite_forward::find_bucket(
+                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
+            );
+            unsafe {
+                ::ferrite_forward::run(e.4, e.5, wm, ctx, device, e.6, e.8)
+            }
+        }
+    };
+
     quote! {
         #weights
 
@@ -3602,10 +3783,15 @@ pub fn emit_model(
 
         #(#static_slices)*
 
+        #(#kvm_artifacts)*
+
         #forward_table
 
+        #kvm_wrappers_emit
+
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
-        /// run the universal interpreter.
+        /// run the universal interpreter (or, when the bucket is
+        /// kvm-eligible, the per-canonical KVM wrapper).
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -3614,12 +3800,7 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let e = ::ferrite_forward::find_bucket(
-                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
-            );
-            unsafe {
-                ::ferrite_forward::run(e.4, e.5, wm, ctx, device, e.6, e.8)
-            }
+            #forward_body
         }
 
         /// Backbone-only dispatch (no lm_head). Returns a fresh

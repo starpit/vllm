@@ -41,6 +41,19 @@ use ferrite_cuda_core::driver;
 use ferrite_cuda_core::dtype::DType;
 
 use crate::ForwardCtx;
+use crate::tile_table::TileEntry;
+
+/// Per-canonical wrapper-fn pointer, generic over the canonical's
+/// `Weights` type. Each macro invocation emits one of these per
+/// kvm-eligible canonical and a parallel `KVM_WRAPPERS` table that
+/// dispatch consults before falling through to the host
+/// interpreter's `run`.
+pub type KvmWrapperFn<W> = unsafe fn(
+    &W,
+    &ForwardCtx,
+    &mut ferrite_cuda_core::device::GpuDevice,
+    &mut Vec<Option<TileEntry>>,
+);
 
 /// Raw GPU pointers to every weight tensor the megakernel reads,
 /// plus the per-projection out-feature dim (`R`) the vendor's

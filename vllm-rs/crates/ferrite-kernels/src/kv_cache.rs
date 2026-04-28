@@ -19,13 +19,19 @@ use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 /// When `cache_dtype` is `Fp8E4m3`, the cache stores 1 byte/element and
 /// per-layer scale factors are maintained for quantization/dequantization.
 pub struct KvCachePool {
-    /// K cache per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
+    /// K cache per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`.
+    /// Each `GpuTensor` is a view into the single contiguous K block at
+    /// offset `layer * bytes_per_layer` — see `_k_block` below.
     k_caches: Vec<GpuTensor>,
-    /// V cache per layer: same layout
+    /// V cache per layer: same layout, view into `_v_block`.
     v_caches: Vec<GpuTensor>,
-    /// RAII wrappers for KV cache GPU allocations — auto-freed on drop.
-    _k_ptrs: Vec<RawGpuMem>,
-    _v_ptrs: Vec<RawGpuMem>,
+    /// One contiguous K allocation covering all layers, shape
+    /// `[num_layers * num_blocks, block_size, num_kv_heads, head_dim]`.
+    /// The vendored KvmMega megakernel's `kv_cache_t = gl<bf16, -1, -1, ...>`
+    /// indexes layer-stride into this block, so per-layer mem_alloc
+    /// would corrupt at `layer > 0`. RAII-freed on drop.
+    _k_block: RawGpuMem,
+    _v_block: RawGpuMem,
     pub num_blocks: usize,
     pub block_size: usize,
     pub num_kv_heads: usize,
@@ -76,24 +82,29 @@ impl KvCachePool {
     ) -> Result<Self> {
         let elems_per_layer = num_blocks * block_size * num_kv_heads * head_dim;
         let bytes_per_layer = elems_per_layer * dtype.size_bytes();
+        let bytes_total = bytes_per_layer
+            .checked_mul(num_layers)
+            .expect("KV bytes overflow");
 
         let mut k_caches = Vec::with_capacity(num_layers);
         let mut v_caches = Vec::with_capacity(num_layers);
-        let mut k_ptrs = Vec::with_capacity(num_layers);
-        let mut v_ptrs = Vec::with_capacity(num_layers);
         let mut k_scale_ptrs = Vec::new();
         let mut v_scale_ptrs = Vec::new();
 
         let shape = [num_blocks, block_size, num_kv_heads, head_dim];
 
-        for _ in 0..num_layers {
-            let k_ptr = driver::mem_alloc(bytes_per_layer)?;
-            let v_ptr = driver::mem_alloc(bytes_per_layer)?;
+        // One contiguous block per K/V — vendor's kv_cache_t treats
+        // the layer dim as stride-into-base, so per-layer allocations
+        // would only work for layer 0.
+        let k_base = driver::mem_alloc(bytes_total)?;
+        let v_base = driver::mem_alloc(bytes_total)?;
 
+        for layer in 0..num_layers {
+            let offset = (layer * bytes_per_layer) as isize;
+            let k_ptr = unsafe { k_base.byte_offset(offset) };
+            let v_ptr = unsafe { v_base.byte_offset(offset) };
             k_caches.push(GpuTensor::new(k_ptr, &shape, dtype));
             v_caches.push(GpuTensor::new(v_ptr, &shape, dtype));
-            k_ptrs.push(RawGpuMem::new(k_ptr, bytes_per_layer));
-            v_ptrs.push(RawGpuMem::new(v_ptr, bytes_per_layer));
         }
 
         // Allocate per-layer scale factors for FP8 cache.
@@ -135,8 +146,8 @@ impl KvCachePool {
         Ok(Self {
             k_caches,
             v_caches,
-            _k_ptrs: k_ptrs,
-            _v_ptrs: v_ptrs,
+            _k_block: RawGpuMem::new(k_base, bytes_total),
+            _v_block: RawGpuMem::new(v_base, bytes_total),
             num_blocks,
             block_size,
             num_kv_heads,
@@ -154,14 +165,29 @@ impl KvCachePool {
 
     /// Get K cache tensor for a layer as a lifetime-checked view.
     pub fn k_cache(&self, layer: usize) -> TensorView<'_> {
-        // Safety: KvCachePool owns the memory via _k_ptrs; view borrows &self.
+        // Safety: KvCachePool owns the memory via _k_block; view borrows &self.
         unsafe { TensorView::from_raw(self.k_caches[layer]) }
     }
 
     /// Get V cache tensor for a layer as a lifetime-checked view.
     pub fn v_cache(&self, layer: usize) -> TensorView<'_> {
-        // Safety: KvCachePool owns the memory via _v_ptrs; view borrows &self.
+        // Safety: KvCachePool owns the memory via _v_block; view borrows &self.
         unsafe { TensorView::from_raw(self.v_caches[layer]) }
+    }
+
+    /// Base device pointer of the contiguous K block, layout
+    /// `[num_layers * num_blocks, block_size, num_kv_heads, head_dim]`.
+    /// The vendored KvmMega megakernel's `kv_cache_t` template
+    /// expects this base + cross-layer stride; per-layer
+    /// `k_cache(0).raw_ptr()` returns the same value.
+    pub fn k_cache_base_ptr(&self) -> *mut u8 {
+        self._k_block.ptr()
+    }
+
+    /// Base device pointer of the contiguous V block — see
+    /// [`Self::k_cache_base_ptr`].
+    pub fn v_cache_base_ptr(&self) -> *mut u8 {
+        self._v_block.ptr()
     }
 
     /// The dtype used for cache storage.
@@ -354,6 +380,6 @@ impl KvCachePool {
     }
 }
 
-// All GPU allocations (_k_ptrs, _v_ptrs, k_scale_ptrs, v_scale_ptrs,
+// All GPU allocations (_k_block, _v_block, k_scale_ptrs, v_scale_ptrs,
 // block_unrotated_gpu_ptr, block_span_gpu_ptr) are RawGpuMem and freed
 // automatically via Drop — no manual impl needed.

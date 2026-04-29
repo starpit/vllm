@@ -47,15 +47,15 @@ use crate::fuf::{Fuf, FufInput, TileId};
 /// File existence + mtime prove the proc-macro ran; content shows
 /// per-canonical accept/reject decisions and reasons.
 ///
-/// The log is truncated on the first call per macro expansion
-/// (tracked via a once-cell) so each build produces a clean file
-/// rather than an ever-growing append. Errors are silenced — the
-/// file is purely diagnostic and must not break the build.
+/// Always appends. The proc-macro is invoked once per consumer
+/// crate (ferrite-model-llama, ferrite-model-qwen2, …), each in
+/// its own rustc process; truncate-on-first-call would lose all
+/// but the last process's output. Caller is expected to `rm` the
+/// log before a build when starting fresh. Errors are silenced —
+/// the file is purely diagnostic and must not break the build.
 fn kvm_diag_log(line: &str) {
     use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
-    static TRUNCATED: OnceLock<()> = OnceLock::new();
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -64,16 +64,12 @@ fn kvm_diag_log(line: &str) {
         return;
     }
     let path = dir.join("_kvm_diag.log");
-    let first = TRUNCATED.set(()).is_ok();
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true);
-    if first {
-        opts.truncate(true);
-    } else {
-        opts.append(true);
-    }
-    if let Ok(mut f) = opts.open(&path) {
-        let _ = writeln!(f, "{line}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[pid {}] {line}", std::process::id());
     }
 }
 use crate::impl_lib::{ImplementationLibrary, MegakernelFit, WeightAccessor};

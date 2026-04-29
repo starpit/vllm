@@ -1849,11 +1849,18 @@ pub fn starter_library() -> ImplementationLibrary {
     // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
     // a lone affine-transform gemm that's not a QKV-pre-rope or
     // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
-    // Gated on the cuBLAS env var (Step 5b) — `CutlassFusedGemmBiasImpl`
-    // below stays registered as the cuBLAS-OFF peer.
-    if cublas_enabled {
-        lib.push(Box::new(FusedGemmBiasImpl));
-    }
+    //
+    // **NOT gated on the cuBLAS env var.** `CutlassFusedGemmBiasImpl`
+    // below has no `cutlass_gemm_bias` CSV rows for qwen2's K/V
+    // projection shapes (N=128, K=896 for Qwen2.5-0.5B and the rest
+    // of the qwen2 fleet). At cuBLAS-OFF the singleton-fallback chain
+    // (CutlassGemv + RopeAppendRefImpl + AttentionPrefill) produces a
+    // different K/V tensor layout than the fused path expects —
+    // verified failure on qwen2-0.5b: position 3 mismatch
+    // ("英文字" engine vs " is" golden). Until Lever A2 ships
+    // (cutlass_gemm_bias CSV sweep across qwen2 packed-QKV shapes),
+    // this Impl stays registered to keep qwen2 correctness-green.
+    lib.push(Box::new(FusedGemmBiasImpl));
     // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
     // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
     // and bias passed as the C operand at ldc=0 (row broadcast). One
@@ -1953,14 +1960,20 @@ pub fn starter_library() -> ImplementationLibrary {
     // (Tile, Tile) pattern.
     lib.push(Box::new(ScalarMulImpl));
     // Decode / prefill QKV+rope variants — the solver picks via
-    // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill). Gated on the
-    // cuBLAS env var (Step 5b) — CutlassFusedQkvRope* below are the
-    // cuBLAS-OFF peers (non-biased; qwen2 biased QKV remains cuBLAS-
-    // dependent until Lever A2 ships).
-    if cublas_enabled {
-        lib.push(Box::new(FusedQkvRopeCacheImpl));
-        lib.push(Box::new(FusedQkvRopePrefillImpl));
-    }
+    // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
+    //
+    // **NOT gated on the cuBLAS env var.** `CutlassFusedQkvRope*Impl`
+    // peers reject biased claims (Lever A2). At cuBLAS-OFF, qwen2's
+    // biased QKV pattern would have NO fused impl available; the
+    // singleton-fallback chain (RopeAppendRefImpl + CutlassFusedGemmBias
+    // + AttentionPrefillContiguous) emits K/V at `[T, heads*head_dim]`
+    // while the downstream Attention impl expects `[T, heads, head_dim]`
+    // (the fused-path layout) — verified correctness failure on
+    // qwen2-0.5b. Keeping these registered preserves correctness; the
+    // DP still picks `CutlassFusedQkvRope*` for non-biased patterns
+    // when its calibrated cost wins.
+    lib.push(Box::new(FusedQkvRopeCacheImpl));
+    lib.push(Box::new(FusedQkvRopePrefillImpl));
     // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
     // followed by the same fused_qkv_rope_cache / fused_qkv_rope
     // post-pass. One Impl per CUTLASS_TILE_ZOO entry per variant;
@@ -2420,19 +2433,9 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, ctx.fuf.get(gemm_tile)) else {
             return f64::INFINITY;
         };
-        // Prefer the calibrated `cutlass_gemm_bias_<tile>` row when
-        // present. Fall back to the gemm roofline (matches
-        // `cost_gemm`'s fallback at uncalibrated shapes) so this
-        // Impl stays competitive at unswept (M, N, K) shapes —
-        // critical for qwen2's K/V projections at cuBLAS-OFF, which
-        // currently have no `cutlass_gemm_bias` rows in the L4 CSV
-        // (Lever A2 in CUBLAS_FREEDOM_HANDOFF.md). Without the
-        // fallback, this Impl loses to `CutlassGemmImpl` singleton
-        // at K/V shapes, which then orphans the BiasAdd tile and
-        // crashes the solver.
         ctx.profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
-            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk))
+            .unwrap_or(UNCALIBRATED_COST_US)
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -4474,6 +4477,25 @@ fn cutlass_gemm_roofline_us(ctx: &CostCtx, m: u32, n: u32, k: u32) -> f64 {
     }
 }
 
+/// Whether a `(M, N, K)` shape satisfies the standalone CUTLASS
+/// tile zoo's alignment requirements. The tiles in
+/// `cutlass_standalone_gemm.cu` are templated on `AlignmentA = 8`
+/// and `AlignmentB = 8` (see csrc), which forces N and K to be
+/// multiples of 8. Granite-3.3-2B's `vocab_size = 49159` (genuinely
+/// not divisible by 8) was the failure that surfaced this — when
+/// the Step 1b(a) DP fix made `CutlassFusedRmsNormGemm` pickable
+/// at lm_head, the kernel returned `-1` at the (1024, 49159, 2048)
+/// shape and crashed `vllm serve`.
+///
+/// Used by every cutlass-tile-zoo Impl's `cost_us` to return
+/// `UNCALIBRATED_COST_US` when alignment doesn't hold; the DP then
+/// routes to a fallback (cuBLAS singleton for vocab-N at cuBLAS-ON,
+/// or singleton-CUTLASS+kernel-failure at cuBLAS-OFF — Lever A2
+/// territory for full coverage).
+fn cutlass_tile_supports_shape(_m: u32, n: u32, k: u32) -> bool {
+    n.is_multiple_of(8) && k.is_multiple_of(8)
+}
+
 impl Implementation for CutlassFusedRmsNormGemmImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
@@ -4511,6 +4533,14 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
             return UNCALIBRATED_COST_US;
         };
+        // Reject shapes the standalone CUTLASS tile zoo can't run
+        // (alignment 8 on N/K). At granite-3.3-2B's vocab_size=49159,
+        // cutlass_<tile> kernels return -1 → vllm serve crashes.
+        // Falling back to UNCALIBRATED_COST_US lets the DP route to
+        // the singleton (norm + Gemm) chain instead.
+        if !cutlass_tile_supports_shape(mm, nn, kk) {
+            return UNCALIBRATED_COST_US;
+        }
         // Match cuBLAS's measurement scale: prefer calibrated CSV row;
         // fall back to roofline when uncalibrated (lm_head vocab-N).
         let gemm_us = ctx
@@ -4735,6 +4765,9 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
             return UNCALIBRATED_COST_US;
         };
+        if !cutlass_tile_supports_shape(mm, nn, kk) {
+            return UNCALIBRATED_COST_US;
+        }
         let gemm_us = ctx
             .profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
@@ -4990,6 +5023,9 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
             return UNCALIBRATED_COST_US;
         };
+        if !cutlass_tile_supports_shape(mm, nn, kk) {
+            return UNCALIBRATED_COST_US;
+        }
         let gemm_us = ctx
             .profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
@@ -5840,15 +5876,6 @@ fn unwrap_gemm_through_bias(fuf: &Fuf, tile: TileId) -> Option<(TileId, Option<T
 /// `RopeAppendRefImpl` to defer to the fused impl whenever it would
 /// match (Llama, Qwen2) and only claim standalone when the pattern
 /// is broken by intervening ops (Qwen3's per-head Q/K rmsnorms).
-///
-/// **Conditional on cuBLAS state (Step 5b)**: at cuBLAS-OFF the
-/// `FusedQkvRope*` cuBLAS Impls are gated out of the library, and
-/// the `CutlassFusedQkvRope*` peers reject biased patterns
-/// (qwen2's Q/K/V bias chain). So at cuBLAS-OFF + biased we have
-/// NO fused impl available and must defer to singleton. Returning
-/// `true` here would deadlock the DP (RopeAppend orphaned). Read
-/// the env var to know whether the cuBLAS-side fused Impls are
-/// registered.
 fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     let node = fuf.get(rope_tile);
     if !is_rope_append_op(node.op) || node.inputs.len() < 3 {
@@ -5875,14 +5902,6 @@ fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     };
     let biased = resolved[0].1.is_some();
     if resolved.iter().any(|r| r.1.is_some() != biased) {
-        return false;
-    }
-    // No CutlassFusedQkvRope* peer claims biased patterns today
-    // (Lever A2 in CUBLAS_FREEDOM_HANDOFF). At cuBLAS-OFF the
-    // FusedQkvRope* cuBLAS-side Impls are gated; biased patterns
-    // would have NO fused impl to defer to → must claim as singleton.
-    let cublas_disabled = std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_some();
-    if biased && cublas_disabled {
         return false;
     }
     let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
@@ -14707,6 +14726,22 @@ mod tests {
             locals: std::collections::HashMap::new(),
             weights: std::collections::HashMap::new(),
         };
+    }
+
+    #[test]
+    fn cutlass_fused_norm_gemm_rejects_unaligned_vocab_n_at_lm_head() {
+        // Granite-3.3-2B vocab_size = 49159 (genuinely not divisible
+        // by 8). The CUTLASS standalone tile zoo requires N % 8 == 0
+        // (AlignmentB = 8 in cutlass_standalone_gemm.cu); without
+        // this gate the kernel returns -1 at runtime and crashes
+        // `vllm serve`. Cost MUST be UNCALIBRATED at unaligned N so
+        // the DP routes to a singleton + cuBLAS fallback. The
+        // alignment helper is shape-only (no FUF traversal needed).
+        assert!(cutlass_tile_supports_shape(1, 49152, 2048));
+        assert!(!cutlass_tile_supports_shape(1, 49159, 2048));
+        assert!(!cutlass_tile_supports_shape(1, 49152, 49159));
+        // 256000 (commandr vocab) is divisible by 8.
+        assert!(cutlass_tile_supports_shape(1, 256000, 8192));
     }
 
     #[test]

@@ -23,14 +23,25 @@ fn cuda_link() {
 
     println!("cargo:rustc-link-search={}", cache_str);
 
-    // Historical megakernel .a (retired with the pre-Ferrite TK
-    // runtime). Kept as a conditional link so rebuilding against a
-    // cache that still contains `libmegakernels.a` doesn't fail the
-    // linker; present builds skip the library entirely.
-    let mk_lib = std::path::Path::new(&cache_str).join("libmegakernels.a");
-    if mk_lib.exists() {
-        println!("cargo:rustc-link-lib=static=megakernels");
-    }
+    // libmegakernels.a — built by ferrite-cuda-builder's build.rs
+    // for tk-mvp's KVM interpreter path. Emit the link directive
+    // UNCONDITIONALLY: the prior `if mk_lib.exists()` check ran at
+    // THIS build.rs's execution time, but cargo can run this
+    // build.rs in PARALLEL with ferrite-cuda-builder's build.rs
+    // (vllm-cuda has only `dirs` as a [build-dependency], so its
+    // build.rs doesn't wait on ferrite-cuda-builder). If libmega.a
+    // hadn't been built yet at this moment, the conditional
+    // silently dropped `-lmegakernels` from the linker command,
+    // and at link time (after libmega.a was built) the wrapper-fn's
+    // extern decl referenced an unresolved symbol — even though the
+    // symbol was sitting right there in the .a file the linker
+    // never searched.
+    //
+    // Always-emit. If libmega.a actually doesn't exist at link
+    // time (e.g. the user disabled megakernels), the linker fails
+    // loudly with a clear "library not found" rather than the
+    // confusing undefined-symbol-from-a-defined-symbol pattern.
+    println!("cargo:rustc-link-lib=static=megakernels");
 
     println!("cargo:rustc-link-lib=static=vllm_kernels");
     println!("cargo:rustc-link-lib=static=ggml_kernels");

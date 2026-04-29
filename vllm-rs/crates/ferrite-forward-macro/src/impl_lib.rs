@@ -9467,6 +9467,20 @@ impl Implementation for FusedCublasGemmAddImpl {
         true
     }
 
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // Step 2b — restrict to M >= 64 so cuBLAS-side fused
+        // (Gemm, Add) only competes where cuBLAS legitimately wins
+        // the underlying GEMM. At smaller M, `CutlassGemmAddImpl`
+        // (CUTLASS-side fused) consistently outpaces cuBLAS at the
+        // same shape, and over-claiming this Impl at M=2..64 is what
+        // produced the +148 cuBLAS-surface regression on cohere
+        // parallel attn+mlp documented in earlier STATUS.
+        WorkloadConstraint::NumTokensRange {
+            min: 64,
+            max: u32::MAX,
+        }
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Same matcher as CutlassGemmAddImpl: dense Gemm + downstream
         // residual-stream Add (both Add inputs are Tiles; one is the

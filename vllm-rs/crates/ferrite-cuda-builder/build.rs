@@ -515,14 +515,17 @@ fn build_cutlass_gemm_bias(cache_dir: &str, rerun_files: &mut Vec<String>) {
 
 #[cfg(feature = "cuda")]
 fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
-    // Megakernels build is disabled on this branch — the forward!()
-    // macro emits .cu files that #include "kittens.cuh", but
-    // ThunderKittens isn't on this branch's include path. The
-    // ff-interpreter cuBLAS-freedom workstream doesn't ship
-    // megakernels; re-enable only when this branch needs them.
-    let _ = (cache_dir, rerun_files);
-    return;
-    #[allow(unreachable_code)]
+    // Re-enabled for tk-mvp. The early `return;` that disabled
+    // this fn on the ff-interpreter base branch (vendored TK
+    // headers weren't on the include path then) sat at the top
+    // of the function during our entire kvm-hookup work,
+    // making every change to the body BELOW it unreachable code.
+    // Took two hours of "build.rs isn't rebuilding the
+    // megakernel" debugging to spot. ThunderKittens +
+    // megakernels vendor sources are now under
+    // `vllm-rs/third_party/megakernels/{cross-gpu-llama,include}/`
+    // and `vllm-rs/third_party/thunderkittens/include/`; the
+    // include paths below find them.
     let megakernel_cache = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");

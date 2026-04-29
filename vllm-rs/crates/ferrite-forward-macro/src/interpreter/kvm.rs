@@ -1,4 +1,81 @@
 // SPDX-License-Identifier: Apache-2.0
+//
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  STOP. READ THIS BEFORE EDITING. — FUTURE CLAUDE INCLUDED.       ║
+// ╠══════════════════════════════════════════════════════════════════╣
+// ║                                                                  ║
+// ║  THE FOLLOWING PATTERNS ARE FORBIDDEN IN THIS FILE.              ║
+// ║  Every single one of them was introduced in a prior pass and     ║
+// ║  ripped out at the user's repeated insistence. Don't put them    ║
+// ║  back.                                                           ║
+// ║                                                                  ║
+// ║  1. `_ => None` CATCH-ALL IN encode_op.                          ║
+// ║     The encoder MUST be total over the eligible set. New         ║
+// ║     variants → explicit decision in `variant_kvm_eligible`. A    ║
+// ║     `_` catch-all silently routes unknown variants to            ║
+// ║     "ineligible" instead of failing the build. This is the       ║
+// ║     refusal anti-pattern (`feedback_no_refusal_chasing`).        ║
+// ║     Catch-all panics with the variant name. Never returns.       ║
+// ║                                                                  ║
+// ║  2. "STRUCTURAL FUDGE" / SHARED OPCODE FOR DIFFERENT ROLES.      ║
+// ║     RmsNorm is NOT a single opcode. Vendor has THREE:            ║
+// ║     OP_ATTN_NORM=1, OP_MLP_NORM=6, OP_LM_HEAD_NORM=10. Each      ║
+// ║     reads a different weight slab. Same for o_proj (5) vs        ║
+// ║     downproj (9) on CutlassGemmAdd. DO NOT emit OP_ATTN_NORM     ║
+// ║     for every RmsNorm "because the kernel figures it out from   ║
+// ║     tape position" — IT DOES NOT. The opcode IS the role.        ║
+// ║                                                                  ║
+// ║  3. "DEFER TO RUNTIME" EMPTY-Vec PLACEHOLDER.                    ║
+// ║     If a variant's row count depends on per-call state           ║
+// ║     (AttentionPrefillContiguous depends on cu_seqlens_q), DO     ║
+// ║     NOT emit `Vec::new()` and pretend the runtime fills it       ║
+// ║     in — the runtime currently does NOT splice rows. Either      ║
+// ║     wire runtime tape splicing for real, or mark the variant    ║
+// ║     `false` in `variant_kvm_eligible` so the bucket falls       ║
+// ║     through to the host interpreter cleanly.                     ║
+// ║                                                                  ║
+// ║  4. POSITIONAL WEIGHT EXTRACTION (`nth_field("RmsNorm", 0)`).    ║
+// ║     The wrapper fn extracts weight accessors BY MATCHING THE     ║
+// ║     WEIGHT PATH (input_layernorm / post_attention_layernorm /   ║
+// ║     model_norm / self_attn_o_proj / mlp_down_proj / lm_head),    ║
+// ║     not by ordinal walk. "First RmsNorm in the bucket is the     ║
+// ║     attn_norm" is not invariant — codegen reordering breaks it.  ║
+// ║     `find_weight_fn(buckets, shapes, variant, path_substr)` is   ║
+// ║     the only correct extractor.                                  ║
+// ║                                                                  ║
+// ║  5. SILENT `Option<TokenStream>` RETURNS FROM emit_wrapper_fn /  ║
+// ║     encode_bucket. None means "I gave up; bucket falls through  ║
+// ║     to host" — that's runtime refusal in disguise. Eligibility  ║
+// ║     is decided ONCE, in `bucket_kvm_eligible`. After that,       ║
+// ║     emit functions return `TokenStream` / `Vec<TapeRow>` and    ║
+// ║     panic on missing accessors / unhandled variants.             ║
+// ║                                                                  ║
+// ║  6. `unwrap_or(0)` / `unwrap_or_default()` ON BOUNDS LOOKUPS.    ║
+// ║     `dims_from_bounds` requires every key. Missing key →         ║
+// ║     panic. A model whose bounds don't carry vocab_size /         ║
+// ║     head_dim / etc. is a manifest bug; silently substituting    ║
+// ║     0 produces div-by-zero, vocab-block-fanout=0 tape rows,      ║
+// ║     and other downstream weirdness.                              ║
+// ║                                                                  ║
+// ║  7. HARDCODED `let v = 256i32` FOR VOCAB-BLOCK FANOUT, OR ANY    ║
+// ║     OTHER ARCH-DEPENDENT CONSTANT. vocab_size is on KvmDims;     ║
+// ║     vocab_block_count = vocab_size / matmul_out_block_size.      ║
+// ║     The same applies to any future "I'll figure out the right    ║
+// ║     value later" placeholder.                                    ║
+// ║                                                                  ║
+// ║  8. LYING COMMENTS THAT EXPLAIN AWAY MISSING IMPLEMENTATION      ║
+// ║     ("the kernel flips opcode based on layer position",          ║
+// ║      "role is positional in the tape — not encoded in the row", ║
+// ║      "the launcher rebuilds rows from cu_seqlens_q" when it      ║
+// ║      doesn't). Don't write comments that describe behavior the   ║
+// ║      code doesn't actually have.                                 ║
+// ║                                                                  ║
+// ║  If you can't make a variant work today, mark it `false` in      ║
+// ║  `variant_kvm_eligible`. The bucket will fall through to host.   ║
+// ║  That's the ONE acceptable place to say "not yet."               ║
+// ║                                                                  ║
+// ╚══════════════════════════════════════════════════════════════════╝
+//
 //! KVM interpreter codegen — sibling of the host interpreter
 //! codegen in `crate::interpreter_codegen`. Consumes the same
 //! [`crate::interpreter_codegen::LoweredBucket`] (the solver's
@@ -85,6 +162,7 @@ pub struct KvmDims {
     pub head_dim: u32,
     pub num_attention_heads: u32,
     pub num_kv_heads: u32,
+    pub vocab_size: u32,
     pub kv_page_size: u32,
     pub prefill_kv_block_size: u32,
     pub decode_kv_block_size: u32,
@@ -94,55 +172,68 @@ pub struct KvmDims {
     pub sm_count: u32,
 }
 
-/// Compute KvmDims from a model's bounds, returning `None` if
-/// any of vendor's static_assert checks fail (head_dim
-/// divisibility, hidden / intermediate multiples of 256, etc.).
-pub fn dims_from_bounds(bounds: &BTreeMap<String, u64>) -> Option<KvmDims> {
-    let g = |k: &str| -> u64 { bounds.get(k).copied().unwrap_or(0) };
-    let head_dim = g("head_dim") as u32;
-    let num_attention_heads = g("num_attention_heads") as u32;
-    let num_kv_heads = g("num_key_value_heads") as u32;
-    let hidden_dim = g("hidden_size") as u32;
-    let intermediate_dim = g("intermediate_size") as u32;
-    let num_layers = g("num_hidden_layers") as u32;
+/// Compute KvmDims from a model's bounds. Required keys must be
+/// present — caller is the codegen path that already lowered
+/// the model, so absence is a programming error, not a silent
+/// fallback. Vendor static_assert preconditions
+/// (`head_dim % 32 == 0`, `hidden_dim % 256 == 0`, etc.) are
+/// asserted here so a divergent canonical fails at proc-macro
+/// build time with a precise diagnostic, not at NVCC time with
+/// a 100-line template-error spew.
+pub fn dims_from_bounds(bounds: &BTreeMap<String, u64>) -> KvmDims {
+    let g = |k: &str| -> u32 {
+        *bounds
+            .get(k)
+            .unwrap_or_else(|| panic!("kvm: bounds missing required key `{k}`")) as u32
+    };
+    let head_dim = g("head_dim");
+    let num_attention_heads = g("num_attention_heads");
+    let num_kv_heads = g("num_key_value_heads");
+    let hidden_dim = g("hidden_size");
+    let intermediate_dim = g("intermediate_size");
+    let num_layers = g("num_hidden_layers");
+    let vocab_size = g("vocab_size");
     let num_devices = 1u32;
     let matmul_out_block_size = 2 * head_dim;
-    if head_dim == 0
-        || num_attention_heads == 0
-        || hidden_dim == 0
-        || intermediate_dim == 0
-        || num_layers == 0
-    {
-        return None;
-    }
-    if !head_dim.is_multiple_of(32) {
-        return None;
-    }
-    if num_kv_heads == 0 || !num_kv_heads.is_multiple_of(num_devices) {
-        return None;
-    }
+    assert!(
+        head_dim.is_multiple_of(32),
+        "kvm: head_dim={head_dim} not a multiple of 32 (vendor qkv_rope_append.cu:179)"
+    );
+    assert!(
+        num_kv_heads.is_multiple_of(num_devices),
+        "kvm: num_kv_heads={num_kv_heads} not divisible by num_devices={num_devices}"
+    );
     let num_generated_heads = matmul_out_block_size / head_dim;
-    if num_generated_heads != 2 {
-        return None;
-    }
+    assert_eq!(
+        num_generated_heads, 2,
+        "kvm: matmul_out_block_size/head_dim must be 2 (vendor matmul_adds.cu \
+         assumes 2 q-heads per matmul block)"
+    );
     let kv_col_start = num_attention_heads / num_generated_heads / num_devices;
-    if !kv_col_start.is_multiple_of(2) {
-        return None;
-    }
+    assert!(
+        kv_col_start.is_multiple_of(2),
+        "kvm: kv_col_start={kv_col_start} (= num_attention_heads/2/num_devices) \
+         must be even (vendor qkv_rope_append.cu storer alignment)"
+    );
     const PIPELINE_K_TIMES_STAGES: u32 = 64 * 4;
-    if !hidden_dim.is_multiple_of(PIPELINE_K_TIMES_STAGES) {
-        return None;
-    }
-    if !(intermediate_dim / num_devices).is_multiple_of(PIPELINE_K_TIMES_STAGES) {
-        return None;
-    }
-    Some(KvmDims {
+    assert!(
+        hidden_dim.is_multiple_of(PIPELINE_K_TIMES_STAGES),
+        "kvm: hidden_dim={hidden_dim} not a multiple of {PIPELINE_K_TIMES_STAGES} \
+         (vendor matmul_pipeline.cuh requires this for K-axis tiling)"
+    );
+    assert!(
+        (intermediate_dim / num_devices).is_multiple_of(PIPELINE_K_TIMES_STAGES),
+        "kvm: intermediate_dim/num_devices={} not a multiple of {PIPELINE_K_TIMES_STAGES}",
+        intermediate_dim / num_devices,
+    );
+    KvmDims {
         num_layers,
         hidden_dim,
         intermediate_dim,
         head_dim,
         num_attention_heads,
         num_kv_heads,
+        vocab_size,
         kv_page_size: 128,
         prefill_kv_block_size: 128,
         decode_kv_block_size: 16,
@@ -150,81 +241,146 @@ pub fn dims_from_bounds(bounds: &BTreeMap<String, u64>) -> Option<KvmDims> {
         matmul_batch_block_size: 128,
         num_devices,
         sm_count: 132,
-    })
+    }
 }
 
-/// Encode one OpInstance into zero-or-more tape rows. Returns
-/// `None` if the instance's variant has no megakernel mapping
-/// (caller treats the bucket as kvm-ineligible). Variants
-/// returning `Some(empty Vec)` are kvm-eligible but emit no
-/// rows at codegen time — runtime tape-rebuild path (e.g.
-/// AttentionPrefillContiguous needs per-call seq_info).
-fn encode_op(
-    inst: &OpInstance,
-    dims: &KvmDims,
-    batch_size: u32,
-    layer: u32,
-) -> Option<Vec<TapeRow>> {
+/// Resolve the OP_*_NORM opcode for an `RmsNorm` OpInstance by
+/// peeking at the weight accessor's path. The lower step emits
+/// `field_values[3] = quote!{ Weights::<base_ident> }` where
+/// `base_ident` carries the role suffix (input_layernorm,
+/// post_attention_layernorm, model_norm). Vendor's megakernel
+/// has SEPARATE opcodes per role — each reads a different
+/// weight slab — so picking the correct one here is mandatory
+/// for correctness, not optional.
+fn rms_norm_opcode(inst: &OpInstance) -> i32 {
+    let path = inst
+        .field_values
+        .get(3)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default();
+    let path = path.replace(' ', "");
+    if path.contains("input_layernorm") {
+        OP_ATTN_NORM
+    } else if path.contains("post_attention_layernorm") {
+        OP_MLP_NORM
+    } else if path.contains("model_norm") || path.ends_with("::norm") || path.ends_with(":norm") {
+        OP_LM_HEAD_NORM
+    } else {
+        panic!(
+            "kvm encoder: RmsNorm weight accessor `{}` doesn't match a known role \
+             (input_layernorm/post_attention_layernorm/model_norm). \
+             Add a case here or extend the weight name pattern.",
+            path
+        )
+    }
+}
+
+/// Resolve the OP_*_RESIDUAL opcode for a `CutlassGemmAdd`
+/// OpInstance by peeking at the weight accessor path. Vendor
+/// has separate opcodes for o_proj and downproj, reading
+/// different weight slabs — picking the correct one is
+/// mandatory.
+fn cutlass_gemm_add_opcode(inst: &OpInstance) -> i32 {
+    let path = inst
+        .field_values
+        .get(3)
+        .map(|ts| ts.to_string())
+        .unwrap_or_default();
+    let path = path.replace(' ', "");
+    if path.contains("self_attn_o_proj") || path.ends_with("::o_proj") {
+        OP_O_PROJ_RESIDUAL
+    } else if path.contains("mlp_down_proj") || path.ends_with("::down_proj") {
+        OP_DOWN_PROJ_RESIDUAL
+    } else {
+        panic!(
+            "kvm encoder: CutlassGemmAdd weight accessor `{}` doesn't match a known role \
+             (self_attn_o_proj/mlp_down_proj).",
+            path
+        )
+    }
+}
+
+/// Bucket-level kvm eligibility. A bucket is kvm-eligible iff
+/// every OpInstance in it is something `encode_op` can produce
+/// tape rows for. The decision is bucket-level (NOT per-op):
+/// either the whole bucket runs through the megakernel, or it
+/// falls through to the host interpreter — no half-encoded
+/// buckets.
+///
+/// `encode_op` is total over the eligible set and never returns
+/// failure; it panics on anything not in this list. Adding a
+/// new variant to the IR forces an explicit eligibility
+/// decision here at proc-macro build time
+/// (`feedback_no_refusal_chasing`).
+pub fn bucket_kvm_eligible(bucket: &LoweredBucket) -> bool {
+    bucket
+        .instances
+        .iter()
+        .all(|inst| variant_kvm_eligible(&inst.name.to_string()))
+}
+
+fn variant_kvm_eligible(name: &str) -> bool {
+    match name {
+        // Megakernel-runnable: encode_op has a real arm that
+        // produces correctly-roled tape rows.
+        "FusedQkvRopeCache"
+        | "FusedQkvRopePrefill"
+        | "FusedGateUpSiluMul"
+        | "AttentionViaCache"
+        | "RmsNorm"
+        | "CutlassGemmAdd"
+        | "CutlassGemm"
+        | "CutlassGemv"
+        | "Gemm"
+        | "Cublas"
+        | "Embed"
+        | "Reshape"
+        | "Free"
+        | "Alias"
+        | "Loop" => true,
+        // Megakernel HAS the opcode (OP_ATTENTION_PREFILL=3) but
+        // the row payload depends on cu_seqlens_q at CALL time;
+        // encoding requires runtime tape splicing in the
+        // wrapper fn. Not yet wired — bucket falls through to
+        // host until it is.
+        "AttentionPrefillContiguous" => false,
+        // Host-only fusions. Megakernel structurally splits
+        // [add, norm] (the add is folded into the prior
+        // matmul_add) and [add, norm, gemm] (split into
+        // OP_LM_HEAD_NORM + OP_LM_HEAD), but exposing that here
+        // requires a TK-side fused Impl OR a tile-splitting
+        // pass; neither implemented. Bucket falls through.
+        "FusedAddRmsNorm" | "CutlassFusedAddRmsNormGemm" => false,
+        // Other backends.
+        "FlashInferAttentionDecode" | "FlashInferAttentionPrefill" => false,
+        other => panic!(
+            "kvm: variant_kvm_eligible has no decision for OpInstance `{other}` — \
+             add an explicit `true` or `false` arm. Silent fall-through is forbidden \
+             (feedback_no_refusal_chasing)."
+        ),
+    }
+}
+
+/// Encode one OpInstance into tape rows. TOTAL over the set
+/// `variant_kvm_eligible` returns true for. Reaching the
+/// catch-all arm is a programming error (eligibility check
+/// should have routed the bucket elsewhere).
+fn encode_op(inst: &OpInstance, dims: &KvmDims, batch_size: u32, layer: u32) -> Vec<TapeRow> {
     let bb = (batch_size / dims.matmul_batch_block_size).max(1) as i32;
     let ob = (dims.hidden_dim / dims.matmul_out_block_size).max(1) as i32;
-    let ib =
-        (dims.intermediate_dim / dims.matmul_out_block_size / dims.num_devices.max(1)).max(1) as i32;
+    let ib = (dims.intermediate_dim / dims.matmul_out_block_size / dims.num_devices.max(1))
+        .max(1) as i32;
     let qb = ((dims.num_attention_heads + 2 * dims.num_kv_heads) * dims.head_dim
         / dims.matmul_out_block_size
         / dims.num_devices.max(1))
     .max(1) as i32;
+    let vb = (dims.vocab_size / dims.matmul_out_block_size).max(1) as i32;
 
     match inst.name.to_string().as_str() {
-        // FusedAddRmsNorm encodes the same rows as a plain RmsNorm
-        // — the "add" half is structural in the megakernel: the
-        // previous op (o_proj or downproj) is a `CutlassGemmAdd`
-        // which fuses the residual add into its accumulator, so by
-        // the time the norm runs the residual stream is already
-        // resident in hidden_states. The fused-add-rms-norm host
-        // Impl claims [add, norm] tiles together; in the TK
-        // universe the same two-tile claim stands but the add tile
-        // produces no kernel work.
-        "RmsNorm" | "FusedAddRmsNorm" => {
-            // Per-batch-position fanout. Vendor's
-            // `batched_rms_norm` dispatches one warp per row.
-            // Role (attn / mlp / lm_head) is positional in the
-            // tape — not encoded in the row itself; the kernel
-            // uses the order to flow data through the residual
-            // stream.
-            let mut out = Vec::with_capacity(batch_size as usize);
-            for bidx in 0..batch_size as i32 {
-                let mut row = TapeRow::new(OP_ATTN_NORM);
-                row.payload[1] = layer as i32;
-                row.payload[2] = 1;
-                row.payload[3] = bidx;
-                out.push(row);
-            }
-            Some(out)
-        }
-        "CutlassGemmAdd" => {
-            // o_proj or downproj fanout. Same row layout for
-            // both — vendor uses a separate opcode for each
-            // role; here we use OP_O_PROJ_RESIDUAL as the
-            // canonical position and the kernel flips opcode
-            // based on layer position.
-            let mut out = Vec::with_capacity((bb * ob) as usize);
-            for batch_block in 0..bb {
-                for out_block in 0..ob {
-                    let mut row = TapeRow::new(OP_O_PROJ_RESIDUAL);
-                    row.payload[1] = layer as i32;
-                    row.payload[2] = batch_block;
-                    row.payload[3] = out_block;
-                    row.payload[4] = batch_block;
-                    row.payload[5] = out_block;
-                    out.push(row);
-                }
-            }
-            Some(out)
-        }
         "FusedQkvRopeCache" | "FusedQkvRopePrefill" => {
-            // Fused qkv + rope_append. Decode vs prefill is a
-            // runtime branch in the kernel via
-            // `g.num_prefill_tokens`; same row layout for both.
+            // Fused qkv + rope_append. Decode/prefill branch is
+            // a runtime check on g.num_prefill_tokens inside
+            // vendor qkv_rope_append.cu; same row layout for both.
             let mut out = Vec::with_capacity((bb * qb) as usize);
             for batch_block in 0..bb {
                 for q_block in 0..qb {
@@ -237,11 +393,12 @@ fn encode_op(
                     out.push(row);
                 }
             }
-            Some(out)
+            out
         }
         "FusedGateUpSiluMul" => {
-            // Two opcodes per batch×intermediate block —
-            // vendor's `gate_silu` then `up_matmul`.
+            // gate_silu reads gate_weights, up_matmul reads
+            // up_weights; megakernel pipelines them back-to-back
+            // into silu_out.
             let mut out = Vec::with_capacity(2 * (bb * ib) as usize);
             for opcode in [OP_GATE_SILU, OP_UP_MATMUL] {
                 for batch_block in 0..bb {
@@ -256,11 +413,11 @@ fn encode_op(
                     }
                 }
             }
-            Some(out)
+            out
         }
-        "AttentionViaCache" | "FlashInferAttentionDecode" => {
-            // Decode attention. Pack (seq, kv_head) pairs
-            // into chunks; vendor's scheduler uses 8 per row.
+        "AttentionViaCache" => {
+            // Decode attention. (seq, kv_head) pairs packed up
+            // to 8 per row (vendor PAIRS_PER_ROW).
             const PAIRS_PER_ROW: usize = 8;
             let mut pairs: Vec<(i32, i32)> = Vec::new();
             for s in 0..batch_size as i32 {
@@ -279,59 +436,49 @@ fn encode_op(
                 }
                 out.push(row);
             }
-            Some(out)
+            out
         }
-        "AttentionPrefillContiguous" | "FlashInferAttentionPrefill" => {
-            // Prefill rows depend on per-call seq_info — defer
-            // to runtime. Encoder emits an empty Vec; the
-            // launcher rebuilds rows from `ctx.cu_seqlens_q`
-            // before issuing the megakernel.
-            Some(Vec::new())
-        }
-        "CutlassGemm" | "Gemm" | "CutlassGemv" => {
-            // Final lm_head Gemm — vocab-block fanout. Vocab
-            // size isn't on `dims` (it's per-canonical); the
-            // launcher reads it from g.vocab_size_arg at run
-            // time. Here we emit a placeholder row count and
-            // patch the per-row col field at run time too.
-            let v = 256i32;
-            let mut out = Vec::with_capacity((bb * v) as usize);
-            for batch_block in 0..bb {
-                for vocab_block in 0..v {
-                    let mut row = TapeRow::new(OP_LM_HEAD);
-                    row.payload[1] = 0;
-                    row.payload[2] = batch_block;
-                    row.payload[3] = vocab_block;
-                    row.payload[4] = batch_block;
-                    row.payload[5] = vocab_block;
-                    out.push(row);
-                }
-            }
-            Some(out)
-        }
-        "CutlassFusedAddRmsNormGemm" => {
-            // Host-side cutlass impl that fuses [add, rms_norm,
-            // gemm] into one kernel. Lives at the lm_head boundary:
-            // (final_layer_residual_add) → lm_head_norm → lm_head.
-            // In the megakernel the "add" half is structural (the
-            // last layer's `tk_cutlass_32x64_s4_add` downproj
-            // already wrote residual+output into hidden_states), so
-            // this single OpInstance encodes to TWO row groups:
-            //   1. OP_LM_HEAD_NORM rows — one per batch position,
-            //      same shape as a plain RmsNorm.
-            //   2. OP_LM_HEAD rows — vocab-block fanout, same shape
-            //      as a plain Gemm at lm_head position.
+        "RmsNorm" => {
+            // Role (attn/mlp/lm_head) determined by the weight
+            // accessor; vendor has a separate opcode per role
+            // reading a different weight slab. `rms_norm_opcode`
+            // peeks at `field_values[3]` and dispatches.
+            let opcode = rms_norm_opcode(inst);
             let mut out = Vec::with_capacity(batch_size as usize);
             for bidx in 0..batch_size as i32 {
-                let mut row = TapeRow::new(OP_LM_HEAD_NORM);
-                row.payload[1] = 0;
+                let mut row = TapeRow::new(opcode);
+                row.payload[1] = layer as i32;
                 row.payload[2] = 1;
                 row.payload[3] = bidx;
                 out.push(row);
             }
-            let v = 256i32;
+            out
+        }
+        "CutlassGemmAdd" => {
+            // Role (o_proj/downproj) determined by the weight
+            // accessor.
+            let opcode = cutlass_gemm_add_opcode(inst);
+            let mut out = Vec::with_capacity((bb * ob) as usize);
             for batch_block in 0..bb {
-                for vocab_block in 0..v {
+                for out_block in 0..ob {
+                    let mut row = TapeRow::new(opcode);
+                    row.payload[1] = layer as i32;
+                    row.payload[2] = batch_block;
+                    row.payload[3] = out_block;
+                    row.payload[4] = batch_block;
+                    row.payload[5] = out_block;
+                    out.push(row);
+                }
+            }
+            out
+        }
+        // lm_head Gemm. Vocab-block fanout: vendor lm_head.cu
+        // reads (batch_block, vocab_block); vocab_block count is
+        // ceil(vocab_size / matmul_out_block_size).
+        "CutlassGemm" | "CutlassGemv" | "Gemm" | "Cublas" => {
+            let mut out = Vec::with_capacity((bb * vb) as usize);
+            for batch_block in 0..bb {
+                for vocab_block in 0..vb {
                     let mut row = TapeRow::new(OP_LM_HEAD);
                     row.payload[1] = 0;
                     row.payload[2] = batch_block;
@@ -341,29 +488,23 @@ fn encode_op(
                     out.push(row);
                 }
             }
-            Some(out)
+            out
         }
-        "Embed" | "Reshape" | "Free" | "Alias" => Some(Vec::new()),
-        "Loop" => {
-            // The caller in `encode_bucket` handles Loop
-            // unrolling — reaching this arm is a bug.
-            None
-        }
-        // Variants the megakernel can't run. Caller falls back
-        // to host interpreter for any bucket containing one.
-        _ => None,
+        "Embed" | "Reshape" | "Free" | "Alias" => Vec::new(),
+        "Loop" => panic!("kvm encoder: encode_bucket should have unrolled Loop"),
+        other => panic!(
+            "kvm encoder: encode_op called for OpInstance `{other}` — \
+             eligibility check should have routed this bucket to host"
+        ),
     }
 }
 
 /// Encode a `LoweredBucket` into a tape. Walks the bucket's
 /// `instances`, unrolling `Loop` bodies into per-iteration row
-/// emission (`layer` field bumped each iteration), returning
-/// `None` if any op is kvm-ineligible.
-pub fn encode_bucket(
-    bucket: &LoweredBucket,
-    dims: &KvmDims,
-    batch_size: u32,
-) -> Option<Vec<TapeRow>> {
+/// emission (`layer` field bumped each iteration). Total over
+/// the IR — `encode_op` panics on unhandled variants, so this
+/// fn only fails by panic, never by silent rejection.
+pub fn encode_bucket(bucket: &LoweredBucket, dims: &KvmDims, batch_size: u32) -> Vec<TapeRow> {
     let instances = &bucket.instances;
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -374,26 +515,29 @@ pub fn encode_bucket(
                 .field_values
                 .get(1)
                 .and_then(|ts| ts.to_string().parse::<usize>().ok())
-                .unwrap_or(0);
+                .unwrap_or_else(|| {
+                    panic!("kvm encode_bucket: malformed Loop variant — body_len missing/unparseable")
+                });
             let body_start = i + 1;
             let body_end = body_start + body_len;
-            if body_end > instances.len() {
-                return None;
-            }
+            assert!(
+                body_end <= instances.len(),
+                "kvm encode_bucket: Loop body_len={body_len} extends past the bucket \
+                 (start={body_start}, end={body_end}, len={})",
+                instances.len()
+            );
             for layer_iter in 0..dims.num_layers {
                 for body_inst in &instances[body_start..body_end] {
-                    let rows = encode_op(body_inst, dims, batch_size, layer_iter)?;
-                    out.extend(rows);
+                    out.extend(encode_op(body_inst, dims, batch_size, layer_iter));
                 }
             }
             i = body_end;
         } else {
-            let rows = encode_op(inst, dims, batch_size, 0)?;
-            out.extend(rows);
+            out.extend(encode_op(inst, dims, batch_size, 0));
             i += 1;
         }
     }
-    Some(out)
+    out
 }
 
 /// Emit `static <ident>: [[i32; 32]; N] = [...]` from an
@@ -734,64 +878,75 @@ pub fn write_cu_to_cache(canonical_name: &str, source: &str) -> std::io::Result<
 }
 
 /// Per-canonical Rust marshaling wrapper. The host dispatcher
-/// invokes this fn for kvm-eligible buckets; it H2Ds the tape,
-/// builds the arg pack, and calls the per-canonical extern
-/// launcher. Body delegates to the runtime helper
-/// `ferrite_forward::interpreter::kvm::launch` which factors
-/// out scratch alloc / D2H+H2D / the extern call itself.
+/// invokes this fn for kvm-eligible buckets; it borrows weight
+/// accessors off `Weights`, builds the arg pack, and calls the
+/// per-canonical extern launcher.
 ///
-/// Returns `None` when the lowered IR doesn't carry the
-/// accessors the wrapper needs. The dispatcher leaves that
-/// canonical's slot empty and the bucket falls through to host.
+/// Weight accessors are extracted by MATCHING THE WEIGHT PATH
+/// against known role names (`input_layernorm`, `self_attn_o_proj`,
+/// `lm_head`, etc.) — NOT by walking the lowered IR by ordinal.
+/// The eligibility check (`bucket_kvm_eligible`) guarantees each
+/// role is present; absence is a programming error and panics.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_wrapper_fn(
     fn_ident: &Ident,
     canonical_name: &str,
     tape_static_ident: &Ident,
     dims: &KvmDims,
-    vocab_size: u32,
     backbone_slot: u32,
     terminal_slot: u32,
     backbone_instances: &[OpInstance],
     lm_head_instances: &[OpInstance],
     shapes: &BTreeMap<String, OpcodeShape>,
-) -> Option<TokenStream> {
+) -> TokenStream {
     let extern_ident = Ident::new(
         &format!("tk_megakernel_{canonical_name}_launch"),
         Span::call_site(),
     );
+    let buckets: Vec<&[OpInstance]> = vec![backbone_instances, lm_head_instances];
 
-    // Walk the lowered IR for accessor paths. Field index for
-    // weight_fn / cos_sin_fn varies by variant — look it up in
-    // the OpcodeShape registry by field NAME, not by position.
-    // FusedQkvRopePrefill, for instance, has 5 u32s before
-    // weight_fn (in_slot, out_slot, layer, num_q_heads,
-    // num_kv_heads), so weight_fn lives at index 5, not 3.
-    let attn_norm = nth_field(backbone_instances, shapes, "RmsNorm", "weight_fn", 0)?;
-    let mlp_norm = nth_field(backbone_instances, shapes, "RmsNorm", "weight_fn", 1)?;
-    let qkv = first_field(
-        backbone_instances,
+    // Each role is identified by (variant_name, weight-path
+    // substring). The eligibility check guarantees every needed
+    // role is present in the bucket; missing role → panic, not
+    // Option-as-refusal.
+    let attn_norm = find_weight_fn(&buckets, shapes, "RmsNorm", "input_layernorm");
+    let mlp_norm = find_weight_fn(&buckets, shapes, "RmsNorm", "post_attention_layernorm");
+    let lm_head_norm = find_weight_fn_first_match(
+        &buckets,
+        shapes,
+        "RmsNorm",
+        &["model_norm", "::norm"],
+    );
+    let qkv = find_weight_fn_any_variant(
+        &buckets,
         shapes,
         &["FusedQkvRopeCache", "FusedQkvRopePrefill"],
+        None,
         "weight_fn",
-    )?;
-    let cos_sin = first_field(
-        backbone_instances,
+    );
+    let cos_sin = find_weight_fn_any_variant(
+        &buckets,
         shapes,
         &["FusedQkvRopeCache", "FusedQkvRopePrefill"],
+        None,
         "cos_sin_fn",
-    )?;
-    let o = nth_field(backbone_instances, shapes, "CutlassGemmAdd", "weight_fn", 0)?;
-    let down = nth_field(backbone_instances, shapes, "CutlassGemmAdd", "weight_fn", 1)?;
-    let gate_up = first_field(backbone_instances, shapes, &["FusedGateUpSiluMul"], "weight_fn")?;
-    let lm_head = first_field(
-        lm_head_instances,
+    );
+    let o = find_weight_fn(&buckets, shapes, "CutlassGemmAdd", "self_attn_o_proj");
+    let down = find_weight_fn(&buckets, shapes, "CutlassGemmAdd", "mlp_down_proj");
+    let gate_up = find_weight_fn_any_variant(
+        &buckets,
         shapes,
-        &["CutlassGemm", "Gemm", "CutlassGemv"],
+        &["FusedGateUpSiluMul"],
+        None,
         "weight_fn",
-    )?;
-    let lm_head_norm = first_field(lm_head_instances, shapes, &["RmsNorm"], "weight_fn")
-        .or_else(|| nth_field(backbone_instances, shapes, "RmsNorm", "weight_fn", 2))?;
+    );
+    let lm_head = find_weight_fn_any_variant(
+        &buckets,
+        shapes,
+        &["CutlassGemm", "Gemm", "CutlassGemv", "Cublas"],
+        Some("lm_head"),
+        "weight_fn",
+    );
 
     let num_layers_lit = proc_macro2::Literal::i32_unsuffixed(dims.num_layers as i32);
     let hidden_dim_lit = proc_macro2::Literal::i32_unsuffixed(dims.hidden_dim as i32);
@@ -802,7 +957,7 @@ pub fn emit_wrapper_fn(
     let intermediate_dim_lit =
         proc_macro2::Literal::i32_unsuffixed(dims.intermediate_dim as i32);
     let num_devices_lit = proc_macro2::Literal::i32_unsuffixed(dims.num_devices as i32);
-    let vocab_size_lit = proc_macro2::Literal::i32_unsuffixed(vocab_size as i32);
+    let vocab_size_lit = proc_macro2::Literal::i32_unsuffixed(dims.vocab_size as i32);
     let matmul_out_lit =
         proc_macro2::Literal::i32_unsuffixed(dims.matmul_out_block_size as i32);
     let matmul_batch_lit =
@@ -813,7 +968,7 @@ pub fn emit_wrapper_fn(
     let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(backbone_slot);
     let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(terminal_slot);
 
-    Some(quote! {
+    quote! {
         #[cfg(feature = "cuda")]
         #[allow(non_snake_case, dead_code, clippy::too_many_arguments, unused_variables)]
         unsafe fn #fn_ident(
@@ -893,49 +1048,127 @@ pub fn emit_wrapper_fn(
             tiles[#terminal_slot_lit as usize] =
                 ::core::option::Option::Some(::ferrite_forward::TileEntry::Owned(logits));
         }
-    })
+    }
 }
 
-fn field_index_of(shapes: &BTreeMap<String, OpcodeShape>, variant: &str, field: &str) -> Option<usize> {
-    let shape = shapes.get(variant)?;
+/// Look up the field-index of a named field on a variant's
+/// OpcodeShape. Panics if the variant or field is missing —
+/// either case means the OpcodeShape registry and the encoder
+/// disagree on what fields exist, which is a programming error.
+fn field_index_of(shapes: &BTreeMap<String, OpcodeShape>, variant: &str, field: &str) -> usize {
+    let shape = shapes.get(variant).unwrap_or_else(|| {
+        panic!("kvm wrapper: OpcodeShape for variant `{variant}` missing from registry")
+    });
     shape
         .fields
         .iter()
         .position(|(name, _ty)| name.to_string() == field)
+        .unwrap_or_else(|| {
+            panic!("kvm wrapper: variant `{variant}` has no field named `{field}`")
+        })
 }
 
-fn first_field(
-    instances: &[OpInstance],
+/// Find the `weight_fn` of a variant whose weight path contains
+/// the given `path_substr` (e.g. `input_layernorm`). Search both
+/// backbone + lm_head buckets in order. Panics if no match —
+/// eligibility check should have ensured the role is present.
+fn find_weight_fn(
+    buckets: &[&[OpInstance]],
     shapes: &BTreeMap<String, OpcodeShape>,
-    names: &[&str],
-    field_name: &str,
-) -> Option<TokenStream> {
-    for inst in instances {
-        let n = inst.name.to_string();
-        if names.iter().any(|x| *x == n.as_str()) {
-            let idx = field_index_of(shapes, &n, field_name)?;
-            return inst.field_values.get(idx).cloned();
-        }
-    }
-    None
-}
-
-fn nth_field(
-    instances: &[OpInstance],
-    shapes: &BTreeMap<String, OpcodeShape>,
-    name: &str,
-    field_name: &str,
-    n: usize,
-) -> Option<TokenStream> {
-    let idx = field_index_of(shapes, name, field_name)?;
-    let mut k = 0;
-    for inst in instances {
-        if inst.name == name {
-            if k == n {
-                return inst.field_values.get(idx).cloned();
+    variant: &str,
+    path_substr: &str,
+) -> TokenStream {
+    let idx = field_index_of(shapes, variant, "weight_fn");
+    for bucket in buckets {
+        for inst in *bucket {
+            if inst.name != variant {
+                continue;
             }
-            k += 1;
+            let path = inst
+                .field_values
+                .get(idx)
+                .map(|ts| ts.to_string().replace(' ', ""))
+                .unwrap_or_default();
+            if path.contains(path_substr) {
+                return inst.field_values[idx].clone();
+            }
         }
     }
-    None
+    panic!(
+        "kvm wrapper: no `{variant}` instance with weight path containing `{path_substr}` \
+         found in backbone + lm_head buckets — eligibility check let through a bucket \
+         that's missing this role"
+    )
+}
+
+/// Same as `find_weight_fn` but tries multiple path substrings;
+/// returns the first match. Used for the lm_head_norm role
+/// where the weight name varies by arch (`model_norm`, `::norm`).
+fn find_weight_fn_first_match(
+    buckets: &[&[OpInstance]],
+    shapes: &BTreeMap<String, OpcodeShape>,
+    variant: &str,
+    path_substrs: &[&str],
+) -> TokenStream {
+    let idx = field_index_of(shapes, variant, "weight_fn");
+    for bucket in buckets {
+        for inst in *bucket {
+            if inst.name != variant {
+                continue;
+            }
+            let path = inst
+                .field_values
+                .get(idx)
+                .map(|ts| ts.to_string().replace(' ', ""))
+                .unwrap_or_default();
+            if path_substrs.iter().any(|s| path.contains(s)) {
+                return inst.field_values[idx].clone();
+            }
+        }
+    }
+    panic!(
+        "kvm wrapper: no `{variant}` instance matching any of {path_substrs:?} \
+         found in backbone + lm_head buckets"
+    )
+}
+
+/// Find a named field of an instance whose variant matches one
+/// of `variants` and (optionally) whose `weight_fn` path
+/// contains `path_substr`. Used for variants where the variant
+/// alone is enough to identify the role (FusedQkvRopeCache —
+/// only one per layer body) or where role is determined by
+/// weight path (lm_head Gemm).
+fn find_weight_fn_any_variant(
+    buckets: &[&[OpInstance]],
+    shapes: &BTreeMap<String, OpcodeShape>,
+    variants: &[&str],
+    path_substr: Option<&str>,
+    field_name: &str,
+) -> TokenStream {
+    for bucket in buckets {
+        for inst in *bucket {
+            let name = inst.name.to_string();
+            if !variants.contains(&name.as_str()) {
+                continue;
+            }
+            let weight_idx = field_index_of(shapes, &name, "weight_fn");
+            let path = inst
+                .field_values
+                .get(weight_idx)
+                .map(|ts| ts.to_string().replace(' ', ""))
+                .unwrap_or_default();
+            if let Some(needle) = path_substr {
+                if !path.contains(needle) {
+                    continue;
+                }
+            }
+            let field_idx = field_index_of(shapes, &name, field_name);
+            return inst.field_values[field_idx].clone();
+        }
+    }
+    panic!(
+        "kvm wrapper: no instance of variants {variants:?} \
+         (path_substr={path_substr:?}, field=`{field_name}`) \
+         found in backbone + lm_head buckets"
+    )
 }

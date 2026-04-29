@@ -72,7 +72,7 @@ fn kvm_diag_log(line: &str) {
         let _ = writeln!(f, "[pid {}] {line}", std::process::id());
     }
 }
-use crate::impl_lib::{ImplementationLibrary, MegakernelFit, WeightAccessor};
+use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
@@ -3494,87 +3494,68 @@ pub fn emit_model(
         proc_macro2::Ident,
     > = BTreeMap::new();
     let mut kvm_artifacts: Vec<TokenStream> = Vec::new();
-    let mut kvm_extern_decl_emitted: HashSet<String> = HashSet::new();
     let kvm_shapes = arch_opcodes.shapes_by_name();
     if kvm_enabled {
         for (i, wp) in bucket_points.iter().enumerate() {
             if bucket_canonical[i] != *wp {
                 continue;
             }
-            // Eligibility: at least one solver-picked Impl in the
-            // SFUF must be a TK Impl (otherwise there's nothing to
-            // hand off to the megakernel), AND `encode_bucket` must
-            // succeed on the lowered IR (the encoder rejects any
-            // op variant the megakernel can't run, including non-Tk
-            // matmul/norm picks). Structural variants (Embed,
-            // Reshape, Free, Alias) encode to empty row sets and
-            // don't gate eligibility.
-            let sfuf = &sfufs.per_workload[wp];
-            let any_kvm = sfuf.impls.values().any(|imp_id| {
-                lib.get(*imp_id).megakernel_fit() == MegakernelFit::Kvm
-            });
-            let mix: Vec<String> = sfuf.impls.values()
+            let (lowered, _, backbone_slot, terminal_slot) = &canonical_lowered[wp];
+            // Bucket-level eligibility: every OpInstance in the
+            // bucket (backbone + lm_head) must be something
+            // `encode_op` can encode. If any variant disqualifies
+            // (host-only fusion, prefill attn that needs runtime
+            // splicing, etc.), the bucket falls through to the
+            // host interpreter — `KVM_WRAPPERS[idx]` stays None.
+            let backbone_eligible =
+                crate::interpreter::kvm::bucket_kvm_eligible(&lowered.backbone);
+            let lm_head_eligible =
+                crate::interpreter::kvm::bucket_kvm_eligible(&lowered.lm_head);
+            let mix: Vec<String> = sfufs.per_workload[wp]
+                .impls
+                .values()
                 .map(|imp_id| lib.get(*imp_id).name().to_string())
                 .collect();
             kvm_diag_log(&format!(
-                "{} m={} sk={} any_kvm={} impls={:?}",
-                model.source_stem, wp.num_tokens, wp.sk_bucket, any_kvm, mix
+                "{} m={} sk={} backbone_eligible={} lm_head_eligible={} impls={:?}",
+                model.source_stem,
+                wp.num_tokens,
+                wp.sk_bucket,
+                backbone_eligible,
+                lm_head_eligible,
+                mix,
             ));
-            if !any_kvm {
+            if !(backbone_eligible && lm_head_eligible) {
+                let backbone_names: Vec<String> = lowered
+                    .backbone
+                    .instances
+                    .iter()
+                    .map(|i| i.name.to_string())
+                    .collect();
+                let lm_names: Vec<String> = lowered
+                    .lm_head
+                    .instances
+                    .iter()
+                    .map(|i| i.name.to_string())
+                    .collect();
+                kvm_diag_log(&format!(
+                    "{} m={} ineligible — backbone={:?} lm_head={:?}",
+                    model.source_stem, wp.num_tokens, backbone_names, lm_names
+                ));
                 continue;
             }
             let bounds = bounds_for_wp(model, *wp, tp_world_size);
-            let dims = match crate::interpreter::kvm::dims_from_bounds(&bounds) {
-                Some(d) => d,
-                None => {
-                    kvm_diag_log(&format!(
-                        "{} m={} REJECTED dims_from_bounds",
-                        model.source_stem, wp.num_tokens
-                    ));
-                    continue;
-                }
-            };
+            let dims = crate::interpreter::kvm::dims_from_bounds(&bounds);
             let batch_size = wp.num_tokens as u32;
-            let (lowered, _, backbone_slot, terminal_slot) = &canonical_lowered[wp];
-
-            // Encode backbone + lm_head into one tape.
-            let mut tape = match crate::interpreter::kvm::encode_bucket(
-                &lowered.backbone,
-                &dims,
-                batch_size,
-            ) {
-                Some(t) => t,
-                None => {
-                    let names: Vec<String> = lowered.backbone.instances.iter()
-                        .map(|inst| inst.name.to_string())
-                        .collect();
-                    kvm_diag_log(&format!(
-                        "{} m={} REJECTED backbone-encode names={:?}",
-                        model.source_stem, wp.num_tokens, names
-                    ));
-                    continue;
-                }
-            };
-            let lm_tape = match crate::interpreter::kvm::encode_bucket(
+            let mut tape =
+                crate::interpreter::kvm::encode_bucket(&lowered.backbone, &dims, batch_size);
+            tape.extend(crate::interpreter::kvm::encode_bucket(
                 &lowered.lm_head,
                 &dims,
                 batch_size,
-            ) {
-                Some(t) => t,
-                None => {
-                    let names: Vec<String> = lowered.lm_head.instances.iter()
-                        .map(|inst| inst.name.to_string())
-                        .collect();
-                    kvm_diag_log(&format!(
-                        "{} m={} REJECTED lm_head-encode names={:?}",
-                        model.source_stem, wp.num_tokens, names
-                    ));
-                    continue;
-                }
-            };
-            tape.extend(lm_tape);
+            ));
             kvm_diag_log(&format!(
-                "{} m={} ACCEPTED tape_rows={}",
+                "{} m={} encoded tape_rows={}",
                 model.source_stem, wp.num_tokens, tape.len()
             ));
 
@@ -3598,51 +3579,39 @@ pub fn emit_model(
                 wp.sk_bucket
             );
 
-            // Tape static.
+            // Per-canonical artifacts. canonical_name is unique
+            // per (model, wp) — no dedup needed.
             kvm_artifacts.push(crate::interpreter::kvm::emit_tape_static(
                 &tape_static_ident,
                 &tape,
             ));
-
-            // Extern decl — once per canonical_name.
-            if kvm_extern_decl_emitted.insert(canonical_name.clone()) {
-                kvm_artifacts
-                    .push(crate::interpreter::kvm::emit_extern_decl(&canonical_name));
-            }
-
-            // Wrapper fn — borrows accessors from Weights, builds
-            // the C arg pack, calls the extern launcher.
-            let vocab_size = *bounds
-                .get("vocab_size")
-                .unwrap_or(&0u64) as u32;
-            if let Some(wrapper) = crate::interpreter::kvm::emit_wrapper_fn(
+            kvm_artifacts.push(crate::interpreter::kvm::emit_extern_decl(&canonical_name));
+            kvm_artifacts.push(crate::interpreter::kvm::emit_wrapper_fn(
                 &wrapper_ident,
                 &canonical_name,
                 &tape_static_ident,
                 &dims,
-                vocab_size,
                 *backbone_slot,
                 *terminal_slot,
                 &lowered.backbone.instances,
                 &lowered.lm_head.instances,
                 &kvm_shapes,
-            ) {
-                kvm_artifacts.push(wrapper);
-                kvm_wrapper_idents.insert(*wp, wrapper_ident);
+            ));
+            kvm_wrapper_idents.insert(*wp, wrapper_ident);
 
-                // Per-canonical .cu source. Side effect: writes
-                // into ~/.cache/cudaforge/megakernels/. The
-                // ferrite-cuda-builder build.rs picks every .cu
-                // in that dir up and feeds it to NVCC.
-                let cu = crate::interpreter::kvm::emit_cu_source(
-                    &canonical_name,
-                    &dims,
-                );
-                let _ = crate::interpreter::kvm::write_cu_to_cache(
-                    &canonical_name,
-                    &cu,
-                );
-            }
+            // Per-canonical .cu source. Side effect: writes
+            // into ~/.cache/cudaforge/megakernels/. The
+            // ferrite-cuda-builder build.rs picks every .cu
+            // in that dir up and feeds it to NVCC. I/O failure
+            // here MUST fail the build — silently dropping the
+            // .cu means a link error later with no breadcrumb.
+            let cu = crate::interpreter::kvm::emit_cu_source(&canonical_name, &dims);
+            crate::interpreter::kvm::write_cu_to_cache(&canonical_name, &cu)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "kvm: failed to write .cu source for canonical `{canonical_name}`: {e}"
+                    )
+                });
         }
     }
 

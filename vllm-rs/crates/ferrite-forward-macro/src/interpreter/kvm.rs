@@ -40,19 +40,25 @@ use crate::interpreter_codegen::LoweredBucket;
 
 pub const INSTRUCTION_WIDTH: usize = 32;
 
-// Vendor opcodes per `~/Megakernels/demos/cross-gpu-llama/llama.cuh`
-// — small fixed set the megakernel switches on.
+// Vendor opcodes — verbatim from
+// `third_party/megakernels/cross-gpu-llama/llama.cuh:9-23`.
+// Numeric values must match exactly; the megakernel switches on
+// `payload[0]` and dispatches to the corresponding op template.
 const OP_ATTN_NORM: i32 = 1;
 const OP_QKV_ROPE_APPEND: i32 = 2;
-const OP_ATTENTION_DECODE: i32 = 3;
-const OP_O_PROJ_RESIDUAL: i32 = 4;
-const OP_MLP_NORM: i32 = 5;
-const OP_GATE_SILU: i32 = 6;
-const OP_UP_MATMUL: i32 = 7;
-const OP_DOWN_PROJ_RESIDUAL: i32 = 8;
-const OP_LM_HEAD_NORM: i32 = 9;
-const OP_LM_HEAD: i32 = 10;
-const OP_ATTENTION_PREFILL: i32 = 11;
+const OP_ATTENTION_PREFILL: i32 = 3;
+const OP_ATTENTION_DECODE: i32 = 4;
+const OP_O_PROJ_RESIDUAL: i32 = 5;
+const OP_MLP_NORM: i32 = 6;
+const OP_GATE_SILU: i32 = 7;
+const OP_UP_MATMUL: i32 = 8;
+const OP_DOWN_PROJ_RESIDUAL: i32 = 9;
+const OP_LM_HEAD_NORM: i32 = 10;
+const OP_LM_HEAD: i32 = 11;
+#[allow(dead_code)]
+const OP_BARRIER_INC: i32 = 12;
+#[allow(dead_code)]
+const OP_ALL_DEVICE_BARRIER: i32 = 13;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TapeRow {
@@ -290,6 +296,40 @@ fn encode_op(
             // patch the per-row col field at run time too.
             let v = 256i32;
             let mut out = Vec::with_capacity((bb * v) as usize);
+            for batch_block in 0..bb {
+                for vocab_block in 0..v {
+                    let mut row = TapeRow::new(OP_LM_HEAD);
+                    row.payload[1] = 0;
+                    row.payload[2] = batch_block;
+                    row.payload[3] = vocab_block;
+                    row.payload[4] = batch_block;
+                    row.payload[5] = vocab_block;
+                    out.push(row);
+                }
+            }
+            Some(out)
+        }
+        "CutlassFusedAddRmsNormGemm" => {
+            // Host-side cutlass impl that fuses [add, rms_norm,
+            // gemm] into one kernel. Lives at the lm_head boundary:
+            // (final_layer_residual_add) → lm_head_norm → lm_head.
+            // In the megakernel the "add" half is structural (the
+            // last layer's `tk_cutlass_32x64_s4_add` downproj
+            // already wrote residual+output into hidden_states), so
+            // this single OpInstance encodes to TWO row groups:
+            //   1. OP_LM_HEAD_NORM rows — one per batch position,
+            //      same shape as a plain RmsNorm.
+            //   2. OP_LM_HEAD rows — vocab-block fanout, same shape
+            //      as a plain Gemm at lm_head position.
+            let mut out = Vec::with_capacity(batch_size as usize);
+            for bidx in 0..batch_size as i32 {
+                let mut row = TapeRow::new(OP_LM_HEAD_NORM);
+                row.payload[1] = 0;
+                row.payload[2] = 1;
+                row.payload[3] = bidx;
+                out.push(row);
+            }
+            let v = 256i32;
             for batch_block in 0..bb {
                 for vocab_block in 0..v {
                     let mut row = TapeRow::new(OP_LM_HEAD);

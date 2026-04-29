@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::classified::OpKind;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
-use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, LaunchKind, MatchInfo};
+use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, LaunchKind, MatchInfo, MegakernelFit};
 use crate::shape::{Inferred, Shape, extern_shape};
 use crate::target::TargetProfile;
 
@@ -426,7 +426,34 @@ fn solve_one(
                 }
                 LaunchKind::DeviceCallable | LaunchKind::CooperativeLaunch => 0.0,
             };
-            let cost = imp.cost_us(info, &ctx) + launch_overhead;
+            // ── MVP HACK ─────────────────────────────────────────────
+            // Force TK Impls to win every cost comparison so the
+            // megakernel path actually gets exercised end-to-end.
+            // The cost model doesn't (yet) capture the real
+            // parallelism / fusion advantage of running ops inside a
+            // cooperative megakernel — it only counts the host
+            // launch-overhead delta, which isn't enough to flip the
+            // DP when a host-only fusion (FusedAddRmsNorm) shares a
+            // claim size with a TK alternative.
+            //
+            // Setting MegakernelFit::Kvm cost to ≈0 makes the DP
+            // pick TK whenever a TK Impl matches. After the
+            // megakernel is demonstrated working end-to-end (NVCC
+            // build green, vllm chat producing tokens, perf
+            // measurable), revisit: replace this with a proper
+            // wave-parallel cost discount so the DP does the right
+            // thing for partial-TK buckets too.
+            //
+            // 0.001µs (NOT exactly 0) so the launch_overhead == 0
+            // term doesn't collapse the per-Impl cost difference
+            // among TK impls (the DP needs SOMETHING to break ties
+            // among TK candidates). 0.001µs << 5µs HostCallback
+            // overhead < any matmul cost.
+            let cost = if imp.megakernel_fit() == MegakernelFit::Kvm {
+                0.001
+            } else {
+                imp.cost_us(info, &ctx) + launch_overhead
+            };
             if !cost.is_finite() {
                 return Err(SolveError::UnreachableCost {
                     tile: node.id,

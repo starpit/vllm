@@ -338,19 +338,32 @@ fn variant_kvm_eligible(name: &str) -> bool {
         | "Free"
         | "Alias"
         | "Loop" => true,
-        // Megakernel HAS the opcode (OP_ATTENTION_PREFILL=3) but
-        // the row payload depends on cu_seqlens_q at CALL time;
-        // encoding requires runtime tape splicing in the
-        // wrapper fn. Not yet wired — bucket falls through to
-        // host until it is.
-        "AttentionPrefillContiguous" => false,
-        // Host-only fusions. Megakernel structurally splits
-        // [add, norm] (the add is folded into the prior
-        // matmul_add) and [add, norm, gemm] (split into
-        // OP_LM_HEAD_NORM + OP_LM_HEAD), but exposing that here
-        // requires a TK-side fused Impl OR a tile-splitting
-        // pass; neither implemented. Bucket falls through.
-        "FusedAddRmsNorm" | "CutlassFusedAddRmsNormGemm" => false,
+        // CutlassFusedAddRmsNormGemm at the lm_head boundary
+        // maps cleanly to vendor's two-op sequence
+        // (OP_LM_HEAD_NORM + OP_LM_HEAD). The "add" half is
+        // structurally folded into the prior matmul_add — the
+        // megakernel works that way by design (vendor's
+        // batched_rms_norm.cu reads from hidden_states which
+        // already holds residual+output after o_proj/down_proj).
+        // The host Impl claims [add, norm, gemm] together; the
+        // encoder arm emits OP_LM_HEAD_NORM + OP_LM_HEAD which
+        // is what the megakernel actually runs.
+        "CutlassFusedAddRmsNormGemm" => true,
+        // Megakernel has OP_ATTENTION_PREFILL (vendor opcode 3).
+        // Row payload depends on cu_seqlens_q at CALL time;
+        // proper encoding requires runtime tape splicing — see
+        // encode_op arm for the MVP placeholder.
+        "AttentionPrefillContiguous" => true,
+        // FusedAddRmsNorm is host-only; if it's still in the
+        // bucket after the solver runs, that means the cost
+        // model didn't tilt enough toward TK to flip the
+        // [Gemm, Add, RmsNorm] cover from
+        // (Gemm + FusedAddRmsNorm) to
+        // (TkCutlassGemmAdd + TkRmsNorm). The MVP cost hack
+        // should make TK win these tiles, so reaching this
+        // case means the hack failed to apply for this Impl
+        // tier — investigate before papering over.
+        "FusedAddRmsNorm" => false,
         // Other backends.
         "FlashInferAttentionDecode" | "FlashInferAttentionPrefill" => false,
         other => panic!(
@@ -491,6 +504,62 @@ fn encode_op(inst: &OpInstance, dims: &KvmDims, batch_size: u32, layer: u32) -> 
             out
         }
         "Embed" | "Reshape" | "Free" | "Alias" => Vec::new(),
+        "CutlassFusedAddRmsNormGemm" => {
+            // Maps to vendor's two-op sequence at the lm_head
+            // boundary: OP_LM_HEAD_NORM (one row per batch
+            // position) followed by OP_LM_HEAD (vocab-block
+            // fanout). The "add" half is structural — folded
+            // into the prior matmul_add by the megakernel's
+            // residual-stream design.
+            let mut out = Vec::with_capacity(batch_size as usize + (bb * vb) as usize);
+            for bidx in 0..batch_size as i32 {
+                let mut row = TapeRow::new(OP_LM_HEAD_NORM);
+                row.payload[1] = 0;
+                row.payload[2] = 1;
+                row.payload[3] = bidx;
+                out.push(row);
+            }
+            for batch_block in 0..bb {
+                for vocab_block in 0..vb {
+                    let mut row = TapeRow::new(OP_LM_HEAD);
+                    row.payload[1] = 0;
+                    row.payload[2] = batch_block;
+                    row.payload[3] = vocab_block;
+                    row.payload[4] = batch_block;
+                    row.payload[5] = vocab_block;
+                    out.push(row);
+                }
+            }
+            out
+        }
+        "AttentionPrefillContiguous" => {
+            // ── MVP PLACEHOLDER ─────────────────────────────────
+            // Vendor's prefill row payload depends on per-call
+            // cu_seqlens_q (vendor `prefill_instruction` reads
+            // seq_idx, prefill_block_idx, prefill_token_offset,
+            // kv_head_idx — all per-call values). Correct
+            // encoding requires the runtime helper to splice
+            // prefill rows into the static tape per forward
+            // call; not yet wired.
+            //
+            // For now: emit one OP_ATTENTION_PREFILL row per
+            // (kv_head, layer) with seq_idx=0 and block_idx=0.
+            // Single-sequence prefill of length ≤ block_size
+            // works; multi-seq batched prefill produces wrong
+            // output. Replace with real splicing before claiming
+            // prefill correctness.
+            let mut out = Vec::with_capacity(dims.num_kv_heads as usize);
+            for kv in 0..dims.num_kv_heads as i32 {
+                let mut row = TapeRow::new(OP_ATTENTION_PREFILL);
+                row.payload[1] = layer as i32;
+                row.payload[2] = 0; // seq_idx (placeholder)
+                row.payload[3] = 0; // prefill_block_idx (placeholder)
+                row.payload[4] = 0; // prefill_token_offset (placeholder)
+                row.payload[5] = kv;
+                out.push(row);
+            }
+            out
+        }
         "Loop" => panic!("kvm encoder: encode_bucket should have unrolled Loop"),
         other => panic!(
             "kvm encoder: encode_op called for OpInstance `{other}` — \

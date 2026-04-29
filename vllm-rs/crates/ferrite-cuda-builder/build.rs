@@ -527,6 +527,15 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");
 
+    // Track the cache dir itself so cargo re-runs this build.rs
+    // whenever a `.cu` file is added, removed, or content-changed.
+    // Emitted unconditionally (BEFORE the empty-check + early-return)
+    // so the FIRST build also tracks the dir; otherwise cargo's
+    // fingerprint never includes the dir and proc-macro-emitted
+    // .cu files added on a later expansion never trigger a rebuild
+    // of libmegakernels.a.
+    rerun_files.push(megakernel_cache.display().to_string());
+
     let megakernel_cus: Vec<String> = if megakernel_cache.exists() {
         std::fs::read_dir(&megakernel_cache)
             .into_iter()
@@ -538,6 +547,12 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     } else {
         vec![]
     };
+
+    println!(
+        "cargo:warning=build_megakernels picking up {} cu files from {}",
+        megakernel_cus.len(),
+        megakernel_cache.display()
+    );
 
     if megakernel_cus.is_empty() {
         return;

@@ -10,11 +10,22 @@ default = []
 cuda = ["cudaforge", "ferrite-models/cuda"]
 
 [dependencies]
-# Dep on ferrite-models ensures forward!() runs first (generates .cu files)
-# before this crate's build.rs compiles them.
+# Re-exported from this crate's lib.rs so downstream crates that
+# `pub use ferrite_cuda_builder::ferrite_models` get the runtime
+# binding. The `[build-dependencies]` block below is what enforces
+# the build-time ordering vs ferrite-model-*'s proc-macro expansion.
 ferrite-models = { path = "../ferrite-models" }
 
 [build-dependencies]
+# CRITICAL: ferrite-models AS A BUILD-DEPENDENCY (not just a regular
+# dependency) is what makes cargo wait for ferrite-models' lib
+# compilation — including ferrite-model-*'s `#[forward]` proc-macro
+# expansion that writes `tk_megakernel_<canonical>.cu` into
+# `~/.cache/cudaforge/megakernels/` — BEFORE this crate's build.rs
+# runs. As a regular [dependencies], cargo only orders the LIB
+# compilation; build.rs runs in parallel and would scan an empty
+# cache.
+ferrite-models = { path = "../ferrite-models" }
 cudaforge = { version = "=0.1.4", path = "../../third_party/cudaforge", optional = true }
 dirs = "6"
 # FlashInfer per-tuple shim is rendered at build time from `templates/`.

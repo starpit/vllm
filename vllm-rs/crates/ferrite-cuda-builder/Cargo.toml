@@ -25,7 +25,19 @@ ferrite-models = { path = "../ferrite-models" }
 # runs. As a regular [dependencies], cargo only orders the LIB
 # compilation; build.rs runs in parallel and would scan an empty
 # cache.
-ferrite-models = { path = "../ferrite-models" }
+#
+# `features = ["cuda"]` is LOAD-BEARING. The workspace uses
+# resolver = "2" (vllm-rs/Cargo.toml), which keeps feature
+# resolution INDEPENDENT between [dependencies] and
+# [build-dependencies]. Without explicit features here, the
+# build-dep ferrite-models compiles without `cuda`, the
+# `#[cfg(feature = "cuda")]`-gated `#[forward]` macro
+# invocations don't expand, no .cu files reach
+# `~/.cache/cudaforge/megakernels/` at build.rs time, and
+# build_megakernels scans an empty cache producing
+# libmegakernels.a with zero `tk_megakernel_*` symbols → linker
+# error.
+ferrite-models = { path = "../ferrite-models", features = ["cuda"] }
 cudaforge = { version = "=0.1.4", path = "../../third_party/cudaforge", optional = true }
 dirs = "6"
 # FlashInfer per-tuple shim is rendered at build time from `templates/`.

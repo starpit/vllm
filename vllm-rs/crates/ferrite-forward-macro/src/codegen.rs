@@ -39,6 +39,43 @@ use syn::Ident;
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
+
+/// Append a line to `~/.cache/cudaforge/megakernels/_kvm_diag.log`.
+/// Used as a proc-macro diagnostic channel — `eprintln!` from a
+/// proc-macro is captured by cargo and unreliably surfaced in
+/// plain `cargo build` output, so a file write is ground truth.
+/// File existence + mtime prove the proc-macro ran; content shows
+/// per-canonical accept/reject decisions and reasons.
+///
+/// The log is truncated on the first call per macro expansion
+/// (tracked via a once-cell) so each build produces a clean file
+/// rather than an ever-growing append. Errors are silenced — the
+/// file is purely diagnostic and must not break the build.
+fn kvm_diag_log(line: &str) {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    static TRUNCATED: OnceLock<()> = OnceLock::new();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let dir = home.join(".cache").join("cudaforge").join("megakernels");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("_kvm_diag.log");
+    let first = TRUNCATED.set(()).is_ok();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if first {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
 use crate::impl_lib::{ImplementationLibrary, MegakernelFit, WeightAccessor};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
@@ -3249,6 +3286,16 @@ pub fn emit_model(
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
 ) -> TokenStream {
+    // Diagnostic file write — proc-macro `eprintln!` is captured
+    // by cargo and unreliably surfaced. A file in the cudaforge
+    // cache is ground truth: its existence/mtime proves the
+    // proc-macro ran with FERRITE_KVM=1; its content shows which
+    // canonicals accepted/rejected and why.
+    kvm_diag_log(&format!(
+        "emit_model entered: model={} canonical_override={:?}",
+        model.source_stem,
+        canonical_override.map(|i| i.to_string()),
+    ));
     if let Some(canonical) = canonical_override {
         return emit_shim_model(
             program,
@@ -3438,8 +3485,10 @@ pub fn emit_model(
     // FORWARD_TABLE loop below uses it to populate KVM_WRAPPERS.
     let kvm_enabled =
         std::env::var("FERRITE_KVM").ok().as_deref() == Some("1");
-    let kvm_diag =
-        std::env::var("FERRITE_KVM_DIAG").ok().as_deref() == Some("1");
+    kvm_diag_log(&format!(
+        "kvm_enabled={} for model={}",
+        kvm_enabled, model.source_stem
+    ));
     let mut kvm_wrapper_idents: BTreeMap<
         crate::solver::WorkloadPoint,
         proc_macro2::Ident,
@@ -3464,15 +3513,13 @@ pub fn emit_model(
             let any_kvm = sfuf.impls.values().any(|imp_id| {
                 lib.get(*imp_id).megakernel_fit() == MegakernelFit::Kvm
             });
-            if kvm_diag {
-                let mix: Vec<String> = sfuf.impls.values()
-                    .map(|imp_id| lib.get(*imp_id).name().to_string())
-                    .collect();
-                eprintln!(
-                    "[FERRITE_KVM_DIAG] {} m={} sk={} any_kvm={} impls={:?}",
-                    model.source_stem, wp.num_tokens, wp.sk_bucket, any_kvm, mix
-                );
-            }
+            let mix: Vec<String> = sfuf.impls.values()
+                .map(|imp_id| lib.get(*imp_id).name().to_string())
+                .collect();
+            kvm_diag_log(&format!(
+                "{} m={} sk={} any_kvm={} impls={:?}",
+                model.source_stem, wp.num_tokens, wp.sk_bucket, any_kvm, mix
+            ));
             if !any_kvm {
                 continue;
             }
@@ -3480,12 +3527,10 @@ pub fn emit_model(
             let dims = match crate::interpreter::kvm::dims_from_bounds(&bounds) {
                 Some(d) => d,
                 None => {
-                    if kvm_diag {
-                        eprintln!(
-                            "[FERRITE_KVM_DIAG] {} m={} REJECTED dims_from_bounds",
-                            model.source_stem, wp.num_tokens
-                        );
-                    }
+                    kvm_diag_log(&format!(
+                        "{} m={} REJECTED dims_from_bounds",
+                        model.source_stem, wp.num_tokens
+                    ));
                     continue;
                 }
             };
@@ -3500,15 +3545,13 @@ pub fn emit_model(
             ) {
                 Some(t) => t,
                 None => {
-                    if kvm_diag {
-                        let names: Vec<String> = lowered.backbone.instances.iter()
-                            .map(|inst| inst.name.to_string())
-                            .collect();
-                        eprintln!(
-                            "[FERRITE_KVM_DIAG] {} m={} REJECTED backbone-encode names={:?}",
-                            model.source_stem, wp.num_tokens, names
-                        );
-                    }
+                    let names: Vec<String> = lowered.backbone.instances.iter()
+                        .map(|inst| inst.name.to_string())
+                        .collect();
+                    kvm_diag_log(&format!(
+                        "{} m={} REJECTED backbone-encode names={:?}",
+                        model.source_stem, wp.num_tokens, names
+                    ));
                     continue;
                 }
             };
@@ -3519,25 +3562,21 @@ pub fn emit_model(
             ) {
                 Some(t) => t,
                 None => {
-                    if kvm_diag {
-                        let names: Vec<String> = lowered.lm_head.instances.iter()
-                            .map(|inst| inst.name.to_string())
-                            .collect();
-                        eprintln!(
-                            "[FERRITE_KVM_DIAG] {} m={} REJECTED lm_head-encode names={:?}",
-                            model.source_stem, wp.num_tokens, names
-                        );
-                    }
+                    let names: Vec<String> = lowered.lm_head.instances.iter()
+                        .map(|inst| inst.name.to_string())
+                        .collect();
+                    kvm_diag_log(&format!(
+                        "{} m={} REJECTED lm_head-encode names={:?}",
+                        model.source_stem, wp.num_tokens, names
+                    ));
                     continue;
                 }
             };
             tape.extend(lm_tape);
-            if kvm_diag {
-                eprintln!(
-                    "[FERRITE_KVM_DIAG] {} m={} ACCEPTED tape_rows={}",
-                    model.source_stem, wp.num_tokens, tape.len()
-                );
-            }
+            kvm_diag_log(&format!(
+                "{} m={} ACCEPTED tape_rows={}",
+                model.source_stem, wp.num_tokens, tape.len()
+            ));
 
             // Per-canonical names. Canonical_name doubles as the C
             // symbol suffix and the .cu filename stem.

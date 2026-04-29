@@ -521,16 +521,19 @@ fn solve_one(
         /// `None` means position i-1 was a pass-through (its
         /// tile was pre-claimed by an earlier multi-tile impl).
         choice: Option<(ImplId, ClaimMask)>,
-        /// Number of multi-tile (claim-mask popcount > 1) picks taken
-        /// on the path to this cell. **Tiebreaker on equal cost.**
-        /// Required because the costed alternatives at uncalibrated
-        /// shapes (lm_head vocab-N) often tie to fp precision between
-        /// `(fused 2-tile)` and `(norm singleton + gemm singleton)`,
-        /// and HashMap iteration order made the DP non-deterministic
-        /// — STATUS Step 1b(a) 0-pick anomaly traced here. Prefer-
-        /// fused at equal cost matches the design intent at
-        /// solver.rs `// Multi-tile claims represent fusion …`.
-        multi_tile_picks: u32,
+        /// Total number of impl picks taken on the path to this cell
+        /// (`choice = Some(_)` increments; pass-through does not).
+        /// **Tiebreaker on equal cost (lower wins).** Required
+        /// because alternatives at uncalibrated shapes (lm_head
+        /// vocab-N) often tie to fp precision between
+        /// `(fused N-tile)` and `(fused (N-1)-tile + 1 singleton)` —
+        /// both cover the same tiles for the same total cost, but
+        /// fewer picks = fewer kernel launches and matches the
+        /// design intent at solver.rs `// Multi-tile claims represent
+        /// fusion …`. Without this tiebreak, HashMap iteration
+        /// order made the DP non-deterministic — STATUS Step 1b(a)
+        /// 0-pick anomaly traced here.
+        picks_count: u32,
     }
 
     let mut dp: Vec<HashMap<ClaimMask, SparseCell>> = vec![HashMap::new(); n + 1];
@@ -540,33 +543,33 @@ fn solve_one(
             cost: 0.0,
             prev_cs: 0,
             choice: None,
-            multi_tile_picks: 0,
+            picks_count: 0,
         },
     );
 
-    let update =
-        |cell_map: &mut HashMap<ClaimMask, SparseCell>, key: ClaimMask, cand: SparseCell| {
-            let better = match cell_map.get(&key) {
-                Some(ex) => {
-                    cand.cost < ex.cost
-                        || (cand.cost == ex.cost && cand.multi_tile_picks > ex.multi_tile_picks)
-                }
-                None => true,
-            };
-            if better {
-                cell_map.insert(key, cand);
+    let update = |cell_map: &mut HashMap<ClaimMask, SparseCell>,
+                  key: ClaimMask,
+                  cand: SparseCell| {
+        let better = match cell_map.get(&key) {
+            Some(ex) => {
+                cand.cost < ex.cost || (cand.cost == ex.cost && cand.picks_count < ex.picks_count)
             }
+            None => true,
         };
+        if better {
+            cell_map.insert(key, cand);
+        }
+    };
 
     for i in 0..n {
         // Snapshot `dp[i]` to avoid borrow conflicts while writing
         // `dp[i+1]` in the same iteration. `dp[i]` is small
-        // (sparse), so cloning its (cost, mtp) pairs is cheap.
+        // (sparse), so cloning its (cost, picks_count) pairs is cheap.
         let at_i: Vec<(ClaimMask, f64, u32)> = dp[i]
             .iter()
-            .map(|(k, c)| (*k, c.cost, c.multi_tile_picks))
+            .map(|(k, c)| (*k, c.cost, c.picks_count))
             .collect();
-        for (cs, cost, mtp) in at_i {
+        for (cs, cost, picks_count) in at_i {
             if cs & 1 != 0 {
                 // Tile i is pre-claimed — pass through.
                 let new_cs = cs >> 1;
@@ -577,7 +580,7 @@ fn solve_one(
                         cost,
                         prev_cs: cs,
                         choice: None,
-                        multi_tile_picks: mtp,
+                        picks_count,
                     },
                 );
             } else {
@@ -587,7 +590,7 @@ fn solve_one(
                     }
                     let new_cs = (cs | cand.mask) >> 1;
                     let new_cost = cost + cand.cost;
-                    let new_mtp = mtp + (cand.mask.count_ones() > 1) as u32;
+                    let new_picks_count = picks_count + 1;
                     update(
                         &mut dp[i + 1],
                         new_cs,
@@ -595,7 +598,7 @@ fn solve_one(
                             cost: new_cost,
                             prev_cs: cs,
                             choice: Some((cand.imp_id, cand.mask)),
-                            multi_tile_picks: new_mtp,
+                            picks_count: new_picks_count,
                         },
                     );
                 }

@@ -5446,11 +5446,19 @@ pub unsafe fn topk_noaux_tc(
     let weights_out = alloc.alloc_tensor(&[num_tokens, topk], DType::F32);
     let ids_out = alloc.alloc_tensor(&[num_tokens, topk], DType::I32);
 
-    // Bias must be F32 (trained parameter)
-    assert_eq!(bias.dtype(), DType::F32, "noaux_tc bias must be F32");
+    // Bias must be F32; cast on the fly if the checkpoint stored it in BF16/F16.
+    let bias_f32_tmp: OwnedTensor;
+    let bias_f32: GpuTensor = if bias.dtype() == DType::F32 {
+        bias
+    } else {
+        let n = bias.numel();
+        bias_f32_tmp = alloc.alloc_tensor(&[n], DType::F32);
+        cast_bias_to_f32(bias, bias_f32_tmp.as_gpu_tensor(), stream);
+        bias_f32_tmp.as_gpu_tensor()
+    };
 
     let scores_ptr = gating_output.as_ptr::<u8>() as *mut c_void;
-    let bias_ptr = bias.as_ptr::<u8>() as *const c_void;
+    let bias_ptr = bias_f32.as_ptr::<u8>() as *const c_void;
 
     let weights_ptr = weights_out.as_mut_ptr::<f32>();
     let ids_ptr = ids_out.as_mut_ptr::<i32>();

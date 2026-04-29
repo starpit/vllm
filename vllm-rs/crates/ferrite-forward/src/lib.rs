@@ -377,12 +377,21 @@ mod dispatcher {
         max_model_len: usize,
         hf: HfFingerprint<'_>,
     ) -> ::anyhow::Result<Option<Box<dyn FerriteWeights>>> {
-        for reg in inventory::iter::<FerriteArchRegistration>() {
-            if reg.hf_arches.contains(&arch_hint) && reg.tp_world_size == tp_world_size {
-                return (reg.try_load)(gw, stream, max_model_len, tp_rank, hf);
-            }
-        }
-        Ok(None)
+        // Walk every registration that claims this HF arch identifier
+        // for this TP world size. `Ok(Some(_))` and `Err(_)` terminate;
+        // `Ok(None)` (this registration's variants all rejected the
+        // live `GpuWeights`) falls through to the next claimant —
+        // required when more than one impl crate registers the same
+        // HF arch (e.g. `ferrite-model-deepseek-v3` LoRA-Q variants
+        // alongside `ferrite-model-deepseek-v3-flat` direct-Q variants
+        // for `DeepseekV3ForCausalLM` checkpoints with `q_lora_rank=null`).
+        // The inner `transpose` flips `Result<Option<W>>` →
+        // `Option<Result<W>>` so `find_map` treats `Ok(None)` as
+        // "keep looking" and any other shape as a hit.
+        inventory::iter::<FerriteArchRegistration>()
+            .filter(|reg| reg.hf_arches.contains(&arch_hint) && reg.tp_world_size == tp_world_size)
+            .find_map(|reg| (reg.try_load)(gw, stream, max_model_len, tp_rank, hf).transpose())
+            .transpose()
     }
 }
 

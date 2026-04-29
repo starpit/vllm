@@ -16,6 +16,8 @@ extern crate ferrite_model_commandr as _keep_commandr;
 extern crate ferrite_model_deepseek_v2 as _keep_deepseek_v2;
 #[cfg(feature = "arch-deepseek-v3")]
 extern crate ferrite_model_deepseek_v3 as _keep_deepseek_v3;
+#[cfg(feature = "arch-deepseek-v3-flat")]
+extern crate ferrite_model_deepseek_v3_flat as _keep_deepseek_v3_flat;
 #[cfg(feature = "arch-gemma2")]
 extern crate ferrite_model_gemma2 as _keep_gemma2;
 #[cfg(feature = "arch-gemma3")]
@@ -39,6 +41,8 @@ pub use ferrite_model_commandr as commandr;
 pub use ferrite_model_deepseek_v2 as deepseek_v2;
 #[cfg(feature = "arch-deepseek-v3")]
 pub use ferrite_model_deepseek_v3 as deepseek_v3;
+#[cfg(feature = "arch-deepseek-v3-flat")]
+pub use ferrite_model_deepseek_v3_flat as deepseek_v3_flat;
 #[cfg(feature = "arch-gemma2")]
 pub use ferrite_model_gemma2 as gemma2;
 #[cfg(feature = "arch-gemma3")]

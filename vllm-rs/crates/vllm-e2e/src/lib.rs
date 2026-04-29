@@ -323,10 +323,12 @@ impl TestModels {
     // V3 architecture (hidden=2048, heads=16, q_lora_rank=1024, 16 layers, 64 experts).
     // Trained from scratch on 350B+ English tokens; produces coherent output.
     pub const DEEPSEEK_V3_ACADEMIC_9B_CUDA: &str = "ByteDance-Seed/academic-ds-9B";
-    // DeepSeek V3 — bzantium/tiny-deepseek-v3: real trained 6-layer model with full V3
-    // dims (hidden=7168, heads=128, q_lora_rank=1536). All 8 experts always activated
-    // (num_experts_per_tok == n_routed_experts) → deterministic routing, coherent output.
-    pub const DEEPSEEK_V3_BZANTIUM_CUDA: &str = "bzantium/tiny-deepseek-v3";
+    // Moonlight-16B-A3B-Instruct — `DeepseekV3ForCausalLM`, 16B MoE BF16.
+    // The only public DeepseekV3ForCausalLM checkpoint with K2-style flat routing
+    // (q_lora_rank=null, n_group=1, topk_group=1, sigmoid+noaux_tc, routed_scaling_factor=2.446)
+    // that fits a single H100 (32 GB BF16, 27 layers, 64 routed + 2 shared experts).
+    // Routes through `ferrite-model-deepseek-v3-flat` (new sibling crate, direct q_proj DSL).
+    pub const MOONLIGHT_16B_A3B_INSTRUCT_CUDA: &str = "moonshotai/Moonlight-16B-A3B-Instruct";
 
     // Granite (IBM) — MLX 4-bit quantized
     pub const GRANITE_3_3_2B_4BIT: &str = "mlx-community/granite-3.3-2b-instruct-4bit";
@@ -365,6 +367,23 @@ impl TestModels {
     // `Fp8BlockLinear::forward` (dequant to BF16 then cuBLAS GEMM —
     // a native block-scaled FP8 GEMM kernel is a perf follow-up).
     pub const QWEN3_0_6B_FP8_BLOCK: &str = "RedHatAI/Qwen3-0.6B-FP8-BLOCK";
+    // DeepSeek V3 academic-9B re-quantized to FP8-block-128×128 (the
+    // canonical V3/K2 storage layout). Same MLA topology as
+    // `DEEPSEEK_V3_ACADEMIC_9B_CUDA` BF16 with `q_a_proj`/`q_b_proj`/
+    // `kv_a_proj_with_mqa`/`kv_b_proj`/`o_proj` carrying FP8 E4M3
+    // weights + 2-D `[N/128, K/128]` scales, and the 64-routed +
+    // 2-shared MoE storing block-scaled experts. Routes through
+    // `Fp8GemmImpl` (dense Linears) + `DeepSeekFp8BlockMoeImpl` (MoE).
+    pub const DEEPSEEK_V3_ACADEMIC_9B_FP8_BLOCK_CUDA: &str = "starpit/academic-ds-9b-fp8-block";
+
+    // Moonlight-16B-A3B-Instruct re-quantized to FP8-block-128×128.
+    // Flat-Q variant (q_lora_rank=null → direct q_proj, no q_a/q_b split),
+    // K2-style sigmoid+noaux_tc routing, routed_scaling_factor=2.446.
+    // Routes through `ferrite-model-deepseek-v3-flat` + `DeepSeekFp8BlockMoeImpl`.
+    // Upload with: huggingface-cli upload starpit/moonlight-16b-a3b-instruct-fp8-block <dir> .
+    #[cfg(feature = "cuda")]
+    pub const MOONLIGHT_16B_A3B_INSTRUCT_FP8_BLOCK_CUDA: &str =
+        "starpit/moonlight-16b-a3b-instruct-fp8-block";
 
     // FP8 MoE models (CUDA-backend, SM89+)
     // 2-layer Mixtral 8x7B FP8 (~3GB) — small enough for single L40S

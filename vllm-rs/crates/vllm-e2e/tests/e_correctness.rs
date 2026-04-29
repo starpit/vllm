@@ -38,8 +38,8 @@
 #![cfg(feature = "e2e")]
 
 use vllm_e2e::assertions::{
-    GoldenReference, GoldenResult, check_logprobs_close_with_threshold, extract_engine_output,
-    load_golden_refs, write_golden_refs,
+    GoldenReference, GoldenResult, assert_coherent_text, check_logprobs_close_with_threshold,
+    extract_engine_output, load_golden_refs, write_golden_refs,
 };
 use vllm_e2e::{Client, TestModels, TestServer};
 use vllm_serve::protocol::{CompletionPrompt, CompletionRequest};
@@ -139,6 +139,79 @@ async fn run_correctness_test_with_threshold(
             assert!(!resp.choices.is_empty(), "prompt {i}: no choices returned");
 
             let engine_output = extract_engine_output(&resp.choices[0]);
+            check_logprobs_close_with_threshold(
+                golden_result,
+                &engine_output,
+                i,
+                late_divergence_threshold,
+            );
+        }
+    }
+}
+
+/// Golden comparison + per-prompt coherence check in one server boot.
+/// Used for real trained models where random-weight output is incoherent
+/// by design (those tests don't need coherence checking).
+async fn run_correctness_test_with_coherence(
+    model: &str,
+    golden_key: &str,
+    late_divergence_threshold: usize,
+) {
+    let golden = load_golden_refs(golden_key);
+    let update_golden = std::env::var("VLLM_UPDATE_GOLDEN")
+        .map(|v| v == "all" || v.split(',').any(|k| k.trim() == golden_key))
+        .unwrap_or(false);
+
+    let server = TestServer::builder(model)
+        .with_args(&["--max-model-len", "2048"])
+        .start()
+        .await
+        .expect("server should start");
+    let client = Client::new(server.base_url());
+
+    if update_golden {
+        let mut new_results: Vec<GoldenResult> = Vec::with_capacity(golden.results.len());
+        for (i, golden_result) in golden.results.iter().enumerate() {
+            let req = completion_request(
+                &golden_result.prompt,
+                golden.max_tokens,
+                golden.num_logprobs,
+            );
+            let resp = client
+                .completion(&req)
+                .await
+                .expect("completion should succeed");
+            assert!(!resp.choices.is_empty(), "prompt {i}: no choices returned");
+            let engine_output = extract_engine_output(&resp.choices[0]);
+            assert_coherent_text(&engine_output.output_text, 4);
+            new_results.push(GoldenResult {
+                prompt: golden_result.prompt.clone(),
+                output_tokens: engine_output.output_tokens,
+                output_text: engine_output.output_text,
+                logprobs: engine_output.logprobs,
+            });
+        }
+        let new_golden = GoldenReference {
+            model: golden.model.clone(),
+            max_tokens: golden.max_tokens,
+            num_logprobs: golden.num_logprobs,
+            results: new_results,
+        };
+        write_golden_refs(golden_key, &new_golden);
+    } else {
+        for (i, golden_result) in golden.results.iter().enumerate() {
+            let req = completion_request(
+                &golden_result.prompt,
+                golden.max_tokens,
+                golden.num_logprobs,
+            );
+            let resp = client
+                .completion(&req)
+                .await
+                .expect("completion should succeed");
+            assert!(!resp.choices.is_empty(), "prompt {i}: no choices returned");
+            let engine_output = extract_engine_output(&resp.choices[0]);
+            assert_coherent_text(&engine_output.output_text, 4);
             check_logprobs_close_with_threshold(
                 golden_result,
                 &engine_output,
@@ -674,25 +747,98 @@ async fn test_cuda_correctness_deepseek_v3_academic_9b() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_cuda_correctness_deepseek_v3_bzantium() {
-    // DeepSeek-V3 — bzantium/tiny-deepseek-v3: real trained 6-layer model with full
-    // V3 dimensions (hidden=7168, heads=128, q_lora_rank=1536, vocab=129280).
-    // All 8 experts always activated (num_experts_per_tok == n_routed_experts=8) so
-    // routing is deterministic. Real weights → coherent output → meaningful golden.
+async fn test_cuda_correctness_deepseek_v3_academic_9b_fp8_block() {
+    // V3 academic-9B re-quantized to FP8-block-128×128 — same MLA
+    // topology as the BF16 sibling but every dense Linear carries
+    // FP8 E4M3 + 2-D block scales, and MoE experts route through
+    // `DeepSeekFp8BlockMoeImpl`. Threshold loosened to 5 (matches
+    // BF16 sibling): FP8 quant adds rounding noise on top of the
+    // FA2-vs-TritonMLA divergence the BF16 test documents.
     //
-    // This exercises the complete V3 path via ferrite-model-deepseek-v3:
-    //   - fingerprint check on `self_attn.q_a_proj` (V3 has no `q_proj`)
-    //   - Q lora-rank path: q_a_proj → q_a_layernorm → q_b_proj
-    //   - Sigmoid MoE routing with e_score_correction_bias (noaux_tc)
-    //   - Full real-dim GEMM shapes (o_proj: 7168×16384, etc.)
+    // Golden is ferrite-self-generated, NOT Python vLLM:
+    // `validate_fp8_block_shape` rejects V3 academic-9B because
+    // `intermediate_size = 10944` (not divisible by 128) and the
+    // fused `q_a_proj + kv_a_proj_with_mqa` output partition is
+    // 1600 (also non-divisible). Ferrite's `Fp8BlockLinear::load`
+    // handles ceil-rounded partial last blocks; Python's loader
+    // does not. Same convention as the BF16 V3 test.
     //
-    // Golden generated with Python vLLM TritonMLA backend on L40S (SM89).
-    // Threshold=1: position 0 must match, rest are warnings (same as V2-Lite;
-    // TritonMLA vs ferrite FA2-based MLA can diverge on later positions).
+    // Regenerate with:
+    //   VLLM_UPDATE_GOLDEN=deepseek_v3_academic_9b_fp8_block \
+    //     cargo test -p vllm-e2e --features cuda,e2e --release \
+    //     --test e_correctness -- --ignored --test-threads=1 \
+    //     test_cuda_correctness_deepseek_v3_academic_9b_fp8_block
     run_correctness_test_with_threshold(
-        TestModels::DEEPSEEK_V3_BZANTIUM_CUDA,
-        "deepseek_v3_bzantium",
-        1,
+        TestModels::DEEPSEEK_V3_ACADEMIC_9B_FP8_BLOCK_CUDA,
+        "deepseek_v3_academic_9b_fp8_block",
+        5,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_moonlight_16b_a3b_instruct() {
+    // moonshotai/Moonlight-16B-A3B-Instruct — `DeepseekV3ForCausalLM`, 16B MoE BF16.
+    // First real-weights K2-flat-routing validation. Key config differences from V3:
+    //   - q_lora_rank=null → direct `q_proj` (no q_a_proj/q_b_proj lora split)
+    //   - Flat sigmoid+noaux_tc routing: n_group=1, topk_group=1
+    //   - routed_scaling_factor=2.446 (vs 1.0 in V3 academic-9B, 2.827 in K2 tiny)
+    //   - 27 layers, 64 routed + 2 shared experts, top-8 per token
+    //   - hidden_size=2048, head_dim=192, num_heads=16
+    // Routes through `ferrite-model-deepseek-v3-flat` (new sibling crate),
+    // not `ferrite-model-deepseek-v3` (which requires q_a_proj / q_b_proj).
+    // The dispatcher's Ok(None) walk-past logic (3bd93fa3b) resolves the crate.
+    //
+    // Golden is ferrite-self-generated: Python vLLM uses TritonMLA absorption,
+    // ferrite uses explicit K/V assembly + FA2 — different FP accumulation order.
+    // Same convention as the V3 academic-9B and V2-Lite tests. Threshold=5.
+    //
+    // On first run, set VLLM_UPDATE_GOLDEN=moonlight_16b_a3b_instruct to capture
+    // ferrite's output as the golden, then commit testdata/golden/*.json and verify
+    // the second run passes. Requires ~32 GB GPU memory (H100 80GB).
+    //
+    // Regenerate with:
+    //   VLLM_UPDATE_GOLDEN=moonlight_16b_a3b_instruct \
+    //     cargo test -p vllm-e2e --features cuda,e2e --release \
+    //     --test e_correctness -- --ignored --test-threads=1 \
+    //     test_cuda_correctness_moonlight_16b_a3b_instruct
+    run_correctness_test_with_coherence(
+        TestModels::MOONLIGHT_16B_A3B_INSTRUCT_CUDA,
+        "moonlight_16b_a3b_instruct",
+        5,
+    )
+    .await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_moonlight_16b_a3b_instruct_fp8_block() {
+    // moonshotai/Moonlight-16B-A3B-Instruct re-quantized to FP8-block-128×128.
+    // Flat-Q variant (q_lora_rank=null → direct q_proj), K2-style sigmoid+noaux_tc
+    // routing, routed_scaling_factor=2.446. Same arch as the BF16 sibling but all
+    // dense Linears carry FP8 E4M3 + [N/128, K/128] block scales; MoE experts
+    // route through `DeepSeekFp8BlockMoeImpl`. Threshold=5 (same as BF16 sibling).
+    //
+    // Unlike the V3 academic-9B, Moonlight's intermediate_size=11264 and
+    // q_proj_out=3072 are both 128-divisible, so Python vLLM can load it too.
+    // If a Python vLLM golden is available, prefer that; otherwise regenerate
+    // ferrite-self to match the BF16 convention.
+    //
+    // Prerequisite: quantize with `scripts/quantize_moonlight_fp8_block.py`
+    // and upload to `starpit/moonlight-16b-a3b-instruct-fp8-block`.
+    //
+    // Regenerate with:
+    //   VLLM_UPDATE_GOLDEN=moonlight_16b_a3b_instruct_fp8_block \
+    //     cargo test -p vllm-e2e --features cuda,e2e --release \
+    //     --test e_correctness -- --ignored --test-threads=1 \
+    //     test_cuda_correctness_moonlight_16b_a3b_instruct_fp8_block
+    run_correctness_test_with_coherence(
+        TestModels::MOONLIGHT_16B_A3B_INSTRUCT_FP8_BLOCK_CUDA,
+        "moonlight_16b_a3b_instruct_fp8_block",
+        5,
     )
     .await;
 }

@@ -1293,6 +1293,10 @@ fn load_marlin_moe_layer_mixtral(
         has_zp,
         b_type_id,
         renormalize,
+        e_score_correction_bias: None,
+        n_expert_group: 0,
+        topk_group: 0,
+        routed_scaling_factor: 1.0,
         #[cfg(feature = "nccl")]
         tp_group: None,
     })

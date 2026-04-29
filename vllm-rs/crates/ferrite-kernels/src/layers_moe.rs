@@ -39,6 +39,61 @@ pub fn select_moe_block_m(num_tokens: usize, top_k: usize, num_experts: usize) -
     }
 }
 
+/// Routing-stage configuration shared by every fused-MoE layer (BF16, FP8 scalar,
+/// FP8 block, Marlin, GGML). The four families differ only in how they consume
+/// the resulting `(topk_weights, topk_ids)` — the *selection* logic is uniform.
+///
+/// The three branches mirror Python vLLM's expert-selection paths:
+/// * `e_score_correction_bias = None` → `topk_softmax` (Mixtral / Qwen MoE / DSv2).
+/// * `Some(bias)` with `n_expert_group == 0` → flat sigmoid+bias top-k.
+/// * `Some(bias)` with `n_expert_group > 0` and `topk_group > 0` → grouped
+///   `noaux_tc` (DeepSeek V3 / Kimi K2). `routed_scaling_factor` is folded into
+///   the unbiased sigmoid weights inside `topk_noaux_tc`.
+pub struct MoeRouting<'a> {
+    pub top_k: usize,
+    pub renormalize: bool,
+    pub e_score_correction_bias: Option<&'a GpuTensor>,
+    pub n_expert_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f64,
+}
+
+/// Dispatch the three router-selection variants. Returns `(topk_weights, topk_ids)`
+/// matching `topk_softmax`'s shape contract: `[num_tokens, top_k]` F32 / I32.
+pub unsafe fn route_experts(
+    router_logits: GpuTensor,
+    cfg: &MoeRouting<'_>,
+    caching: &mut ferrite_cuda_core::alloc::CachingAllocator,
+    stream: ferrite_cuda_core::CUstream,
+) -> (OwnedTensor, OwnedTensor) {
+    if let Some(bias) = cfg.e_score_correction_bias {
+        if cfg.n_expert_group > 0 && cfg.topk_group > 0 {
+            kernels::topk_noaux_tc(
+                router_logits,
+                *bias,
+                cfg.top_k,
+                cfg.n_expert_group,
+                cfg.topk_group,
+                cfg.renormalize,
+                cfg.routed_scaling_factor,
+                caching,
+                stream,
+            )
+        } else {
+            kernels::topk_sigmoid_with_bias(
+                router_logits,
+                *bias,
+                cfg.top_k,
+                cfg.renormalize,
+                caching,
+                stream,
+            )
+        }
+    } else {
+        kernels::topk_softmax(router_logits, cfg.top_k, cfg.renormalize, caching, stream)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FusedMoELayer
 // ---------------------------------------------------------------------------
@@ -111,40 +166,19 @@ impl FusedMoELayer {
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        let (topk_weights, topk_ids) = if let Some(bias) = &self.e_score_correction_bias {
-            if self.n_expert_group > 0 && self.topk_group > 0 {
-                // noaux_tc grouped routing (DeepSeek V3 / Kimi K2)
-                kernels::topk_noaux_tc(
-                    router_logits.as_gpu_tensor(),
-                    *bias,
-                    self.top_k,
-                    self.n_expert_group,
-                    self.topk_group,
-                    self.renormalize,
-                    self.routed_scaling_factor,
-                    &mut device.caching,
-                    stream,
-                )
-            } else {
-                // Flat sigmoid top-k with bias (no group selection)
-                kernels::topk_sigmoid_with_bias(
-                    router_logits.as_gpu_tensor(),
-                    *bias,
-                    self.top_k,
-                    self.renormalize,
-                    &mut device.caching,
-                    stream,
-                )
-            }
-        } else {
-            kernels::topk_softmax(
-                router_logits.as_gpu_tensor(),
-                self.top_k,
-                self.renormalize,
-                &mut device.caching,
-                stream,
-            )
-        };
+        let (topk_weights, topk_ids) = route_experts(
+            router_logits.as_gpu_tensor(),
+            &MoeRouting {
+                top_k: self.top_k,
+                renormalize: self.renormalize,
+                e_score_correction_bias: self.e_score_correction_bias.as_ref(),
+                n_expert_group: self.n_expert_group,
+                topk_group: self.topk_group,
+                routed_scaling_factor: self.routed_scaling_factor,
+            },
+            &mut device.caching,
+            stream,
+        );
         drop(router_logits);
 
         let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
@@ -450,7 +484,11 @@ impl DeepSeekV2MoELayer {
             e_score_correction_bias,
             n_expert_group,
             topk_group,
-            routed_scaling_factor: routed_scaling_factor as f64,
+            // Python passes routed_scaling_factor=1.0 to the inner FusedMoE and
+            // applies the actual factor *outside* (after the expert computation).
+            // DeepSeekV2MoELayer::forward does the same via scale_inplace — so
+            // we must not fold it into the routing weights here too (double apply).
+            routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };
@@ -471,6 +509,297 @@ impl DeepSeekV2MoELayer {
 
         let shared_down =
             crate::layers::Linear::load(gw, &format!("{prefix}.shared_experts.down_proj"))?;
+
+        Ok(Self {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_intermediate_size: shared_inter,
+            routed_scaling_factor,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeekV2Fp8BlockMoELayer
+// ---------------------------------------------------------------------------
+
+/// FP8 block-quantized analog of [`DeepSeekV2MoELayer`]. Used by DeepSeek-V3
+/// and Kimi K2 official checkpoints (FP8 E4M3 with 128×128 weight-block scales).
+///
+/// Forward shape is identical to `DeepSeekV2MoELayer::forward` — the only
+/// change is the storage of the routed experts (`Fp8BlockFusedMoELayer`) and
+/// the shared expert (`Fp8BlockLinear`).
+pub struct DeepSeekV2Fp8BlockMoELayer {
+    pub moe: Fp8BlockFusedMoELayer,
+    /// Shared expert fused gate+up: concatenated `Fp8BlockLinear`
+    /// `[2 * shared_inter, hidden_size]`.
+    pub shared_gate_up: crate::layers::Fp8BlockLinear,
+    /// Shared expert down: `Fp8BlockLinear` `[hidden_size, shared_inter]`.
+    pub shared_down: crate::layers::Fp8BlockLinear,
+    pub shared_intermediate_size: usize,
+    pub routed_scaling_factor: f32,
+}
+
+impl DeepSeekV2Fp8BlockMoELayer {
+    /// Forward pass: `output = routed_scaling_factor * moe(x) + shared_expert(x)`.
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let stream = device.compute_stream;
+
+        // Routed experts (FP8 block).
+        let moe_out = self.moe.forward(hidden_states, device);
+        if self.routed_scaling_factor != 1.0 {
+            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, &device.cublas);
+        }
+
+        // Shared expert: silu(gate_up) → down. Both Fp8BlockLinear.
+        let shared_gu = self.shared_gate_up.forward(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+            stream,
+        );
+        let shared_activated = kernels::silu_and_mul_fused(
+            *shared_gu.view(),
+            self.shared_intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(shared_gu);
+        let shared_out = self.shared_down.forward(
+            shared_activated.view(),
+            &mut device.cublas,
+            &mut device.caching,
+            stream,
+        );
+        drop(shared_activated);
+
+        // output = moe_out + shared_out (no sigmoid gate).
+        kernels::add_inplace(*moe_out.view(), *shared_out.view(), stream);
+        drop(shared_out);
+        moe_out
+    }
+
+    /// Load from safetensors. Mirrors `DeepSeekV2MoELayer::load` but expects
+    /// FP8 E4M3 expert weights with `weight_scale_inv` block scales (V3/K2
+    /// canonical layout).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        use_sigmoid: bool,
+        n_expert_group: usize,
+        topk_group: usize,
+        output_dtype: ferrite_cuda_core::dtype::DType,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        use crate::layers_quant::{block_scale_name, ensure_f32_scale};
+        use ferrite_cuda_core::driver;
+        use ferrite_cuda_core::dtype::DType;
+        use ferrite_cuda_core::tensor::GpuTensor;
+
+        let inter = moe_intermediate_size;
+
+        // Gate router (always dense BF16 for V3/K2 — even when experts are FP8).
+        let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
+
+        // Derive block size from first expert's gate_proj scale shape.
+        let first_gate_w = format!("{prefix}.experts.0.gate_proj.weight");
+        let first_gate_s = block_scale_name(gw, &format!("{prefix}.experts.0.gate_proj"));
+        let (w_shape, w_dtype) = gw
+            .tensor_info(&first_gate_w)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate_w}"))?;
+        anyhow::ensure!(
+            w_dtype == DType::Fp8E4m3,
+            "DeepSeekV2Fp8BlockMoELayer::load: expected Fp8E4m3 expert weights, got {w_dtype}"
+        );
+        let (s_shape, _) = gw
+            .tensor_info(&first_gate_s)
+            .ok_or_else(|| anyhow::anyhow!("scale not found: {first_gate_s}"))?;
+        let block_n = w_shape[0] / s_shape[0];
+        let block_k = w_shape[1] / s_shape[1];
+
+        // Stacked expert layout (single-rank, no TP yet): w1=[E, 2*inter, hidden] FP8,
+        // w2=[E, hidden, inter] FP8.
+        let w1_n = 2 * inter;
+        let w1_k = hidden_size;
+        let w2_n = hidden_size;
+        let w2_k = inter;
+        let w1_scale_rows = w1_n.div_ceil(block_n);
+        let w1_scale_cols = w1_k.div_ceil(block_k);
+        let w2_scale_rows = w2_n.div_ceil(block_n);
+        let w2_scale_cols = w2_k.div_ceil(block_k);
+        let gate_scale_rows = inter.div_ceil(block_n);
+
+        let w1_bytes = n_routed_experts * w1_n * w1_k;
+        let w2_bytes = n_routed_experts * w2_n * w2_k;
+        let w1_ptr = unsafe { driver::mem_alloc(w1_bytes)? };
+        let w2_ptr = unsafe { driver::mem_alloc(w2_bytes)? };
+
+        let w1_scale_bytes = n_routed_experts * w1_scale_rows * w1_scale_cols * 4;
+        let w2_scale_bytes = n_routed_experts * w2_scale_rows * w2_scale_cols * 4;
+        let w1_scale_ptr = unsafe { driver::mem_alloc(w1_scale_bytes)? };
+        let w2_scale_ptr = unsafe { driver::mem_alloc(w2_scale_bytes)? };
+
+        for e in 0..n_routed_experts {
+            let gate_pfx = format!("{prefix}.experts.{e}.gate_proj");
+            let up_pfx = format!("{prefix}.experts.{e}.up_proj");
+            let down_pfx = format!("{prefix}.experts.{e}.down_proj");
+
+            // FP8 weights: stack gate then up along dim=0, down separately.
+            let expert_w1_off = e * w1_n * w1_k;
+            let gate_proj_bytes = inter * hidden_size;
+            let expert_w2_off = e * w2_n * w2_k;
+            unsafe {
+                gw.take_into(
+                    &format!("{gate_pfx}.weight"),
+                    w1_ptr.add(expert_w1_off),
+                    stream,
+                )?;
+                gw.take_into(
+                    &format!("{up_pfx}.weight"),
+                    w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                    stream,
+                )?;
+                gw.take_into(
+                    &format!("{down_pfx}.weight"),
+                    w2_ptr.add(expert_w2_off),
+                    stream,
+                )?;
+            }
+
+            // Block scales: copy into stacked 3D buffers.
+            let expert_w1_scale_off = e * w1_scale_rows * w1_scale_cols * 4;
+            let gate_scale = {
+                let raw = gw.take(&block_scale_name(gw, &gate_pfx))?;
+                ensure_f32_scale(raw, stream)?
+            };
+            let gate_scale_bytes = gate_scale_rows * w1_scale_cols * 4;
+            unsafe {
+                driver::memcpy_dtod_async(
+                    w1_scale_ptr.add(expert_w1_scale_off),
+                    gate_scale.raw_ptr(),
+                    gate_scale_bytes,
+                    stream,
+                )?;
+            }
+            let up_scale = {
+                let raw = gw.take(&block_scale_name(gw, &up_pfx))?;
+                ensure_f32_scale(raw, stream)?
+            };
+            let up_scale_rows = w1_scale_rows - gate_scale_rows;
+            let up_scale_bytes = up_scale_rows * w1_scale_cols * 4;
+            unsafe {
+                driver::memcpy_dtod_async(
+                    w1_scale_ptr.add(expert_w1_scale_off + gate_scale_bytes),
+                    up_scale.raw_ptr(),
+                    up_scale_bytes,
+                    stream,
+                )?;
+            }
+            let expert_w2_scale_off = e * w2_scale_rows * w2_scale_cols * 4;
+            let down_scale = {
+                let raw = gw.take(&block_scale_name(gw, &down_pfx))?;
+                ensure_f32_scale(raw, stream)?
+            };
+            let down_scale_bytes = w2_scale_rows * w2_scale_cols * 4;
+            unsafe {
+                driver::memcpy_dtod_async(
+                    w2_scale_ptr.add(expert_w2_scale_off),
+                    down_scale.raw_ptr(),
+                    down_scale_bytes,
+                    stream,
+                )?;
+            }
+
+            // Consume input_scale if present (block quant uses dynamic activation).
+            for pfx in &[&gate_pfx, &up_pfx, &down_pfx] {
+                let is_name = format!("{pfx}.input_scale");
+                if gw.contains(&is_name) {
+                    let _ = gw.take(&is_name);
+                }
+            }
+        }
+
+        let w1 = unsafe { GpuTensor::new(w1_ptr, &[n_routed_experts, w1_n, w1_k], DType::Fp8E4m3) };
+        let w2 = unsafe { GpuTensor::new(w2_ptr, &[n_routed_experts, w2_n, w2_k], DType::Fp8E4m3) };
+        let w1_scale_inv = unsafe {
+            GpuTensor::new(
+                w1_scale_ptr,
+                &[n_routed_experts, w1_scale_rows, w1_scale_cols],
+                DType::F32,
+            )
+        };
+        let w2_scale_inv = unsafe {
+            GpuTensor::new(
+                w2_scale_ptr,
+                &[n_routed_experts, w2_scale_rows, w2_scale_cols],
+                DType::F32,
+            )
+        };
+
+        // e_score_correction_bias (F32) for sigmoid routing.
+        let e_score_correction_bias = if use_sigmoid {
+            let bias_name = format!("{prefix}.gate.e_score_correction_bias");
+            let bias_raw = gw.take(&bias_name)?;
+            let bias_f32 = if bias_raw.dtype() == DType::F32 {
+                bias_raw
+            } else {
+                let n = bias_raw.numel();
+                let f32_ptr = unsafe { driver::mem_alloc(n * 4)? };
+                let f32_bias = unsafe { GpuTensor::new(f32_ptr, &[n], DType::F32) };
+                unsafe { kernels::cast_bias_to_f32(bias_raw, f32_bias, stream) };
+                f32_bias
+            };
+            Some(bias_f32)
+        } else {
+            None
+        };
+
+        let moe = Fp8BlockFusedMoELayer {
+            gate,
+            w1,
+            w2,
+            w1_scale_inv,
+            w2_scale_inv,
+            block_size: [block_n, block_k],
+            num_experts: n_routed_experts,
+            top_k,
+            intermediate_size: inter,
+            hidden_size,
+            renormalize: norm_topk_prob,
+            e_score_correction_bias,
+            n_expert_group,
+            topk_group,
+            // Same as DeepSeekV2MoELayer: outer layer applies scale_inplace after
+            // experts; inner layer must use 1.0 to avoid double application.
+            routed_scaling_factor: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        };
+
+        // Shared expert (FP8 block): concat gate_proj+up_proj, then down_proj.
+        let shared_gate_pfx = format!("{prefix}.shared_experts.gate_proj");
+        let shared_up_pfx = format!("{prefix}.shared_experts.up_proj");
+        let shared_down_pfx = format!("{prefix}.shared_experts.down_proj");
+        let shared_gate_up = crate::layers::Fp8BlockLinear::load_concat(
+            gw,
+            &[&shared_gate_pfx, &shared_up_pfx],
+            output_dtype,
+        )?;
+        let shared_down = crate::layers::Fp8BlockLinear::load(gw, &shared_down_pfx, output_dtype)?;
+        let shared_inter = n_shared_experts * moe_intermediate_size;
 
         Ok(Self {
             moe,
@@ -514,6 +843,13 @@ pub struct Fp8FusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
+    /// `[num_experts]` F32 e_score_correction_bias for sigmoid routing (DeepSeek V3 / Kimi K2).
+    /// `None` ⇒ softmax routing (Mixtral / Qwen MoE).
+    pub e_score_correction_bias: Option<GpuTensor>,
+    /// 0 ⇒ flat top-k. >0 with `topk_group` >0 ⇒ noaux_tc grouped routing.
+    pub n_expert_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f64,
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
 }
@@ -536,11 +872,17 @@ impl Fp8FusedMoELayer {
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // 2. Top-K softmax
-        let (topk_weights, topk_ids) = kernels::topk_softmax(
+        // 2. Route: softmax / sigmoid+bias / grouped noaux_tc (DSv3/Kimi K2).
+        let (topk_weights, topk_ids) = route_experts(
             router_logits.as_gpu_tensor(),
-            self.top_k,
-            self.renormalize,
+            &MoeRouting {
+                top_k: self.top_k,
+                renormalize: self.renormalize,
+                e_score_correction_bias: self.e_score_correction_bias.as_ref(),
+                n_expert_group: self.n_expert_group,
+                topk_group: self.topk_group,
+                routed_scaling_factor: self.routed_scaling_factor,
+            },
             &mut device.caching,
             stream,
         );
@@ -671,6 +1013,11 @@ pub struct Fp8BlockFusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
+    /// See [`Fp8FusedMoELayer::e_score_correction_bias`].
+    pub e_score_correction_bias: Option<GpuTensor>,
+    pub n_expert_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f64,
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
 }
@@ -691,11 +1038,17 @@ impl Fp8BlockFusedMoELayer {
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // 2. Top-K softmax
-        let (topk_weights, topk_ids) = kernels::topk_softmax(
+        // 2. Route: softmax / sigmoid+bias / grouped noaux_tc.
+        let (topk_weights, topk_ids) = route_experts(
             router_logits.as_gpu_tensor(),
-            self.top_k,
-            self.renormalize,
+            &MoeRouting {
+                top_k: self.top_k,
+                renormalize: self.renormalize,
+                e_score_correction_bias: self.e_score_correction_bias.as_ref(),
+                n_expert_group: self.n_expert_group,
+                topk_group: self.topk_group,
+                routed_scaling_factor: self.routed_scaling_factor,
+            },
             &mut device.caching,
             stream,
         );
@@ -901,6 +1254,11 @@ pub struct GgmlFusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
+    /// See [`Fp8FusedMoELayer::e_score_correction_bias`].
+    pub e_score_correction_bias: Option<GpuTensor>,
+    pub n_expert_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f64,
 }
 
 impl GgmlFusedMoELayer {
@@ -929,11 +1287,17 @@ impl GgmlFusedMoELayer {
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // 2. Top-K softmax
-        let (topk_weights, topk_ids) = kernels::topk_softmax(
+        // 2. Route: softmax / sigmoid+bias / grouped noaux_tc.
+        let (topk_weights, topk_ids) = route_experts(
             router_logits.as_gpu_tensor(),
-            self.top_k,
-            self.renormalize,
+            &MoeRouting {
+                top_k: self.top_k,
+                renormalize: self.renormalize,
+                e_score_correction_bias: self.e_score_correction_bias.as_ref(),
+                n_expert_group: self.n_expert_group,
+                topk_group: self.topk_group,
+                routed_scaling_factor: self.routed_scaling_factor,
+            },
             &mut device.caching,
             stream,
         );
@@ -1182,6 +1546,11 @@ pub struct MarlinFusedMoELayer {
     /// 1 = kU4 (AWQ), 0 = kU4B8 (GPTQ).
     pub b_type_id: i32,
     pub renormalize: bool,
+    /// See [`Fp8FusedMoELayer::e_score_correction_bias`].
+    pub e_score_correction_bias: Option<GpuTensor>,
+    pub n_expert_group: usize,
+    pub topk_group: usize,
+    pub routed_scaling_factor: f64,
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
 }
@@ -1205,11 +1574,17 @@ impl MarlinFusedMoELayer {
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // 2. Top-K softmax
-        let (topk_weights, topk_ids) = kernels::topk_softmax(
+        // 2. Route: softmax / sigmoid+bias / grouped noaux_tc.
+        let (topk_weights, topk_ids) = route_experts(
             router_logits.as_gpu_tensor(),
-            self.top_k,
-            self.renormalize,
+            &MoeRouting {
+                top_k: self.top_k,
+                renormalize: self.renormalize,
+                e_score_correction_bias: self.e_score_correction_bias.as_ref(),
+                n_expert_group: self.n_expert_group,
+                topk_group: self.topk_group,
+                routed_scaling_factor: self.routed_scaling_factor,
+            },
             &mut device.caching,
             stream,
         );
@@ -1470,6 +1845,10 @@ mod tests {
             intermediate_size: 14336,
             hidden_size: 4096,
             renormalize: false,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };
@@ -1509,6 +1888,10 @@ mod tests {
             intermediate_size: 3072,
             hidden_size: 2048,
             renormalize: true,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };
@@ -1576,6 +1959,10 @@ mod tests {
             intermediate_size: inter,
             hidden_size: hidden,
             renormalize: true,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

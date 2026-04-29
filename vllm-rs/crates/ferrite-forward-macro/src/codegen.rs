@@ -155,6 +155,21 @@ enum FieldLoad {
         /// Number of groups to select in the first-stage grouped top-k. 0 = disabled.
         topk_group: usize,
     },
+    /// FP8 blockwise-quantized analog of `DeepSeekV2Moe` — DeepSeek-V3
+    /// official 671B and Kimi K2 official checkpoints.
+    DeepSeekV2Fp8BlockMoe {
+        prefix: String,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        use_sigmoid: bool,
+        n_expert_group: usize,
+        topk_group: usize,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -197,6 +212,106 @@ enum MarlinFormat {
     },
 }
 
+/// MoE config bits shared by `DeepSeekV2Moe` and `DeepSeekV2Fp8BlockMoe`
+/// FieldLoad variants. Reads the per-variant config JSON once and falls
+/// back to the model's `bounds` / `scalars` map when a key is absent.
+struct DeepSeekMoeCfg {
+    n_routed_experts: usize,
+    n_shared_experts: usize,
+    top_k: usize,
+    moe_intermediate_size: usize,
+    hidden_size: usize,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f32,
+    use_sigmoid: bool,
+    n_expert_group: usize,
+    topk_group: usize,
+}
+
+fn read_deepseek_moe_cfg(model: &ModelParams) -> DeepSeekMoeCfg {
+    let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+    let n_routed_experts = v
+        .get("n_routed_experts")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| model.bounds.get("n_routed_experts").copied().unwrap_or(64) as usize);
+    let n_shared_experts = v
+        .get("n_shared_experts")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| model.bounds.get("n_shared_experts").copied().unwrap_or(2) as usize);
+    let top_k = v
+        .get("num_experts_per_tok")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| {
+            model
+                .bounds
+                .get("num_experts_per_tok")
+                .copied()
+                .unwrap_or(6) as usize
+        });
+    let moe_intermediate_size = v
+        .get("moe_intermediate_size")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or_else(|| {
+            model
+                .bounds
+                .get("moe_intermediate_size")
+                .copied()
+                .unwrap_or(1536) as usize
+        });
+    let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+    let norm_topk_prob = v
+        .get("norm_topk_prob")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let routed_scaling_factor = v
+        .get("routed_scaling_factor")
+        .and_then(|x| x.as_f64())
+        .map(|x| x as f32)
+        .unwrap_or_else(|| {
+            model
+                .scalars
+                .get("routed_scaling_factor")
+                .copied()
+                .unwrap_or(1.0) as f32
+        });
+    let use_sigmoid = v
+        .get("scoring_func")
+        .and_then(|x| x.as_str())
+        .map(|s| s == "sigmoid")
+        .unwrap_or(false)
+        && v.get("topk_method")
+            .and_then(|x| x.as_str())
+            .map(|s| s == "noaux_tc")
+            .unwrap_or(false);
+    let n_expert_group = v
+        .get("n_group")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(0);
+    let topk_group = v
+        .get("topk_group")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .unwrap_or(0);
+    DeepSeekMoeCfg {
+        n_routed_experts,
+        n_shared_experts,
+        top_k,
+        moe_intermediate_size,
+        hidden_size,
+        norm_topk_prob,
+        routed_scaling_factor,
+        use_sigmoid,
+        n_expert_group,
+        topk_group,
+    }
+}
+
 /// Distill a `WeightAccessor` into its field-load plan. Uses the
 /// accessor's declared `rust_type` + `source_weights` and the
 /// model's config (for `rms_norm_eps` / `tie_word_embeddings`).
@@ -211,6 +326,9 @@ fn plan_field_load(
     let is_deepseek_v2_moe = ty.ends_with("::DeepSeekV2MoELayer")
         || ty == "DeepSeekV2MoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2MoELayer");
+    let is_deepseek_v2_fp8_block_moe = ty.ends_with("::DeepSeekV2Fp8BlockMoELayer")
+        || ty == "DeepSeekV2Fp8BlockMoELayer"
+        || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     let is_rmsnorm =
@@ -455,6 +573,31 @@ fn plan_field_load(
             FieldLoad::Fp8BlockLinear { prefixes }
         } else {
             FieldLoad::Fp8Linear { prefixes }
+        };
+    }
+
+    if is_deepseek_v2_fp8_block_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "DeepSeekV2Fp8BlockMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let cfg = read_deepseek_moe_cfg(model);
+        return FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts: cfg.n_routed_experts,
+            n_shared_experts: cfg.n_shared_experts,
+            top_k: cfg.top_k,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            hidden_size: cfg.hidden_size,
+            norm_topk_prob: cfg.norm_topk_prob,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+            use_sigmoid: cfg.use_sigmoid,
+            n_expert_group: cfg.n_expert_group,
+            topk_group: cfg.topk_group,
         };
     }
 
@@ -1069,8 +1212,13 @@ fn emit_fingerprint_check(
             block_size: Some(_),
             ..
         }) => {
-            let inv_tensor = "model.layers.0.self_attn.q_proj.weight_scale_inv";
-            let scale_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
+            // MLA archs ship `q_a_proj` instead of `q_proj` — match
+            // the leaf the fingerprint already chose above so V3 / K2
+            // FP8-block fixtures aren't silently rejected.
+            let inv_tensor = format!("model.layers.0.{fp_leaf}.weight_scale_inv");
+            let scale_tensor = format!("model.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = inv_tensor.as_str();
+            let scale_tensor = scale_tensor.as_str();
             quote! {
                 // Block variant: accept if `.weight_scale_inv` exists,
                 // or if `.weight_scale` is 2-D with more than one
@@ -1089,8 +1237,10 @@ fn emit_fingerprint_check(
         Some(crate::quantization::QuantMethod::Fp8 {
             block_size: None, ..
         }) => {
-            let inv_tensor = "model.layers.0.self_attn.q_proj.weight_scale_inv";
-            let scale_tensor = "model.layers.0.self_attn.q_proj.weight_scale";
+            let inv_tensor = format!("model.layers.0.{fp_leaf}.weight_scale_inv");
+            let scale_tensor = format!("model.layers.0.{fp_leaf}.weight_scale");
+            let inv_tensor = inv_tensor.as_str();
+            let scale_tensor = scale_tensor.as_str();
             quote! {
                 // Per-tensor variant: reject block checkpoints.
                 if gw.contains(#inv_tensor) {
@@ -1219,7 +1369,10 @@ fn emit_weights_struct(
         // variant.
         let accessor_is_fp8_any = ty.ends_with("::Fp8AnyLinear")
             || ty == "Fp8AnyLinear"
-            || ty.ends_with("layers::Fp8AnyLinear");
+            || ty.ends_with("layers::Fp8AnyLinear")
+            || ty.ends_with("::DeepSeekV2Fp8BlockMoELayer")
+            || ty == "DeepSeekV2Fp8BlockMoELayer"
+            || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
@@ -1671,10 +1824,16 @@ fn emit_weights_struct(
         let yarn_rope_head_dim: Option<usize> =
             model.bounds.get("qk_rope_head_dim").map(|&v| v as usize);
         let scaling = model.rope_scaling.clone();
+        // For MLA models (DeepSeek V2/V3 flat), the rope portion uses
+        // `qk_rope_head_dim` rather than the full `head_dim`. YaRN already
+        // uses `yarn_rope_head_dim`; apply the same override to standard RoPE.
+        let rope_cache_head_dim = yarn_rope_head_dim.unwrap_or(head_dim);
+        let rope_cache_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(rope_cache_head_dim);
+
         let body = match (rotary_dim_lit, scaling) {
             (None, None) => quote! {
                 ::ferrite_kernels::rotary::RotaryCache::new_from_stream(
-                    #head_dim,
+                    #rope_cache_head_dim_lit,
                     #max_pos,
                     #rope_theta,
                     None,
@@ -2503,6 +2662,48 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                let #name = ::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer::load(
+                    gw,
+                    #prefix,
+                    #n_routed_experts,
+                    #n_shared_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #hidden_size,
+                    #norm_topk_prob,
+                    #routed_scaling_factor,
+                    #use_sigmoid,
+                    #n_expert_group,
+                    #topk_group,
+                    __fp8_dtype,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -2811,6 +3012,53 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #use_sigmoid,
                             #n_expert_group,
                             #topk_group,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer::load(
+                            gw,
+                            &#p,
+                            #n_routed_experts,
+                            #n_shared_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #hidden_size,
+                            #norm_topk_prob,
+                            #routed_scaling_factor,
+                            #use_sigmoid,
+                            #n_expert_group,
+                            #topk_group,
+                            __fp8_dtype,
                             stream,
                         )
                     })
@@ -4335,6 +4583,127 @@ mod tests {
         assert!(
             ts.contains("4 as usize"),
             "expected `4 as usize` for baked tp_world_size literal (got: {ts})",
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Per-arch config dir, in ff-interpreter's per-crate layout
+    /// (`crates/ferrite-model-<arch>/configs/`). Pass the arch slug
+    /// using hyphens, e.g. `"deepseek-v3"`, `"qwen3"`.
+    fn arch_configs(arch: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(format!("ferrite-model-{arch}"))
+            .join("configs")
+    }
+
+    /// MLA archs (DeepSeek V3 / Kimi K2) ship `q_a_proj` rather than
+    /// `q_proj`, so the FP8-block disambiguation tensor names must
+    /// follow the same `fp_leaf` selection the rest of the
+    /// fingerprint already uses. Regression for the bug where the
+    /// V3 FP8-block fingerprint hardcoded `q_proj.weight_scale_inv`
+    /// and silently rejected every V3 FP8-block checkpoint.
+    #[test]
+    fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
+        let dir = arch_configs("deepseek-v3");
+        let configs = crate::config::load_dir(&dir).expect("load deepseek-v3 configs");
+        let manifest = crate::weights_manifest::load_or_empty(&dir)
+            .expect("load deepseek-v3 weights manifest");
+        // Pick a V3 variant with FP8-block quantization (block_size: Some).
+        let model = configs
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.quantization.as_ref().map(|qc| &qc.method),
+                    Some(crate::quantization::QuantMethod::Fp8 {
+                        block_size: Some(_),
+                        ..
+                    })
+                )
+            })
+            .expect("at least one V3 FP8-block variant");
+        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        assert!(
+            ts.contains("q_a_proj.weight_scale_inv"),
+            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
+        );
+        assert!(
+            !ts.contains("q_proj.weight_scale_inv"),
+            "MLA arch FP8-block fingerprint must not reference q_proj.weight_scale_inv \
+             (V3/K2 ship q_a_proj on disk; q_proj presence would silently reject every \
+             real checkpoint), got:\n{ts}",
+        );
+        assert!(
+            ts.contains("q_a_proj.weight_scale"),
+            "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale, got:\n{ts}",
+        );
+    }
+
+    /// Flat-Q MLA arches (Moonlight / K2 direct-q_proj) ship `q_proj`
+    /// rather than `q_a_proj`, so the FP8-block fingerprint must use
+    /// `q_proj.weight_scale_inv` even though the arch is otherwise
+    /// structurally MLA (kv_a_proj_with_mqa, kv_b_proj, etc.).
+    #[test]
+    fn fp8_block_disambiguation_uses_q_proj_for_flat_q_mla_archs() {
+        let dir = arch_configs("deepseek-v3-flat");
+        let configs = crate::config::load_dir(&dir).expect("load deepseek-v3-flat configs");
+        let manifest = crate::weights_manifest::load_or_empty(&dir)
+            .expect("load deepseek-v3-flat weights manifest");
+        let model = configs
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.quantization.as_ref().map(|qc| &qc.method),
+                    Some(crate::quantization::QuantMethod::Fp8 {
+                        block_size: Some(_),
+                        ..
+                    })
+                )
+            })
+            .expect("at least one deepseek-v3-flat FP8-block variant");
+        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        assert!(
+            ts.contains("q_proj.weight_scale_inv"),
+            "flat-Q MLA FP8-block fingerprint should use q_proj.weight_scale_inv \
+             (no q_a_proj on disk for q_lora_rank=null checkpoints), got:\n{ts}",
+        );
+        assert!(
+            !ts.contains("q_a_proj.weight_scale_inv"),
+            "flat-Q MLA FP8-block fingerprint must not reference q_a_proj \
+             (Moonlight ships q_proj, not q_a_proj), got:\n{ts}",
+        );
+    }
+
+    /// Non-MLA arches (Llama / Qwen / etc.) keep the historical
+    /// `q_proj` leaf — the fp_leaf selection is purely opt-in for
+    /// archs whose manifest declares `q_a_proj`.
+    #[test]
+    fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
+        let dir = arch_configs("qwen3");
+        let configs = crate::config::load_dir(&dir).expect("load qwen3 configs");
+        let manifest =
+            crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
+        let model = configs
+            .iter()
+            .find(|c| {
+                matches!(
+                    c.quantization.as_ref().map(|qc| &qc.method),
+                    Some(crate::quantization::QuantMethod::Fp8 {
+                        block_size: Some(_),
+                        ..
+                    })
+                )
+            })
+            .expect("at least one Qwen3 FP8-block variant");
+        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        assert!(
+            ts.contains("q_proj.weight_scale_inv"),
+            "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",
         );
     }
 }

@@ -106,13 +106,12 @@ MODELS = {
     # 64 routed experts + 2 shared, topk=8, sigmoid/noaux_tc routing). Trained from
     # scratch on 350B+ English tokens; produces coherent output → meaningful golden.
     "deepseek_v3_academic_9b": "ByteDance-Seed/academic-ds-9B",
-    # DeepSeek V3 — bzantium/tiny-deepseek-v3: real trained 6-layer model with
-    # full V3 dims (hidden=7168, heads=128, q_lora_rank=1536, vocab=129280,
-    # n_routed_experts=8, num_experts_per_tok=8 so all experts always activated
-    # → deterministic routing). 10.7 GB bf16 across 3 safetensors shards.
-    # Meaningful golden: real weights produce coherent output, verifies both
-    # the ferrite fingerprint (q_a_proj path) and the V3 MoE forward pass.
-    "deepseek_v3_bzantium": "bzantium/tiny-deepseek-v3",
+    # Moonlight-16B-A3B-Instruct — `DeepseekV3ForCausalLM`, 16B MoE BF16.
+    # K2-style flat routing: q_lora_rank=null, n_group=1, topk_group=1,
+    # sigmoid+noaux_tc, routed_scaling_factor=2.446. 27 layers, 64 routed + 2
+    # shared experts. Routes through ferrite-model-deepseek-v3-flat.
+    # Real trained model → coherent output → meaningful golden comparison.
+    "moonlight_16b_a3b_instruct": "moonshotai/Moonlight-16B-A3B-Instruct",
     # CommandR (CohereForCausalLM) — 1-layer trim of real v01 by
     # Citaman (mergekit). Full v01 dims (hidden=8192, head_dim=128,
     # vocab=256000), single decoder layer → ~5GB bf16, fits L4.
@@ -163,6 +162,19 @@ MODELS = {
     # nondeterministic across runs) — the factory override below
     # keys off the `_fp8` suffix which matches block too.
     "qwen3_0_6b_fp8_block": "RedHatAI/Qwen3-0.6B-FP8-BLOCK",
+    # NOTE: `deepseek_v3_academic_9b_fp8_block` is intentionally NOT in
+    # this map. Python vLLM's `validate_fp8_block_shape` rejects V3
+    # academic-9B's `intermediate_size = 10944` (not divisible by 128)
+    # plus the fused `q_a_proj + kv_a_proj_with_mqa` output partition
+    # of 1600 (also non-divisible). Architectural dim choices, not
+    # something we can fix on the fixture side. Ferrite's
+    # `Fp8BlockLinear::load` handles `ceil`-rounded partial last
+    # blocks; Python's loader does not. The Rust correctness test
+    # therefore uses ferrite-self-golden (same convention the BF16
+    # `deepseek_v3_academic_9b` test already uses for the FA2-vs-
+    # TritonMLA divergence reason). See
+    # `test_cuda_correctness_deepseek_v3_academic_9b_fp8_block` and
+    # the bootstrap procedure documented there.
     # Phi-3-mini-4k-instruct — `Phi3ForCausalLM`, dense bf16, MHA,
     # no LongRoPE. Matches `TestModels::PHI3_MINI_4K_CUDA`. First
     # ferrite arch with packed on-disk weights (`qkv_proj`,
@@ -227,13 +239,22 @@ def generate_for_model(model_id: str, output_key: str):
     # path — their numerics are already stable enough that graph
     # nondeterminism stays below the top-N tolerance.
     is_fp8 = "fp8" in output_key.lower()
+    is_mla = output_key.startswith(("deepseek_", "kimi_", "moonlight_"))
     kwargs = {"model": model_id, "max_model_len": 2048}
+    if output_key.startswith("moonlight_"):
+        kwargs["trust_remote_code"] = True
     if is_fp8:
         kwargs["enforce_eager"] = True
         # Ferrite defaults to FlashInfer for FP8; match that in the
         # golden so the top-N comparison isn't backend-skewed.
         # Replaces the retired `VLLM_ATTENTION_BACKEND` env var.
-        kwargs["attention_backend"] = "FLASHINFER"
+        # MLA arches (DeepSeek V3 / Kimi K2) skip the override —
+        # FlashInfer rejects MLA head shapes; Python vLLM auto-picks
+        # TritonMLA. The Rust correctness test threshold already
+        # accounts for the resulting FA2-vs-TritonMLA late-position
+        # drift (same convention as the BF16 V3 golden).
+        if not is_mla:
+            kwargs["attention_backend"] = "FLASHINFER"
     llm = LLM(**kwargs)
     tokenizer = llm.get_tokenizer()
 

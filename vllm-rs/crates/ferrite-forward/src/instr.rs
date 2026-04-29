@@ -36,7 +36,7 @@ use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, LinearLayer, MarlinLinear, RmsNorm,
 };
-use ferrite_kernels::layers_moe::DeepSeekV2MoELayer;
+use ferrite_kernels::layers_moe::{DeepSeekV2Fp8BlockMoELayer, DeepSeekV2MoELayer};
 
 /// Per-canonical model parameters. Implemented by each canonical's
 /// `Weights` so the universal `Instruction::eval` body can read
@@ -199,6 +199,7 @@ pub enum Instruction<W> {
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32, CosSinFn<W>),
     DeepSeekMoe(u32, u32, u32, WtFn<W, DeepSeekV2MoELayer>),
+    DeepSeekMoeFp8Block(u32, u32, u32, WtFn<W, DeepSeekV2Fp8BlockMoELayer>),
     CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassGemmSplitK(
         u32,
@@ -1333,6 +1334,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             }
             Instruction::DeepSeekMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let out = w.forward(v, ctx.device);
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::DeepSeekMoeFp8Block(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);

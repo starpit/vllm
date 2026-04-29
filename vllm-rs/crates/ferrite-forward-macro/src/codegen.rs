@@ -55,11 +55,12 @@ use crate::fuf::{Fuf, FufInput, TileId};
 /// the file is purely diagnostic and must not break the build.
 fn kvm_diag_log(line: &str) {
     use std::io::Write;
-    use std::path::PathBuf;
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let dir = home.join(".cache").join("cudaforge").join("megakernels");
+    // Use the SAME XDG-aware cache-dir resolution as
+    // `interpreter::kvm::megakernel_cache_dir`. Mismatched paths
+    // were the root cause of the linker-error rabbit hole — the
+    // diag log writing to one path while build.rs scanned a
+    // different one.
+    let dir = crate::interpreter::kvm::megakernel_cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }

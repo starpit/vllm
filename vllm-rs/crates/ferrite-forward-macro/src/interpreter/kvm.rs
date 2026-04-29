@@ -934,16 +934,39 @@ pub fn emit_cu_source(canonical_name: &str, dims: &KvmDims) -> String {
 /// up and feeds them to NVCC alongside vendor sources.
 pub fn write_cu_to_cache(canonical_name: &str, source: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::path::PathBuf;
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let dir = home.join(".cache").join("cudaforge").join("megakernels");
+    let dir = megakernel_cache_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("tk_megakernel_{canonical_name}.cu"));
     let mut f = std::fs::File::create(&path)?;
     f.write_all(source.as_bytes())?;
     Ok(())
+}
+
+/// Resolve the megakernel cache directory using the SAME logic
+/// `ferrite-cuda-builder/build.rs` uses (`dirs::cache_dir()`):
+/// `$XDG_CACHE_HOME/cudaforge/megakernels` if set, else
+/// `$HOME/.cache/cudaforge/megakernels`. The proc-macro can't
+/// depend on the `dirs` crate (proc-macro deps are heavy), so
+/// we replicate the precedence inline.
+///
+/// PRIOR BUG: this fn used `$HOME/.cache/...` unconditionally,
+/// ignoring `XDG_CACHE_HOME`. Anyone with `XDG_CACHE_HOME` set
+/// got a SILENT path mismatch — proc-macro wrote `.cu` files to
+/// `$HOME/.cache/cudaforge/megakernels/`, build.rs scanned
+/// `$XDG_CACHE_HOME/cudaforge/megakernels/` (empty), no `.cu`
+/// reached NVCC, no `libmegakernels.a` was produced, every
+/// `tk_megakernel_<canonical>_launch` symbol came out
+/// undefined at link time. Took multiple sessions to spot.
+pub fn megakernel_cache_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let cache_root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".cache"))
+                .unwrap_or_else(|| PathBuf::from("/tmp/.cache"))
+        });
+    cache_root.join("cudaforge").join("megakernels")
 }
 
 /// Per-canonical Rust marshaling wrapper. The host dispatcher

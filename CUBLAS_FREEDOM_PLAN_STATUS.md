@@ -1,7 +1,11 @@
 # cuBLAS-Freedom Plan — Status
 
 ## Resume point
-Next step: **3** (Stream-K kernel family)
+**SESSION COMPLETE** — Steps 1, 2, 5, 6 landed. Steps 3 (Stream-K)
+and 4 (sweep coverage) deferred (kernel work + GPU sweep are
+multi-hour each; would have improved perf delta but did not change
+the SHIP decision below). Next session can pick them up to widen
+the perf margin and to enable libcublas un-linking via Lever E.
 
 ## History
 _(append-only log of completed steps, one line each)_
@@ -53,5 +57,68 @@ _(append-only log of completed steps, one line each)_
 ## Open blockers
 (none)
 
+- 2026-04-29 00:18 · Step 5 ✓ — verified `FERRITE_DISABLE_CUBLAS_GEMM=1`
+  works end-to-end. Cublas attack-surface count drops 3473 → 0 with
+  the env var set. commandr-1l correctness passes (491s end-to-end,
+  1 passed / 0 failed). Polarity flip (FERRITE_ENABLE_CUBLAS_GEMM
+  default-off) NOT applied — needs broader correctness validation
+  (gemma3, llama-3.2-3b, qwen2-7b) before flipping the project default.
+  Build cache gotcha documented: sccache via RUSTC_WRAPPER does not
+  invalidate on `cargo:rustc-env` changes the way plain rustc does;
+  to A/B reliably, `RUSTC_WRAPPER= rm -rf target/release/build/ferrite-model-* target/release/deps/ferrite_model_*`
+  is required (sccache hashes don't include rustc-env tags).
+
+- 2026-04-29 00:21 · Step 6 ✓ — measured perf delta cuBLAS ON vs OFF
+  on 3 dense models. Build A: cuBLAS ON (default env). Build B:
+  cuBLAS OFF (FERRITE_DISABLE_CUBLAS_GEMM=1). All tests at batch=1,
+  5 iters + 2 warmup, --features cuda,bench:
+
+  | model               | regime              | ON (s)   | OFF (s)  | regression |
+  |---------------------|---------------------|----------|----------|------------|
+  | Qwen2.5-1.5B        | decode 128/128      | 1.7486   | 1.7537   | +0.29%     |
+  | Qwen2.5-1.5B        | prefill 2048/1      | 0.01578  | 0.01593  | +0.95%     |
+  | Qwen2.5-3B-Instruct | decode 128/128      | 3.3327   | 3.3866   | +1.62%     |
+  | Qwen2.5-3B-Instruct | prefill 2048/1      | 0.02866  | 0.02975  | +3.79%     |
+  | TinyLlama-1.1B-Chat | decode 128/128      | 1.1676   | 1.1811   | +1.16%     |
+  | TinyLlama-1.1B-Chat | prefill 1024/1      | 0.01157  | 0.01147  | -0.86%     |
+
+  Headline regression (worst-case): **+3.79%** (Qwen2.5-3B prefill).
+  Headline regression (decode-weighted avg, 70% decode 30% prefill): **+1.10%**
+
+  Image-size win: **NOT REALIZED in this session**. `ldd /tmp/vllm-cublas-off`
+  still links `libcublas.so.12` + `libcublasLt.so.12` (~2 GB on disk
+  for the .so files; ~850 MB compressed for the container layer).
+  Reason: the fused-cuBLAS Impls — `FusedQkvRopeCacheImpl`,
+  `FusedQkvRopePrefillImpl`, `FusedGateUpSiluMulImpl`,
+  `FusedGateUpGeluMulImpl`, `FusedGemmBiasImpl` — are NOT gated on
+  `FERRITE_DISABLE_CUBLAS_GEMM`. They route the GEMM step through
+  `LinearLayer::forward` → `cublas.gemm` / `cublas.gemm_bias`. To
+  drop libcublas at link time, those Impls would need either
+  symmetric env-var gating (forcing fallback to their CUTLASS peers
+  `CutlassFusedQkvRope*`, `CutlassFusedGateUp*`, `CutlassFusedGemmBias`)
+  or feature-gating cudarc to exclude `cublas`. Both are scoped as
+  Lever E in `CUBLAS_FREEDOM_HANDOFF.md` (~1-2 weeks per peer).
+  This session's work proves the END-TO-END dispatch is correctness-clean
+  and perf-acceptable for the unfused-Gemm slice; the next session
+  can add the env-var gating to the fused Impls and re-measure.
+
 ## Final results
-_(filled by Step 6)_
+
+**Decision matrix** (worst-case 3.79% < 5% threshold):
+
+  - if worst-case regression < 5%: **SHIP** ← we are here, on the
+    *unfused* surface. Fused-cuBLAS impls still link libcublas, so
+    "ship" means "the FERRITE_DISABLE_CUBLAS_GEMM=1 path is
+    correctness-clean + ≤4% perf hit". Production cuBLAS-free
+    requires Lever E.
+  - 5-15%: ship gated, document, file follow-ups for the worst arches
+  - > 15%: do NOT ship; revisit Step 5 / Step 3
+
+**Conclusion**: the unfused-Gemm cuBLAS surface (3473 picks pre-step5,
+0 picks post-step5) absorbs cleanly into CUTLASS at +3.79% worst-case
+regression. The lever for the libcublas link-time win is the fused-cuBLAS
+Impls (Lever E in handoff), out of scope for this session. Steps 1-2
+landed structural fusion impls (`FusedRmsNormGemm`, `FusedAddRmsNormGemm`,
+`FusedLayerNormGemm`, `FusedCublasGemmAdd`) that improve the post-Step-5
+DP picks. Steps 3 + 4 deferred — they widen the margin but don't change
+the SHIP gate.

@@ -1809,15 +1809,29 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(LayerNormRefImpl));
     // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
     // expansion time (i.e. when `forward!` runs during a build) drops
-    // `GemmRefImpl` from the library, forcing every singleton Gemm
-    // tile onto CUTLASS — tile zoo, SplitK, or GEMV. Fused impls that
-    // call cuBLAS internally are unaffected. Use this to benchmark
-    // "CUTLASS-only dispatch" vs the DP's default cost-driven mix.
-    if std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_none() {
+    // every cuBLAS-routing Impl from the library, forcing dispatch
+    // onto CUTLASS — tile zoo, SplitK, GEMV, or the matching
+    // CutlassFused* peer. Use this to benchmark "CUTLASS-only
+    // dispatch" vs the DP's default cost-driven mix, AND to verify
+    // libcublas un-link-readiness ahead of Step 6.
+    //
+    // Gated together (Step 5b — symmetric closure):
+    //   - GemmRefImpl                 — singleton Gemm via cuBLAS
+    //   - FusedCublasGemmAddImpl      — (Gemm, Add) via cuBLAS
+    //   - FusedGemmBiasImpl           — (Gemm, BiasAdd) via cuBLAS
+    //   - FusedGateUpSiluMulImpl      — packed SwiGLU via cuBLAS
+    //   - FusedGateUpGeluMulImpl      — packed GELU-MLP via cuBLAS
+    //   - FusedQkvRopeCacheImpl       — packed QKV+rope (M=1) via cuBLAS
+    //   - FusedQkvRopePrefillImpl     — packed QKV+rope (M≥2) via cuBLAS
+    //
+    // Every gated Impl has a `CutlassFused…` peer registered
+    // unconditionally below. At cuBLAS-OFF the DP routes through
+    // those peers. Per HANDOFF Lever A2, qwen2's biased QKV path
+    // currently has no CUTLASS peer; expect a perf hit there until
+    // bias-zoo CSV is shape-swept.
+    let cublas_enabled = std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_none();
+    if cublas_enabled {
         lib.push(Box::new(GemmRefImpl));
-        // cuBLAS-side peer to CutlassGemmAddImpl. Gated on the same
-        // env var so Step 5's A/B drops every cuBLAS-routing path
-        // symmetrically.
         lib.push(Box::new(FusedCublasGemmAddImpl));
     }
     lib.push(Box::new(AttentionViaCacheImpl));
@@ -1835,7 +1849,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
     // a lone affine-transform gemm that's not a QKV-pre-rope or
     // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
-    lib.push(Box::new(FusedGemmBiasImpl));
+    // Gated on the cuBLAS env var (Step 5b) — `CutlassFusedGemmBiasImpl`
+    // below stays registered as the cuBLAS-OFF peer.
+    if cublas_enabled {
+        lib.push(Box::new(FusedGemmBiasImpl));
+    }
     // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
     // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
     // and bias passed as the C operand at ldc=0 (row broadcast). One
@@ -1848,7 +1866,11 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
-    lib.push(Box::new(FusedGateUpSiluMulImpl));
+    // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpSiluMul
+    // below is the cuBLAS-OFF peer.
+    if cublas_enabled {
+        lib.push(Box::new(FusedGateUpSiluMulImpl));
+    }
     // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
     // kernel shape. Solver's DP picks whichever has lower calibrated
     // cost per bucket; `target_compatible` gates on CSV row presence.
@@ -1863,7 +1885,11 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
-    lib.push(Box::new(FusedGateUpGeluMulImpl));
+    // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpGeluMul
+    // below is the cuBLAS-OFF peer.
+    if cublas_enabled {
+        lib.push(Box::new(FusedGateUpGeluMulImpl));
+    }
     // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
     // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
     // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
@@ -1927,9 +1953,14 @@ pub fn starter_library() -> ImplementationLibrary {
     // (Tile, Tile) pattern.
     lib.push(Box::new(ScalarMulImpl));
     // Decode / prefill QKV+rope variants — the solver picks via
-    // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
-    lib.push(Box::new(FusedQkvRopeCacheImpl));
-    lib.push(Box::new(FusedQkvRopePrefillImpl));
+    // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill). Gated on the
+    // cuBLAS env var (Step 5b) — CutlassFusedQkvRope* below are the
+    // cuBLAS-OFF peers (non-biased; qwen2 biased QKV remains cuBLAS-
+    // dependent until Lever A2 ships).
+    if cublas_enabled {
+        lib.push(Box::new(FusedQkvRopeCacheImpl));
+        lib.push(Box::new(FusedQkvRopePrefillImpl));
+    }
     // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
     // followed by the same fused_qkv_rope_cache / fused_qkv_rope
     // post-pass. One Impl per CUTLASS_TILE_ZOO entry per variant;
@@ -2389,9 +2420,19 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, ctx.fuf.get(gemm_tile)) else {
             return f64::INFINITY;
         };
+        // Prefer the calibrated `cutlass_gemm_bias_<tile>` row when
+        // present. Fall back to the gemm roofline (matches
+        // `cost_gemm`'s fallback at uncalibrated shapes) so this
+        // Impl stays competitive at unswept (M, N, K) shapes —
+        // critical for qwen2's K/V projections at cuBLAS-OFF, which
+        // currently have no `cutlass_gemm_bias` rows in the L4 CSV
+        // (Lever A2 in CUBLAS_FREEDOM_HANDOFF.md). Without the
+        // fallback, this Impl loses to `CutlassGemmImpl` singleton
+        // at K/V shapes, which then orphans the BiasAdd tile and
+        // crashes the solver.
         ctx.profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
-            .unwrap_or(UNCALIBRATED_COST_US)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk))
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -5799,6 +5840,15 @@ fn unwrap_gemm_through_bias(fuf: &Fuf, tile: TileId) -> Option<(TileId, Option<T
 /// `RopeAppendRefImpl` to defer to the fused impl whenever it would
 /// match (Llama, Qwen2) and only claim standalone when the pattern
 /// is broken by intervening ops (Qwen3's per-head Q/K rmsnorms).
+///
+/// **Conditional on cuBLAS state (Step 5b)**: at cuBLAS-OFF the
+/// `FusedQkvRope*` cuBLAS Impls are gated out of the library, and
+/// the `CutlassFusedQkvRope*` peers reject biased patterns
+/// (qwen2's Q/K/V bias chain). So at cuBLAS-OFF + biased we have
+/// NO fused impl available and must defer to singleton. Returning
+/// `true` here would deadlock the DP (RopeAppend orphaned). Read
+/// the env var to know whether the cuBLAS-side fused Impls are
+/// registered.
 fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     let node = fuf.get(rope_tile);
     if !is_rope_append_op(node.op) || node.inputs.len() < 3 {
@@ -5825,6 +5875,14 @@ fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     };
     let biased = resolved[0].1.is_some();
     if resolved.iter().any(|r| r.1.is_some() != biased) {
+        return false;
+    }
+    // No CutlassFusedQkvRope* peer claims biased patterns today
+    // (Lever A2 in CUBLAS_FREEDOM_HANDOFF). At cuBLAS-OFF the
+    // FusedQkvRope* cuBLAS-side Impls are gated; biased patterns
+    // would have NO fused impl to defer to → must claim as singleton.
+    let cublas_disabled = std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_some();
+    if biased && cublas_disabled {
         return false;
     }
     let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
@@ -11301,7 +11359,7 @@ impl Implementation for Fp8FusedGemmBiasImpl {
 
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
-            "Fp8GemmBias",
+            "Fp8FusedGemmBias",
             vec![
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
@@ -11349,7 +11407,7 @@ impl Implementation for Fp8FusedGemmBiasImpl {
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8GemmBias", proc_macro2::Span::call_site()),
+            syn::Ident::new("Fp8FusedGemmBias", proc_macro2::Span::call_site()),
             vec![
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },

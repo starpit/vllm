@@ -3483,11 +3483,15 @@ pub fn emit_model(
     // write the per-canonical .cu source into the cudaforge cache.
     // Stash the wrapper fn ident keyed by canonical wp; the
     // FORWARD_TABLE loop below uses it to populate KVM_WRAPPERS.
-    let kvm_enabled =
-        std::env::var("FERRITE_KVM").ok().as_deref() == Some("1");
+    let kvm_raw = std::env::var("FERRITE_KVM");
+    let kvm_enabled = kvm_raw.as_deref().ok() == Some("1");
     kvm_diag_log(&format!(
-        "kvm_enabled={} for model={}",
-        kvm_enabled, model.source_stem
+        "kvm_enabled={} for model={} (FERRITE_KVM={:?}, FERRITE_MODELS={:?}, FERRITE_GPU={:?})",
+        kvm_enabled,
+        model.source_stem,
+        kvm_raw,
+        std::env::var("FERRITE_MODELS"),
+        std::env::var("FERRITE_GPU"),
     ));
     let mut kvm_wrapper_idents: BTreeMap<
         crate::solver::WorkloadPoint,

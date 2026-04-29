@@ -521,6 +521,16 @@ fn solve_one(
         /// `None` means position i-1 was a pass-through (its
         /// tile was pre-claimed by an earlier multi-tile impl).
         choice: Option<(ImplId, ClaimMask)>,
+        /// Number of multi-tile (claim-mask popcount > 1) picks taken
+        /// on the path to this cell. **Tiebreaker on equal cost.**
+        /// Required because the costed alternatives at uncalibrated
+        /// shapes (lm_head vocab-N) often tie to fp precision between
+        /// `(fused 2-tile)` and `(norm singleton + gemm singleton)`,
+        /// and HashMap iteration order made the DP non-deterministic
+        /// — STATUS Step 1b(a) 0-pick anomaly traced here. Prefer-
+        /// fused at equal cost matches the design intent at
+        /// solver.rs `// Multi-tile claims represent fusion …`.
+        multi_tile_picks: u32,
     }
 
     let mut dp: Vec<HashMap<ClaimMask, SparseCell>> = vec![HashMap::new(); n + 1];
@@ -530,13 +540,17 @@ fn solve_one(
             cost: 0.0,
             prev_cs: 0,
             choice: None,
+            multi_tile_picks: 0,
         },
     );
 
     let update =
         |cell_map: &mut HashMap<ClaimMask, SparseCell>, key: ClaimMask, cand: SparseCell| {
             let better = match cell_map.get(&key) {
-                Some(ex) => ex.cost > cand.cost,
+                Some(ex) => {
+                    cand.cost < ex.cost
+                        || (cand.cost == ex.cost && cand.multi_tile_picks > ex.multi_tile_picks)
+                }
                 None => true,
             };
             if better {
@@ -547,9 +561,12 @@ fn solve_one(
     for i in 0..n {
         // Snapshot `dp[i]` to avoid borrow conflicts while writing
         // `dp[i+1]` in the same iteration. `dp[i]` is small
-        // (sparse), so cloning its (key, cost) pairs is cheap.
-        let at_i: Vec<(ClaimMask, f64)> = dp[i].iter().map(|(k, c)| (*k, c.cost)).collect();
-        for (cs, cost) in at_i {
+        // (sparse), so cloning its (cost, mtp) pairs is cheap.
+        let at_i: Vec<(ClaimMask, f64, u32)> = dp[i]
+            .iter()
+            .map(|(k, c)| (*k, c.cost, c.multi_tile_picks))
+            .collect();
+        for (cs, cost, mtp) in at_i {
             if cs & 1 != 0 {
                 // Tile i is pre-claimed — pass through.
                 let new_cs = cs >> 1;
@@ -560,6 +577,7 @@ fn solve_one(
                         cost,
                         prev_cs: cs,
                         choice: None,
+                        multi_tile_picks: mtp,
                     },
                 );
             } else {
@@ -569,6 +587,7 @@ fn solve_one(
                     }
                     let new_cs = (cs | cand.mask) >> 1;
                     let new_cost = cost + cand.cost;
+                    let new_mtp = mtp + (cand.mask.count_ones() > 1) as u32;
                     update(
                         &mut dp[i + 1],
                         new_cs,
@@ -576,6 +595,7 @@ fn solve_one(
                             cost: new_cost,
                             prev_cs: cs,
                             choice: Some((cand.imp_id, cand.mask)),
+                            multi_tile_picks: new_mtp,
                         },
                     );
                 }
@@ -1016,6 +1036,12 @@ mod tests {
             let mut singleton_rmsnorm_count = 0;
             let mut singleton_add_count = 0;
             let mut gemm_add_count = 0;
+            // 3-tile (Add, RmsNorm, Gemm) — `CutlassFusedAddRmsNormGemm`.
+            // Lands at lm_head where the (Add, RmsNorm) pair feeds a
+            // single-consumer Gemm. Counts as both an Add+RmsNorm
+            // absorption AND a Gemm absorption (one less downstream
+            // singleton-RmsNorm pinned by a CutlassGemmAdd).
+            let mut fused_3tile_arn_g_count = 0;
             for sg in sfuf.subgraphs() {
                 let tiles = sfuf.tiles_in_subgraph(sg);
                 let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
@@ -1041,29 +1067,39 @@ mod tests {
                     && ops.contains(&OpKind::Add)
                 {
                     gemm_add_count += 1;
+                } else if tiles.len() == 3
+                    && ops.contains(&OpKind::Add)
+                    && ops.contains(&OpKind::RmsNorm)
+                    && ops.contains(&OpKind::Gemm)
+                {
+                    fused_3tile_arn_g_count += 1;
                 }
             }
             // Every Add fuses into something — `fused_add_rms_norm`
             // (always wins at decode m=1, where the upstream is a
             // GEMV) or `cutlass_gemm_add` (wins at prefill m≥512
-            // via the beta=1.0 epilogue that amortizes the aux-read).
+            // via the beta=1.0 epilogue that amortizes the aux-read)
+            // or `CutlassFusedAddRmsNormGemm` 3-tile (lm_head).
             // No Add stays unfused.
             assert_eq!(
                 singleton_add_count, 0,
                 "expected zero unfused Add subgraphs at m={m}",
             );
-            // 2 Adds per layer, each absorbed either by FusedAddRmsNorm
-            // or by CutlassGemmAdd. Sum equals 2*NL regardless of
-            // which fusion the solver chose.
+            // 2 Adds per layer, each absorbed by one of the three
+            // fusion families. Sum equals 2*NL regardless of which
+            // fusion the solver chose.
             assert_eq!(
-                fused_add_rms_norm_count + gemm_add_count,
+                fused_add_rms_norm_count + gemm_add_count + fused_3tile_arn_g_count,
                 2 * nl,
-                "expected fused_add_rms_norm + gemm_add to equal 2*NL at m={m}",
+                "expected fused_add_rms_norm + gemm_add + 3tile-arng to equal 2*NL at m={m}",
             );
             // Each `cutlass_gemm_add` fusion strands the downstream
             // RmsNorm as a singleton. Plus the first layer's
             // input_layernorm always escapes (upstream is Embed, not
-            // Add). So singleton RmsNorm count = 1 + gemm_add_count.
+            // Add). The 3-tile (Add, RmsNorm, Gemm) absorbs both the
+            // RmsNorm and the Gemm so it does NOT contribute a
+            // singleton RmsNorm. So singleton RmsNorm count =
+            // 1 + gemm_add_count (independent of 3-tile count).
             assert_eq!(
                 singleton_rmsnorm_count,
                 1 + gemm_add_count,

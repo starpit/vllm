@@ -4456,6 +4456,11 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let norm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("CutlassFusedRmsNormGemm: claim contains RmsNorm");
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -4471,16 +4476,20 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
             .profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
             .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
-        // Norm BW-bound cost: read input + read weight + write normed.
-        let num_tokens = ctx.num_tokens() as f64;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
-        let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        let bytes = (2.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
-        let norm_us = if bw_gb > 0.0 {
-            (bytes / (bw_gb * 1e9)) * 1e6
-        } else {
-            0.0
+        // Norm cost MUST equal `RmsNormRefImpl::cost_us` byte-for-byte
+        // (`elementwise_cost` on the norm tile), or the DP's
+        // claim-size-DESC tiebreak hands the lm_head pick to
+        // (norm + cublas) singletons at uncalibrated shapes (where
+        // gemm_us cancels via shared roofline). Hand-rolled
+        // `read+write+weight` formulas here charged an extra
+        // `+ hidden` weight read that the singleton does NOT —
+        // 0-pick anomaly at vocab-N STATUS Step 1b(a) flagged.
+        let norm_singleton = MatchInfo {
+            claimed_tiles: vec![norm_id],
+            boundary_inputs: m.boundary_inputs.clone(),
+            boundary_outputs: vec![norm_id],
         };
+        let norm_us = elementwise_cost(&norm_singleton, ctx);
         gemm_us + norm_us
     }
 
@@ -4671,6 +4680,11 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
         })
     }
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let norm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::LayerNorm)
+            .expect("CutlassFusedLayerNormGemm: claim contains LayerNorm");
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -4684,16 +4698,15 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
             .profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
             .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
-        let num_tokens = ctx.num_tokens() as f64;
-        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
-        let bw_gb = ctx.profile.memory_bandwidth_gbps;
-        // CohereLayerNorm: read input + write normed + read weight (no bias).
-        let bytes = (2.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
-        let norm_us = if bw_gb > 0.0 {
-            (bytes / (bw_gb * 1e9)) * 1e6
-        } else {
-            0.0
+        // Norm cost MUST equal `LayerNormRefImpl::cost_us` byte-for-byte
+        // (`elementwise_cost` on the norm tile) — see the matching
+        // CutlassFusedRmsNormGemm comment.
+        let norm_singleton = MatchInfo {
+            claimed_tiles: vec![norm_id],
+            boundary_inputs: m.boundary_inputs.clone(),
+            boundary_outputs: vec![norm_id],
         };
+        let norm_us = elementwise_cost(&norm_singleton, ctx);
         gemm_us + norm_us
     }
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -14089,7 +14102,6 @@ mod tests {
             memory_bandwidth_gbps: 300.0,
             shared_memory_per_sm_kb: 100,
             cost_table,
-            kernel_fits: std::collections::HashMap::new(),
         }
     }
 
@@ -14317,6 +14329,382 @@ mod tests {
         model.bounds.insert("num_key_value_heads".to_string(), 8);
         model.bounds.insert("head_dim".to_string(), 128);
         model
+    }
+
+    // ── CutlassFusedRmsNormGemm / LayerNormGemm 2-tile matchers ──────
+    //
+    // The 2-tile (Norm, Gemm) family is the `Norm → Gemm` lm_head
+    // shape commandr emits (`LayerNorm → Cublas (M=1,N=256000,K=8192)`).
+    // Audit at tip `1a756be34` showed 0 picks for both 2-tile variants
+    // despite 958 lm_head picks the analyzer flagged as
+    // `lm_head: Norm→Gemm[→ScalarMul]` absorbable. These tests pin the
+    // matcher's structural acceptance of the canonical lm_head shape so
+    // the 0-pick can be traced to cost / DP behavior, not a silent
+    // matcher reject.
+
+    fn fused_norm_gemm_test_fuf(norm_kind: OpKind) -> Fuf {
+        use crate::shape::Dim;
+        // 3-node FUF mirroring commandr lm_head:
+        //   t0  Embed       → s0 [bf16, 1×8192]   (activation)
+        //   t1  Norm        → s0 [bf16, 1×8192]   (consumes t0 slot 0)
+        //   t2  Gemm        → s0 [bf16, 1×256000] (consumes t1 slot 0,
+        //                                          weight Dense)
+        let t0 = TileId(0);
+        let t1 = TileId(1);
+        let t2 = TileId(2);
+        Fuf {
+            nodes: vec![
+                FufNode {
+                    id: t0,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: crate::classified::ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t1,
+                    op: norm_kind,
+                    inputs: vec![
+                        FufInput::Tile { id: t0, slot: 0 },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(0),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t2,
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile { id: t1, slot: 0 },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(1),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn cutlass_fused_layer_norm_gemm_2tile_matches_commandr_lm_head_shape() {
+        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
+        let imp = CutlassFusedLayerNormGemmImpl {
+            tile_m: 16,
+            tile_n: 64,
+            stages: 3,
+        };
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let m = imp.matches(&fuf, TileId(1), &profile);
+        assert!(
+            m.is_some(),
+            "CutlassFusedLayerNormGemmImpl 2-tile must match (LayerNorm, Gemm) seeded \
+             on the LayerNorm — the canonical commandr lm_head shape"
+        );
+        let m = m.unwrap();
+        assert_eq!(m.claimed_tiles.len(), 2);
+        assert!(m.claimed_tiles.contains(&TileId(1)));
+        assert!(m.claimed_tiles.contains(&TileId(2)));
+        assert_eq!(m.boundary_inputs, vec![TileId(0)]);
+        assert_eq!(m.boundary_outputs, vec![TileId(2)]);
+    }
+
+    #[test]
+    fn cutlass_fused_rms_norm_gemm_2tile_matches_canonical_lm_head_shape() {
+        let fuf = fused_norm_gemm_test_fuf(OpKind::RmsNorm);
+        let imp = CutlassFusedRmsNormGemmImpl {
+            tile_m: 16,
+            tile_n: 64,
+            stages: 3,
+        };
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let m = imp.matches(&fuf, TileId(1), &profile);
+        assert!(
+            m.is_some(),
+            "CutlassFusedRmsNormGemmImpl 2-tile must match (RmsNorm, Gemm) seeded \
+             on the RmsNorm — the canonical lm_head shape on llama-family arches \
+             without an upstream residual Add"
+        );
+        let m = m.unwrap();
+        assert_eq!(m.claimed_tiles.len(), 2);
+        assert!(m.claimed_tiles.contains(&TileId(1)));
+        assert!(m.claimed_tiles.contains(&TileId(2)));
+    }
+
+    /// Build a FUF that mirrors commandr's true lm_head shape:
+    /// `Embed → LayerNorm → Gemm → ScalarMul`. The ScalarMul on the
+    /// Gemm's output is what makes commandr's lm_head match
+    /// CutlassFusedLayerNormGemm + a separate ScalarMul singleton —
+    /// or, when the (d) family lands, CutlassFusedLayerNormGemmScalarMul.
+    fn fused_norm_gemm_scalarmul_test_fuf(norm_kind: OpKind) -> Fuf {
+        use crate::shape::Dim;
+        let t0 = TileId(0);
+        let t1 = TileId(1);
+        let t2 = TileId(2);
+        let t3 = TileId(3);
+        Fuf {
+            nodes: vec![
+                FufNode {
+                    id: t0,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: crate::classified::ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t1,
+                    op: norm_kind,
+                    inputs: vec![
+                        FufInput::Tile { id: t0, slot: 0 },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(0),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t2,
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile { id: t1, slot: 0 },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(1),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
+                },
+                FufNode {
+                    id: t3,
+                    op: OpKind::Mul,
+                    inputs: vec![FufInput::Tile { id: t2, slot: 0 }, FufInput::Scalar(0.0625)],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn cutlass_fused_norm_gemm_solver_picks_2tile_with_downstream_scalarmul() {
+        // Production reality at commandr lm_head: the Gemm has a
+        // downstream ScalarMul consumer. The 2-tile (Norm, Gemm)
+        // matcher constrains the NORM's consumers (must be 1 = Gemm)
+        // but not the Gemm's downstream — so a downstream ScalarMul
+        // must NOT block the claim.
+        use crate::shape::Inferred;
+        let fuf = fused_norm_gemm_scalarmul_test_fuf(OpKind::LayerNorm);
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let lib = starter_library();
+        let inferred = Inferred {
+            locals: std::collections::HashMap::new(),
+            weights: std::collections::HashMap::new(),
+        };
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let assignments =
+            crate::solver::solve(&fuf, &lib, &profile, &inferred, &bounds, &[1], &[0])
+                .expect("solver");
+        let asgn = assignments
+            .per_workload
+            .iter()
+            .next()
+            .map(|(_, a)| a)
+            .expect("one workload point");
+
+        let sg = asgn.subgraph_of(TileId(1)).expect("LayerNorm covered");
+        let imp_id = asgn.impl_of(sg).expect("subgraph mapped to Impl");
+        let imp = lib.get(imp_id);
+        let name = imp.name();
+        // The 2-tile fused name is e.g. "cutlass_16x64_s3" (csv_name
+        // mirrors CutlassGemmImpl) — disambiguated by being part of a
+        // 2-tile claim covering both the Norm and the Gemm.
+        let sg_gemm = asgn.subgraph_of(TileId(2)).expect("Gemm covered");
+        assert_eq!(
+            sg_gemm, sg,
+            "(LayerNorm, Gemm) must collapse into a single 2-tile fused subgraph \
+             even when the Gemm has a downstream ScalarMul; got name=`{name}`"
+        );
+    }
+
+    #[test]
+    fn cutlass_fused_norm_gemm_solver_picks_2tile_at_commandr_lm_head_shape() {
+        // Integration: run the actual solver on the (LayerNorm, Gemm)
+        // 3-node FUF and assert that the 2-tile fused Impl wins the DP
+        // pick at the seed (M=1 lm_head). This is the production
+        // scenario STATUS flagged 0-pick on; the test pins what the
+        // dump should contain after Step 1b(a).
+        use crate::shape::Inferred;
+        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let lib = starter_library();
+        let inferred = Inferred {
+            locals: std::collections::HashMap::new(),
+            weights: std::collections::HashMap::new(),
+        };
+        let bounds: BTreeMap<String, u64> = BTreeMap::new();
+        let assignments =
+            crate::solver::solve(&fuf, &lib, &profile, &inferred, &bounds, &[1], &[0])
+                .expect("solver");
+        let asgn = assignments
+            .per_workload
+            .iter()
+            .next()
+            .map(|(_, a)| a)
+            .expect("one workload point");
+
+        // Look up which Impl claimed the LayerNorm tile (TileId(1)).
+        let sg = asgn.subgraph_of(TileId(1)).expect("LayerNorm covered");
+        let imp_id = asgn.impl_of(sg).expect("subgraph mapped to Impl");
+        let imp = lib.get(imp_id);
+        let name = imp.name();
+        assert!(
+            name.starts_with("cutlass_") && !name.contains("gemv"),
+            "DP must pick a CutlassFused*Gemm tile at the LayerNorm seed (got `{name}`); \
+             a `cublas`/singleton pick here is the 0-pick anomaly."
+        );
+        // And the same subgraph must claim the Gemm too (2-tile fusion).
+        let sg_gemm = asgn.subgraph_of(TileId(2)).expect("Gemm covered");
+        assert_eq!(
+            sg_gemm, sg,
+            "fused 2-tile claim must cover both (LayerNorm, Gemm) tiles in one subgraph"
+        );
+    }
+
+    #[test]
+    fn cutlass_fused_norm_gemm_norm_term_must_equal_singleton_norm_cost() {
+        // The 2-tile fused (Norm, Gemm) cost is `gemm_us + norm_us`.
+        // The unfused alternative is `norm_singleton_us + gemm_singleton_us`.
+        // For the DP's claim-size-DESC tiebreak to favor fusion at
+        // uncalibrated shapes (where gemm_us == gemm_singleton_us via
+        // shared roofline), the FUSED `norm_us` term MUST equal the
+        // SINGLETON `LayerNormRefImpl::cost_us` byte-for-byte. Any
+        // delta hands the win to the singleton chain.
+        //
+        // Singleton uses `elementwise_cost` which sums Tile inputs +
+        // outputs ONLY (no weight). Fused must mirror this. STATUS
+        // 0-pick on 2-tile traces here: fused was charging an extra
+        // `+ hidden` weight-vector read per call.
+        use crate::shape::Inferred;
+        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
+        let imp = CutlassFusedLayerNormGemmImpl {
+            tile_m: 16,
+            tile_n: 64,
+            stages: 3,
+        };
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let mut bounds: BTreeMap<String, u64> = BTreeMap::new();
+        bounds.insert("hidden_size".to_string(), 8192);
+        bounds.insert("num_tokens".to_string(), 1);
+        let ctx = CostCtx {
+            fuf: &fuf,
+            profile: &profile,
+            bounds: &bounds,
+        };
+
+        // Singleton norm cost: LayerNormRefImpl matches the LayerNorm
+        // tile (TileId(1)) and computes elementwise_cost(input + output).
+        let norm_singleton = MatchInfo {
+            claimed_tiles: vec![TileId(1)],
+            boundary_inputs: vec![TileId(0)],
+            boundary_outputs: vec![TileId(1)],
+        };
+        let norm_singleton_us = LayerNormRefImpl.cost_us(&norm_singleton, &ctx);
+
+        // Fused total cost.
+        let m = imp.matches(&fuf, TileId(1), &profile).expect("matches");
+        let fused_total_us = imp.cost_us(&m, &ctx);
+
+        // Singleton-Gemm cost via cost_gemm (cuBLAS path: CSV row at
+        // M=1 N=256000 K=8192 missing → roofline).
+        let gemm_only = MatchInfo {
+            claimed_tiles: vec![TileId(2)],
+            boundary_inputs: vec![TileId(1)],
+            boundary_outputs: vec![TileId(2)],
+        };
+        let gemm_singleton_us = cost_gemm(&gemm_only, &ctx);
+
+        // Equivalence: fused_total - gemm_singleton = norm_singleton.
+        // Allow a tiny numerical tolerance (1e-9 µs).
+        let delta = fused_total_us - gemm_singleton_us;
+        assert!(
+            (delta - norm_singleton_us).abs() < 1e-9,
+            "fused norm term ({delta:.6}) must equal singleton norm cost \
+             ({norm_singleton_us:.6}); fused_total={fused_total_us:.6} \
+             gemm_singleton={gemm_singleton_us:.6}. A delta means the DP \
+             tiebreak hands the lm_head pick to (norm + cublas) singletons \
+             — exactly the 0-pick anomaly STATUS flagged for the 2-tile."
+        );
+        let _ = Inferred {
+            locals: std::collections::HashMap::new(),
+            weights: std::collections::HashMap::new(),
+        };
+    }
+
+    #[test]
+    fn cutlass_fused_norm_gemm_cost_matches_unfused_norm_plus_cublas_at_uncalibrated_shape() {
+        // At commandr's lm_head (M=1, N=256000, K=8192) NEITHER
+        // `cutlass_<tile>` nor `cublas` has a CSV row — both fall to
+        // their roofline formula. The 2-tile FUSED cost should equal
+        // the UNFUSED (norm-singleton + cublas-singleton) cost
+        // BYTE-FOR-BYTE so the DP's claim-size-DESC sort picks the
+        // fused form. If the fused side is even ε higher, the DP
+        // picks singleton+singleton and the fused Impl captures 0
+        // picks at vocab-N — exactly the 0-pick anomaly STATUS flagged.
+        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
+        let imp = CutlassFusedLayerNormGemmImpl {
+            tile_m: 16,
+            tile_n: 64,
+            stages: 3,
+        };
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let m = imp.matches(&fuf, TileId(1), &profile).expect("matches");
+
+        let mut bounds: BTreeMap<String, u64> = BTreeMap::new();
+        bounds.insert("hidden_size".to_string(), 8192);
+        bounds.insert("num_tokens".to_string(), 1);
+        let ctx = CostCtx {
+            fuf: &fuf,
+            profile: &profile,
+            bounds: &bounds,
+        };
+
+        let fused_us = imp.cost_us(&m, &ctx);
+        // Unfused alternative: cuBLAS singleton on the Gemm via
+        // cost_gemm. Norm singleton's cost cancels (the fused Impl
+        // adds the same `bytes / bw_gb` term). So the gate is
+        // entirely on the GEMM: cutlass_roofline vs cublas_roofline.
+        let gemm_only = MatchInfo {
+            claimed_tiles: vec![TileId(2)],
+            boundary_inputs: vec![TileId(1)],
+            boundary_outputs: vec![TileId(2)],
+        };
+        let unfused_gemm_us = cost_gemm(&gemm_only, &ctx);
+
+        // Both rooflines compute (2*M*N*K) / peak_flops. Fused cost =
+        // gemm_roofline + norm_bw. Unfused gemm-only cost = the same
+        // gemm_roofline. So fused_us == unfused_gemm_us + norm_us.
+        // The norm_us term is what the DP would charge to the
+        // norm SINGLETON in the unfused path — so it cancels at the
+        // total-cost level. The DP's claim-size-DESC tiebreak then
+        // picks fused.
+        assert!(fused_us.is_finite() && fused_us > 0.0);
+        assert!(unfused_gemm_us.is_finite() && unfused_gemm_us > 0.0);
+        assert!(
+            fused_us >= unfused_gemm_us,
+            "fused cost ({fused_us}) includes norm BW; unfused gemm-only ({unfused_gemm_us}) \
+             does not — fused must be ≥ gemm-only at the SAME shape"
+        );
     }
 }
 // ── AllReduceImpl ────────────────────────────────────────────────

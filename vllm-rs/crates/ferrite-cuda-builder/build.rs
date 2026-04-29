@@ -527,14 +527,28 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");
 
-    // Track the cache dir itself so cargo re-runs this build.rs
-    // whenever a `.cu` file is added, removed, or content-changed.
-    // Emitted unconditionally (BEFORE the empty-check + early-return)
-    // so the FIRST build also tracks the dir; otherwise cargo's
-    // fingerprint never includes the dir and proc-macro-emitted
-    // .cu files added on a later expansion never trigger a rebuild
-    // of libmegakernels.a.
+    // Create the cache dir if it doesn't exist. cargo's
+    // `rerun-if-changed=<path>` for a NON-existent path doesn't
+    // reliably trigger a re-run when files later appear there
+    // (cargo records "absent" and won't notice "now has files").
+    // Creating the dir up-front means cargo's first-build
+    // fingerprint records "exists, empty" and a later
+    // proc-macro write of `tk_megakernel_<canonical>.cu`
+    // changes the dir's mtime → cargo invalidates → build.rs
+    // re-runs → libmegakernels.a gets rebuilt with the fresh
+    // symbols.
+    let _ = std::fs::create_dir_all(&megakernel_cache);
     rerun_files.push(megakernel_cache.display().to_string());
+
+    // Always-printed scan-result warning so the user can see
+    // (a) whether build_megakernels even ran, and (b) what it
+    // saw in the cache. Emitted unconditionally so a missing
+    // line in the build output proves build.rs didn't run at
+    // all (vs. ran but found 0 files).
+    println!(
+        "cargo:warning=ferrite-cuda-builder: build_megakernels scanning {}",
+        megakernel_cache.display()
+    );
 
     let megakernel_cus: Vec<String> = if megakernel_cache.exists() {
         std::fs::read_dir(&megakernel_cache)
@@ -549,9 +563,8 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     };
 
     println!(
-        "cargo:warning=build_megakernels picking up {} cu files from {}",
+        "cargo:warning=ferrite-cuda-builder: build_megakernels picking up {} cu files",
         megakernel_cus.len(),
-        megakernel_cache.display()
     );
 
     if megakernel_cus.is_empty() {

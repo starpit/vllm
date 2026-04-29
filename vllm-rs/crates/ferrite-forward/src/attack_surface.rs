@@ -20,7 +20,7 @@
 //!    cuBLAS-side variant means the DP can't pick a fused cuBLAS
 //!    path when cutlass loses the bucket.
 //!    Norm→Gemm  — no fusion exists today (would be
-//!    `FusedRmsNormGemm` / `FusedLayerNormGemm`).
+//!    `CutlassFusedRmsNormGemm` / `CutlassFusedLayerNormGemm`).
 //!    Gemm→ScalarMul — no fusion; ScalarMul is BW-bound and would
 //!    fold into a GEMM epilogue.
 //!    lm_head    — the chain `Norm → Gemm[→ScalarMul]` at the

@@ -15,16 +15,16 @@ _(append-only log of completed steps, one line each)_
   - 1571 in `g_gt_5.00`, 1403 in `no_csv_data`, 487 close-margin
   - fusion-gap absorbable: 1702 (49.2%) — 1095 lm_head + 563 norm→gemm + 32 gemm→scalarmul + 12 gemm→add
   - Stream-K-recoverable: 540 (with 20 fusion overlap)
-- 2026-04-28 23:50 · Step 1 ✓ (partial) — landed `FusedRmsNormGemm`,
-  `FusedLayerNormGemm`, `FusedAddRmsNormGemm` Impls (3 × 20 tile zoo
+- 2026-04-28 23:50 · Step 1 ✓ (partial) — landed `CutlassFusedRmsNormGemm`,
+  `CutlassFusedLayerNormGemm`, `CutlassFusedAddRmsNormGemm` Impls (3 × 20 tile zoo
   = 60 registrations). cuBLAS surface 3461 → 3325 (-136 logical
-  picks; -464 raw rows on FusedAddRmsNormGemm). lm_head: 1095 → 962
+  picks; -464 raw rows on CutlassFusedAddRmsNormGemm). lm_head: 1095 → 962
   (-133); body Norm→Gemm: 563 → 560 (-3). commandr-1l correctness
   passed. Gaps documented:
-  - FusedRmsNormGemm 2-tile (RmsNorm,Gemm) caught 0 picks: body
+  - CutlassFusedRmsNormGemm 2-tile (RmsNorm,Gemm) caught 0 picks: body
     norms feed multi-consumer fusions (QKV/gate-up); single-consumer
     candidates are M=1 patterns where CutlassGemv beats both.
-  - FusedLayerNormGemm 2-tile caught 0 picks despite cohere lm_head
+  - CutlassFusedLayerNormGemm 2-tile caught 0 picks despite cohere lm_head
     matching the structural pattern. Root cause not pinned in this
     session (matches() should fire on `LayerNorm [s0,s0] → Cublas
     [s0,s7]` at the lm_head; left as a follow-up — would unlock the
@@ -34,7 +34,7 @@ _(append-only log of completed steps, one line each)_
     ScalarOffsetRmsNorm → Gemm (gemma standalone) — additional
     Norm→Gemm shapes the analyzer flags but my Impls don't claim.
     Each would need a parallel 3-tile claim Impl following the same
-    pattern as FusedAddRmsNormGemm.
+    pattern as CutlassFusedAddRmsNormGemm.
 
 - 2026-04-29 00:00 · Step 2 ✓ — landed `FusedCublasGemmAddImpl`
   (cuBLAS-side peer to `CutlassGemmAddImpl`). Gated on the same
@@ -118,7 +118,7 @@ _(append-only log of completed steps, one line each)_
 0 picks post-step5) absorbs cleanly into CUTLASS at +3.79% worst-case
 regression. The lever for the libcublas link-time win is the fused-cuBLAS
 Impls (Lever E in handoff), out of scope for this session. Steps 1-2
-landed structural fusion impls (`FusedRmsNormGemm`, `FusedAddRmsNormGemm`,
-`FusedLayerNormGemm`, `FusedCublasGemmAdd`) that improve the post-Step-5
+landed structural fusion impls (`CutlassFusedRmsNormGemm`, `CutlassFusedAddRmsNormGemm`,
+`CutlassFusedLayerNormGemm`, `FusedCublasGemmAdd`) that improve the post-Step-5
 DP picks. Steps 3 + 4 deferred — they widen the margin but don't change
 the SHIP gate.

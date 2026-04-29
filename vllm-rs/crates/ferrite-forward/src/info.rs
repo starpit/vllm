@@ -189,7 +189,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::FusedRmsNormGemm(
+            Instruction::CutlassFusedRmsNormGemm(
                 in_slot,
                 out_slot,
                 layer,
@@ -201,7 +201,7 @@ impl<W> Instruction<W> {
                 n,
                 k,
             ) => (
-                "FusedRmsNormGemm",
+                "CutlassFusedRmsNormGemm",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
@@ -214,7 +214,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::FusedLayerNormGemm(
+            Instruction::CutlassFusedLayerNormGemm(
                 in_slot,
                 out_slot,
                 layer,
@@ -226,7 +226,7 @@ impl<W> Instruction<W> {
                 n,
                 k,
             ) => (
-                "FusedLayerNormGemm",
+                "CutlassFusedLayerNormGemm",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
@@ -239,7 +239,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::FusedAddRmsNormGemm(
+            Instruction::CutlassFusedAddRmsNormGemm(
                 delta_slot,
                 residual_slot,
                 out_slot,
@@ -252,7 +252,7 @@ impl<W> Instruction<W> {
                 n,
                 k,
             ) => (
-                "FusedAddRmsNormGemm",
+                "CutlassFusedAddRmsNormGemm",
                 vec![
                     F::Slot(delta_slot),
                     F::Slot(residual_slot),

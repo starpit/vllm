@@ -110,7 +110,7 @@ pub enum Instruction<W> {
     /// Reuses existing `kernels::rms_norm` + `cutlass::cutlass_gemm`
     /// — no new .cu file. Matches body norms whose only downstream
     /// consumer is a single dense Gemm.
-    FusedRmsNormGemm(
+    CutlassFusedRmsNormGemm(
         u32,
         u32,
         u32,
@@ -123,7 +123,7 @@ pub enum Instruction<W> {
         u32,
     ),
     /// LayerNorm→Gemm sibling for Cohere-style architectures.
-    FusedLayerNormGemm(
+    CutlassFusedLayerNormGemm(
         u32,
         u32,
         u32,
@@ -142,7 +142,7 @@ pub enum Instruction<W> {
     /// a TensorView aliasing the residual upstream OwnedTensor (same
     /// alias semantics as `FusedAddRmsNorm`); the Gemm output is a
     /// fresh OwnedTensor.
-    FusedAddRmsNormGemm(
+    CutlassFusedAddRmsNormGemm(
         u32,
         u32,
         u32,
@@ -511,40 +511,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedRmsNormGemm(
-                in_slot,
-                out_slot,
-                layer,
-                norm_wf,
-                gemm_wf,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => unsafe {
-                let layer = ctx.layer_offset + layer;
-                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let nw = (norm_wf)(ctx.wm, layer);
-                let gw = (gemm_wf)(ctx.wm, layer);
-                assert_weight_shape("FusedRmsNormGemm", gw.dense_weight(), n, k, tp_active(ctx));
-                let normed = kernels::rms_norm(
-                    *v,
-                    nw.weight,
-                    nw.eps,
-                    &mut ctx.device.caching,
-                    ctx.device.compute_stream,
-                );
-                let out = cutlass::cutlass_gemm(
-                    normed.as_gpu_tensor(),
-                    gw.dense_weight(),
-                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
-                    &mut ctx.device.caching,
-                    ctx.device.compute_stream,
-                );
-                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
-            },
-            Instruction::FusedLayerNormGemm(
+            Instruction::CutlassFusedRmsNormGemm(
                 in_slot,
                 out_slot,
                 layer,
@@ -561,7 +528,46 @@ impl<W: CanonicalParams> Instruction<W> {
                 let nw = (norm_wf)(ctx.wm, layer);
                 let gw = (gemm_wf)(ctx.wm, layer);
                 assert_weight_shape(
-                    "FusedLayerNormGemm",
+                    "CutlassFusedRmsNormGemm",
+                    gw.dense_weight(),
+                    n,
+                    k,
+                    tp_active(ctx),
+                );
+                let normed = kernels::rms_norm(
+                    *v,
+                    nw.weight,
+                    nw.eps,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let out = cutlass::cutlass_gemm(
+                    normed.as_gpu_tensor(),
+                    gw.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::CutlassFusedLayerNormGemm(
+                in_slot,
+                out_slot,
+                layer,
+                norm_wf,
+                gemm_wf,
+                tile_m,
+                tile_n,
+                stages,
+                n,
+                k,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let nw = (norm_wf)(ctx.wm, layer);
+                let gw = (gemm_wf)(ctx.wm, layer);
+                assert_weight_shape(
+                    "CutlassFusedLayerNormGemm",
                     gw.dense_weight(),
                     n,
                     k,
@@ -583,7 +589,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedAddRmsNormGemm(
+            Instruction::CutlassFusedAddRmsNormGemm(
                 delta_slot,
                 residual_slot,
                 out_slot,
@@ -602,7 +608,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let nw = (norm_wf)(ctx.wm, layer);
                 let gw = (gemm_wf)(ctx.wm, layer);
                 assert_weight_shape(
-                    "FusedAddRmsNormGemm",
+                    "CutlassFusedAddRmsNormGemm",
                     gw.dense_weight(),
                     n,
                     k,

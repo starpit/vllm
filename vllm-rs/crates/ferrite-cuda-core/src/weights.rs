@@ -412,6 +412,21 @@ pub struct GpuWeights {
     /// causing silent data corruption on GPU. This field retains all mmaps
     /// until the GpuWeights struct is dropped (after model loading completes).
     _mmaps: Vec<Arc<memmap2::Mmap>>,
+
+    /// Quantized linear weights loaded from a GGUF file. Empty when
+    /// the backing store is safetensors. Keyed by HF-style tensor
+    /// name (e.g. `model.layers.0.self_attn.q_proj.weight`). The
+    /// pointers are owned by `gpu_allocs` for lifetime management;
+    /// `take_quantized_linear` removes the entry without dropping
+    /// the underlying GPU memory.
+    quantized: HashMap<String, crate::ggml_quant::GgmlStorage>,
+
+    /// Already-on-GPU dense weights from a GGUF file (norms,
+    /// embeddings, lm_head — the GGUF loader dequantizes these at
+    /// load time). Mirrors `quantized` — both are populated only on
+    /// the GGUF path. Safetensors-backed `GpuWeights` populates
+    /// `tensors` instead and uploads on `take()`.
+    gguf_dense: HashMap<String, GpuTensor>,
 }
 
 // Safety: GPU device pointers accessible from any host thread.
@@ -419,6 +434,33 @@ unsafe impl Send for GpuWeights {}
 unsafe impl Sync for GpuWeights {}
 
 impl GpuWeights {
+    /// Construct an empty `GpuWeights` — used by the GGUF loader in
+    /// `ferrite-kernels`, which then populates `quantized` and
+    /// `gguf_dense` directly via `quantized_map_mut` /
+    /// `gguf_dense_map_mut`. Safetensors callers should use
+    /// `from_dir` / `from_index` / `from_single_file` instead.
+    pub fn empty(stream: CUstream) -> Self {
+        Self {
+            tensors: HashMap::new(),
+            stream,
+            target_dtype: None,
+            cast_pinned: (std::ptr::null_mut(), 0),
+            precast: None,
+            precast_handle: None,
+            gpu_allocs: Vec::new(),
+            _mmaps: Vec::new(),
+            quantized: HashMap::new(),
+            gguf_dense: HashMap::new(),
+        }
+    }
+
+    /// Push a `RawGpuMem` allocation onto the lifetime tracker. Used
+    /// by the GGUF loader so quantized-weight GPU memory is freed
+    /// alongside the rest of the `GpuWeights` allocations.
+    pub fn push_gpu_alloc(&mut self, alloc: crate::alloc::RawGpuMem) {
+        self.gpu_allocs.push(alloc);
+    }
+
     /// Load all weights from a model directory (CPU-only — no GPU allocation).
     ///
     /// Handles both single-file (`model.safetensors`) and sharded
@@ -437,6 +479,99 @@ impl GpuWeights {
         }
     }
 
+    /// Unified entry point: loads either a safetensors model
+    /// directory or a GGUF file. Detects format from the path
+    /// extension (file ending in `.gguf` → GGUF; everything else
+    /// is treated as a directory with safetensors).
+    ///
+    /// For safetensors, `dtype` / `alloc` / `tp_*` are stored as
+    /// `target_dtype` (so `take()` casts F32 → model dtype) but
+    /// otherwise unused at load time. For GGUF they're consumed
+    /// immediately by the registered loader.
+    ///
+    /// # Safety
+    /// Caller must hold a valid CUDA context and stream.
+    pub unsafe fn from_path(
+        path: impl AsRef<Path>,
+        stream: CUstream,
+        alloc: &mut crate::CachingAllocator,
+        target_dtype: DType,
+        tp_rank: usize,
+        tp_world_size: usize,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let is_gguf_file = path.is_file() && path.extension().is_some_and(|e| e == "gguf");
+        let gguf_in_dir = path.is_dir() && {
+            std::fs::read_dir(path)
+                .ok()
+                .and_then(|mut it| {
+                    it.find_map(|entry| {
+                        let p = entry.ok()?.path();
+                        (p.extension().is_some_and(|e| e == "gguf")).then_some(p)
+                    })
+                })
+                .is_some()
+        };
+        if is_gguf_file {
+            return unsafe {
+                Self::from_gguf_file(path, target_dtype, alloc, stream, tp_rank, tp_world_size)
+            };
+        }
+        if gguf_in_dir {
+            // Find the .gguf file in the dir and load it.
+            let gguf_path = std::fs::read_dir(path)?
+                .find_map(|entry| {
+                    let p = entry.ok()?.path();
+                    (p.extension().is_some_and(|e| e == "gguf")).then_some(p)
+                })
+                .ok_or_else(|| anyhow::anyhow!("no .gguf file in directory"))?;
+            return unsafe {
+                Self::from_gguf_file(
+                    &gguf_path,
+                    target_dtype,
+                    alloc,
+                    stream,
+                    tp_rank,
+                    tp_world_size,
+                )
+            };
+        }
+        let mut gw = Self::from_dir(path, stream)?;
+        gw.set_target_dtype(target_dtype);
+        Ok(gw)
+    }
+
+    /// Load all weights from a single `.gguf` file via the
+    /// inventory-registered GGUF loader (provided by
+    /// `ferrite-kernels`). Eagerly uploads quantized linears and
+    /// dequantizes norms / embeddings / lm_head on GPU.
+    ///
+    /// `tp_world_size = 1` is implemented today; >1 returns an
+    /// error from the registered loader (the per-tensor block-
+    /// aligned slicing pass is a follow-up).
+    ///
+    /// # Safety
+    /// Caller must hold a valid CUDA context and stream. The
+    /// returned `GpuWeights` retains GGUF tensor pointers for the
+    /// lifetime of the model.
+    pub unsafe fn from_gguf_file(
+        path: impl AsRef<Path>,
+        model_dtype: DType,
+        alloc: &mut crate::CachingAllocator,
+        stream: CUstream,
+        tp_rank: usize,
+        tp_world_size: usize,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let reg = crate::gguf_loader::registered_gguf_loader().ok_or_else(|| {
+            anyhow::anyhow!(
+                "GGUF loader not registered — link `ferrite-kernels` (which submits a \
+                 `GgufLoaderRegistration` via inventory) into the consuming binary"
+            )
+        })?;
+        unsafe { (reg.load)(path, model_dtype, alloc, stream, tp_rank, tp_world_size) }
+    }
+
     /// Load from a single safetensors file (CPU-only).
     pub fn from_single_file(path: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
         let path = path.as_ref();
@@ -449,6 +584,8 @@ impl GpuWeights {
             precast_handle: None,
             gpu_allocs: Vec::new(),
             _mmaps: Vec::new(),
+            quantized: HashMap::new(),
+            gguf_dense: HashMap::new(),
         };
         gw.load_shard(path)?;
         Ok(gw)
@@ -493,6 +630,8 @@ impl GpuWeights {
                 precast_handle: None,
                 gpu_allocs: Vec::new(),
                 _mmaps: Vec::new(),
+                quantized: HashMap::new(),
+                gguf_dense: HashMap::new(),
             };
             if let Some(name) = shard_files.first() {
                 gw.load_shard(&dir.join(name))?;
@@ -536,6 +675,8 @@ impl GpuWeights {
             precast_handle: None,
             gpu_allocs: Vec::new(),
             _mmaps: mmaps,
+            quantized: HashMap::new(),
+            gguf_dense: HashMap::new(),
         })
     }
 
@@ -713,7 +854,17 @@ impl GpuWeights {
     /// DMA uses the pre-cast pinned buffer (fast path — no page faults or
     /// CPU casting on the hot path). Otherwise falls back to synchronous
     /// cast from the mmap.
+    ///
+    /// GGUF backing: if the tensor is in `gguf_dense` (already on GPU,
+    /// dequantized at load), this short-circuits and returns it
+    /// directly — no upload, no precast.
     pub fn take(&mut self, name: &str) -> Result<GpuTensor> {
+        // GGUF fast-path: norms / embeddings / lm_head are
+        // pre-uploaded and dequantized by `load_gguf_into_weights`.
+        if let Some(t) = self.gguf_dense.remove(name) {
+            return Ok(t);
+        }
+
         let cpu_ref = self
             .tensors
             .remove(name)
@@ -860,6 +1011,28 @@ impl GpuWeights {
         })
     }
 
+    /// Tensor shape lookup that checks all three backing maps —
+    /// safetensors `tensors`, `gguf_dense`, and `quantized`. Used by
+    /// the per-variant fingerprint sniff which needs to verify
+    /// embedding / first-layer shapes regardless of backing store.
+    /// Returns `Vec<usize>` to avoid borrow lifetime tangles across
+    /// heterogeneous backings (CpuTensorRef carries usize, GpuTensor
+    /// carries u32, GgmlStorage stores nrows/ncols).
+    pub fn tensor_shape_any(&self, name: &str) -> Option<Vec<usize>> {
+        if let Some(r) = self.tensors.get(name) {
+            return Some(r.shape.clone());
+        }
+        if let Some(t) = self.gguf_dense.get(name) {
+            return Some(t.shape().iter().map(|&d| d as usize).collect());
+        }
+        if let Some(s) = self.quantized.get(name) {
+            // 2D row-major weight; nrows = out, ncols = in. Match
+            // the safetensors layout convention.
+            return Some(vec![s.nrows, s.ncols]);
+        }
+        None
+    }
+
     /// Get a tensor by name (copies to GPU). For read-only access.
     ///
     /// WARNING: The returned GPU tensor is leaked — caller must arrange cleanup.
@@ -886,6 +1059,83 @@ impl GpuWeights {
     /// Check if a tensor exists.
     pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
+            || self.quantized.contains_key(name)
+            || self.gguf_dense.contains_key(name)
+    }
+
+    // ----------------------------------------------------------------------
+    // GGUF backing-store accessors
+    // ----------------------------------------------------------------------
+    //
+    // Populated by `from_gguf` (in `ferrite-kernels`, since it depends on
+    // GGUF-specific kernels for dequantizing norms / embeddings). The
+    // safetensors construction paths leave these maps empty.
+
+    /// Take a quantized linear weight by HF tensor name. Returns
+    /// `None` when the backing store is safetensors, or when the
+    /// requested tensor was already taken / never existed.
+    ///
+    /// The underlying GPU allocation is owned by `gpu_allocs`, so the
+    /// returned `GgmlStorage` is valid as long as the `GpuWeights` is
+    /// alive. Callers that move the storage into a long-lived layer
+    /// must also retain the `GpuWeights` (or call
+    /// `take_gpu_allocs` to transfer ownership).
+    pub fn take_quantized_linear(&mut self, name: &str) -> Option<crate::ggml_quant::GgmlStorage> {
+        self.quantized.remove(name)
+    }
+
+    /// Take a dense (already dequantized) GGUF weight — norms,
+    /// embeddings, lm_head. Returns `None` for the safetensors path.
+    pub fn take_gguf_dense(&mut self, name: &str) -> Option<GpuTensor> {
+        self.gguf_dense.remove(name)
+    }
+
+    /// True when this `GpuWeights` was populated from a GGUF file
+    /// (i.e. has at least one entry in `quantized` or `gguf_dense`).
+    /// Used by codegen to decide between the safetensors and GGUF
+    /// load helpers.
+    pub fn is_gguf(&self) -> bool {
+        !self.quantized.is_empty() || !self.gguf_dense.is_empty()
+    }
+
+    /// True iff the named tensor is present as a GGUF-quantized
+    /// linear (in `quantized`). Lets concat-loaders probe before
+    /// committing to the GGUF byte-pack path vs the dense fallback.
+    pub fn contains_quantized_linear(&self, name: &str) -> bool {
+        self.quantized.contains_key(name)
+    }
+
+    /// True iff the named tensor is present in the GGUF-dense map
+    /// (norms / embeddings / lm_head — pre-uploaded and dequantized).
+    pub fn gguf_dense_contains(&self, name: &str) -> bool {
+        self.gguf_dense.contains_key(name)
+    }
+
+    /// True iff the named tensor is present in the safetensors-backed
+    /// `tensors` map (CPU-mmap, uploaded on `take`).
+    pub fn safetensor_contains(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
+    /// Iterator over GGUF-quantized linear tensor names. Diagnostic
+    /// helper for `FERRITE_GGUF_TRACE`-style debug output.
+    pub fn quantized_linear_names(&self) -> impl Iterator<Item = &String> {
+        self.quantized.keys()
+    }
+
+    /// Direct access to the quantized-linear map for the GGUF
+    /// loader's population step. Not part of the public API for
+    /// model code — use `take_quantized_linear` from the model side.
+    #[doc(hidden)]
+    pub fn quantized_map_mut(&mut self) -> &mut HashMap<String, crate::ggml_quant::GgmlStorage> {
+        &mut self.quantized
+    }
+
+    /// Direct access to the GGUF-dense map for the loader's
+    /// population step. Same caveats as `quantized_map_mut`.
+    #[doc(hidden)]
+    pub fn gguf_dense_map_mut(&mut self) -> &mut HashMap<String, GpuTensor> {
+        &mut self.gguf_dense
     }
 
     /// Synthesize N virtual per-slice entries from a packed safetensors

@@ -224,6 +224,7 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
                 "q:fp8-std".to_string()
             }
         }
+        Some(crate::quantization::QuantMethod::Ggml) => "q:ggml".to_string(),
     }
 }
 
@@ -605,6 +606,9 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 syn::Error::new(args.span, format!("unroll [{}]: {e}", model.source_stem))
             })?;
             model_fuf.annotate_storage_formats(&classified, model);
+            if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() {
+                eprintln!("[ggml-build] === BEGIN model={} ===", model.source_stem);
+            }
             // Tensor-parallel lowering pass. At tp=1 (every existing
             // SolvedModel until task #7's canonical fanout lands) this is
             // a strict no-op — the FUF flowing into the solver is
@@ -726,8 +730,10 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                         Some(5) // marlin
                     } else if name.starts_with("fp8") {
                         Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
-                    } else if name.starts_with("bnb4") {
-                        Some(3) // cublas (bnb4 dequant + cuBLAS matmul)
+                    } else if name.starts_with("bnb4") || name.starts_with("ggml") {
+                        // cublas: bnb4 dequant + cuBLAS matmul; ggml
+                        // dequant_mul_mat_vec at decode + cuBLAS at prefill.
+                        Some(3)
                     } else if name.starts_with("cutlass") {
                         Some(4) // cutlass
                     } else if NON_GEMM_NAMES.contains(&name) {

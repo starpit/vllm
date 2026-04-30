@@ -13,9 +13,11 @@
 
 // Always-available types (pure metadata, no CUDA calls).
 pub mod dtype;
+pub mod ggml_quant;
 pub mod tensor;
 
 pub use dtype::DType;
+pub use ggml_quant::{GgmlDType, GgmlStorage};
 pub use tensor::{GpuTensor, TensorView};
 
 // CUDA runtime (requires CUDA toolkit).
@@ -31,6 +33,8 @@ pub mod cublas;
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
+#[cfg(feature = "cuda")]
+pub mod gguf_loader;
 #[cfg(feature = "cuda")]
 pub mod weights;
 

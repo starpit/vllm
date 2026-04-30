@@ -2482,8 +2482,77 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))
 }
 
-/// Try to load a chat template from `tokenizer_config.json` in the model dir.
+/// Try to load a chat template. Sources tried, in order:
+/// 1. `model_dir/tokenizer_config.json` (HF convention).
+/// 2. `model_dir/chat_template.jinja` (some quantized repos).
+/// 3. `tokenizer.chat_template` metadata in a `.gguf` file —
+///    handles both `model_dir` being a `.gguf` file directly and
+///    a directory containing one.
 fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
+    // GGUF: read from metadata. Try direct file, then look for any
+    // .gguf file in the directory.
+    let gguf_candidate: Option<std::path::PathBuf> =
+        if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf") {
+            Some(model_dir.to_path_buf())
+        } else if model_dir.is_dir() {
+            std::fs::read_dir(model_dir).ok().and_then(|mut it| {
+                it.find_map(|entry| {
+                    let p = entry.ok()?.path();
+                    (p.extension().is_some_and(|e| e == "gguf")).then_some(p)
+                })
+            })
+        } else {
+            None
+        };
+    if let Some(gguf_path) = gguf_candidate
+        && let Ok(gguf) = vllm_model::gguf::GgufFile::open(&gguf_path)
+        && let Some(template_str) = vllm_model::gguf::gguf_chat_template(&gguf)
+    {
+        match ChatTemplate::new(template_str) {
+            Ok(mut tpl) => {
+                // Resolve bos_token / eos_token strings from the GGUF
+                // metadata (`tokenizer.ggml.{bos,eos}_token_id` →
+                // `tokens[id]`) so the Jinja template's
+                // `{{- bos_token }}` / `{{ eos_token }}` placeholders
+                // render correctly. Without this the prompt is missing
+                // the leading `<|begin_of_text|>` and the model gets
+                // an out-of-distribution input → garbage output.
+                if let Some(tokens_val) = gguf.metadata().get("tokenizer.ggml.tokens")
+                    && let Ok(tokens) = tokens_val.to_vec()
+                {
+                    let resolve = |id: u32| -> Option<String> {
+                        tokens.get(id as usize)?.to_string().ok().cloned()
+                    };
+                    if let Some(bos_id) = gguf.get_metadata_u32("tokenizer.ggml.bos_token_id")
+                        && let Some(s) = resolve(bos_id)
+                    {
+                        tpl = tpl.with_bos_token(s);
+                    }
+                    if let Some(eos_id) = gguf.get_metadata_u32("tokenizer.ggml.eos_token_id")
+                        && let Some(s) = resolve(eos_id)
+                    {
+                        tpl = tpl.with_eos_token(s);
+                    }
+                }
+                info!("Chat template loaded from GGUF metadata");
+                return Some(tpl);
+            }
+            Err(e) => {
+                info!("Failed to parse GGUF chat_template: {e}");
+            }
+        }
+    }
+
+    // Bare .gguf file path with no template in metadata: fall through to
+    // checking the parent directory for tokenizer_config.json /
+    // chat_template.jinja (some HF GGUF repos ship those alongside).
+    let probe_dir: std::borrow::Cow<'_, Path> = if model_dir.is_file() {
+        std::borrow::Cow::Owned(model_dir.parent().unwrap_or(model_dir).to_path_buf())
+    } else {
+        std::borrow::Cow::Borrowed(model_dir)
+    };
+    let model_dir = probe_dir.as_ref();
+
     let config_path = model_dir.join("tokenizer_config.json");
     match ChatTemplate::from_tokenizer_config(&config_path) {
         Ok(Some(tpl)) => Some(tpl),

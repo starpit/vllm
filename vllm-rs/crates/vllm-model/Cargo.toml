@@ -23,6 +23,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 llguidance = { workspace = true, optional = true }
 toktrie = { workspace = true, optional = true }
 toktrie_hf_tokenizers = { workspace = true, optional = true }
+tokenizers = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

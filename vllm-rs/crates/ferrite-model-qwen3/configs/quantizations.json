@@ -3,6 +3,7 @@
     "bnb-nf4-dq",
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor",
-    "fp8-block-128x128"
+    "fp8-block-128x128",
+    "ggml"
   ]
 }

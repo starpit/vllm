@@ -123,6 +123,180 @@ impl GgufFile {
 /// `llama.block_count`, `llama.embedding_length`, etc. This function reads
 /// those values and converts them to an `HfModelConfig` for compatibility
 /// with the existing init code.
+/// Extract the chat template (Jinja2) string from a GGUF file's
+/// metadata. GGUF embeds the same `chat_template` field that HF's
+/// `tokenizer_config.json` carries — see llama.cpp's
+/// `convert_hf_to_gguf.py`. Returns `None` when the GGUF doesn't
+/// ship a template (rare for chat-tuned models, common for base
+/// completions models).
+pub fn gguf_chat_template(gguf: &GgufFile) -> Option<String> {
+    gguf.get_metadata_string("tokenizer.chat_template")
+        .map(str::to_string)
+}
+
+/// Build a `tokenizers::Tokenizer` from GGUF metadata. Handles the
+/// `gpt2` BPE family (Llama-3, Mistral-3-style models that use
+/// `pre = "llama-bpe"` etc.) — vocab from
+/// `tokenizer.ggml.tokens`, merges from `tokenizer.ggml.merges`,
+/// special tokens from `tokenizer.ggml.{bos,eos,pad,unk}_token_id`.
+///
+/// Returns `Ok(None)` for GGUFs whose `tokenizer.ggml.model` is
+/// neither `"gpt2"` nor `"llama"` (these would need
+/// SentencePiece/Unigram support and a different builder); the
+/// caller should fall back to a sibling `tokenizer.json` for those.
+pub fn gguf_tokenizer(gguf: &GgufFile) -> ModelResult<Option<tokenizers::Tokenizer>> {
+    use tokenizers::AddedToken;
+    use tokenizers::SplitDelimiterBehavior;
+    use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel as ByteLevelPre;
+    use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
+    use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+
+    let Some(model) = gguf.get_metadata_string("tokenizer.ggml.model") else {
+        return Ok(None);
+    };
+    // Llama-3 / Mistral-3 / Qwen-2/3 / etc. all use `model = "gpt2"`
+    // (byte-level BPE). `model = "llama"` is the older
+    // SentencePiece-BPE used by Llama-2; structurally similar but
+    // not byte-level — left as a follow-up.
+    if model != "gpt2" {
+        tracing::info!(
+            "gguf_tokenizer: unsupported tokenizer model `{model}` (only `gpt2` BPE \
+             is reconstructable today); caller should fall back to tokenizer.json"
+        );
+        return Ok(None);
+    }
+
+    // Vocab: array of strings indexed by token id.
+    let tokens_val = gguf
+        .metadata()
+        .get("tokenizer.ggml.tokens")
+        .ok_or_else(|| ModelError::Other("GGUF missing tokenizer.ggml.tokens".into()))?;
+    let tokens = tokens_val
+        .to_vec()
+        .map_err(|e| ModelError::Other(format!("tokenizer.ggml.tokens: {e}")))?;
+    let mut vocab_pairs: Vec<(String, u32)> = Vec::with_capacity(tokens.len());
+    for (idx, t) in tokens.iter().enumerate() {
+        let s = t
+            .to_string()
+            .map_err(|e| ModelError::Other(format!("tokenizer.ggml.tokens[{idx}]: {e}")))?;
+        vocab_pairs.push((s.clone(), idx as u32));
+    }
+    let vocab: tokenizers::models::bpe::Vocab = vocab_pairs.into_iter().collect();
+
+    // Merges: array of "left right" strings.
+    let merges_val = gguf
+        .metadata()
+        .get("tokenizer.ggml.merges")
+        .ok_or_else(|| ModelError::Other("GGUF missing tokenizer.ggml.merges".into()))?;
+    let merges_raw = merges_val
+        .to_vec()
+        .map_err(|e| ModelError::Other(format!("tokenizer.ggml.merges: {e}")))?;
+    let mut merges: Vec<(String, String)> = Vec::with_capacity(merges_raw.len());
+    for (idx, m) in merges_raw.iter().enumerate() {
+        let s = m
+            .to_string()
+            .map_err(|e| ModelError::Other(format!("tokenizer.ggml.merges[{idx}]: {e}")))?;
+        let mut parts = s.splitn(2, ' ');
+        let l = parts
+            .next()
+            .ok_or_else(|| ModelError::Other(format!("merge {idx}: empty")))?;
+        let r = parts
+            .next()
+            .ok_or_else(|| ModelError::Other(format!("merge {idx}: missing right side `{s}`")))?;
+        merges.push((l.to_string(), r.to_string()));
+    }
+
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .build()
+        .map_err(|e| ModelError::Other(format!("BPE build failed: {e}")))?;
+
+    let mut tokenizer = tokenizers::Tokenizer::new(bpe);
+
+    // Pre-tokenizer. `tokenizer.ggml.pre` names the family:
+    //   `llama-bpe` (Llama-3, Llama-3.1, Llama-3.2): Llama-3's
+    //     specific regex, then ByteLevel byte-mapping (no regex).
+    //   `default` / unset / others: GPT-2-style ByteLevel default
+    //     (its built-in regex + byte-mapping).
+    // Wrong choice here is the most common cause of gibberish output
+    // — Llama-3 punctuation/whitespace splitting differs from GPT-2.
+    let pre = gguf
+        .get_metadata_string("tokenizer.ggml.pre")
+        .unwrap_or("default");
+    let llama3_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    let pre_tokenizer: PreTokenizerWrapper =
+        if pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3" {
+            let regex_split = Split::new(
+                SplitPattern::Regex(llama3_regex.to_string()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .map_err(|e| ModelError::Other(format!("llama-bpe regex compile: {e}")))?;
+            let bl = ByteLevelPre::new(false, false, false); // no add_prefix_space, no trim, no use_regex
+            PreSequence::new(vec![regex_split.into(), bl.into()]).into()
+        } else {
+            ByteLevelPre::default().into()
+        };
+    tokenizer.with_pre_tokenizer(Some(pre_tokenizer));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+
+    // Special tokens. GGUF marks token roles via
+    // `tokenizer.ggml.token_type` (parallel to tokens array):
+    //   1=NORMAL, 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED,
+    //   5=UNUSED, 6=BYTE.
+    // Anything that's CONTROL or USER_DEFINED needs to be registered
+    // as a special added token so the tokenizer recognizes the
+    // multi-byte form (e.g. `<|begin_of_text|>`) atomically rather
+    // than BPE-encoding it. Without this, chat templates produce
+    // nonsense input to the model.
+    let mut added: Vec<AddedToken> = Vec::new();
+    if let Some(types_val) = gguf.metadata().get("tokenizer.ggml.token_type")
+        && let Ok(types) = types_val.to_vec()
+    {
+        for (idx, t) in types.iter().enumerate() {
+            // GGUF token_type is typically I32 (signed) — try both.
+            let kind = t
+                .to_u32()
+                .map(|x| x as i64)
+                .or_else(|_| t.to_i32().map(|x| x as i64))
+                .unwrap_or(1);
+            if (kind == 3 || kind == 4)
+                && let Some(token_val) = tokens.get(idx)
+                && let Ok(s) = token_val.to_string()
+            {
+                added.push(AddedToken::from(s.clone(), true));
+            }
+        }
+    }
+    // Always add the explicit-id specials too (some GGUFs don't set
+    // token_type for these or set to NORMAL).
+    let token_str_for_id = |id: u32| -> Option<String> {
+        let s = tokens.get(id as usize)?.to_string().ok()?.clone();
+        Some(s)
+    };
+    for key in [
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.pad_token_id",
+        "tokenizer.ggml.unknown_token_id",
+        "tokenizer.ggml.padding_token_id",
+    ] {
+        if let Some(id) = gguf.get_metadata_u32(key)
+            && let Some(content) = token_str_for_id(id)
+        {
+            added.push(AddedToken::from(content, true));
+        }
+    }
+    if !added.is_empty() {
+        tokenizer.add_special_tokens(&added);
+    }
+
+    Ok(Some(tokenizer))
+}
+
 pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
     // Determine the architecture prefix (e.g., "llama", "qwen2").
     let arch = gguf

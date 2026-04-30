@@ -256,6 +256,11 @@ pub enum Instruction<W> {
     Bnb4FusedGateUpGeluMul(u32, u32, u32, WtFn<W, Bnb4bitLinear>),
     Bnb4FusedQkvRopeCache(u32, u32, u32, WtFn<W, Bnb4bitLinear>, CosSinFn<W>),
     Bnb4FusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, Bnb4bitLinear>, CosSinFn<W>),
+    GgmlGemm(u32, u32, u32, WtFn<W, LinearLayer>),
+    GgmlFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
+    GgmlFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
+    GgmlFusedQkvRopeCache(u32, u32, u32, WtFn<W, LinearLayer>, CosSinFn<W>, bool),
+    GgmlFusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, LinearLayer>, CosSinFn<W>),
     Fp8Gemm(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
     Fp8FusedGemmBias(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
     Fp8FusedGateUpSiluMul(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
@@ -1801,6 +1806,169 @@ impl<W: CanonicalParams> Instruction<W> {
                     let w = (weight_fn)(ctx.wm, layer);
                     let qkv_packed =
                         w.forward(view_in, &mut ctx.device.caching, ctx.device.compute_stream);
+                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    kernels::fused_qkv_rope(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::NUM_KV_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                };
+                unsafe {
+                    ah::write_kv_cache(
+                        k.view(),
+                        v_out.view(),
+                        ctx.fwd.slot_mapping,
+                        ctx.fwd.kv_cache,
+                        layer as usize,
+                        ctx.device.compute_stream,
+                    );
+                }
+                ctx.tiles[q_out_slot as usize] = Some(TileEntry::Owned(q));
+                ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
+                ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
+            }
+            Instruction::GgmlGemm(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let out = w.forward(
+                    v,
+                    &mut ctx.device.cublas,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let gate_up = w.forward(
+                    v,
+                    &mut ctx.device.cublas,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let out = kernels::silu_and_mul_fused(
+                    *gate_up,
+                    W::INTERMEDIATE_SIZE,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let gate_up = w.forward(
+                    v,
+                    &mut ctx.device.cublas,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let out = kernels::gelu_and_mul_fused(
+                    *gate_up,
+                    W::INTERMEDIATE_SIZE,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GgmlFusedQkvRopeCache(
+                in_slot,
+                out_slot,
+                layer,
+                weight_fn,
+                cos_sin_fn,
+                interleaved,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let qkv_packed = w.forward(
+                    v,
+                    &mut ctx.device.cublas,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let out = if interleaved {
+                    kernels::fused_qkv_interleaved_rope_cache(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        *ctx.fwd.slot_mapping,
+                        *ctx.fwd.kv_cache.k_cache(layer as usize),
+                        *ctx.fwd.kv_cache.v_cache(layer as usize),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                } else if ctx.fwd.kv_cache.is_fp8() {
+                    kernels::fused_qkv_rope_cache_fp8(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        *ctx.fwd.slot_mapping,
+                        *ctx.fwd.kv_cache.k_cache(layer as usize),
+                        *ctx.fwd.kv_cache.v_cache(layer as usize),
+                        ctx.fwd.kv_cache.k_scale_ptr(layer as usize),
+                        ctx.fwd.kv_cache.v_scale_ptr(layer as usize),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                } else {
+                    kernels::fused_qkv_rope_cache(
+                        *qkv_packed,
+                        *ctx.fwd.positions,
+                        cos_sin,
+                        *ctx.fwd.slot_mapping,
+                        *ctx.fwd.kv_cache.k_cache(layer as usize),
+                        *ctx.fwd.kv_cache.v_cache(layer as usize),
+                        W::Q_SIZE,
+                        W::KV_SIZE,
+                        W::NUM_Q_HEADS as usize,
+                        W::HEAD_DIM as usize,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                };
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GgmlFusedQkvRopePrefill(
+                in_slot,
+                q_out_slot,
+                k_out_slot,
+                v_out_slot,
+                layer,
+                weight_fn,
+                cos_sin_fn,
+            ) => {
+                let layer = ctx.layer_offset + layer;
+                let (q, k, v_out) = unsafe {
+                    let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                    let w = (weight_fn)(ctx.wm, layer);
+                    let qkv_packed = w.forward(
+                        view_in,
+                        &mut ctx.device.cublas,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    );
                     let cos_sin = (cos_sin_fn)(ctx.wm, layer);
                     kernels::fused_qkv_rope(
                         *qkv_packed,

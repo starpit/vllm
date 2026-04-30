@@ -20,6 +20,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 vllm-model = { path = "../vllm-model" }
+inventory = { workspace = true }
 
 [build-dependencies]
 dirs = "6"

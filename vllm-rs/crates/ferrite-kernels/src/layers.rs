@@ -565,6 +565,16 @@ pub enum LinearLayer {
     Dense(Linear),
     Marlin(Box<MarlinLinear>),
     Ggml(Box<GgmlLinear>),
+    /// Heterogeneous-dtype concat of GGUF linears. Used by
+    /// `load_dense_concat_or_ggml` when the source tensors don't
+    /// share a `GgmlDType` (e.g. a Q4_K_M Llama-3.2-1B has gate_proj
+    /// at Q4_K but up_proj at Q6_K). Forward computes each branch
+    /// separately and concatenates outputs along dim 1, producing
+    /// the same `[tokens, sum(out_features)]` layout the
+    /// homogeneous packed `GgmlLinear` produces — so downstream
+    /// `silu_and_mul_fused` (which splits at `intermediate_size`)
+    /// works without per-variant kernel changes.
+    GgmlConcat(Vec<GgmlLinear>),
     Bnb4bit(Box<Bnb4bitLinear>),
     Fp8(Box<Fp8Linear>),
     Fp8Block(Box<Fp8BlockLinear>),
@@ -597,6 +607,48 @@ impl LinearLayer {
                 }
                 l.forward(x, alloc, stream)
             }
+            Self::GgmlConcat(branches) => {
+                // Heterogeneous-dtype gate/up packing for Q4_K_M-style
+                // mixed quants. Compute each branch separately, then
+                // concat along dim 1 into the same `[tokens, sum(out)]`
+                // layout the homogeneous packed `Ggml` arm produces —
+                // so downstream `silu_and_mul_fused(out, intermediate)`
+                // sees identical bytes regardless of which arm
+                // produced them.
+                debug_assert!(!branches.is_empty(), "GgmlConcat with no branches");
+                let num_tokens = x.dim(0);
+                let total_out: usize = branches.iter().map(|b| b.out_features()).sum();
+                // Output dtype follows the input (the per-branch
+                // forwards cast back to the input dtype if needed).
+                let out_dtype = x.dtype();
+                let packed = alloc.alloc_tensor(&[num_tokens, total_out], out_dtype);
+                let row_stride_bytes = total_out * out_dtype.size_bytes();
+                let elem = out_dtype.size_bytes();
+                let mut col_offset_elems: usize = 0;
+                for branch in branches {
+                    let part = branch.forward(x, alloc, stream);
+                    let part_view = part.as_gpu_tensor();
+                    let part_out = branch.out_features();
+                    let part_row_bytes = part_out * elem;
+                    // Strided per-row D2D copy of `part` columns into
+                    // `packed[:, col_offset:col_offset + part_out]`.
+                    for row in 0..num_tokens {
+                        let src = (part_view.raw_ptr() as *const u8).add(row * part_row_bytes);
+                        let dst = (packed.as_mut_ptr() as *mut u8)
+                            .add(row * row_stride_bytes + col_offset_elems * elem);
+                        ferrite_cuda_core::driver::memcpy_dtod_async(
+                            dst,
+                            src,
+                            part_row_bytes,
+                            stream,
+                        )
+                        .expect("dtod copy in GgmlConcat::forward");
+                    }
+                    col_offset_elems += part_out;
+                    drop(part);
+                }
+                packed
+            }
             Self::Bnb4bit(l) => l.forward(x, cublas, alloc, stream),
             Self::Fp8(l) => l.forward(x, cublas, alloc, stream),
             Self::Fp8Block(l) => l.forward(x, cublas, alloc, stream),
@@ -608,7 +660,34 @@ impl LinearLayer {
     pub fn dense_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
         match self {
             Self::Dense(l) => l.weight,
-            _ => panic!("dense_weight() called on quantized LinearLayer"),
+            Self::Marlin(_) => panic!("dense_weight() called on Marlin LinearLayer"),
+            Self::Ggml(s) => {
+                eprintln!(
+                    "[dense_weight] called on Ggml LinearLayer (storage dtype={:?} \
+                     shape=[{}, {}]). Call site backtrace:\n{}",
+                    s.storage.dtype,
+                    s.storage.nrows,
+                    s.storage.ncols,
+                    std::backtrace::Backtrace::force_capture()
+                );
+                panic!("dense_weight() called on Ggml LinearLayer");
+            }
+            Self::GgmlConcat(branches) => {
+                eprintln!(
+                    "[dense_weight] called on GgmlConcat LinearLayer ({} branches: {:?}). \
+                     Call site backtrace:\n{}",
+                    branches.len(),
+                    branches
+                        .iter()
+                        .map(|b| (b.storage.dtype, b.storage.nrows, b.storage.ncols))
+                        .collect::<Vec<_>>(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+                panic!("dense_weight() called on GgmlConcat LinearLayer");
+            }
+            Self::Bnb4bit(_) => panic!("dense_weight() called on Bnb4bit LinearLayer"),
+            Self::Fp8(_) => panic!("dense_weight() called on Fp8 LinearLayer"),
+            Self::Fp8Block(_) => panic!("dense_weight() called on Fp8Block LinearLayer"),
         }
     }
 
@@ -636,6 +715,7 @@ impl LinearLayer {
             Self::Dense(l) => l.out_features(),
             Self::Marlin(l) => l.out_features(),
             Self::Ggml(l) => l.out_features(),
+            Self::GgmlConcat(branches) => branches.iter().map(|b| b.out_features()).sum(),
             Self::Bnb4bit(l) => l.out_features(),
             Self::Fp8(l) => l.out_features(),
             Self::Fp8Block(l) => l.out_features(),
@@ -647,6 +727,7 @@ impl LinearLayer {
             Self::Dense(l) => l.in_features(),
             Self::Marlin(l) => l.in_features(),
             Self::Ggml(l) => l.in_features(),
+            Self::GgmlConcat(branches) => branches[0].in_features(),
             Self::Bnb4bit(l) => l.in_features(),
             Self::Fp8(l) => l.in_features(),
             Self::Fp8Block(l) => l.in_features(),
@@ -658,6 +739,177 @@ impl LinearLayer {
     /// optional `".bias"`).
     pub fn load_dense(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
         Ok(Self::Dense(Linear::load(weights, prefix)?))
+    }
+
+    /// Load a linear layer that may be either dense (safetensors) or
+    /// GGUF-quantized. Tries `take_quantized_linear` first; falls back
+    /// to `load_dense` when the prefix isn't quantized in the
+    /// backing `GpuWeights`. Used by codegen for any
+    /// `StorageFormat::Ggml` weight — and harmlessly equivalent to
+    /// `load_dense` on safetensors models (where
+    /// `take_quantized_linear` always returns `None`).
+    pub fn load_dense_or_ggml(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
+        let weight_name = format!("{prefix}.weight");
+        if std::env::var("FERRITE_GGUF_TRACE").is_ok() {
+            eprintln!(
+                "[ggml] load_dense_or_ggml: prefix={prefix} weight_name={weight_name} \
+                 quantized.contains={} gguf_dense.contains={} tensors.contains={}",
+                weights.contains_quantized_linear(&weight_name),
+                weights.gguf_dense_contains(&weight_name),
+                weights.safetensor_contains(&weight_name),
+            );
+        }
+        if let Some(storage) = weights.take_quantized_linear(&weight_name) {
+            // Optional bias — GGUF rarely ships bias on linears, but
+            // qwen-style checkpoints can. `take` falls back to
+            // gguf_dense automatically.
+            let bias_name = format!("{prefix}.bias");
+            let bias = weights.take(&bias_name).ok();
+            return Ok(Self::Ggml(Box::new(GgmlLinear { storage, bias })));
+        }
+        Self::load_dense(weights, prefix)
+    }
+
+    /// Concat-load variant of `load_dense_or_ggml`. If every prefix
+    /// is GGUF-quantized in the backing `GpuWeights`, byte-stacks
+    /// the per-prefix `GgmlStorage` blobs into one packed
+    /// `[sum(out_features), in_features]` quantized tensor and
+    /// returns `Self::Ggml`. Otherwise falls back to
+    /// `load_dense_concat`.
+    ///
+    /// The byte-stack works because each row of a row-major
+    /// quantized matrix is a whole number of GGML blocks (block
+    /// boundaries never straddle rows), so `cat[gate.bytes,
+    /// up.bytes]` produces a valid `[gate.nrows + up.nrows, ncols]`
+    /// blob with the same dtype. Refuses if dtype or `ncols` differ
+    /// across prefixes — neither is expected in practice (GGUF
+    /// quantizers ship gate/up with identical layouts) but the
+    /// guard prevents silent corruption if an arch ever pairs
+    /// different quants.
+    pub fn load_dense_concat_or_ggml(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        if prefixes.is_empty() {
+            anyhow::bail!("load_dense_concat_or_ggml: empty prefix list");
+        }
+        if std::env::var("FERRITE_GGUF_TRACE").is_ok() {
+            eprintln!(
+                "[ggml] load_dense_concat_or_ggml: prefixes={prefixes:?} \
+                 (call site = either load_layered_linear_dense_concat or codegen unindexed concat)"
+            );
+        }
+
+        // Probe: are ALL prefixes GGUF-quantized? (Either every
+        // prefix or none — mixed would mean the GGUF loader took
+        // some weights as quantized and others as dense, which it
+        // doesn't do today.)
+        let weight_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.weight")).collect();
+        let all_gguf = weight_names
+            .iter()
+            .all(|n| weights.contains_quantized_linear(n));
+
+        if !all_gguf {
+            return Self::load_dense_concat(weights, prefixes, stream);
+        }
+
+        // Take all storages.
+        let mut storages: Vec<crate::ggml::GgmlStorage> = Vec::with_capacity(prefixes.len());
+        for name in &weight_names {
+            let s = weights
+                .take_quantized_linear(name)
+                .ok_or_else(|| anyhow::anyhow!("load_dense_concat_or_ggml: missing {name}"))?;
+            storages.push(s);
+        }
+
+        // Validate ncols (in_features) — must be uniform across all
+        // branches; mismatched dtype is OK and triggers the
+        // `GgmlConcat` runtime-concat path below.
+        let first = storages[0];
+        for s in &storages[1..] {
+            if s.ncols != first.ncols {
+                anyhow::bail!(
+                    "load_dense_concat_or_ggml: ncols mismatch ({} vs {})",
+                    first.ncols,
+                    s.ncols
+                );
+            }
+        }
+        let uniform_dtype = storages.iter().all(|s| s.dtype == first.dtype);
+        if !uniform_dtype {
+            // Heterogeneous: keep separate `GgmlLinear`s and let
+            // `LinearLayer::forward` concat their outputs at runtime
+            // via the `GgmlConcat` arm. This is the Q4_K_M case
+            // where gate_proj is Q4_K but up_proj is Q6_K.
+            let branches: Vec<GgmlLinear> = storages
+                .into_iter()
+                .map(|s| GgmlLinear {
+                    storage: s,
+                    bias: None,
+                })
+                .collect();
+            return Ok(Self::GgmlConcat(branches));
+        }
+
+        // Allocate the packed buffer and copy each storage's bytes
+        // sequentially. Row-major quant layout makes this a plain
+        // [gate.bytes, up.bytes, ...] concat.
+        let total_len: usize = storages.iter().map(|s| s.len).sum();
+        let total_rows: usize = storages.iter().map(|s| s.nrows).sum();
+        let packed_ptr = unsafe { ferrite_cuda_core::driver::mem_alloc(total_len)? };
+
+        let mut offset: usize = 0;
+        for s in &storages {
+            unsafe {
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    packed_ptr.add(offset),
+                    s.ptr,
+                    s.len,
+                    stream,
+                )?;
+            }
+            offset += s.len;
+        }
+        unsafe { ferrite_cuda_core::driver::stream_synchronize(stream)? };
+
+        // Free per-prefix storages now that the packed copy owns the bytes.
+        for s in storages {
+            unsafe { ferrite_cuda_core::driver::mem_free(s.ptr).ok() };
+        }
+
+        let packed = crate::ggml::GgmlStorage {
+            ptr: packed_ptr,
+            len: total_len,
+            dtype: first.dtype,
+            nrows: total_rows,
+            ncols: first.ncols,
+        };
+
+        // Optional concat-bias path: if every prefix has a sibling
+        // bias, collect + concat them as a single dense tensor.
+        // GGUF rarely ships gate/up biases, so fast-path the
+        // common bias-less case.
+        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+        let any_bias = bias_names.iter().any(|n| weights.contains(n));
+        let bias = if any_bias {
+            // Defer to dense path — GGUF biases are dequantized into
+            // gguf_dense already, so `take` returns them. Concat via
+            // existing dense-only path is overkill for v1; a
+            // bias-less GGUF path is what every common GGUF ships.
+            anyhow::bail!(
+                "load_dense_concat_or_ggml: GGUF gate/up bias concat not implemented; \
+                 the common GGUF case is bias-less. Re-emit the model with bias-less \
+                 gate/up if you hit this."
+            );
+        } else {
+            None
+        };
+
+        Ok(Self::Ggml(Box::new(GgmlLinear {
+            storage: packed,
+            bias,
+        })))
     }
 
     /// Tensor-parallel sharded dense linear load. See

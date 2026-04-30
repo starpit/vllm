@@ -4,6 +4,7 @@
     "ct-int4-sym",
     "gptq-sym",
     "fp8-dynamic-per-tensor",
-    "fp8-static-per-tensor"
+    "fp8-static-per-tensor",
+    "ggml"
   ]
 }

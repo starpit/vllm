@@ -102,8 +102,11 @@ pub fn load_layered_linear_dense(
     n_layers: u32,
     suffix: &str,
 ) -> Result<Vec<LinearLayer>> {
+    // `load_dense_or_ggml`: tries `take_quantized_linear` first
+    // (for `StorageFormat::Ggml` weights), falls back to dense.
+    // Transparent on safetensors models since the GGUF map is empty.
     (0..n_layers)
-        .map(|layer| LinearLayer::load_dense(gw, &layer_weight_path(layer, suffix)))
+        .map(|layer| LinearLayer::load_dense_or_ggml(gw, &layer_weight_path(layer, suffix)))
         .collect()
 }
 
@@ -132,11 +135,16 @@ pub fn load_layered_linear_dense_concat(
     suffixes: &[&str],
     stream: CUstream,
 ) -> Result<Vec<LinearLayer>> {
+    if std::env::var("FERRITE_GGUF_TRACE").is_ok() {
+        eprintln!(
+            "[ggml] load_layered_linear_dense_concat: n_layers={n_layers} suffixes={suffixes:?}"
+        );
+    }
     (0..n_layers)
         .map(|layer| {
             let paths = concat_paths_for_layer(layer, suffixes);
             let refs = as_str_refs(&paths);
-            LinearLayer::load_dense_concat(gw, &refs, stream)
+            LinearLayer::load_dense_concat_or_ggml(gw, &refs, stream)
         })
         .collect()
 }

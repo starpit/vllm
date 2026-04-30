@@ -2182,165 +2182,6 @@ impl CudaWorker {
         }
     }
 
-    /// Load a GGUF model — separate path from safetensors loading.
-    fn load_model_gguf(
-        &mut self,
-        gguf_path: PathBuf,
-        t0: std::time::Instant,
-    ) -> ExecutorResult<()> {
-        // Tokenizer: look in parent directory of the GGUF file.
-        let tok_dir = gguf_path.parent().unwrap_or(&gguf_path).to_path_buf();
-        let tokenizer_handle = std::thread::spawn(move || {
-            let path = tok_dir.join("tokenizer.json");
-            if path.exists() {
-                tokenizers::Tokenizer::from_file(&path).ok()
-            } else {
-                None
-            }
-        });
-
-        // Parse config from GGUF metadata.
-        let gguf_file = vllm_model::gguf::GgufFile::open(&gguf_path)
-            .map_err(|e| ExecutorError::WorkerInit(format!("GGUF open failed: {e}")))?;
-        let hf_config = vllm_model::gguf::gguf_model_config(&gguf_file)
-            .map_err(|e| ExecutorError::WorkerInit(format!("GGUF config parse failed: {e}")))?;
-
-        // Resolve dtype.
-        let dtype = match self.config.dtype.as_str() {
-            "f16" | "float16" => GpuDType::F16,
-            "bf16" | "bfloat16" => GpuDType::BF16,
-            "f32" | "float32" => GpuDType::F32,
-            _ => match hf_config.torch_dtype.as_deref() {
-                Some("bfloat16") => GpuDType::BF16,
-                Some("float16") => GpuDType::F16,
-                _ => GpuDType::BF16,
-            },
-        };
-        info!("CudaWorker: GGUF model, dtype {:?}", dtype);
-
-        let arch = hf_config.architectures.first().cloned().unwrap_or_default();
-        info!("CudaWorker: GGUF architecture = {arch}");
-
-        // Load GGUF weights (quantized bytes stay on GPU, norms/embeddings dequantized).
-        let device = self
-            .device
-            .as_mut()
-            .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".into()))?;
-        let mut gguf_weights = unsafe {
-            vllm_cuda::ggml::GgufGpuWeights::load(
-                &gguf_path,
-                dtype,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        }
-        .map_err(|e| ExecutorError::WorkerInit(format!("GGUF weight load: {e}")))?;
-        info!("CudaWorker: loaded {} GGUF tensors", gguf_weights.len());
-
-        // Construct model.
-        let model = match arch.as_str() {
-            "LlamaForCausalLM" | "MistralForCausalLM" | "Phi3ForCausalLM" => {
-                let config = llama_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::llama::LlamaForCausalLM::load_gguf(
-                    &mut gguf_weights,
-                    &config,
-                    dtype,
-                    device,
-                )
-                .map_err(|e| {
-                    ExecutorError::WorkerInit(format!("LlamaForCausalLM GGUF load: {e}"))
-                })?;
-                CudaModel::Llama(m)
-            }
-            "Qwen2ForCausalLM" | "Qwen2_5ForCausalLM" => {
-                // Qwen2 shares the LLaMA architecture for GGUF.
-                let config = llama_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::llama::LlamaForCausalLM::load_gguf(
-                    &mut gguf_weights,
-                    &config,
-                    dtype,
-                    device,
-                )
-                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 GGUF load: {e}")))?;
-                CudaModel::Llama(m)
-            }
-            _ => {
-                // Qwen3 dense intentionally not in this list — its
-                // per-head q_norm / k_norm tensors don't fit the
-                // LlamaForCausalLM weight layout, so a GGUF Qwen3
-                // would silently drop them. Add a dedicated GGUF
-                // Qwen3 loader before re-enabling.
-                return Err(ExecutorError::WorkerInit(format!(
-                    "unsupported architecture for GGUF: {arch}. Supported: LlamaForCausalLM, \
-                     MistralForCausalLM, Qwen2ForCausalLM, Phi3ForCausalLM"
-                )));
-            }
-        };
-
-        // Sync all H2D copies.
-        unsafe { driver::stream_synchronize(device.compute_stream) }
-            .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
-
-        let model_dir = gguf_path.parent().unwrap_or(&gguf_path).to_path_buf();
-        self.model_dtype = dtype;
-        self.resolved_architecture = Some(arch);
-        self.model = Some(model);
-        self.uses_ggml = true;
-        self.model_dir = Some(model_dir.clone());
-        self.hf_config = Some(hf_config);
-
-        // Pooling strategy.
-        self.pooling_strategy = match self.config.pooling_strategy.as_str() {
-            "last" => vllm_model::embedding::PoolingStrategy::Last,
-            "cls" => vllm_model::embedding::PoolingStrategy::Cls,
-            "mean" => vllm_model::embedding::PoolingStrategy::Mean,
-            _ => vllm_model::embedding::detect_pooling_strategy(&model_dir)
-                .unwrap_or(vllm_model::embedding::PoolingStrategy::Last),
-        };
-
-        // Tokenizer.
-        if let Ok(Some(tok)) = tokenizer_handle.join() {
-            self.preloaded_tokenizer = Some(tok);
-        }
-
-        // Logits pipeline.
-        let vocab_size = self.model.as_ref().unwrap().vocab_size();
-        let processors: Vec<Box<dyn vllm_cuda::logits_processor::LogitsProcessor>> = vec![
-            Box::new(MinTokensProcessor::new()),
-            Box::new(LogitBiasProcessor::new()),
-            Box::new(PenaltiesProcessor::new(vocab_size)),
-            Box::new(BadWordsProcessor::new()),
-        ];
-        self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
-
-        // Reinitialize SealPadProcessor with real EOS token IDs from model config.
-        if let Some(ref hf_config) = self.hf_config {
-            let eos_token_ids: Vec<u32> = hf_config
-                .extra
-                .get("eos_token_id")
-                .map(|v| {
-                    if let Some(id) = v.as_u64() {
-                        vec![id as u32]
-                    } else if let Some(arr) = v.as_array() {
-                        arr.iter()
-                            .filter_map(|v| v.as_u64().map(|id| id as u32))
-                            .collect()
-                    } else {
-                        vec![]
-                    }
-                })
-                .unwrap_or_default();
-            self.seal_pad_processor =
-                SealPadProcessor::new(eos_token_ids, 0, self.config.block_size);
-        }
-
-        info!(
-            "CudaWorker: GGUF model loaded in {:.2}s",
-            t0.elapsed().as_secs_f64()
-        );
-        Ok(())
-    }
-
     /// Resolve model path: local dir, local GGUF file, or HF download.
     ///
     /// Returns a `PathBuf` that is either:
@@ -4990,30 +4831,55 @@ impl Worker for CudaWorker {
         let model_dir = self.resolve_model_path()?;
         info!("CudaWorker: loading model from {}", model_dir.display());
 
-        // GGUF path — completely different loading flow.
-        if model_dir.extension().is_some_and(|e| e == "gguf") {
-            return self.load_model_gguf(model_dir, t0);
-        }
-
         let device = self
             .device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".into()))?;
 
-        // Tokenizer on background thread.
-        let tok_dir = model_dir.clone();
-        let tokenizer_handle = std::thread::spawn(move || {
-            let path = tok_dir.join("tokenizer.json");
-            if path.exists() {
-                tokenizers::Tokenizer::from_file(&path).ok()
+        // Tokenizer on background thread. Sources tried, in order:
+        //   1. `tokenizer.json` in the dir (parent dir if model_dir
+        //      is a bare `.gguf` file path).
+        //   2. GGUF metadata `tokenizer.ggml.*` if a `.gguf` is found
+        //      (covers HF GGUF repos that don't ship a sibling
+        //      tokenizer.json — unsloth, bartowski, etc.).
+        let tok_search_dir = if model_dir.is_file() {
+            model_dir.parent().unwrap_or(&model_dir).to_path_buf()
+        } else {
+            model_dir.clone()
+        };
+        let tok_gguf_path: Option<PathBuf> =
+            if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf") {
+                Some(model_dir.clone())
             } else {
-                None
+                std::fs::read_dir(&tok_search_dir).ok().and_then(|mut it| {
+                    it.find_map(|entry| {
+                        let p = entry.ok()?.path();
+                        (p.extension().is_some_and(|e| e == "gguf")).then_some(p)
+                    })
+                })
+            };
+        let tokenizer_handle = std::thread::spawn(move || {
+            let json_path = tok_search_dir.join("tokenizer.json");
+            if json_path.exists()
+                && let Ok(t) = tokenizers::Tokenizer::from_file(&json_path)
+            {
+                return Some(t);
             }
+            if let Some(gguf_path) = tok_gguf_path
+                && let Ok(gguf) = vllm_model::gguf::GgufFile::open(&gguf_path)
+            {
+                match vllm_model::gguf::gguf_tokenizer(&gguf) {
+                    Ok(Some(t)) => return Some(t),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("gguf_tokenizer failed: {e}"),
+                }
+            }
+            None
         });
 
-        // 2. Parse config.json.
-        let hf_config = HfModelConfig::from_dir(&model_dir)
-            .map_err(|e| ExecutorError::WorkerInit(format!("config.json parse failed: {e}")))?;
+        // 2. Parse config (config.json for safetensors, GGUF metadata for .gguf).
+        let hf_config = HfModelConfig::from_path(&model_dir)
+            .map_err(|e| ExecutorError::WorkerInit(format!("config parse failed: {e}")))?;
 
         // 3. Resolve dtype.
         let dtype = match self.config.dtype.as_str() {
@@ -5032,10 +4898,27 @@ impl Worker for CudaWorker {
         let arch = hf_config.architectures.first().cloned().unwrap_or_default();
         info!("CudaWorker: architecture = {arch}");
 
-        // 5. Parse weight files (CPU mmap — no GPU allocation yet).
-        let mut weights = GpuWeights::from_dir(&model_dir, device.compute_stream)
-            .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
-        info!("CudaWorker: parsed {} weight tensors (CPU)", weights.len());
+        // 5. Parse weight files. Safetensors stays CPU-mmap'd (lazy
+        // upload via take()); GGUF is eagerly uploaded via the
+        // inventory-registered loader. `from_path` dispatches.
+        let tp_world = self.config.tp_world_size.max(1);
+        let tp_rank = self.config.tp_rank;
+        let stream = device.compute_stream;
+        let mut weights = unsafe {
+            let device_mut = self.device.as_mut().unwrap();
+            GpuWeights::from_path(
+                &model_dir,
+                stream,
+                &mut device_mut.caching,
+                dtype,
+                tp_rank,
+                tp_world,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
+        info!("CudaWorker: parsed {} weight tensors", weights.len());
+        let uses_ggml = weights.is_gguf();
+        let device = self.device.as_ref().unwrap();
 
         // Set target dtype so F32 weights are cast to model dtype on load.
         // Matches Python vLLM where model parameters are initialized with
@@ -5897,6 +5780,7 @@ impl Worker for CudaWorker {
         self.model_dtype = dtype;
         self.resolved_architecture = Some(arch);
         self.model = Some(model);
+        self.uses_ggml = uses_ggml;
         self.model_dir = Some(model_dir.clone());
         self.hf_config = Some(hf_config);
         self.pp_config = pp_config;

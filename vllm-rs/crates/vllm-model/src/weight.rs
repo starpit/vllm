@@ -149,6 +149,17 @@ impl HfModelConfig {
         Self::from_file(path)
     }
 
+    /// Load from either a model directory (reads `config.json`) or a
+    /// `.gguf` file (reads metadata from the GGUF header).
+    pub fn from_path(path: impl AsRef<Path>) -> ModelResult<Self> {
+        let path = path.as_ref();
+        if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
+            let gguf = crate::gguf::GgufFile::open(path)?;
+            return crate::gguf::gguf_model_config(&gguf);
+        }
+        Self::from_dir(path)
+    }
+
     /// Effective head dimension.
     ///
     /// For MLA models (DeepSeek V2/V3) this returns `qk_nope_head_dim + qk_rope_head_dim`

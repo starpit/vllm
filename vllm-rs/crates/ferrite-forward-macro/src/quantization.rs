@@ -93,6 +93,18 @@ pub enum StorageFormat {
         /// `None` for per-tensor / per-channel scales.
         block_size: Option<[u32; 2]>,
     },
+    /// GGML/GGUF block-quantized weights. The on-disk per-tensor
+    /// dtype (Q4_0, Q4_K, Q8_0, Q6_K, …) is heterogeneous within a
+    /// single GGUF — different linears can ship with different
+    /// quants — and is stored in the `.gguf` file's per-tensor
+    /// header rather than `config.json`. So this `StorageFormat`
+    /// carries no fields: at compile time we only know "GGUF
+    /// quantized, runtime-dispatched"; the actual per-weight dtype
+    /// is read from the GGUF file at load time and stored in the
+    /// `GgmlStorage` the `GpuWeights` hands out via
+    /// `take_quantized_linear`. The runtime `GgmlLinear` kernel
+    /// dispatcher already handles dtype variation.
+    Ggml,
 }
 
 /// FP8 activation quantization scheme. Matches
@@ -188,6 +200,9 @@ pub enum QuantMethod {
         scheme: Fp8ActivationScheme,
         block_size: Option<[u32; 2]>,
     },
+    /// GGML/GGUF block-quantized weights. No knobs at compile time —
+    /// per-tensor dtype is read from the GGUF file at load time.
+    Ggml,
 }
 
 /// Errors from [`QuantizationConfig::parse`]. All variants preserve
@@ -257,6 +272,8 @@ impl QuantizationConfig {
             "compressed-tensors" => parse_compressed_tensors(obj)?,
             "bitsandbytes" => parse_bitsandbytes(obj)?,
             "fp8" => parse_fp8(obj)?,
+            // GGML/GGUF block-quantized — no compile-time knobs.
+            "ggml" | "gguf" => QuantMethod::Ggml,
             other => return Err(ParseError::UnsupportedMethod(other.to_string())),
         };
 
@@ -662,8 +679,20 @@ pub fn storage_format_for_weight(
     model: &ModelParams,
 ) -> StorageFormat {
     let Some(ref qc) = model.quantization else {
+        if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() && model.source_stem.contains("ggml") {
+            eprintln!(
+                "[ggml-build] storage_format_for_weight model={} weight_id={id:?} → Dense (no quantization config)",
+                model.source_stem
+            );
+        }
         return StorageFormat::Dense;
     };
+    if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() && model.source_stem.contains("ggml") {
+        eprintln!(
+            "[ggml-build] storage_format_for_weight model={} weight_id={id:?} method={:?}",
+            model.source_stem, qc.method
+        );
+    }
 
     let dotted: String = program.weights.path(id).join(".");
     for excl in &qc.modules_to_not_convert {
@@ -703,6 +732,14 @@ pub fn storage_format_for_weight(
     // the output projection is tied or kept high-precision for
     // sampling quality.
     if dotted == "lm_head" && matches!(qc.method, QuantMethod::Fp8 { .. }) {
+        return StorageFormat::Dense;
+    }
+
+    // GGUF convention: the on-disk loader (`GgufGpuWeights::load`)
+    // dequantizes `output.weight` (lm_head) and ships it via
+    // `take_gguf_dense`. The codegen FieldLoad arm for GGUF lm_head
+    // uses the dense path, so the storage format must agree.
+    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Ggml) {
         return StorageFormat::Dense;
     }
 
@@ -769,6 +806,7 @@ pub fn storage_format_for_weight(
             blocksize,
         },
         QuantMethod::Fp8 { scheme, block_size } => StorageFormat::Fp8 { scheme, block_size },
+        QuantMethod::Ggml => StorageFormat::Ggml,
     }
 }
 

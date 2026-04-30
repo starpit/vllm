@@ -798,6 +798,57 @@ impl<W> Instruction<W> {
                     F::RopeCosSin,
                 ],
             ),
+            Instruction::GgmlGemm(in_slot, out_slot, layer, _wf) => (
+                "GgmlGemm",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
+            Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+                "GgmlFusedGateUpSiluMul",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
+            Instruction::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer, _wf) => (
+                "GgmlFusedGateUpGeluMul",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
+            Instruction::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, _wf, _cs, _i) => (
+                "GgmlFusedQkvRopeCache",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                    F::RopeCosSin,
+                ],
+            ),
+            Instruction::GgmlFusedQkvRopePrefill(in_slot, q_out, k_out, v_out, layer, _wf, _cs) => {
+                (
+                    "GgmlFusedQkvRopePrefill",
+                    vec![
+                        F::Slot(in_slot),
+                        F::Slot(q_out),
+                        F::Slot(k_out),
+                        F::Slot(v_out),
+                        F::Layer(layer),
+                        F::LayerKind("LinearLayer"),
+                        F::RopeCosSin,
+                    ],
+                )
+            }
             Instruction::Bnb4Gemm(in_slot, out_slot, layer, _wf) => (
                 "Bnb4Gemm",
                 vec![

@@ -2088,6 +2088,18 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(Bnb4FusedQkvRopeCacheImpl));
     lib.push(Box::new(Bnb4FusedQkvRopePrefillImpl));
 
+    // ── GGML/GGUF impls ─────────────────────────────────────────
+    // Gated per-matches on `StorageFormat::Ggml`; stay dormant on
+    // dense / Marlin / BNB4 / FP8 models. Singleton + fused
+    // gate/up SwiGLU/SwiGELU; fused QKV+rope is still a follow-up
+    // (RopeAppendRefImpl claims the rope tile when storage is Ggml,
+    // matching the deferral gate in `rope_append_has_fused_qkv_upstream`).
+    lib.push(Box::new(GgmlGemmImpl));
+    lib.push(Box::new(GgmlFusedGateUpSiluMulImpl));
+    lib.push(Box::new(GgmlFusedGateUpGeluMulImpl));
+    lib.push(Box::new(GgmlFusedQkvRopeCacheImpl));
+    lib.push(Box::new(GgmlFusedQkvRopePrefillImpl));
+
     // ── FP8 (E4M3) impls ────────────────────────────────────────
     // Gated per-matches on `StorageFormat::Fp8 { .. }`; stay dormant
     // on dense / Marlin / BNB4 models. Singleton only today; fused
@@ -5909,9 +5921,26 @@ fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     let Some(act) = first_tile_input(fuf.get(gemms[0])) else {
         return false;
     };
-    gemms
+    if !gemms
         .iter()
         .all(|t| first_tile_input(fuf.get(*t)) == Some(act))
+    {
+        return false;
+    }
+    // GGUF + interleaved RoPE: only the decode (Cache) Ggml fused
+    // Impl handles interleaved; the Prefill Ggml fused Impl rejects.
+    // For prefill workloads (M>1) we'd lose claim coverage if
+    // `RopeAppendRefImpl` deferred. Force-defer-NOT here so the
+    // singleton ref Impl claims at prefill while the Cache fused
+    // Impl claims at decode (workload constraints disambiguate).
+    if node.op == OpKind::RopeAppendInterleaved
+        && gemms
+            .iter()
+            .any(|t| matches!(weight_storage_of(fuf.get(*t)), Some(StorageFormat::Ggml)))
+    {
+        return false;
+    }
+    true
 }
 
 impl Implementation for FusedQkvRopeCacheImpl {
@@ -5938,8 +5967,19 @@ impl Implementation for FusedQkvRopeCacheImpl {
             return None;
         }
         // Dense kernel: reject AWQ storage on the seed.
-        if !matches!(weight_storage_of(seed_node), Some(StorageFormat::Dense)) {
+        let storage = weight_storage_of(seed_node);
+        if !matches!(storage, Some(StorageFormat::Dense)) {
+            if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() {
+                eprintln!(
+                    "[ggml-build] FusedQkvRopeCacheImpl rejecting seed={seed:?} storage={storage:?}"
+                );
+            }
             return None;
+        }
+        if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() {
+            eprintln!(
+                "[ggml-build] FusedQkvRopeCacheImpl ACCEPTING seed={seed:?} storage={storage:?}"
+            );
         }
 
         // Find a RopeAppend whose first three Tile inputs all resolve
@@ -6152,6 +6192,13 @@ impl Implementation for FusedQkvRopeCacheImpl {
             })
             .collect();
         let name = fused_accessor_name(program, &sources);
+        if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() {
+            eprintln!(
+                "[ggml-build] FusedQkvRopeCacheImpl::required_weights name={name} \
+                 sources={:?}",
+                sources
+            );
+        }
         vec![WeightAccessor {
             name,
             rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
@@ -9886,6 +9933,15 @@ fn is_fp8_block_moe(fuf: &Fuf, tile: TileId) -> bool {
     )
 }
 
+/// GGML/GGUF counterpart of [`is_marlin_gemm`]. A Gemm whose weight
+/// resolves to `StorageFormat::Ggml` — the GGUF impl family claims
+/// these; every other impl rejects them via their own storage
+/// gates.
+fn is_ggml_gemm(fuf: &Fuf, tile: TileId) -> bool {
+    let node = fuf.get(tile);
+    node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Ggml))
+}
+
 /// Accessor Rust type for an FP8 GEMM. Always `Fp8AnyLinear` — the
 /// loader picks `Std` vs `Block` per claim based on the weight's
 /// on-disk storage, but the per-arch Weights field type is uniform so
@@ -11145,6 +11201,985 @@ impl Implementation for Bnb4GemmImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── GGML/GGUF impl family ────────────────────────────────────────
+//
+// Singleton-only today. Per-tensor on-disk dtype (Q4_K, Q8_0, …) is
+// heterogeneous within a single GGUF and runtime-dispatched inside
+// `LinearLayer::Ggml(GgmlLinear)::forward`, so a single `GgmlGemmImpl`
+// covers every quantized linear regardless of dtype. Fused QKV /
+// gate-up peers (`GgmlFusedQkvRope*`, `GgmlFusedGateUpSiluMulImpl`)
+// are perf follow-ups; the singleton produces correct results by
+// emitting separate GEMMs where the fused dense path would emit one.
+
+/// Singleton GGML GEMM — GGUF counterpart of `Fp8GemmImpl` /
+/// `Bnb4GemmImpl`. Matches any `Gemm` whose weight resolves to
+/// `StorageFormat::Ggml`. Emits a `LinearLayer::Ggml(..)` invocation
+/// that dispatches to the right `ggml_dequant_mul_mat_vec` /
+/// `ggml_dequantize_to_tensor + cuBLAS` kernel based on the runtime
+/// `GgmlDType` carried on the loaded `GgmlStorage`.
+#[derive(Debug, Default)]
+pub struct GgmlGemmImpl;
+
+impl Implementation for GgmlGemmImpl {
+    fn name(&self) -> &'static str {
+        "ggml_gemm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if !is_ggml_gemm(fuf, seed) {
+            return None;
+        }
+        // No fused-partner deference — like Bnb4 / Fp8 singletons,
+        // we have no fused GGUF peers yet, so this is the only Impl
+        // that can claim a GGUF Gemm. DP picks it whenever
+        // `is_ggml_gemm` is true.
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        cost_gemm(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let (wid, index) = first_weight_ref(fuf.get(tile)).expect("Gemm has a weight input");
+        let name = weight_field_name(program, wid, index);
+        vec![WeightAccessor {
+            name,
+            // The polymorphic `LinearLayer` enum's `Ggml` arm is
+            // what the codegen FieldLoad arm constructs at load
+            // time. `forward` dispatches on the enum at runtime.
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: vec![(wid, index)],
+        }]
+    }
+
+    // ── Host-interpreter codegen ────────────────────────────────
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GgmlGemm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GgmlGemm: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GgmlGemm: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GgmlGemm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+/// Fused gate/up + SwiGLU for GGUF. Mirrors `Fp8FusedGateUpSiluMulImpl`
+/// — same FUF pattern (Gemm+Gemm sharing activation → Silu → Mul),
+/// same single-packed-weight accessor (`LinearLayer::Ggml(..)` whose
+/// storage is the byte-concat of gate/up). Runtime opcode handler
+/// calls the polymorphic `LinearLayer::forward` to dequant+gemm
+/// into a `[tokens, 2*intermediate]` tensor, then `silu_and_mul_fused`.
+#[derive(Debug, Default)]
+pub struct GgmlFusedGateUpSiluMulImpl;
+
+impl Implementation for GgmlFusedGateUpSiluMulImpl {
+    fn name(&self) -> &'static str {
+        "ggml_fused_gate_up_silu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let gate_gemm = fuf.get(seed);
+        if !is_ggml_gemm(fuf, seed) {
+            return None;
+        }
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
+        let silu_id = silu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, silu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
+            _ => None,
+        })?;
+        if !is_ggml_gemm(fuf, up_gemm_id) {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, silu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedGateUpSiluMulImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GgmlFusedGateUpSiluMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let silu_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Silu)
+            .expect("GgmlFusedGateUpSiluMul: claim contains Silu");
+        let mul_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("GgmlFusedGateUpSiluMul: claim contains Mul");
+        let gate_id = match fuf.get(silu_id).inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            other => panic!("GgmlFusedGateUpSiluMul: Silu input 0 must be a Tile (got {other:?})"),
+        };
+        let gate_node = fuf.get(gate_id);
+        let (in_id, in_slot) = match gate_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("GgmlFusedGateUpSiluMul: gate gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(mul_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GgmlFusedGateUpSiluMul: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GgmlFusedGateUpSiluMul", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+/// GELU counterpart of `GgmlFusedGateUpSiluMulImpl`. Same shape;
+/// matches Gelu+Mul instead of Silu+Mul. Cohere/commandr uses Silu;
+/// Gemma uses Gelu — having both ready avoids a second round-trip
+/// when wiring more arches.
+#[derive(Debug, Default)]
+pub struct GgmlFusedGateUpGeluMulImpl;
+
+impl Implementation for GgmlFusedGateUpGeluMulImpl {
+    fn name(&self) -> &'static str {
+        "ggml_fused_gate_up_gelu_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let gate_gemm = fuf.get(seed);
+        if !is_ggml_gemm(fuf, seed) {
+            return None;
+        }
+        let gelu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Gelu && consumes_tile(n, seed))?;
+        let gelu_id = gelu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, gelu_id))?;
+        let mul_id = mul_node.id;
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != gelu_id => Some(*id),
+            _ => None,
+        })?;
+        if !is_ggml_gemm(fuf, up_gemm_id) {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(fuf.get(up_gemm_id))? {
+            return None;
+        }
+        let mut claimed = [seed, up_gemm_id, gelu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedGateUpGeluMulImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GgmlFusedGateUpGeluMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let gelu_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gelu)
+            .expect("GgmlFusedGateUpGeluMul: claim contains Gelu");
+        let mul_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("GgmlFusedGateUpGeluMul: claim contains Mul");
+        let gate_id = match fuf.get(gelu_id).inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            other => panic!("GgmlFusedGateUpGeluMul: Gelu input 0 must be a Tile (got {other:?})"),
+        };
+        let gate_node = fuf.get(gate_id);
+        let (in_id, in_slot) = match gate_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("GgmlFusedGateUpGeluMul: gate gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(mul_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GgmlFusedGateUpGeluMul: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GgmlFusedGateUpGeluMul", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+/// Fused QKV+RoPE (decode, M=1) for GGUF. Mirrors
+/// `Bnb4FusedQkvRopeCacheImpl`'s claim shape — three Gemms (with or
+/// without uniform `BiasAdd`) feeding a single `RopeAppend`. The
+/// Ggml-specific bits: gate on `is_ggml_gemm`, accessor type
+/// `LinearLayer` (which the runtime polymorphically dispatches to
+/// `GgmlLinear` / `GgmlConcat` for the byte-packed q/k/v storage).
+/// Required weights: one packed accessor with three sources (q/k/v);
+/// `LinearLayer::load_dense_concat_or_ggml` either byte-stacks them
+/// when dtypes match or wraps them in `GgmlConcat` for runtime
+/// concat. Critically: this Impl handles BIASED q/k/v (Qwen2 style)
+/// — without it, the standalone `BiasAdd` tile has no claimer and
+/// the solver fails.
+#[derive(Debug, Default)]
+pub struct GgmlFusedQkvRopeCacheImpl;
+
+impl Implementation for GgmlFusedQkvRopeCacheImpl {
+    fn name(&self) -> &'static str {
+        "ggml_fused_qkv_rope_cache"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let seed_node = fuf.get(seed);
+        if !is_ggml_gemm(fuf, seed) {
+            return None;
+        }
+        let rope_node = fuf.nodes.iter().find(|n| {
+            // Accept both standard `RopeAppend` (Llama, Qwen, Mistral)
+            // and `RopeAppendInterleaved` (Cohere) — same claim shape,
+            // runtime kernel dispatches on the kv_cache extern.
+            if !is_rope_append_op(n.op) || n.inputs.len() < 3 {
+                return false;
+            }
+            let qkv_raw: Vec<TileId> = n
+                .inputs
+                .iter()
+                .take(3)
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if qkv_raw.len() != 3 {
+                return false;
+            }
+            let resolved: Option<Vec<(TileId, Option<TileId>)>> = qkv_raw
+                .iter()
+                .map(|t| unwrap_gemm_through_bias(fuf, *t))
+                .collect();
+            let Some(resolved) = resolved else {
+                return false;
+            };
+            let biased = resolved[0].1.is_some();
+            if resolved.iter().any(|r| r.1.is_some() != biased) {
+                return false;
+            }
+            let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
+            if !gemms.contains(&seed) {
+                return false;
+            }
+            if gemms.iter().any(|t| !is_ggml_gemm(fuf, *t)) {
+                return false;
+            }
+            let act = first_tile_input(fuf.get(gemms[0]));
+            act.is_some() && gemms.iter().all(|t| first_tile_input(fuf.get(*t)) == act)
+        })?;
+        let rope_id = rope_node.id;
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| unwrap_gemm_through_bias(fuf, *t).expect("validated in find"))
+            .collect();
+        let mut claimed: Vec<TileId> = Vec::with_capacity(7);
+        for (g, b) in &resolved {
+            claimed.push(*g);
+            if let Some(b) = b {
+                claimed.push(*b);
+            }
+        }
+        claimed.push(rope_id);
+        claimed.sort();
+        let _ = seed_node;
+        let activation = first_tile_input(fuf.get(resolved[0].0))?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation],
+            boundary_outputs: vec![rope_id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        FusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
+            .expect("claim contains RopeAppend");
+        vec![((rope_id, 0), None)]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let sources: Vec<(WeightId, Option<u64>)> = claimed_tiles
+            .iter()
+            .filter_map(|t| {
+                let n = fuf.get(*t);
+                if n.op == OpKind::Gemm {
+                    first_weight_ref(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: sources,
+        }]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GgmlFusedQkvRopeCache",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+                ("interleaved", syn::parse_quote!(bool)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
+            .expect("GgmlFusedQkvRopeCache: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("GgmlFusedQkvRopeCache: RopeAppend has KvCache extern with layer index")
+            as u32;
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("GgmlFusedQkvRopeCache: Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let q_gemm_id = resolved[0].0;
+        let q_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GgmlFusedQkvRopeCache: q_gemm input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(rope_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GgmlFusedQkvRopeCache: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "GgmlFusedQkvRopeCache: weight_layer disagrees with kv_cache layer"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+        let interleaved = fuf.get(rope_id).op == OpKind::RopeAppendInterleaved;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GgmlFusedQkvRopeCache", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
+                quote! { #interleaved },
+            ],
+        )])
+    }
+}
+
+/// Fused QKV+RoPE (prefill, contiguous K/V) for GGUF.
+#[derive(Debug, Default)]
+pub struct GgmlFusedQkvRopePrefillImpl;
+
+impl Implementation for GgmlFusedQkvRopePrefillImpl {
+    fn name(&self) -> &'static str {
+        "ggml_fused_qkv_rope_prefill"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange {
+            min: 2,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = GgmlFusedQkvRopeCacheImpl.matches(fuf, seed, profile)?;
+        // No interleaved-rope prefill kernel exists today
+        // (`fused_qkv_rope` non-interleaved only). Reject so commandr
+        // prefill falls through to standalone GgmlGemm + RopeAppendRef.
+        let rope_id = *info
+            .claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))?;
+        if fuf.get(rope_id).op == OpKind::RopeAppendInterleaved {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        GgmlFusedQkvRopeCacheImpl.cost_us(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        GgmlFusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GgmlFusedQkvRopePrefill",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("q_out_slot", syn::parse_quote!(u32)),
+                ("k_out_slot", syn::parse_quote!(u32)),
+                ("v_out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
+            .expect("GgmlFusedQkvRopePrefill: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let layer = rope_kv_cache_layer(rope_node)
+            .expect("GgmlFusedQkvRopePrefill: RopeAppend has KvCache extern with layer index")
+            as u32;
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("GgmlFusedQkvRopePrefill: Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+        let q_gemm_id = resolved[0].0;
+        let q_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => {
+                panic!("GgmlFusedQkvRopePrefill: q_gemm input 0 must be a Tile (got {other:?})")
+            }
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let q_out = slots.of(rope_id, 0);
+        let k_out = slots.of(rope_id, 1);
+        let v_out = slots.of(rope_id, 2);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GgmlFusedQkvRopePrefill: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "GgmlFusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GgmlFusedQkvRopePrefill", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #q_out },
+                quote! { #k_out },
+                quote! { #v_out },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
             ],
         )])
     }

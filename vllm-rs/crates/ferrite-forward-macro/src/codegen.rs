@@ -816,6 +816,7 @@ fn collect_accessors(
     fuf: &Fuf,
     sfufs: &WorkloadAssignments,
     lib: &ImplementationLibrary,
+    _model_for_trace: &ModelParams,
 ) -> Result<Vec<WeightAccessor>, TokenStream> {
     // name → (first-seen accessor, rust_type string for collision check).
     let mut by_name: BTreeMap<String, (WeightAccessor, String)> = BTreeMap::new();
@@ -829,6 +830,28 @@ fn collect_accessors(
             let claimed = sfuf.tiles_in_subgraph(sg);
             let imp = lib.get(imp_id);
             for acc in imp.required_weights(&claimed, fuf, program) {
+                if std::env::var("FERRITE_GGUF_BUILD_TRACE").is_ok() {
+                    let storages: Vec<_> = acc
+                        .source_weights
+                        .iter()
+                        .map(|(wid, _)| {
+                            crate::quantization::storage_format_for_weight(
+                                program,
+                                fuf,
+                                *wid,
+                                _model_for_trace,
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[ggml-build] collect_accessors model={} impl={} acc={} sources={} storages={:?}",
+                        _model_for_trace.source_stem,
+                        imp.name(),
+                        acc.name,
+                        acc.source_weights.len(),
+                        storages,
+                    );
+                }
                 let key = acc.name.to_string();
                 let ty_str = acc.rust_type.to_string();
                 by_name
@@ -913,6 +936,12 @@ fn emit_fingerprint_check(
         }) => ("weight_packed", "weight"),
         Some(crate::quantization::QuantMethod::Bnb4 { .. }) => ("weight.absmax", "qweight"),
         Some(crate::quantization::QuantMethod::Fp8 { .. }) => ("weight_scale", "qweight"),
+        // GGUF ships the same `.weight` suffix as dense (the loader
+        // stores the quantized tensor under the HF-style name) — the
+        // disambiguator vs Dense is `gw.is_gguf()` (added below in
+        // qweight_shape_gate) plus the absence of fp8/bnb4 markers
+        // at `.weight_scale` / `.weight.absmax`.
+        Some(crate::quantization::QuantMethod::Ggml) => ("weight", "qweight"),
         Some(_) => ("qweight", "weight"),
         None => ("weight", "qweight"),
     };
@@ -1116,7 +1145,27 @@ fn emit_fingerprint_check(
             // same arch+size.
             quote! {}
         }
-        None => quote! {},
+        Some(crate::quantization::QuantMethod::Ggml) | None => quote! {},
+    };
+
+    // Backing-store reject: every non-Ggml variant must reject a
+    // GGUF-backed `GpuWeights`, and the Ggml variant must require
+    // one. Without this the dense variant's shape-only fingerprint
+    // matches a GGUF (since `gw.contains` checks the quantized map)
+    // and the dense load body's fused-QKV path fires on Ggml
+    // weights — panicking at runtime when a Cutlass instr calls
+    // `dense_weight()` on a `LinearLayer::GgmlConcat`.
+    let is_gguf_gate: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Ggml) => quote! {
+            if !gw.is_gguf() {
+                return false;
+            }
+        },
+        _ => quote! {
+            if gw.is_gguf() {
+                return false;
+            }
+        },
     };
 
     // GPTQ-Qweight desc_act disambiguation. With overlay fan-out we
@@ -1265,8 +1314,8 @@ fn emit_fingerprint_check(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
             hf: ::ferrite_forward::HfFingerprint<'_>,
         ) -> bool {
-            match gw.tensor_info("model.embed_tokens.weight") {
-                Some((shape, _))
+            match gw.tensor_shape_any("model.embed_tokens.weight") {
+                Some(ref shape)
                     if shape.len() >= 2
                         && shape[0] == #vocab_lit
                         && shape[1] == #hidden_lit => {}
@@ -1299,6 +1348,7 @@ fn emit_fingerprint_check(
                 return false;
             }
             #qweight_shape_gate
+            #is_gguf_gate
             #g_idx_disambiguation
             #input_scale_disambiguation
             #block_disambiguation
@@ -1333,7 +1383,7 @@ fn emit_weights_struct(
     mode: WeightsEmitMode<'_>,
     tp_world_size: u8,
 ) -> TokenStream {
-    let accessors = match collect_accessors(program, fuf, sfufs, lib) {
+    let accessors = match collect_accessors(program, fuf, sfufs, lib, model) {
         Ok(a) => a,
         Err(err) => return err,
     };
@@ -1341,12 +1391,18 @@ fn emit_weights_struct(
     // Storage-format guard: a given accessor's `rust_type` must be
     // compatible with every one of its source weights' storage
     // formats. The allowed pairs today:
-    //   `LinearLayer`   ↔ `Dense`
+    //   `LinearLayer`   ↔ `Dense` | `Ggml`
     //   `Embedding`     ↔ `Dense`
     //   `RmsNorm`       ↔ `Dense`
     //   `MarlinLinear`  ↔ `Awq { .. }` | `Gptq { .. }`
     //   `Bnb4bitLinear` ↔ `Bnb4 { .. }`
     //   `Fp8Linear`     ↔ `Fp8 { .. }`
+    //
+    // GGUF rides on the `LinearLayer` accessor type because the
+    // runtime enum already has a `Ggml(Box<GgmlLinear>)` arm that
+    // dispatches at forward time — so codegen produces the same
+    // accessor field type for Dense and Ggml; the FieldLoad arm
+    // picks `take_quantized_linear` vs `take` based on storage.
     //
     // Any other pair means the solver picked an impl whose
     // declared accessor type doesn't match the bits on disk — a
@@ -1407,6 +1463,11 @@ fn emit_weights_struct(
                     false,
                     false,
                     true
+                ) | (
+                    crate::quantization::StorageFormat::Ggml,
+                    false,
+                    false,
+                    false
                 ),
             );
             if !ok {
@@ -2459,7 +2520,12 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                     )?;
                 },
                 _ => quote! {
-                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense(gw, #prefix)?;
+                    // `load_dense_or_ggml`: try `take_quantized_linear`
+                    // first (for `StorageFormat::Ggml` weights), fall
+                    // back to dense safetensors path. Transparent on
+                    // every existing safetensors model since the
+                    // GGUF map is empty there.
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_or_ggml(gw, #prefix)?;
                 },
             }
         }
@@ -2481,7 +2547,11 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 }
             } else {
                 quote! {
-                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat(
+                    // `load_dense_concat_or_ggml`: tries GGUF byte-pack
+                    // first (when every prefix has a quantized linear),
+                    // falls back to the existing safetensors concat
+                    // path. Transparent on safetensors models.
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat_or_ggml(
                         gw,
                         &[ #(#prefixes),* ],
                         stream,

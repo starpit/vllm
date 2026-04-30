@@ -30,228 +30,12 @@ fn note_iq(flag: &AtomicBool, name: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// GgmlDType
+// GgmlDType + GgmlStorage live in ferrite-cuda-core::ggml_quant so
+// `GpuWeights` can hold a `quantized: HashMap<String, GgmlStorage>`
+// field without a circular crate dependency. Re-exported here for
+// backward compat with all existing call sites.
 // ---------------------------------------------------------------------------
-
-/// GGML quantization data types.
-///
-/// Matches the GGUF
-/// on-disk format tags. Each variant knows its `type_size()` (bytes per block)
-/// and `block_size()` (elements per block).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum GgmlDType {
-    Q4_0 = 2,
-    Q4_1 = 3,
-    Q5_0 = 6,
-    Q5_1 = 7,
-    Q8_0 = 8,
-    Q8_1 = 9,
-    Q2K = 10,
-    Q3K = 11,
-    Q4K = 12,
-    Q5K = 13,
-    Q6K = 14,
-    Q8K = 15,
-    IQ2XXS = 16,
-    IQ2XS = 17,
-    IQ1S = 19,
-    IQ4NL = 20,
-    IQ3S = 21,
-    IQ2S = 22,
-    IQ4XS = 23,
-    IQ1M = 29,
-}
-
-impl GgmlDType {
-    /// Create from the GGUF on-disk u32 tag.
-    pub fn from_u32(u: u32) -> Option<Self> {
-        match u {
-            2 => Some(Self::Q4_0),
-            3 => Some(Self::Q4_1),
-            6 => Some(Self::Q5_0),
-            7 => Some(Self::Q5_1),
-            8 => Some(Self::Q8_0),
-            9 => Some(Self::Q8_1),
-            10 => Some(Self::Q2K),
-            11 => Some(Self::Q3K),
-            12 => Some(Self::Q4K),
-            13 => Some(Self::Q5K),
-            14 => Some(Self::Q6K),
-            15 => Some(Self::Q8K),
-            16 => Some(Self::IQ2XXS),
-            17 => Some(Self::IQ2XS),
-            19 => Some(Self::IQ1S),
-            20 => Some(Self::IQ4NL),
-            21 => Some(Self::IQ3S),
-            22 => Some(Self::IQ2S),
-            23 => Some(Self::IQ4XS),
-            29 => Some(Self::IQ1M),
-            _ => None,
-        }
-    }
-
-    /// Convert from a vendored GgufDType tag.
-    pub fn from_gguf(dt: vllm_model::gguf_format::GgufDType) -> Option<Self> {
-        Self::from_u32(dt.0)
-    }
-
-    /// Size in bytes of one quantization block.
-    ///
-    /// Values match llama.cpp block structs.
-    pub const fn type_size(self) -> usize {
-        match self {
-            Self::Q4_0 => 18,
-            Self::Q4_1 => 20,
-            Self::Q5_0 => 22,
-            Self::Q5_1 => 24,
-            Self::Q8_0 => 34,
-            Self::Q8_1 => 36, // 2*sizeof(ggml_half) + QK8_1 = 4 + 32 = 36 (see static_assert in quantized.cu)
-            Self::Q2K => 84,
-            Self::Q3K => 110,
-            Self::Q4K => 144,
-            Self::Q5K => 176,
-            Self::Q6K => 210,
-            Self::Q8K => 292,
-            Self::IQ2XXS => 66,
-            Self::IQ2XS => 74,
-            Self::IQ1S => 50,
-            Self::IQ4NL => 18,
-            Self::IQ3S => 110,
-            Self::IQ2S => 82,
-            Self::IQ4XS => 136,
-            Self::IQ1M => 56,
-        }
-    }
-
-    /// Number of elements per quantization block.
-    pub const fn block_size(self) -> usize {
-        match self {
-            Self::Q4_0
-            | Self::Q4_1
-            | Self::Q5_0
-            | Self::Q5_1
-            | Self::Q8_0
-            | Self::Q8_1
-            | Self::IQ4NL => 32,
-            Self::Q2K
-            | Self::Q3K
-            | Self::Q4K
-            | Self::Q5K
-            | Self::Q6K
-            | Self::Q8K
-            | Self::IQ2XXS
-            | Self::IQ2XS
-            | Self::IQ1S
-            | Self::IQ3S
-            | Self::IQ2S
-            | Self::IQ4XS
-            | Self::IQ1M => 256,
-        }
-    }
-
-    /// Whether this is a "K-quant" type (QK_K=256 block size).
-    pub const fn is_k_quant(self) -> bool {
-        matches!(
-            self,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K
-        )
-    }
-
-    /// Whether this is an IQ (importance-matrix) quantization type.
-    ///
-    /// IQ types lack the fused dequant+dot BS=1 kernel — they must always go
-    /// through the Q8_1 intermediate quantization path.
-    pub const fn is_iq_quant(self) -> bool {
-        matches!(
-            self,
-            Self::IQ4NL
-                | Self::IQ4XS
-                | Self::IQ1M
-                | Self::IQ2XXS
-                | Self::IQ2XS
-                | Self::IQ1S
-                | Self::IQ3S
-                | Self::IQ2S
-        )
-    }
-}
-
-impl std::fmt::Display for GgmlDType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Q4_0 => write!(f, "Q4_0"),
-            Self::Q4_1 => write!(f, "Q4_1"),
-            Self::Q5_0 => write!(f, "Q5_0"),
-            Self::Q5_1 => write!(f, "Q5_1"),
-            Self::Q8_0 => write!(f, "Q8_0"),
-            Self::Q8_1 => write!(f, "Q8_1"),
-            Self::Q2K => write!(f, "Q2K"),
-            Self::Q3K => write!(f, "Q3K"),
-            Self::Q4K => write!(f, "Q4K"),
-            Self::Q5K => write!(f, "Q5K"),
-            Self::Q6K => write!(f, "Q6K"),
-            Self::Q8K => write!(f, "Q8K"),
-            Self::IQ2XXS => write!(f, "IQ2_XXS"),
-            Self::IQ2XS => write!(f, "IQ2_XS"),
-            Self::IQ1S => write!(f, "IQ1_S"),
-            Self::IQ4NL => write!(f, "IQ4_NL"),
-            Self::IQ3S => write!(f, "IQ3_S"),
-            Self::IQ2S => write!(f, "IQ2_S"),
-            Self::IQ4XS => write!(f, "IQ4_XS"),
-            Self::IQ1M => write!(f, "IQ1_M"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GgmlStorage — raw quantized bytes on GPU
-// ---------------------------------------------------------------------------
-
-/// Raw GGML-quantized weight data on GPU.
-///
-/// The bytes are in the exact same format as the GGUF file — no dequantization.
-/// The CUDA kernels read quantized blocks directly and do fused dequant+matvec.
-#[derive(Clone, Copy)]
-pub struct GgmlStorage {
-    /// Raw GPU pointer to quantized block data.
-    pub ptr: *mut u8,
-    /// Total size in bytes.
-    pub len: usize,
-    /// Quantization type.
-    pub dtype: GgmlDType,
-    /// Number of rows (output features for a weight matrix).
-    pub nrows: usize,
-    /// Number of columns (input features) — the "logical" element count per row.
-    pub ncols: usize,
-}
-
-unsafe impl Send for GgmlStorage {}
-unsafe impl Sync for GgmlStorage {}
-
-impl GgmlStorage {
-    /// Total number of logical elements.
-    pub fn numel(&self) -> usize {
-        self.nrows * self.ncols
-    }
-
-    /// Verify that the stored byte count matches the expected size.
-    pub fn verify_size(&self) -> bool {
-        let expected_blocks = self.numel() / self.dtype.block_size();
-        let expected_bytes = expected_blocks * self.dtype.type_size();
-        self.len == expected_bytes
-    }
-}
-
-impl std::fmt::Debug for GgmlStorage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "GgmlStorage({}, [{}, {}], {} bytes, ptr={:p})",
-            self.dtype, self.nrows, self.ncols, self.len, self.ptr
-        )
-    }
-}
+pub use ferrite_cuda_core::ggml_quant::{GgmlDType, GgmlStorage};
 
 // ---------------------------------------------------------------------------
 // Constants (match llama.cpp quantized kernels)
@@ -1519,6 +1303,19 @@ pub struct GgufGpuWeights {
 impl GgufGpuWeights {
     /// Load all tensors from a GGUF file onto GPU.
     ///
+    /// At `tp_world_size > 1` per-tensor block-aligned slicing kicks
+    /// in based on `gguf_shard_kind_for_hf_name` (mirrors the
+    /// safetensors codegen's `tp_lowering` rule table):
+    ///
+    /// - `ShardDim0` (q/k/v/gate/up/embed/lm_head): rows split. Each
+    ///   row is a whole number of GGML blocks, so the per-rank slice
+    ///   is a contiguous byte range — a single seek+read.
+    /// - `ShardDim1` (o/down): per-row column slice. Refuse-at-load
+    ///   if `(in_features / tp) % block_size != 0`.
+    /// - `Replicate` (norms): full tensor on every rank.
+    ///
+    /// 3D MoE experts and 1D weights are always replicated.
+    ///
     /// # Safety
     /// Requires valid CUDA context and stream.
     pub unsafe fn load(
@@ -1526,8 +1323,17 @@ impl GgufGpuWeights {
         model_dtype: DType,
         alloc: &mut CachingAllocator,
         stream: CUstream,
+        tp_rank: usize,
+        tp_world_size: usize,
     ) -> anyhow::Result<Self> {
         use vllm_model::gguf_format::Content;
+
+        if tp_world_size == 0 {
+            anyhow::bail!("tp_world_size must be >= 1");
+        }
+        if tp_rank >= tp_world_size {
+            anyhow::bail!("tp_rank ({tp_rank}) >= tp_world_size ({tp_world_size})");
+        }
 
         let file = std::fs::File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -1552,9 +1358,109 @@ impl GgufGpuWeights {
 
         for (gguf_name, info) in &content.tensor_infos {
             let hf_name = vllm_model::gguf::gguf_to_hf_name(gguf_name);
-            let dims = info.shape.dims();
-            let elem_count = info.shape.elem_count();
+            let dims_full = info.shape.dims();
             let gguf_dtype = info.ggml_dtype;
+
+            // Compute per-rank shard. Returns
+            //   (sliced_dims, sliced_elem_count, sliced_size_bytes,
+            //    Vec<(byte_offset_in_file, byte_count)>)
+            // where the offsets are RELATIVE to the tensor's data start
+            // (i.e. tensor_data_offset + info.offset).
+            let shard_kind = if dims_full.len() == 2 && tp_world_size > 1 {
+                gguf_shard_kind_for_hf_name(&hf_name)
+            } else {
+                GgufShardKind::Replicate
+            };
+            let bs = gguf_dtype.block_size();
+            let ts = gguf_dtype.type_size();
+            let (dims, slice_reads, sliced_elem_count, sliced_size_bytes) = match shard_kind {
+                GgufShardKind::Replicate => {
+                    let elems = info.shape.elem_count();
+                    let sb = (elems / bs) * ts;
+                    (dims_full.to_vec(), vec![(0u64, sb)], elems, sb)
+                }
+                GgufShardKind::ShardDim0 => {
+                    // 2D row-major: dims = [out, in]. Per-rank rows.
+                    let total_rows = dims_full[0];
+                    let cols = dims_full[1];
+                    if total_rows % tp_world_size != 0 {
+                        anyhow::bail!(
+                            "tp shard: tensor `{}` ShardDim0 rows={} not divisible by \
+                             tp_world_size={}",
+                            hf_name,
+                            total_rows,
+                            tp_world_size
+                        );
+                    }
+                    let rows_per_rank = total_rows / tp_world_size;
+                    if cols % bs != 0 {
+                        anyhow::bail!(
+                            "tp shard: tensor `{}` cols={} not a multiple of block_size={} \
+                             (dtype {:?})",
+                            hf_name,
+                            cols,
+                            bs,
+                            gguf_dtype
+                        );
+                    }
+                    let row_bytes = (cols / bs) * ts;
+                    let row_offset = tp_rank * rows_per_rank;
+                    let byte_offset = (row_offset * row_bytes) as u64;
+                    let slice_bytes = rows_per_rank * row_bytes;
+                    (
+                        vec![rows_per_rank, cols],
+                        vec![(byte_offset, slice_bytes)],
+                        rows_per_rank * cols,
+                        slice_bytes,
+                    )
+                }
+                GgufShardKind::ShardDim1 => {
+                    // 2D row-major: dims = [out, in]. Per-rank cols.
+                    let rows = dims_full[0];
+                    let total_cols = dims_full[1];
+                    if total_cols % tp_world_size != 0 {
+                        anyhow::bail!(
+                            "tp shard: tensor `{}` ShardDim1 cols={} not divisible by \
+                             tp_world_size={}",
+                            hf_name,
+                            total_cols,
+                            tp_world_size
+                        );
+                    }
+                    let cols_per_rank = total_cols / tp_world_size;
+                    if !cols_per_rank.is_multiple_of(bs) {
+                        anyhow::bail!(
+                            "tp shard: tensor `{}` per-rank cols={} not a multiple of \
+                             block_size={} (dtype {:?}) — refuse-at-load",
+                            hf_name,
+                            cols_per_rank,
+                            bs,
+                            gguf_dtype
+                        );
+                    }
+                    let row_bytes_full = (total_cols / bs) * ts;
+                    let row_bytes_local = (cols_per_rank / bs) * ts;
+                    let col_byte_offset = tp_rank * row_bytes_local;
+                    // Per-row strided reads: one (offset, size) per row.
+                    let reads: Vec<(u64, usize)> = (0..rows)
+                        .map(|r| {
+                            (
+                                (r * row_bytes_full + col_byte_offset) as u64,
+                                row_bytes_local,
+                            )
+                        })
+                        .collect();
+                    (
+                        vec![rows, cols_per_rank],
+                        reads,
+                        rows * cols_per_rank,
+                        rows * row_bytes_local,
+                    )
+                }
+            };
+            let dims = dims.as_slice();
+            let elem_count = sliced_elem_count;
+            let size_bytes = sliced_size_bytes;
 
             // Map GGUF dtype tag to our quantized GgmlDType (None for float types).
             let our_dtype = GgmlDType::from_gguf(gguf_dtype);
@@ -1572,13 +1478,18 @@ impl GgufGpuWeights {
             let is_lm_head = hf_name == "lm_head.weight";
             let is_f32_or_f16 = gguf_dtype.is_float();
 
-            // Read raw bytes from disk.
-            let bs = gguf_dtype.block_size();
-            let ts = gguf_dtype.type_size();
-            let size_bytes = (elem_count / bs) * ts;
-            reader.seek(SeekFrom::Start(tensor_data_offset + info.offset))?;
-            let host_slice = std::slice::from_raw_parts_mut(host_buf, size_bytes);
-            reader.read_exact(host_slice)?;
+            // Read per-rank bytes from disk into the pinned host
+            // buffer. Replicate / ShardDim0 = single read; ShardDim1
+            // = per-row strided reads concatenated.
+            let mut written = 0usize;
+            for (rel_off, n) in &slice_reads {
+                reader.seek(SeekFrom::Start(tensor_data_offset + info.offset + *rel_off))?;
+                let host_slice = std::slice::from_raw_parts_mut(host_buf.add(written), *n);
+                reader.read_exact(host_slice)?;
+                written += *n;
+            }
+            debug_assert_eq!(written, size_bytes);
+            let _ = elem_count; // silence unused if no downstream use
 
             if is_f32_or_f16 || is_norm || is_embedding || is_lm_head {
                 // Dequantize path: for unquantized types, just H2D copy.
@@ -1774,6 +1685,13 @@ impl GgufGpuWeights {
         self.weights.remove(name)
     }
 
+    /// Consume self, return the underlying weights map. Used by the
+    /// `load_gguf_into_weights` adapter to transfer storages into a
+    /// `GpuWeights` without re-uploading anything.
+    pub fn into_weights(self) -> HashMap<String, GgufWeight> {
+        self.weights
+    }
+
     /// Take a quantized weight, returning the GgmlStorage.
     pub fn take_quantized(&mut self, name: &str) -> anyhow::Result<GgmlStorage> {
         match self.take(name) {
@@ -1810,6 +1728,133 @@ impl GgufGpuWeights {
     pub fn is_empty(&self) -> bool {
         self.weights.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// GpuWeights adapter — load a GGUF file into a `GpuWeights` so the
+// ferrite codegen path (which holds `&mut GpuWeights`) can consume
+// quantized-linear and dequantized-norm/embed/lm_head tensors via
+// the standard `take_*` accessors. Today's eager GGUF loader stays
+// the source of truth — this is a thin wrapper that transfers the
+// storages without re-uploading.
+// ---------------------------------------------------------------------------
+
+/// How a tensor is split across `tp_world_size` ranks. Mirrors
+/// `ferrite_forward_macro::tp_lowering::ShardKind` — kept here as
+/// pure data so the GGUF loader (which runs at runtime) can decide
+/// per-tensor slicing without depending on the proc-macro crate.
+///
+/// Future: when the `Ggml` `StorageFormat` lands in `quantization.rs`,
+/// the proc-macro and this enum should both ultimately read the
+/// same rule table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GgufShardKind {
+    ShardDim0,
+    ShardDim1,
+    Replicate,
+}
+
+/// Apply the standard HF-name shard rule. Mirrors
+/// `tp_lowering::shard_kind_for_last_segment` exactly — must stay in
+/// sync if either side changes. This is the rule table the
+/// safetensors codegen path emits today.
+pub fn gguf_shard_kind_for_hf_name(hf_name: &str) -> GgufShardKind {
+    // Strip the trailing `.weight` / `.bias` suffix that GGUF loader
+    // emits, then look at the final segment.
+    let stem = hf_name
+        .strip_suffix(".weight")
+        .or_else(|| hf_name.strip_suffix(".bias"))
+        .unwrap_or(hf_name);
+    let last = stem.rsplit('.').next().unwrap_or("");
+    match last {
+        "q_proj" | "k_proj" | "v_proj" | "gate_proj" | "up_proj" => GgufShardKind::ShardDim0,
+        "o_proj" | "down_proj" => GgufShardKind::ShardDim1,
+        "embed_tokens" | "lm_head" => GgufShardKind::ShardDim0,
+        _ => GgufShardKind::Replicate,
+    }
+}
+
+// Register `load_gguf_into_weights` as the workspace's GGUF loader
+// so `ferrite-cuda-core::GpuWeights::from_gguf_file` can route through
+// it without `ferrite-cuda-core` depending on `ferrite-kernels` (cycle).
+// The registration is collected at link time via `inventory`.
+inventory::submit! {
+    ferrite_cuda_core::gguf_loader::GgufLoaderRegistration {
+        name: "ferrite-kernels",
+        load: load_gguf_into_weights,
+    }
+}
+
+/// Load a GGUF file into a freshly-constructed `GpuWeights`.
+///
+/// Quantized linears land in `gw.quantized_map_mut()`; dequantized
+/// norms / embeddings / lm_head land in `gw.gguf_dense_map_mut()`.
+/// Both maps are keyed by HF tensor name.
+///
+/// **TP status (2026-04-29):** `tp_world_size = 1` is implemented;
+/// `tp_world_size > 1` returns an error. The shard-rule lookup
+/// (`gguf_shard_kind_for_hf_name`) is wired so a future TP slicing
+/// pass can be added inside `GgufGpuWeights::load` without changing
+/// this adapter's signature. The slicing semantics are:
+///   - `ShardDim0` (q/k/v/gate/up/embed/lm_head): per-rank rows of
+///     the row-major [out, in] tensor — contiguous byte-range slice.
+///     Always block-aligned because each row is a whole number of
+///     blocks.
+///   - `ShardDim1` (o/down): per-rank columns within each row —
+///     strided byte slice. Requires `(in_features / tp) %
+///     block_size == 0` for the underlying GgmlDType. Refuse-at-load
+///     on misalignment.
+///   - `Replicate` (norms / qk_norm): full tensor on every rank.
+///
+/// # Safety
+/// Requires a valid CUDA context and stream. The returned
+/// `GpuWeights` retains the GGUF tensor pointers for the lifetime
+/// of the model — same lifetime contract as the existing
+/// `GgufGpuWeights::load`.
+pub unsafe fn load_gguf_into_weights(
+    path: &std::path::Path,
+    model_dtype: DType,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+    tp_rank: usize,
+    tp_world_size: usize,
+) -> anyhow::Result<ferrite_cuda_core::weights::GpuWeights> {
+    let gguf =
+        unsafe { GgufGpuWeights::load(path, model_dtype, alloc, stream, tp_rank, tp_world_size)? };
+    let mut gw = ferrite_cuda_core::weights::GpuWeights::empty(stream);
+
+    for (name, weight) in gguf.into_weights() {
+        match weight {
+            GgufWeight::Quantized(storage) => {
+                gw.quantized_map_mut().insert(name, storage);
+            }
+            GgufWeight::Dense(tensor) => {
+                gw.gguf_dense_map_mut().insert(name, tensor);
+            }
+        }
+    }
+
+    if std::env::var("FERRITE_GGUF_TRACE").is_ok() {
+        let q_names: Vec<String> = {
+            let mut v: Vec<String> = gw.quantized_linear_names().cloned().collect();
+            v.sort();
+            v
+        };
+        let dense_count = gw.gguf_dense_map_mut().len();
+        eprintln!(
+            "[ggml] load_gguf_into_weights: {} quantized linear tensors, {} dense gguf tensors",
+            q_names.len(),
+            dense_count,
+        );
+        for n in q_names.iter().take(20) {
+            eprintln!("[ggml]   quantized: {n}");
+        }
+        if q_names.len() > 20 {
+            eprintln!("[ggml]   ... ({} more)", q_names.len() - 20);
+        }
+    }
+
+    Ok(gw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1863,6 +1908,54 @@ mod tests {
     fn test_ggml_dtype_iq4_block_size() {
         assert_eq!(GgmlDType::IQ4NL.block_size(), 32);
         assert_eq!(GgmlDType::IQ4XS.block_size(), 256);
+    }
+
+    #[test]
+    fn test_gguf_shard_kind_for_hf_name() {
+        // Column-parallel: q/k/v/gate/up + embed + lm_head.
+        for name in [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.7.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.5.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ] {
+            assert_eq!(
+                gguf_shard_kind_for_hf_name(name),
+                GgufShardKind::ShardDim0,
+                "expected ShardDim0 for {name}"
+            );
+        }
+
+        // Row-parallel: o_proj / down_proj.
+        for name in [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.7.mlp.down_proj.weight",
+            "model.layers.3.mlp.down_proj.bias",
+        ] {
+            assert_eq!(
+                gguf_shard_kind_for_hf_name(name),
+                GgufShardKind::ShardDim1,
+                "expected ShardDim1 for {name}"
+            );
+        }
+
+        // Replicate: norms (incl. q_norm / k_norm / final norm).
+        for name in [
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.5.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.norm.weight",
+        ] {
+            assert_eq!(
+                gguf_shard_kind_for_hf_name(name),
+                GgufShardKind::Replicate,
+                "expected Replicate for {name}"
+            );
+        }
     }
 
     #[test]

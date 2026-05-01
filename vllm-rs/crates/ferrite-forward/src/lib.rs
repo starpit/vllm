@@ -384,7 +384,10 @@ mod dispatcher {
         // required when more than one impl crate registers the same
         // HF arch (e.g. `ferrite-model-deepseek-v3` LoRA-Q variants
         // alongside `ferrite-model-deepseek-v3-flat` direct-Q variants
-        // for `DeepseekV3ForCausalLM` checkpoints with `q_lora_rank=null`).
+        // for `DeepseekV3ForCausalLM` checkpoints with `q_lora_rank=null`,
+        // and `ferrite-model-mistral` claiming `LlamaForCausalLM` as an
+        // alias for GGUFs whose `general.architecture = "llama"` flattens
+        // Llama-2 and Mistral together).
         // The inner `transpose` flips `Result<Option<W>>` →
         // `Option<Result<W>>` so `find_map` treats `Ok(None)` as
         // "keep looking" and any other shape as a hit.

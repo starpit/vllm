@@ -59,6 +59,18 @@ struct ForwardArgs {
     /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
     /// small prefill.
     sk_buckets: Vec<u64>,
+    /// Additional HF arch tags this arch is willing to claim, beyond
+    /// the union of model `architectures` lists. Used so GGUF-coalesced
+    /// arch tags route here too: a GGUF with
+    /// `general.architecture = "llama"` translates to
+    /// `LlamaForCausalLM`, but the file may actually be Mistral. Mistral
+    /// declares `extra_hf_arches = ["LlamaForCausalLM"]` so the
+    /// dispatcher tries it after Llama's fingerprints reject. The
+    /// dispatcher's per-registration walk is fingerprint-gated, so a
+    /// safetensors Llama checkpoint is never mis-routed to Mistral —
+    /// Mistral's per-model `fingerprint_matches` rejects on vocab /
+    /// hidden / etc.
+    extra_hf_arches: Vec<String>,
     /// Span used for error reporting when a required arg is
     /// missing.
     span: Span,
@@ -69,6 +81,7 @@ impl Parse for ForwardArgs {
         let span = input.span();
         let mut workloads: Option<Vec<u64>> = None;
         let mut sk_buckets: Option<Vec<u64>> = None;
+        let mut extra_hf_arches: Option<Vec<String>> = None;
 
         fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
             let list;
@@ -84,6 +97,20 @@ impl Parse for ForwardArgs {
             Ok(pts)
         }
 
+        fn parse_str_list(input: ParseStream) -> syn::Result<Vec<String>> {
+            let list;
+            syn::bracketed!(list in input);
+            let mut items = Vec::new();
+            while !list.is_empty() {
+                let s: syn::LitStr = list.parse()?;
+                items.push(s.value());
+                if !list.is_empty() {
+                    list.parse::<Token![,]>()?;
+                }
+            }
+            Ok(items)
+        }
+
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -91,6 +118,7 @@ impl Parse for ForwardArgs {
             match key.to_string().as_str() {
                 "workloads" => workloads = Some(parse_u64_list(input)?),
                 "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
+                "extra_hf_arches" => extra_hf_arches = Some(parse_str_list(input)?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -119,6 +147,7 @@ impl Parse for ForwardArgs {
         Ok(Self {
             workloads,
             sk_buckets,
+            extra_hf_arches: extra_hf_arches.unwrap_or_default(),
             span,
         })
     }
@@ -907,10 +936,16 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
 
     // Union of HF `architectures: [..]` strings across every compiled
     // model — the set of `arch_hint` values `ferrite_forward::try_load`
-    // will route to this arch. Deduped + sorted for determinism.
+    // will route to this arch. Plus any `extra_hf_arches = [..]`
+    // declared on the `#[forward]` attribute (used so GGUF-coalesced
+    // arch tags route here too — e.g. Mistral declares
+    // `LlamaForCausalLM` because GGUFs report
+    // `general.architecture = "llama"` for the Mistral family).
+    // Deduped + sorted for determinism.
     let mut hf_arches: Vec<String> = models
         .iter()
         .flat_map(|m| m.architectures.iter().cloned())
+        .chain(args.extra_hf_arches.iter().cloned())
         .collect();
     hf_arches.sort();
     hf_arches.dedup();

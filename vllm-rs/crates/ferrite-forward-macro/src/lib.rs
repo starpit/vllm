@@ -18,6 +18,8 @@
 //! time — the failure mode `feedback_integration_test_per_phase`
 //! memorializes.
 
+use std::path::Path;
+
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -951,7 +953,13 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     hf_arches.dedup();
 
     let arch_ident = Ident::new(&arch_name, carrier.sig.ident.span());
-    let arch_dispatch_ts = emit_arch_dispatcher(&arch_ident, &hf_arches, &arch_dispatch_arms);
+    let arch_dispatch_ts = emit_arch_dispatcher(
+        &arch_ident,
+        &hf_arches,
+        &arch_dispatch_arms,
+        &models_dir,
+        carrier.sig.ident.span(),
+    )?;
 
     // Emit items INLINE at the carrier's scope (no wrapping mod).
     // The carrier fn itself is consumed — it was only a host for
@@ -1041,9 +1049,11 @@ fn emit_arch_dispatcher(
     arch_ident: &Ident,
     hf_arches: &[String],
     arms: &[DispatchArm],
-) -> proc_macro2::TokenStream {
+    models_dir: &Path,
+    error_span: Span,
+) -> syn::Result<proc_macro2::TokenStream> {
     if arms.is_empty() {
-        return quote! {};
+        return Ok(quote! {});
     }
 
     // Variant ident = PascalCase of the model ident (e.g.
@@ -1224,7 +1234,95 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    quote! {
+    // GGUF auto-registration. Driven entirely by `quantizations.json`:
+    // an arch opts in by listing `"ggml"` (string or
+    // `{"ggml": {<fields>}}` object form). Every per-arch knob —
+    // qk_permute, gguf_arch override, tensor_renames,
+    // metadata reads, defaults, the Llama-3 rope-scale heuristic —
+    // is carried as static data through `ferrite_gguf::register!`.
+    let gguf_spec = config::load_gguf_spec(models_dir).map_err(|e| {
+        syn::Error::new(
+            error_span,
+            format!(
+                "quantizations.json gguf spec in {}: {e}",
+                models_dir.display()
+            ),
+        )
+    })?;
+    let gguf_register_emit: proc_macro2::TokenStream = match (gguf_spec, hf_arches.first()) {
+        // No `ggml` entry, or no HF arch declared (FERRITE_MODELS-
+        // filtered build with empty configs/) — emit nothing.
+        (None, _) | (_, None) => quote! {},
+        (Some(spec), Some(hf_first)) => {
+            let gguf_arch_lit = proc_macro2::Literal::string(
+                &spec.gguf_arch.unwrap_or_else(|| arch_ident.to_string()),
+            );
+            let hf_arch_class_lit = proc_macro2::Literal::string(hf_first);
+            let qk = spec.qk_permute;
+            let rope = spec.llama3_rope_scaling_inference;
+            let renames: Vec<proc_macro2::TokenStream> = spec
+                .tensor_renames
+                .iter()
+                .map(|(g, h)| {
+                    let g = proc_macro2::Literal::string(g);
+                    let h = proc_macro2::Literal::string(h);
+                    quote! { (#g, #h) }
+                })
+                .collect();
+            let m_u32: Vec<proc_macro2::TokenStream> = spec
+                .metadata_u32
+                .iter()
+                .map(|(g, e)| {
+                    let g = proc_macro2::Literal::string(g);
+                    let e = proc_macro2::Literal::string(e);
+                    quote! { (#g, #e) }
+                })
+                .collect();
+            let m_f32: Vec<proc_macro2::TokenStream> = spec
+                .metadata_f32
+                .iter()
+                .map(|(g, e)| {
+                    let g = proc_macro2::Literal::string(g);
+                    let e = proc_macro2::Literal::string(e);
+                    quote! { (#g, #e) }
+                })
+                .collect();
+            let d_u32: Vec<proc_macro2::TokenStream> = spec
+                .metadata_defaults_u32
+                .iter()
+                .map(|(k, v)| {
+                    let k = proc_macro2::Literal::string(k);
+                    let v = proc_macro2::Literal::u32_suffixed(*v);
+                    quote! { (#k, #v) }
+                })
+                .collect();
+            let d_f32: Vec<proc_macro2::TokenStream> = spec
+                .metadata_defaults_f32
+                .iter()
+                .map(|(k, v)| {
+                    let k = proc_macro2::Literal::string(k);
+                    let v = proc_macro2::Literal::f32_suffixed(*v);
+                    quote! { (#k, #v) }
+                })
+                .collect();
+            quote! {
+                #[cfg(feature = "cuda")]
+                ::ferrite_gguf::register! {
+                    gguf_arch = #gguf_arch_lit,
+                    hf_arch_class = #hf_arch_class_lit,
+                    qk_permute = #qk,
+                    tensor_renames = [ #(#renames),* ],
+                    metadata_u32 = [ #(#m_u32),* ],
+                    metadata_f32 = [ #(#m_f32),* ],
+                    metadata_defaults_u32 = [ #(#d_u32),* ],
+                    metadata_defaults_f32 = [ #(#d_f32),* ],
+                    llama3_rope_scaling_inference = #rope,
+                }
+            }
+        }
+    };
+
+    Ok(quote! {
         /// One variant per compiled model config. Holds that
         /// model's specialized `Weights`.
         #[cfg(feature = "cuda")]
@@ -1362,7 +1460,13 @@ fn emit_arch_dispatcher(
                 dump_all: || vec![ #(#dump_rows),* ],
             }
         }
-    }
+
+        // GGUF arch registration: empty when the arch's
+        // `quantizations.json` has no `"ggml"` entry; otherwise one
+        // `ferrite_gguf::register! { ... }` block. All per-arch GGUF
+        // data flows through `quantizations.json`.
+        #gguf_register_emit
+    })
 }
 
 /// PascalCase a snake_case ident while preserving underscores

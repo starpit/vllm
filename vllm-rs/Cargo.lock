@@ -2025,6 +2025,7 @@ name = "ferrite-gguf"
 version = "0.1.0"
 dependencies = [
  "byteorder",
+ "inventory",
  "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
@@ -2054,6 +2055,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2065,6 +2067,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2076,6 +2079,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2098,6 +2102,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2109,6 +2114,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2120,6 +2126,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2131,6 +2138,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2142,6 +2150,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2153,6 +2162,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2164,6 +2174,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]
@@ -2175,6 +2186,7 @@ dependencies = [
  "anyhow",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-kernels",
  "tracing",
 ]

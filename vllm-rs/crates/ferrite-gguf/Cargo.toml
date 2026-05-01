@@ -11,6 +11,7 @@ byteorder = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tokenizers = { workspace = true }
+inventory = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

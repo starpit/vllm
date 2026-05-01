@@ -1357,23 +1357,20 @@ impl GgufGpuWeights {
         let host_buf = ferrite_cuda_core::driver::mem_alloc_host(max_tensor_bytes)?;
 
         // GGML's RoPE convention pre-permutes q_proj / k_proj rows
-        // (interleaved pairs) at file-write time, BUT only for
-        // archs whose `convert_hf_to_gguf` class derives from
-        // `LlamaModel` (which calls `permute()` in its
-        // `modify_tensors`). Other archs (Qwen2/3, Gemma2/3,
-        // CommandR, DeepSeekV2/V3, Phi3) write q/k unpermuted —
-        // un-permuting on load would silently break them. The
-        // discriminator is `general.architecture`. Verified via
-        // weight-byte comparison: bartowski-Llama-3.2-3B Q4_K_M
-        // un-permute → 0.07 maxdiff vs safetensors (Q4_K noise),
-        // raw → 1.3 (broken). Whitelist starts conservatively at
-        // `llama` (covers Llama-2/3.x and Llama-tagged Mistral
-        // GGUFs); add other entries as each arch is verified.
+        // (interleaved pairs) at file-write time. Per-arch decision —
+        // each ferrite-model-X declares
+        // `qk_permute: true|false` in its `configs/quantizations.json`
+        // ggml entry, and that flag flows through the
+        // `ferrite_gguf::register!` block the macro emits.
         let qk_arch = content
             .metadata
             .get("general.architecture")
             .and_then(|v| v.to_string().ok().cloned());
-        let qk_permuted = matches!(qk_arch.as_deref(), Some("llama"));
+        let qk_permuted = qk_arch
+            .as_deref()
+            .and_then(ferrite_gguf::find_spec)
+            .map(|s| s.qk_permute)
+            .unwrap_or(false);
         let qk_meta: Option<(usize, usize, usize)> = qk_arch.as_deref().and_then(|arch| {
             let head_count = content
                 .metadata
@@ -1402,8 +1399,9 @@ impl GgufGpuWeights {
             Some((head_count, head_count_kv, key_length))
         });
 
+        let gguf_arch_str = qk_arch.as_deref().unwrap_or("");
         for (gguf_name, info) in &content.tensor_infos {
-            let hf_name = ferrite_gguf::gguf_to_hf_name(gguf_name);
+            let hf_name = ferrite_gguf::gguf_to_hf_name(gguf_name, gguf_arch_str);
             // `gguf_format` already reverses the on-disk ggml dim
             // order to HF's [rows, cols] = [out, in] convention, so
             // `info.shape.dims()` is already row-major-friendly here.

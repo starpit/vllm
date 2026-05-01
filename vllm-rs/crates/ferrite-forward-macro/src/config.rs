@@ -278,15 +278,34 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     let quantizations_path = dir.join("quantizations.json");
     if quantizations_path.exists() {
         let (_, qjson) = read_json_file(&quantizations_path)?;
-        let presets: Vec<String> = qjson
+        // Each entry is either a bare preset name (`"fp8-..."`,
+        // `"ggml"`) or a single-key object carrying registration data
+        // for that preset's runtime side. Currently used by `ggml`
+        // to forward arch-specific GGUF spec (qk_permute, gguf_arch
+        // override, tensor_renames, metadata reads) into the
+        // `ferrite_gguf::register!` call the macro emits. The preset
+        // overlay loop here just needs the preset NAMES; the
+        // structured fields are picked up later by `load_gguf_spec`.
+        let entries = qjson
             .get("quantizations")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ConfigError::BadQuantizations {
                 path: quantizations_path.clone(),
-                reason: "expected `{\"quantizations\": [\"<preset>\", ...]}` string array",
-            })?
+                reason: "expected `{\"quantizations\": [<entry>, ...]}` array",
+            })?;
+        let presets: Vec<String> = entries
             .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
+            .filter_map(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else if let Some(obj) = v.as_object()
+                    && obj.len() == 1
+                {
+                    obj.keys().next().cloned()
+                } else {
+                    None
+                }
+            })
             .collect();
 
         // Presets live in the shared `ferrite-quantizations` crate.
@@ -429,6 +448,142 @@ fn read_json_file(path: &Path) -> Result<(String, serde_json::Value), ConfigErro
             source,
         })?;
     Ok((contents, json))
+}
+
+/// Per-arch GGUF registration data harvested from `quantizations.json`.
+/// Populated only when the arch's quantizations list contains a `"ggml"`
+/// entry (string or object form). Forwarded into the
+/// `ferrite_gguf::register!` call the macro emits.
+#[derive(Debug, Clone, Default)]
+pub struct GgufSpec {
+    /// GGUF `general.architecture` override. Defaults to the `arch`
+    /// ident on the `#[forward]` block; set explicitly when the arch
+    /// reports a non-matching tag (Mistral GGUFs report `"llama"`,
+    /// DeepSeek-V2 `"deepseek2"`, etc.).
+    pub gguf_arch: Option<String>,
+    pub qk_permute: bool,
+    pub llama3_rope_scaling_inference: bool,
+    /// Per-suffix tensor renames: `(gguf_suffix, hf_suffix)` pairs.
+    pub tensor_renames: Vec<(String, String)>,
+    /// `(gguf_key_template, extra_key)` u32 reads. The template may
+    /// contain `{arch}` which `apply_metadata` substitutes.
+    pub metadata_u32: Vec<(String, String)>,
+    pub metadata_f32: Vec<(String, String)>,
+    /// Constants always inserted into `HfModelConfig.extra` (split by
+    /// numeric type so the macro can emit the right `GgufDefault`
+    /// variant).
+    pub metadata_defaults_u32: Vec<(String, u32)>,
+    pub metadata_defaults_f32: Vec<(String, f32)>,
+}
+
+/// Read the arch's `quantizations.json` and return its GGUF spec —
+/// `Some` when the list contains a `"ggml"` entry (string or object
+/// form), `None` otherwise.
+///
+/// Schema for the structured form (all fields optional):
+///
+/// ```json
+/// {"ggml": {
+///   "qk_permute": true,
+///   "gguf_arch": "llama",
+///   "tensor_renames": {
+///     "attn_qkv.weight": "self_attn.qkv_proj.weight"
+///   },
+///   "metadata_u32": {"{arch}.attention.sliding_window": "sliding_window"},
+///   "metadata_f32": {"{arch}.attention.scale": "attention_multiplier"},
+///   "metadata_defaults": {"sliding_window_pattern": 6},
+///   "llama3_rope_scaling_inference": true
+/// }}
+/// ```
+pub fn load_gguf_spec(dir: &Path) -> Result<Option<GgufSpec>, ConfigError> {
+    let path = dir.join("quantizations.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let (_, qjson) = read_json_file(&path)?;
+    let arr = match qjson.get("quantizations").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let mut data: Option<&serde_json::Value> = None;
+    let mut found_bare = false;
+    for entry in arr {
+        if entry.as_str() == Some("ggml") {
+            found_bare = true;
+        }
+        if let Some(obj) = entry.as_object()
+            && let Some(d) = obj.get("ggml")
+        {
+            data = Some(d);
+            break;
+        }
+    }
+    if !found_bare && data.is_none() {
+        return Ok(None);
+    }
+    let mut spec = GgufSpec::default();
+    let Some(data) = data else {
+        return Ok(Some(spec));
+    };
+    let obj = data
+        .as_object()
+        .ok_or_else(|| ConfigError::BadQuantizations {
+            path: path.clone(),
+            reason: "`ggml` entry must be a string or `{\"ggml\": {<fields>}}` object",
+        })?;
+    let bad = || ConfigError::BadQuantizations {
+        path: path.clone(),
+        reason: "ggml field has wrong shape",
+    };
+    if let Some(v) = obj.get("gguf_arch").and_then(|v| v.as_str()) {
+        spec.gguf_arch = Some(v.to_string());
+    }
+    if let Some(v) = obj.get("qk_permute").and_then(|v| v.as_bool()) {
+        spec.qk_permute = v;
+    }
+    if let Some(v) = obj
+        .get("llama3_rope_scaling_inference")
+        .and_then(|v| v.as_bool())
+    {
+        spec.llama3_rope_scaling_inference = v;
+    }
+    if let Some(v) = obj.get("tensor_renames") {
+        let map = v.as_object().ok_or_else(bad)?;
+        for (k, val) in map {
+            spec.tensor_renames
+                .push((k.clone(), val.as_str().ok_or_else(bad)?.to_string()));
+        }
+    }
+    if let Some(v) = obj.get("metadata_u32") {
+        let map = v.as_object().ok_or_else(bad)?;
+        for (k, val) in map {
+            spec.metadata_u32
+                .push((k.clone(), val.as_str().ok_or_else(bad)?.to_string()));
+        }
+    }
+    if let Some(v) = obj.get("metadata_f32") {
+        let map = v.as_object().ok_or_else(bad)?;
+        for (k, val) in map {
+            spec.metadata_f32
+                .push((k.clone(), val.as_str().ok_or_else(bad)?.to_string()));
+        }
+    }
+    if let Some(v) = obj.get("metadata_defaults") {
+        let map = v.as_object().ok_or_else(bad)?;
+        for (k, val) in map {
+            // Pick the variant by JSON type — integers go to u32,
+            // numbers to f32. Bools/strings are not currently used.
+            if let Some(n) = val.as_u64() {
+                spec.metadata_defaults_u32
+                    .push((k.clone(), n.try_into().map_err(|_| bad())?));
+            } else if let Some(f) = val.as_f64() {
+                spec.metadata_defaults_f32.push((k.clone(), f as f32));
+            } else {
+                return Err(bad());
+            }
+        }
+    }
+    Ok(Some(spec))
 }
 
 /// Extract a `Path::file_stem` as a String, erroring if it's

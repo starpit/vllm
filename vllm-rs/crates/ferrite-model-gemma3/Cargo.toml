@@ -20,5 +20,6 @@ nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forwa
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-forward = { path = "../ferrite-forward" }
+ferrite-gguf = { path = "../ferrite-gguf" }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -3,17 +3,17 @@
 //!
 //! Format-level mechanics: the binary parser (in `format`), the
 //! `GgufFile` reader, tokenizer reconstruction, chat-template extraction,
-//! and (transitionally) the GGUF→HfModelConfig translator + tensor-name
-//! mapper.
+//! and the GGUF→HfModelConfig translator + tensor-name mapper.
 //!
-//! Per-arch concerns (tensor renames, qk-permute, GGUF arch aliasing,
-//! arch-specific metadata reads) belong in each `ferrite-model-X` crate
-//! — not here. The `gguf_model_config` and `gguf_to_hf_name` god-switches
-//! below are scheduled to be dismantled into per-arch declarations in
-//! subsequent commits; they're kept here transitionally so the format-level
-//! relocation lands as one self-contained step.
+//! Per-arch concerns (HF arch class, qk-permute, tensor renames,
+//! arch-specific metadata reads) live in each ferrite-model-X's
+//! `configs/quantizations.json` `ggml` entry. The `ferrite-forward`
+//! macro forwards each field straight into the [`register!`] call it
+//! emits. There are NO per-arch arms in this crate — every per-arch
+//! difference is a static-data record looked up by GGUF arch tag.
 
 pub mod format;
+mod spec;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -26,6 +26,11 @@ use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::weight::HfModelConfig;
 
 pub use crate::format::{Content, GgufDType, Shape, TensorInfo, Value, ValueType};
+pub use crate::spec::{GgufArchSpec, GgufDefault, apply_metadata, find_spec, lookup_rename};
+
+/// Re-export `inventory` so the `register!` macro's expansion resolves
+/// in consumer crates without their own `inventory` dep.
+pub use inventory;
 
 // ---------------------------------------------------------------------------
 // GgufFile
@@ -336,25 +341,25 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         .ok_or_else(|| ModelError::Other("GGUF missing general.architecture metadata".to_string()))?
         .to_string();
 
+    // Per-arch spec: declared by the matching ferrite-model-X via
+    // `configs/quantizations.json` `ggml` entry (the macro forwards
+    // each field into a `register!` call). The spec carries
+    // hf_arch_class, qk_permute, tensor renames, and metadata reads
+    // — every per-arch knob lives in the JSON, not here.
+    let spec = find_spec(&arch).ok_or_else(|| {
+        ModelError::Other(format!(
+            "no GGUF arch registered for `general.architecture = \"{arch}\"`. \
+             Each ferrite-model-X declares its GGUF support by listing \
+             `\"ggml\"` (or a `{{\"ggml\": {{...}}}}` object form for archs \
+             that need overrides) in `configs/quantizations.json`."
+        ))
+    })?;
+
     let mut config = HfModelConfig {
         model_type: Some(arch.clone()),
+        architectures: vec![spec.hf_arch_class.to_string()],
         ..Default::default()
     };
-
-    // Map GGUF architecture name to HF architecture class.
-    let hf_arch = match arch.as_str() {
-        "llama" => "LlamaForCausalLM",
-        "qwen2" => "Qwen2ForCausalLM",
-        "qwen3" => "Qwen3ForCausalLM",
-        "qwen35" => "Qwen3NextForCausalLM",
-        "gemma3" => "Gemma3ForCausalLM",
-        "gemma2" | "gemma" => "Gemma2ForCausalLM",
-        "mistral" => "MistralForCausalLM",
-        "phi3" | "phi" => "Phi3ForCausalLM",
-        "deepseek2" => "DeepseekV2ForCausalLM",
-        other => other, // pass through as-is
-    };
-    config.architectures = vec![hf_arch.to_string()];
 
     // Read hyperparameters using the architecture prefix.
     config.num_hidden_layers = gguf
@@ -442,30 +447,6 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
             "rope_scaling".to_string(),
             serde_json::Value::Object(scaling),
         );
-    } else if arch == "llama" {
-        // Infer Llama-3.x llama3 rope_scaling when the GGUF omits the scaling keys.
-        // Signature: rope_theta == 500000 (Llama 3 base) AND context_length > 8192 (extended).
-        // Values match HF config for Llama-3.1 / 3.2 / 3.3 (all use identical defaults).
-        let theta = config.rope_theta.unwrap_or(10000.0);
-        let ctx = config.max_position_embeddings.unwrap_or(0);
-        if (theta - 500000.0).abs() < 1.0 && ctx > 8192 {
-            let mut scaling = serde_json::Map::new();
-            scaling.insert(
-                "rope_type".to_string(),
-                serde_json::Value::String("llama3".to_string()),
-            );
-            scaling.insert("factor".to_string(), serde_json::Value::from(32.0));
-            scaling.insert("low_freq_factor".to_string(), serde_json::Value::from(1.0));
-            scaling.insert("high_freq_factor".to_string(), serde_json::Value::from(4.0));
-            scaling.insert(
-                "original_max_position_embeddings".to_string(),
-                serde_json::Value::from(8192u64),
-            );
-            config.extra.insert(
-                "rope_scaling".to_string(),
-                serde_json::Value::Object(scaling),
-            );
-        }
     }
 
     // Compute head_dim: try arch-specific key_length first, fall back to hidden/heads.
@@ -477,171 +458,11 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         config.head_dim = Some(hidden / heads);
     }
 
-    // Gemma3-specific metadata.
-    if arch == "gemma3" {
-        // Sliding window.
-        if let Some(sw) = gguf.get_metadata_u32(&format!("{arch}.attention.sliding_window")) {
-            config
-                .extra
-                .insert("sliding_window".to_string(), serde_json::json!(sw));
-            // Default sliding_window_pattern = 6 when sliding_window is present.
-            if !config.extra.contains_key("sliding_window_pattern") {
-                config
-                    .extra
-                    .insert("sliding_window_pattern".to_string(), serde_json::json!(6));
-            }
-        }
-
-        // Local RoPE theta (for sliding window layers).
-        let local_freq = gguf
-            .get_metadata_f32(&format!("{arch}.rope.local.freq_base"))
-            .unwrap_or(10000.0);
-        config.extra.insert(
-            "rope_local_base_freq".to_string(),
-            serde_json::json!(local_freq as f64),
-        );
-
-        // query_pre_attn_scalar defaults to head_dim.
-        let head_dim = config.head_dim.unwrap_or(256);
-        config.extra.insert(
-            "query_pre_attn_scalar".to_string(),
-            serde_json::json!(head_dim as f64),
-        );
-    }
-
-    // Qwen3.5 (qwen35) specific metadata: SSM/hybrid attention fields.
-    if arch == "qwen35" {
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.ssm.conv_kernel")) {
-            config
-                .extra
-                .insert("linear_conv_kernel_dim".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.ssm.state_size")) {
-            config
-                .extra
-                .insert("linear_value_head_dim".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.ssm.group_count")) {
-            config
-                .extra
-                .insert("linear_num_value_heads".to_string(), serde_json::json!(v));
-            // linear_num_key_heads defaults to same as group_count.
-            config
-                .extra
-                .insert("linear_num_key_heads".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.full_attention_interval")) {
-            config
-                .extra
-                .insert("full_attention_interval".to_string(), serde_json::json!(v));
-        }
-        // Derive partial_rotary_factor from rope.dimension_count / head_dim.
-        if let Some(rope_dim) = gguf.get_metadata_u32(&format!("{arch}.rope.dimension_count"))
-            && let Some(hd) = config.head_dim
-        {
-            let factor = rope_dim as f64 / hd as f64;
-            config.extra.insert(
-                "partial_rotary_factor".to_string(),
-                serde_json::json!(factor),
-            );
-        }
-        // linear_num_key_heads from ssm.time_step_rank.
-        if let Some(time_step_rank) = gguf.get_metadata_u32(&format!("{arch}.ssm.time_step_rank")) {
-            config.extra.insert(
-                "linear_num_key_heads".to_string(),
-                serde_json::json!(time_step_rank),
-            );
-        }
-        // linear_key_head_dim: derive from ssm.inner_size.
-        if let Some(inner) = gguf.get_metadata_u32(&format!("{arch}.ssm.inner_size")) {
-            config
-                .extra
-                .insert("ssm_inner_size".to_string(), serde_json::json!(inner));
-        }
-    }
-
-    // DeepSeek V2/V3 specific metadata (MLA + MoE fields).
-    if arch == "deepseek2" {
-        // MLA attention dimensions
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.attention.q_lora_rank")) {
-            config
-                .extra
-                .insert("q_lora_rank".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.attention.kv_lora_rank")) {
-            config
-                .extra
-                .insert("kv_lora_rank".to_string(), serde_json::json!(v));
-        }
-        // MLA head dimensions: try key_length_mla (new llama.cpp), then derive from
-        // key_length + kv_lora_rank (older GGUF), then fall back to DeepSeek defaults.
-        let rope_dim = gguf
-            .get_metadata_u32(&format!("{arch}.rope.dimension_count"))
-            .unwrap_or(64); // All DeepSeek V2/V3 variants use 64
-        if let Some(key_len_mla) =
-            gguf.get_metadata_u32(&format!("{arch}.attention.key_length_mla"))
-        {
-            // New format: key_length_mla = qk_nope + qk_rope
-            let nope_dim = key_len_mla.saturating_sub(rope_dim);
-            config
-                .extra
-                .insert("qk_nope_head_dim".to_string(), serde_json::json!(nope_dim));
-            config
-                .extra
-                .insert("qk_rope_head_dim".to_string(), serde_json::json!(rope_dim));
-        } else {
-            // Older GGUF without key_length_mla: all DeepSeek V2/V3 variants
-            // use qk_nope_head_dim=128, qk_rope_head_dim=64.
-            config
-                .extra
-                .insert("qk_nope_head_dim".to_string(), serde_json::json!(128u32));
-            config
-                .extra
-                .insert("qk_rope_head_dim".to_string(), serde_json::json!(rope_dim));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.attention.value_length_mla")) {
-            config
-                .extra
-                .insert("v_head_dim".to_string(), serde_json::json!(v));
-        } else {
-            // All DeepSeek V2/V3 variants use v_head_dim=128
-            config
-                .extra
-                .insert("v_head_dim".to_string(), serde_json::json!(128u32));
-        }
-        // MoE fields
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_count")) {
-            config
-                .extra
-                .insert("n_routed_experts".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_used_count")) {
-            config
-                .extra
-                .insert("num_experts_per_tok".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_shared_count")) {
-            config
-                .extra
-                .insert("n_shared_experts".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_feed_forward_length")) {
-            config
-                .extra
-                .insert("moe_intermediate_size".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.leading_dense_block_count")) {
-            config
-                .extra
-                .insert("first_k_dense_replace".to_string(), serde_json::json!(v));
-        }
-        if let Some(v) = gguf.get_metadata_f32(&format!("{arch}.expert_weights_scale")) {
-            config.extra.insert(
-                "routed_scaling_factor".to_string(),
-                serde_json::json!(v as f64),
-            );
-        }
-    }
+    // Per-arch metadata reads + defaults + Llama-3 rope-scaling
+    // inference, all driven by the spec's pure-data declarations
+    // (Gemma3 sliding window, Granite multipliers, etc.). No
+    // per-arch arms here.
+    apply_metadata(spec, gguf, &mut config);
 
     // EOS token ID (stored in tokenizer.ggml.eos_token_id or general.eos_token_id).
     if let Some(eos) = gguf.get_metadata_u32("tokenizer.ggml.eos_token_id") {
@@ -673,13 +494,38 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
 // Tensor name mapping: GGUF (llama.cpp) → HuggingFace convention
 // ---------------------------------------------------------------------------
 
-/// Map a GGUF tensor name to the HuggingFace convention.
+/// Map a GGUF tensor name to the HuggingFace convention, given the
+/// GGUF's `general.architecture` value.
 ///
 /// llama.cpp uses names like `blk.0.attn_q.weight` while HF uses
-/// `model.layers.0.self_attn.q_proj.weight`. This mapping is needed so
-/// that quantized models can reuse the same config/init code as safetensors
-/// models.
-pub fn gguf_to_hf_name(gguf_name: &str) -> String {
+/// `model.layers.0.self_attn.q_proj.weight`. The default rename is
+/// Llama-shape and covers every arm that's globally unambiguous
+/// (per-bias, MLA, MoE, etc.). When an arch's GGUF tensor name maps
+/// to a different HF target than the default — Phi3's fused
+/// `attn_qkv` + `ffn_up` (gate-up), Gemma2/3's pre/post norms — that
+/// arch's `configs/quantizations.json` declares the override under
+/// `tensor_renames`, and the spec's lookup runs first.
+pub fn gguf_to_hf_name(gguf_name: &str, gguf_arch: &str) -> String {
+    // Per-layer overrides apply first. The layer number is preserved
+    // and only the suffix gets the override lookup.
+    if let Some(rest) = gguf_name.strip_prefix("blk.")
+        && let Some(dot_pos) = rest.find('.')
+    {
+        let layer_num = &rest[..dot_pos];
+        let suffix = &rest[dot_pos + 1..];
+        if let Some(spec) = find_spec(gguf_arch)
+            && let Some(hf_suffix) = lookup_rename(spec, suffix)
+        {
+            return format!("model.layers.{layer_num}.{hf_suffix}");
+        }
+    }
+    default_gguf_to_hf_name(gguf_name)
+}
+
+/// Llama-shape default rename. Public so per-arch overrides can fall
+/// through to it for tensor names they don't override (typically all
+/// of them — overrides are usually 2-4 arms).
+pub fn default_gguf_to_hf_name(gguf_name: &str) -> String {
     // Global tensors.
     if gguf_name == "token_embd.weight" {
         return "model.embed_tokens.weight".to_string();
@@ -982,37 +828,40 @@ mod tests {
     #[test]
     fn test_gguf_to_hf_name_embedding() {
         assert_eq!(
-            gguf_to_hf_name("token_embd.weight"),
+            default_gguf_to_hf_name("token_embd.weight"),
             "model.embed_tokens.weight"
         );
     }
 
     #[test]
     fn test_gguf_to_hf_name_output_norm() {
-        assert_eq!(gguf_to_hf_name("output_norm.weight"), "model.norm.weight");
+        assert_eq!(
+            default_gguf_to_hf_name("output_norm.weight"),
+            "model.norm.weight"
+        );
     }
 
     #[test]
     fn test_gguf_to_hf_name_lm_head() {
-        assert_eq!(gguf_to_hf_name("output.weight"), "lm_head.weight");
+        assert_eq!(default_gguf_to_hf_name("output.weight"), "lm_head.weight");
     }
 
     #[test]
     fn test_gguf_to_hf_name_attention() {
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_q.weight"),
+            default_gguf_to_hf_name("blk.0.attn_q.weight"),
             "model.layers.0.self_attn.q_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.5.attn_k.weight"),
+            default_gguf_to_hf_name("blk.5.attn_k.weight"),
             "model.layers.5.self_attn.k_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.31.attn_v.weight"),
+            default_gguf_to_hf_name("blk.31.attn_v.weight"),
             "model.layers.31.self_attn.v_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_output.weight"),
+            default_gguf_to_hf_name("blk.0.attn_output.weight"),
             "model.layers.0.self_attn.o_proj.weight"
         );
     }
@@ -1020,11 +869,11 @@ mod tests {
     #[test]
     fn test_gguf_to_hf_name_norms() {
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_norm.weight"),
+            default_gguf_to_hf_name("blk.0.attn_norm.weight"),
             "model.layers.0.input_layernorm.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.ffn_norm.weight"),
+            default_gguf_to_hf_name("blk.0.ffn_norm.weight"),
             "model.layers.0.post_attention_layernorm.weight"
         );
     }
@@ -1032,15 +881,15 @@ mod tests {
     #[test]
     fn test_gguf_to_hf_name_mlp() {
         assert_eq!(
-            gguf_to_hf_name("blk.0.ffn_gate.weight"),
+            default_gguf_to_hf_name("blk.0.ffn_gate.weight"),
             "model.layers.0.mlp.gate_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.ffn_up.weight"),
+            default_gguf_to_hf_name("blk.0.ffn_up.weight"),
             "model.layers.0.mlp.up_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.ffn_down.weight"),
+            default_gguf_to_hf_name("blk.0.ffn_down.weight"),
             "model.layers.0.mlp.down_proj.weight"
         );
     }
@@ -1049,32 +898,32 @@ mod tests {
     fn test_gguf_to_hf_name_deepseek_mla() {
         // MLA attention
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_q_a.weight"),
+            default_gguf_to_hf_name("blk.0.attn_q_a.weight"),
             "model.layers.0.self_attn.q_a_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_q_a_norm.weight"),
+            default_gguf_to_hf_name("blk.0.attn_q_a_norm.weight"),
             "model.layers.0.self_attn.q_a_layernorm.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_q_b.weight"),
+            default_gguf_to_hf_name("blk.0.attn_q_b.weight"),
             "model.layers.0.self_attn.q_b_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_kv_a_mqa.weight"),
+            default_gguf_to_hf_name("blk.0.attn_kv_a_mqa.weight"),
             "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_kv_a_norm.weight"),
+            default_gguf_to_hf_name("blk.0.attn_kv_a_norm.weight"),
             "model.layers.0.self_attn.kv_a_layernorm.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_kv_b.weight"),
+            default_gguf_to_hf_name("blk.0.attn_kv_b.weight"),
             "model.layers.0.self_attn.kv_b_proj.weight"
         );
         // DeepSeek uses attn_o (not attn_output)
         assert_eq!(
-            gguf_to_hf_name("blk.0.attn_o.weight"),
+            default_gguf_to_hf_name("blk.0.attn_o.weight"),
             "model.layers.0.self_attn.o_proj.weight"
         );
     }
@@ -1083,38 +932,38 @@ mod tests {
     fn test_gguf_to_hf_name_deepseek_moe() {
         // Router gate
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_gate_inp.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_gate_inp.weight"),
             "model.layers.5.mlp.gate.weight"
         );
         // Fused expert weights
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_gate_exps.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_gate_exps.weight"),
             "model.layers.5.mlp.experts.fused_gate_exps.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_up_exps.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_up_exps.weight"),
             "model.layers.5.mlp.experts.fused_up_exps.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_down_exps.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_down_exps.weight"),
             "model.layers.5.mlp.experts.fused_down_exps.weight"
         );
         // Shared experts
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_gate_shexp.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_gate_shexp.weight"),
             "model.layers.5.mlp.shared_experts.gate_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_up_shexp.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_up_shexp.weight"),
             "model.layers.5.mlp.shared_experts.up_proj.weight"
         );
         assert_eq!(
-            gguf_to_hf_name("blk.5.ffn_down_shexp.weight"),
+            default_gguf_to_hf_name("blk.5.ffn_down_shexp.weight"),
             "model.layers.5.mlp.shared_experts.down_proj.weight"
         );
         // Score correction bias
         assert_eq!(
-            gguf_to_hf_name("blk.5.exp_probs_b.bias"),
+            default_gguf_to_hf_name("blk.5.exp_probs_b.bias"),
             "model.layers.5.mlp.gate.e_score_correction_bias"
         );
     }
@@ -1122,7 +971,7 @@ mod tests {
     #[test]
     fn test_gguf_to_hf_name_unknown_passthrough() {
         assert_eq!(
-            gguf_to_hf_name("some.unknown.tensor"),
+            default_gguf_to_hf_name("some.unknown.tensor"),
             "some.unknown.tensor"
         );
     }
@@ -1130,7 +979,7 @@ mod tests {
     #[test]
     fn test_gguf_to_hf_name_unknown_layer_suffix() {
         assert_eq!(
-            gguf_to_hf_name("blk.0.some_unknown.weight"),
+            default_gguf_to_hf_name("blk.0.some_unknown.weight"),
             "model.layers.0.some_unknown.weight"
         );
     }

@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `GpuDevice`: the central runtime object combining streams, cuBLAS, and allocator.
+//! `GpuDevice`: the central runtime object combining streams and allocator.
 //!
 //! One `GpuDevice` per GPU. All kernel launches go on `compute_stream`.
 //! The `transfer_stream` handles async H2D/D2H copies for overlap.
+//!
+//! cuBLAS has been removed; all GEMM dispatch goes through CUTLASS
+//! kernels in `vllm-cuda/csrc/cutlass_*`.
 
 use crate::alloc::CachingAllocator;
-use crate::cublas::CublasHandle;
 use crate::driver;
 use anyhow::Result;
 use cudarc::driver::sys::{CUcontext, CUevent, CUstream};
 
-/// The GPU device runtime. Owns streams, cuBLAS handle, and caching allocator.
+/// The GPU device runtime. Owns streams and caching allocator.
 ///
 /// All model forward passes operate through this struct. One instance per GPU.
 /// Memory management uses a caching allocator (like PyTorch's CUDACachingAllocator)
@@ -20,7 +22,6 @@ pub struct GpuDevice {
     pub ctx: CUcontext,
     pub compute_stream: CUstream,
     pub transfer_stream: CUstream,
-    pub cublas: CublasHandle,
     /// Caching allocator — the ONLY allocator. Like PyTorch's CUDACachingAllocator.
     pub caching: CachingAllocator,
     /// Event for gating CPU reuse of pinned buffers after H2D transfer.
@@ -36,7 +37,7 @@ pub struct GpuDevice {
 impl GpuDevice {
     /// Initialize a GPU device.
     ///
-    /// Creates CUDA context, two streams, cuBLAS handle, and caching allocator.
+    /// Creates CUDA context, two streams, and caching allocator.
     pub fn new(device_id: i32) -> Result<Self> {
         unsafe {
             driver::init()?;
@@ -48,8 +49,7 @@ impl GpuDevice {
             let transfer_done = driver::event_create_disable_timing()?;
             let d2h_done = driver::event_create_disable_timing()?;
 
-            let mut caching = CachingAllocator::new();
-            let cublas = CublasHandle::new(compute_stream, &mut caching)?;
+            let caching = CachingAllocator::new();
             let num_sm = driver::device_get_num_sm(cu_device)?;
             let sm_version = driver::device_get_sm_version(cu_device)?;
 
@@ -65,7 +65,6 @@ impl GpuDevice {
                 ctx,
                 compute_stream,
                 transfer_stream,
-                cublas,
                 caching,
                 transfer_done,
                 d2h_done,
@@ -317,46 +316,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_device_gemm_f32() {
-        let mut dev = GpuDevice::new(0).expect("GpuDevice::new");
-        unsafe {
-            let host_a = driver::mem_alloc_host(16).unwrap();
-            let host_b = driver::mem_alloc_host(16).unwrap();
-            std::slice::from_raw_parts_mut(host_a as *mut f32, 4)
-                .copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
-            std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
-                .copy_from_slice(&[2.0, 3.0, 4.0, 5.0]);
-
-            let gpu_a = driver::mem_alloc(16).unwrap();
-            let gpu_b = driver::mem_alloc(16).unwrap();
-            driver::memcpy_htod_async(gpu_a, host_a, 16, dev.compute_stream).unwrap();
-            driver::memcpy_htod_async(gpu_b, host_b, 16, dev.compute_stream).unwrap();
-
-            let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
-            let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
-
-            let c = dev.cublas.gemm(a, b, &mut dev.caching);
-
-            let host_c = driver::mem_alloc_host(16).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.as_gpu_tensor().raw_ptr(), 16, dev.compute_stream)
-                .unwrap();
-            driver::stream_synchronize(dev.compute_stream).unwrap();
-
-            let result = std::slice::from_raw_parts(host_c as *const f32, 4);
-            let expected = [2.0, 4.0, 3.0, 5.0];
-            for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
-                assert!(
-                    (got - exp).abs() < 1e-3,
-                    "gemm mismatch at {i}: got {got}, expected {exp}"
-                );
-            }
-
-            driver::mem_free_host(host_a).unwrap();
-            driver::mem_free_host(host_b).unwrap();
-            driver::mem_free_host(host_c).unwrap();
-            driver::mem_free(gpu_a).unwrap();
-            driver::mem_free(gpu_b).unwrap();
-        }
-    }
+    // `test_device_gemm_f32` deleted: it exercised `dev.cublas.gemm`
+    // which no longer exists. cuBLAS has been removed; GEMM tests
+    // live in the CUTLASS-side wrapper crate (`ferrite-kernels`).
 }

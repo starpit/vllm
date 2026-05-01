@@ -1,8 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0
-//! GEMM sweep: cuBLAS baseline + every CUTLASS tile variant in
+//! GEMM sweep: every CUTLASS tile variant in
 //! `ferrite_kernels::cutlass::CUTLASS_TILE_ZOO` + GEMV @ M=1 +
 //! fused CUTLASS SiLU×Mul epilogue, across a dense `(M, N, K)` grid
 //! covering LLaMA 1B–70B model shapes.
+//!
+//! ## Regenerating the per-GPU cost CSV
+//!
+//! The CSV is consumed by `ferrite_forward_macro::target::CostTable`
+//! at proc-macro expansion time (compile-time `include_str!`) — after
+//! regenerating you MUST rebuild for the new costs to take effect.
+//!
+//! Output path: `crates/ferrite-cuda-targets/profiles/cost_<gpu>.csv`
+//! (`<gpu>` = `l4_sm89`, `l40s_sm89`, `h100_sm90`, etc.).
+//!
+//! ### L40s (sm_89, GDDR6, 142 SMs)
+//!
+//! ```sh
+//! CUDA_PATH=/usr/local/cuda-12.9 \
+//!   cargo run -p ferrite-cost-sweep --features cuda --release --bin gpu_cost_sweep \
+//!   > crates/ferrite-cuda-targets/profiles/cost_l40s_sm89.csv
+//! # Then rebuild: cargo build -p vllm-cli --features cuda --release
+//! ```
+//!
+//! ### L4 (sm_89, GDDR6, 58 SMs)
+//!
+//! ```sh
+//! CUDA_PATH=/usr/local/cuda-12.9 \
+//!   cargo run -p ferrite-cost-sweep --features cuda --release --bin gpu_cost_sweep \
+//!   > crates/ferrite-cuda-targets/profiles/cost_l4_sm89.csv
+//! ```
+//!
+//! ### H100 (sm_90, HBM3, 132 SMs)
+//!
+//! ```sh
+//! CUDA_PATH=/usr/local/cuda-12.9 \
+//!   cargo run -p ferrite-cost-sweep --features cuda --release --bin gpu_cost_sweep \
+//!   > crates/ferrite-cuda-targets/profiles/cost_h100_sm90.csv
+//! ```
+//!
+//! Sweep wall time: ~15-25 minutes per GPU (varies with shape grid +
+//! tile count). Stdout is the CSV; stderr is progress / `done` notice.
+//!
+//! ## Anatomy
 //!
 //! Ports the GEMM portion of the pre-refactor sweep in
 //! `ferrite-test-harness/tests/gpu_cost_sweep.rs` (deleted Step G),
@@ -13,10 +52,15 @@
 //! (rms_norm_bf16, silu_and_mul_fused_bf16) and the fused QKV RoPE
 //! kernel are swept too — their cost rows flow into `cost_gemm` /
 //! `elementwise_cost` via the same `CostTable`.
+//!
+//! cuBLAS reference baseline removed in the no-cublas branch — the
+//! production binary no longer links libcublas, so measuring a
+//! `cublas,M,N,K,cost_us` baseline is moot. Only `cutlass_*` /
+//! `cutlass_gemv` / `cutlass_gemm_silu_mul` / `rms_norm_bf16` /
+//! `fused_qkv_rope_cache` rows are written.
 
 #![cfg(feature = "cuda")]
 
-use cudarc::cublas::sys as cublas;
 use cudarc::driver::sys;
 use ferrite_kernels::cutlass::{
     cutlass_gemm_16x64_s3_launch, cutlass_gemm_16x64_s4_launch, cutlass_gemm_16x64_s4_sk2_launch,
@@ -150,6 +194,24 @@ const NK_SHAPES: &[(u32, u32)] = &[
     (8192, 3072),
     (2048, 8192),
     (3072, 8192),
+    // Qwen2.5-3B: hidden=2048, num_q=16 head_dim=128, num_kv=2,
+    // intermediate=11008. Packed QKV = 16*128 + 2*2*128 = 2560.
+    // Packed gate|up = 2*11008 = 22016. lm_head N=151936.
+    // Without these rows, CutlassFusedGateUpSiluMul at the heavy
+    // gate/up shape falls to roofline cost (DP can't discriminate
+    // tiles) — measured 2× throughput regression on qwen2.5-3B.
+    (2560, 2048),  // packed QKV (biased)
+    (11008, 2048), // gate or up (un-fused fallback path)
+    (22016, 2048), // packed gate|up — heaviest GEMM per layer
+    (2048, 11008), // down proj
+    // Qwen2.5-1.5B: hidden=1536, num_q=12 head_dim=128, num_kv=2,
+    // intermediate=8960. Packed QKV = 12*128 + 2*2*128 = 2048.
+    // Packed gate|up = 2*8960 = 17920.
+    (2048, 1536),  // packed QKV
+    (1536, 1536),  // O proj
+    (8960, 1536),  // gate or up
+    (17920, 1536), // packed gate|up
+    (1536, 8960),  // down
     // ── 7B–13B (hidden=4096) ──
     (4096, 4096),
     (6144, 4096),
@@ -274,6 +336,42 @@ const NK_SHAPES: &[(u32, u32)] = &[
     (24576, 1536), // deepseek-v3 q_b_to_q
     (32768, 512),  // deepseek-v3 long-K MLA
     (2048, 10944), // deepseek-v2-lite / v3-academic-9b down
+    // ── LM_HEAD shapes (M=1 vocab × hidden) ──
+    //
+    // The lm_head Gemm at decode runs at M=1, N=vocab, K=hidden — a
+    // very tall-skinny shape. Without these rows the predictor
+    // extrapolates wildly off (measured on L40s qwen2.5-3B: predicted
+    // ~tile cost vs measured 13.3 ms = 18× off, eating 54% of total
+    // GPU time). Adding direct calibration anchors lets the DP pick
+    // between the cutlass tile zoo and `cutlass_gemv` accurately at
+    // these shapes.
+    //
+    // Vocab values:
+    //   - 32064 (phi-3)
+    //   - 32768 (mistral)
+    //   - 49152 (granite)
+    //   - 128256 (llama-3, llama-3.2)
+    //   - 151936 (qwen2 / qwen2.5 family)
+    //   - 256000 (command-r)
+    //   - 262144 (gemma3 family)
+    (32064, 3072),  // phi-3 medium
+    (32768, 4096),  // mistral-7b
+    (49152, 2048),  // granite-3.1-2b
+    (49152, 4096),  // granite-3.1-8b
+    (128256, 2048), // llama-3.2-1b
+    (128256, 3072), // llama-3.2-3b
+    (128256, 4096), // llama-3-8b
+    (151936, 896),  // qwen2-0.5b
+    (151936, 1536), // qwen2-1.5b
+    (151936, 2048), // qwen2.5-3b
+    (151936, 3584), // qwen2-7b
+    (151936, 5120), // qwen2.5-14b
+    (151936, 8192), // qwen2-72b
+    (256000, 8192), // command-r 35b
+    (262144, 1152), // gemma3-1b
+    (262144, 2560), // gemma3-4b
+    (262144, 3840), // gemma3-12b
+    (262144, 5376), // gemma3-27b
 ];
 
 /// `num_tokens` grid — matches the solver's default workload sweep.
@@ -299,39 +397,17 @@ const ROPE_CONFIGS: &[(&str, u32, u32, u32, u32)] = &[
 pub fn run(launch_overhead_us: f64) {
     let stream: sys::CUstream = std::ptr::null_mut();
 
-    // cuBLAS handle (dropped at end of fn). Default stream is fine —
-    // we only enqueue one launch at a time.
-    let mut handle: cublas::cublasHandle_t = std::ptr::null_mut();
-    unsafe {
-        let s = cublas::cublasCreate_v2(&mut handle);
-        assert_eq!(s, cublas::cublasStatus_t::CUBLAS_STATUS_SUCCESS);
-        // `cublas::sys::cudaStream_t` and `driver::sys::CUstream` are
-        // the same underlying pointer type with different wrapper
-        // structs — cast through raw pointer.
-        let s = cublas::cublasSetStream_v2(handle, stream as *mut _);
-        assert_eq!(s, cublas::cublasStatus_t::CUBLAS_STATUS_SUCCESS);
-    }
-
     for &(n, k) in NK_SHAPES {
         for &m in M_VALUES {
-            bench_one_shape(handle, stream, m, n, k, launch_overhead_us);
+            bench_one_shape(stream, m, n, k, launch_overhead_us);
         }
     }
-
-    unsafe { cublas::cublasDestroy_v2(handle) };
 
     sweep_elementwise(stream, launch_overhead_us);
     sweep_rope(stream, launch_overhead_us);
 }
 
-fn bench_one_shape(
-    handle: cublas::cublasHandle_t,
-    stream: sys::CUstream,
-    m: u32,
-    n: u32,
-    k: u32,
-    launch_overhead_us: f64,
-) {
+fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhead_us: f64) {
     // Input/output buffers for the whole shape. All kernels share
     // the same A/B/C layout: A is `[M, K]` row-major, B is `[N, K]`
     // row-major (cuBLAS-style weight — B^T is the math operand),
@@ -343,35 +419,7 @@ fn bench_one_shape(
     let m_i = m as i32;
     let n_i = n as i32;
     let k_i = k as i32;
-    let one: f32 = 1.0;
-    let zero: f32 = 0.0;
-
-    // ── cuBLAS baseline ──
-    let cublas_gemm = || unsafe {
-        cublas::cublasGemmEx(
-            handle,
-            cublas::cublasOperation_t::CUBLAS_OP_T,
-            cublas::cublasOperation_t::CUBLAS_OP_N,
-            n_i,
-            m_i,
-            k_i,
-            &one as *const f32 as *const _,
-            b as *const _,
-            cublas::cudaDataType_t::CUDA_R_16BF,
-            k_i,
-            a as *const _,
-            cublas::cudaDataType_t::CUDA_R_16BF,
-            k_i,
-            &zero as *const f32 as *const _,
-            c as *mut _,
-            cublas::cudaDataType_t::CUDA_R_16BF,
-            n_i,
-            cublas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-        );
-    };
-    let us = (bench_kernel(stream, WARMUP, ITERS, cublas_gemm) - launch_overhead_us).max(0.0);
-    println!("cublas,{m},{n},{k},{us:.1}");
+    let _ = (m_i, n_i, k_i);
 
     // ── CUTLASS tile zoo — the 16 variants the current solver registers ──
     macro_rules! bench_cutlass {

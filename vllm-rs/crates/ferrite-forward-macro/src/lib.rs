@@ -713,6 +713,10 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 "deepseek_moe_ggml",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
+                "bias_add_ref",
+                "silu_ref",
+                "gelu_ref",
+                "mul_ref",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
@@ -748,7 +752,10 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                         // AllGather after lm_head). Maps to NCCL —
                         // semantically distinct from compute kernels.
                         Some(7) // comm
-                    } else if name.starts_with("fused_") || name == "gemm_ref" {
+                    } else if name.starts_with("fused_")
+                        || name == "gemm_ref"
+                        || name == "catchall_dense_gemm"
+                    {
                         Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
                     } else {
                         None

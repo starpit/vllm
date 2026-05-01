@@ -164,7 +164,7 @@ impl FusedMoELayer {
 
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         let (topk_weights, topk_ids) = route_experts(
             router_logits.as_gpu_tensor(),
@@ -295,7 +295,7 @@ impl SharedFusedMoELayer {
         ) {
             // shared_gate_up(hidden_states) → [num_tokens, 2*intermediate]
             let shared_gu =
-                shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate_up.forward(hidden_states, &mut device.caching, device.compute_stream);
             // SiLU-and-mul → [num_tokens, intermediate]
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
@@ -308,14 +308,14 @@ impl SharedFusedMoELayer {
             // down_proj → [num_tokens, hidden]
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                &mut device.cublas,
                 &mut device.caching,
+                device.compute_stream,
             );
             drop(shared_activated);
 
             // Gate: sigmoid(shared_expert_gate(hidden_states)) * shared_out
             let gate_logits =
-                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, &mut device.caching, device.compute_stream);
 
             // Fused: out = moe_out + sigmoid(gate_logits) * shared_out
             let result = kernels::sigmoid_mul_add(
@@ -367,13 +367,17 @@ impl DeepSeekV2MoELayer {
         // Routed experts.
         let moe_out = self.moe.forward(hidden_states, device);
         if self.routed_scaling_factor != 1.0 {
-            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, &device.cublas);
+            kernels::scale_inplace(
+                *moe_out.view(),
+                self.routed_scaling_factor,
+                device.compute_stream,
+            );
         }
 
         // Shared expert: silu(gate_up) → down.
         let shared_gu =
             self.shared_gate_up
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
         let shared_activated = kernels::silu_and_mul_fused(
             *shared_gu.view(),
             self.shared_intermediate_size,
@@ -383,8 +387,8 @@ impl DeepSeekV2MoELayer {
         drop(shared_gu);
         let shared_out = self.shared_down.forward(
             shared_activated.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
         drop(shared_activated);
 
@@ -553,16 +557,15 @@ impl DeepSeekV2Fp8BlockMoELayer {
         // Routed experts (FP8 block).
         let moe_out = self.moe.forward(hidden_states, device);
         if self.routed_scaling_factor != 1.0 {
-            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, &device.cublas);
+            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, stream);
         }
 
         // Shared expert: silu(gate_up) → down. Both Fp8BlockLinear.
-        let shared_gu = self.shared_gate_up.forward(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-            stream,
-        );
+        // Post-cuBLAS-removal: forward signature is (x, alloc, stream) —
+        // the dropped `&mut cublas` arg was the cuBLAS handle.
+        let shared_gu = self
+            .shared_gate_up
+            .forward(hidden_states, &mut device.caching, stream);
         let shared_activated = kernels::silu_and_mul_fused(
             *shared_gu.view(),
             self.shared_intermediate_size,
@@ -570,12 +573,9 @@ impl DeepSeekV2Fp8BlockMoELayer {
             stream,
         );
         drop(shared_gu);
-        let shared_out = self.shared_down.forward(
-            shared_activated.view(),
-            &mut device.cublas,
-            &mut device.caching,
-            stream,
-        );
+        let shared_out =
+            self.shared_down
+                .forward(shared_activated.view(), &mut device.caching, stream);
         drop(shared_activated);
 
         // output = moe_out + shared_out (no sigmoid gate).
@@ -870,7 +870,7 @@ impl Fp8FusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         // 2. Route: softmax / sigmoid+bias / grouped noaux_tc (DSv3/Kimi K2).
         let (topk_weights, topk_ids) = route_experts(
@@ -1036,7 +1036,7 @@ impl Fp8BlockFusedMoELayer {
         // 1. Gate
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         // 2. Route: softmax / sigmoid+bias / grouped noaux_tc.
         let (topk_weights, topk_ids) = route_experts(
@@ -1184,7 +1184,7 @@ impl Fp8SharedFusedMoELayer {
             &self.shared_expert_gate,
         ) {
             let shared_gu =
-                shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate_up.forward(hidden_states, &mut device.caching, device.compute_stream);
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
                 self.intermediate_size,
@@ -1195,13 +1195,13 @@ impl Fp8SharedFusedMoELayer {
 
             let shared_out = shared_down.forward(
                 shared_activated.view(),
-                &mut device.cublas,
                 &mut device.caching,
+                device.compute_stream,
             );
             drop(shared_activated);
 
             let gate_logits =
-                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, &mut device.caching, device.compute_stream);
 
             let result = kernels::sigmoid_mul_add(
                 moe_out.as_gpu_tensor(),
@@ -1289,7 +1289,7 @@ impl GgmlFusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T (dense Linear).
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         // 2. Route: softmax / sigmoid+bias / grouped noaux_tc.
         let (topk_weights, topk_ids) = route_experts(
@@ -1490,7 +1490,7 @@ impl DeepSeekV2GgmlMoELayer {
         // Routed experts (GGML).
         let moe_out = self.moe.forward(hidden_states, device);
         if self.routed_scaling_factor != 1.0 {
-            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, &device.cublas);
+            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, stream);
         }
 
         // Shared expert: silu(gate_up) → down. Both GgmlLinear; outputs match
@@ -1901,7 +1901,7 @@ impl MarlinFusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         // 2. Route: softmax / sigmoid+bias / grouped noaux_tc.
         let (topk_weights, topk_ids) = route_experts(
@@ -2076,12 +2076,7 @@ impl MarlinSharedFusedMoELayer {
             &self.shared_down,
             &self.shared_expert_gate,
         ) {
-            let shared_gu = shared_gate_up.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                stream,
-            );
+            let shared_gu = shared_gate_up.forward(hidden_states, &mut device.caching, stream);
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
                 self.intermediate_size,
@@ -2090,16 +2085,12 @@ impl MarlinSharedFusedMoELayer {
             );
             drop(shared_gu);
 
-            let shared_out = shared_down.forward(
-                shared_activated.view(),
-                &mut device.cublas,
-                &mut device.caching,
-                stream,
-            );
+            let shared_out =
+                shared_down.forward(shared_activated.view(), &mut device.caching, stream);
             drop(shared_activated);
 
             let gate_logits =
-                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, &mut device.caching, device.compute_stream);
 
             let result = kernels::sigmoid_mul_add(
                 moe_out.as_gpu_tensor(),

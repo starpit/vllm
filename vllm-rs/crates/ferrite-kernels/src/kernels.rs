@@ -302,6 +302,19 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Standalone in-place activations: x[i] = act(x[i]).
+    fn silu_inplace_f16(x: *mut u16, n: i32, stream: CUstream);
+    fn silu_inplace_bf16(x: *mut u16, n: i32, stream: CUstream);
+    fn silu_inplace_f32(x: *mut f32, n: i32, stream: CUstream);
+    fn gelu_inplace_f16(x: *mut u16, n: i32, stream: CUstream);
+    fn gelu_inplace_bf16(x: *mut u16, n: i32, stream: CUstream);
+    fn gelu_inplace_f32(x: *mut f32, n: i32, stream: CUstream);
+
+    // Element-wise in-place multiply: a[i] *= b[i].
+    fn mul_elementwise_inplace_f16(a: *mut u16, b: *const u16, n: i32, stream: CUstream);
+    fn mul_elementwise_inplace_bf16(a: *mut u16, b: *const u16, n: i32, stream: CUstream);
+    fn mul_elementwise_inplace_f32(a: *mut f32, b: *const f32, n: i32, stream: CUstream);
+
     // Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
     fn tanh_softcap_inplace_f16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
     fn tanh_softcap_inplace_bf16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
@@ -1874,6 +1887,71 @@ pub unsafe fn gelu_and_mul_fused(
         ),
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Standalone in-place SiLU / GELU / element-wise Mul
+// ---------------------------------------------------------------------------
+
+/// In-place `x[i] = silu(x[i])` over every element of `x`.
+///
+/// Singleton fallback for the (Silu, Mul) gate-up pattern when the
+/// fused matcher declines (e.g., the upstream gate-up Gemm produced
+/// a non-contiguous layout).
+pub unsafe fn silu_inplace(x: GpuTensor, stream: CUstream) {
+    let n = x.numel() as i32;
+    match x.dtype() {
+        DType::F16 => silu_inplace_f16(x.raw_ptr() as *mut u16, n, stream),
+        DType::BF16 => silu_inplace_bf16(x.raw_ptr() as *mut u16, n, stream),
+        DType::F32 => silu_inplace_f32(x.raw_ptr() as *mut f32, n, stream),
+        _ => panic!("silu_inplace: unsupported dtype {:?}", x.dtype()),
+    }
+}
+
+/// In-place `x[i] = gelu_tanh(x[i])` over every element of `x`.
+pub unsafe fn gelu_inplace(x: GpuTensor, stream: CUstream) {
+    let n = x.numel() as i32;
+    match x.dtype() {
+        DType::F16 => gelu_inplace_f16(x.raw_ptr() as *mut u16, n, stream),
+        DType::BF16 => gelu_inplace_bf16(x.raw_ptr() as *mut u16, n, stream),
+        DType::F32 => gelu_inplace_f32(x.raw_ptr() as *mut f32, n, stream),
+        _ => panic!("gelu_inplace: unsupported dtype {:?}", x.dtype()),
+    }
+}
+
+/// Element-wise in-place multiply `a[i] *= b[i]`. Both tensors must
+/// have the same dtype and the same total element count; layout is
+/// not checked beyond shape (must match upstream's contiguous output).
+pub unsafe fn mul_elementwise_inplace(a: GpuTensor, b: GpuTensor, stream: CUstream) {
+    let n = a.numel() as i32;
+    debug_assert_eq!(
+        a.numel(),
+        b.numel(),
+        "mul_elementwise_inplace: numel mismatch ({} vs {})",
+        a.numel(),
+        b.numel()
+    );
+    match a.dtype() {
+        DType::F16 => mul_elementwise_inplace_f16(
+            a.raw_ptr() as *mut u16,
+            b.raw_ptr() as *const u16,
+            n,
+            stream,
+        ),
+        DType::BF16 => mul_elementwise_inplace_bf16(
+            a.raw_ptr() as *mut u16,
+            b.raw_ptr() as *const u16,
+            n,
+            stream,
+        ),
+        DType::F32 => mul_elementwise_inplace_f32(
+            a.raw_ptr() as *mut f32,
+            b.raw_ptr() as *const f32,
+            n,
+            stream,
+        ),
+        _ => panic!("mul_elementwise_inplace: unsupported dtype {:?}", a.dtype()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4002,54 +4080,31 @@ pub unsafe fn flash_attn_paged_ext(
 }
 
 // ---------------------------------------------------------------------------
-// Scalar multiply (in-place via cuBLAS)
+// Scalar multiply (in-place) — CUTLASS-side custom kernel
+//
+// Replaces the previous `cublasScalEx` dispatch. Implementation lives
+// in `vllm-cuda/csrc/embedding_kernels.cu` as `scalar_mul_inplace_*`.
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
-    fn cublasScalEx(
-        handle: cudarc::cublas::sys::cublasHandle_t,
-        n: c_int,
-        alpha: *const c_void,
-        alphaType: cudarc::cublas::sys::cudaDataType_t,
-        x: *mut c_void,
-        xType: cudarc::cublas::sys::cudaDataType_t,
-        incx: c_int,
-        executionType: cudarc::cublas::sys::cudaDataType_t,
-    ) -> cudarc::cublas::sys::cublasStatus_t;
+    fn scalar_mul_inplace_f16(x: *mut c_void, scale: f32, n: i64, stream: CUstream);
+    fn scalar_mul_inplace_bf16(x: *mut c_void, scale: f32, n: i64, stream: CUstream);
+    fn scalar_mul_inplace_f32(x: *mut c_void, scale: f32, n: i64, stream: CUstream);
 }
 
 /// Multiply every element of a tensor by a scalar, in-place.
 ///
 /// * `x`: any contiguous tensor (F16, BF16, or F32)
 /// * `scale`: the scalar multiplier (always f32)
-/// * `cublas`: cuBLAS handle on the compute stream
-pub unsafe fn scale_inplace(
-    x: GpuTensor,
-    scale: f32,
-    cublas: &ferrite_cuda_core::cublas::CublasHandle,
-) {
-    use cudarc::cublas::sys::cudaDataType_t;
-    let n = x.numel() as c_int;
-    let x_type = match x.dtype() {
-        DType::F16 => cudaDataType_t::CUDA_R_16F,
-        DType::BF16 => cudaDataType_t::CUDA_R_16BF,
-        DType::F32 => cudaDataType_t::CUDA_R_32F,
+/// * `stream`: the live compute stream
+pub unsafe fn scale_inplace(x: GpuTensor, scale: f32, stream: CUstream) {
+    let n = x.numel() as i64;
+    match x.dtype() {
+        DType::F16 => scalar_mul_inplace_f16(x.raw_ptr() as *mut c_void, scale, n, stream),
+        DType::BF16 => scalar_mul_inplace_bf16(x.raw_ptr() as *mut c_void, scale, n, stream),
+        DType::F32 => scalar_mul_inplace_f32(x.raw_ptr() as *mut c_void, scale, n, stream),
         _ => panic!("scale_inplace: unsupported dtype {:?}", x.dtype()),
-    };
-    let status = cublasScalEx(
-        cublas.raw_handle(),
-        n,
-        &scale as *const f32 as *const c_void,
-        cudaDataType_t::CUDA_R_32F,
-        x.raw_ptr() as *mut c_void,
-        x_type,
-        1,
-        cudaDataType_t::CUDA_R_32F,
-    );
-    assert_eq!(
-        status,
-        cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
-    );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4080,20 +4135,20 @@ pub unsafe fn pool_select_row(
 
 /// Mean pool: average all rows of `[num_tokens, hidden_size]` → `[hidden_size]`.
 ///
-/// Uses cuBLAS gemv: `out = (1/N) * A^T * ones_vec` where A = `[N, H]` (row-major).
-/// The ones vector is allocated from the caching allocator and filled via memset.
+/// Custom CUDA kernel: one block per hidden-dim column, intra-block tree
+/// reduction across the M tokens. Replaces the previous cuBLAS gemv
+/// `(1/N) * A^T * ones_vec` dispatch with a kernel that doesn't need
+/// an externally-materialized ones vector — memory traffic is the
+/// same `M*H` reads, output `H` writes; no extra `H2D` for ones.
 ///
 /// # Safety
 /// `hidden_states` must be a valid 2D GPU tensor with dtype F32.
 /// For bf16/f16 inputs, caller must cast to f32 first.
 pub unsafe fn pool_mean_f32(
     hidden_states: GpuTensor,
-    cublas: &ferrite_cuda_core::cublas::CublasHandle,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
-    use cudarc::cublas::sys::cublasOperation_t;
-
     assert_eq!(
         hidden_states.dtype(),
         DType::F32,
@@ -4107,72 +4162,24 @@ pub unsafe fn pool_mean_f32(
         return pool_select_row(hidden_states, 0, alloc, stream);
     }
 
-    // Allocate ones vector [num_tokens] filled with 1.0f32.
-    let ones = alloc.alloc_tensor(&[num_tokens], DType::F32);
-    // Fill with 1.0f32 (bit pattern 0x3F800000). Use a kernel-free approach:
-    // set all bytes to 0, then use cuBLAS to set to 1.0 would be circular.
-    // Instead, write 1.0f32 via a small H2D.
-    let ones_host: Vec<f32> = vec![1.0f32; num_tokens];
-    ferrite_cuda_core::driver::memcpy_htod_async(
-        ones.raw_ptr(),
-        ones_host.as_ptr() as *const u8,
-        num_tokens * 4,
-        stream,
-    )
-    .expect("pool_mean: H2D ones vector");
-
-    // Allocate output [hidden_size].
     let out = alloc.alloc_tensor(&[hidden_size], DType::F32);
 
-    // cuBLAS gemv: out = alpha * A^T * x + beta * out
-    // A is [N, H] in row-major = [H, N] in column-major.
-    // We want A^T * x = [H, N]^T * [N] = [H] (sum of rows).
-    // In column-major: A is [H, N], op=N means no-transpose, so y = A * x = [H].
-    let alpha = 1.0f32 / num_tokens as f32;
-    let beta = 0.0f32;
-
     unsafe extern "C" {
-        fn cublasSgemv_v2(
-            handle: cudarc::cublas::sys::cublasHandle_t,
-            trans: cublasOperation_t,
+        fn pool_mean_f32_launch(
+            x: *const c_void,
+            out: *mut c_void,
             m: c_int,
             n: c_int,
-            alpha: *const f32,
-            a: *const f32,
-            lda: c_int,
-            x: *const f32,
-            incx: c_int,
-            beta: *const f32,
-            y: *mut f32,
-            incy: c_int,
-        ) -> cudarc::cublas::sys::cublasStatus_t;
+            stream: CUstream,
+        );
     }
 
-    // Row-major [N, H] is column-major [H, N]. We want sum of rows = A^T * ones
-    // In column-major: A = [H, N], trans=T → A^T * x = [N, H] * [N] — wrong dims.
-    // Actually: row-major [N, H] stored as contiguous memory.
-    // In cuBLAS column-major convention, this is a [H, N] matrix (columns are rows).
-    // We want: out[h] = sum_n A[n, h] / N = (1/N) * A^T_colmajor * ones
-    // A_colmajor = [H, N], transpose it → [N, H], multiply by ones[N] → [N] — wrong.
-    // No: A_colmajor = [H, N], no transpose: y = A * x = [H, N] * [N, 1] = [H, 1]. Correct!
-    let status = cublasSgemv_v2(
-        cublas.raw_handle(),
-        cublasOperation_t::CUBLAS_OP_N, // no transpose
-        hidden_size as c_int,           // m = H
-        num_tokens as c_int,            // n = N
-        &alpha,
-        hidden_states.as_ptr::<f32>(),
-        hidden_size as c_int, // lda = H (column-major leading dim)
-        ones.as_ptr::<f32>(),
-        1,
-        &beta,
-        out.as_mut_ptr::<f32>(),
-        1,
-    );
-    assert_eq!(
-        status,
-        cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-        "pool_mean_f32: cublasSgemv failed"
+    pool_mean_f32_launch(
+        hidden_states.as_ptr::<f32>() as *const c_void,
+        out.as_mut_ptr::<f32>() as *mut c_void,
+        num_tokens as c_int,
+        hidden_size as c_int,
+        stream,
     );
 
     out
@@ -7757,8 +7764,6 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas =
-                ferrite_cuda_core::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             // 3 tokens, hidden_size=3
             // row0=[1,2,3], row1=[3,4,5], row2=[5,6,7] → mean=[3,4,5]
@@ -7766,7 +7771,7 @@ mod tests_pooling {
             let ptr = upload_f32(&data, stream);
             let hs = GpuTensor::new(ptr, &[3, 3], DType::F32);
 
-            let out = pool_mean_f32(hs, &cublas, &mut alloc, stream);
+            let out = pool_mean_f32(hs, &mut alloc, stream);
             driver::stream_synchronize(stream).expect("sync");
             let result = download_f32(out.as_gpu_tensor().raw_ptr(), 3, stream);
             assert!((result[0] - 3.0).abs() < 1e-5, "got {}", result[0]);
@@ -7783,14 +7788,12 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas =
-                ferrite_cuda_core::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             let data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0];
             let ptr = upload_f32(&data, stream);
             let hs = GpuTensor::new(ptr, &[1, 4], DType::F32);
 
-            let out = pool_mean_f32(hs, &cublas, &mut alloc, stream);
+            let out = pool_mean_f32(hs, &mut alloc, stream);
             driver::stream_synchronize(stream).expect("sync");
             let result = download_f32(out.as_gpu_tensor().raw_ptr(), 4, stream);
             assert_eq!(result, vec![7.0, 8.0, 9.0, 10.0]);
@@ -7805,15 +7808,13 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas =
-                ferrite_cuda_core::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             // [0, 4] and [2, 6] → mean [1, 5]
             let data: Vec<f32> = vec![0.0, 4.0, 2.0, 6.0];
             let ptr = upload_f32(&data, stream);
             let hs = GpuTensor::new(ptr, &[2, 2], DType::F32);
 
-            let out = pool_mean_f32(hs, &cublas, &mut alloc, stream);
+            let out = pool_mean_f32(hs, &mut alloc, stream);
             driver::stream_synchronize(stream).expect("sync");
             let result = download_f32(out.as_gpu_tensor().raw_ptr(), 2, stream);
             assert!((result[0] - 1.0).abs() < 1e-5);

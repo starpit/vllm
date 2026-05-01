@@ -1,7 +1,21 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::DType;
+    // Note: `super::*` from this file resolves to the intermediate
+    // `mod layers_tests` (declared via `#[path = "layers_tests.rs"]
+    // mod layers_tests` in lib.rs), which contains only this `tests`
+    // sub-module — so `super::*` brings in nothing. Use `crate::…`
+    // imports for everything from the crate root instead.
+    //
+    // `pub use` (rather than plain `use`) lets the inner `cuda_tests`
+    // / sibling `fp8_block_tests` modules pick these up via their own
+    // `use super::*;` — a plain `use` would be private to this
+    // module and invisible through a glob import.
+    pub use crate::DType;
+    pub use crate::layers::{
+        Bnb4bitLinear, Embedding, Fp8BlockLinear, Fp8Linear, Linear, LinearLayer, RmsNorm,
+    };
+    pub use crate::weights::GpuWeights;
+    pub use crate::{CachingAllocator, GpuTensor, TensorView};
 
     #[test]
     fn test_linear_dimensions() {
@@ -109,7 +123,6 @@ mod tests {
             let stream = init_cuda();
             unsafe {
                 let mut arena = CachingAllocator::new();
-                let mut cublas = CublasHandle::new(stream, &mut arena).unwrap();
 
                 // Weight [2, 3] = [[1,0,0],[0,1,0]] (identity-ish)
                 let host_w = driver::mem_alloc_host(24).unwrap();
@@ -133,7 +146,7 @@ mod tests {
 
                 // Forward: x @ W^T = [4,3] @ [3,2] = [4,2]
                 // Expected: [[1,2],[4,5],[7,8],[10,11]]
-                let y = linear.forward(x_view, &mut cublas, &mut arena);
+                let y = linear.forward(x_view, &mut arena, stream);
                 assert_eq!(y.dim(0), 4);
                 assert_eq!(y.dim(1), 2);
 
@@ -222,7 +235,6 @@ mod tests {
             let stream = init_cuda();
             unsafe {
                 let mut alloc = crate::alloc::CachingAllocator::new();
-                let mut cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).unwrap();
 
                 // Weight shape: [out=8, in=8] → 64 elements → 32 packed bytes.
                 // Use blocksize=64 so all elements are in one block.
@@ -323,7 +335,7 @@ mod tests {
                 };
 
                 // Forward.
-                let output = layer.forward(x_view, &mut cublas, &mut alloc, stream);
+                let output = layer.forward(x_view, &mut alloc, stream);
                 let out_t = output.as_gpu_tensor();
                 assert_eq!(out_t.dim(0), 1);
                 assert_eq!(out_t.dim(1), out_features);
@@ -402,7 +414,6 @@ mod tests {
             let stream = init_cuda();
             unsafe {
                 let mut alloc = crate::alloc::CachingAllocator::new();
-                let mut cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).unwrap();
 
                 // Simulate: q=[128, 64], k=[64, 64], v=[64, 64], blocksize=64
                 let in_features = 64usize;
@@ -511,7 +522,7 @@ mod tests {
                     bias: None,
                 };
 
-                let output = layer.forward(x_view, &mut cublas, &mut alloc, stream);
+                let output = layer.forward(x_view, &mut alloc, stream);
                 let out_t = output.as_gpu_tensor();
                 assert_eq!(out_t.dim(0), 1);
                 assert_eq!(out_t.dim(1), total_out);
@@ -815,9 +826,13 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod fp8_block_tests {
-    use super::*;
     use crate::DType;
     use crate::driver;
+    // Sibling of `mod tests`; `super::*` here resolves to the
+    // intermediate `mod layers_tests` (empty). Re-import the moved-out
+    // types directly. See `mod tests` above for the rationale.
+    use crate::layers::Fp8BlockLinear;
+    use crate::{CachingAllocator, GpuTensor, TensorView};
 
     /// Convert f32 to FP8 E4M3 (1 sign + 4 exponent + 3 mantissa, bias=7).
     /// Only handles normal/subnormal positive values in the representable range.
@@ -865,7 +880,6 @@ mod fp8_block_tests {
         let stream = init_cuda();
         unsafe {
             let mut alloc = CachingAllocator::new();
-            let mut cublas = CublasHandle::new(stream, &mut alloc).unwrap();
 
             let n = 4usize;
             let k = 4usize;
@@ -918,7 +932,7 @@ mod fp8_block_tests {
             // Forward: y = x @ W^T, x=[1,4] all-ones, W=[4,4]
             // y[j] = sum_k(W[j][k]) = row sum
             // Row sums: [6, 14, 6, 14]
-            let out = layer.forward(x_view, &mut cublas, &mut alloc, stream);
+            let out = layer.forward(x_view, &mut alloc, stream);
             assert_eq!(out.as_gpu_tensor().dim(0), 1);
             assert_eq!(out.as_gpu_tensor().dim(1), n);
 
@@ -953,7 +967,6 @@ mod fp8_block_tests {
         let stream = init_cuda();
         unsafe {
             let mut alloc = CachingAllocator::new();
-            let mut cublas = CublasHandle::new(stream, &mut alloc).unwrap();
 
             let n = 128usize;
             let k = 128usize;
@@ -987,14 +1000,14 @@ mod fp8_block_tests {
 
             // First forward — establishes the allocator's pool.
             let x1 = TensorView::from_raw(GpuTensor::new(gpu_x, &[1, k], DType::BF16));
-            let out1 = layer.forward(x1, &mut cublas, &mut alloc, stream);
+            let out1 = layer.forward(x1, &mut alloc, stream);
             drop(out1);
             driver::stream_synchronize(stream).unwrap();
             let bytes_after_first = alloc.active_bytes();
 
             // Second forward — should reuse pools, NOT grow active_bytes.
             let x2 = TensorView::from_raw(GpuTensor::new(gpu_x, &[1, k], DType::BF16));
-            let out2 = layer.forward(x2, &mut cublas, &mut alloc, stream);
+            let out2 = layer.forward(x2, &mut alloc, stream);
             drop(out2);
             driver::stream_synchronize(stream).unwrap();
             let bytes_after_second = alloc.active_bytes();

@@ -34,7 +34,8 @@ pub use loaders::{
     load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
     load_layered_linear_dense, load_layered_linear_dense_concat,
     load_layered_linear_dense_concat_sharded, load_layered_linear_dense_sharded,
-    load_layered_marlin_linear, load_layered_marlin_linear_concat, load_layered_rms_norm,
+    load_layered_marlin_linear, load_layered_marlin_linear_concat, load_layered_raw_tensor,
+    load_layered_rms_norm,
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};

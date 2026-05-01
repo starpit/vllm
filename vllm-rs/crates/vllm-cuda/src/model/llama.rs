@@ -55,18 +55,10 @@ impl LlamaMLP {
     pub unsafe fn forward(&self, x: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         let gate_up = if let Some(ref up_proj) = self.up_proj {
             // Quantized: separate gate + up GEMMs, then concat
-            let gate_out = self.gate_up_proj.forward(
-                x,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            let up_out = up_proj.forward(
-                x,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
+            let gate_out = self
+                .gate_up_proj
+                .forward(x, &mut device.caching, device.compute_stream);
+            let up_out = up_proj.forward(x, &mut device.caching, device.compute_stream);
             // Concat gate_out and up_out along dim 1 → [num_tokens, 2*intermediate]
             let concat = kernels::concat_dim1(
                 gate_out.as_gpu_tensor(),
@@ -79,12 +71,8 @@ impl LlamaMLP {
             concat
         } else {
             // Dense: single fused gate+up GEMM
-            self.gate_up_proj.forward(
-                x,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            )
+            self.gate_up_proj
+                .forward(x, &mut device.caching, device.compute_stream)
         };
 
         let activated = kernels::silu_and_mul_fused(
@@ -95,12 +83,9 @@ impl LlamaMLP {
         );
         drop(gate_up);
 
-        let result = self.down_proj.forward(
-            activated.view(),
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let result =
+            self.down_proj
+                .forward(activated.view(), &mut device.caching, device.compute_stream);
         drop(activated);
 
         // TP: all-reduce down_proj output (row parallel).
@@ -203,24 +188,11 @@ impl LlamaAttention {
         let qkv = if let (Some(k_proj), Some(v_proj)) = (self.k_proj.as_ref(), self.v_proj.as_ref())
         {
             // Quantized: separate Q, K, V GEMMs → concat
-            let q_out = self.qkv_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            let k_out = k_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            let v_out = v_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
+            let q_out =
+                self.qkv_proj
+                    .forward(hidden_states, &mut device.caching, device.compute_stream);
+            let k_out = k_proj.forward(hidden_states, &mut device.caching, device.compute_stream);
+            let v_out = v_proj.forward(hidden_states, &mut device.caching, device.compute_stream);
             // Concat Q, K, V along dim 1 → [num_tokens, q_size + 2*kv_size]
             let qk = kernels::concat_dim1(
                 q_out.as_gpu_tensor(),
@@ -241,12 +213,8 @@ impl LlamaAttention {
             qkv
         } else {
             // Dense: single fused QKV GEMM
-            self.qkv_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            )
+            self.qkv_proj
+                .forward(hidden_states, &mut device.caching, device.compute_stream)
         };
 
         // Split QKV and apply RoPE (with optional per-head QK-norm for Qwen3/Gemma3).
@@ -361,12 +329,9 @@ impl LlamaAttention {
 
                 // Reshape to [num_tokens, q_size] and output projection.
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-                let result = self.o_proj.forward(
-                    attn_flat,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                let result =
+                    self.o_proj
+                        .forward(attn_flat, &mut device.caching, device.compute_stream);
                 drop(attn_output);
 
                 #[cfg(feature = "nccl")]
@@ -447,12 +412,9 @@ impl LlamaAttention {
                 drop(v);
 
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-                let result = self.o_proj.forward(
-                    attn_flat,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                let result =
+                    self.o_proj
+                        .forward(attn_flat, &mut device.caching, device.compute_stream);
                 drop(attn_output);
 
                 #[cfg(feature = "nccl")]
@@ -513,12 +475,9 @@ impl LlamaAttention {
 
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-        let result = self.o_proj.forward(
-            attn_flat,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let result = self
+            .o_proj
+            .forward(attn_flat, &mut device.caching, device.compute_stream);
         drop(attn_output);
 
         // TP: all-reduce o_proj output (row parallel).
@@ -632,7 +591,11 @@ impl LlamaDecoderLayer {
 
         // Granite: scale attention output.
         if self.residual_multiplier != 1.0 {
-            kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
+            kernels::scale_inplace(
+                *attn_output,
+                self.residual_multiplier,
+                device.compute_stream,
+            );
         }
 
         // Post-attention norm: mutates attn_output buffer → post-normed,
@@ -654,7 +617,7 @@ impl LlamaDecoderLayer {
 
         // Granite: scale MLP output.
         if self.residual_multiplier != 1.0 {
-            kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);
+            kernels::scale_inplace(*mlp_output, self.residual_multiplier, device.compute_stream);
         }
 
         (mlp_output, residual)
@@ -710,7 +673,7 @@ impl LlamaModel {
             kernels::scale_inplace(
                 hidden_states.as_gpu_tensor(),
                 self.embedding_multiplier,
-                &device.cublas,
+                device.compute_stream,
             );
         }
 
@@ -824,7 +787,6 @@ impl LlamaForCausalLM {
         #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
         );
@@ -843,7 +805,7 @@ impl LlamaForCausalLM {
             kernels::scale_inplace(
                 logits.as_gpu_tensor(),
                 self.logits_scaling.recip(),
-                &device.cublas,
+                device.compute_stream,
             );
         }
 
@@ -3396,7 +3358,7 @@ impl LlamaModel {
                     kernels::scale_inplace(
                         hs.as_gpu_tensor(),
                         self.embedding_multiplier,
-                        &device.cublas,
+                        device.compute_stream,
                     );
                 }
                 (hs, None)
@@ -3590,12 +3552,9 @@ impl LlamaForCausalLM {
                 };
 
                 #[allow(unused_mut)]
-                let mut logits = self.lm_head.forward(
-                    hs_view,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                let mut logits =
+                    self.lm_head
+                        .forward(hs_view, &mut device.caching, device.compute_stream);
                 // hidden_states can be freed now.
                 drop(gathered);
                 drop(hidden_states);
@@ -3613,7 +3572,7 @@ impl LlamaForCausalLM {
                     kernels::scale_inplace(
                         logits.as_gpu_tensor(),
                         self.logits_scaling.recip(),
-                        &device.cublas,
+                        device.compute_stream,
                     );
                 }
 

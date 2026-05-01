@@ -2471,6 +2471,9 @@ pub fn load_expert_gptq_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Helpers moved to ferrite-cuda-core::weights by the
+    // ferrite-extraction refactor (commit 9314418d0); re-import them.
+    use ferrite_cuda_core::weights::{read_to_f32, safetensors_dtype, write_from_f32};
 
     #[test]
     fn test_safetensors_dtype_mapping() {
@@ -2925,23 +2928,14 @@ mod tests {
         .unwrap();
 
         // Load weights (no GPU needed — merge is CPU-only).
-        let mut gw = GpuWeights {
-            tensors: HashMap::new(),
-            stream: std::ptr::null_mut(),
-            target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
-            precast: None,
-            precast_handle: None,
-            gpu_allocs: Vec::new(),
-            _mmaps: Vec::new(),
-        };
+        let mut gw = GpuWeights::empty_for_test();
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();
 
         // Strip "model." prefix to match what CudaWorker does.
         // Actually, merge_lora looks for "{prefix}.weight" keys, so let's check
         // what keys we have.
-        let keys: Vec<String> = gw.tensors.keys().cloned().collect();
+        let keys: Vec<String> = gw.names().map(|s| s.to_string()).collect();
         assert!(keys.contains(&"model.layers.0.self_attn.q_proj.weight".to_string()));
 
         let merged = gw.merge_lora(adapter_dir.path()).unwrap();
@@ -3033,16 +3027,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut gw = GpuWeights {
-            tensors: HashMap::new(),
-            stream: std::ptr::null_mut(),
-            target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
-            precast: None,
-            precast_handle: None,
-            gpu_allocs: Vec::new(),
-            _mmaps: Vec::new(),
-        };
+        let mut gw = GpuWeights::empty_for_test();
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();
 

@@ -2,13 +2,15 @@
 //! Model layers using `GpuTensor`.
 //!
 //! These are minimal, inference-only layer types. Weights are stored as
-//! `GpuTensor` (raw GPU pointers). Forward passes use cuBLAS GEMM from
-//! the `GpuDevice` and fused CUDA kernels.
+//! `GpuTensor` (raw GPU pointers). Forward passes use CUTLASS GEMM
+//! (the `cutlass` module in this crate) and fused CUDA kernels.
+//!
+//! cuBLAS has been removed — every dense GEMM dispatches to a
+//! CUTLASS tile from `cutlass_standalone_gemm.cu`.
 
 use anyhow::Result;
 
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
-use ferrite_cuda_core::cublas::CublasHandle;
 use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 use ferrite_cuda_core::weights::GpuWeights;
 
@@ -151,8 +153,9 @@ fn try_synthesize_packed_slice(weights: &mut GpuWeights, prefix: &str) -> Result
 /// Dense linear layer: y = x @ W^T + b
 ///
 /// Weight is stored in `[out_features, in_features]` layout (NOT pre-transposed).
-/// cuBLAS GEMM handles the transpose internally via `CUBLAS_OP_T`, which is
-/// more efficient than a separate transpose copy.
+/// CUTLASS GEMM handles the transpose internally via the column-major
+/// `LayoutB` template parameter, which is more efficient than a separate
+/// transpose copy.
 pub struct Linear {
     pub weight: GpuTensor,       // [out_features, in_features]
     pub bias: Option<GpuTensor>, // [out_features]
@@ -268,20 +271,34 @@ impl Linear {
     /// Returns: `[num_tokens, out_features]` as OwnedTensor from caching allocator.
     ///
     /// # Safety
-    /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
+    /// All tensors must be valid GPU memory. `stream` must be the
+    /// live compute stream.
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         debug_assert_eq!(x.ndim(), 2);
         debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
 
         if let Some(bias) = self.bias {
-            cublas.gemm_bias(*x, self.weight, bias, alloc)
+            crate::cutlass::cutlass_gemm_bias(
+                *x,
+                self.weight,
+                bias,
+                crate::cutlass::DEFAULT_GEMM_TILE,
+                alloc,
+                stream,
+            )
         } else {
-            cublas.gemm(*x, self.weight, alloc)
+            crate::cutlass::cutlass_gemm(
+                *x,
+                self.weight,
+                crate::cutlass::DEFAULT_GEMM_TILE,
+                alloc,
+                stream,
+            )
         }
     }
 
@@ -430,7 +447,6 @@ impl Bnb4bitLinear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -452,9 +468,22 @@ impl Bnb4bitLinear {
 
         // cuBLAS GEMM: x @ weight_view^T
         if let Some(bias) = self.bias {
-            cublas.gemm_bias(*x, weight_view, bias, alloc)
+            crate::cutlass::cutlass_gemm_bias(
+                *x,
+                weight_view,
+                bias,
+                crate::cutlass::DEFAULT_GEMM_TILE,
+                alloc,
+                stream,
+            )
         } else {
-            cublas.gemm(*x, weight_view, alloc)
+            crate::cutlass::cutlass_gemm(
+                *x,
+                weight_view,
+                crate::cutlass::DEFAULT_GEMM_TILE,
+                alloc,
+                stream,
+            )
         }
     }
 
@@ -561,7 +590,7 @@ impl GgmlLinear {
 }
 
 // ---------------------------------------------------------------------------
-// Fp8Linear (FP8 E4M3 quantized via cublasLt FP8 GEMM)
+// Fp8Linear (FP8 E4M3 quantized via CUTLASS FP8 GEMM)
 // ---------------------------------------------------------------------------
 
 /// FP8 (E4M3) quantized linear layer.
@@ -595,7 +624,6 @@ impl Fp8Linear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        _cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -714,25 +742,22 @@ impl LinearLayer {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         match self {
-            Self::Dense(l) => l.forward(x, cublas, alloc),
+            Self::Dense(l) => l.forward(x, alloc, stream),
             Self::Marlin(l) => l.forward(x, alloc, stream),
             Self::Ggml(l) => {
                 if ggml_probe::use_reference() {
                     // FERRITE_USE_REFERENCE=1: bypass ggml_matmul entirely, use
-                    // dequant-to-f32 + cuBLAS F32 GEMM + optional bias. If this
+                    // dequant-to-f32 + CUTLASS F32 GEMM + optional bias. If this
                     // produces coherent inference, the MMVQ/DMMV kernels are the
                     // bug; if garbage, the problem is upstream (weight bytes).
-                    return ggml_probe::reference_forward(
-                        &l.storage, x, l.bias, cublas, alloc, stream,
-                    );
+                    return ggml_probe::reference_forward(&l.storage, x, l.bias, alloc, stream);
                 }
                 if ggml_probe::is_enabled() {
-                    ggml_probe::compare(&l.storage, x, cublas, alloc, stream);
+                    ggml_probe::compare(&l.storage, x, alloc, stream);
                 }
                 l.forward(x, alloc, stream)
             }
@@ -768,7 +793,6 @@ impl LinearLayer {
                             &branch.storage,
                             x,
                             branch.bias,
-                            cublas,
                             alloc,
                             stream,
                         )
@@ -798,9 +822,9 @@ impl LinearLayer {
                 drop(keepalive);
                 packed
             }
-            Self::Bnb4bit(l) => l.forward(x, cublas, alloc, stream),
-            Self::Fp8(l) => l.forward(x, cublas, alloc, stream),
-            Self::Fp8Block(l) => l.forward(x, cublas, alloc, stream),
+            Self::Bnb4bit(l) => l.forward(x, alloc, stream),
+            Self::Fp8(l) => l.forward(x, alloc, stream),
+            Self::Fp8Block(l) => l.forward(x, alloc, stream),
         }
     }
 
@@ -1421,7 +1445,6 @@ impl Fp8BlockLinear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -1442,7 +1465,13 @@ impl Fp8BlockLinear {
         // Standard GEMM: x @ dequant_weight^T
         // Use as_gpu_tensor() to borrow — dequant_weight drops after GEMM,
         // returning the buffer to the caching allocator.
-        let out = cublas.gemm(*x, dequant_weight.as_gpu_tensor(), alloc);
+        let out = crate::cutlass::cutlass_gemm(
+            *x,
+            dequant_weight.as_gpu_tensor(),
+            crate::cutlass::DEFAULT_GEMM_TILE,
+            alloc,
+            stream,
+        );
         drop(dequant_weight);
 
         if let Some(bias) = self.bias {
@@ -1474,7 +1503,7 @@ impl Fp8BlockLinear {
 ///
 /// `forward` matches both inner `forward`s' signature, so the
 /// per-arch interpreter arm calls `(weight_fn)(wm, layer).forward(x,
-/// cublas, alloc, stream)` without caring which variant is inside.
+/// alloc, stream)` without caring which variant is inside.
 pub enum Fp8AnyLinear {
     Std(Fp8Linear),
     Block(Fp8BlockLinear),
@@ -1485,19 +1514,17 @@ impl Fp8AnyLinear {
     /// Both variants take the same arguments and return `OwnedTensor`.
     ///
     /// # Safety
-    /// All tensors must be valid GPU memory; `cublas` / `alloc` /
-    /// `stream` must be live. Inner `forward`s carry the same
-    /// invariants.
+    /// All tensors must be valid GPU memory; `alloc` / `stream` must
+    /// be live. Inner `forward`s carry the same invariants.
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         match self {
-            Self::Std(l) => unsafe { l.forward(x, cublas, alloc, stream) },
-            Self::Block(l) => unsafe { l.forward(x, cublas, alloc, stream) },
+            Self::Std(l) => unsafe { l.forward(x, alloc, stream) },
+            Self::Block(l) => unsafe { l.forward(x, alloc, stream) },
         }
     }
 
@@ -1689,11 +1716,10 @@ impl ColumnParallelLinear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
-        let out = self.inner.forward(x, cublas, alloc, stream);
+        let out = self.inner.forward(x, alloc, stream);
 
         #[cfg(feature = "nccl")]
         if self.gather_output
@@ -1747,11 +1773,10 @@ impl RowParallelLinear {
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
-        let out = self.inner.forward(x, cublas, alloc, stream);
+        let out = self.inner.forward(x, alloc, stream);
 
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {
@@ -1879,7 +1904,7 @@ mod ggml_probe {
             }
             if use_ref {
                 eprintln!(
-                    "[probe] FERRITE_USE_REFERENCE=1 — GgmlLinear routes through dequant+cublas"
+                    "[probe] FERRITE_USE_REFERENCE=1 — GgmlLinear routes through dequant+cutlass"
                 );
             }
         });
@@ -1901,7 +1926,6 @@ mod ggml_probe {
         storage: &crate::ggml::GgmlStorage,
         x: TensorView<'_>,
         bias: Option<GpuTensor>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -1917,7 +1941,13 @@ mod ggml_probe {
 
         let w_f32 =
             crate::ggml::ggml_dequantize_to_tensor(storage, DType::F32, &[n, k], alloc, stream);
-        let out_f32 = cublas.gemm(x_f32, w_f32.as_gpu_tensor(), alloc);
+        let out_f32 = crate::cutlass::cutlass_gemm(
+            x_f32,
+            w_f32.as_gpu_tensor(),
+            crate::cutlass::DEFAULT_GEMM_TILE,
+            alloc,
+            stream,
+        );
         drop(w_f32);
         drop(x_cast);
 
@@ -1962,7 +1992,6 @@ mod ggml_probe {
     pub unsafe fn compare(
         storage: &crate::ggml::GgmlStorage,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) {
@@ -2002,7 +2031,13 @@ mod ggml_probe {
         // 3. Path B: dequant weight to F32, cuBLAS F32 GEMM.
         let w_f32 =
             crate::ggml::ggml_dequantize_to_tensor(storage, DType::F32, &[n, k], alloc, stream);
-        let out_b = cublas.gemm(x_f32, w_f32.as_gpu_tensor(), alloc);
+        let out_b = crate::cutlass::cutlass_gemm(
+            x_f32,
+            w_f32.as_gpu_tensor(),
+            crate::cutlass::DEFAULT_GEMM_TILE,
+            alloc,
+            stream,
+        );
 
         // 4. Copy both outputs to host, compute diff.
         let nelem = num_tokens * n;

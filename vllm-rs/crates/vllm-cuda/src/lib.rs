@@ -40,8 +40,6 @@ pub use ferrite_cuda_core::arena;
 #[cfg(feature = "cuda")]
 pub use ferrite_cuda_core::cpu_gpu_buf;
 #[cfg(feature = "cuda")]
-pub use ferrite_cuda_core::cublas;
-#[cfg(feature = "cuda")]
 pub use ferrite_cuda_core::device;
 #[cfg(feature = "cuda")]
 pub use ferrite_cuda_core::driver;
@@ -104,9 +102,7 @@ mod layers_tests;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "cuda")]
-pub use ferrite_cuda_core::{
-    CachingAllocator, CublasHandle, GpuDevice, OwnedTensor, RawGpuAlloc, RawGpuMem,
-};
+pub use ferrite_cuda_core::{CachingAllocator, GpuDevice, OwnedTensor, RawGpuAlloc, RawGpuMem};
 #[cfg(feature = "cuda")]
 pub use ferrite_cuda_core::{CpuGpuBuf, PinnedBuf};
 #[cfg(feature = "cuda")]

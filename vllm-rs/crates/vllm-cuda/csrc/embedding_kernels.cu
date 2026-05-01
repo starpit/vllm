@@ -357,3 +357,97 @@ void bias_add_f32(void* out, const void* bias, int M, int N, cudaStream_t stream
 }
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------------
+// Scalar multiply (in-place): x[i] *= scale, scale a host f32.
+// CUTLASS-side replacement for the cuBLAS `cublasScalEx` call that
+// `kernels::scale_inplace` previously dispatched. cuBLAS has been
+// removed; a custom kernel is required.
+// ---------------------------------------------------------------------------
+
+template<typename T>
+__global__ void scalar_mul_kernel(T* __restrict__ x, float scale, long long n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    // Compute in f32 for half/bfloat16 accuracy parity with cublasScalEx
+    // (which takes alphaType=F32 in our previous wiring).
+    float v = (float)x[idx];
+    x[idx] = (T)(v * scale);
+}
+
+template<>
+__global__ void scalar_mul_kernel<float>(float* __restrict__ x, float scale, long long n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    x[idx] = x[idx] * scale;
+}
+
+extern "C" {
+
+void scalar_mul_inplace_f16(void* x, float scale, long long n, cudaStream_t stream) {
+    int threads = 256;
+    long long blocks = (n + threads - 1) / threads;
+    scalar_mul_kernel<__half><<<(unsigned)blocks, threads, 0, stream>>>(
+        (__half*)x, scale, n);
+}
+
+void scalar_mul_inplace_bf16(void* x, float scale, long long n, cudaStream_t stream) {
+    int threads = 256;
+    long long blocks = (n + threads - 1) / threads;
+    scalar_mul_kernel<__nv_bfloat16><<<(unsigned)blocks, threads, 0, stream>>>(
+        (__nv_bfloat16*)x, scale, n);
+}
+
+void scalar_mul_inplace_f32(void* x, float scale, long long n, cudaStream_t stream) {
+    int threads = 256;
+    long long blocks = (n + threads - 1) / threads;
+    scalar_mul_kernel<float><<<(unsigned)blocks, threads, 0, stream>>>(
+        (float*)x, scale, n);
+}
+
+// ---------------------------------------------------------------------------
+// Pool mean (token-axis): out[j] = (1/M) * sum_i x[i, j], for x [M, N] f32.
+// CUTLASS-side replacement for the cuBLAS `cublasSgemv` call that
+// `kernels::pool_mean_f32` previously dispatched (vector-of-ones ⋅ x).
+// One block per N column; each block reduces M rows of that column.
+// ---------------------------------------------------------------------------
+
+__global__ void pool_mean_f32_kernel(
+    const float* __restrict__ x,  // [M, N]
+    float* __restrict__ out,      // [N]
+    int M, int N
+) {
+    extern __shared__ float smem[];
+    int j = blockIdx.x;
+    if (j >= N) return;
+    int tid = threadIdx.x;
+    float local = 0.0f;
+    for (int i = tid; i < M; i += blockDim.x) {
+        local += x[(long long)i * N + j];
+    }
+    smem[tid] = local;
+    __syncthreads();
+    // Tree reduction within block
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[j] = smem[0] / (float)M;
+    }
+}
+
+void pool_mean_f32_launch(
+    const void* x, void* out,
+    int M, int N,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    size_t smem = threads * sizeof(float);
+    pool_mean_f32_kernel<<<N, threads, smem, stream>>>(
+        (const float*)x, (float*)out, M, N);
+}
+
+}  // extern "C"

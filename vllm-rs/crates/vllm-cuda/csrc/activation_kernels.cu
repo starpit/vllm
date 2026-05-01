@@ -261,6 +261,158 @@ void gelu_and_mul_fused_bf16(
 } // extern "C"
 
 // ---------------------------------------------------------------------------
+// Standalone in-place activations: x[i] = act(x[i])
+// Used as singleton fallbacks when the DP solver cannot pick a fused
+// (act, mul) matcher (e.g., the upstream gate-up GEMM produced a
+// non-contiguous layout that the fused kernel doesn't support).
+// ---------------------------------------------------------------------------
+
+template <float (*ACT_FN)(float), typename T>
+__global__ void act_inplace_kernel(T* __restrict__ x, int n) {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+    const int num_vecs = n / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    for (int vi = blockIdx.x * blockDim.x + threadIdx.x;
+         vi < num_vecs;
+         vi += gridDim.x * blockDim.x) {
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            buf[j] = ACT_FN(buf[j]);
+        }
+        vec_store(&x[vi * VEC_SIZE], pack_vec<T>(buf));
+    }
+
+    for (int i = tail_start + blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += gridDim.x * blockDim.x) {
+        x[i] = static_cast<T>(ACT_FN(static_cast<float>(x[i])));
+    }
+}
+
+extern "C" {
+
+void silu_inplace_f32(float* x, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    act_inplace_kernel<silu, float><<<blocks, threads, 0, stream>>>(x, n);
+}
+
+void silu_inplace_f16(__half* x, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    act_inplace_kernel<silu, __half><<<blocks, threads, 0, stream>>>(x, n);
+}
+
+void silu_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    act_inplace_kernel<silu, __nv_bfloat16><<<blocks, threads, 0, stream>>>(x, n);
+}
+
+void gelu_inplace_f32(float* x, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    act_inplace_kernel<gelu_tanh, float><<<blocks, threads, 0, stream>>>(x, n);
+}
+
+void gelu_inplace_f16(__half* x, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    act_inplace_kernel<gelu_tanh, __half><<<blocks, threads, 0, stream>>>(x, n);
+}
+
+void gelu_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    act_inplace_kernel<gelu_tanh, __nv_bfloat16><<<blocks, threads, 0, stream>>>(x, n);
+}
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
+// Element-wise in-place multiply: a[i] *= b[i].
+// Singleton fallback for the (Silu, Mul) / (Gelu, Mul) gate-up
+// pattern when the fused activation+mul matcher declines.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void mul_elementwise_inplace_kernel(
+    T* __restrict__ a,
+    const T* __restrict__ b,
+    int n)
+{
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+    const int num_vecs = n / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    for (int vi = blockIdx.x * blockDim.x + threadIdx.x;
+         vi < num_vecs;
+         vi += gridDim.x * blockDim.x) {
+        float abuf[VEC_SIZE], bbuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&a[vi * VEC_SIZE]), abuf);
+        unpack_vec<T>(vec_load(&b[vi * VEC_SIZE]), bbuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            abuf[j] = abuf[j] * bbuf[j];
+        }
+        vec_store(&a[vi * VEC_SIZE], pack_vec<T>(abuf));
+    }
+
+    for (int i = tail_start + blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += gridDim.x * blockDim.x) {
+        float av = static_cast<float>(a[i]);
+        float bv = static_cast<float>(b[i]);
+        a[i] = static_cast<T>(av * bv);
+    }
+}
+
+extern "C" {
+
+void mul_elementwise_inplace_f32(float* a, const float* b, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    mul_elementwise_inplace_kernel<float><<<blocks, threads, 0, stream>>>(a, b, n);
+}
+
+void mul_elementwise_inplace_f16(__half* a, const __half* b, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    mul_elementwise_inplace_kernel<__half><<<blocks, threads, 0, stream>>>(a, b, n);
+}
+
+void mul_elementwise_inplace_bf16(
+    __nv_bfloat16* a, const __nv_bfloat16* b, int n, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (n + threads * 4 - 1) / (threads * 4);
+    if (blocks < 1) blocks = 1;
+    if (blocks > 4096) blocks = 4096;
+    mul_elementwise_inplace_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(a, b, n);
+}
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
 // Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
 // Used for Gemma 2 final logit softcapping.
 // x: [n] total elements, cap: scalar float.

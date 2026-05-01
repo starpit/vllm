@@ -473,10 +473,10 @@ impl GdnWeights {
         // 1. Input projections on GPU.
         let qkvz =
             self.in_proj_qkvz
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
         let ba = self
             .in_proj_ba
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+            .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         // 2. Split QKVZ and BA on GPU using fused kernel (no CPU round-trip).
         let key_dim = self.key_dim;
@@ -688,8 +688,8 @@ impl GdnWeights {
         // 7. Output projection on GPU.
         let result = self.out_proj.forward(
             proj_input.view().reshape(&[num_tokens, value_dim]),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
         drop(proj_input);
 
@@ -850,12 +850,10 @@ impl Qwen3NextFullAttention {
 
         // 1. QKV projection → [num_tokens, q_size + 2*kv_size].
         //    Where q_size = 2*true_q_size if attn_output_gate.
-        let qkv = self.inner.qkv_proj.forward(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-            stream,
-        );
+        let qkv = self
+            .inner
+            .qkv_proj
+            .forward(hidden_states, &mut device.caching, stream);
 
         // 2. Split into Q+gate, K, V.
         let q_size = self.inner.q_size;
@@ -1013,10 +1011,10 @@ impl Qwen3NextFullAttention {
         };
 
         // 9. Output projection.
-        let result =
-            self.inner
-                .o_proj
-                .forward(attn_flat, &mut device.cublas, &mut device.caching, stream);
+        let result = self
+            .inner
+            .o_proj
+            .forward(attn_flat, &mut device.caching, stream);
         drop(attn_output);
 
         // TP all-reduce.
@@ -1464,7 +1462,6 @@ impl Qwen3NextForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
         )

@@ -71,6 +71,13 @@ fn safetensors_prefix(program: &Program, id: WeightId, index: Option<u64>) -> St
 /// How the `Weights::load` method constructs a field from safetensors.
 #[derive(Clone)]
 enum FieldLoad {
+    /// Raw 1-D tensor read directly via `gw.take(&prefix)` — no
+    /// wrapper struct. Used for accessors whose `rust_type` is
+    /// `GpuTensor`, e.g. the standalone `BiasAddRefImpl` singleton's
+    /// bias accessor (input[1] of `OpKind::BiasAdd`). The on-disk
+    /// path is the bias tensor itself (`q_proj.bias`), distinct from
+    /// any packed-QKV `LinearLayer` source set, so no loader collision.
+    RawTensor(String),
     /// `Embedding::load(gw, prefix)`.
     Embedding(String),
     /// `RmsNorm::load(gw, prefix, eps)`. `eps` is baked in from the
@@ -350,6 +357,8 @@ fn plan_field_load(
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
+    let is_raw_tensor =
+        ty.ends_with("::GpuTensor") || ty == "GpuTensor" || ty.ends_with("tensor::GpuTensor");
     let is_rmsnorm =
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_cohere_layer_norm = ty.ends_with("::CohereLayerNorm")
@@ -743,7 +752,16 @@ fn plan_field_load(
         };
     }
 
-    if is_embedding {
+    if is_raw_tensor {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "RawTensor accessor `{}` with {} sources",
+            accessor.name,
+            prefixes.len()
+        );
+        FieldLoad::RawTensor(prefixes.into_iter().next().unwrap())
+    } else if is_embedding {
         assert_eq!(
             prefixes.len(),
             1,
@@ -2516,6 +2534,17 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
     let sharded = tp_world_size > 1;
     match plan {
+        FieldLoad::RawTensor(prefix) => {
+            // Raw 1-D tensor (singleton bias accessor). No struct
+            // wrapper, no sharding hook — biases ride through the
+            // packed `LinearLayer` accessor when the fused matcher
+            // wins, so this path only runs when a singleton claims
+            // a tile, which is the unsharded fallback.
+            let _ = sharded;
+            quote! {
+                let #name = gw.take(#prefix)?;
+            }
+        }
         FieldLoad::Embedding(prefix) => {
             // Embed paths route to vocab-parallel `_sharded` at tp>1
             // (matches Python vLLM `VocabParallelEmbedding`). Non-
@@ -2955,6 +2984,15 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
     let sharded = tp_world_size > 1;
     match plan {
+        FieldLoad::RawTensor(prefix) => {
+            // Layered raw 1-D tensor — biases at every layer, e.g.
+            // `model.layers.{L}.self_attn.q_proj.bias`.
+            let suffix = layered_suffix(prefix);
+            let _ = sharded;
+            quote! {
+                ::ferrite_forward::load_layered_raw_tensor(gw, #n_lit, #suffix)?
+            }
+        }
         FieldLoad::Embedding(prefix) => {
             let suffix = layered_suffix(prefix);
             // Embedding is vocab-parallel at tp>1 (matches Python

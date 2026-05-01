@@ -31,7 +31,7 @@ cuda = [
 ferrite-cuda-builder = { path = "../ferrite-cuda-builder" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
-cudarc = { workspace = true, features = ["cublas", "dynamic-linking", "cuda-version-from-build-system"] }
+cudarc = { workspace = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
 
 [build-dependencies]
 # `dirs::cache_dir()` resolves the cudaforge cache path the kernel

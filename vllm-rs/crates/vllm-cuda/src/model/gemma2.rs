@@ -181,12 +181,9 @@ impl Gemma2MLP {
     }
 
     pub unsafe fn forward(&self, x: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
-        let gate_up = self.gate_up_proj.forward(
-            x,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let gate_up = self
+            .gate_up_proj
+            .forward(x, &mut device.caching, device.compute_stream);
         let activated = kernels::gelu_and_mul_fused(
             *gate_up.view(),
             self.intermediate_size,
@@ -194,12 +191,9 @@ impl Gemma2MLP {
             device.compute_stream,
         );
         drop(gate_up);
-        let result = self.down_proj.forward(
-            activated.view(),
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let result =
+            self.down_proj
+                .forward(activated.view(), &mut device.caching, device.compute_stream);
         drop(activated);
 
         // TP: all-reduce down_proj output (row parallel).
@@ -457,12 +451,9 @@ impl Gemma2Attention {
     ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
 
-        let qkv = self.qkv_proj.forward(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let qkv = self
+            .qkv_proj
+            .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         if max_seqlen_q == 1 {
             // Decode path: fused QKV split + RoPE + cache write.
@@ -535,12 +526,9 @@ impl Gemma2Attention {
             drop(q);
 
             let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-            let result = self.o_proj.forward(
-                attn_flat,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
+            let result = self
+                .o_proj
+                .forward(attn_flat, &mut device.caching, device.compute_stream);
             drop(attn_output);
 
             #[cfg(feature = "nccl")]
@@ -614,12 +602,9 @@ impl Gemma2Attention {
         drop(v);
 
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-        let result = self.o_proj.forward(
-            attn_flat,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let result = self
+            .o_proj
+            .forward(attn_flat, &mut device.caching, device.compute_stream);
         drop(attn_output);
 
         // TP: all-reduce o_proj output (row parallel).
@@ -1421,7 +1406,11 @@ impl Gemma2Model {
             &mut device.caching,
             device.compute_stream,
         );
-        kernels::scale_inplace(*hidden_states.view(), self.embed_scale, &device.cublas);
+        kernels::scale_inplace(
+            *hidden_states.view(),
+            self.embed_scale,
+            device.compute_stream,
+        );
 
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
@@ -1823,8 +1812,8 @@ impl Gemma2ForCausalLM {
 
         let logits = self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
 
         // Apply final logit soft capping: logits = cap * tanh(logits / cap).
@@ -2322,7 +2311,7 @@ impl Gemma2Model {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                kernels::scale_inplace(*hs.view(), self.embed_scale, &device.cublas);
+                kernels::scale_inplace(*hs.view(), self.embed_scale, device.compute_stream);
                 (hs, None)
             } else {
                 let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");
@@ -2510,7 +2499,7 @@ impl Gemma2ForCausalLM {
                 #[allow(unused_mut)]
                 let mut logits =
                     self.lm_head
-                        .forward(hs_view, &mut device.cublas, &mut device.caching);
+                        .forward(hs_view, &mut device.caching, device.compute_stream);
                 // hidden_states can be freed now.
                 drop(gathered);
                 drop(hidden_states);

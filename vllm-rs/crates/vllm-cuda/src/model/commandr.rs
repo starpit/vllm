@@ -83,24 +83,11 @@ impl CommandRAttention {
         let qkv = if let (Some(k_proj), Some(v_proj)) = (attn.k_proj.as_ref(), attn.v_proj.as_ref())
         {
             // Quantized: separate Q, K, V GEMMs → concat
-            let q_out = attn.qkv_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            let k_out = k_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            let v_out = v_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            );
+            let q_out =
+                attn.qkv_proj
+                    .forward(hidden_states, &mut device.caching, device.compute_stream);
+            let k_out = k_proj.forward(hidden_states, &mut device.caching, device.compute_stream);
+            let v_out = v_proj.forward(hidden_states, &mut device.caching, device.compute_stream);
             let qk = kernels::concat_dim1(
                 *q_out.view(),
                 *k_out.view(),
@@ -120,12 +107,8 @@ impl CommandRAttention {
             qkv
         } else {
             // Dense: single fused QKV GEMM
-            attn.qkv_proj.forward(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-                device.compute_stream,
-            )
+            attn.qkv_proj
+                .forward(hidden_states, &mut device.caching, device.compute_stream)
         };
 
         // Split QKV and apply interleaved RoPE.
@@ -244,12 +227,9 @@ impl CommandRAttention {
                 drop(q);
 
                 let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
-                let result = attn.o_proj.forward(
-                    attn_flat,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                let result =
+                    attn.o_proj
+                        .forward(attn_flat, &mut device.caching, device.compute_stream);
                 drop(attn_output);
                 return result;
             } else {
@@ -315,12 +295,9 @@ impl CommandRAttention {
                 drop(v);
 
                 let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
-                let result = attn.o_proj.forward(
-                    attn_flat,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                let result =
+                    attn.o_proj
+                        .forward(attn_flat, &mut device.caching, device.compute_stream);
                 drop(attn_output);
                 return result;
             };
@@ -362,12 +339,9 @@ impl CommandRAttention {
         drop(v);
 
         let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
-        let result = attn.o_proj.forward(
-            attn_flat,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
+        let result = attn
+            .o_proj
+            .forward(attn_flat, &mut device.caching, device.compute_stream);
         drop(attn_output);
         result
     }
@@ -587,13 +561,13 @@ impl CommandRForCausalLM {
         // lm_head: logits = hidden_states @ lm_head_weight^T
         let logits = self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
 
         // Apply logit scaling.
         if self.logit_scale != 1.0 {
-            kernels::scale_inplace(*logits.view(), self.logit_scale, &device.cublas);
+            kernels::scale_inplace(*logits.view(), self.logit_scale, device.compute_stream);
         }
 
         logits

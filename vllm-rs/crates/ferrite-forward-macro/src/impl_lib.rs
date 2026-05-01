@@ -1807,33 +1807,16 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(LayerNormRefImpl));
-    // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
-    // expansion time (i.e. when `forward!` runs during a build) drops
-    // every cuBLAS-routing Impl from the library, forcing dispatch
-    // onto CUTLASS — tile zoo, SplitK, GEMV, or the matching
-    // CutlassFused* peer. Use this to benchmark "CUTLASS-only
-    // dispatch" vs the DP's default cost-driven mix, AND to verify
-    // libcublas un-link-readiness ahead of Step 6.
-    //
-    // Gated together (Step 5b — symmetric closure):
-    //   - GemmRefImpl                 — singleton Gemm via cuBLAS
-    //   - FusedCublasGemmAddImpl      — (Gemm, Add) via cuBLAS
-    //   - FusedGemmBiasImpl           — (Gemm, BiasAdd) via cuBLAS
-    //   - FusedGateUpSiluMulImpl      — packed SwiGLU via cuBLAS
-    //   - FusedGateUpGeluMulImpl      — packed GELU-MLP via cuBLAS
-    //   - FusedQkvRopeCacheImpl       — packed QKV+rope (M=1) via cuBLAS
-    //   - FusedQkvRopePrefillImpl     — packed QKV+rope (M≥2) via cuBLAS
-    //
-    // Every gated Impl has a `CutlassFused…` peer registered
-    // unconditionally below. At cuBLAS-OFF the DP routes through
-    // those peers. Per HANDOFF Lever A2, qwen2's biased QKV path
-    // currently has no CUTLASS peer; expect a perf hit there until
-    // bias-zoo CSV is shape-swept.
-    let cublas_enabled = std::env::var_os("FERRITE_DISABLE_CUBLAS_GEMM").is_none();
-    if cublas_enabled {
-        lib.push(Box::new(GemmRefImpl));
-        lib.push(Box::new(FusedCublasGemmAddImpl));
-    }
+    // cuBLAS-namesake Impls (`GemmRefImpl`, `FusedCublasGemmAddImpl`,
+    // `FusedGemmBiasImpl`, `FusedGateUp{Silu,Gelu}MulImpl`,
+    // `FusedQkvRope{Cache,Prefill}Impl`) are NOT registered. Their
+    // structs and `Implementation` blocks remain in the file (the
+    // CUTLASS peers' matchers structurally delegate to their
+    // `matches()` / `required_weights()` / `output_alias()`), but
+    // un-registered they never enter the DP's candidate set. Every
+    // Gemm tile lands on a CUTLASS tile via the DP's per-shape pick:
+    // tile zoo, SplitK, GEMV, or the matching `CutlassFused*` peer.
+    // libcublas is no longer linked.
     lib.push(Box::new(AttentionViaCacheImpl));
     // Reshape is a metadata-only view op synthesized by shape
     // inference to bridge axis-factor mismatches (e.g. per-head QK-
@@ -1846,22 +1829,8 @@ pub fn starter_library() -> ImplementationLibrary {
     // (e.g. the first layer's input_layernorm, whose upstream is
     // `embed` not `Add`, stays a singleton RmsNorm claim).
     //
-    // `(Gemm, BiasAdd)` pairs not absorbed by a larger fusion (e.g.
-    // a lone affine-transform gemm that's not a QKV-pre-rope or
-    // gate/up-pre-MLP). Emits cuBLAS gemm_bias via `LinearLayer::forward`.
-    //
-    // **NOT gated on the cuBLAS env var.** `CutlassFusedGemmBiasImpl`
-    // below has no `cutlass_gemm_bias` CSV rows for qwen2's K/V
-    // projection shapes (N=128, K=896 for Qwen2.5-0.5B and the rest
-    // of the qwen2 fleet). At cuBLAS-OFF the singleton-fallback chain
-    // (CutlassGemv + RopeAppendRefImpl + AttentionPrefill) produces a
-    // different K/V tensor layout than the fused path expects —
-    // verified failure on qwen2-0.5b: position 3 mismatch
-    // ("英文字" engine vs " is" golden). Until Lever A2 ships
-    // (cutlass_gemm_bias CSV sweep across qwen2 packed-QKV shapes),
-    // this Impl stays registered to keep qwen2 correctness-green.
-    lib.push(Box::new(FusedGemmBiasImpl));
-    // CUTLASS bias-add peer to FusedGemmBiasImpl — plain
+    // CUTLASS bias-add — was previously paired with the cuBLAS-routing
+    // `FusedGemmBiasImpl` (now unregistered). Plain
     // `cutlass::gemm::device::Gemm` with `LinearCombination` epilogue
     // and bias passed as the C operand at ldc=0 (row broadcast). One
     // Impl per CUTLASS_TILE_ZOO entry, gated per-tile on calibrated
@@ -1873,18 +1842,10 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
-    // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpSiluMul
-    // below is the cuBLAS-OFF peer.
-    if cublas_enabled {
-        lib.push(Box::new(FusedGateUpSiluMulImpl));
-    }
-    // CUTLASS EVT peer to FusedGateUpSiluMulImpl — same claim, different
-    // kernel shape. Solver's DP picks whichever has lower calibrated
-    // cost per bucket; `target_compatible` gates on CSV row presence.
-    // Parameterized over CUTLASS_TILE_ZOO so the up-projection GEMM
-    // tile is DP-pickable rather than hardcoded — the previous
-    // hardcoded `cutlass_128x128_s3` lost to small-M tiles after the
-    // tile_m=16 splitK additions, breaking SiLU MLP fusions.
+    // CUTLASS EVT SwiGLU MLP — was paired with the cuBLAS-routing
+    // `FusedGateUpSiluMulImpl` (now unregistered). Solver's DP picks
+    // the cheapest tile per (M, 2I, K) bucket; `target_compatible`
+    // gates per-tile on CSV row presence.
     for tile in CUTLASS_TILE_ZOO {
         lib.push(Box::new(CutlassFusedGateUpSiluMulImpl {
             tile_m: tile.0,
@@ -1892,15 +1853,28 @@ pub fn starter_library() -> ImplementationLibrary {
             stages: tile.2,
         }));
     }
-    // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpGeluMul
-    // below is the cuBLAS-OFF peer.
-    if cublas_enabled {
-        lib.push(Box::new(FusedGateUpGeluMulImpl));
+    // M=1 packed-GEMV peer for the QKV+RoPE+cache fusion. Replaces the
+    // tile-zoo `cutlass_<TM>x<TN>` GEMM step with `cutlass_gemv` at
+    // decode shapes (qwen2 N=1152 K=896 measures 1.8 µs vs ~25 µs for
+    // the smallest tile). DP picks per (M, packed_n, K) bucket.
+    lib.push(Box::new(CutlassFusedQkvRopeCacheGemvImpl));
+    // PACKED-GEMM SwiGLU MLP — mirrors the cuBLAS-peer structure:
+    // ONE packed CUTLASS GEMM at (M, 2I, K) then BW-bound
+    // `silu_and_mul_fused`. The EVT 2-GEMM peer above wins for
+    // compute-bound shapes (uses `up_out` from registers, no HBM
+    // round-trip); this packed peer wins at decode (M=1) where the
+    // saved kernel launch beats the extra HBM read of [M, 2I].
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassFusedGateUpSiluMulPackedImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
     }
-    // CUTLASS peer to FusedGateUpGeluMulImpl. Mirrors the cuBLAS path
-    // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
-    // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
-    // 2I, K) bucket. One Impl per CUTLASS_TILE_ZOO entry.
+    // CUTLASS GELU MLP — was paired with the cuBLAS-routing
+    // `FusedGateUpGeluMulImpl` (now unregistered). Packed CUTLASS
+    // GEMM at (M, 2I, K) followed by BW-bound `gelu_and_mul_fused`,
+    // tile pick per (M, 2I, K) bucket via the DP.
     for tile in CUTLASS_TILE_ZOO {
         lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
             tile_m: tile.0,
@@ -1927,7 +1901,32 @@ pub fn starter_library() -> ImplementationLibrary {
             tile_n: tile.1,
             stages: tile.2,
         }));
+        // 3-tile peer for the commandr lm_head pattern: LayerNorm +
+        // Gemm + ScalarMul (logit_scale). Saves the standalone
+        // ScalarMul launch barrier vs the 2-tile peer above.
+        lib.push(Box::new(CutlassFusedLayerNormGemmScalarMulImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
         lib.push(Box::new(CutlassFusedAddRmsNormGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+        // 4-tile peer for the gemma2/3 lm_head pattern: residual Add
+        // → scalar-offset Add (1.0) → RmsNorm → Gemm. Same kernel
+        // sequence as the non-offset peer plus a `weight_offset`
+        // fp32 fadd in the bw-bound rmsnorm.
+        lib.push(Box::new(CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+        // 3-tile peer (no upstream residual Add) — gemma's first-
+        // iteration pre-norm and any future single-Gemm-consumer
+        // `(1+w)` rmsnorm pattern.
+        lib.push(Box::new(CutlassFusedScalarOffsetRmsNormGemmImpl {
             tile_m: tile.0,
             tile_n: tile.1,
             stages: tile.2,
@@ -1937,6 +1936,14 @@ pub fn starter_library() -> ImplementationLibrary {
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
     // adds before any LayerNorm. Emits `add_inplace`.
     lib.push(Box::new(AddRefImpl));
+    // Singleton fallbacks for orphan-by-design ops. Cost is
+    // `UNCALIBRATED_COST_US` so the DP keeps preferring fused
+    // matchers; eval bodies call real `*_inplace` kernels so the
+    // path runs end-to-end if a singleton is ever selected.
+    lib.push(Box::new(BiasAddRefImpl));
+    lib.push(Box::new(SiluRefImpl));
+    lib.push(Box::new(GeluRefImpl));
+    lib.push(Box::new(MulRefImpl));
     // Tensor-parallel all-reduce-sum: the only matcher for
     // `OpKind::AllReduce` nodes the lowering pass inserts after every
     // row-parallel gemm at tp>1.
@@ -1959,27 +1966,20 @@ pub fn starter_library() -> ImplementationLibrary {
     // tensor×tensor SwiGLU / GELU fusions claim the disjoint
     // (Tile, Tile) pattern.
     lib.push(Box::new(ScalarMulImpl));
-    // Decode / prefill QKV+rope variants — the solver picks via
-    // WorkloadConstraint (M=1 → Cache, M≥2 → Prefill).
+    // CUTLASS QKV+rope — was paired with cuBLAS-routing
+    // `FusedQkvRope{Cache,Prefill}Impl` (now unregistered). Packed
+    // CUTLASS GEMM at (M, q+2*kv, hidden) followed by the same
+    // fused_qkv_rope_cache / fused_qkv_rope post-pass. One Impl per
+    // CUTLASS_TILE_ZOO entry per variant. Solver picks Cache (M=1)
+    // vs Prefill (M≥2) via WorkloadConstraint.
     //
-    // **NOT gated on the cuBLAS env var.** `CutlassFusedQkvRope*Impl`
-    // peers reject biased claims (Lever A2). At cuBLAS-OFF, qwen2's
-    // biased QKV pattern would have NO fused impl available; the
-    // singleton-fallback chain (RopeAppendRefImpl + CutlassFusedGemmBias
-    // + AttentionPrefillContiguous) emits K/V at `[T, heads*head_dim]`
-    // while the downstream Attention impl expects `[T, heads, head_dim]`
-    // (the fused-path layout) — verified correctness failure on
-    // qwen2-0.5b. Keeping these registered preserves correctness; the
-    // DP still picks `CutlassFusedQkvRope*` for non-biased patterns
-    // when its calibrated cost wins.
-    lib.push(Box::new(FusedQkvRopeCacheImpl));
-    lib.push(Box::new(FusedQkvRopePrefillImpl));
-    // CUTLASS peers — packed CUTLASS GEMM at (M, q+2*kv, hidden)
-    // followed by the same fused_qkv_rope_cache / fused_qkv_rope
-    // post-pass. One Impl per CUTLASS_TILE_ZOO entry per variant;
-    // target_compatible gates each on calibrated CSV row presence.
-    // matches() rejects biased claims (qwen2 keeps cuBLAS until the
-    // bias-zoo CSV is shape-swept).
+    // Note on biased QKV (qwen2): the matchers reject biased claims
+    // because the `cutlass_gemm_bias_*` CSV doesn't yet cover the
+    // packed-QKV shapes for the qwen2 fleet. With cuBLAS gone, biased
+    // QKV falls through to (CutlassFusedGemmBias singletons +
+    // RopeAppendRefImpl). Lever A2 (sweep packed QKV bias shapes +
+    // drop the bias gate in `CutlassFusedQkvRope*::matches`) is the
+    // proper close.
     for tile in CUTLASS_TILE_ZOO {
         lib.push(Box::new(CutlassFusedQkvRopeCacheImpl {
             tile_m: tile.0,
@@ -2063,6 +2063,15 @@ pub fn starter_library() -> ImplementationLibrary {
     }
 
     lib.push(Box::new(CutlassGemvImpl));
+    // CATCH-ALL singleton for Dense Gemm at ANY workload.
+    // Diagnostic-only finite cost (UNCALIBRATED_COST_US is huge so
+    // any other matching Impl wins on cost). Exists so that DP can
+    // never raise `UnclaimedTile` on a Dense Gemm — when a fused
+    // matcher unexpectedly returns None and the storage gate on
+    // `CutlassGemv` (`M=1` only) excludes the higher-M case, this
+    // catches the orphan tile. Runtime falls through `cutlass_gemv`'s
+    // existing `any_align_bf16_gemm` fallback for misaligned shapes.
+    lib.push(Box::new(CatchAllDenseGemmImpl));
 
     // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
     //
@@ -2447,9 +2456,19 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, ctx.fuf.get(gemm_tile)) else {
             return f64::INFINITY;
         };
+        // Roofline fallback at uncalibrated shapes — required for
+        // qwen2's biased K/V projections (N=128 K=hidden) which
+        // aren't in the bias-zoo CSV. Without the fallback this
+        // Impl returns UNCALIBRATED and loses to the orphan
+        // (`CutlassGemv` singleton + un-claimed `BiasAdd`) — the
+        // BiasAdd tile then has no claim, the DP fails with
+        // `UnclaimedTile` at qwen2 build time. The roofline figure
+        // matches `cost_gemm`'s convention so the comparison stays
+        // calibrated where data exists and falls back consistently
+        // where it doesn't.
         ctx.profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
-            .unwrap_or(UNCALIBRATED_COST_US)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk))
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -3390,6 +3409,207 @@ impl Implementation for CutlassFusedGateUpGeluMulImpl {
     }
 }
 
+// ── CutlassFusedGateUpSiluMulPackedImpl ──────────────────────────
+//
+// Packed-1-GEMM peer to [`CutlassFusedGateUpSiluMulImpl`]. Mirrors
+// the cuBLAS-peer structure exactly (same as `CutlassFusedGateUpGeluMulImpl`
+// does for GELU): ONE packed CUTLASS GEMM at `(M, 2I, K)` producing
+// `[M, 2I]`, then BW-bound `silu_and_mul_fused` writing `[M, I]`.
+//
+// Wins over the EVT 2-GEMM peer at decode (M=1) where the saved
+// launch dominates the extra HBM round-trip of the packed
+// intermediate. Loses on compute-bound prefill MLPs where the EVT
+// peer's register-resident `up_out` win is real.
+
+#[derive(Debug, Clone)]
+pub struct CutlassFusedGateUpSiluMulPackedImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedGateUpSiluMulPackedImpl {
+    fn csv_name(&self) -> &'static str {
+        // Same naming as the GeluMul packed peer — the GEMM step is
+        // an ordinary `cutlass_<TM>x<TN>_s<S>` at packed `N=2I`.
+        CutlassFusedGateUpGeluMulImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for CutlassFusedGateUpSiluMulPackedImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        FusedGateUpSiluMulImpl.matches(fuf, seed, profile)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Mirror of `CutlassFusedGateUpGeluMulImpl::cost_us`:
+        //   - one packed GEMM at `(M, 2I, K)` via this Impl's
+        //     calibrated CSV row
+        //   - one BW-bound `silu_and_mul_fused` over `[M, 2I] → [M, I]`
+        // Total: 2 launches/layer (vs the EVT peer's 2 GEMM launches).
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
+        let packed_n = 2u32.saturating_mul(intermediate);
+
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), num_tokens, packed_n, hidden)
+            .unwrap_or(UNCALIBRATED_COST_US);
+
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * (num_tokens as f64) * (intermediate as f64) * BYTES_PER_ELEM;
+        let elem_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+
+        let _ = m;
+        gemm_us + elem_us
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedGateUpSiluMulImpl.required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedGateUpSiluMulPacked",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("packed_n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let silu_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Silu)
+            .expect("CutlassFusedGateUpSiluMulPacked: claim contains Silu");
+        let mul_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("CutlassFusedGateUpSiluMulPacked: claim contains Mul");
+        let gate_id = match fuf.get(silu_id).inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            other => panic!(
+                "CutlassFusedGateUpSiluMulPacked: Silu's first input must be a Tile (got {other:?})"
+            ),
+        };
+        let gate_node = fuf.get(gate_id);
+        let (in_id, in_slot) = match gate_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedGateUpSiluMulPacked: gate gemm's first input must be a Tile (got {other:?})"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(mul_id, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("CutlassFusedGateUpSiluMulPacked: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+
+        let (gate_n, k) = gemm_nk_from_fuf(fuf, gate_node, bounds)
+            .expect("CutlassFusedGateUpSiluMulPacked: gate (N, K) must resolve from FUF + bounds");
+        let packed_n = gate_n.saturating_mul(2);
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new(
+                "CutlassFusedGateUpSiluMulPacked",
+                proc_macro2::Span::call_site(),
+            ),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #packed_n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
 /// Return the `cos_sin_cache` TokenStream for a rope-related tile.
 /// Checks whether the tile (or any tile in `claimed`) carries an
 /// `ExternKind::RotaryLocal` input; if so emits `wm.rotary_local`,
@@ -4132,6 +4352,417 @@ impl Implementation for AddRefImpl {
         Some(vec![OpInstance::new(
             syn::Ident::new("Add", proc_macro2::Span::call_site()),
             vec![quote! { #delta_idx }, quote! { #residual_idx }],
+        )])
+    }
+}
+
+// ── BiasAddRefImpl / SiluRefImpl / GeluRefImpl / MulRefImpl ──────
+//
+// Singleton fallbacks for orphan-by-design ops. Cost is
+// `UNCALIBRATED_COST_US` (1e9 µs) so the DP keeps preferring fused
+// matchers (`FusedQkvRopeCacheImpl`, `FusedGateUpSiluMulImpl`, …)
+// whenever they match. They exist to satisfy the "every tile is
+// claimable" invariant — an `UnclaimedTile` from the solver is a
+// compiler bug, not a user error (`feedback_no_unmatchable_tiles`).
+//
+// Each calls a real `*_inplace` kernel (`bias_add_inplace`,
+// `silu_inplace`, `gelu_inplace`, `mul_elementwise_inplace`) so if
+// the singleton is ever picked the path runs end-to-end — no
+// `unimplemented!` (`feedback_no_unimplemented_singletons`).
+//
+// `BiasAddRefImpl::required_weights` declares the accessor against
+// the BiasAdd's own bias weight (input[1]). `rust_type = GpuTensor`
+// routes through the `FieldLoad::RawTensor` arm — `gw.take(prefix)`
+// reads the bias tensor directly. Source set is disjoint from any
+// packed-QKV `LinearLayer` accessor (which only concatenates `.weight`
+// tensors), so no loader-uniqueness conflict.
+
+#[derive(Debug, Default)]
+pub struct BiasAddRefImpl;
+
+impl Implementation for BiasAddRefImpl {
+    fn name(&self) -> &'static str {
+        "bias_add_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::BiasAdd || node.inputs.len() != 2 {
+            return None;
+        }
+        let act = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        // input[1] must be a weight (the bias vector).
+        if !matches!(node.inputs[1], FufInput::Weight { .. }) {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![act],
+            boundary_outputs: vec![seed],
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let id = claimed_tiles[0];
+        let node = fuf.get(id);
+        let src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((id, 0), src)]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "BiasAdd",
+            vec![
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let id = m.claimed_tiles[0];
+        let node = fuf.get(id);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("BiasAdd: input 0 must be a Tile"),
+        };
+        let in_idx = slots.of(in_id, in_slot);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("BiasAdd: required_weights returned empty (bias weight missing)");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("BiasAdd", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SiluRefImpl;
+
+impl Implementation for SiluRefImpl {
+    fn name(&self) -> &'static str {
+        "silu_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::Silu || node.inputs.len() != 1 {
+            return None;
+        }
+        let inp = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![inp],
+            boundary_outputs: vec![seed],
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let id = claimed_tiles[0];
+        let node = fuf.get(id);
+        let src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((id, 0), src)]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("Silu", vec![("slot", syn::parse_quote!(u32))])
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let id = m.claimed_tiles[0];
+        let node = fuf.get(id);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("Silu: input must be a Tile"),
+        };
+        let idx = slots.of(in_id, in_slot);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Silu", proc_macro2::Span::call_site()),
+            vec![quote! { #idx }],
+        )])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GeluRefImpl;
+
+impl Implementation for GeluRefImpl {
+    fn name(&self) -> &'static str {
+        "gelu_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::Gelu || node.inputs.len() != 1 {
+            return None;
+        }
+        let inp = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![inp],
+            boundary_outputs: vec![seed],
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let id = claimed_tiles[0];
+        let node = fuf.get(id);
+        let src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((id, 0), src)]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("Gelu", vec![("slot", syn::parse_quote!(u32))])
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let id = m.claimed_tiles[0];
+        let node = fuf.get(id);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("Gelu: input must be a Tile"),
+        };
+        let idx = slots.of(in_id, in_slot);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Gelu", proc_macro2::Span::call_site()),
+            vec![quote! { #idx }],
+        )])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MulRefImpl;
+
+impl Implementation for MulRefImpl {
+    fn name(&self) -> &'static str {
+        "mul_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::Mul || node.inputs.len() != 2 {
+            return None;
+        }
+        let slot_a = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        let slot_b = match &node.inputs[1] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![slot_a, slot_b],
+            boundary_outputs: vec![seed],
+        })
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let id = claimed_tiles[0];
+        let node = fuf.get(id);
+        let src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((id, 0), src)]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Mul",
+            vec![
+                ("a_slot", syn::parse_quote!(u32)),
+                ("b_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let id = m.claimed_tiles[0];
+        let node = fuf.get(id);
+        let (a_id, a_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("Mul: input 0 must be a Tile"),
+        };
+        let (b_id, b_slot) = match node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("Mul: input 1 must be a Tile"),
+        };
+        let a_idx = slots.of(a_id, a_slot);
+        let b_idx = slots.of(b_id, b_slot);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Mul", proc_macro2::Span::call_site()),
+            vec![quote! { #a_idx }, quote! { #b_idx }],
         )])
     }
 }
@@ -4944,6 +5575,283 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
     }
 }
 
+// ── CutlassFusedLayerNormGemmScalarMulImpl ───────────────────────
+//
+// 3-tile claim (LayerNorm + Gemm + ScalarMul) for the commandr
+// lm_head pattern:
+//
+//     normed = layer_norm(hidden, norm);
+//     logits = gemm(normed, lm_head) * scalar(logit_scale);
+//
+// Without this Impl, `CutlassFusedLayerNormGemmImpl` claims the
+// (LayerNorm, Gemm) 2-tile + standalone `ScalarMulImpl` for the
+// final scale — same correctness, one extra launch barrier on
+// every prefill/decode lm_head dispatch. Same kernel sequence as
+// the 2-tile peer plus a `scale_inplace` over the gemm output
+// (~bw-bound).
+//
+// Currently active for commandr; future RmsNorm+Gemm+ScalarMul
+// arches would need a sibling `CutlassFusedRmsNormGemmScalarMul`
+// peer (deferred — symmetric closure once a use case lands).
+#[derive(Debug, Clone)]
+pub struct CutlassFusedLayerNormGemmScalarMulImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedLayerNormGemmScalarMulImpl {
+    fn csv_name(&self) -> &'static str {
+        CutlassFusedRmsNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for CutlassFusedLayerNormGemmScalarMulImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Reuse the LayerNorm-Gemm matcher; extend by requiring a
+        // single ScalarMul consumer of the Gemm output.
+        let (norm_id, gemm_id) = match_norm_gemm_pair(fuf, seed, OpKind::LayerNorm)?;
+        let mut consumers = fuf.nodes.iter().filter(|n| consumes_tile(n, gemm_id));
+        let only = consumers.next()?;
+        if consumers.next().is_some() {
+            return None;
+        }
+        if only.op != OpKind::Mul || only.inputs.len() != 2 {
+            return None;
+        }
+        // ScalarMul shape: (Tile, Scalar) — reject (Tile, Tile)
+        // which is the SwiGLU/GELU MLP fusion territory.
+        let mut has_tile = false;
+        let mut has_scalar = false;
+        for inp in &only.inputs {
+            match inp {
+                FufInput::Tile { .. } => has_tile = true,
+                FufInput::Scalar(_) => has_scalar = true,
+                _ => return None,
+            }
+        }
+        if !(has_tile && has_scalar) {
+            return None;
+        }
+        let scalar_mul_id = only.id;
+        let norm_node = fuf.get(norm_id);
+        let activation_in = first_tile_input(norm_node)?.0;
+        let mut claimed = [norm_id, gemm_id, scalar_mul_id];
+        claimed.sort();
+        Some(MatchInfo {
+            claimed_tiles: claimed.to_vec(),
+            boundary_inputs: vec![activation_in],
+            // The ScalarMul output is the externally-visible result.
+            boundary_outputs: vec![scalar_mul_id],
+        })
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Cost = sum of the alternative path's parts: CutlassFusedLayerNormGemm
+        // (gemm + norm bw) + ScalarMulImpl (hidden-size bw, matches the peer's
+        // formula byte-for-byte so picks_count tiebreak fires at equal cost).
+        // The picks-count tiebreak then favors this 1-pick claim over the
+        // 2-pick (LayerNormGemm + standalone ScalarMul) alternative.
+        let norm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::LayerNorm)
+            .expect("CutlassFusedLayerNormGemmScalarMul: claim contains LayerNorm");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedLayerNormGemmScalarMul: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
+        let norm_singleton = MatchInfo {
+            claimed_tiles: vec![norm_id],
+            boundary_inputs: m.boundary_inputs.clone(),
+            boundary_outputs: vec![norm_id],
+        };
+        let norm_us = elementwise_cost(&norm_singleton, ctx);
+        // ScalarMul cost — match `ScalarMulImpl::cost_us` byte-for-byte (uses
+        // num_tokens × hidden_size, NOT the actual mul-output shape; pre-existing
+        // peer convention). Cost parity is required so the picks-count tiebreak
+        // fires deterministically.
+        let numel = ctx.num_tokens() * ctx.bounds.get("hidden_size").copied().unwrap_or(0);
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let scalar_mul_us = if bw_gb > 0.0 {
+            (2.0 * numel as f64 * BYTES_PER_ELEM) / (bw_gb * 1e9) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + norm_us + scalar_mul_us
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Same accessor set as the 2-tile peer (norm + gemm); the
+        // ScalarMul carries no Weight input.
+        CutlassFusedLayerNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedLayerNormGemmScalarMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("scale", syn::parse_quote!(f32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers::CohereLayerNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let norm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::LayerNorm)
+            .expect("CutlassFusedLayerNormGemmScalarMul: claim contains LayerNorm");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedLayerNormGemmScalarMul: claim contains Gemm");
+        let scalar_mul_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mul)
+            .expect("CutlassFusedLayerNormGemmScalarMul: claim contains ScalarMul");
+        let norm_node = fuf.get(norm_id);
+        let gemm_node = fuf.get(gemm_id);
+        let scalar_mul_node = fuf.get(scalar_mul_id);
+        let (in_id, in_slot) = match norm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedLayerNormGemmScalarMul: norm input 0 must be a Tile (got {other:?})"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        // The OUTPUT of the fused 3-tile is the ScalarMul's output
+        // slot — that's what downstream tiles see.
+        let out_slot_idx = slots.of(scalar_mul_id, 0);
+        let scale: f32 = scalar_mul_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("CutlassFusedLayerNormGemmScalarMul: ScalarMul has a Scalar input");
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("CutlassFusedLayerNormGemmScalarMul: required_weights[0]");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("CutlassFusedLayerNormGemmScalarMul: required_weights[1]");
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("CutlassFusedLayerNormGemmScalarMul: gemm (N, K) must resolve");
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new(
+                "CutlassFusedLayerNormGemmScalarMul",
+                proc_macro2::Span::call_site(),
+            ),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { #scale },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CutlassFusedAddRmsNormGemmImpl {
     pub tile_m: u32,
@@ -5222,6 +6130,696 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
                 quote! { #residual_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
+// ── CutlassFusedAddScalarOffsetRmsNormGemmImpl ───────────────────
+//
+// 4-tile claim (residual_Add, scalar_offset_Add, RmsNorm, Gemm) for
+// the Gemma2/3 lm_head pattern:
+//   hidden = add(post_ffwd_normed, hidden);     // residual update
+//   normed = rmsnorm(hidden, norm + 1.0);       // (1 + w) rmsnorm
+//   logits = gemm(normed, lm_head);             // dense projection
+//
+// Without this Impl, the DP picks `FusedAddRmsNormWithOffsetImpl`
+// for the (Add, ScalarOffsetAdd, RmsNorm) 3-tile + standalone Gemm.
+// Same kernel sequence as the non-offset peer plus a `weight_offset`
+// fp32 fadd inside the bw-bound rmsnorm — effectively free. Shares
+// the runtime opcode shape with `CutlassFusedAddRmsNormGemm`; the
+// extra `offset` field rides on the per-instance opcode.
+#[derive(Debug)]
+pub struct CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+    fn csv_name(&self) -> &'static str {
+        CutlassFusedRmsNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Seed at the residual-stream Add: both inputs must be tiles.
+        let residual_add = fuf.get(seed);
+        if residual_add.op != OpKind::Add {
+            return None;
+        }
+        if !residual_add
+            .inputs
+            .iter()
+            .all(|i| matches!(i, FufInput::Tile { .. }))
+        {
+            return None;
+        }
+        // Find a RmsNorm whose slot 0 reads the residual-Add and
+        // whose slot 1 (weight) reads a scalar-offset Add (Weight +
+        // Scalar). Same shape as `FusedAddRmsNormWithOffsetImpl`.
+        let rmsnorm_node = fuf.nodes.iter().find(|n| {
+            if n.op != OpKind::RmsNorm || n.inputs.len() < 2 {
+                return false;
+            }
+            let reads_residual_at_0 =
+                matches!(n.inputs[0], FufInput::Tile { id, .. } if id == seed);
+            if !reads_residual_at_0 {
+                return false;
+            }
+            let scalar_add_id = match n.inputs[1] {
+                FufInput::Tile { id, .. } => id,
+                _ => return false,
+            };
+            let scalar_add = fuf.get(scalar_add_id);
+            if scalar_add.op != OpKind::Add {
+                return false;
+            }
+            let mut has_weight = false;
+            let mut has_scalar = false;
+            for inp in &scalar_add.inputs {
+                match inp {
+                    FufInput::Weight { .. } => has_weight = true,
+                    FufInput::Scalar(_) => has_scalar = true,
+                    _ => return false,
+                }
+            }
+            has_weight && has_scalar
+        })?;
+        let rmsnorm_id = rmsnorm_node.id;
+        let scalar_add_id = match rmsnorm_node.inputs[1] {
+            FufInput::Tile { id, .. } => id,
+            _ => unreachable!(),
+        };
+        // RmsNorm's only consumer is a single dense Gemm reading
+        // RmsNorm at its first tile slot.
+        let mut consumers = fuf.nodes.iter().filter(|n| consumes_tile(n, rmsnorm_id));
+        let only = consumers.next()?;
+        if consumers.next().is_some() {
+            return None;
+        }
+        if only.op != OpKind::Gemm {
+            return None;
+        }
+        if !matches!(weight_storage_of(only), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        match first_tile_input(only) {
+            Some((id, slot)) if id == rmsnorm_id && slot == 0 => {}
+            _ => return None,
+        }
+        let gemm_id = only.id;
+        let mut claimed = [seed, scalar_add_id, rmsnorm_id, gemm_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        let boundary_inputs: Vec<TileId> = residual_add
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs,
+            // Both the Add output (residual update) and the Gemm
+            // output (matmul result) are externally visible.
+            boundary_outputs: vec![seed, gemm_id],
+        })
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same cost shape as the non-offset peer: gemm + bw-bound
+        // fused add+rmsnorm. The `+ offset` is free.
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = (4.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        let norm_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + norm_us
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Scalar-offset Add's Weight input IS the rmsnorm weight —
+        // matches `FusedAddRmsNormWithOffsetImpl::required_weights`.
+        // Order: norm accessor first, gemm accessor second (matches
+        // peer's `fan_out` indexing).
+        let scalar_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let scalar_add = fuf.get(scalar_add_id);
+        let (norm_weight_id, norm_weight_idx) = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Weight input");
+        let norm_acc = WeightAccessor {
+            name: weight_field_name(program, norm_weight_id, norm_weight_idx),
+            rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+            source_weights: vec![(norm_weight_id, norm_weight_idx)],
+        };
+        let gemm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
+        let gemm_node = fuf.get(gemm_id);
+        let (gemm_weight_id, gemm_weight_idx) = gemm_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("Gemm has a Weight input");
+        let gemm_acc = WeightAccessor {
+            name: weight_field_name(program, gemm_weight_id, gemm_weight_idx),
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: vec![(gemm_weight_id, gemm_weight_idx)],
+        };
+        vec![norm_acc, gemm_acc]
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Identical aliasing to the non-offset peer: Add tile slot 0
+        // aliases the residual upstream's OwnedTensor; Gemm output is
+        // a fresh allocation.
+        let residual_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains residual Add");
+        let add_node = fuf.get(residual_add_id);
+        let residual_src = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("residual Add input 1 must be a Tile"),
+        };
+        vec![((residual_add_id, 0), Some(residual_src))]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        // Fresh opcode (not shared with `CutlassFusedAddRmsNormGemm`)
+        // because the runtime needs the `offset` field. Same fields
+        // as the non-offset peer plus `offset`.
+        OpcodeShape::new(
+            "CutlassFusedAddScalarOffsetRmsNormGemm",
+            vec![
+                ("delta_slot", syn::parse_quote!(u32)),
+                ("residual_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("offset", syn::parse_quote!(f32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let residual_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains residual Add");
+        let scalar_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
+        let add_node = fuf.get(residual_add_id);
+        let gemm_node = fuf.get(gemm_id);
+        let (delta_id, delta_in_slot) = match add_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("residual Add input 0 must be a Tile (got {other:?})"),
+        };
+        let (residual_id, residual_in_slot) = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("residual Add input 1 must be a Tile (got {other:?})"),
+        };
+        let delta_idx = slots.of(delta_id, delta_in_slot);
+        let residual_idx = slots.of(residual_id, residual_in_slot);
+        let out_slot_idx = slots.of(gemm_id, 0);
+        let scalar_add = fuf.get(scalar_add_id);
+        let offset: f32 = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Scalar input");
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: required_weights[0]");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: required_weights[1]");
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds).expect(
+            "CutlassFusedAddScalarOffsetRmsNormGemm: gemm (N, K) must resolve from FUF + bounds",
+        );
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new(
+                "CutlassFusedAddScalarOffsetRmsNormGemm",
+                proc_macro2::Span::call_site(),
+            ),
+            vec![
+                quote! { #delta_idx },
+                quote! { #residual_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { #offset },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
+// ── CutlassFusedScalarOffsetRmsNormGemmImpl ──────────────────────
+//
+// 3-tile claim (scalar-offset Add + RmsNorm + Gemm) for the
+// no-upstream-residual case of gemma's `(1+w)` rmsnorm pattern:
+//
+//     normed = rmsnorm(x, w + 1.0);     // standalone (x is OwnedTensor)
+//     out    = gemm(normed, weight);    // single Gemm consumer
+//
+// This is the gemma-arch peer of `CutlassFusedAddScalarOffsetRmsNormGemmImpl`
+// minus the residual Add (e.g. on the first iteration's pre-norm
+// before any residual chain has formed, or any future arch where a
+// `(1+w)` rmsnorm has a single Gemm consumer without an upstream
+// Add). Same kernel sequence: `rms_norm_with_offset` →
+// `cutlass_gemm`.
+//
+// Without this Impl, `ScalarOffsetRmsNormImpl` claims the (Add,
+// RmsNorm) 2-tile and the Gemm dispatches as a standalone CUTLASS
+// kernel — same correctness, one extra launch barrier.
+#[derive(Debug)]
+pub struct CutlassFusedScalarOffsetRmsNormGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedScalarOffsetRmsNormGemmImpl {
+    fn csv_name(&self) -> &'static str {
+        CutlassFusedRmsNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for CutlassFusedScalarOffsetRmsNormGemmImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Seed at the scalar-offset Add: Weight + Scalar inputs.
+        let scalar_add = fuf.get(seed);
+        if scalar_add.op != OpKind::Add {
+            return None;
+        }
+        let mut has_weight = false;
+        let mut has_scalar = false;
+        for inp in &scalar_add.inputs {
+            match inp {
+                FufInput::Weight { .. } => has_weight = true,
+                FufInput::Scalar(_) => has_scalar = true,
+                _ => return None,
+            }
+        }
+        if !(has_weight && has_scalar) {
+            return None;
+        }
+        // RmsNorm reads scalar-offset Add at the weight slot (1),
+        // its slot 0 is the input tensor (an upstream tile).
+        let rmsnorm_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::RmsNorm
+                && matches!(n.inputs.get(1), Some(FufInput::Tile { id, .. }) if *id == seed)
+        })?;
+        let rmsnorm_id = rmsnorm_node.id;
+        // Single Gemm consumer reading RmsNorm at slot 0.
+        let mut consumers = fuf.nodes.iter().filter(|n| consumes_tile(n, rmsnorm_id));
+        let only = consumers.next()?;
+        if consumers.next().is_some() {
+            return None;
+        }
+        if only.op != OpKind::Gemm {
+            return None;
+        }
+        if !matches!(weight_storage_of(only), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        match first_tile_input(only) {
+            Some((id, slot)) if id == rmsnorm_id && slot == 0 => {}
+            _ => return None,
+        }
+        let gemm_id = only.id;
+        let mut claimed = [seed, rmsnorm_id, gemm_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+        // Boundary inputs: the RmsNorm's input tensor (slot 0).
+        let boundary_inputs: Vec<TileId> = rmsnorm_node
+            .inputs
+            .iter()
+            .take(1)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs,
+            // Only the Gemm output is live downstream — the
+            // intermediate RmsNorm output is consumed by the Gemm
+            // and not visible to any other tile.
+            boundary_outputs: vec![gemm_id],
+        })
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        let gemm_us = ctx
+            .profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
+        // BW-bound rms_norm: 1 read input + 1 read weight + 1 write
+        // normed.
+        let num_tokens = ctx.num_tokens() as f64;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as f64;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = (2.0 * num_tokens * hidden + hidden) * BYTES_PER_ELEM;
+        let norm_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + norm_us
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Scalar-offset Add's Weight input is the rmsnorm weight.
+        let scalar_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let scalar_add = fuf.get(scalar_add_id);
+        let (norm_weight_id, norm_weight_idx) = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Weight input");
+        let norm_acc = WeightAccessor {
+            name: weight_field_name(program, norm_weight_id, norm_weight_idx),
+            rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+            source_weights: vec![(norm_weight_id, norm_weight_idx)],
+        };
+        let gemm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("claim contains Gemm");
+        let gemm_node = fuf.get(gemm_id);
+        let (gemm_weight_id, gemm_weight_idx) = gemm_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("Gemm has a Weight input");
+        let gemm_acc = WeightAccessor {
+            name: weight_field_name(program, gemm_weight_id, gemm_weight_idx),
+            rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+            source_weights: vec![(gemm_weight_id, gemm_weight_idx)],
+        };
+        vec![norm_acc, gemm_acc]
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedScalarOffsetRmsNormGemm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("offset", syn::parse_quote!(f32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let scalar_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let rmsnorm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: claim contains RmsNorm");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: claim contains Gemm");
+        let rmsnorm_node = fuf.get(rmsnorm_id);
+        let gemm_node = fuf.get(gemm_id);
+        let (in_id, in_in_slot) = match rmsnorm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedScalarOffsetRmsNormGemm: RmsNorm input 0 must be a Tile (got {other:?})"
+            ),
+        };
+        let in_idx = slots.of(in_id, in_in_slot);
+        let out_slot_idx = slots.of(gemm_id, 0);
+        let scalar_add = fuf.get(scalar_add_id);
+        let offset: f32 = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Scalar input");
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: required_weights[0]");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: required_weights[1]");
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("CutlassFusedScalarOffsetRmsNormGemm: gemm (N, K) must resolve");
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+        Some(vec![OpInstance::new(
+            syn::Ident::new(
+                "CutlassFusedScalarOffsetRmsNormGemm",
+                proc_macro2::Span::call_site(),
+            ),
+            vec![
+                quote! { #in_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { #offset },
                 quote! { Weights::#norm_ident },
                 quote! { Weights::#gemm_ident },
                 quote! { #tile_m },
@@ -5918,6 +7516,20 @@ fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
     if resolved.iter().any(|r| r.1.is_some() != biased) {
         return false;
     }
+    // Biased QKV is now claimable by
+    // `CutlassFusedQkvRope{Cache,Prefill}Impl` (their `matches`
+    // accept biased; the runtime evaluator routes through
+    // `cutlass_gemm_bias` when `dense_bias().is_some()`). The
+    // earlier biased-skip gate here is removed — letting it return
+    // `false` at biased let `RopeAppendRefImpl` claim a standalone
+    // rope and create a feasible per-slice fallback path. The DP
+    // then mixed picks across buckets (fused at M=1, per-slice at
+    // M=64+), and codegen aggregated both a fused accessor and the
+    // per-slice ones — overlapping CPU-weight ownership broke the
+    // loader at startup. With the gate dropped, biased shapes are
+    // fused-or-fail across every bucket → exactly one accessor
+    // emitted.
+    let _ = biased;
     let gemms: Vec<TileId> = resolved.iter().map(|r| r.0).collect();
     let Some(act) = first_tile_input(fuf.get(gemms[0])) else {
         return false;
@@ -7739,6 +9351,236 @@ fn fused_qkv_claim_is_biased(fuf: &Fuf, info: &MatchInfo) -> bool {
         .is_some_and(|(_, bias)| bias.is_some())
 }
 
+// ── CutlassFusedQkvRopeCacheGemvImpl ────────────────────────────
+//
+// M=1 specialization of `CutlassFusedQkvRopeCacheImpl`. Same 4-tile
+// claim (3 Gemms + 1 RopeAppend) but the GEMM step uses
+// `cutlass_gemv` instead of a `cutlass_<TM>x<TN>` tile. Wins at
+// decode: e.g. qwen2-0.5b QKV at `(M=1, N=1152, K=896)` measures
+// 1.8 µs as gemv vs ~25 µs as the smallest tile-zoo entry —
+// 14× faster, and that's per-layer × 24 layers. Workload-gated to
+// `NumTokensRange{1, 1}`. Biased claims (qwen2 packed QKV bias)
+// dispatch to `cutlass_gemv_bias`, which folds the bias broadcast
+// into the GEMV epilogue (`alpha=1, beta=1, ref_C=bias`) — single
+// launch matching cuBLAS's `cublasGemvParamsEx` bias-fused path.
+#[derive(Debug, Default)]
+pub struct CutlassFusedQkvRopeCacheGemvImpl;
+
+impl Implementation for CutlassFusedQkvRopeCacheGemvImpl {
+    fn name(&self) -> &'static str {
+        "cutlass_fused_qkv_rope_cache_gemv"
+    }
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile
+            .cost_table
+            .kernel_names()
+            .iter()
+            .any(|k| k == "cutlass_gemv")
+    }
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Same 4-tile claim shape as the tile-zoo peer. Biased and
+        // unbiased both supported — runtime dispatches to
+        // `cutlass_gemv_bias` (single-launch bias-broadcast via the
+        // GEMV epilogue) when the packed LinearLayer carries a bias.
+        FusedQkvRopeCacheImpl.matches(fuf, seed, profile)
+    }
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Mirror of `CutlassFusedQkvRopeCacheImpl::cost_us` with
+        // `cutlass_gemv` substituting the tile-zoo GEMM step.
+        let num_tokens = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
+        let num_kv_heads = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
+        let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let packed_n = num_q_heads
+            .saturating_add(2u32.saturating_mul(num_kv_heads))
+            .saturating_mul(head_dim);
+        // cutlass_gemv requires N and K aligned to 8.
+        if !packed_n.is_multiple_of(8) || !hidden.is_multiple_of(8) {
+            return f64::INFINITY;
+        }
+        let gemm_us = ctx
+            .profile
+            .cost_us_for("cutlass_gemv", num_tokens, packed_n, hidden)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, num_tokens, packed_n, hidden));
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 3.0 * (num_tokens as f64) * (packed_n as f64) * BYTES_PER_ELEM;
+        let rope_cache_us = if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + rope_cache_us
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        FusedQkvRopeCacheImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        FusedQkvRopeCacheImpl.required_weights(claimed_tiles, fuf, program)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedQkvRopeCacheGemv",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+                ("interleaved", syn::parse_quote!(bool)),
+                ("packed_n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let rope_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| is_rope_append_op(fuf.get(**t).op))
+            .expect("CutlassFusedQkvRopeCacheGemv: claim contains a RopeAppend");
+        let rope_node = fuf.get(rope_id);
+        let interleaved = rope_node.op == OpKind::RopeAppendInterleaved;
+        let layer = rope_kv_cache_layer(rope_node).expect(
+            "CutlassFusedQkvRopeCacheGemv: RopeAppend has a KvCache extern with concrete layer index",
+        ) as u32;
+
+        let qkv_raw: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .take(3)
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let resolved: Vec<(TileId, Option<TileId>)> = qkv_raw
+            .iter()
+            .map(|t| {
+                unwrap_gemm_through_bias(fuf, *t)
+                    .expect("CutlassFusedQkvRopeCacheGemv: claim guarantees Gemm-or-BiasAdd(Gemm)")
+            })
+            .collect();
+
+        let q_gemm_id = resolved[0].0;
+        let q_gemm_node = fuf.get(q_gemm_id);
+        let (in_id, in_slot) = match q_gemm_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedQkvRopeCacheGemv: q_gemm's first input must be a Tile (got {other:?})"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(rope_id, 0);
+
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("CutlassFusedQkvRopeCacheGemv: required_weights returned empty");
+        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
+        assert_eq!(
+            weight_layer, layer,
+            "CutlassFusedQkvRopeCacheGemv: weight_layer ({weight_layer}) and \
+             kv_cache layer ({layer}) disagree — DSL bug"
+        );
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+
+        let uses_local = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
+
+        let (q_n, k) = gemm_nk_from_fuf(fuf, q_gemm_node, bounds)
+            .expect("CutlassFusedQkvRopeCacheGemv: q gemm (N, K) must resolve from FUF + bounds");
+        let num_kv_heads = bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
+        let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let kv_size = num_kv_heads.saturating_mul(head_dim);
+        let packed_n = q_n.saturating_add(kv_size.saturating_mul(2));
+        Some(vec![OpInstance::new(
+            syn::Ident::new(
+                "CutlassFusedQkvRopeCacheGemv",
+                proc_macro2::Span::call_site(),
+            ),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
+                quote! { #interleaved },
+                quote! { #packed_n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CutlassFusedQkvRopeCacheImpl {
     pub tile_m: u32,
@@ -7791,11 +9633,16 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
-        let info = FusedQkvRopeCacheImpl.matches(fuf, seed, profile)?;
-        if fused_qkv_claim_is_biased(fuf, &info) {
-            return None;
-        }
-        Some(info)
+        // Biased QKV (qwen2 fleet) is supported: the runtime evaluator
+        // dispatches to `cutlass_gemm_bias` when the packed
+        // `LinearLayer` carries a bias. Without dropping this gate at
+        // biased shapes, decode (M=1) was the only bucket where the
+        // fused QKV won the DP — at M≥2 prefill the per-slice
+        // `CutlassFusedGemmBias × 3 + RopeAppendRef` path won on cost,
+        // and the resulting accessor mismatch (one fused source set
+        // *and* three per-slice source sets owning the same
+        // q/k/v.weight tensors) crashed the loader at startup.
+        FusedQkvRopeCacheImpl.matches(fuf, seed, profile)
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -7805,6 +9652,14 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
         // Difference: the GEMM is a calibrated cutlass_<tile> row,
         // not cublas. Reduces to cutlass_<tile>(M, packed_n, K) vs
         // cublas(M, packed_n, K).
+        //
+        // CSV miss → roofline fallback (parity with the cuBLAS peer
+        // and every other CutlassFused* Impl). Without the fallback,
+        // unmeasured packed-N shapes returned `UNCALIBRATED_COST_US`
+        // (1e9 µs ≈ 1000 s) and lost every DP race to per-slice peers
+        // whose smaller-N rows *are* in the sweep — even at biased
+        // QKV shapes where the fused path is the only one that
+        // satisfies the accessor uniqueness invariant.
         let num_tokens = ctx.num_tokens() as u32;
         let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
         let num_q_heads = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
@@ -7817,7 +9672,7 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
         let gemm_us = ctx
             .profile
             .cost_us_for(self.csv_name(), num_tokens, packed_n, hidden)
-            .unwrap_or(UNCALIBRATED_COST_US);
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, num_tokens, packed_n, hidden));
 
         let bw_gb = ctx.profile.memory_bandwidth_gbps;
         let bytes = 3.0 * (num_tokens as f64) * (packed_n as f64) * BYTES_PER_ELEM;
@@ -7943,11 +9798,12 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
                     .expect("CutlassFusedQkvRopeCache: claim guarantees Gemm-or-BiasAdd(Gemm)")
             })
             .collect();
-        // matches() rejected biased claims; runtime does not handle bias.
-        debug_assert!(
-            resolved[0].1.is_none(),
-            "CutlassFusedQkvRopeCache: matches() should have rejected biased claim",
-        );
+        // Biased claims are supported: runtime dispatches to
+        // `cutlass_gemm_bias` when the packed `LinearLayer` carries a
+        // bias (see matches() comment). The earlier debug_assert
+        // contradicted that documented behaviour and tripped on
+        // biased qwen2 in debug builds.
+        let _ = &resolved;
 
         let q_gemm_id = resolved[0].0;
         let q_gemm_node = fuf.get(q_gemm_id);
@@ -8055,11 +9911,9 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
-        let info = FusedQkvRopePrefillImpl.matches(fuf, seed, profile)?;
-        if fused_qkv_claim_is_biased(fuf, &info) {
-            return None;
-        }
-        Some(info)
+        // Biased supported via `cutlass_gemm_bias` at runtime — see
+        // sibling comment on `CutlassFusedQkvRopeCacheImpl::matches`.
+        FusedQkvRopePrefillImpl.matches(fuf, seed, profile)
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -8178,10 +10032,9 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
                     .expect("CutlassFusedQkvRopePrefill: claim guarantees Gemm-or-BiasAdd(Gemm)")
             })
             .collect();
-        debug_assert!(
-            resolved[0].1.is_none(),
-            "CutlassFusedQkvRopePrefill: matches() should have rejected biased claim",
-        );
+        // Biased claims are supported via `cutlass_gemm_bias` at
+        // runtime (mirrors the cache-variant fix above).
+        let _ = &resolved;
 
         let q_gemm_id = resolved[0].0;
         let q_gemm_node = fuf.get(q_gemm_id);
@@ -9083,9 +10936,49 @@ impl Implementation for CutlassGemmSplitKImpl {
         let Some((mm, nn, kk)) = gemm_mnk(ctx, node) else {
             return f64::INFINITY;
         };
-        ctx.profile
+        // Wave-fill gate. SplitK exists to add parallelism by
+        // partitioning K when the standard data-parallel grid (M-tiles
+        // × N-tiles) is too small to fill the GPU. If the grid already
+        // produces many waves of work, splitting K just adds reduction
+        // overhead with zero parallelism benefit.
+        //
+        // qwen2.5-3B prefill at M=16384 N=2048 with tile_m=64 tile_n=64:
+        // 256 × 32 = 8192 tiles / 142 SMs (L40s) ≈ 57 waves. SplitK is
+        // structurally wasted at this scale. nsys profile showed it
+        // dominating 52% of GPU time at this exact shape — the +11%
+        // reduction-kernel cost added below isn't enough to flip the
+        // pick because the GEMM-grid measurement itself is competitive
+        // with non-SplitK at large M (the predictor doesn't know that
+        // wasted parallelism doesn't shorten wallclock when SMs are
+        // already saturated).
+        //
+        // Reject SplitK when standard-grid waves >= 2: the second wave
+        // already amortizes launch overhead, so SplitK can't win.
+        let m_tiles = (mm as u64).div_ceil(self.tile_m as u64);
+        let n_tiles = (nn as u64).div_ceil(self.tile_n as u64);
+        let total_tiles = m_tiles.saturating_mul(n_tiles);
+        let num_sms = ctx.profile.num_sms.max(1) as u64;
+        if total_tiles >= 2 * num_sms {
+            return UNCALIBRATED_COST_US;
+        }
+        let gemm_us = ctx
+            .profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
-            .unwrap_or(UNCALIBRATED_COST_US)
+            .unwrap_or(UNCALIBRATED_COST_US);
+        // Reduction-kernel cost. SplitK's CSV rows measure ONLY the
+        // partial-product GEMM grid; the paired `ReduceSplitK` kernel
+        // (one launch per SplitK call) is invisible to the cost model
+        // unless we add it here. Reads `(split_k + 1) × M × N` bf16
+        // partial-sum elements + writes M × N bf16 — bw-bound.
+        let split_k = self.split_k as f64;
+        let reduce_bytes = (split_k + 1.0) * (mm as f64) * (nn as f64) * BYTES_PER_ELEM;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let reduce_us = if bw_gb > 0.0 {
+            (reduce_bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        };
+        gemm_us + reduce_us
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
@@ -9862,6 +11755,108 @@ impl Implementation for CutlassGemvImpl {
                 quote! { #k },
             ],
         )])
+    }
+}
+
+// ── CatchAllDenseGemmImpl ────────────────────────────────────────
+//
+// Diagnostic catch-all for dense Gemm tiles. Always matches a Gemm
+// with `StorageFormat::Dense` at any workload point. Reports
+// `UNCALIBRATED_COST_US` (1e9 µs) so it loses every realistic DP
+// race; exists purely so that `solver::solve_one` cannot raise
+// `UnclaimedTile` when other (presumably calibrated/fused) Impls
+// unexpectedly return None at a Dense Gemm.
+//
+// Runtime emits `CutlassGemv` (M=1) — which falls back to
+// `any_align_bf16_gemm` for misaligned (N, K) — or
+// `cutlass_gemm` with the smallest tile (M≥2) likewise via the
+// any-align fallback baked into both Rust wrappers. So no matter
+// what shape DP picks this for, the eval body has a real kernel
+// behind it.
+//
+// The catch-all is intentionally narrow: it does NOT cover quant
+// storages (Awq/Gptq/Bnb4/Fp8). Each of those has its own family
+// of Impls; if a quant matcher suite leaves an orphan, fix that
+// suite — don't paper over it here. Dense is the lowest-risk
+// fallback because every dense gemm has a working kernel via
+// `any_align_bf16_gemm`.
+
+#[derive(Debug, Default)]
+pub struct CatchAllDenseGemmImpl;
+
+impl Implementation for CatchAllDenseGemmImpl {
+    fn name(&self) -> &'static str {
+        "catchall_dense_gemm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::Any
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::Gemm)?;
+        if !matches!(weight_storage_of(fuf.get(seed)), Some(StorageFormat::Dense)) {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        // Reuse `CutlassGemv`'s opcode — the catch-all just emits a
+        // CutlassGemv instance at fan_out. No new variant needed.
+        CutlassGemvImpl.opcode_shape()
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        // Defer to CutlassGemv's emission path — the runtime kernel
+        // (`cutlass::cutlass_gemv`) already handles M=1 directly and
+        // falls through `any_align_bf16_gemm` for misaligned (N, K).
+        // For M≥2 cases the catch-all is exercising a path the DP
+        // shouldn't normally reach (some other Impl should win); the
+        // eval kernel still produces correct math via the any-align
+        // fallback, just slowly.
+        CutlassGemvImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

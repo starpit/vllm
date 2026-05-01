@@ -87,8 +87,11 @@ impl Qwen3MoeMlp {
                 if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
                     (shared_gate_up, shared_down, shared_expert_gate)
                 {
-                    let shared_gu =
-                        shared_gu_w.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                    let shared_gu = shared_gu_w.forward(
+                        hidden_states,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
                     let shared_activated = kernels::silu_and_mul_fused(
                         *shared_gu.view(),
                         *shared_intermediate_size,
@@ -99,15 +102,15 @@ impl Qwen3MoeMlp {
 
                     let shared_out = shared_down_w.forward(
                         shared_activated.view(),
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     );
                     drop(shared_activated);
 
                     let gate_logits = shared_gate_w.forward(
                         hidden_states,
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     );
 
                     let result = kernels::sigmoid_mul_add(
@@ -140,8 +143,11 @@ impl Qwen3MoeMlp {
                 if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
                     (shared_gate_up, shared_down, shared_expert_gate)
                 {
-                    let shared_gu =
-                        shared_gu_w.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                    let shared_gu = shared_gu_w.forward(
+                        hidden_states,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
                     let shared_activated = kernels::silu_and_mul_fused(
                         *shared_gu.view(),
                         *shared_intermediate_size,
@@ -152,15 +158,15 @@ impl Qwen3MoeMlp {
 
                     let shared_out = shared_down_w.forward(
                         shared_activated.view(),
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     );
                     drop(shared_activated);
 
                     let gate_logits = shared_gate_w.forward(
                         hidden_states,
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     );
 
                     let result = kernels::sigmoid_mul_add(
@@ -192,8 +198,11 @@ impl Qwen3MoeMlp {
                 if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
                     (shared_gate_up, shared_down, shared_expert_gate)
                 {
-                    let shared_gu =
-                        shared_gu_w.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                    let shared_gu = shared_gu_w.forward(
+                        hidden_states,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
                     let shared_activated = kernels::silu_and_mul_fused(
                         *shared_gu.view(),
                         *shared_intermediate_size,
@@ -204,15 +213,15 @@ impl Qwen3MoeMlp {
 
                     let shared_out = shared_down_w.forward(
                         shared_activated.view(),
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     );
                     drop(shared_activated);
 
                     let gate_logits = shared_gate_w.forward(
                         hidden_states,
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     );
 
                     let result = kernels::sigmoid_mul_add(
@@ -1349,8 +1358,8 @@ impl Qwen3MoeForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         )
     }
 }

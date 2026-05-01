@@ -15,7 +15,7 @@ nccl = ["cuda", "cudarc/nccl", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl"]
 profiling = ["cuda", "cudarc/nvtx"]
 
 [dependencies]
-cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+cudarc = { workspace = true, optional = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
 ferrite-cuda-builder = { path = "../ferrite-cuda-builder", optional = true }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }

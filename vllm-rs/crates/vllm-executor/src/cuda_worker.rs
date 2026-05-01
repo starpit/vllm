@@ -2634,7 +2634,6 @@ impl CudaWorker {
                     unsafe {
                         vllm_cuda::kernels::pool_mean_f32(
                             hidden_states,
-                            &device.cublas,
                             &mut device.caching,
                             device.compute_stream,
                         )
@@ -3594,7 +3593,7 @@ impl CudaWorker {
                     vllm_cuda::kernels::scale_inplace(
                         h.as_gpu_tensor(),
                         m.model.embed_scale,
-                        &device.cublas,
+                        device.compute_stream,
                     )
                 };
                 h
@@ -3612,7 +3611,7 @@ impl CudaWorker {
                     vllm_cuda::kernels::scale_inplace(
                         h.as_gpu_tensor(),
                         m.model.embed_scale,
-                        &device.cublas,
+                        device.compute_stream,
                     )
                 };
                 h
@@ -3985,7 +3984,6 @@ impl CudaWorker {
                     // hidden is now normed; project to vocab
                     m.lm_head.forward(
                         TensorView::from_raw(hidden),
-                        &mut device.cublas,
                         &mut device.caching,
                         device.compute_stream,
                     )
@@ -4001,7 +3999,6 @@ impl CudaWorker {
                 );
                 m.0.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -4019,8 +4016,8 @@ impl CudaWorker {
                     );
                     m.lm_head.forward(
                         TensorView::from_raw(hidden),
-                        &mut device.cublas,
                         &mut device.caching,
+                        device.compute_stream,
                     )
                 }
             }
@@ -4034,8 +4031,8 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
                     &mut device.caching,
+                    device.compute_stream,
                 )
             },
             Some(CudaModel::Qwen3Moe(m)) => unsafe {
@@ -4048,8 +4045,8 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
                     &mut device.caching,
+                    device.compute_stream,
                 )
             },
             Some(CudaModel::Qwen2Moe(m)) => unsafe {
@@ -4062,8 +4059,8 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
                     &mut device.caching,
+                    device.compute_stream,
                 )
             },
             Some(CudaModel::Mixtral(m)) => unsafe {
@@ -4076,8 +4073,8 @@ impl CudaWorker {
                 );
                 m.lm_head.forward(
                     TensorView::from_raw(hidden),
-                    &mut device.cublas,
                     &mut device.caching,
+                    device.compute_stream,
                 )
             },
             _ => {
@@ -6521,7 +6518,7 @@ impl Worker for CudaWorker {
         }
 
         if self.config.cublas_autotune {
-            unsafe { device.cublas.benchmark_plans() };
+            // cublas.benchmark_plans() removed (no cuBLAS)
         }
 
         Ok(())
@@ -6600,10 +6597,10 @@ impl Worker for CudaWorker {
     fn wake_up(&mut self, _tags: Option<&[String]>) -> ExecutorResult<()> {
         info!("CudaWorker: waking up — reloading model and KV cache");
 
-        // Re-bind cuBLAS workspace — sleep's release_all() freed the old one.
-        if let Some(ref mut dev) = self.device {
-            unsafe { dev.cublas.rebind_workspace(&mut dev.caching) };
-        }
+        // (Was: re-bind cuBLAS workspace — `sleep`'s release_all() freed
+        // the old one. With cuBLAS removed, no rebind needed; the
+        // CachingAllocator's pools are reset by `release_all()` and
+        // refilled lazily by the first kernel launch after wake.)
 
         // Re-load model from disk (mmap'd safetensors, fast).
         self.load_model()?;

@@ -444,30 +444,31 @@ impl DeepSeekV2Attention {
 
         // ===== Q path =====
         // q_a_proj → q_a_layernorm → q_b_proj (or direct q_proj)
-        let q_proj_out =
-            if let (Some(q_a_proj), Some(q_a_ln)) = (&self.q_a_proj, &self.q_a_layernorm) {
-                // q = q_a_proj(hidden_states)  → [num_tokens, q_lora_rank]
-                let q_a = q_a_proj.forward(hidden_states, &mut device.cublas, &mut device.caching);
-                // q = q_a_layernorm(q_a) → [num_tokens, q_lora_rank]
-                let q_normed = kernels::rms_norm(
-                    *q_a.view(),
-                    q_a_ln.weight,
-                    q_a_ln.eps,
-                    &mut device.caching,
-                    stream,
-                );
-                drop(q_a);
-                // q = q_b_proj(q_normed) → [num_tokens, num_heads * qk_head_dim]
-                let q =
-                    self.q_b_proj
-                        .forward(q_normed.view(), &mut device.cublas, &mut device.caching);
-                drop(q_normed);
-                q
-            } else {
-                // Direct: q_proj(hidden_states) → [num_tokens, num_heads * qk_head_dim]
+        let q_proj_out = if let (Some(q_a_proj), Some(q_a_ln)) =
+            (&self.q_a_proj, &self.q_a_layernorm)
+        {
+            // q = q_a_proj(hidden_states)  → [num_tokens, q_lora_rank]
+            let q_a = q_a_proj.forward(hidden_states, &mut device.caching, device.compute_stream);
+            // q = q_a_layernorm(q_a) → [num_tokens, q_lora_rank]
+            let q_normed = kernels::rms_norm(
+                *q_a.view(),
+                q_a_ln.weight,
+                q_a_ln.eps,
+                &mut device.caching,
+                stream,
+            );
+            drop(q_a);
+            // q = q_b_proj(q_normed) → [num_tokens, num_heads * qk_head_dim]
+            let q =
                 self.q_b_proj
-                    .forward(hidden_states, &mut device.cublas, &mut device.caching)
-            };
+                    .forward(q_normed.view(), &mut device.caching, device.compute_stream);
+            drop(q_normed);
+            q
+        } else {
+            // Direct: q_proj(hidden_states) → [num_tokens, num_heads * qk_head_dim]
+            self.q_b_proj
+                .forward(hidden_states, &mut device.caching, device.compute_stream)
+        };
 
         // Reshape Q to [num_tokens, num_heads, qk_head_dim]
         // Then split into q_nope [num_tokens, num_heads, nope_dim] and q_pe [num_tokens, num_heads, rope_dim]
@@ -479,9 +480,11 @@ impl DeepSeekV2Attention {
 
         // ===== KV path =====
         // kv_a_proj_with_mqa(hidden_states) → [num_tokens, kv_lora_rank + rope_dim]
-        let kv_a_out =
-            self.kv_a_proj_with_mqa
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let kv_a_out = self.kv_a_proj_with_mqa.forward(
+            hidden_states,
+            &mut device.caching,
+            device.compute_stream,
+        );
 
         // Split into latent [kv_lora_rank] and k_pe_compressed [rope_dim]
         // latent_cache = kv_a_out (we keep both parts, split is virtual)
@@ -520,9 +523,11 @@ impl DeepSeekV2Attention {
         drop(kv_a_latent);
 
         // kv_b_proj(kv_a_normed) → [num_tokens, num_heads * (nope_dim + v_head_dim)]
-        let kv_b_out =
-            self.kv_b_proj
-                .forward(kv_a_normed.view(), &mut device.cublas, &mut device.caching);
+        let kv_b_out = self.kv_b_proj.forward(
+            kv_a_normed.view(),
+            &mut device.caching,
+            device.compute_stream,
+        );
         drop(kv_a_normed);
 
         // kv_b_out is [num_tokens, num_heads * (nope_dim + v_head_dim)]
@@ -698,9 +703,9 @@ impl DeepSeekV2Attention {
         };
 
         // o_proj: [num_tokens, num_heads * v_head_dim] → [num_tokens, hidden_size]
-        let result = self
-            .o_proj
-            .forward(o_input.view(), &mut device.cublas, &mut device.caching);
+        let result =
+            self.o_proj
+                .forward(o_input.view(), &mut device.caching, device.compute_stream);
         drop(o_input);
 
         // TP all-reduce
@@ -747,14 +752,14 @@ impl DeepSeekV2MoE {
             kernels::scale_inplace(
                 *moe_out.view(),
                 self.routed_scaling_factor as f32,
-                &device.cublas,
+                device.compute_stream,
             );
         }
 
         // Shared expert path (unconditional, no sigmoid gate)
         let shared_gu =
             self.shared_gate_up
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
         let shared_activated = kernels::silu_and_mul_fused(
             *shared_gu.view(),
             self.shared_intermediate_size,
@@ -765,8 +770,8 @@ impl DeepSeekV2MoE {
 
         let shared_out = self.shared_down.forward(
             shared_activated.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
         drop(shared_activated);
 
@@ -809,7 +814,7 @@ impl DeepSeekV2GgmlMoE {
             kernels::scale_inplace(
                 *moe_out.view(),
                 self.routed_scaling_factor as f32,
-                &device.cublas,
+                device.compute_stream,
             );
         }
 
@@ -862,13 +867,13 @@ impl DeepSeekV2Fp8MoE {
             kernels::scale_inplace(
                 *moe_out.view(),
                 self.routed_scaling_factor as f32,
-                &device.cublas,
+                device.compute_stream,
             );
         }
 
         let shared_gu =
             self.shared_gate_up
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.caching, device.compute_stream);
         let shared_activated = kernels::silu_and_mul_fused(
             *shared_gu.view(),
             self.shared_intermediate_size,
@@ -879,8 +884,8 @@ impl DeepSeekV2Fp8MoE {
 
         let shared_out = self.shared_down.forward(
             shared_activated.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
         drop(shared_activated);
 
@@ -1438,8 +1443,8 @@ impl DeepSeekV2ForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         )
     }
 
@@ -2020,6 +2025,9 @@ mod tests {
             moe_intermediate_size: 1408,
             norm_topk_prob: false,
             routed_scaling_factor: 1.0,
+            n_expert_group: 0,
+            topk_group: 0,
+            scoring_func: "softmax".to_string(),
             yarn_rope_scaling: None,
         };
 

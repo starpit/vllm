@@ -16,6 +16,28 @@
 #include <cuda_runtime.h>
 
 // ── Generic launch ──
+//
+// `run_gemm` is the legacy monolithic path: build Arguments → can_implement →
+// initialize → kernel launch. Every call pays full host-side setup overhead
+// (grid swizzle calc, params derivation, alignment validation). With ~300
+// kernel launches per decode forward, that's ~1.5ms of pure host overhead per
+// token in eager mode.
+//
+// The 2-phase API (`make_op` + `run_op` + `drop_op` below) splits this into:
+//   make_op(M, N, K, α, β) → Op*   — done once per (tile, shape); runs
+//                                    can_implement + initialize, returns a
+//                                    heap-allocated Op handle with its Params
+//                                    pre-derived.
+//   run_op(Op*, C, A, B, …) → int  — done per call; uses CUTLASS's `update()`
+//                                    to patch only the operand pointers into
+//                                    the cached Params, then `run()` launches
+//                                    the kernel. No can_implement, no grid
+//                                    re-derivation.
+//   drop_op(Op*)                   — frees the cached Op handle.
+//
+// CUTLASS's `device::Gemm::update(args)` is exactly the "patch pointers only"
+// path we want — it's a few `params_.ref_*.reset(...)` calls and an epilogue
+// op assignment, no kernel-launch-equivalent host work.
 
 template <typename GemmOp>
 static int run_gemm(
@@ -42,6 +64,62 @@ static int run_gemm(
 
     status = op(stream);
     return (status == cutlass::Status::kSuccess) ? 0 : -3;
+}
+
+// ── 2-phase API helpers ──
+
+template <typename GemmOp>
+static GemmOp* run_gemm_make_op(int M, int N, int K, float alpha, float beta) {
+    // Pre-construct Op + Params with dummy operand pointers. The real
+    // pointers are patched per call by `run_gemm_run_op` below via
+    // `op->update(args)`. CUTLASS only uses the strides and problem size
+    // during initialize() — actual ptr values are not dereferenced —
+    // so dummy nullptrs are safe at this stage.
+    typename GemmOp::Arguments args(
+        {M, N, K},
+        {(cutlass::bfloat16_t const*)nullptr, K},
+        {(cutlass::bfloat16_t const*)nullptr, K},
+        {(cutlass::bfloat16_t*)nullptr, N},
+        {(cutlass::bfloat16_t*)nullptr, N},
+        {alpha, beta}
+    );
+    auto* op = new GemmOp;
+    if (op->can_implement(args) != cutlass::Status::kSuccess) {
+        delete op;
+        return nullptr;
+    }
+    if (op->initialize(args, nullptr, nullptr) != cutlass::Status::kSuccess) {
+        delete op;
+        return nullptr;
+    }
+    return op;
+}
+
+template <typename GemmOp>
+static int run_gemm_run_op(
+    GemmOp* op,
+    void* C, const void* A, const void* B,
+    int M, int N, int K,
+    float alpha, float beta,
+    cudaStream_t stream
+) {
+    typename GemmOp::Arguments args(
+        {M, N, K},
+        {(cutlass::bfloat16_t const*)A, K},
+        {(cutlass::bfloat16_t const*)B, K},
+        {(cutlass::bfloat16_t*)C, N},
+        {(cutlass::bfloat16_t*)C, N},
+        {alpha, beta}
+    );
+    // `update()` only resets the operand pointers + epilogue op in the
+    // already-derived Params — no grid recomputation, no can_implement.
+    if (op->update(args, nullptr) != cutlass::Status::kSuccess) return -1;
+    return op->run(stream) == cutlass::Status::kSuccess ? 0 : -2;
+}
+
+template <typename GemmOp>
+static void run_gemm_drop_op(GemmOp* op) {
+    delete op;
 }
 
 // ── Macro: define type alias + extern "C" launch wrapper ──
@@ -72,6 +150,26 @@ static int run_gemm(
     ) {                                                                             \
         return run_gemm<Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                \
             C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                   \
+    }                                                                               \
+    extern "C" void* cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_make_op(             \
+        int M, int N, int K, float alpha, float beta                                \
+    ) {                                                                             \
+        return (void*)run_gemm_make_op<Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(  \
+            M, N, K, alpha, beta);                                                  \
+    }                                                                               \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_run_op(                \
+        void* op, void* C, const void* A, const void* B,                            \
+        int M, int N, int K, float alpha, float beta, uint64_t stream               \
+    ) {                                                                             \
+        return run_gemm_run_op<Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(          \
+            (Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES*)op, C, A, B,                \
+            M, N, K, alpha, beta, (cudaStream_t)stream);                            \
+    }                                                                               \
+    extern "C" void cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_drop_op(              \
+        void* op                                                                    \
+    ) {                                                                             \
+        run_gemm_drop_op<Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                \
+            (Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES*)op);                        \
     }
 
 #define CUTLASS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)            \
@@ -559,6 +657,31 @@ using GemvKernel_8 = cutlass::gemm::kernel::Gemv<
 >;
 using GemvOp_8 = cutlass::gemm::device::Gemv<GemvKernel_8>;
 
+// Build a Gemv::Arguments — used by both the legacy launch and the
+// 2-phase make_op/run_op paths below.
+static typename GemvOp_8::Arguments cutlass_gemv_args(
+    void* C, const void* A, const void* B,
+    int N, int K,
+    float alpha, float beta
+) {
+    using Gemv = GemvOp_8;
+    using TensorRefA = typename Gemv::GemvKernel::TensorRefA;
+    TensorRefA ref_A{(cutlass::bfloat16_t*)B, cutlass::layout::RowMajor(K)};
+    return typename Gemv::Arguments(
+        cutlass::MatrixCoord{N, K},
+        1,
+        {alpha, beta},
+        ref_A,
+        A,
+        C,
+        C,
+        (int64_t)N * K,
+        (int64_t)K,
+        (int64_t)N,
+        (int64_t)N
+    );
+}
+
 extern "C" int cutlass_gemv_launch(
     void* C, const void* A, const void* B,
     int M, int N, int K,
@@ -574,22 +697,7 @@ extern "C" int cutlass_gemv_launch(
     if (M != 1) return -10;  // GEMV only valid at M=1
 
     using Gemv = GemvOp_8;
-    using TensorRefA = typename Gemv::GemvKernel::TensorRefA;
-
-    TensorRefA ref_A{(cutlass::bfloat16_t*)B, cutlass::layout::RowMajor(K)};
-    typename Gemv::Arguments args(
-        cutlass::MatrixCoord{N, K},                                // problem_size {rows, cols}
-        1,                                                          // batch_count
-        {alpha, beta},                                              // epilogue params
-        ref_A,                                                      // ref_A (weight)
-        A,                                                          // ptr_B (input vector)
-        C,                                                          // ptr_C
-        C,                                                          // ptr_D
-        (int64_t)N * K,                                             // batch_stride_A
-        (int64_t)K,                                                 // batch_stride_B
-        (int64_t)N,                                                 // batch_stride_C
-        (int64_t)N                                                  // batch_stride_D
-    );
+    auto args = cutlass_gemv_args(C, A, B, N, K, alpha, beta);
 
     Gemv op;
     auto status = op.can_implement(args);
@@ -598,6 +706,86 @@ extern "C" int cutlass_gemv_launch(
     status = op.initialize(args, nullptr, (cudaStream_t)stream);
     if (status != cutlass::Status::kSuccess) return -2;
 
+    status = op((cudaStream_t)stream);
+    return (status == cutlass::Status::kSuccess) ? 0 : -3;
+}
+
+// ── 2-phase API for cutlass_gemv ──
+extern "C" void* cutlass_gemv_make_op(int N, int K, float alpha, float beta) {
+    using Gemv = GemvOp_8;
+    auto args = cutlass_gemv_args(nullptr, nullptr, nullptr, N, K, alpha, beta);
+    auto* op = new Gemv;
+    if (op->can_implement(args) != cutlass::Status::kSuccess) { delete op; return nullptr; }
+    if (op->initialize(args, nullptr, nullptr) != cutlass::Status::kSuccess) { delete op; return nullptr; }
+    return op;
+}
+
+extern "C" int cutlass_gemv_run_op(
+    void* op_ptr,
+    void* C, const void* A, const void* B,
+    int M, int N, int K,
+    float alpha, float beta,
+    uint64_t stream
+) {
+    if (M != 1) return -10;
+    using Gemv = GemvOp_8;
+    auto* op = (Gemv*)op_ptr;
+    auto args = cutlass_gemv_args(C, A, B, N, K, alpha, beta);
+    if (op->update(args, nullptr) != cutlass::Status::kSuccess) return -1;
+    return op->run((cudaStream_t)stream) == cutlass::Status::kSuccess ? 0 : -2;
+}
+
+extern "C" void cutlass_gemv_drop_op(void* op_ptr) {
+    delete (GemvOp_8*)op_ptr;
+}
+
+// ── CUTLASS GEMV with bias broadcast ──
+//
+// Same kernel as `cutlass_gemv_launch` but exposes a separate `bias`
+// buffer as `ref_C` with `alpha=1, beta=1`. Output: `D = W @ x + bias`.
+// ref_C is `[1, N]` — same shape as the GEMV's output row, so a
+// straight bias[N] read works without any broadcast trickery.
+//
+// Replaces the cuBLAS `cublasGemvParamsEx` bias-fused path at qwen2's
+// biased QKV (M=1, N=q+2*kv, K=hidden) — measured 11.3 µs on cuBLAS
+// vs ~25 µs on the cutlass tile-zoo fallback. cutlass_gemv at the
+// same shape is 1.8 µs; adding the bias as ref_C costs nothing.
+
+static typename GemvOp_8::Arguments cutlass_gemv_bias_args(
+    void* D, const void* A, const void* B, const void* bias,
+    int N, int K
+) {
+    using Gemv = GemvOp_8;
+    using TensorRefA = typename Gemv::GemvKernel::TensorRefA;
+    TensorRefA ref_A{(cutlass::bfloat16_t*)B, cutlass::layout::RowMajor(K)};
+    return typename Gemv::Arguments(
+        cutlass::MatrixCoord{N, K},
+        1,
+        {1.0f, 1.0f},   // alpha=1, beta=1 → D = A*x + bias
+        ref_A,
+        A,
+        bias,           // ref_C: bias[N] read as [1, N]
+        D,              // ref_D: output
+        (int64_t)N * K,
+        (int64_t)K,
+        (int64_t)N,
+        (int64_t)N
+    );
+}
+
+extern "C" int cutlass_gemv_bias_launch(
+    void* D, const void* A, const void* B, const void* bias,
+    int M, int N, int K,
+    uint64_t stream
+) {
+    if (M != 1) return -10;
+    using Gemv = GemvOp_8;
+    auto args = cutlass_gemv_bias_args(D, A, B, bias, N, K);
+    Gemv op;
+    auto status = op.can_implement(args);
+    if (status != cutlass::Status::kSuccess) return -1;
+    status = op.initialize(args, nullptr, (cudaStream_t)stream);
+    if (status != cutlass::Status::kSuccess) return -2;
     status = op((cudaStream_t)stream);
     return (status == cutlass::Status::kSuccess) ? 0 : -3;
 }
@@ -868,4 +1056,117 @@ __global__ void null_kernel() {}
 
 extern "C" void null_kernel_launch(uint64_t stream) {
     null_kernel<<<1, 1, 0, (cudaStream_t)stream>>>();
+}
+
+// ── any-N bf16 GEMM (no alignment requirement) ─────────────────────
+//
+// CUTLASS standalone tile zoo requires `AlignmentB = 8` for bf16 +
+// tensor cores; an output dim N that isn't divisible by 8 causes
+// `op.can_implement` to fail (returned -1 at runtime). Granite
+// 3.3-2B's `vocab_size = 49159` (prime-ish, not divisible by 8) hits
+// this on lm_head.
+//
+// This kernel handles any (M, N, K) ≥ (1, 1, 1) in bf16. SMEM-tiled
+// with 16×16 thread-block tiles and TILE_K=16 K-step. f32 accumulate
+// for accuracy. ~30× slower than tensor-core CUTLASS at aligned
+// shapes, but the only correctness path for unaligned shapes today.
+//
+// Memory: A is RowMajor `[M, K]`, B is RowMajor `[N, K]` (the same
+// storage convention the standalone CUTLASS uses with ColumnMajor B
+// view + ldb=K — bytes layout is identical). C is RowMajor `[M, N]`.
+
+#include <cuda_bf16.h>
+
+#define ANY_TILE_M 16
+#define ANY_TILE_N 16
+#define ANY_TILE_K 16
+
+__global__ void any_align_bf16_gemm_kernel(
+    __nv_bfloat16* __restrict__ C,
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    int M, int N, int K
+) {
+    __shared__ float sA[ANY_TILE_M][ANY_TILE_K];
+    __shared__ float sB[ANY_TILE_N][ANY_TILE_K];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int bm = blockIdx.y * ANY_TILE_M;
+    int bn = blockIdx.x * ANY_TILE_N;
+    int gm = bm + ty;
+    int gn = bn + tx;
+
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += ANY_TILE_K) {
+        // Load A tile [ANY_TILE_M × ANY_TILE_K]: row gm, col k0+tx.
+        // Each thread (ty, tx) loads sA[ty][tx].
+        {
+            int gk = k0 + tx;
+            sA[ty][tx] = (gm < M && gk < K) ? __bfloat162float(A[gm * K + gk]) : 0.0f;
+        }
+        // Load B tile [ANY_TILE_N × ANY_TILE_K]: row gn, col k0+tx.
+        // B is stored row-major [N, K]; element at row n, col k is at
+        // offset n*K + k. We need sB[t_n_idx][k_idx] for n in
+        // {bn..bn+ANY_TILE_N}, k in {k0..k0+ANY_TILE_K}. With block
+        // dim 16×16, thread (ty, tx) loads B's row (bn+ty), col (k0+tx).
+        {
+            int gn_load = bn + ty;
+            int gk = k0 + tx;
+            sB[ty][tx] = (gn_load < N && gk < K) ? __bfloat162float(B[gn_load * K + gk]) : 0.0f;
+        }
+        __syncthreads();
+
+        if (gm < M && gn < N) {
+            #pragma unroll
+            for (int k = 0; k < ANY_TILE_K; ++k) {
+                acc += sA[ty][k] * sB[tx][k];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (gm < M && gn < N) {
+        C[gm * N + gn] = __float2bfloat16(acc);
+    }
+}
+
+extern "C" int any_align_bf16_gemm_launch(
+    void* C, const void* A, const void* B,
+    int M, int N, int K,
+    uint64_t stream
+) {
+    if (M <= 0 || N <= 0 || K <= 0) return -1;
+    dim3 block(ANY_TILE_N, ANY_TILE_M);  // (tx=N, ty=M)
+    dim3 grid((N + ANY_TILE_N - 1) / ANY_TILE_N,
+              (M + ANY_TILE_M - 1) / ANY_TILE_M);
+    any_align_bf16_gemm_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)C,
+        (const __nv_bfloat16*)A,
+        (const __nv_bfloat16*)B,
+        M, N, K
+    );
+    return 0;
+}
+
+extern "C" int any_align_bf16_gemm_bias_launch(
+    void* C, const void* A, const void* B, const void* bias,
+    int M, int N, int K,
+    uint64_t stream
+) {
+    if (M <= 0 || N <= 0 || K <= 0) return -1;
+    // Compute the GEMM first.
+    dim3 block(ANY_TILE_N, ANY_TILE_M);
+    dim3 grid((N + ANY_TILE_N - 1) / ANY_TILE_N,
+              (M + ANY_TILE_M - 1) / ANY_TILE_M);
+    any_align_bf16_gemm_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)C,
+        (const __nv_bfloat16*)A,
+        (const __nv_bfloat16*)B,
+        M, N, K
+    );
+    // Then add the bias broadcast: C[m,n] += bias[n].
+    extern void bias_add_bf16(void* out, const void* bias, int M, int N, cudaStream_t stream);
+    bias_add_bf16(C, bias, M, N, (cudaStream_t)stream);
+    return 0;
 }

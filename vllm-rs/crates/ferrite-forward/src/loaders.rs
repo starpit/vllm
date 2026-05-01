@@ -75,6 +75,22 @@ pub fn load_layered_embedding_sharded(
         .collect()
 }
 
+/// Layered raw 1-D tensor loader — used by the singleton
+/// `BiasAddRefImpl` accessor when its `rust_type` is `GpuTensor`.
+/// On disk the tensor is e.g. `model.layers.{L}.self_attn.q_proj.bias`;
+/// `gw.take(...)` reads it directly with no struct wrapper. Distinct
+/// source set from any packed `LinearLayer` accessor (which only
+/// concats `.weight` tensors), so no loader collision.
+pub fn load_layered_raw_tensor(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffix: &str,
+) -> Result<Vec<GpuTensor>> {
+    (0..n_layers)
+        .map(|layer| gw.take(&layer_weight_path(layer, suffix)))
+        .collect()
+}
+
 pub fn load_layered_rms_norm(
     gw: &mut GpuWeights,
     n_layers: u32,

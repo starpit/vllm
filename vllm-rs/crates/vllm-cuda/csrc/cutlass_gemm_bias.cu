@@ -46,6 +46,53 @@ static int run_gemm_bias(
     return (status == cutlass::Status::kSuccess) ? 0 : -3;
 }
 
+// 2-phase API helpers — see `cutlass_standalone_gemm.cu` for design.
+template <typename GemmOp>
+static GemmOp* run_gemm_bias_make_op(int M, int N, int K) {
+    using BF16 = cutlass::bfloat16_t;
+    typename GemmOp::Arguments args(
+        {M, N, K},
+        {(BF16 const*)nullptr, K},
+        {(BF16 const*)nullptr, K},
+        {(BF16 const*)nullptr, 0},
+        {(BF16*)nullptr, N},
+        {1.0f, 1.0f}
+    );
+    auto* op = new GemmOp;
+    if (op->can_implement(args) != cutlass::Status::kSuccess) {
+        delete op;
+        return nullptr;
+    }
+    if (op->initialize(args, nullptr, nullptr) != cutlass::Status::kSuccess) {
+        delete op;
+        return nullptr;
+    }
+    return op;
+}
+
+template <typename GemmOp>
+static int run_gemm_bias_run_op(
+    GemmOp* op,
+    void* d, const void* a, const void* b, const void* bias,
+    int M, int N, int K,
+    cudaStream_t stream
+) {
+    using BF16 = cutlass::bfloat16_t;
+    typename GemmOp::Arguments args(
+        {M, N, K},
+        {(BF16 const*)a, K},
+        {(BF16 const*)b, K},
+        {(BF16 const*)bias, 0},
+        {(BF16*)d, N},
+        {1.0f, 1.0f}
+    );
+    if (op->update(args, nullptr) != cutlass::Status::kSuccess) return -1;
+    return op->run(stream) == cutlass::Status::kSuccess ? 0 : -2;
+}
+
+template <typename GemmOp>
+static void run_gemm_bias_drop_op(GemmOp* op) { delete op; }
+
 #define BIAS_GEMM_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)        \
     using GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm< \
         cutlass::bfloat16_t, cutlass::layout::RowMajor,                           \
@@ -71,6 +118,28 @@ static int run_gemm_bias(
     ) {                                                                           \
         return run_gemm_bias<GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(      \
             d, a, b, bias, M, N, K, (cudaStream_t)stream);                        \
+    }                                                                             \
+    extern "C" void* cutlass_gemm_bias_##TB_M##x##TB_N##_s##STAGES##_make_op(     \
+        int M, int N, int K                                                       \
+    ) {                                                                           \
+        return (void*)run_gemm_bias_make_op<                                      \
+            GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(M, N, K);              \
+    }                                                                             \
+    extern "C" int cutlass_gemm_bias_##TB_M##x##TB_N##_s##STAGES##_run_op(        \
+        void* op, void* d, const void* a, const void* b, const void* bias,        \
+        int M, int N, int K, uint64_t stream                                      \
+    ) {                                                                           \
+        return run_gemm_bias_run_op<                                              \
+            GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                       \
+            (GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES*)op,                   \
+            d, a, b, bias, M, N, K, (cudaStream_t)stream);                        \
+    }                                                                             \
+    extern "C" void cutlass_gemm_bias_##TB_M##x##TB_N##_s##STAGES##_drop_op(      \
+        void* op                                                                  \
+    ) {                                                                           \
+        run_gemm_bias_drop_op<                                                    \
+            GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                       \
+            (GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES*)op);                  \
     }
 
 #define BIAS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)               \

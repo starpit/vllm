@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn loop_detection_handles_iter_index_field() {
         let mut map = std::collections::HashMap::new();
-        map.insert("Norm".to_string(), 1usize); // field index 1 = layer
+        map.insert("Norm".to_string(), vec![1usize]); // field index 1 = layer
         let v = vec![
             op("Norm", &["wm.norm", "0u32"]),
             op("Norm", &["wm.norm", "1u32"]),
@@ -1621,7 +1621,7 @@ mod tests {
     #[test]
     fn loop_detection_rejects_non_unit_iter_step() {
         let mut map = std::collections::HashMap::new();
-        map.insert("Norm".to_string(), 1usize);
+        map.insert("Norm".to_string(), vec![1usize]);
         let v = vec![
             op("Norm", &["wm.norm", "0u32"]),
             op("Norm", &["wm.norm", "2u32"]),
@@ -1636,7 +1636,7 @@ mod tests {
     #[test]
     fn loop_detection_rejects_non_iter_field_drift() {
         let mut map = std::collections::HashMap::new();
-        map.insert("Norm".to_string(), 1usize);
+        map.insert("Norm".to_string(), vec![1usize]);
         let v = vec![
             op("Norm", &["wm.input_layernorm", "0u32"]),
             op("Norm", &["wm.post_attention_layernorm", "1u32"]),

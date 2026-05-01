@@ -8,8 +8,9 @@
 //!
 //! This crate provides the foundational types for GPU tensor management:
 //! `GpuTensor` (32-byte descriptor), `TensorView` (lifetime-checked borrow),
-//! `OwnedTensor` (RAII allocation), `GpuDevice` (streams + cublas + allocator),
-//! and the caching allocator.
+//! `OwnedTensor` (RAII allocation), `GpuDevice` (streams + allocator),
+//! and the caching allocator. cuBLAS has been removed; all GEMM
+//! dispatch goes through CUTLASS.
 
 // Always-available types (pure metadata, no CUDA calls).
 pub mod dtype;
@@ -28,8 +29,6 @@ pub mod arena;
 #[cfg(feature = "cuda")]
 pub mod cpu_gpu_buf;
 #[cfg(feature = "cuda")]
-pub mod cublas;
-#[cfg(feature = "cuda")]
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
@@ -42,8 +41,6 @@ pub mod weights;
 pub use alloc::{CachingAllocator, OwnedTensor, RawGpuAlloc, RawGpuMem};
 #[cfg(feature = "cuda")]
 pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
-#[cfg(feature = "cuda")]
-pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 pub use device::GpuDevice;
 #[cfg(feature = "cuda")]

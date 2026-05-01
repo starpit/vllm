@@ -209,7 +209,7 @@ impl Gemma3Attention {
         // QKV projection → owned.
         let qkv = self
             .qkv_proj
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+            .forward(hidden_states, &mut device.caching, device.compute_stream);
 
         // Split QKV (no RoPE yet — we need to apply QK norms first).
         let (q, k, v) = kernels::split_qkv(
@@ -311,7 +311,7 @@ impl Gemma3Attention {
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
         let result = self
             .o_proj
-            .forward(attn_flat, &mut device.cublas, &mut device.caching);
+            .forward(attn_flat, &mut device.caching, device.compute_stream);
         drop(attn_output);
 
         // TP: all-reduce o_proj output (row parallel).
@@ -596,7 +596,11 @@ impl Gemma3Model {
             &mut device.caching,
             device.compute_stream,
         );
-        kernels::scale_inplace(*hidden_states.view(), self.embed_scale, &device.cublas);
+        kernels::scale_inplace(
+            *hidden_states.view(),
+            self.embed_scale,
+            device.compute_stream,
+        );
 
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
@@ -713,8 +717,8 @@ impl Gemma3ForCausalLM {
 
         self.lm_head.forward(
             hidden_states.view(),
-            &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         )
     }
 }
@@ -1271,7 +1275,7 @@ impl Gemma3Model {
                     &mut device.caching,
                     device.compute_stream,
                 );
-                kernels::scale_inplace(*hs.view(), self.embed_scale, &device.cublas);
+                kernels::scale_inplace(*hs.view(), self.embed_scale, device.compute_stream);
                 (hs, None)
             } else {
                 let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");
@@ -1454,9 +1458,9 @@ impl Gemma3ForCausalLM {
                     hidden_states.view()
                 };
 
-                let logits = self
-                    .lm_head
-                    .forward(hs_view, &mut device.cublas, &mut device.caching);
+                let logits =
+                    self.lm_head
+                        .forward(hs_view, &mut device.caching, device.compute_stream);
                 // hidden_states can be freed now.
                 drop(gathered);
                 drop(hidden_states);

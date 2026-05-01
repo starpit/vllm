@@ -29,7 +29,7 @@ use crate::tensor::GpuTensor;
 // ---------------------------------------------------------------------------
 
 /// Map safetensors dtype string to our DType.
-fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
+pub fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
     match dtype {
         safetensors::Dtype::F16 => Ok(DType::F16),
         safetensors::Dtype::BF16 => Ok(DType::BF16),
@@ -48,7 +48,7 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
 // ---------------------------------------------------------------------------
 
 /// Read raw bytes in `dtype` into a pre-allocated f32 slice.
-fn read_to_f32(data: &[u8], dtype: DType, out: &mut [f32]) {
+pub fn read_to_f32(data: &[u8], dtype: DType, out: &mut [f32]) {
     match dtype {
         DType::F32 => {
             let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, out.len()) };
@@ -74,7 +74,7 @@ fn read_to_f32(data: &[u8], dtype: DType, out: &mut [f32]) {
 }
 
 /// Write f32 values back to bytes in the given dtype.
-fn write_from_f32(data: &[f32], dtype: DType) -> Vec<u8> {
+pub fn write_from_f32(data: &[f32], dtype: DType) -> Vec<u8> {
     match dtype {
         DType::F32 => {
             let mut out = vec![0u8; data.len() * 4];
@@ -456,6 +456,28 @@ impl GpuWeights {
         }
     }
 
+    /// Empty test stub — null stream, no tensors, no allocations.
+    /// Used by vllm-cuda's `weights_quant.rs` LoRA-merge tests, which
+    /// need a constructable `GpuWeights` to call `load_shard()` on
+    /// without requiring a real CUDA context. Cross-crate visibility
+    /// (this struct is in ferrite-cuda-core, those tests are in
+    /// vllm-cuda) drives the `pub` constructor instead of using a
+    /// struct literal directly. All other fields stay private.
+    pub fn empty_for_test() -> Self {
+        Self {
+            tensors: HashMap::new(),
+            stream: std::ptr::null_mut(),
+            target_dtype: None,
+            cast_pinned: (std::ptr::null_mut(), 0),
+            precast: None,
+            precast_handle: None,
+            gpu_allocs: Vec::new(),
+            _mmaps: Vec::new(),
+            quantized: HashMap::new(),
+            gguf_dense: HashMap::new(),
+        }
+    }
+
     /// Push a `RawGpuMem` allocation onto the lifetime tracker. Used
     /// by the GGUF loader so quantized-weight GPU memory is freed
     /// alongside the rest of the `GpuWeights` allocations.
@@ -683,7 +705,8 @@ impl GpuWeights {
     }
 
     /// Parse a shard file, madvise(WILLNEED), and store tensor references.
-    fn load_shard(&mut self, path: &Path) -> Result<()> {
+    /// `pub` to support cross-crate test access (see `tensors` field).
+    pub fn load_shard(&mut self, path: &Path) -> Result<()> {
         let (shard_tensors, mmap) = load_shard_into_map(path)?;
         self.tensors.extend(shard_tensors);
         self._mmaps.push(mmap);

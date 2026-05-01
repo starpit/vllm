@@ -510,15 +510,21 @@ impl GgmlLinear {
         let out_f32 = crate::ggml::ggml_matmul(&self.storage, x_f32, alloc, stream);
         drop(cast_buf);
 
-        if let Some(bias) = self.bias {
-            // ggml_matmul output is F32. The bias was cast to
-            // `model_dtype` (typically BF16) at GGUF load time so
-            // the dense path can consume it directly. Cast to F32
-            // here when dtypes disagree — `bias_add_inplace`
-            // reinterprets the bias pointer as `out.dtype()` so a
-            // BF16 source against an F32 out would be silent garbage.
+        // ggml_matmul output is F32; bias was cast to model_dtype
+        // (typically BF16) at GGUF load time so the dense path can
+        // consume it directly. Cast back to F32 here when dtypes
+        // disagree — `bias_add_inplace` reinterprets the bias
+        // pointer as `out.dtype()` so a BF16 source against F32 out
+        // would be silent garbage. The temp F32 buffer must
+        // outlive the (async) `bias_add_inplace` kernel: hoist its
+        // binding to function scope so the caching allocator can't
+        // hand the same pointer to a downstream `cast_from_f32`
+        // launch on the same stream — see
+        // `feedback_tensorview_for_async_gpu`.
+        let _bias_keepalive = if let Some(bias) = self.bias {
             if bias.dtype() == ferrite_cuda_core::dtype::DType::F32 {
                 crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
+                None
             } else {
                 let bias_f32 = crate::kernels::cast_logits_to_f32(bias, alloc, stream);
                 crate::kernels::bias_add_inplace(
@@ -526,17 +532,21 @@ impl GgmlLinear {
                     bias_f32.as_gpu_tensor(),
                     stream,
                 );
-                drop(bias_f32);
+                Some(bias_f32)
             }
-        }
+        } else {
+            None
+        };
 
         // Cast back to original dtype if we converted to f32.
         if input_dtype != ferrite_cuda_core::dtype::DType::F32 {
             let out_f32_gpu = out_f32.as_gpu_tensor();
             let result = crate::kernels::cast_from_f32(out_f32_gpu, input_dtype, alloc, stream);
             drop(out_f32);
+            drop(_bias_keepalive);
             result
         } else {
+            drop(_bias_keepalive);
             out_f32
         }
     }
@@ -744,6 +754,14 @@ impl LinearLayer {
                 let row_stride_bytes = total_out * out_dtype.size_bytes();
                 let elem = out_dtype.size_bytes();
                 let mut col_offset_elems: usize = 0;
+                // Hold every per-branch `part` alive until the loop
+                // exits so the CachingAllocator can't recycle a
+                // dropped branch's GPU buffer for the NEXT branch's
+                // matmul allocation while D2D copies from the dropped
+                // branch are still queued on the stream — same
+                // use-after-free pattern documented in
+                // `feedback_tensorview_for_async_gpu`.
+                let mut keepalive: Vec<OwnedTensor> = Vec::with_capacity(branches.len());
                 for branch in branches {
                     let part = if ggml_probe::use_reference() {
                         ggml_probe::reference_forward(
@@ -775,8 +793,9 @@ impl LinearLayer {
                         .expect("dtod copy in GgmlConcat::forward");
                     }
                     col_offset_elems += part_out;
-                    drop(part);
+                    keepalive.push(part);
                 }
+                drop(keepalive);
                 packed
             }
             Self::Bnb4bit(l) => l.forward(x, cublas, alloc, stream),
@@ -977,18 +996,42 @@ impl LinearLayer {
                 );
             }
         }
+        // Bias collection: GGUF biases are dequantized into
+        // `gguf_dense` at load time. If every prefix has a sibling
+        // `.bias`, collect them; if any has and others don't, hard-
+        // error (Qwen2's biased q/k/v is all-or-none). Bias-less
+        // GGUFs (Llama gate/up, Llama q/k/v) keep `bias = None` per
+        // branch and the fast-path stays the same.
+        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+        let any_bias = bias_names.iter().any(|n| weights.contains(n));
+        let all_bias = bias_names.iter().all(|n| weights.contains(n));
+        if any_bias && !all_bias {
+            anyhow::bail!(
+                "load_dense_concat_or_ggml: inconsistent biases across prefixes {:?} \
+                 — biased Qwen-style q/k/v requires every prefix to ship a `.bias`",
+                prefixes
+            );
+        }
+        let mut biases: Vec<Option<GpuTensor>> = vec![None; prefixes.len()];
+        if all_bias {
+            for (i, n) in bias_names.iter().enumerate() {
+                biases[i] = Some(weights.take(n)?);
+            }
+        }
+
         let uniform_dtype = storages.iter().all(|s| s.dtype == first.dtype);
         if !uniform_dtype {
             // Heterogeneous: keep separate `GgmlLinear`s and let
             // `LinearLayer::forward` concat their outputs at runtime
             // via the `GgmlConcat` arm. This is the Q4_K_M case
-            // where gate_proj is Q4_K but up_proj is Q6_K.
+            // where q is Q5_0 but v is Q6_K (Qwen) or gate is Q4_K
+            // but up is Q6_K (Llama). Each branch keeps its own
+            // bias, applied inside `GgmlLinear::forward` before the
+            // concat.
             let branches: Vec<GgmlLinear> = storages
                 .into_iter()
-                .map(|s| GgmlLinear {
-                    storage: s,
-                    bias: None,
-                })
+                .zip(biases)
+                .map(|(s, bias)| GgmlLinear { storage: s, bias })
                 .collect();
             return Ok(Self::GgmlConcat(branches));
         }
@@ -1027,22 +1070,45 @@ impl LinearLayer {
             ncols: first.ncols,
         };
 
-        // Optional concat-bias path: if every prefix has a sibling
-        // bias, collect + concat them as a single dense tensor.
-        // GGUF rarely ships gate/up biases, so fast-path the
-        // common bias-less case.
-        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
-        let any_bias = bias_names.iter().any(|n| weights.contains(n));
-        let bias = if any_bias {
-            // Defer to dense path — GGUF biases are dequantized into
-            // gguf_dense already, so `take` returns them. Concat via
-            // existing dense-only path is overkill for v1; a
-            // bias-less GGUF path is what every common GGUF ships.
-            anyhow::bail!(
-                "load_dense_concat_or_ggml: GGUF gate/up bias concat not implemented; \
-                 the common GGUF case is bias-less. Re-emit the model with bias-less \
-                 gate/up if you hit this."
-            );
+        // Homogeneous-quant path with biases: concat the per-branch
+        // biases into one packed [sum(out)] tensor. The bias dtype
+        // must be uniform across branches (Qwen2's q/k/v biases are
+        // all F32 → BF16-cast, so they share dtype). For Llama Q/K
+        // weights are also same-dtype (e.g. all Q4_K) and bias-less,
+        // so this branch only fires for biased models.
+        let bias = if all_bias {
+            let bias_parts: Vec<GpuTensor> = biases.into_iter().map(|b| b.unwrap()).collect();
+            let bdtype = bias_parts[0].dtype();
+            for (i, bt) in bias_parts.iter().enumerate() {
+                if bt.dtype() != bdtype {
+                    anyhow::bail!(
+                        "load_dense_concat_or_ggml: bias dtype mismatch on prefix `{}` \
+                         ({:?} vs {:?}) — homogeneous packed bias requires uniform dtype",
+                        prefixes[i],
+                        bt.dtype(),
+                        bdtype
+                    );
+                }
+            }
+            let bias_total: usize = bias_parts.iter().map(|t| t.dim(0)).sum();
+            let elem = bdtype.size_bytes();
+            let bias_bytes = bias_total * elem;
+            let bdst = unsafe { ferrite_cuda_core::driver::mem_alloc(bias_bytes)? };
+            weights.record_alloc(bdst, bias_bytes);
+            let mut bias_off: usize = 0;
+            for bt in &bias_parts {
+                let n = bt.dim(0);
+                unsafe {
+                    ferrite_cuda_core::driver::memcpy_dtod_async(
+                        (bdst as *mut u8).add(bias_off * elem),
+                        bt.raw_ptr(),
+                        n * elem,
+                        stream,
+                    )?;
+                }
+                bias_off += n;
+            }
+            Some(unsafe { GpuTensor::new(bdst, &[bias_total], bdtype) })
         } else {
             None
         };
@@ -1930,11 +1996,16 @@ mod ggml_probe {
         drop(w_f32);
         drop(x_cast);
 
-        if let Some(bias) = bias {
-            // bias is in model dtype; for F32 out, cast the bias to F32 once per call.
-            // Keep simple: use bias_add if dtypes match, else convert on the fly.
+        // Same `_bias_keepalive` pattern as `GgmlLinear::forward`:
+        // a temp F32 cast of the bias must outlive the async
+        // `bias_add_inplace` kernel because the caching allocator
+        // can hand its pointer to the downstream `cast_from_f32`
+        // call on the same stream. See
+        // `feedback_tensorview_for_async_gpu`.
+        let _bias_keepalive = if let Some(bias) = bias {
             if bias.dtype() == DType::F32 {
                 crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
+                None
             } else {
                 let bias_f32 = crate::kernels::cast_logits_to_f32(bias, alloc, stream);
                 crate::kernels::bias_add_inplace(
@@ -1942,16 +2013,20 @@ mod ggml_probe {
                     bias_f32.as_gpu_tensor(),
                     stream,
                 );
-                drop(bias_f32);
+                Some(bias_f32)
             }
-        }
+        } else {
+            None
+        };
 
         if input_dtype != DType::F32 {
             let out_f32_gpu = out_f32.as_gpu_tensor();
             let result = crate::kernels::cast_from_f32(out_f32_gpu, input_dtype, alloc, stream);
             drop(out_f32);
+            drop(_bias_keepalive);
             result
         } else {
+            drop(_bias_keepalive);
             out_f32
         }
     }

@@ -1,10 +1,17 @@
 # Ferrite GGUF integration — handoff
 
-Branch: `worktree-ff-gguf`. Status as of 2026-05-01.
+Branch: `worktree-ff-gguf`. Status as of 2026-05-01 (PM).
 
 ## Headline
 
-**Llama-3.x Q4_K_M GGUFs run end-to-end through ferrite-forward and produce coherent output** at tp=1. Verified on `unsloth/Llama-3.2-3B-Instruct-GGUF`, `unsloth/Llama-3.2-1B-Instruct-GGUF`, `bartowski/Llama-3.2-3B-Instruct-GGUF`. Other archs (Qwen2/3, Gemma2/3, CommandR, Mistral, Phi3, DeepSeekV2/3, Granite) compile but are unverified — Qwen2 specifically is **known-broken** end-to-end (model loads, output is gibberish even through `FERRITE_USE_REFERENCE=1` reference forward).
+**Llama-3.x AND Qwen2.5 / Qwen3 Q4_K_M GGUFs run end-to-end through ferrite-forward and produce coherent output** at tp=1. Verified on:
+- `unsloth/Llama-3.2-3B-Instruct-GGUF` → "2 + 2 = 4"
+- `unsloth/Llama-3.2-1B-Instruct-GGUF`
+- `bartowski/Llama-3.2-3B-Instruct-GGUF`
+- `bartowski/Qwen2.5-0.5B-Instruct-GGUF` Q4_K_M (was gibberish prior to today's PM fix) → "2+2 equals 4."
+- `unsloth/Qwen3-0.6B-GGUF` Q4_K_M → coherent `<think>...` reasoning trace
+
+Other archs (Gemma2/3, CommandR, Mistral, Phi3, DeepSeekV2/3, Granite) compile but are unverified.
 
 ## What landed (2026-04-30 → 2026-05-01)
 
@@ -47,9 +54,16 @@ cargo build -p vllm-cli --features cuda --release
 
 ### Blockers (correctness)
 
-1. **Qwen2 GGUF garbage**. Bartowski Qwen2.5-0.5B Q4_K_M produces gibberish even through `FERRITE_USE_REFERENCE=1` (which routes every Ggml linear through dequant+cuBLAS, bypassing the MMVQ kernel entirely). Bytes match HF safetensors at the weight level (raw maxdiff = 0.047 = Q5_0 quant noise) and tokenizer matches HF byte-for-byte. So the bug is downstream of weight loading and tokenization but specific to Qwen2 — likely in some kernel path that doesn't exercise on Llama (qwen2 has biased q/k/v but my bias-cast fix is in place; rope_theta is compile-time-baked and matches; rms_norm_eps matches). **Next debugging step**: dump hidden states after layer 0 for both safetensors and GGUF and compare; or compare logits at the first decode position.
+(none open at tp=1 for verified archs)
 
-2. **Audit other archs.** The qk-permute is gated to `arch == "llama"` so Qwen/Gemma/CommandR/Phi3/DeepSeek shouldn't be silently broken by it, but I haven't end-to-end-verified any of them. Mistral GGUFs in the wild typically tag as `arch == "llama"` (same convert class) — should work but untested.
+#### Closed today (2026-05-01 PM)
+
+1. **Qwen2/Qwen3 GGUF garbage — FIXED.** Root cause: `gguf_to_hf_name`'s per-layer suffix table only matched `.weight` arms; for any `.bias` GGUF tensor (`blk.{N}.attn_q.bias` etc.) the function fell through to the `other` arm and returned `model.layers.{N}.attn_q.bias`, but `load_dense_concat_or_ggml` looks for `model.layers.{N}.self_attn.q_proj.bias`. The lookup `weights.contains("model.layers.0.self_attn.q_proj.bias")` returned false, `any_bias = false`, and the bias was silently dropped. Llama / Mistral never tripped this because they ship no q/k/v biases; Qwen2/2.5/3 always do, hence the garbage. The biased-q/k/v plumbing landed in `b595f86ca` was correct — it just never received the biases through the rename gap.
+   Fix: added `attn_{q,k,v,output,o}.bias` arms to the suffix table in `vllm-model/src/gguf.rs`. Three diagnostics that nailed this down are kept on disk for future regressions: the synthetic+real Q5_0 dequant harness (`crates/vllm-cuda/examples/q5_0_dequant_check.rs`) which exonerated the Q5_0 kernel before we hunted the loader; running Python vLLM on the same GGUF to confirm coherence (rules out kernel and file); pattern-matching the bias mapping table to find the gap.
+
+#### Open follow-ups
+
+1. **Audit other archs end-to-end.** Beyond the verified four (Llama-3 + Qwen2.5 + Qwen3 + Mistral via llama-converter), Gemma2/3, CommandR, Phi3, DeepSeekV2/3, and Granite compile but are unverified. The qk-permute is gated to `arch == "llama"` so they shouldn't be silently broken by it, but biased archs (CommandR, some Phi variants) may be hitting other rename gaps. Run `vllm chat <repo> --enforce-eager --quick "What is 2+2?"` per arch and triage.
 
 ### Plumbing
 

@@ -696,6 +696,14 @@ pub fn gguf_to_hf_name(gguf_name: &str) -> String {
             "attn_norm.weight" => "input_layernorm.weight",
             "attn_q_norm.weight" => "self_attn.q_norm.weight",
             "attn_k_norm.weight" => "self_attn.k_norm.weight",
+            // Biases (Qwen2/2.5 ships q/k/v biases; Llama / Mistral / etc. don't).
+            // Without these arms the bias falls through to `model.layers.{N}.attn_q.bias`,
+            // but the downstream loader looks for `model.layers.{N}.self_attn.q_proj.bias`,
+            // and silently drops the bias — producing gibberish on biased archs.
+            "attn_q.bias" => "self_attn.q_proj.bias",
+            "attn_k.bias" => "self_attn.k_proj.bias",
+            "attn_v.bias" => "self_attn.v_proj.bias",
+            "attn_output.bias" | "attn_o.bias" => "self_attn.o_proj.bias",
             // MLA attention (DeepSeek V2/V3)
             "attn_q_a.weight" => "self_attn.q_a_proj.weight",
             "attn_q_a_norm.weight" => "self_attn.q_a_layernorm.weight",

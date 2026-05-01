@@ -1356,8 +1356,57 @@ impl GgufGpuWeights {
             .unwrap_or(0);
         let host_buf = ferrite_cuda_core::driver::mem_alloc_host(max_tensor_bytes)?;
 
+        // GGML's RoPE convention pre-permutes q_proj / k_proj rows
+        // (interleaved pairs) at file-write time, BUT only for
+        // archs whose `convert_hf_to_gguf` class derives from
+        // `LlamaModel` (which calls `permute()` in its
+        // `modify_tensors`). Other archs (Qwen2/3, Gemma2/3,
+        // CommandR, DeepSeekV2/V3, Phi3) write q/k unpermuted —
+        // un-permuting on load would silently break them. The
+        // discriminator is `general.architecture`. Verified via
+        // weight-byte comparison: bartowski-Llama-3.2-3B Q4_K_M
+        // un-permute → 0.07 maxdiff vs safetensors (Q4_K noise),
+        // raw → 1.3 (broken). Whitelist starts conservatively at
+        // `llama` (covers Llama-2/3.x and Llama-tagged Mistral
+        // GGUFs); add other entries as each arch is verified.
+        let qk_arch = content
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| v.to_string().ok().cloned());
+        let qk_permuted = matches!(qk_arch.as_deref(), Some("llama"));
+        let qk_meta: Option<(usize, usize, usize)> = qk_arch.as_deref().and_then(|arch| {
+            let head_count = content
+                .metadata
+                .get(&format!("{arch}.attention.head_count"))?
+                .to_u32()
+                .ok()? as usize;
+            let head_count_kv = content
+                .metadata
+                .get(&format!("{arch}.attention.head_count_kv"))
+                .and_then(|v| v.to_u32().ok())
+                .map(|v| v as usize)
+                .unwrap_or(head_count);
+            let key_length = content
+                .metadata
+                .get(&format!("{arch}.attention.key_length"))
+                .and_then(|v| v.to_u32().ok())
+                .map(|v| v as usize)
+                .or_else(|| {
+                    let hidden = content
+                        .metadata
+                        .get(&format!("{arch}.embedding_length"))?
+                        .to_u32()
+                        .ok()? as usize;
+                    Some(hidden / head_count)
+                })?;
+            Some((head_count, head_count_kv, key_length))
+        });
+
         for (gguf_name, info) in &content.tensor_infos {
             let hf_name = vllm_model::gguf::gguf_to_hf_name(gguf_name);
+            // `gguf_format` already reverses the on-disk ggml dim
+            // order to HF's [rows, cols] = [out, in] convention, so
+            // `info.shape.dims()` is already row-major-friendly here.
             let dims_full = info.shape.dims();
             let gguf_dtype = info.ggml_dtype;
 
@@ -1490,6 +1539,65 @@ impl GgufGpuWeights {
             }
             debug_assert_eq!(written, size_bytes);
             let _ = elem_count; // silence unused if no downstream use
+
+            // GGML→HF row un-permute for q_proj / k_proj. llama.cpp's
+            // `convert_hf_to_gguf` reshapes [n_heads, head_dim, in]
+            // as [n_heads, 2, head_dim/2, in] and swaps the middle
+            // axes — i.e. interleaves "first half" and "second half"
+            // of head_dim into pairs. ferrite's RoPE follows the HF
+            // split-halves convention, so we need to reverse that
+            // permutation by re-interleaving rows. The permutation
+            // operates strictly on rows (dim 0), so block-quantized
+            // rows can be moved bytewise without touching the
+            // intra-row block layout.
+            //
+            // ShardDim0 keeps each rank's row range head-aligned
+            // (verified upstream by `rows_per_rank % head_dim == 0`)
+            // so the permutation is well-defined per-rank.
+            let is_q_proj = gguf_name.ends_with(".attn_q.weight");
+            let is_k_proj = gguf_name.ends_with(".attn_k.weight");
+            if qk_permuted
+                && dims_full.len() == 2
+                && (is_q_proj || is_k_proj)
+                && let Some((n_heads, n_kv_heads, head_dim)) = qk_meta
+            {
+                let rows_local = dims[0];
+                let row_bytes_local = if dims[1] % bs == 0 {
+                    (dims[1] / bs) * ts
+                } else {
+                    dims[1] * ts
+                };
+                debug_assert_eq!(rows_local * row_bytes_local, sliced_size_bytes);
+                let head_count_for_this = if is_q_proj { n_heads } else { n_kv_heads };
+                if rows_local.is_multiple_of(head_dim) && head_dim.is_multiple_of(2) {
+                    let heads_local = rows_local / head_dim;
+                    let half = head_dim / 2;
+                    // tp ShardDim0 may give us only a contiguous
+                    // slice of heads; in that case heads_local <
+                    // total head_count_for_this and head boundaries
+                    // still align. The permutation only mixes rows
+                    // within a head, so works on any whole-head set.
+                    let _ = head_count_for_this;
+                    let mut tmp = vec![0u8; sliced_size_bytes];
+                    let src = std::slice::from_raw_parts(host_buf, sliced_size_bytes);
+                    for head in 0..heads_local {
+                        for pos_hf in 0..head_dim {
+                            let r_hf = head * head_dim + pos_hf;
+                            let r_ggml = if pos_hf < half {
+                                head * head_dim + 2 * pos_hf
+                            } else {
+                                head * head_dim + 2 * (pos_hf - half) + 1
+                            };
+                            let dst_off = r_hf * row_bytes_local;
+                            let src_off = r_ggml * row_bytes_local;
+                            tmp[dst_off..dst_off + row_bytes_local]
+                                .copy_from_slice(&src[src_off..src_off + row_bytes_local]);
+                        }
+                    }
+                    let dst = std::slice::from_raw_parts_mut(host_buf, sliced_size_bytes);
+                    dst.copy_from_slice(&tmp);
+                }
+            }
 
             if is_f32_or_f16 || is_norm || is_embedding || is_lm_head {
                 // Dequantize path: for unquantized types, just H2D copy.

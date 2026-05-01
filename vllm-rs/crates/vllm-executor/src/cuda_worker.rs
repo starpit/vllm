@@ -4995,17 +4995,40 @@ impl Worker for CudaWorker {
             // config-only fields (Phi-3-mini-4k vs Phi-3.5-mini-128k
             // — same weights, different `max_position_embeddings` +
             // `rope_scaling.type`). Ferrite owns the rest.
+            // GGUF metadata's `<arch>.context_length` and rope_scaling
+            // hash often disagree with the canonical HF config.json
+            // (e.g. Qwen2.5-0.5B-Instruct GGUF reports 8192, JSON
+            // reports 32768; unsloth Llama-3 GGUFs omit rope_scaling
+            // entirely so we infer it). Treat those config-disambiguation
+            // hints as permissive (None) for GGUF sources — the
+            // fingerprint's positive shape + suffix checks plus
+            // `is_gguf_gate` are already disjoint enough; the
+            // compile-time variant's baked rope/max_pos values stay
+            // authoritative.
+            let suppress_hf_hints = weights.is_gguf();
             let hf_fp = ferrite_forward::HfFingerprint {
-                max_position_embeddings: hf_config.max_position_embeddings.map(|v| v as u64),
-                rope_scaling_type: hf_config
-                    .extra
-                    .get("rope_scaling")
-                    .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
-                    .and_then(|v| v.as_str()),
-                rope_scaling_hash: hf_config
-                    .extra
-                    .get("rope_scaling")
-                    .map(ferrite_forward::hash_json_value),
+                max_position_embeddings: if suppress_hf_hints {
+                    None
+                } else {
+                    hf_config.max_position_embeddings.map(|v| v as u64)
+                },
+                rope_scaling_type: if suppress_hf_hints {
+                    None
+                } else {
+                    hf_config
+                        .extra
+                        .get("rope_scaling")
+                        .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
+                        .and_then(|v| v.as_str())
+                },
+                rope_scaling_hash: if suppress_hf_hints {
+                    None
+                } else {
+                    hf_config
+                        .extra
+                        .get("rope_scaling")
+                        .map(ferrite_forward::hash_json_value)
+                },
             };
             // Runtime `max_model_len` — matches the serve-level
             // resolution (CLI `--max-model-len` ∨ HF
@@ -5066,6 +5089,21 @@ impl Worker for CudaWorker {
         let model = if let Some(m) = ferrite_loaded {
             m
         } else {
+            // GGUF source has only one supported load path
+            // (ferrite-forward); the fallback paths below read from
+            // the safetensors mmap map and would fail deep with a
+            // confusing "weight not found". Surface the real problem:
+            // ferrite-forward did not match a compiled variant.
+            if uses_ggml {
+                return Err(ExecutorError::WorkerInit(format!(
+                    "GGUF source loaded but no ferrite-forward variant matched arch=`{arch}` \
+                     at tp={tp_world}. Make sure the `-ggml` overlay is compiled in: \
+                     rebuild without `FERRITE_MODELS` (compiles every variant) or set \
+                     `FERRITE_MODELS=<base-stem>` (the prefix matches `<base>-ggml` too — \
+                     e.g. `FERRITE_MODELS=llama-3.2-3b`). Also confirm the arch's \
+                     `configs/quantizations.json` lists `\"ggml\"`."
+                )));
+            }
             match arch.as_str() {
                 // Qwen3 dense — Llama math + per-head Q/K rmsnorm before
                 // RoPE (no QKV bias). Only bf16/fp16 ferrite-forward is

@@ -7866,6 +7866,7 @@ dependencies = [
 name = "vllm-examples"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "js-sys",
  "pollster",
  "serde",
@@ -7874,6 +7875,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "tokio",
  "tracing",
+ "vllm-model",
  "vllm-wgpu",
  "wasm-bindgen",
  "wasm-bindgen-futures",

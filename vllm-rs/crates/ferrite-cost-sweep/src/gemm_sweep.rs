@@ -19,8 +19,11 @@
 use cudarc::cublas::sys as cublas;
 use cudarc::driver::sys;
 use ferrite_kernels::cutlass::{
-    cutlass_gemm_16x64_s3_launch, cutlass_gemm_16x64_s4_launch, cutlass_gemm_16x128_s3_launch,
-    cutlass_gemm_16x128_s4_launch, cutlass_gemm_32x64_s3_launch, cutlass_gemm_32x64_s4_launch,
+    cutlass_gemm_16x64_s3_launch, cutlass_gemm_16x64_s4_launch, cutlass_gemm_16x64_s4_sk2_launch,
+    cutlass_gemm_16x64_s4_sk4_launch, cutlass_gemm_16x64_s4_sk8_launch,
+    cutlass_gemm_16x128_s3_launch, cutlass_gemm_16x128_s4_launch,
+    cutlass_gemm_16x128_s4_sk2_launch, cutlass_gemm_16x128_s4_sk4_launch,
+    cutlass_gemm_16x128_s4_sk8_launch, cutlass_gemm_32x64_s3_launch, cutlass_gemm_32x64_s4_launch,
     cutlass_gemm_32x128_s3_launch, cutlass_gemm_32x128_s4_launch, cutlass_gemm_32x256_s3_launch,
     cutlass_gemm_64x64_s3_launch, cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x64_s4_sk2_launch,
     cutlass_gemm_64x64_s4_sk4_launch, cutlass_gemm_64x64_s4_sk8_launch,
@@ -31,10 +34,7 @@ use ferrite_kernels::cutlass::{
     cutlass_gemm_128x64_s4_sk4_launch, cutlass_gemm_128x64_s4_sk8_launch,
     cutlass_gemm_128x128_s3_launch, cutlass_gemm_128x128_s4_launch,
     cutlass_gemm_128x128_s4_sk2_launch, cutlass_gemm_128x128_s4_sk4_launch,
-    cutlass_gemm_128x128_s4_sk8_launch, cutlass_gemm_16x64_s4_sk2_launch,
-    cutlass_gemm_16x64_s4_sk4_launch, cutlass_gemm_16x64_s4_sk8_launch,
-    cutlass_gemm_16x128_s4_sk2_launch, cutlass_gemm_16x128_s4_sk4_launch,
-    cutlass_gemm_16x128_s4_sk8_launch, cutlass_gemm_128x256_s3_launch,
+    cutlass_gemm_128x128_s4_sk8_launch, cutlass_gemm_128x256_s3_launch,
     cutlass_gemm_256x64_s3_launch, cutlass_gemm_256x64_s4_launch,
     cutlass_gemm_bias_16x64_s3_launch, cutlass_gemm_bias_16x64_s4_launch,
     cutlass_gemm_bias_16x128_s3_launch, cutlass_gemm_bias_16x128_s4_launch,

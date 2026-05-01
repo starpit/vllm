@@ -352,7 +352,17 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         // downstream emit_arch_dispatcher already handles empty
         // arms by producing nothing.
         let available: Vec<String> = out.iter().map(|m| m.source_stem.clone()).collect();
-        out.retain(|m| set.contains(&m.source_stem));
+        // A user-supplied stem matches either exactly (a base or a
+        // synthesized `<base>-<preset>` variant) OR as a base prefix —
+        // `FERRITE_MODELS=llama-3.2-3b` keeps the dense base AND every
+        // overlay variant (`-ggml`, `-awq-gemm`, …). Without the prefix
+        // pass, requesting a base by its bare stem silently dropped
+        // every quant variant for that base and arches like `-ggml`
+        // never registered.
+        out.retain(|m| {
+            set.iter()
+                .any(|s| m.source_stem == *s || m.source_stem.starts_with(&format!("{s}-")))
+        });
 
         // Typo detection: warn (don't fail) when the filter was
         // non-empty AND this arch had models AND none matched. The

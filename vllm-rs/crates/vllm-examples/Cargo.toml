@@ -47,7 +47,13 @@ serde-wasm-bindgen = "0.6"
 pollster = "0.4"
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokenizers.workspace = true
+vllm-model = { path = "../vllm-model" }
+anyhow = { workspace = true }
 
 [[example]]
 name = "native_chat"
 path = "examples/native_chat.rs"
+
+[[example]]
+name = "gguf_tok_dump"
+path = "examples/gguf_tok_dump.rs"

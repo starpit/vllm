@@ -26,6 +26,109 @@ use std::sync::Arc;
 // already gone and this is a no-op.
 // ---------------------------------------------------------------------------
 
+/// Concat-load when every source weight is in the GGUF dense map
+/// (FP16/F32 GGUFs land all weights here). `take()` already checks
+/// `gguf_dense` first and returns the GpuTensor; we then D2D-copy
+/// each [rows, cols] slab into a packed [sum(rows), cols] buffer.
+/// Bias follows the same path.
+fn load_gguf_dense_concat(
+    weights: &mut GpuWeights,
+    prefixes: &[&str],
+    stream: cudarc::driver::sys::CUstream,
+) -> Result<LinearLayer> {
+    debug_assert!(!prefixes.is_empty());
+    let mut parts: Vec<GpuTensor> = Vec::with_capacity(prefixes.len());
+    for p in prefixes {
+        let name = format!("{p}.weight");
+        let t = weights.take(&name)?;
+        if t.ndim() != 2 {
+            anyhow::bail!(
+                "load_gguf_dense_concat: `{name}` has rank {}, expected 2",
+                t.ndim()
+            );
+        }
+        parts.push(t);
+    }
+    let cols = parts[0].dim(1);
+    let dtype = parts[0].dtype();
+    for (i, t) in parts.iter().enumerate() {
+        if t.dim(1) != cols {
+            anyhow::bail!(
+                "load_gguf_dense_concat: `{}` in_features {} != {cols}",
+                prefixes[i],
+                t.dim(1)
+            );
+        }
+        if t.dtype() != dtype {
+            anyhow::bail!(
+                "load_gguf_dense_concat: `{}` dtype {:?} != {dtype:?}",
+                prefixes[i],
+                t.dtype()
+            );
+        }
+    }
+    let total_rows: usize = parts.iter().map(|t| t.dim(0)).sum();
+    let elem = dtype.size_bytes();
+    let total_bytes = total_rows * cols * elem;
+    let dst = unsafe { ferrite_cuda_core::driver::mem_alloc(total_bytes)? };
+    weights.record_alloc(dst, total_bytes);
+    let mut row_off: usize = 0;
+    for t in &parts {
+        let part_rows = t.dim(0);
+        let part_bytes = part_rows * cols * elem;
+        unsafe {
+            ferrite_cuda_core::driver::memcpy_dtod_async(
+                (dst as *mut u8).add(row_off * cols * elem),
+                t.raw_ptr(),
+                part_bytes,
+                stream,
+            )?;
+        }
+        row_off += part_rows;
+    }
+    let weight = unsafe { GpuTensor::new(dst, &[total_rows, cols], dtype) };
+
+    // Bias: either all branches ship one or none.
+    let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+    let any_bias = weights.contains(&bias_names[0]);
+    let bias = if any_bias {
+        let mut bias_parts: Vec<GpuTensor> = Vec::with_capacity(prefixes.len());
+        for n in &bias_names {
+            if !weights.contains(n) {
+                anyhow::bail!(
+                    "load_gguf_dense_concat: inconsistent bias — `{}` exists but `{n}` is missing",
+                    bias_names[0]
+                );
+            }
+            bias_parts.push(weights.take(n)?);
+        }
+        let bias_dtype = bias_parts[0].dtype();
+        let bias_total_rows: usize = bias_parts.iter().map(|t| t.dim(0)).sum();
+        let bias_elem = bias_dtype.size_bytes();
+        let bias_bytes = bias_total_rows * bias_elem;
+        let bdst = unsafe { ferrite_cuda_core::driver::mem_alloc(bias_bytes)? };
+        weights.record_alloc(bdst, bias_bytes);
+        let mut bias_off: usize = 0;
+        for bt in &bias_parts {
+            let n = bt.dim(0);
+            unsafe {
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (bdst as *mut u8).add(bias_off * bias_elem),
+                    bt.raw_ptr(),
+                    n * bias_elem,
+                    stream,
+                )?;
+            }
+            bias_off += n;
+        }
+        Some(unsafe { GpuTensor::new(bdst, &[bias_total_rows], bias_dtype) })
+    } else {
+        None
+    };
+
+    Ok(LinearLayer::Dense(Linear { weight, bias }))
+}
+
 fn try_synthesize_packed_slice(weights: &mut GpuWeights, prefix: &str) -> Result<()> {
     let (parent, suffix) = match prefix.rsplit_once('.') {
         Some(split) => split,
@@ -408,7 +511,23 @@ impl GgmlLinear {
         drop(cast_buf);
 
         if let Some(bias) = self.bias {
-            crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
+            // ggml_matmul output is F32. The bias was cast to
+            // `model_dtype` (typically BF16) at GGUF load time so
+            // the dense path can consume it directly. Cast to F32
+            // here when dtypes disagree — `bias_add_inplace`
+            // reinterprets the bias pointer as `out.dtype()` so a
+            // BF16 source against an F32 out would be silent garbage.
+            if bias.dtype() == ferrite_cuda_core::dtype::DType::F32 {
+                crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
+            } else {
+                let bias_f32 = crate::kernels::cast_logits_to_f32(bias, alloc, stream);
+                crate::kernels::bias_add_inplace(
+                    out_f32.as_gpu_tensor(),
+                    bias_f32.as_gpu_tensor(),
+                    stream,
+                );
+                drop(bias_f32);
+            }
         }
 
         // Cast back to original dtype if we converted to f32.
@@ -626,7 +745,18 @@ impl LinearLayer {
                 let elem = out_dtype.size_bytes();
                 let mut col_offset_elems: usize = 0;
                 for branch in branches {
-                    let part = branch.forward(x, alloc, stream);
+                    let part = if ggml_probe::use_reference() {
+                        ggml_probe::reference_forward(
+                            &branch.storage,
+                            x,
+                            branch.bias,
+                            cublas,
+                            alloc,
+                            stream,
+                        )
+                    } else {
+                        branch.forward(x, alloc, stream)
+                    };
                     let part_view = part.as_gpu_tensor();
                     let part_out = branch.out_features();
                     let part_row_bytes = part_out * elem;
@@ -811,6 +941,17 @@ impl LinearLayer {
             .all(|n| weights.contains_quantized_linear(n));
 
         if !all_gguf {
+            // FP16/F32 GGUFs land all weights in `gguf_dense` (none
+            // in `quantized`); `load_dense_concat` reads via
+            // `tensor_info` + `take_into` which only see the
+            // safetensors mmap map. Detect that case and assemble
+            // the packed Dense linear via `take()` (which DOES check
+            // gguf_dense first) + per-row D2D copy. Bias comes from
+            // the same path.
+            let all_gguf_dense = weight_names.iter().all(|n| weights.gguf_dense_contains(n));
+            if all_gguf_dense {
+                return load_gguf_dense_concat(weights, prefixes, stream);
+            }
             return Self::load_dense_concat(weights, prefixes, stream);
         }
 

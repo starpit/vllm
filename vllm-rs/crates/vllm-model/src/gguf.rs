@@ -216,32 +216,53 @@ pub fn gguf_tokenizer(gguf: &GgufFile) -> ModelResult<Option<tokenizers::Tokeniz
 
     let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
-    // Pre-tokenizer. `tokenizer.ggml.pre` names the family:
-    //   `llama-bpe` (Llama-3, Llama-3.1, Llama-3.2): Llama-3's
-    //     specific regex, then ByteLevel byte-mapping (no regex).
-    //   `default` / unset / others: GPT-2-style ByteLevel default
-    //     (its built-in regex + byte-mapping).
-    // Wrong choice here is the most common cause of gibberish output
-    // — Llama-3 punctuation/whitespace splitting differs from GPT-2.
+    // Pre-tokenizer. `tokenizer.ggml.pre` names the family. Almost
+    // every modern HF tokenizer is structured as:
+    //   Sequence([Split(<arch_regex>, Isolated), ByteLevel(false, false, false)])
+    // The arch differs only in the splitting regex — so the regex
+    // table below is the single point of variance. ByteLevel always
+    // runs with `add_prefix_space=false, trim_offsets=false,
+    // use_regex=false` (the regex Split already did the splitting;
+    // ByteLevel just maps bytes through the byte-to-unicode table).
+    //
+    // Wrong choice here is the #1 cause of gibberish output — picking
+    // `ByteLevel::default()` (which has `add_prefix_space=true,
+    // use_regex=true`) silently inserts a leading space on every
+    // word, offsetting every token id and destroying inference.
     let pre = gguf
         .get_metadata_string("tokenizer.ggml.pre")
         .unwrap_or("default");
     let llama3_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    // Qwen2 / Qwen2.5 / Qwen3: same family as Llama-3 but `\p{N}`
+    // instead of `\p{N}{1,3}` (digits split one-at-a-time).
+    let qwen2_regex = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+    // GPT-2 base regex (also fits `default` and tokenizers whose
+    // pre-tokenizer field is absent — the safest fallback that still
+    // keeps `add_prefix_space=false` so we don't silently corrupt
+    // tokenization).
+    let gpt2_regex =
+        "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
+    let regex_str: &str = match pre {
+        "llama-bpe" | "llama3" | "llama-v3" => llama3_regex,
+        "qwen2" => qwen2_regex,
+        _ => gpt2_regex,
+    };
+    let regex_split = Split::new(
+        SplitPattern::Regex(regex_str.to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .map_err(|e| ModelError::Other(format!("pre-tokenizer regex compile ({pre}): {e}")))?;
+    let bl = ByteLevelPre::new(false, false, false);
     let pre_tokenizer: PreTokenizerWrapper =
-        if pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3" {
-            let regex_split = Split::new(
-                SplitPattern::Regex(llama3_regex.to_string()),
-                SplitDelimiterBehavior::Isolated,
-                false,
-            )
-            .map_err(|e| ModelError::Other(format!("llama-bpe regex compile: {e}")))?;
-            let bl = ByteLevelPre::new(false, false, false); // no add_prefix_space, no trim, no use_regex
-            PreSequence::new(vec![regex_split.into(), bl.into()]).into()
-        } else {
-            ByteLevelPre::default().into()
-        };
+        PreSequence::new(vec![regex_split.into(), bl.into()]).into();
     tokenizer.with_pre_tokenizer(Some(pre_tokenizer));
-    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    // Decoder: ByteLevel with `add_prefix_space=false, trim_offsets=false`
+    // matches HF tokenizer.json on Llama-3/Qwen2/Qwen3/Mistral families.
+    // The default ctor has `add_prefix_space=true` which strips a
+    // leading space from every decoded token — visible as missing
+    // spaces in user-facing output.
+    tokenizer.with_decoder(Some(ByteLevelDecoder::new(false, false, false)));
 
     // Special tokens. GGUF marks token roles via
     // `tokenizer.ggml.token_type` (parallel to tokens array):

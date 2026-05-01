@@ -1974,6 +1974,7 @@ dependencies = [
  "anyhow",
  "cudarc",
  "dirs 6.0.0",
+ "ferrite-gguf",
  "half",
  "inventory",
  "libc",
@@ -2020,12 +2021,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-gguf"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "serde_json",
+ "tempfile",
+ "tokenizers 0.22.2",
+ "tracing",
+ "vllm-model",
+]
+
+[[package]]
 name = "ferrite-kernels"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "cudarc",
  "ferrite-cuda-core",
+ "ferrite-gguf",
  "half",
  "inventory",
  "serde_json",
@@ -7808,6 +7822,7 @@ dependencies = [
  "dirs 6.0.0",
  "ferrite-cuda-builder",
  "ferrite-cuda-core",
+ "ferrite-gguf",
  "ferrite-kernels",
  "ferrite-models",
  "half",
@@ -7867,6 +7882,7 @@ name = "vllm-examples"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ferrite-gguf",
  "js-sys",
  "pollster",
  "serde",
@@ -7891,6 +7907,7 @@ dependencies = [
  "cudarc",
  "ferrite-cuda-core",
  "ferrite-forward",
+ "ferrite-gguf",
  "ferrite-models",
  "half",
  "hf-hub",
@@ -8041,6 +8058,7 @@ dependencies = [
  "axum-server",
  "bincode",
  "chrono",
+ "ferrite-gguf",
  "http",
  "http-body-util",
  "indicatif 0.17.11",

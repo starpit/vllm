@@ -1,9 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! GGUF file loading, config extraction, and tensor name mapping.
+//! GGUF (llama.cpp) file format support for ferrite.
 //!
-//! Wraps `gguf_format::Content` (our vendored GGUF parser) and provides
-//! typed metadata accessors and maps GGUF tensor names to the HuggingFace
-//! convention used by the rest of the crate.
+//! Format-level mechanics: the binary parser (in `format`), the
+//! `GgufFile` reader, tokenizer reconstruction, chat-template extraction,
+//! and (transitionally) the GGUF→HfModelConfig translator + tensor-name
+//! mapper.
+//!
+//! Per-arch concerns (tensor renames, qk-permute, GGUF arch aliasing,
+//! arch-specific metadata reads) belong in each `ferrite-model-X` crate
+//! — not here. The `gguf_model_config` and `gguf_to_hf_name` god-switches
+//! below are scheduled to be dismantled into per-arch declarations in
+//! subsequent commits; they're kept here transitionally so the format-level
+//! relocation lands as one self-contained step.
+
+pub mod format;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,9 +22,10 @@ use std::path::Path;
 
 use tracing::info;
 
-use crate::error::{ModelError, ModelResult};
-use crate::gguf_format::{Content, Value};
-use crate::weight::HfModelConfig;
+use vllm_model::error::{ModelError, ModelResult};
+use vllm_model::weight::HfModelConfig;
+
+pub use crate::format::{Content, GgufDType, Shape, TensorInfo, Value, ValueType};
 
 // ---------------------------------------------------------------------------
 // GgufFile

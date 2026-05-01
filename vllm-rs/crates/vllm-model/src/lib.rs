@@ -4,16 +4,16 @@
 //! This crate provides:
 //! - **HfModelConfig** for parsing HuggingFace `config.json`
 //! - **SafeTensorsIndex** for sharded weight map lookups
-//! - **GGUF format** parsing for quantized models
 //! - **Quantization configs** (AWQ, BnB, GPTQ)
 //! - **LoRA adapter config** parsing
+//!
+//! GGUF format support lives in the `ferrite-gguf` crate — adding GGUF
+//! support to a new model arch should not touch this crate.
 
 pub mod attention_metadata;
 pub mod awq_config;
 pub mod bnb_config;
 pub mod embedding;
-pub mod gguf;
-pub mod gguf_format;
 pub mod gptq_config;
 #[cfg(feature = "guided-decoding")]
 pub mod grammar;

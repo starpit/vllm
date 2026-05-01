@@ -42,6 +42,7 @@ members = [
     "crates/ferrite-forward",
     "crates/ferrite-forward-macro",
     "crates/ferrite-cost-sweep",
+    "crates/ferrite-gguf",
 ]
 exclude = []
 
@@ -178,6 +179,7 @@ vllm-engine = { path = "crates/vllm-engine" }
 vllm-serve = { path = "crates/vllm-serve" }
 vllm-executor = { path = "crates/vllm-executor" }
 vllm-model = { path = "crates/vllm-model" }
+ferrite-gguf = { path = "crates/ferrite-gguf" }
 vllm-protocol = { path = "crates/vllm-protocol" }
 vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }

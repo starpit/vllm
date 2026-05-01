@@ -67,7 +67,7 @@ impl GgmlDType {
     }
 
     /// Convert from a vendored GgufDType tag.
-    pub fn from_gguf(dt: vllm_model::gguf_format::GgufDType) -> Option<Self> {
+    pub fn from_gguf(dt: ferrite_gguf::GgufDType) -> Option<Self> {
         Self::from_u32(dt.0)
     }
 

@@ -11,8 +11,8 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("usage: gguf_tok_dump <path-to-.gguf>"))?
         .into();
 
-    let gguf = vllm_model::gguf::GgufFile::open(&path)?;
-    let tok = vllm_model::gguf::gguf_tokenizer(&gguf)?
+    let gguf = ferrite_gguf::GgufFile::open(&path)?;
+    let tok = ferrite_gguf::gguf_tokenizer(&gguf)?
         .ok_or_else(|| anyhow::anyhow!("gguf_tokenizer returned None"))?;
 
     let mut args = std::env::args().skip(2);

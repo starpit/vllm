@@ -194,9 +194,9 @@ fn parse_arg(name: &str) -> Option<String> {
 }
 
 fn read_gguf_tensor(path: &str, tensor: &str) -> anyhow::Result<Vec<u8>> {
+    use ferrite_gguf::Content;
     use std::fs::File;
     use std::io::{BufReader, Read, Seek, SeekFrom};
-    use vllm_model::gguf_format::Content;
 
     let mut reader = BufReader::new(File::open(path)?);
     let content = Content::read(&mut reader).map_err(|e| anyhow::anyhow!("GGUF parse: {e}"))?;

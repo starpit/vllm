@@ -149,14 +149,11 @@ impl HfModelConfig {
         Self::from_file(path)
     }
 
-    /// Load from either a model directory (reads `config.json`) or a
-    /// `.gguf` file (reads metadata from the GGUF header).
+    /// Load from a model directory (reads `config.json`).
+    ///
+    /// For `.gguf` paths, callers must use `ferrite_gguf::gguf_model_config`
+    /// directly — GGUF format support lives in ferrite, not vllm-model.
     pub fn from_path(path: impl AsRef<Path>) -> ModelResult<Self> {
-        let path = path.as_ref();
-        if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
-            let gguf = crate::gguf::GgufFile::open(path)?;
-            return crate::gguf::gguf_model_config(&gguf);
-        }
         Self::from_dir(path)
     }
 

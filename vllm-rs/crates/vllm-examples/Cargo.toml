@@ -48,6 +48,7 @@ pollster = "0.4"
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokenizers.workspace = true
 vllm-model = { path = "../vllm-model" }
+ferrite-gguf = { path = "../ferrite-gguf" }
 anyhow = { workspace = true }
 
 [[example]]

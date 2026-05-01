@@ -1326,7 +1326,7 @@ impl GgufGpuWeights {
         tp_rank: usize,
         tp_world_size: usize,
     ) -> anyhow::Result<Self> {
-        use vllm_model::gguf_format::Content;
+        use ferrite_gguf::Content;
 
         if tp_world_size == 0 {
             anyhow::bail!("tp_world_size must be >= 1");
@@ -1403,7 +1403,7 @@ impl GgufGpuWeights {
         });
 
         for (gguf_name, info) in &content.tensor_infos {
-            let hf_name = vllm_model::gguf::gguf_to_hf_name(gguf_name);
+            let hf_name = ferrite_gguf::gguf_to_hf_name(gguf_name);
             // `gguf_format` already reverses the on-disk ggml dim
             // order to HF's [rows, cols] = [out, in] convention, so
             // `info.shape.dims()` is already row-major-friendly here.
@@ -1607,7 +1607,7 @@ impl GgufGpuWeights {
                     let dtype_size = ts; // 4 for f32, 2 for f16/bf16
                     let source_dtype = if dtype_size == 4 {
                         DType::F32
-                    } else if gguf_dtype == vllm_model::gguf_format::GgufDType::BF16 {
+                    } else if gguf_dtype == ferrite_gguf::GgufDType::BF16 {
                         DType::BF16
                     } else {
                         DType::F16

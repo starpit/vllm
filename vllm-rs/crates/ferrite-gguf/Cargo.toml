@@ -1,0 +1,16 @@
+[package]
+name = "ferrite-gguf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGUF (llama.cpp) file format support for ferrite. Format-level code only; per-arch concerns (tensor renames, qk-permute, GGUF arch aliasing) live in each ferrite-model-X."
+
+[dependencies]
+vllm-model = { path = "../vllm-model" }
+byteorder = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

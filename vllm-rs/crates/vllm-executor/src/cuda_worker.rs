@@ -4866,9 +4866,9 @@ impl Worker for CudaWorker {
                 return Some(t);
             }
             if let Some(gguf_path) = tok_gguf_path
-                && let Ok(gguf) = vllm_model::gguf::GgufFile::open(&gguf_path)
+                && let Ok(gguf) = ferrite_gguf::GgufFile::open(&gguf_path)
             {
-                match vllm_model::gguf::gguf_tokenizer(&gguf) {
+                match ferrite_gguf::gguf_tokenizer(&gguf) {
                     Ok(Some(t)) => return Some(t),
                     Ok(None) => {}
                     Err(e) => tracing::warn!("gguf_tokenizer failed: {e}"),
@@ -4877,9 +4877,19 @@ impl Worker for CudaWorker {
             None
         });
 
-        // 2. Parse config (config.json for safetensors, GGUF metadata for .gguf).
-        let hf_config = HfModelConfig::from_path(&model_dir)
-            .map_err(|e| ExecutorError::WorkerInit(format!("config parse failed: {e}")))?;
+        // 2. Parse config: GGUF metadata for `.gguf` files, otherwise
+        //    `config.json` in the model dir. GGUF support lives in
+        //    `ferrite-gguf` — vllm-model has no GGUF-awareness.
+        let hf_config = if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf")
+        {
+            let gguf = ferrite_gguf::GgufFile::open(&model_dir)
+                .map_err(|e| ExecutorError::WorkerInit(format!("GGUF parse failed: {e}")))?;
+            ferrite_gguf::gguf_model_config(&gguf)
+                .map_err(|e| ExecutorError::WorkerInit(format!("GGUF config: {e}")))?
+        } else {
+            HfModelConfig::from_path(&model_dir)
+                .map_err(|e| ExecutorError::WorkerInit(format!("config parse failed: {e}")))?
+        };
 
         // 3. Resolve dtype.
         let dtype = match self.config.dtype.as_str() {

@@ -26,6 +26,7 @@ vllm-config = { workspace = true }
 vllm-core = { workspace = true }
 vllm-engine = { workspace = true }
 vllm-model = { workspace = true }
+ferrite-gguf = { workspace = true }
 vllm-cuda = { workspace = true, optional = true }
 ferrite-forward = { path = "../ferrite-forward", optional = true }
 ferrite-models = { path = "../ferrite-models", optional = true }

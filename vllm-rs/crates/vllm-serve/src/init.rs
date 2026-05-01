@@ -2505,8 +2505,8 @@ fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
             None
         };
     if let Some(gguf_path) = gguf_candidate
-        && let Ok(gguf) = vllm_model::gguf::GgufFile::open(&gguf_path)
-        && let Some(template_str) = vllm_model::gguf::gguf_chat_template(&gguf)
+        && let Ok(gguf) = ferrite_gguf::GgufFile::open(&gguf_path)
+        && let Some(template_str) = ferrite_gguf::gguf_chat_template(&gguf)
     {
         match ChatTemplate::new(template_str) {
             Ok(mut tpl) => {

@@ -416,9 +416,11 @@ pub struct GpuWeights {
     /// Quantized linear weights loaded from a GGUF file. Empty when
     /// the backing store is safetensors. Keyed by HF-style tensor
     /// name (e.g. `model.layers.0.self_attn.q_proj.weight`). The
-    /// pointers are owned by `gpu_allocs` for lifetime management;
-    /// `take_quantized_linear` removes the entry without dropping
-    /// the underlying GPU memory.
+    /// underlying GPU bytes are deliberately leaked for the model's
+    /// lifetime; `take_quantized_linear` is non-destructive (returns
+    /// a `GgmlStorage` view, leaves the entry in place) so multiple
+    /// accessors can share the same source weight — see the docstring
+    /// on that method for the workload-fanout case.
     quantized: HashMap<String, crate::ggml_quant::GgmlStorage>,
 
     /// Already-on-GPU dense weights from a GGUF file (norms,
@@ -1071,17 +1073,25 @@ impl GpuWeights {
     // GGUF-specific kernels for dequantizing norms / embeddings). The
     // safetensors construction paths leave these maps empty.
 
-    /// Take a quantized linear weight by HF tensor name. Returns
-    /// `None` when the backing store is safetensors, or when the
-    /// requested tensor was already taken / never existed.
+    /// Get a quantized linear weight by HF tensor name. Returns
+    /// `None` when the backing store is safetensors or the tensor
+    /// is absent.
     ///
-    /// The underlying GPU allocation is owned by `gpu_allocs`, so the
-    /// returned `GgmlStorage` is valid as long as the `GpuWeights` is
-    /// alive. Callers that move the storage into a long-lived layer
-    /// must also retain the `GpuWeights` (or call
-    /// `take_gpu_allocs` to transfer ownership).
+    /// **Non-destructive** — the entry stays in the map so multiple
+    /// consumers can each obtain a `GgmlStorage` view of the same
+    /// GPU buffer. Required because the same source weight (e.g.
+    /// `model.layers.5.self_attn.k_proj.weight`) may be referenced
+    /// by both a singleton accessor (prefill workload's
+    /// `GgmlGemmImpl`) and a fused-QKV accessor (decode workload's
+    /// `GgmlFusedQkvRopeCacheImpl`); the codegen emits both load
+    /// paths and both must succeed. `GgmlStorage` is `Copy` and
+    /// holds no ownership — the underlying GPU bytes are leaked
+    /// for the model's lifetime, matching the existing pattern.
+    ///
+    /// The returned storage is valid as long as the `GpuWeights`
+    /// (or its successor after `take_gpu_allocs`) is alive.
     pub fn take_quantized_linear(&mut self, name: &str) -> Option<crate::ggml_quant::GgmlStorage> {
-        self.quantized.remove(name)
+        self.quantized.get(name).copied()
     }
 
     /// Take a dense (already dequantized) GGUF weight — norms,

@@ -1,5 +1,7 @@
 {
   "quantizations": [
-    "ggml"
+    {"ggml": {
+      "gguf_arch": "command-r"
+    }}
   ]
 }

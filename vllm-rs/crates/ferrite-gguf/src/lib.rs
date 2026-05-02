@@ -402,7 +402,14 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
     // rope_scaling: parse if the GGUF records it, otherwise infer llama3 defaults
     // for Llama-3.x files (unsloth GGUFs omit the scaling keys entirely).
     // Keys follow llama.cpp convention: {arch}.rope.scaling.type and friends.
-    let rope_scaling_type = gguf.get_metadata_string(&format!("{arch}.rope.scaling.type"));
+    // llama.cpp emits `rope.scaling.type = "none"` for archs whose HF
+    // config has no rope_scaling key (CommandR-v01 is the canonical
+    // example). Treat it as no-scaling — leaving it as a populated
+    // `rope_scaling` object would fail the fingerprint check on every
+    // arch whose manifest declares no rope_scaling.
+    let rope_scaling_type = gguf
+        .get_metadata_string(&format!("{arch}.rope.scaling.type"))
+        .filter(|t| *t != "none");
     let has_scaling_keys = rope_scaling_type.is_some()
         || gguf
             .get_metadata_f32(&format!("{arch}.rope.scaling.factor"))

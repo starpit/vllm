@@ -43,17 +43,38 @@ Verified at tp=1: Llama-3.2-1B/3B (unsloth + bartowski), Qwen2.5-0.5B
   `match` arm in `gguf_model_config` / `gguf_to_hf_name` /
   `ferrite-kernels::ggml.rs` deleted in favor of registry lookup +
   declarative data.
+* **CommandR + dual-claim load fix.** Two pieces:
+  (a) `gguf_arch: "command-r"` override on the commandr spec so
+  the GGUF tag (with hyphen) routes to the `commandr` Rust ident.
+  (b) `take_quantized_linear` is now non-destructive and
+  `load_dense_concat_or_ggml` no longer frees per-prefix storages
+  after byte-pack. Required because commandR's interleaved RoPE
+  causes `GgmlFusedQkvRopePrefillImpl` to reject at prefill, so
+  codegen emits BOTH a singleton GgmlGemm accessor (per-prefill q/k/v)
+  AND a fused-QKV accessor (decode); both load paths now succeed.
+  Cost: each per-prefix QKV/gate-up buffer stays alongside its
+  byte-packed twin. Negligible on Llama-1B (~32 MB), bounded by
+  arch size. Plus a `rope.scaling.type = "none"` filter in
+  `gguf_model_config` so commandR's HF-no-scaling fingerprint
+  matches (llama.cpp emits the literal string `"none"`).
 
 ## Open follow-ups
 
 * **Audit other archs end-to-end.** With P2 landed, each arch's
   GGUF support is a small `quantizations.json` edit. Granite +
-  Gemma2 + Gemma3 specs landed; the concrete remaining JSON edits
-  are: Phi3 fused qkv/gate-up (also needs LongRoPE for Phi-3.5/Phi-4
-  variants — out of current arch scope); CommandR (no small GGUF
-  available — 35B+ is the smallest published, deferred); DeepSeek
+  Gemma2 + Gemma3 + CommandR specs landed; the concrete remaining
+  JSON edits are: Phi3 fused qkv/gate-up (also needs LongRoPE for
+  Phi-3.5/Phi-4 variants — out of current arch scope); DeepSeek
   V2/V3 MLA + MoE (V2/V3's bespoke MLA dim derivation isn't
   expressible as pure data and needs follow-up).
+* **CommandR memory-tight on consumer GPUs.** With the load fix
+  landed, IQ1_S commandR-35B now loads cleanly through ferrite-gguf
+  but the per-prefix QKV/gate-up duplication (kept alive for the
+  prefill singleton path) plus 4 GB embedding dequant pushes total
+  weight footprint past a 24 GB L4. Failure mode is now a clean
+  KvCachePool OOM, not a load bug. Refcount-based sharing (instead
+  of "leak per-prefix bytes") would fix this; deferred until a
+  needed arch hits the limit.
 * **TP > 1 untested for GGUF** (task #8). Un-permute respects head
   boundaries by construction (see comment in `ggml.rs`); just needs
   a real run.

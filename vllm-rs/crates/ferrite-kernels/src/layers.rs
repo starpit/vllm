@@ -1019,104 +1019,29 @@ impl LinearLayer {
             }
         }
 
-        let uniform_dtype = storages.iter().all(|s| s.dtype == first.dtype);
-        if !uniform_dtype {
-            // Heterogeneous: keep separate `GgmlLinear`s and let
-            // `LinearLayer::forward` concat their outputs at runtime
-            // via the `GgmlConcat` arm. This is the Q4_K_M case
-            // where q is Q5_0 but v is Q6_K (Qwen) or gate is Q4_K
-            // but up is Q6_K (Llama). Each branch keeps its own
-            // bias, applied inside `GgmlLinear::forward` before the
-            // concat.
-            let branches: Vec<GgmlLinear> = storages
-                .into_iter()
-                .zip(biases)
-                .map(|(s, bias)| GgmlLinear { storage: s, bias })
-                .collect();
-            return Ok(Self::GgmlConcat(branches));
-        }
-
-        // Allocate the packed buffer and copy each storage's bytes
-        // sequentially. Row-major quant layout makes this a plain
-        // [gate.bytes, up.bytes, ...] concat.
-        let total_len: usize = storages.iter().map(|s| s.len).sum();
-        let total_rows: usize = storages.iter().map(|s| s.nrows).sum();
-        let packed_ptr = unsafe { ferrite_cuda_core::driver::mem_alloc(total_len)? };
-
-        let mut offset: usize = 0;
-        for s in &storages {
-            unsafe {
-                ferrite_cuda_core::driver::memcpy_dtod_async(
-                    packed_ptr.add(offset),
-                    s.ptr,
-                    s.len,
-                    stream,
-                )?;
-            }
-            offset += s.len;
-        }
-        unsafe { ferrite_cuda_core::driver::stream_synchronize(stream)? };
-
-        // Free per-prefix storages now that the packed copy owns the bytes.
-        for s in storages {
-            unsafe { ferrite_cuda_core::driver::mem_free(s.ptr).ok() };
-        }
-
-        let packed = crate::ggml::GgmlStorage {
-            ptr: packed_ptr,
-            len: total_len,
-            dtype: first.dtype,
-            nrows: total_rows,
-            ncols: first.ncols,
-        };
-
-        // Homogeneous-quant path with biases: concat the per-branch
-        // biases into one packed [sum(out)] tensor. The bias dtype
-        // must be uniform across branches (Qwen2's q/k/v biases are
-        // all F32 → BF16-cast, so they share dtype). For Llama Q/K
-        // weights are also same-dtype (e.g. all Q4_K) and bias-less,
-        // so this branch only fires for biased models.
-        let bias = if all_bias {
-            let bias_parts: Vec<GpuTensor> = biases.into_iter().map(|b| b.unwrap()).collect();
-            let bdtype = bias_parts[0].dtype();
-            for (i, bt) in bias_parts.iter().enumerate() {
-                if bt.dtype() != bdtype {
-                    anyhow::bail!(
-                        "load_dense_concat_or_ggml: bias dtype mismatch on prefix `{}` \
-                         ({:?} vs {:?}) — homogeneous packed bias requires uniform dtype",
-                        prefixes[i],
-                        bt.dtype(),
-                        bdtype
-                    );
-                }
-            }
-            let bias_total: usize = bias_parts.iter().map(|t| t.dim(0)).sum();
-            let elem = bdtype.size_bytes();
-            let bias_bytes = bias_total * elem;
-            let bdst = unsafe { ferrite_cuda_core::driver::mem_alloc(bias_bytes)? };
-            weights.record_alloc(bdst, bias_bytes);
-            let mut bias_off: usize = 0;
-            for bt in &bias_parts {
-                let n = bt.dim(0);
-                unsafe {
-                    ferrite_cuda_core::driver::memcpy_dtod_async(
-                        (bdst as *mut u8).add(bias_off * elem),
-                        bt.raw_ptr(),
-                        n * elem,
-                        stream,
-                    )?;
-                }
-                bias_off += n;
-            }
-            Some(unsafe { GpuTensor::new(bdst, &[bias_total], bdtype) })
-        } else {
-            None
-        };
-
-        Ok(Self::Ggml(Box::new(GgmlLinear {
-            storage: packed,
-            bias,
-        })))
+        // Always use the per-branch `GgmlConcat` path — never allocate
+        // a byte-packed copy of the source weights.
+        //
+        // The per-prefix `GgmlStorage` values share the underlying
+        // GPU buffers in `GpuWeights.quantized` (`take_quantized_linear`
+        // is non-destructive). Routing the fused load through a
+        // byte-packed copy would duplicate those bytes — fatal at
+        // commandR-35B scale and fundamentally wrong as a "fix" for
+        // any sharing problem. `GgmlConcat::forward` produces the
+        // same packed `[num_tokens, sum(out)]` activation the
+        // downstream `fused_qkv_rope_cache` / `silu_and_mul` kernels
+        // consume; only the activation is materialized, the weights
+        // stay in their original quantized buffers.
+        //
+        // Each branch keeps its own bias (applied inside
+        // `GgmlLinear::forward` before `GgmlConcat::forward` packs the
+        // outputs), matching the heterogeneous-dtype path's contract.
+        let branches: Vec<GgmlLinear> = storages
+            .into_iter()
+            .zip(biases)
+            .map(|(s, bias)| GgmlLinear { storage: s, bias })
+            .collect();
+        Ok(Self::GgmlConcat(branches))
     }
 
     /// Tensor-parallel sharded dense linear load. See

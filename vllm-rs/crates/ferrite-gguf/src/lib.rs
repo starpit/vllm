@@ -150,6 +150,286 @@ pub fn gguf_chat_template(gguf: &GgufFile) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Build a SentencePiece (`model = "llama"`) tokenizer from GGUF
+/// metadata. GGUF ships vocab strings (with `▁` already
+/// substituted for spaces) and per-token f32 scores but no
+/// merges. Mirrors HF's
+/// `transformers/convert_slow_tokenizer.py::generate_merges` step
+/// (the routine `LlamaConverter` / `GemmaConverter` /
+/// `MistralConverter` invoke when materializing a fast
+/// `tokenizer.json` from an SP `tokenizer.model`): for every
+/// compound vocab entry, emit one merge per (left, right) split
+/// where both halves are in the vocab; per-piece merges are
+/// pre-sorted ascending by combined constituent rank, then a
+/// stable global sort orders by `(score, len(left), len(right))`
+/// descending so most-frequent parents merge first. Tokenization
+/// matches `LlamaTokenizerFast` / `MistralTokenizerFast` /
+/// `GemmaTokenizerFast` on the text shapes the models actually
+/// see — verified against the HF reference for "What is the
+/// capital of France?" across Mistral / Gemma2 / Gemma3.
+///
+/// Pre-tokenizer + decoder choice depends on the SP convention the
+/// original tokenizer was trained with — see the dispatch on
+/// `general.architecture` below.
+/// Synthesize BPE merges from a SentencePiece vocab + scores.
+/// Direct port of HF `transformers/convert_slow_tokenizer.py::generate_merges`.
+///
+/// Algorithm (verbatim from the Python):
+///
+/// ```text
+/// for (piece, piece_score) in vocab_iteration_order:
+///     local = []
+///     for split in 1..codepoint_len(piece):
+///         l, r = piece[:split], piece[split:]
+///         if l in vocab and r in vocab:
+///             local.append((l, r, piece_score))
+///     local.sort(key=(vocab[l], vocab[r]))   # asc
+///     merges.extend(local)
+/// merges.sort(key=(score, len(l), len(r)), reverse=True)
+/// ```
+///
+/// Per-piece local list orders constituent pairs by ascending
+/// combined vocab index (most-canonical decomposition first); the
+/// global stable sort puts highest-scoring parents first with
+/// longer constituents leading on ties. Stable sort preserves the
+/// local ordering among parents of equal score.
+pub fn generate_merges(vocab_strings: &[String], scores: &[f32]) -> Vec<(String, String)> {
+    use std::collections::HashMap;
+
+    let token_to_id: HashMap<&str, u32> = vocab_strings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i as u32))
+        .collect();
+
+    let mut all_merges: Vec<(f32, usize, usize, String, String)> = Vec::new();
+    for (idx, piece) in vocab_strings.iter().enumerate() {
+        let piece_score = scores[idx];
+        // `range(1, len(piece))` in Python iterates codepoint positions;
+        // pre-compute byte offsets for each char start so we can slice.
+        let char_byte_starts: Vec<usize> = piece
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(piece.len()))
+            .collect();
+        let mut local: Vec<(u32, u32, &str, &str)> = Vec::new();
+        // Skip index 0 (empty left) and the last entry (empty right).
+        for &split in char_byte_starts
+            .iter()
+            .skip(1)
+            .take(char_byte_starts.len().saturating_sub(2))
+        {
+            let left = &piece[..split];
+            let right = &piece[split..];
+            let (Some(&l_id), Some(&r_id)) = (token_to_id.get(left), token_to_id.get(right)) else {
+                continue;
+            };
+            local.push((l_id, r_id, left, right));
+        }
+        local.sort_by_key(|t| (t.0, t.1));
+        for (_, _, l, r) in local {
+            all_merges.push((
+                piece_score,
+                l.chars().count(),
+                r.chars().count(),
+                l.to_string(),
+                r.to_string(),
+            ));
+        }
+    }
+    all_merges.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.cmp(&a.1))
+            .then(b.2.cmp(&a.2))
+    });
+    all_merges
+        .into_iter()
+        .map(|(_, _, _, l, r)| (l, r))
+        .collect()
+}
+
+fn build_sentencepiece_tokenizer(gguf: &GgufFile) -> ModelResult<tokenizers::Tokenizer> {
+    use tokenizers::AddedToken;
+    use tokenizers::decoders::byte_fallback::ByteFallback;
+    use tokenizers::decoders::fuse::Fuse;
+    use tokenizers::decoders::sequence::Sequence as DecoderSequence;
+    use tokenizers::decoders::strip::Strip as StripDecoder;
+    use tokenizers::models::bpe::BPE;
+    use tokenizers::normalizers::replace::Replace;
+    use tokenizers::pre_tokenizers::metaspace::{Metaspace as MetaspacePre, PrependScheme};
+
+    let tokens_val = gguf
+        .metadata()
+        .get("tokenizer.ggml.tokens")
+        .ok_or_else(|| ModelError::Other("GGUF missing tokenizer.ggml.tokens".into()))?;
+    let tokens = tokens_val
+        .to_vec()
+        .map_err(|e| ModelError::Other(format!("tokenizer.ggml.tokens: {e}")))?;
+    let scores_val = gguf
+        .metadata()
+        .get("tokenizer.ggml.scores")
+        .ok_or_else(|| ModelError::Other("GGUF missing tokenizer.ggml.scores".into()))?;
+    let scores_raw = scores_val
+        .to_vec()
+        .map_err(|e| ModelError::Other(format!("tokenizer.ggml.scores: {e}")))?;
+    if scores_raw.len() != tokens.len() {
+        return Err(ModelError::Other(format!(
+            "tokenizer.ggml.scores ({}) and tokens ({}) have mismatched lengths",
+            scores_raw.len(),
+            tokens.len()
+        )));
+    }
+    let mut vocab_strings: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut scores_f32: Vec<f32> = Vec::with_capacity(tokens.len());
+    for (idx, (tok, score)) in tokens.iter().zip(scores_raw.iter()).enumerate() {
+        let s = tok
+            .to_string()
+            .map_err(|e| ModelError::Other(format!("tokenizer.ggml.tokens[{idx}]: {e}")))?;
+        let v = score
+            .to_f32()
+            .map_err(|e| ModelError::Other(format!("tokenizer.ggml.scores[{idx}]: {e}")))?;
+        vocab_strings.push(s.clone());
+        scores_f32.push(v);
+    }
+
+    // Byte-fallback flag: presence of any BYTE-typed (token_type=6)
+    // token in the vocab means the tokenizer encodes unknown bytes
+    // via the `<0xNN>` byte tokens rather than the `unk` token. All
+    // SP checkpoints we care about (Llama-2 / Mistral / Gemma) ship
+    // these.
+    let _byte_fallback = gguf
+        .metadata()
+        .get("tokenizer.ggml.token_type")
+        .and_then(|v| v.to_vec().ok())
+        .map(|types| {
+            types.iter().any(|t| {
+                t.to_u32()
+                    .map(|x| x == 6)
+                    .or_else(|_| t.to_i32().map(|x| x == 6))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    let merges = generate_merges(&vocab_strings, &scores_f32);
+
+    let vocab_map: tokenizers::models::bpe::Vocab = vocab_strings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u32))
+        .collect();
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab_map, merges)
+        .build()
+        .map_err(|e| ModelError::Other(format!("SentencePiece-BPE build failed: {e}")))?;
+    let mut tokenizer = tokenizers::Tokenizer::new(bpe);
+
+    // Pre-tokenizer / decoder choice depends on the SP convention
+    // the original tokenizer was trained with. The canonical
+    // signal is `tokenizer.ggml.add_space_prefix` — llama.cpp's
+    // direct mirror of SentencePiece's `add_dummy_prefix`
+    // training option:
+    //
+    //   * `add_space_prefix = false` (Gemma family): NO metaspace
+    //     prepend. HF fast tokenizer uses a Replace normalizer
+    //     (`" " → "▁"`) and lets leading-no-space pieces stay
+    //     un-prefixed; the decoder is `Replace + ByteFallback +
+    //     Fuse` with no trailing Strip.
+    //
+    //   * `add_space_prefix = true` OR ABSENT (Llama-2 / Mistral /
+    //     Phi-3 / etc.): Metaspace pre-tokenizer with
+    //     `prepend_scheme = First` so a leading-no-space input
+    //     like "What is..." tokenizes as `▁What ▁is ...`
+    //     (matching the training-time tokenization). Decoder ends
+    //     with `Strip(' ', start=1, stop=0)` to remove the
+    //     synthesized prefix space at output.
+    //
+    // Earlier versions branched on `general.architecture`
+    // (`gemma*`); that's strictly less reliable than the explicit
+    // metadata field which every llama.cpp-converted SP GGUF
+    // ships when relevant. Default to prepend (the SP default)
+    // when the field is absent.
+    let prepend_metaspace = gguf
+        .metadata()
+        .get("tokenizer.ggml.add_space_prefix")
+        .and_then(|v| v.to_bool().ok())
+        .unwrap_or(true);
+    if !prepend_metaspace {
+        let normalizer: tokenizers::NormalizerWrapper = Replace::new(" ", "▁")
+            .map_err(|e| ModelError::Other(format!("Replace normalizer: {e}")))?
+            .into();
+        tokenizer.with_normalizer(Some(normalizer));
+        let dec_replace: tokenizers::DecoderWrapper = Replace::new("▁", " ")
+            .map_err(|e| ModelError::Other(format!("Replace decoder: {e}")))?
+            .into();
+        let dec_byte_fallback: tokenizers::DecoderWrapper = ByteFallback::new().into();
+        let dec_fuse: tokenizers::DecoderWrapper = Fuse::new().into();
+        let dec_seq: tokenizers::DecoderWrapper =
+            DecoderSequence::new(vec![dec_replace, dec_byte_fallback, dec_fuse]).into();
+        tokenizer.with_decoder(Some(dec_seq));
+    } else {
+        let pre: tokenizers::PreTokenizerWrapper =
+            MetaspacePre::new('▁', PrependScheme::First, false).into();
+        tokenizer.with_pre_tokenizer(Some(pre));
+        let dec_replace: tokenizers::DecoderWrapper = Replace::new("▁", " ")
+            .map_err(|e| ModelError::Other(format!("Replace decoder: {e}")))?
+            .into();
+        let dec_byte_fallback: tokenizers::DecoderWrapper = ByteFallback::new().into();
+        let dec_fuse: tokenizers::DecoderWrapper = Fuse::new().into();
+        let dec_strip: tokenizers::DecoderWrapper = StripDecoder::new(' ', 1, 0).into();
+        let dec_seq: tokenizers::DecoderWrapper =
+            DecoderSequence::new(vec![dec_replace, dec_byte_fallback, dec_fuse, dec_strip]).into();
+        tokenizer.with_decoder(Some(dec_seq));
+    }
+
+    // Special tokens. Same logic as the BPE path: register CONTROL
+    // (token_type=3) and USER_DEFINED (token_type=4) tokens as
+    // special-added so the chat template's literal `<|start_header|>`-
+    // style markers tokenize atomically; plus the explicit-id BOS /
+    // EOS / UNK / PAD entries from metadata.
+    let mut added: Vec<AddedToken> = Vec::new();
+    if let Some(types_val) = gguf.metadata().get("tokenizer.ggml.token_type")
+        && let Ok(types) = types_val.to_vec()
+    {
+        for (idx, t) in types.iter().enumerate() {
+            let kind = t
+                .to_u32()
+                .map(|x| x as i64)
+                .or_else(|_| t.to_i32().map(|x| x as i64))
+                .unwrap_or(1);
+            if (kind == 3 || kind == 4)
+                && let Some(token_val) = tokens.get(idx)
+                && let Ok(s) = token_val.to_string()
+            {
+                added.push(AddedToken::from(s.clone(), true));
+            }
+        }
+    }
+    let token_str_for_id = |id: u32| -> Option<String> {
+        let s = tokens.get(id as usize)?.to_string().ok()?.clone();
+        Some(s)
+    };
+    for key in [
+        "tokenizer.ggml.bos_token_id",
+        "tokenizer.ggml.eos_token_id",
+        "tokenizer.ggml.pad_token_id",
+        "tokenizer.ggml.unknown_token_id",
+        "tokenizer.ggml.padding_token_id",
+    ] {
+        if let Some(id) = gguf.get_metadata_u32(key)
+            && let Some(content) = token_str_for_id(id)
+        {
+            added.push(AddedToken::from(content, true));
+        }
+    }
+    if !added.is_empty() {
+        tokenizer.add_special_tokens(&added);
+    }
+
+    Ok(tokenizer)
+}
+
 /// Build a `tokenizers::Tokenizer` from GGUF metadata. Handles the
 /// `gpt2` BPE family (Llama-3, Mistral-3-style models that use
 /// `pre = "llama-bpe"` etc.) — vocab from
@@ -174,13 +454,18 @@ pub fn gguf_tokenizer(gguf: &GgufFile) -> ModelResult<Option<tokenizers::Tokeniz
         return Ok(None);
     };
     // Llama-3 / Mistral-3 / Qwen-2/3 / etc. all use `model = "gpt2"`
-    // (byte-level BPE). `model = "llama"` is the older
-    // SentencePiece-BPE used by Llama-2; structurally similar but
-    // not byte-level — left as a follow-up.
+    // (byte-level BPE). `model = "llama"` is the SentencePiece tokenizer
+    // shared by Llama-2 / Mistral / Gemma / etc. — vocab + per-token
+    // scores + optional byte-fallback. Reconstructed via the
+    // `tokenizers::Unigram` model below.
+    if model == "llama" {
+        return build_sentencepiece_tokenizer(gguf).map(Some);
+    }
     if model != "gpt2" {
         tracing::info!(
             "gguf_tokenizer: unsupported tokenizer model `{model}` (only `gpt2` BPE \
-             is reconstructable today); caller should fall back to tokenizer.json"
+             and `llama` SentencePiece are reconstructable today); caller should \
+             fall back to tokenizer.json"
         );
         return Ok(None);
     }
@@ -1075,5 +1360,194 @@ mod tests {
         let found = detect_mmproj_gguf(&main);
         assert!(found.is_some());
         assert_eq!(found.unwrap(), mmproj);
+    }
+
+    /// Synthetic-vocab unit test for `generate_merges`. Mirrors the
+    /// shape of the reference Python algorithm (vocab dict iteration
+    /// order = vocab order) so the assertion is exact, not "looks
+    /// right". The vocab encodes a mini SentencePiece corpus where
+    /// `▁the` decomposes via two valid splits and the algorithm has
+    /// to keep BOTH plus pre-sort the per-piece local list by
+    /// constituent rank.
+    #[test]
+    fn generate_merges_matches_hf_reference() {
+        // Vocab order matches HF iteration order: byte-level chars
+        // and unk first, then progressively longer multi-char pieces.
+        let vocab: Vec<String> = vec![
+            "<unk>".into(), // 0
+            "▁".into(),     // 1
+            "t".into(),     // 2
+            "h".into(),     // 3
+            "e".into(),     // 4
+            "i".into(),     // 5
+            "s".into(),     // 6
+            "th".into(),    // 7  → ('t','h')
+            "is".into(),    // 8  → ('i','s')
+            "▁t".into(),    // 9  → ('▁','t')
+            "▁i".into(),    // 10 → ('▁','i')
+            "he".into(),    // 11 → ('h','e')
+            "the".into(),   // 12 → ('th','e') | ('t','he')
+            "▁is".into(),   // 13 → ('▁','is') | ('▁i','s')
+            "▁the".into(), // 14 → ('▁','the') | ('▁t','he') | ('▁th','e') ; only ('▁','the') and ('▁t','he') exist as both-in-vocab
+        ];
+        // Score = -id approximates SP convention (more frequent = higher score).
+        let scores: Vec<f32> = (0..vocab.len()).map(|i| -(i as f32)).collect();
+
+        let merges = generate_merges(&vocab, &scores);
+
+        // Every emitted merge must reconstruct a token in the vocab.
+        let token_set: std::collections::HashSet<&str> = vocab.iter().map(|s| s.as_str()).collect();
+        for (l, r) in &merges {
+            let combined = format!("{l}{r}");
+            assert!(
+                token_set.contains(combined.as_str()),
+                "merge ({l:?}, {r:?}) → {combined:?} is not a vocab entry"
+            );
+        }
+
+        // Every compound vocab entry must have at least one merge
+        // that produces it (otherwise BPE can't tokenize it).
+        let merge_set: std::collections::HashSet<String> =
+            merges.iter().map(|(l, r)| format!("{l}{r}")).collect();
+        for (i, tok) in vocab.iter().enumerate() {
+            if tok.chars().count() >= 2 && tok != "<unk>" {
+                assert!(
+                    merge_set.contains(tok),
+                    "compound token #{i} {tok:?} has no producing merge"
+                );
+            }
+        }
+
+        // Sort order: outer sort is `(score, len_l, len_r)` DESC.
+        // Highest-score parent is the first vocab entry that's
+        // compound — `th` (id 7, score -7). Its single-decomposition
+        // merge `('t','h')` MUST appear before any merge produced by
+        // a lower-score (higher-id) parent.
+        let th_pos = merges
+            .iter()
+            .position(|(l, r)| l == "t" && r == "h")
+            .expect("('t','h') merge missing");
+        // `▁the` is the lowest-score (highest-id) compound; its
+        // merges should land at or near the end of the file.
+        let last_the_merge = merges
+            .iter()
+            .rposition(|(l, r)| {
+                let combined = format!("{l}{r}");
+                combined == "▁the"
+            })
+            .expect("merge producing `▁the` missing");
+        assert!(
+            th_pos < last_the_merge,
+            "lowest-level merge ('t','h') at {th_pos} should precede ▁the merge at {last_the_merge}"
+        );
+
+        // `▁the` has TWO valid decompositions in this vocab —
+        // `('▁','the')` and `('▁t','he')`. Both must be emitted so
+        // the BPE cascade can produce `▁the` regardless of which
+        // intermediate forms first.
+        let prods: Vec<&(String, String)> = merges
+            .iter()
+            .filter(|(l, r)| format!("{l}{r}") == "▁the")
+            .collect();
+        assert_eq!(
+            prods.len(),
+            2,
+            "expected 2 merges producing `▁the`, got {prods:?}"
+        );
+    }
+
+    /// Integration test against real GGUFs in the local HF cache.
+    /// Asserts that `gguf_tokenizer` produces the SAME ids as the HF
+    /// reference for a fixed prompt across every supported tokenizer
+    /// shape: BPE (`gpt2`-style — Llama-3, Qwen) and SentencePiece
+    /// (`llama`-style — Mistral, Gemma2, Gemma3). Reference ids are
+    /// hard-coded from `transformers.AutoTokenizer.encode(prompt,
+    /// add_special_tokens=False)` for each model.
+    ///
+    /// `#[ignore]` because it depends on the local HF cache; run
+    /// manually with `cargo test -p ferrite-gguf -- --ignored`.
+    #[test]
+    #[ignore]
+    fn gguf_tokenizer_matches_hf_reference() {
+        let prompt = "What is the capital of France?";
+        let home = std::env::var("HOME").unwrap();
+
+        // (label, gguf-path-suffix-under-HF-cache, expected-ids).
+        // Reference ids come from
+        // `transformers.AutoTokenizer.from_pretrained(<repo>).encode(prompt, add_special_tokens=False)`
+        // run against the matching HF safetensors repo.
+        let cases: &[(&str, &str, &[u32])] = &[
+            // BPE (`tokenizer.ggml.model = "gpt2"`).
+            (
+                "Llama-3.2-1B (BPE, llama-bpe pre)",
+                "models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/b69aef112e9f895e6f98d7ae0949f72ff09aa401/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+                &[3923, 374, 279, 6864, 315, 9822, 30],
+            ),
+            (
+                "Llama-3.2-3B (BPE, llama-bpe pre)",
+                "models--unsloth--Llama-3.2-3B-Instruct-GGUF/snapshots/e7d0997e49c9cb00d88b4c1a6a16aa894b0bbc31/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+                &[3923, 374, 279, 6864, 315, 9822, 30],
+            ),
+            (
+                "Qwen2.5-0.5B (BPE, qwen2 pre)",
+                "models--bartowski--Qwen2.5-0.5B-Instruct-GGUF/snapshots/41ba88dbac95fed2528c92514c131d73eb5a174b/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+                &[3838, 374, 279, 6722, 315, 9625, 30],
+            ),
+            (
+                "Qwen3-0.6B (BPE, qwen2 pre)",
+                "models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf",
+                &[3838, 374, 279, 6722, 315, 9625, 30],
+            ),
+            (
+                "Granite-3.1-2B (BPE, refact pre)",
+                "models--bartowski--granite-3.1-2b-instruct-GGUF/snapshots/e47b8b46c04cede00f9e19d5a846551b14b2efce/granite-3.1-2b-instruct-Q4_K_M.gguf",
+                &[8197, 438, 322, 18926, 432, 45600, 49],
+            ),
+            // SentencePiece with Metaspace-prepend (`tokenizer.ggml.model = "llama"`,
+            // non-Gemma arch).
+            (
+                "Mistral-7B-v0.3 (SP, Metaspace prepend)",
+                "models--bartowski--Mistral-7B-Instruct-v0.3-GGUF/snapshots/61fd4167fff3ab01ee1cfe0da183fa27a944db48/Mistral-7B-Instruct-v0.3-IQ2_S.gguf",
+                &[2592, 1117, 1040, 6333, 1070, 5611, 29572],
+            ),
+            (
+                "Phi-3.5-mini (SP, Metaspace prepend)",
+                "models--bartowski--Phi-3.5-mini-instruct-GGUF/snapshots/6d70da17e749a471ccb62ade694486011a75cda3/Phi-3.5-mini-instruct-Q4_K_M.gguf",
+                &[1724, 338, 278, 7483, 310, 3444, 29973],
+            ),
+            // SentencePiece without prepend (`tokenizer.ggml.model = "llama"`,
+            // gemma* arch).
+            (
+                "Gemma-2-2B (SP, Replace-only)",
+                "models--bartowski--gemma-2-2b-it-GGUF/snapshots/855f67caed130e1befc571b52bd181be2e858883/gemma-2-2b-it-Q4_K_M.gguf",
+                &[1841, 603, 573, 6037, 576, 6081, 235336],
+            ),
+            (
+                "Gemma-3-1B (SP, Replace-only)",
+                "models--unsloth--gemma-3-1b-it-GGUF/snapshots/f0b45be0aac41bd6a100a4b5734cad5f67255bfb/gemma-3-1b-it-Q4_K_M.gguf",
+                &[3689, 563, 506, 5279, 529, 7001, 236881],
+            ),
+        ];
+
+        let mut ran = 0;
+        for (label, suffix, expected) in cases {
+            let path = format!("{home}/.cache/huggingface/hub/{suffix}");
+            if !std::path::Path::new(&path).exists() {
+                eprintln!("[skip] {label}: {path} not found");
+                continue;
+            }
+            let gguf = GgufFile::open(&path).expect("open gguf");
+            let tok = gguf_tokenizer(&gguf)
+                .expect("build tokenizer")
+                .expect("tokenizer present");
+            let enc = tok.encode(prompt, true).expect("encode");
+            let got: Vec<u32> = enc.get_ids().to_vec();
+            assert_eq!(&got, expected, "ids for {label} ({path})");
+            ran += 1;
+        }
+        assert!(
+            ran > 0,
+            "no GGUFs found in HF cache — populate at least one of the test fixtures"
+        );
     }
 }

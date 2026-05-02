@@ -61,18 +61,6 @@ struct ForwardArgs {
     /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
     /// small prefill.
     sk_buckets: Vec<u64>,
-    /// Additional HF arch tags this arch is willing to claim, beyond
-    /// the union of model `architectures` lists. Used so GGUF-coalesced
-    /// arch tags route here too: a GGUF with
-    /// `general.architecture = "llama"` translates to
-    /// `LlamaForCausalLM`, but the file may actually be Mistral. Mistral
-    /// declares `extra_hf_arches = ["LlamaForCausalLM"]` so the
-    /// dispatcher tries it after Llama's fingerprints reject. The
-    /// dispatcher's per-registration walk is fingerprint-gated, so a
-    /// safetensors Llama checkpoint is never mis-routed to Mistral —
-    /// Mistral's per-model `fingerprint_matches` rejects on vocab /
-    /// hidden / etc.
-    extra_hf_arches: Vec<String>,
     /// Span used for error reporting when a required arg is
     /// missing.
     span: Span,
@@ -83,7 +71,6 @@ impl Parse for ForwardArgs {
         let span = input.span();
         let mut workloads: Option<Vec<u64>> = None;
         let mut sk_buckets: Option<Vec<u64>> = None;
-        let mut extra_hf_arches: Option<Vec<String>> = None;
 
         fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
             let list;
@@ -99,20 +86,6 @@ impl Parse for ForwardArgs {
             Ok(pts)
         }
 
-        fn parse_str_list(input: ParseStream) -> syn::Result<Vec<String>> {
-            let list;
-            syn::bracketed!(list in input);
-            let mut items = Vec::new();
-            while !list.is_empty() {
-                let s: syn::LitStr = list.parse()?;
-                items.push(s.value());
-                if !list.is_empty() {
-                    list.parse::<Token![,]>()?;
-                }
-            }
-            Ok(items)
-        }
-
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -120,7 +93,6 @@ impl Parse for ForwardArgs {
             match key.to_string().as_str() {
                 "workloads" => workloads = Some(parse_u64_list(input)?),
                 "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
-                "extra_hf_arches" => extra_hf_arches = Some(parse_str_list(input)?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -149,7 +121,6 @@ impl Parse for ForwardArgs {
         Ok(Self {
             workloads,
             sk_buckets,
-            extra_hf_arches: extra_hf_arches.unwrap_or_default(),
             span,
         })
     }
@@ -937,17 +908,17 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     }
 
     // Union of HF `architectures: [..]` strings across every compiled
-    // model — the set of `arch_hint` values `ferrite_forward::try_load`
-    // will route to this arch. Plus any `extra_hf_arches = [..]`
-    // declared on the `#[forward]` attribute (used so GGUF-coalesced
-    // arch tags route here too — e.g. Mistral declares
-    // `LlamaForCausalLM` because GGUFs report
-    // `general.architecture = "llama"` for the Mistral family).
-    // Deduped + sorted for determinism.
+    // model — the set of safetensors `arch_hint` values
+    // `ferrite_forward::try_load` will route to this arch. Deduped +
+    // sorted for determinism.
+    //
+    // GGUF dispatch is on a SEPARATE field (`gguf_archs` below).
+    // GGUFs report family-level tags (`"deepseek2"` covers V2 + V3-LoRA +
+    // V3-flat; `"llama"` covers Llama + Mistral); the dispatcher tries
+    // every claimant of that tag and `fingerprint_matches` discriminates.
     let mut hf_arches: Vec<String> = models
         .iter()
         .flat_map(|m| m.architectures.iter().cloned())
-        .chain(args.extra_hf_arches.iter().cloned())
         .collect();
     hf_arches.sort();
     hf_arches.dedup();
@@ -1181,6 +1152,32 @@ fn emit_arch_dispatcher(
         .map(|s| proc_macro2::Literal::string(s))
         .collect();
 
+    // GGUF spec (per-arch). Loaded once: drives both
+    // (a) the `gguf_archs` field of `FerriteArchRegistration` (every arch
+    //     with a `"ggml"` entry claims its gguf tag for dispatch), and
+    // (b) the optional `ferrite_gguf::register!` emission below (only
+    //     the canonical owner per gguf_arch tag — `register_spec=false`
+    //     opts out for non-canonical claimants like Mistral or
+    //     deepseek-v3-flat).
+    let gguf_spec = config::load_gguf_spec(models_dir).map_err(|e| {
+        syn::Error::new(
+            error_span,
+            format!(
+                "quantizations.json gguf spec in {}: {e}",
+                models_dir.display()
+            ),
+        )
+    })?;
+    let gguf_arch_lits: Vec<proc_macro2::Literal> = match &gguf_spec {
+        Some(spec) => vec![proc_macro2::Literal::string(
+            spec.gguf_arch
+                .clone()
+                .unwrap_or_else(|| arch_ident.to_string())
+                .as_str(),
+        )],
+        None => vec![],
+    };
+
     // Per-variant `(stem, dump_fn)` rows for the backbone-dump
     // registry. Each variant's `mod <model_ident>` emits a
     // `pub fn dump() -> Vec<BucketDump>`; here we name them so a
@@ -1219,6 +1216,7 @@ fn emit_arch_dispatcher(
                     ::ferrite_forward::FerriteArchRegistration {
                         arch_name: #arch_name_lit,
                         hf_arches: &[#(#hf_arch_lits),*],
+                        gguf_archs: &[#(#gguf_arch_lits),*],
                         tp_world_size: #tp_lit,
                         try_load: |gw, stream, max_model_len, tp_rank, hf| {
                             Weights::load(
@@ -1234,30 +1232,20 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    // GGUF auto-registration. Driven entirely by `quantizations.json`:
-    // an arch opts in by listing `"ggml"` (string or
-    // `{"ggml": {<fields>}}` object form). Every per-arch knob —
-    // qk_permute, gguf_arch override, tensor_renames,
-    // metadata reads, defaults, the Llama-3 rope-scale heuristic —
-    // is carried as static data through `ferrite_gguf::register!`.
-    let gguf_spec = config::load_gguf_spec(models_dir).map_err(|e| {
-        syn::Error::new(
-            error_span,
-            format!(
-                "quantizations.json gguf spec in {}: {e}",
-                models_dir.display()
-            ),
-        )
-    })?;
-    let gguf_register_emit: proc_macro2::TokenStream = match (gguf_spec, hf_arches.first()) {
-        // No `ggml` entry, or no HF arch declared (FERRITE_MODELS-
-        // filtered build with empty configs/) — emit nothing.
-        (None, _) | (_, None) => quote! {},
-        (Some(spec), Some(hf_first)) => {
+    // GGUF spec registration. Conditional on (a) the arch having a
+    // `"ggml"` entry in `quantizations.json` AND (b) `register_spec`
+    // being true (default). Non-canonical owners of a gguf tag set
+    // `register_spec: false` so only one crate per gguf_arch supplies
+    // the inventory-side spec data — find_spec stays deterministic.
+    // The arch is still routed for that tag via the `gguf_archs`
+    // field of its `FerriteArchRegistration` above.
+    let gguf_register_emit: proc_macro2::TokenStream = match gguf_spec {
+        None => quote! {},
+        Some(ref spec) if !spec.register_spec => quote! {},
+        Some(spec) => {
             let gguf_arch_lit = proc_macro2::Literal::string(
                 &spec.gguf_arch.unwrap_or_else(|| arch_ident.to_string()),
             );
-            let hf_arch_class_lit = proc_macro2::Literal::string(hf_first);
             let qk = spec.qk_permute;
             let rope = spec.llama3_rope_scaling_inference;
             let nwo = proc_macro2::Literal::f32_suffixed(spec.norm_weight_offset);
@@ -1310,7 +1298,6 @@ fn emit_arch_dispatcher(
                 #[cfg(feature = "cuda")]
                 ::ferrite_gguf::register! {
                     gguf_arch = #gguf_arch_lit,
-                    hf_arch_class = #hf_arch_class_lit,
                     qk_permute = #qk,
                     tensor_renames = [ #(#renames),* ],
                     metadata_u32 = [ #(#m_u32),* ],

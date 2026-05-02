@@ -333,6 +333,18 @@ mod dispatcher {
         /// Harvested by the macro from the union of every compiled
         /// model's `config.json` `architectures: [..]` field.
         pub hf_arches: &'static [&'static str],
+        /// GGUF `general.architecture` tags this arch claims to handle.
+        /// Family-level — multiple forward arches can claim the same
+        /// gguf tag (`"deepseek2"` covers V2, V3-LoRA, V3-flat;
+        /// `"llama"` covers Llama and Mistral). The dispatcher tries
+        /// each claimant in turn and the per-variant
+        /// `fingerprint_matches` discriminates by bounds.
+        ///
+        /// Populated by the macro from the arch's `quantizations.json`
+        /// `ggml.gguf_arch` field (defaults to `arch_name` when the
+        /// entry is bare). Empty for arches without a `"ggml"`
+        /// quantization preset.
+        pub gguf_archs: &'static [&'static str],
         /// Compile-time tensor-parallel world size this registration
         /// covers. The macro emits one `FerriteArchRegistration` per
         /// `(arch, tp_world_size)` tuple — at task #7's outer-loop
@@ -392,7 +404,10 @@ mod dispatcher {
         // `Option<Result<W>>` so `find_map` treats `Ok(None)` as
         // "keep looking" and any other shape as a hit.
         inventory::iter::<FerriteArchRegistration>()
-            .filter(|reg| reg.hf_arches.contains(&arch_hint) && reg.tp_world_size == tp_world_size)
+            .filter(|reg| {
+                (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
+                    && reg.tp_world_size == tp_world_size
+            })
             .find_map(|reg| (reg.try_load)(gw, stream, max_model_len, tp_rank, hf).transpose())
             .transpose()
     }

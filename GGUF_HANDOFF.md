@@ -71,6 +71,7 @@ arch bug).
   Ok(None); Mistral declares `extra_hf_arches = ["LlamaForCausalLM"]`
   so Mistral GGUFs (which report `general.architecture = "llama"`)
   route through the Llama spec then land on Mistral's fingerprint.
+  *Superseded* — see "GGUF dispatch via gguf_archs" below.
 * **P1: GGUF format relocation** (`71869363e`) — `GgufFile`,
   `gguf_format`, tokenizer, chat-template, the (transitional)
   god-switches all moved out of `vllm-model` into the new
@@ -97,6 +98,25 @@ arch bug).
   arch size. Plus a `rope.scaling.type = "none"` filter in
   `gguf_model_config` so commandR's HF-no-scaling fingerprint
   matches (llama.cpp emits the literal string `"none"`).
+* **GGUF dispatch via `gguf_archs`.** GGUF tags are family-level
+  (`"deepseek2"` covers V2 / V3-LoRA / V3-flat; `"llama"` covers Llama
+  + Mistral); the previous `extra_hf_arches` hack had each non-canonical
+  crate manually claim the canonical owner's HF class string so dispatch
+  fanned out. New design: `FerriteArchRegistration` gains a
+  `gguf_archs: &[&str]` field, `try_load` filters by
+  `(hf_arches ∪ gguf_archs).contains(arch_hint)`, and `gguf_model_config`
+  stamps the GGUF tag itself (`"deepseek2"`) into `architectures[0]`
+  instead of an HF class string. Per-crate `quantizations.json` now
+  carries an explicit `gguf_arch` (used both for the registration's
+  `gguf_archs` and — when this crate is the canonical owner — for
+  `ferrite_gguf::register!`). Non-canonical claimants set
+  `register_spec: false` so a single deterministic spec covers each
+  gguf_arch (find_spec collisions gone). `extra_hf_arches` removed
+  from the `#[forward]` macro entirely; Mistral / V3 / V3-flat opt in
+  via `register_spec: false`. Verified Llama + Mistral GGUFs still
+  coherent post-refactor; DeepSeek-V2-Lite + Moonlight GGUFs now
+  fingerprint-match correctly via the new path (V2 forward catches
+  V2-Lite, V3-flat forward catches Moonlight).
 * **Gemma `norm_weight_offset` (rmsnorm garbage-output bug).**
   llama.cpp's converter pre-bakes `+1` into every Gemma rmsnorm
   weight (incl. QK and final norms) so a vanilla `rmsnorm(x, w)`
@@ -137,43 +157,35 @@ arch bug).
   split MLP. (b) The LongRoPE `rope_scaling_hash` doesn't match.
   Triage: print which variant `Weights::load` returns at runtime,
   and add a `phi-3.5-mini-128k.json` config with longrope scaling.
-* **DeepSeek V2 / V3 GGUF.** Three-piece job, not the "bespoke MLA
-  dim derivation" the original handoff implied. MLA dims fingerprint-
-  match cleanly through the existing JSON-baked variants
-  (`deepseek-v2-lite`, `deepseek-v3-tiny`, …); the code-side work
-  is elsewhere:
-  1. **Add `quantizations.json` to both crates.** Today neither
-     ferrite-model-deepseek-v2 nor -v3 has one, so the macro emits
-     no `register!` and `find_spec("deepseek2")` fails. Pure data:
-     `{"ggml": {"gguf_arch": "deepseek2"}}` plus any `metadata_u32`
-     reads we want to surface (`{arch}.attention.kv_lora_rank`,
-     `{arch}.attention.q_lora_rank`, etc.). The MLA tensor renames
-     (`attn_q_a / q_b / kv_a_mqa / kv_b / kv_a_norm`) and MoE
-     renames (`ffn_gate_inp`, `ffn_*_exps`, `ffn_*_shexp`,
-     `exp_probs_b.bias`) are already in `default_gguf_to_hf_name`
-     — no overrides needed.
-  2. **Yarn `rope_scaling` reconstruction.** Code, ~15 lines.
-     `gguf_model_config` currently builds `extra["rope_scaling"]`
-     with `factor` + `original_max_position_embeddings` and
-     special-cases `llama3` for its low/high-freq factors. Yarn
-     needs the parallel treatment: read `{arch}.rope.scaling.{
-     beta_fast, beta_slow, mscale, mscale_all_dim}` and stamp
-     them into the same nested object. Without this, the
-     compile-baked `rope_scaling_hash` for V2/V3 won't match the
-     runtime config and the fingerprint dispatcher rejects.
-     Declarative `metadata_f32` writes flat into `extra`, not
-     into nested objects, so this stays in code.
-  3. **MoE fused-3D expert tensor loader audit.** GGUF stores
-     experts as a single 3D `ffn_*_exps.weight` (shape
-     `[num_experts, n, k]`). Default rename emits
-     `mlp.experts.fused_*`. Need to confirm the DeepSeek-V3
-     forward arch's MoE loader consumes that fused storage
-     directly — `ggml_moe_forward` (`ferrite-kernels/src/ggml.rs`)
-     already has `launch_indexed_moe_forward_q*_q8_1` per-quant
-     paths so the kernel side is likely fine; the question is
-     whether the load-time path produces the storage shape
-     those kernels expect. Empirical: drop in the spec, run, see
-     where it errors.
+* **DeepSeek V2 / V3 GGUF — MoE loader is the only remaining blocker.**
+  Steps 1 (quantizations.json on all three deepseek crates) and 2
+  (yarn rope_scaling reconstruction in `gguf_model_config`) landed
+  with the `gguf_archs` dispatch refactor (see Phases above).
+  V2-Lite Q4_K_M and Moonlight-16B-A3B-Instruct Q4_K_M both
+  download cleanly, both fingerprint-match the right forward arch
+  (V2 catches V2-Lite; V3-flat catches Moonlight), both fail at the
+  same point: `DeepSeekV2MoELayer::load` asks for
+  `model.layers.{N}.mlp.experts.{e}.gate_proj.weight` per expert,
+  which is the safetensors layout. GGUF ships fused 3D
+  `mlp.experts.fused_{gate,up,down}_exps.weight`. The hand-written
+  `vllm-cuda::deepseek_v2::load_gguf` (lines 1620–1707) is the
+  reference: takes the three fused tensors, interleaves gate+up
+  into a `[num_experts, 2*inter, hidden]` quantized w1, uses the
+  fused down as w2, builds a `GgmlFusedMoELayer`. Need either
+  (a) a separate `DeepSeekV2GgmlMoELayer` accessor type + Impl
+  variant that the codegen picks when expert storage is `Ggml`, or
+  (b) `DeepSeekV2MoELayer.moe` becomes an enum (`Bf16(FusedMoELayer)
+  | Ggml(GgmlFusedMoELayer)`) and `load` branches on storage. Same
+  for `shared_gate_up` / `shared_down` (currently dense `Linear`).
+  (a) is more invasive (DP solver + Impl library + codegen) but
+  cleaner; (b) is contained but couples bf16/quant in one type.
+  Reproducer:
+  ```
+  ./vllm-rs/target/release/vllm chat \
+    --model ~/.cache/huggingface/hub/models--mradermacher--DeepSeek-V2-Lite-GGUF/snapshots/0f37fdf276e8094747457f0ae4d40f2e8d2521f9/DeepSeek-V2-Lite.Q4_K_M.gguf \
+    --max-tokens 5 --temperature 0 --prompt "Hi"
+  # Errors: weight not found: model.layers.1.mlp.experts.0.gate_proj.weight
+  ```
 
   Q-path coverage in the project (`v3-flat` is in this worktree's
   workspace post-rebase):
@@ -183,23 +195,9 @@ arch bug).
   | flat (no LoRA) | `ferrite-model-deepseek-v2`  ✓  | `ferrite-model-deepseek-v3-flat` ✓ (Moonlight, Kimi K2 family) |
   | LoRA (q_a/q_b) | (DeepSeek-V2 non-Lite — n/a)    | `ferrite-model-deepseek-v3`  ✓          |
 
-  Suggested order of attack:
-  1. Land step 1 (quantizations.json) on all three deepseek crates.
-     Try a tiny fixture — `bzantium/tiny-deepseek-v3` ships
-     safetensors only (no GGUF) so for end-to-end you need a
-     real GGUF. Smallest known: `unsloth/DeepSeek-V2-Lite-GGUF`
-     `Q4_K_M` (~10 GB, fits L4); for V3-flat use
-     `unsloth/Moonlight-16B-A3B-Instruct-GGUF` (BF16 16 GB or
-     Q4_K_M ~9 GB, fits L4).
-  2. Run the smoke-test command above against the GGUF. Expected
-     failure mode if step 2 (yarn rope_scaling) isn't done:
-     fingerprint dispatch rejects (`hf.rope_scaling_hash` mismatch).
-     Add the yarn case in `crates/ferrite-gguf/src/lib.rs::
-     gguf_model_config` next to the existing llama3 special case.
-  3. If load proceeds and ggml_moe_forward fires, MoE storage
-     shape is fine. If it errors at the experts-load step, audit
-     `ferrite-kernels::layers` MoE loader vs. the rename's
-     `mlp.experts.fused_*` target.
+  Test fixtures cached:
+  - `mradermacher/DeepSeek-V2-Lite-GGUF` `Q4_K_M` (~10 GB) — V2 path
+  - `mmnga/Moonlight-16B-A3B-Instruct-gguf` `Q4_K_M` (~10.5 GB) — V3-flat path
 * **CommandR forward correctness on a bigger GPU.** Reproducer:
   ```
   ./vllm-rs/target/release/vllm chat \
@@ -229,13 +227,25 @@ arch bug).
   TP-side bug — most likely shard-aware un-permute in the
   `qk_permuted` path of `ferrite-kernels/src/ggml.rs::
   load_gguf_into_weights`.
-* **Integration test.** Tokenization is locked down by
-  `cargo test -p ferrite-gguf -- --include-ignored` —
-  `gguf_tokenizer_matches_hf_reference` covers Llama-3.2-1B/3B,
-  Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B, Mistral-7B-v0.3,
-  Phi-3.5-mini, Gemma-2-2B, Gemma-3-1B against HF reference ids.
-  Forward-pass / inference-coherence integration tests still
-  unwritten (would need a GPU CI runner).
+* **Integration tests.**
+  - **Tokenization** — `gguf_tokenizer_matches_hf_reference` covers
+    Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B,
+    Mistral-7B-v0.3, Phi-3.5-mini, Gemma-2-2B, Gemma-3-1B against
+    HF reference ids.
+  - **End-to-end inference** — `gguf_inference_smoke` shells out
+    to the built `vllm` binary and asserts greedy "Paris" coherent
+    on Llama-3.2-1B + Mistral-7B-v0.3 GGUFs. Locks down the load +
+    dispatch + forward pipeline; needs a built binary + GPU. Run:
+    ```
+    cargo build --manifest-path vllm-rs/Cargo.toml -p vllm-cli \
+        --features cuda --release
+    cargo test --manifest-path vllm-rs/Cargo.toml -p ferrite-gguf \
+        --release -- --ignored gguf_inference_smoke
+    ```
+    DeepSeek-V2-Lite + Moonlight fixtures intentionally omitted
+    until the fused-3D MoE expert loader lands (handoff step 3) —
+    adding them today would assert "Paris" against an error msg
+    and flap.
 
 ## Where to look first
 

@@ -33,10 +33,6 @@ pub enum GgufDefault {
 pub struct GgufArchSpec {
     /// GGUF `general.architecture` value this spec handles.
     pub gguf_arch: &'static str,
-    /// HF arch class to stamp on `HfModelConfig.architectures`. Must
-    /// match (literally) some forward arch's `hf_arches` so the
-    /// dispatcher can route.
-    pub hf_arch_class: &'static str,
     /// Whether to un-permute q/k rows on load (Llama-derived archs).
     pub qk_permute: bool,
     /// Per-suffix tensor-name overrides. Each `(gguf_suffix, hf_suffix)`
@@ -149,8 +145,7 @@ pub fn apply_metadata(spec: &GgufArchSpec, gguf: &crate::GgufFile, config: &mut 
 #[macro_export]
 macro_rules! register {
     (
-        gguf_arch = $gguf:literal,
-        hf_arch_class = $hf:literal
+        gguf_arch = $gguf:literal
         $(, qk_permute = $perm:literal)?
         $(, tensor_renames = [ $(($tg:literal, $th:literal)),* $(,)? ])?
         $(, metadata_u32 = [ $(($mu_g:literal, $mu_e:literal)),* $(,)? ])?
@@ -164,7 +159,6 @@ macro_rules! register {
         $crate::inventory::submit! {
             $crate::GgufArchSpec {
                 gguf_arch: $gguf,
-                hf_arch_class: $hf,
                 qk_permute: $crate::register!(@bool false $($perm)?),
                 tensor_renames: &[ $($( ($tg, $th) ),*)? ],
                 metadata_u32: &[ $($( ($mu_g, $mu_e) ),*)? ],

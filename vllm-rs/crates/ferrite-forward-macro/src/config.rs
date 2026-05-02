@@ -454,7 +454,7 @@ fn read_json_file(path: &Path) -> Result<(String, serde_json::Value), ConfigErro
 /// Populated only when the arch's quantizations list contains a `"ggml"`
 /// entry (string or object form). Forwarded into the
 /// `ferrite_gguf::register!` call the macro emits.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GgufSpec {
     /// GGUF `general.architecture` override. Defaults to the `arch`
     /// ident on the `#[forward]` block; set explicitly when the arch
@@ -480,6 +480,31 @@ pub struct GgufSpec {
     /// shape so the runtime kernel's `(w + offset)` fold isn't
     /// double-applied. Default 0.0.
     pub norm_weight_offset: f32,
+    /// Whether this arch is the canonical owner of the gguf tag —
+    /// the only crate that emits the inventory `ferrite_gguf::register!`
+    /// call. Default `true`. Set `false` on non-canonical claimants
+    /// (e.g. Mistral for `"llama"`, deepseek-v3-flat for `"deepseek2"`)
+    /// so a single deterministic spec covers each gguf_arch. The arch
+    /// still gets a `-ggml` overlay variant + `gguf_archs` entry in
+    /// its `FerriteArchRegistration` so the dispatcher tries it.
+    pub register_spec: bool,
+}
+
+impl Default for GgufSpec {
+    fn default() -> Self {
+        Self {
+            gguf_arch: None,
+            qk_permute: false,
+            llama3_rope_scaling_inference: false,
+            tensor_renames: Vec::new(),
+            metadata_u32: Vec::new(),
+            metadata_f32: Vec::new(),
+            metadata_defaults_u32: Vec::new(),
+            metadata_defaults_f32: Vec::new(),
+            norm_weight_offset: 0.0,
+            register_spec: true,
+        }
+    }
 }
 
 /// Read the arch's `quantizations.json` and return its GGUF spec —
@@ -555,6 +580,9 @@ pub fn load_gguf_spec(dir: &Path) -> Result<Option<GgufSpec>, ConfigError> {
     }
     if let Some(v) = obj.get("norm_weight_offset").and_then(|v| v.as_f64()) {
         spec.norm_weight_offset = v as f32;
+    }
+    if let Some(v) = obj.get("register_spec").and_then(|v| v.as_bool()) {
+        spec.register_spec = v;
     }
     if let Some(v) = obj.get("tensor_renames") {
         let map = v.as_object().ok_or_else(bad)?;

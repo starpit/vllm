@@ -2,6 +2,9 @@
   "quantizations": [
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor",
-    "ggml"
+    {"ggml": {
+      "gguf_arch": "llama",
+      "register_spec": false
+    }}
   ]
 }

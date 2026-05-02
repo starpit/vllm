@@ -33,12 +33,6 @@ use ferrite_forward::forward;
 #[forward(
     workloads = [1, 8, 64, 512, 4096],
     sk_buckets = [128, 512, 2048, 8192],
-    // GGUFs flatten Mistral checkpoints to `general.architecture = "llama"`,
-    // which the gguf→HF translator maps to `LlamaForCausalLM`. Claim that
-    // tag too so the dispatcher tries Mistral's per-model fingerprints
-    // after Llama's reject. Safetensors Mistral checkpoints still report
-    // `MistralForCausalLM` and route here directly.
-    extra_hf_arches = ["LlamaForCausalLM"],
 )]
 fn mistral() {
     hidden_states = embed(input_ids, embed_tokens);

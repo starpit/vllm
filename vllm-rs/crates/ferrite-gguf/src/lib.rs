@@ -626,11 +626,14 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         .ok_or_else(|| ModelError::Other("GGUF missing general.architecture metadata".to_string()))?
         .to_string();
 
-    // Per-arch spec: declared by the matching ferrite-model-X via
+    // Per-arch spec: declared by the canonical owner crate via
     // `configs/quantizations.json` `ggml` entry (the macro forwards
     // each field into a `register!` call). The spec carries
-    // hf_arch_class, qk_permute, tensor renames, and metadata reads
-    // — every per-arch knob lives in the JSON, not here.
+    // qk_permute, tensor renames, and metadata reads — every per-arch
+    // knob lives in the JSON, not here. Non-canonical claimants of
+    // the same gguf_arch (e.g. Mistral for `"llama"`) opt out of
+    // registration via `"register_spec": false` so a single spec
+    // covers the family deterministically.
     let spec = find_spec(&arch).ok_or_else(|| {
         ModelError::Other(format!(
             "no GGUF arch registered for `general.architecture = \"{arch}\"`. \
@@ -640,9 +643,18 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         ))
     })?;
 
+    // The arch hint stamped into `architectures` is the GGUF tag
+    // itself (`"deepseek2"`, `"llama"`, …), not an HF class string.
+    // Forward arches advertise their gguf-tag claims via
+    // `FerriteArchRegistration::gguf_archs`; cuda_worker hands the
+    // first `architectures` entry to `try_load`, which filters by
+    // (`hf_arches` ∪ `gguf_archs`). Stamping the gguf tag means a
+    // single tag like `"deepseek2"` fans out to every claiming forward
+    // (V2 / V3-LoRA / V3-flat) without each having to declare HF
+    // class aliases.
     let mut config = HfModelConfig {
         model_type: Some(arch.clone()),
-        architectures: vec![spec.hf_arch_class.to_string()],
+        architectures: vec![arch.clone()],
         ..Default::default()
     };
 
@@ -705,8 +717,20 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
             .get_metadata_f32(&format!("{arch}.rope.scaling.factor"))
             .unwrap_or(1.0) as f64;
         let mut scaling = serde_json::Map::new();
+        // The HF key spelling for the rope-type discriminator is not
+        // standardized: Llama-3 / Mistral / Phi-3 configs use
+        // `rope_type`, DeepSeek-V2 / V3 (yarn) configs use `type`. The
+        // safetensors `rope_scaling_hash` is computed from the literal
+        // JSON object, so the runtime stamp must use the spelling
+        // that arch's checkpoints use — otherwise fingerprint
+        // dispatch rejects on hash mismatch.
+        let type_key = if rope_type == "yarn" {
+            "type"
+        } else {
+            "rope_type"
+        };
         scaling.insert(
-            "rope_type".to_string(),
+            type_key.to_string(),
             serde_json::Value::String(rope_type.clone()),
         );
         scaling.insert("factor".to_string(), serde_json::Value::from(factor));
@@ -733,6 +757,23 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
                     "high_freq_factor".to_string(),
                     serde_json::Value::from(hi as f64),
                 );
+            }
+        }
+        // Yarn (DeepSeek V2 / V3) — read the four extra knobs that
+        // discriminate yarn checkpoints. llama.cpp's GGUF converter
+        // emits each as a top-level f32 under `{arch}.rope.scaling.*`;
+        // the safetensors HF config carries them in the same nested
+        // `rope_scaling` object hashed at compile time.
+        if rope_type == "yarn" {
+            for (gguf_key, hf_key) in [
+                ("beta_fast", "beta_fast"),
+                ("beta_slow", "beta_slow"),
+                ("mscale", "mscale"),
+                ("mscale_all_dim", "mscale_all_dim"),
+            ] {
+                if let Some(v) = gguf.get_metadata_f32(&format!("{arch}.rope.scaling.{gguf_key}")) {
+                    scaling.insert(hf_key.to_string(), serde_json::Value::from(v as f64));
+                }
             }
         }
         config.extra.insert(
@@ -1548,6 +1589,128 @@ mod tests {
         assert!(
             ran > 0,
             "no GGUFs found in HF cache — populate at least one of the test fixtures"
+        );
+    }
+
+    /// E2E inference smoke. Shells out to a built `vllm` binary,
+    /// runs greedy "Paris" against each cached GGUF, asserts the
+    /// expected substring lands in stdout. Locks down the GGUF load
+    /// + dispatch + forward pipeline end-to-end on real fixtures.
+    ///
+    /// Skips fixtures that aren't in the local HF cache, and the
+    /// whole test if `vllm` isn't built. Set `VLLM_BIN=...` to point
+    /// at a non-default binary path; default is the workspace's
+    /// `target/release/vllm`.
+    ///
+    /// `#[ignore]` because it depends on the local HF cache + a
+    /// built CUDA binary + a GPU. Run manually:
+    ///
+    /// ```text
+    /// cargo build --manifest-path vllm-rs/Cargo.toml -p vllm-cli \
+    ///     --features cuda --release
+    /// cargo test --manifest-path vllm-rs/Cargo.toml -p ferrite-gguf \
+    ///     --release -- --ignored gguf_inference_smoke
+    /// ```
+    ///
+    /// **Coverage gaps marked here, not skipped silently**:
+    /// V2-Lite + Moonlight (DeepSeek family GGUFs) are listed but
+    /// known-broken at `DeepSeekV2MoELayer::load` — the per-expert
+    /// safetensors-shaped weight names don't exist in GGUF land
+    /// (fused 3D `mlp.experts.fused_*_exps.weight`). Add them back
+    /// once the GGUF MoE loader audit (handoff step 3) lands.
+    #[test]
+    #[ignore]
+    fn gguf_inference_smoke() {
+        let prompt = "What is the capital of France?";
+        let expected = "Paris";
+        let home = std::env::var("HOME").expect("HOME");
+
+        // CARGO_MANIFEST_DIR points at vllm-rs/crates/ferrite-gguf;
+        // workspace target lives two up at vllm-rs/target.
+        let bin = std::env::var("VLLM_BIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .expect("crate dir has two ancestors")
+                    .join("target/release/vllm")
+            });
+        if !bin.exists() {
+            eprintln!(
+                "[skip] vllm binary not built at {} — \
+                 run `cargo build --manifest-path vllm-rs/Cargo.toml \
+                 -p vllm-cli --features cuda --release` first",
+                bin.display()
+            );
+            return;
+        }
+
+        // (label, gguf-path-suffix-under-HF-cache).
+        let cases: &[(&str, &str)] = &[
+            (
+                "Llama-3.2-1B (BPE)",
+                "models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/b69aef112e9f895e6f98d7ae0949f72ff09aa401/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+            ),
+            (
+                "Mistral-7B-v0.3 (SP)",
+                "models--bartowski--Mistral-7B-Instruct-v0.3-GGUF/snapshots/61fd4167fff3ab01ee1cfe0da183fa27a944db48/Mistral-7B-Instruct-v0.3-IQ2_S.gguf",
+            ),
+            // DeepSeek-V2 / V3 family GGUFs land here once the
+            // fused-3D MoE expert loader exists. Today the dispatch
+            // is correct (V2 + V3-flat fingerprint-match their
+            // checkpoints via `gguf_archs` routing) but
+            // `DeepSeekV2MoELayer::load` asks for safetensors-shaped
+            // per-expert names that GGUF doesn't ship. Adding the
+            // fixtures here without the loader fix would assert
+            // "Paris" against an error message and flap.
+        ];
+
+        let mut ran = 0;
+        for (label, suffix) in cases {
+            let path = format!("{home}/.cache/huggingface/hub/{suffix}");
+            if !std::path::Path::new(&path).exists() {
+                eprintln!("[skip] {label}: {path} not found");
+                continue;
+            }
+            // `timeout 120` — wraps `vllm chat`. Coherent output
+            // exits cleanly; garbage loops forever (per
+            // `feedback_no_run_chat`). 120s is plenty for both
+            // small models on L4.
+            let output = std::process::Command::new("timeout")
+                .args([
+                    "120",
+                    bin.to_str().expect("vllm bin path is utf-8"),
+                    "chat",
+                    "--model",
+                    &path,
+                    "--max-tokens",
+                    "30",
+                    "--temperature",
+                    "0",
+                    "--prompt",
+                    prompt,
+                ])
+                .output()
+                .unwrap_or_else(|e| panic!("spawn `timeout vllm chat`: {e}"));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Greedy "Paris" check — appears in `vllm chat`'s
+            // generated text on stdout. Falls back to combined
+            // stdout+stderr in case future versions change which
+            // stream the chat output goes to.
+            let combined = format!("{stdout}\n{stderr}");
+            assert!(
+                combined.contains(expected),
+                "{label}: expected `{expected}` in vllm output\n\
+                 stdout:\n{stdout}\n\
+                 stderr:\n{stderr}"
+            );
+            ran += 1;
+        }
+        assert!(
+            ran > 0,
+            "no GGUF inference fixtures found — populate at least one"
         );
     }
 }

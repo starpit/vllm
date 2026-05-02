@@ -1260,6 +1260,7 @@ fn emit_arch_dispatcher(
             let hf_arch_class_lit = proc_macro2::Literal::string(hf_first);
             let qk = spec.qk_permute;
             let rope = spec.llama3_rope_scaling_inference;
+            let nwo = proc_macro2::Literal::f32_suffixed(spec.norm_weight_offset);
             let renames: Vec<proc_macro2::TokenStream> = spec
                 .tensor_renames
                 .iter()
@@ -1317,6 +1318,7 @@ fn emit_arch_dispatcher(
                     metadata_defaults_u32 = [ #(#d_u32),* ],
                     metadata_defaults_f32 = [ #(#d_f32),* ],
                     llama3_rope_scaling_inference = #rope,
+                    norm_weight_offset = #nwo,
                 }
             }
         }

@@ -3,6 +3,7 @@
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor",
     {"ggml": {
+      "norm_weight_offset": 1.0,
       "tensor_renames": {
         "ffn_norm.weight": "pre_feedforward_layernorm.weight",
         "post_attention_norm.weight": "post_attention_layernorm.weight",

@@ -474,6 +474,12 @@ pub struct GgufSpec {
     /// variant).
     pub metadata_defaults_u32: Vec<(String, u32)>,
     pub metadata_defaults_f32: Vec<(String, f32)>,
+    /// Subtracted from every rmsnorm weight at GGUF load time. Lets
+    /// archs (Gemma2/3) whose llama.cpp converter pre-bakes a
+    /// constant into the stored weight recover the canonical "raw w"
+    /// shape so the runtime kernel's `(w + offset)` fold isn't
+    /// double-applied. Default 0.0.
+    pub norm_weight_offset: f32,
 }
 
 /// Read the arch's `quantizations.json` and return its GGUF spec —
@@ -546,6 +552,9 @@ pub fn load_gguf_spec(dir: &Path) -> Result<Option<GgufSpec>, ConfigError> {
         .and_then(|v| v.as_bool())
     {
         spec.llama3_rope_scaling_inference = v;
+    }
+    if let Some(v) = obj.get("norm_weight_offset").and_then(|v| v.as_f64()) {
+        spec.norm_weight_offset = v as f32;
     }
     if let Some(v) = obj.get("tensor_renames") {
         let map = v.as_object().ok_or_else(bad)?;

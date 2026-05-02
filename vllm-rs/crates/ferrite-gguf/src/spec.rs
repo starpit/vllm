@@ -57,6 +57,16 @@ pub struct GgufArchSpec {
     /// `rope_theta == 500000` and `max_position_embeddings > 8192`,
     /// `gguf_model_config` stamps the canonical llama3 scaling block.
     pub llama3_rope_scaling_inference: bool,
+    /// Constant value baked into every rmsnorm weight by llama.cpp's
+    /// GGUF converter. Subtracted at load time to recover the raw
+    /// safetensors `w` so the runtime kernel's `(w + offset)` fold
+    /// produces the right `(1+w_orig)`. Gemma2 / Gemma3 ship norms as
+    /// `1+w` (the converter pre-adds 1 so vanilla `rmsnorm(x, w)`
+    /// matches HF's `rmsnorm(x, 1+w)`); ferrite's DSL still uses
+    /// `weight + 1.0`, so without this subtraction we'd double-apply
+    /// the offset and double-scale every norm output. Default `0.0`
+    /// for archs whose GGUF stores raw `w` (everything except Gemma).
+    pub norm_weight_offset: f32,
 }
 
 inventory::collect!(GgufArchSpec);
@@ -148,6 +158,7 @@ macro_rules! register {
         $(, metadata_defaults_u32 = [ $(($mdu_k:literal, $mdu_v:literal)),* $(,)? ])?
         $(, metadata_defaults_f32 = [ $(($mdf_k:literal, $mdf_v:literal)),* $(,)? ])?
         $(, llama3_rope_scaling_inference = $rope:literal)?
+        $(, norm_weight_offset = $nwo:literal)?
         $(,)?
     ) => {
         $crate::inventory::submit! {
@@ -164,9 +175,13 @@ macro_rules! register {
                 ],
                 llama3_rope_scaling_inference:
                     $crate::register!(@bool false $($rope)?),
+                norm_weight_offset:
+                    $crate::register!(@f32 0.0 $($nwo)?),
             }
         }
     };
     (@bool $default:literal) => { $default };
     (@bool $_default:literal $v:literal) => { $v };
+    (@f32 $default:literal) => { $default };
+    (@f32 $_default:literal $v:literal) => { $v };
 }

@@ -1,8 +1,8 @@
 # Ferrite GGUF integration — handoff
 
-Branch: `worktree-ff-gguf`. Tip: `d4519563d` (rebased onto
-`ff-interpreter` 2026-05-02; `ferrite-model-deepseek-v3-flat`
-landed in the workspace via the rebase).
+Branch: `worktree-ff-gguf`. Tip: see `git log -1`. Last big landing:
+the Gemma `norm_weight_offset` fix (rmsnorm garbage-output bug, see
+"Phases landed" below). Rebased onto `ff-interpreter` 2026-05-02.
 
 ## Hit the ground running
 
@@ -45,13 +45,20 @@ field as static data into a `ferrite_gguf::register!{...}` block.
 There are NO arch-keyed god-switches anywhere; no GGUF code in
 `vllm-model`; no GGUF code in any model crate's `lib.rs`.
 
-Verified at tp=1: Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B,
-Granite-3.1-2B, Mistral-7B-Instruct-v0.3, Gemma-2-2B,
-Gemma-3-1B — tokenization round-trips against `LlamaTokenizerFast` /
-`MistralTokenizerFast` / `GemmaTokenizerFast` on the standard
-prompt. The SentencePiece path (`tokenizer.ggml.model = "llama"`)
-synthesizes BPE merges from vocab+scores via a direct port of HF's
-`generate_merges` — see `build_sentencepiece_tokenizer`.
+**Inference-coherent at tp=1** (greedy "Paris" smoke through `vllm
+chat`): Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B,
+Mistral-7B-Instruct-v0.3, **Gemma-2-2B**, **Gemma-3-1B**.
+
+**Tokenizer-only verified** (CPU round-trip, NO inference run):
+Phi-3.5-mini. The SentencePiece path (`tokenizer.ggml.model =
+"llama"`) synthesizes BPE merges from vocab+scores via a direct port
+of HF's `generate_merges` — see `build_sentencepiece_tokenizer`.
+
+**Known broken / out of scope here:** Phi-3.5-mini inference (loader
+asks for `mlp.gate_proj.weight` while the Phi3 spec renames to fused
+`gate_up_proj` — LongRoPE follow-up); CommandR-35B (decodes only PAD
+on L4, needs >40 GB GPU to disambiguate IQ1_S quality cliff vs real
+arch bug).
 
 ## Phases landed
 
@@ -90,6 +97,21 @@ synthesizes BPE merges from vocab+scores via a direct port of HF's
   arch size. Plus a `rope.scaling.type = "none"` filter in
   `gguf_model_config` so commandR's HF-no-scaling fingerprint
   matches (llama.cpp emits the literal string `"none"`).
+* **Gemma `norm_weight_offset` (rmsnorm garbage-output bug).**
+  llama.cpp's converter pre-bakes `+1` into every Gemma rmsnorm
+  weight (incl. QK and final norms) so a vanilla `rmsnorm(x, w)`
+  matches HF's `(1+w)*x`. Ferrite's DSL writes `rmsnorm(x, weight +
+  1.0)` and `ScalarOffsetRmsNormImpl` adds `+1` at kernel time —
+  resulting in `(2+w_orig)*x` and ~2× scaled activations every
+  norm. Pre-fix output: `"1.1.1.4. in tartalomajánló…"` /
+  `"ia theks. on and கீض sweep…"`. Symmetric across Gemma2 + Gemma3,
+  reproduces under `FERRITE_USE_REFERENCE=1` (so not a quant kernel
+  bug). Fix: declarative `norm_weight_offset: f32` field on
+  `GgufArchSpec` (default 0.0), plumbed through `quantizations.json`
+  → macro → register; subtracted from each F32 norm element in the
+  GGUF F32→model-dtype load path so canonical raw `w` lands on GPU.
+  Set to `1.0` for Gemma2 + Gemma3 specs. Verified coherent post-fix
+  on both fixtures.
 
 ## Open follow-ups
 
@@ -97,7 +119,24 @@ synthesizes BPE merges from vocab+scores via a direct port of HF's
   GGUF support is a small `quantizations.json` edit. Granite +
   Gemma2 + Gemma3 + CommandR + Phi3 specs landed (Phi3 covers
   Phi-3-mini-4k; Phi-3.5/Phi-4 LongRoPE variants need separate
-  follow-up).
+  follow-up — see Phi-3.5-mini bullet below).
+* **Phi-3.5-mini GGUF load error.** Reproducer:
+  ```
+  ./vllm-rs/target/release/vllm chat \
+    --model ~/.cache/huggingface/hub/models--bartowski--Phi-3.5-mini-instruct-GGUF/snapshots/6d70da17e749a471ccb62ade694486011a75cda3/Phi-3.5-mini-instruct-Q4_K_M.gguf \
+    --max-tokens 5 --prompt "Hi"
+  ```
+  Today: `weight not found: model.layers.0.mlp.gate_proj.weight`.
+  The Phi3 spec renames `ffn_up.weight → mlp.gate_up_proj.weight`
+  (fused) and the Phi3 forward DSL expects fused gate_up_proj — but
+  fingerprint dispatch is landing on a non-Phi3 variant whose loader
+  asks for split `mlp.gate_proj`. Two suspects:
+  (a) Phi-3.5-mini's LongRoPE config differs from any compiled
+  Phi3 variant (Phi3 only has `phi3-mini-4k`-style entries today),
+  so dispatch falls through to a Llama-shaped variant that wants
+  split MLP. (b) The LongRoPE `rope_scaling_hash` doesn't match.
+  Triage: print which variant `Weights::load` returns at runtime,
+  and add a `phi-3.5-mini-128k.json` config with longrope scaling.
 * **DeepSeek V2 / V3 GGUF.** Three-piece job, not the "bespoke MLA
   dim derivation" the original handoff implied. MLA dims fingerprint-
   match cleanly through the existing JSON-baked variants
@@ -201,11 +240,24 @@ synthesizes BPE merges from vocab+scores via a direct port of HF's
 ## Where to look first
 
 1. `crates/ferrite-gguf/src/spec.rs` — `GgufArchSpec` data shape
-   and the `register!` macro.
+   and the `register!` macro. Includes `norm_weight_offset`.
 2. `crates/ferrite-forward-macro/src/config.rs::load_gguf_spec` —
    the JSON parser the macro feeds from.
-3. `crates/ferrite-model-llama/configs/quantizations.json` —
-   reference structured ggml entry (`qk_permute`,
-   `llama3_rope_scaling_inference`).
-4. `crates/ferrite-gguf/src/spec.rs::apply_metadata` — the runtime
+3. `crates/ferrite-model-gemma3/configs/quantizations.json` —
+   reference for `norm_weight_offset` + `tensor_renames`.
+4. `crates/ferrite-model-llama/configs/quantizations.json` —
+   reference for `qk_permute` + `llama3_rope_scaling_inference`.
+5. `crates/ferrite-gguf/src/spec.rs::apply_metadata` — the runtime
    side that consumes the declarative metadata reads.
+6. `crates/ferrite-kernels/src/ggml.rs::load_gguf_into_weights` —
+   GGUF load path; `norm_baked_offset` lookup + subtraction lives
+   in the F32 → model-dtype norm-weight branch.
+
+## Reproducing the smoke sweep
+
+`/tmp/gguf_smoke.sh` is the script run at handoff: 9 cached fixtures
+(Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B,
+Mistral-7B-v0.3, Gemma-2-2B, Gemma-3-1B + Phi-3.5-mini known-broken,
+CommandR known-broken-on-L4). Each runs greedy "Paris" with a 90 s
+(180 s for CommandR) timeout. Per-fixture log at
+`/tmp/smoke_<name>.log`.

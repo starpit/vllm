@@ -1400,6 +1400,14 @@ impl GgufGpuWeights {
         });
 
         let gguf_arch_str = qk_arch.as_deref().unwrap_or("");
+        // Per-arch baked offset on rmsnorm weights (Gemma2/3 store `1+w`
+        // so a vanilla `rmsnorm(x, w)` matches HF's `rmsnorm(x, 1+w)`).
+        // Subtracted from each F32 norm element below so the loaded
+        // weight is canonical raw `w`; ferrite's runtime kernel then
+        // applies its own `(w + offset)` exactly once.
+        let norm_baked_offset: f32 = ferrite_gguf::find_spec(gguf_arch_str)
+            .map(|s| s.norm_weight_offset)
+            .unwrap_or(0.0);
         for (gguf_name, info) in &content.tensor_infos {
             let hf_name = ferrite_gguf::gguf_to_hf_name(gguf_name, gguf_arch_str);
             // `gguf_format` already reverses the on-disk ggml dim
@@ -1634,6 +1642,10 @@ impl GgufGpuWeights {
                                 std::slice::from_raw_parts(host_buf as *const f32, elem_count);
                             let out_size = elem_count * target_dtype.size_bytes();
                             let conv_buf = ferrite_cuda_core::driver::mem_alloc_host(out_size)?;
+                            // Subtract per-arch baked offset only on rmsnorm
+                            // weights (the QK-norm pair included). Embeddings
+                            // / lm_head pass through unchanged.
+                            let bake_off = if is_norm { norm_baked_offset } else { 0.0 };
                             match target_dtype {
                                 DType::BF16 => {
                                     let out = std::slice::from_raw_parts_mut(
@@ -1641,7 +1653,7 @@ impl GgufGpuWeights {
                                         elem_count,
                                     );
                                     for (i, &v) in f32_slice.iter().enumerate() {
-                                        out[i] = half::bf16::from_f32(v).to_bits();
+                                        out[i] = half::bf16::from_f32(v - bake_off).to_bits();
                                     }
                                 }
                                 DType::F16 => {
@@ -1650,7 +1662,7 @@ impl GgufGpuWeights {
                                         elem_count,
                                     );
                                     for (i, &v) in f32_slice.iter().enumerate() {
-                                        out[i] = half::f16::from_f32(v).to_bits();
+                                        out[i] = half::f16::from_f32(v - bake_off).to_bits();
                                     }
                                 }
                                 _ => panic!(

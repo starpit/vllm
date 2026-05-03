@@ -15558,6 +15558,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "FlashInfer is disabled fleet-wide pending a fix for the \
+                persistent-kernel CUDA_ERROR_ILLEGAL_ADDRESS hit at tp>1 \
+                with num_kv_heads=1 (see starter_library() for details). \
+                Re-enable this test when the FI registration loop in \
+                impl_lib.rs is uncommented."]
     fn starter_library_registers_twelve_flashinfer_variants() {
         // Six tuples in `FLASHINFER_CONFIG_SET` × {Decode, Prefill} Impls.
         // If this count drifts, either the config set or the registration

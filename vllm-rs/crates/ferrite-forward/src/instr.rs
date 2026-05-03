@@ -2102,44 +2102,85 @@ impl<W: CanonicalParams> Instruction<W> {
                         )
                     };
                     let cos_sin = (cos_sin_fn)(ctx.wm, layer);
-                    if interleaved {
-                        kernels::fused_qkv_interleaved_rope(
-                            *qkv_packed,
-                            *ctx.fwd.positions,
-                            cos_sin,
-                            W::Q_SIZE,
-                            W::KV_SIZE,
-                            W::NUM_Q_HEADS as usize,
-                            W::NUM_KV_HEADS as usize,
-                            W::HEAD_DIM as usize,
-                            &mut ctx.device.caching,
-                            ctx.device.compute_stream,
-                        )
+                    // Fused rope + cache scatter for the BF16/F16 prefill path
+                    // (one kernel instead of fused_qkv_rope + reshape_and_cache).
+                    // FP8 cache still falls through to the unfused path because
+                    // the fused kernel doesn't quantize.
+                    if !ctx.fwd.kv_cache.is_fp8() {
+                        let k_cache = *ctx.fwd.kv_cache.k_cache(layer as usize);
+                        let v_cache = *ctx.fwd.kv_cache.v_cache(layer as usize);
+                        if interleaved {
+                            kernels::fused_qkv_interleaved_rope_cache_prefill(
+                                *qkv_packed,
+                                *ctx.fwd.positions,
+                                cos_sin,
+                                *ctx.fwd.slot_mapping,
+                                k_cache,
+                                v_cache,
+                                W::Q_SIZE,
+                                W::KV_SIZE,
+                                W::NUM_Q_HEADS as usize,
+                                W::NUM_KV_HEADS as usize,
+                                W::HEAD_DIM as usize,
+                                &mut ctx.device.caching,
+                                ctx.device.compute_stream,
+                            )
+                        } else {
+                            kernels::fused_qkv_rope_cache_prefill(
+                                *qkv_packed,
+                                *ctx.fwd.positions,
+                                cos_sin,
+                                *ctx.fwd.slot_mapping,
+                                k_cache,
+                                v_cache,
+                                W::Q_SIZE,
+                                W::KV_SIZE,
+                                W::NUM_Q_HEADS as usize,
+                                W::NUM_KV_HEADS as usize,
+                                W::HEAD_DIM as usize,
+                                &mut ctx.device.caching,
+                                ctx.device.compute_stream,
+                            )
+                        }
                     } else {
-                        kernels::fused_qkv_rope(
-                            *qkv_packed,
-                            *ctx.fwd.positions,
-                            cos_sin,
-                            W::Q_SIZE,
-                            W::KV_SIZE,
-                            W::NUM_Q_HEADS as usize,
-                            W::NUM_KV_HEADS as usize,
-                            W::HEAD_DIM as usize,
-                            &mut ctx.device.caching,
+                        let (q, k, v) = if interleaved {
+                            kernels::fused_qkv_interleaved_rope(
+                                *qkv_packed,
+                                *ctx.fwd.positions,
+                                cos_sin,
+                                W::Q_SIZE,
+                                W::KV_SIZE,
+                                W::NUM_Q_HEADS as usize,
+                                W::NUM_KV_HEADS as usize,
+                                W::HEAD_DIM as usize,
+                                &mut ctx.device.caching,
+                                ctx.device.compute_stream,
+                            )
+                        } else {
+                            kernels::fused_qkv_rope(
+                                *qkv_packed,
+                                *ctx.fwd.positions,
+                                cos_sin,
+                                W::Q_SIZE,
+                                W::KV_SIZE,
+                                W::NUM_Q_HEADS as usize,
+                                W::NUM_KV_HEADS as usize,
+                                W::HEAD_DIM as usize,
+                                &mut ctx.device.caching,
+                                ctx.device.compute_stream,
+                            )
+                        };
+                        ah::write_kv_cache(
+                            k.view(),
+                            v.view(),
+                            ctx.fwd.slot_mapping,
+                            ctx.fwd.kv_cache,
+                            layer as usize,
                             ctx.device.compute_stream,
-                        )
+                        );
+                        (q, k, v)
                     }
                 };
-                unsafe {
-                    ah::write_kv_cache(
-                        k_tensor.view(),
-                        v_out.view(),
-                        ctx.fwd.slot_mapping,
-                        ctx.fwd.kv_cache,
-                        layer as usize,
-                        ctx.device.compute_stream,
-                    );
-                }
                 ctx.tiles[q_out_slot as usize] = Some(TileEntry::Owned(q));
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k_tensor));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));

@@ -1208,22 +1208,90 @@ impl GpuWeights {
     /// any `Weights::load` field read). No-op when the packed tensor
     /// isn't present — returns `Ok(false)` so non-packed checkpoints
     /// (Llama, Mistral, …) fall through unharmed.
+    ///
+    /// Two backing maps are checked: dense `tensors` (safetensors mmap
+    /// refs) and quantized `quantized` (GGUF `GgmlStorage` on GPU).
+    /// GGUF checkpoints (Phi-3, etc.) ship the fused parent in the
+    /// quantized map; the row-split there carves the existing GPU
+    /// buffer into N children that share the same allocation — no
+    /// memory doubling, no extra H2D, no dequant.
     pub fn synthesize_packed_row_split_sizes(
         &mut self,
         packed_prefix: &str,
         split_targets: &[(&str, usize)],
     ) -> Result<bool> {
         let packed_weight_name = format!("{packed_prefix}.weight");
-        if !self.tensors.contains_key(&packed_weight_name) {
-            return Ok(false);
+        if split_targets.is_empty() {
+            anyhow::bail!("synthesize_packed_row_split_sizes: empty split_targets");
         }
         let grandparent = packed_prefix
             .rsplit_once('.')
             .map(|(p, _)| p)
             .ok_or_else(|| anyhow::anyhow!("packed prefix has no parent: {packed_prefix}"))?;
 
-        if split_targets.is_empty() {
-            anyhow::bail!("synthesize_packed_row_split_sizes: empty split_targets");
+        // GGUF quantized path — Phi-3 family ships fused qkv_proj /
+        // gate_up_proj as block-quantized GgmlStorage. Each child is a
+        // view into the parent's GPU buffer at a row-aligned byte
+        // offset; the parent allocation is leaked-by-design (model
+        // weights live for the model's lifetime, same as before this
+        // split) so single-buffer ownership is preserved without any
+        // refcount machinery.
+        if self.quantized.contains_key(&packed_weight_name) {
+            let packed = self
+                .quantized
+                .remove(&packed_weight_name)
+                .expect("contains");
+            let total_rows = packed.nrows;
+            let hidden = packed.ncols;
+            let sum_rows: usize = split_targets.iter().map(|(_, r)| *r).sum();
+            if sum_rows != total_rows {
+                anyhow::bail!(
+                    "packed quantized source `{packed_weight_name}` rows ({total_rows}) != \
+                     sum of split sizes ({sum_rows}) across {:?}",
+                    split_targets
+                        .iter()
+                        .map(|(s, r)| format!("{s}={r}"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let block_elems = packed.dtype.block_size();
+            let type_size = packed.dtype.type_size();
+            // Each row contributes hidden / block_elems blocks; rows are
+            // stored contiguously, so a child at row offset `r` starts
+            // at byte offset `r * (hidden / block_elems) * type_size`.
+            // Row-alignment check: every quantized format we ship has
+            // hidden % block_elems == 0 in practice (k-quants block
+            // size 256, hidden ≥ 256 always; legacy quants block size
+            // 32). If a future format violates this, error rather than
+            // silently produce torn blocks.
+            if !hidden.is_multiple_of(block_elems) {
+                anyhow::bail!(
+                    "quantized row-split unsafe: `{packed_weight_name}` has ncols ({hidden}) \
+                     not divisible by `{}` block size ({block_elems})",
+                    packed.dtype,
+                );
+            }
+            let row_bytes = (hidden / block_elems) * type_size;
+            let mut row_offset = 0usize;
+            for (target, rows) in split_targets {
+                let slice_bytes = *rows * row_bytes;
+                let child_ptr = unsafe { packed.ptr.add(row_offset * row_bytes) };
+                let child = crate::ggml_quant::GgmlStorage {
+                    ptr: child_ptr,
+                    len: slice_bytes,
+                    dtype: packed.dtype,
+                    nrows: *rows,
+                    ncols: hidden,
+                };
+                let vname = format!("{grandparent}.{target}.weight");
+                self.quantized.insert(vname, child);
+                row_offset += rows;
+            }
+            return Ok(true);
+        }
+
+        if !self.tensors.contains_key(&packed_weight_name) {
+            return Ok(false);
         }
 
         let packed_weight = self.tensors.remove(&packed_weight_name).expect("contains");

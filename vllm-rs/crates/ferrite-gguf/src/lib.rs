@@ -1656,14 +1656,14 @@ mod tests {
                 "Mistral-7B-v0.3 (SP)",
                 "models--bartowski--Mistral-7B-Instruct-v0.3-GGUF/snapshots/61fd4167fff3ab01ee1cfe0da183fa27a944db48/Mistral-7B-Instruct-v0.3-IQ2_S.gguf",
             ),
-            // DeepSeek-V2 / V3 family GGUFs land here once the
-            // fused-3D MoE expert loader exists. Today the dispatch
-            // is correct (V2 + V3-flat fingerprint-match their
-            // checkpoints via `gguf_archs` routing) but
-            // `DeepSeekV2MoELayer::load` asks for safetensors-shaped
-            // per-expert names that GGUF doesn't ship. Adding the
-            // fixtures here without the loader fix would assert
-            // "Paris" against an error message and flap.
+            (
+                "DeepSeek-V2-Lite (MoE)",
+                "models--mradermacher--DeepSeek-V2-Lite-GGUF/snapshots/0f37fdf276e8094747457f0ae4d40f2e8d2521f9/DeepSeek-V2-Lite.Q4_K_M.gguf",
+            ),
+            (
+                "Phi-3.5-mini (fused qkv + gate_up)",
+                "models--bartowski--Phi-3.5-mini-instruct-GGUF/snapshots/6d70da17e749a471ccb62ade694486011a75cda3/Phi-3.5-mini-instruct-Q4_K_M.gguf",
+            ),
         ];
 
         let mut ran = 0;

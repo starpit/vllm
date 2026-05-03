@@ -49,16 +49,12 @@ There are NO arch-keyed god-switches anywhere; no GGUF code in
 
 **Inference-coherent at tp=1** (greedy "Paris" smoke through `vllm
 chat`): Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B,
-Mistral-7B-Instruct-v0.3, Gemma-2-2B, Gemma-3-1B, **DeepSeek-V2-Lite**.
-
-**Tokenizer-only verified** (CPU round-trip, NO inference run):
-Phi-3.5-mini. The SentencePiece path (`tokenizer.ggml.model =
+Mistral-7B-Instruct-v0.3, Gemma-2-2B, Gemma-3-1B, **DeepSeek-V2-Lite**,
+**Phi-3.5-mini**. The SentencePiece path (`tokenizer.ggml.model =
 "llama"`) synthesizes BPE merges from vocab+scores via a direct port
 of HF's `generate_merges` — see `build_sentencepiece_tokenizer`.
 
-**Known broken / out of scope here:** Phi-3.5-mini inference (loader
-asks for `mlp.gate_proj.weight` while the Phi3 spec renames to fused
-`gate_up_proj` — LongRoPE follow-up); CommandR-35B (decodes only PAD
+**Known broken / out of scope here:** CommandR-35B (decodes only PAD
 on L4, needs >40 GB GPU to disambiguate IQ1_S quality cliff vs real
 arch bug).
 
@@ -134,31 +130,40 @@ arch bug).
   GGUF F32→model-dtype load path so canonical raw `w` lands on GPU.
   Set to `1.0` for Gemma2 + Gemma3 specs. Verified coherent post-fix
   on both fixtures.
+* **Phi-3.5-mini GGUF — quantized packed-split.** Phi3's GGUF ships
+  fused `attn_qkv.weight` and `ffn_up.weight` (the "ffn_up" name is
+  llama.cpp's tag for the fused gate_up_proj — there's no separate
+  `ffn_gate.weight`). The Phi3 spec renames these to the fused HF
+  names (`self_attn.qkv_proj.weight`, `mlp.gate_up_proj.weight`) so
+  that the manifest-driven `__packed_splits__` prelude can synthesize
+  per-slice virtual entries before any field load. But the splitter
+  (`GpuWeights::synthesize_packed_row_split_sizes`) only walked the
+  dense `tensors` map; for GGUF the fused parents land in the
+  `quantized` map (block-quantized `GgmlStorage`) and the call
+  returned Ok(false), leaving the per-slice names absent → first
+  field read failed with `weight not found:
+  model.layers.0.mlp.gate_proj.weight`. Fix: extended
+  `synthesize_packed_row_split_sizes` to recognize a quantized parent
+  and carve N children out of the same GPU buffer at row-aligned byte
+  offsets. Each child `GgmlStorage` is a view into the parent's
+  allocation (no doubling, no extra H2D, no dequant); the parent
+  allocation is leaked-by-design exactly as before (model weights
+  live for the model's lifetime). Block-alignment is asserted —
+  `ncols % dtype.block_size() == 0` is true for every quant we ship
+  but a future format would error rather than silently produce torn
+  blocks. Verified: Phi-3.5-mini Q4_K_M now greedy-coherent ("The
+  capital of France is Paris."); Llama-3.2-1B / Mistral-7B /
+  V2-Lite / Gemma-3-1B unchanged. `gguf_inference_smoke` integration
+  test now covers Phi-3.5-mini and DeepSeek-V2-Lite alongside
+  Llama-3.2-1B + Mistral-7B-v0.3 — 4 fixtures, all green serial.
 
 ## Open follow-ups
 
 * **Audit other archs end-to-end.** With P2 landed, each arch's
   GGUF support is a small `quantizations.json` edit. Granite +
-  Gemma2 + Gemma3 + CommandR + Phi3 specs landed (Phi3 covers
-  Phi-3-mini-4k; Phi-3.5/Phi-4 LongRoPE variants need separate
-  follow-up — see Phi-3.5-mini bullet below).
-* **Phi-3.5-mini GGUF load error.** Reproducer:
-  ```
-  ./vllm-rs/target/release/vllm chat \
-    --model ~/.cache/huggingface/hub/models--bartowski--Phi-3.5-mini-instruct-GGUF/snapshots/6d70da17e749a471ccb62ade694486011a75cda3/Phi-3.5-mini-instruct-Q4_K_M.gguf \
-    --max-tokens 5 --prompt "Hi"
-  ```
-  Today: `weight not found: model.layers.0.mlp.gate_proj.weight`.
-  The Phi3 spec renames `ffn_up.weight → mlp.gate_up_proj.weight`
-  (fused) and the Phi3 forward DSL expects fused gate_up_proj — but
-  fingerprint dispatch is landing on a non-Phi3 variant whose loader
-  asks for split `mlp.gate_proj`. Two suspects:
-  (a) Phi-3.5-mini's LongRoPE config differs from any compiled
-  Phi3 variant (Phi3 only has `phi3-mini-4k`-style entries today),
-  so dispatch falls through to a Llama-shaped variant that wants
-  split MLP. (b) The LongRoPE `rope_scaling_hash` doesn't match.
-  Triage: print which variant `Weights::load` returns at runtime,
-  and add a `phi-3.5-mini-128k.json` config with longrope scaling.
+  Gemma2 + Gemma3 + CommandR + Phi3 specs landed; Phi-3.5-mini now
+  inference-coherent (see "Phi-3.5-mini GGUF — quantized packed-split"
+  in Phases landed below).
 * **DeepSeek V2 / V3 GGUF — DONE.** V2-Lite Q4_K_M coherent end-to-end
   through the ferrite path. Two fixes landed: (1) the GGML MoE accessor
   + dispatch (see "Phases landed" → "DeepSeek V2 GGML MoE wiring") and
@@ -309,18 +314,18 @@ arch bug).
     HF reference ids.
   - **End-to-end inference** — `gguf_inference_smoke` shells out
     to the built `vllm` binary and asserts greedy "Paris" coherent
-    on Llama-3.2-1B + Mistral-7B-v0.3 GGUFs. Locks down the load +
-    dispatch + forward pipeline; needs a built binary + GPU. Run:
+    on Llama-3.2-1B, Mistral-7B-v0.3, DeepSeek-V2-Lite, and
+    Phi-3.5-mini GGUFs. Locks down the load + dispatch + forward
+    pipeline; needs a built binary + GPU. Moonlight (V3-flat) is
+    held back pending GGUF chat-template extraction. Run:
     ```
     cargo build --manifest-path vllm-rs/Cargo.toml -p vllm-cli \
         --features cuda --release
     cargo test --manifest-path vllm-rs/Cargo.toml -p ferrite-gguf \
         --release -- --ignored gguf_inference_smoke
     ```
-    DeepSeek-V2-Lite + Moonlight fixtures intentionally omitted
-    until the fused-3D MoE expert loader lands (handoff step 3) —
-    adding them today would assert "Paris" against an error msg
-    and flap.
+    Run with `--test-threads=1` if mixing with other GPU tests; the
+    four fixtures together transiently use up to ~12 GB GPU.
 
 ## Where to look first
 

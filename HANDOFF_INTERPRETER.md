@@ -14,11 +14,12 @@
 
 ## Where we are
 
-The branch sits at `82a46a7b9` (446 commits ahead of `main`).
-Eleven model crates build, the curated 6-arch golden subset shows
-15/17 pass (two qwen3 failures are the pre-existing per-head
-QK-norm divergence; see §6), and the macro-test suite is **207/207
-green**.
+The branch sits at `2883e7e29` (450 commits ahead of `main`).
+**Thirteen** model crates build (mixtral + qwen3-moe joined the
+fleet — see §"Tier-1 MoE follow-up"), the curated 6-arch golden
+subset shows 15/17 pass (two qwen3 failures are the pre-existing
+per-head QK-norm divergence; see §6), and the macro-test suite is
+**210/210 green**.
 
 ### Architectural pivot (the big one, since `5a8301a86`)
 
@@ -94,6 +95,29 @@ wrong and just hadn't hit graph capture yet.
 2. Rename `OpKind::DeepSeekMoe` → `OpKind::Moe`, DSL `deepseek_moe(..)` → `moe_block(..)` (HF naming match: `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `DeepseekV2MoE`). DSL bodies in `ferrite-model-deepseek-{v2,v3,v3-flat}` rebased. `Instruction::DeepSeekMoe` variant name kept — it carries `WtFn<W, DeepSeekV2MoELayer>` so it's type-anchored, not OpKind-anchored.
 
 207/207 macro tests preserved; deepseek-v2-lite expansion unchanged (331 tiles, 221 waves). No existing Impl overrides `applies_to` — gating is dormant until per-arch Impls (`FusedMoeRefImpl`, `SharedFusedMoeRefImpl`, updated `DeepSeekMoeRefImpl::applies_to`) land in the Tier-1 follow-up.
+
+### Tier-1 MoE follow-up — landed (`5e19f72dd` + `da84ed61d` + `2883e7e29`)
+
+Wholesale across three commits, no behavior change to existing arches:
+
+- **`5e19f72dd`** `DeepSeekMoeRefImpl::applies_to` — gates on `n_routed_experts` (DeepSeek-distinctive). No-op today; locks the contract for the peer Impls below. 207 → 208 tests.
+
+- **`da84ed61d`** **Mixtral wholesale**: kernel `FusedMoELayer::load` (mirror of vllm-cuda's `mixtral::load_moe` at tp=1, BF16, `w1/w2/w3` naming) → `Instruction::FusedMoe` variant + eval → `FieldLoad::FusedMoe` codegen → `FusedMoeRefImpl` gating on `num_local_experts && !shared_expert_intermediate_size && !n_routed_experts` → new `ferrite-model-mixtral` crate (`block_sparse_moe[layer]` accessor; configs: `mixtral-8x7b-instruct-v0.1` 355 tiles · 195 waves, `mixtral-1-layer` 14 tiles · 9 waves) → workspace + ferrite-models registration. 208 → 209 tests.
+
+- **`2883e7e29`** **Qwen3-MoE wholesale**: kernel `SharedFusedMoELayer::load` (mirror of vllm-cuda's `qwen3_moe::load_moe` at tp=1, BF16, `gate_proj/up_proj/down_proj` naming, optional `shared_expert.*` + `shared_expert_gate`, `renormalize: true`) → `Instruction::SharedFusedMoe` variant + eval → `FieldLoad::SharedFusedMoe` codegen → `SharedFusedMoeRefImpl` gating on `num_experts && !num_local_experts && !n_routed_experts` (covers BOTH Qwen2-MoE-with-shared and Qwen3-MoE-Instruct-without-shared — `shared_expert_intermediate_size` is a runtime-Optional on the same kernel surface, not a family discriminator) → new `ferrite-model-qwen3-moe` crate (Qwen3 attention math + `mlp[layer]` MoE accessor; configs: `qwen3-30b-a3b-instruct` 819 tiles · 483 waves, `qwen3-moe-1-layer` 20 tiles · 13 waves) → workspace + ferrite-models registration. Adds `fused_moe_ref` + `shared_fused_moe_ref` to `lib.rs::NON_GEMM_NAMES` for kernel-class summary. 209 → 210 tests.
+
+DeepSeek-V2-Lite expansion unchanged across all three commits (331 tiles · 221 waves; 246 waves at GGML). The applies_to gate triple
+(`n_routed_experts` ↔ DeepSeek, `num_local_experts` ↔ Mixtral, `num_experts` ↔ Qwen-MoE) partitions every BF16 MoE config in the fleet exactly once.
+
+Out of scope (deferred to next follow-up): quantized MoE variants
+(Mixtral Marlin / FP8, Qwen3-MoE FP8) need dedicated `Mixtral*Impl` /
+`Qwen3Moe*Impl` peers + their respective FieldLoad arms; the BF16
+Impls' `matches` already defer when storage is FP8/GGML, so adding
+those is purely additive. Also out of scope: Qwen3-Next-style
+hybrid configs with non-empty `mlp_only_layers` — would need a
+layer-conditional DSL split akin to DeepSeek-V2's
+`first_k_dense_replace`. None of the official Qwen3-MoE-Instruct
+checkpoints ship a non-empty `mlp_only_layers`.
 
 `82a46a7b9` **dedup_quant_sig in canonical hashing** — a
 correctness fix for FP8 dispatch. The `dedup_signature()` used

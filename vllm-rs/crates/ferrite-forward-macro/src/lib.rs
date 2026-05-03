@@ -712,6 +712,8 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 "deepseek_moe_ref",
                 "deepseek_moe_fp8_block",
                 "deepseek_moe_ggml",
+                "fused_moe_ref",
+                "shared_fused_moe_ref",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
             ];

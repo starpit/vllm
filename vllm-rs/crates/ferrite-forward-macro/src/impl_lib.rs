@@ -2165,6 +2165,7 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
     lib.push(Box::new(DeepSeekGgmlMoeImpl));
     lib.push(Box::new(FusedMoeRefImpl));
+    lib.push(Box::new(SharedFusedMoeRefImpl));
 
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
@@ -15476,6 +15477,169 @@ impl Implementation for FusedMoeRefImpl {
     }
 }
 
+// ── SharedFusedMoeRefImpl ────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::Moe` claiming Qwen2-MoE / Qwen3-MoE BF16 checkpoints
+// — fused routed experts PLUS a shared expert with sigmoid gate. The
+// `applies_to` gate restricts this Impl to canonicals whose ModelParams
+// carries `shared_expert_intermediate_size` (Qwen-MoE-distinctive).
+//
+// DSL: moe_out = moe_block(hidden_states, mlp[layer])
+// (or whichever identifier the per-arch weights manifest maps to a
+// `SharedFusedMoELayer` accessor.)
+#[derive(Debug, Default)]
+pub struct SharedFusedMoeRefImpl;
+
+impl Implementation for SharedFusedMoeRefImpl {
+    fn name(&self) -> &'static str {
+        "shared_fused_moe_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // The Qwen-MoE family is the only family whose `config.json`
+        // ships `num_experts` as the routed-expert count (DeepSeek
+        // uses `n_routed_experts`, Mixtral uses `num_local_experts`).
+        // `shared_expert_intermediate_size` is an *optional* runtime
+        // parameter on this family — Qwen3-MoE-Instruct ships
+        // checkpoints with shared_inter=0 alongside Qwen2-MoE-style
+        // shared-expert checkpoints; both share the same weight
+        // naming and routing kernel, so a single Impl gate on
+        // `num_experts` covers them.
+        let b = &ctx.model.bounds;
+        b.contains_key("num_experts")
+            && !b.contains_key("num_local_experts")
+            && !b.contains_key("n_routed_experts")
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
+            return None;
+        }
+        single_tile_match(fuf, seed, OpKind::Moe)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers_moe::SharedFusedMoELayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "SharedFusedMoe",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers_moe::SharedFusedMoELayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("SharedFusedMoe: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("SharedFusedMoe: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("SharedFusedMoe", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15737,6 +15901,103 @@ mod tests {
         assert!(
             !imp.applies_to(&ctx_dense),
             "FusedMoeRefImpl must defer on dense configs"
+        );
+    }
+
+    #[test]
+    fn shared_fused_moe_applies_to_keys_on_num_experts() {
+        // Locks the SharedFusedMoeRefImpl gate. The Qwen-MoE family is the
+        // only family whose config carries `num_experts` (DeepSeek uses
+        // `n_routed_experts`; Mixtral uses `num_local_experts`). The gate
+        // covers BOTH Qwen2-MoE-with-shared and Qwen3-MoE-without-shared
+        // — `shared_expert_intermediate_size` is a runtime parameter on
+        // the same kernel surface, not a family discriminator.
+        use crate::classified::Program;
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let program = Program {
+            statements: Vec::new(),
+            locals: Default::default(),
+            weights: Default::default(),
+            reshape_targets: Default::default(),
+        };
+
+        let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
+            name: name.to_string(),
+            source_stem: name.to_string(),
+            source_path: std::path::PathBuf::new(),
+            bounds: kvs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            scalars: std::collections::BTreeMap::new(),
+            quantization: None,
+            tie_word_embeddings: false,
+            architectures: Vec::new(),
+            extra_tracked_paths: Vec::new(),
+            rope_scaling: None,
+            rope_scaling_hash: None,
+        };
+
+        let imp = SharedFusedMoeRefImpl;
+
+        // Qwen3-MoE-Instruct (no shared): claims.
+        let m_qwen3 = mk_model(
+            "qwen3_30b_a3b_test",
+            &[("num_experts", 128), ("shared_expert_intermediate_size", 0)],
+        );
+        let ctx_qwen3 = MatchContext {
+            program: &program,
+            model: &m_qwen3,
+            profile: &profile,
+        };
+        assert!(
+            imp.applies_to(&ctx_qwen3),
+            "SharedFusedMoeRefImpl must claim Qwen3-MoE configs even with shared_expert_intermediate_size=0"
+        );
+
+        // Qwen2-MoE (with shared): claims.
+        let m_qwen2 = mk_model(
+            "qwen2_moe_test",
+            &[
+                ("num_experts", 60),
+                ("shared_expert_intermediate_size", 5632),
+            ],
+        );
+        let ctx_qwen2 = MatchContext {
+            program: &program,
+            model: &m_qwen2,
+            profile: &profile,
+        };
+        assert!(
+            imp.applies_to(&ctx_qwen2),
+            "SharedFusedMoeRefImpl must claim Qwen2-MoE-with-shared configs"
+        );
+
+        // Mixtral: skips (defers to FusedMoeRefImpl).
+        let m_mix = mk_model("mixtral_test", &[("num_local_experts", 8)]);
+        let ctx_mix = MatchContext {
+            program: &program,
+            model: &m_mix,
+            profile: &profile,
+        };
+        assert!(
+            !imp.applies_to(&ctx_mix),
+            "SharedFusedMoeRefImpl must defer on Mixtral (uses num_local_experts)"
+        );
+
+        // DeepSeek: skips (defers to DeepSeekMoeRefImpl).
+        let m_ds = mk_model(
+            "deepseek_v2_lite_test",
+            &[("num_experts", 64), ("n_routed_experts", 64)],
+        );
+        let ctx_ds = MatchContext {
+            program: &program,
+            model: &m_ds,
+            profile: &profile,
+        };
+        assert!(
+            !imp.applies_to(&ctx_ds),
+            "SharedFusedMoeRefImpl must defer when n_routed_experts is present"
         );
     }
 

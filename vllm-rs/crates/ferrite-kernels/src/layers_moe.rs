@@ -368,6 +368,119 @@ pub struct SharedFusedMoELayer {
 }
 
 impl SharedFusedMoELayer {
+    /// Load a Qwen-MoE-style BF16 fused MoE + shared-expert layer.
+    ///
+    /// Mirrors `vllm-cuda/src/model/qwen3_moe.rs::Qwen3MoeDecoderLayer::load_moe`
+    /// at single-rank (tp=1). Qwen3-MoE / Qwen2-MoE expert weight names use the
+    /// HF `gate_proj/up_proj/down_proj` convention (NOT Mixtral's
+    /// `w1/w2/w3`); the shared expert lives at
+    /// `{prefix}.shared_expert.{gate,up,down}_proj.weight` with a sigmoid
+    /// gate at `{prefix}.shared_expert_gate.weight`.
+    ///
+    /// Routed `renormalize: true` matches Python vLLM's Qwen-MoE softmax
+    /// path (`norm_topk_prob = True` is implicit in the family).
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        use ferrite_cuda_core::driver;
+
+        let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
+
+        let first_gate = format!("{prefix}.experts.0.gate_proj.weight");
+        let (_, dtype) = gw
+            .tensor_info(&first_gate)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
+        let elem = dtype.size_bytes();
+
+        let inter = moe_intermediate_size;
+        let w1_bytes = num_experts * 2 * inter * hidden_size * elem;
+        let w2_bytes = num_experts * hidden_size * inter * elem;
+        let w1_ptr = unsafe { driver::mem_alloc(w1_bytes)? };
+        let w2_ptr = unsafe { driver::mem_alloc(w2_bytes)? };
+
+        let gate_proj_bytes = inter * hidden_size * elem;
+        for e in 0..num_experts {
+            let gate_name = format!("{prefix}.experts.{e}.gate_proj.weight");
+            let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
+            let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
+            let expert_w1_off = e * 2 * inter * hidden_size * elem;
+            let expert_w2_off = e * hidden_size * inter * elem;
+            unsafe {
+                gw.take_into(&gate_name, w1_ptr.add(expert_w1_off), stream)?;
+                gw.take_into(
+                    &up_name,
+                    w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                    stream,
+                )?;
+                gw.take_into(&down_name, w2_ptr.add(expert_w2_off), stream)?;
+            }
+        }
+
+        let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden_size], dtype) };
+        let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden_size, inter], dtype) };
+
+        let moe = FusedMoELayer {
+            gate,
+            w1,
+            w2,
+            num_experts,
+            top_k,
+            intermediate_size: inter,
+            hidden_size,
+            renormalize: true,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        };
+
+        let (shared_gate_up, shared_down, shared_expert_gate) = if shared_expert_intermediate_size
+            > 0
+        {
+            let shared_inter = shared_expert_intermediate_size;
+            let shared_gate_proj_bytes = shared_inter * hidden_size * elem;
+            let shared_total = 2 * shared_gate_proj_bytes;
+            let ptr = unsafe { driver::mem_alloc(shared_total)? };
+            unsafe {
+                gw.take_into(
+                    &format!("{prefix}.shared_expert.gate_proj.weight"),
+                    ptr,
+                    stream,
+                )?;
+                gw.take_into(
+                    &format!("{prefix}.shared_expert.up_proj.weight"),
+                    ptr.add(shared_gate_proj_bytes),
+                    stream,
+                )?;
+            }
+            let gu_w = unsafe { GpuTensor::new(ptr, &[2 * shared_inter, hidden_size], dtype) };
+            let gate_up = crate::layers::Linear::new(gu_w, None);
+            let down =
+                crate::layers::Linear::load(gw, &format!("{prefix}.shared_expert.down_proj"))?;
+            let sgate = crate::layers::Linear::load(gw, &format!("{prefix}.shared_expert_gate"))?;
+            (Some(gate_up), Some(down), Some(sgate))
+        } else {
+            (None, None, None)
+        };
+
+        Ok(SharedFusedMoELayer {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_expert_gate,
+            intermediate_size: shared_expert_intermediate_size,
+        })
+    }
+
     /// Forward pass — MoE + shared expert.
     pub unsafe fn forward(
         &self,

@@ -197,6 +197,18 @@ enum FieldLoad {
         intermediate_size: usize,
         hidden_size: usize,
     },
+    /// Qwen-MoE-style BF16 fused MoE + shared expert. Calls
+    /// `SharedFusedMoELayer::load`. Used by Qwen2-MoE / Qwen3-MoE
+    /// whose checkpoints use HF's `experts.{e}.{gate,up,down}_proj`
+    /// naming and ship a shared-expert SwiGLU + sigmoid gate.
+    SharedFusedMoe {
+        prefix: String,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -359,6 +371,9 @@ fn plan_field_load(
     let is_fused_moe = ty.ends_with("::FusedMoELayer")
         || ty == "FusedMoELayer"
         || ty.ends_with("layers_moe::FusedMoELayer");
+    let is_shared_fused_moe = ty.ends_with("::SharedFusedMoELayer")
+        || ty == "SharedFusedMoELayer"
+        || ty.ends_with("layers_moe::SharedFusedMoELayer");
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
@@ -699,6 +714,66 @@ fn plan_field_load(
             num_experts,
             top_k,
             intermediate_size,
+            hidden_size,
+        };
+    }
+
+    if is_shared_fused_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "SharedFusedMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let num_experts = v
+            .get("num_experts")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| model.bounds.get("num_experts").copied().unwrap_or(60) as usize);
+        let top_k = v
+            .get("num_experts_per_tok")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("num_experts_per_tok")
+                    .copied()
+                    .unwrap_or(4) as usize
+            });
+        let moe_intermediate_size = v
+            .get("moe_intermediate_size")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("moe_intermediate_size")
+                    .copied()
+                    .unwrap_or(1408) as usize
+            });
+        let shared_expert_intermediate_size = v
+            .get("shared_expert_intermediate_size")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("shared_expert_intermediate_size")
+                    .copied()
+                    .unwrap_or(0) as usize
+            });
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+        return FieldLoad::SharedFusedMoe {
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
             hidden_size,
         };
     }
@@ -2969,6 +3044,32 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::SharedFusedMoe {
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+        } => {
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let shared_expert_intermediate_size = *shared_expert_intermediate_size;
+            let hidden_size = *hidden_size;
+            quote! {
+                let #name = ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load(
+                    gw,
+                    #prefix,
+                    #num_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #shared_expert_intermediate_size,
+                    #hidden_size,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -3397,6 +3498,37 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #num_experts,
                             #top_k,
                             #intermediate_size,
+                            #hidden_size,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        FieldLoad::SharedFusedMoe {
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let shared_expert_intermediate_size = *shared_expert_intermediate_size;
+            let hidden_size = *hidden_size;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load(
+                            gw,
+                            &#p,
+                            #num_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #shared_expert_intermediate_size,
                             #hidden_size,
                             stream,
                         )

@@ -554,6 +554,15 @@ impl<W> Instruction<W> {
                     F::LayerKind("FusedMoELayer"),
                 ],
             ),
+            Instruction::SharedFusedMoe(in_slot, out_slot, layer, _wf) => (
+                "SharedFusedMoe",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("SharedFusedMoELayer"),
+                ],
+            ),
             Instruction::CutlassGemm(
                 in_slot,
                 out_slot,

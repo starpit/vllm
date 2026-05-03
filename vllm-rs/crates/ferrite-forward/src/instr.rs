@@ -38,6 +38,7 @@ use ferrite_kernels::layers::{
 };
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
+    SharedFusedMoELayer,
 };
 
 /// Per-canonical model parameters. Implemented by each canonical's
@@ -207,6 +208,11 @@ pub enum Instruction<W> {
     /// via softmax; experts are stacked `[E, 2*inter, hidden]` /
     /// `[E, hidden, inter]` and dispatched through the fused-MoE GEMM.
     FusedMoe(u32, u32, u32, WtFn<W, FusedMoELayer>),
+    /// Qwen-MoE-style BF16 fused MoE PLUS shared expert with sigmoid
+    /// gate. Routed experts use the same fused-MoE pipeline as
+    /// `FusedMoe` (with `renormalize=true`); the shared expert is a
+    /// SwiGLU MLP gated by `sigmoid(shared_expert_gate(x))`.
+    SharedFusedMoe(u32, u32, u32, WtFn<W, SharedFusedMoELayer>),
     CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassGemmSplitK(
         u32,
@@ -1367,6 +1373,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::FusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let out = w.forward(v, ctx.device);
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::SharedFusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);

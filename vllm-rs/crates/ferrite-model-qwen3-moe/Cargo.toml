@@ -1,0 +1,19 @@
+[package]
+name = "ferrite-model-qwen3-moe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite Qwen3-MoE architecture (one #[forward] body)"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward = { path = "../ferrite-forward" }
+ferrite-gguf = { path = "../ferrite-gguf" }
+anyhow = { workspace = true }
+tracing = { workspace = true }

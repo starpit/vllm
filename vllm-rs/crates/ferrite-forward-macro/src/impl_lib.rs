@@ -2036,6 +2036,15 @@ pub fn starter_library() -> ImplementationLibrary {
             tile_m: tile.0,
             tile_n: tile.1,
             stages: tile.2,
+            variant: GEMM_VARIANT_BASIC,
+        }));
+    }
+    for tile in CUTLASS_SW_TILE_ZOO {
+        lib.push(Box::new(CutlassGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+            variant: GEMM_VARIANT_SW,
         }));
     }
     // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
@@ -2046,8 +2055,16 @@ pub fn starter_library() -> ImplementationLibrary {
             tile_m: tile.0,
             tile_n: tile.1,
             stages: tile.2,
+            variant: GEMM_VARIANT_BASIC,
         }));
     }
+    // [TEMPORARILY DISABLED FOR A/B BENCH — restore before commit]
+    // for tile in CUTLASS_SW_TILE_ZOO {
+    //     lib.push(Box::new(CutlassGemmAddImpl {
+    //         tile_m: tile.0, tile_n: tile.1, stages: tile.2,
+    //         variant: GEMM_VARIANT_SW,
+    //     }));
+    // }
     // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
     // Closes the small-N/large-K tall-skinny shape class where the
     // standard tile zoo leaves cuBLAS winning. target_compatible
@@ -5106,20 +5123,37 @@ fn match_norm_gemm_pair(
     Some((norm_seed, only.id))
 }
 
-/// Roofline FLOPs cost — the same fallback `GemmRefImpl::cost_us`
-/// (via `cost_gemm`) uses when the cuBLAS CSV row is missing. Used
-/// by every fused-Gemm peer below at uncalibrated shapes
-/// (lm_head's vocab-N rows are not swept) so cuBLAS-vs-fusion stays
-/// on a single measurement scale rather than comparing roofline
-/// (cuBLAS) against `UNCALIBRATED_COST_US` (CUTLASS).
+/// Roofline GEMM cost — `max(compute-bound, BW-bound)`.
+///
+/// The compute term is `2*M*N*K / peak_tflops`. The BW term is the
+/// weight read `N*K*BYTES_PER_ELEM / hbm_gbps` plus the activation
+/// read+write `M*(N+K)*BYTES_PER_ELEM / hbm_gbps` — for a small-M
+/// large-N GEMM (lm_head, vocab projection, MoE expert outputs) the
+/// weight read dominates at ≈ 1.4 ms per GB on L40s, which the
+/// pure-flops roofline understates by 10-20×.
+///
+/// Used by every fused-Gemm peer's `cost_us` at shapes the predictor
+/// can't reach (out-of-bounding-box) so the DP doesn't tile-pick
+/// blind. Cheaper to be order-of-magnitude correct here than to
+/// special-case every uncalibrated arch downstream.
 fn cutlass_gemm_roofline_us(ctx: &CostCtx, m: u32, n: u32, k: u32) -> f64 {
-    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+    let m = m as f64;
+    let n = n as f64;
+    let k = k as f64;
+    let flops = 2.0 * m * n * k;
     let peak = ctx.profile.peak_tflops_fp16 * 1e12;
-    if peak > 0.0 && flops > 0.0 {
-        (flops / peak) * 1e6
-    } else {
-        UNCALIBRATED_COST_US
+    let bw_gb = ctx.profile.memory_bandwidth_gbps;
+    if peak <= 0.0 || flops <= 0.0 {
+        return UNCALIBRATED_COST_US;
     }
+    let compute_us = (flops / peak) * 1e6;
+    let bytes_to_read_write = (n * k + m * (n + k)) * BYTES_PER_ELEM;
+    let bw_us = if bw_gb > 0.0 {
+        (bytes_to_read_write / (bw_gb * 1e9)) * 1e6
+    } else {
+        0.0
+    };
+    compute_us.max(bw_us)
 }
 
 /// Whether a `(M, N, K)` shape satisfies the standalone CUTLASS
@@ -10592,13 +10626,85 @@ const CUTLASS_TILE_ZOO: &[(u32, u32, u32)] = &[
     (128, 256, 3),
     (256, 64, 3),
     (256, 64, 4),
+    // ── Deep-stage / stages-2 variants ──
+    //
+    // Match cuBLAS's mid-M picks observed via NVTX-tagged nsys traces
+    // against cuBLAS-on at qwen2.5-3b prefill. cuBLAS routinely picks
+    // 5..8-stage variants where a deep pipeline hides BW latency
+    // better than the default stages=3/4. csrc has these compiled;
+    // launch + 2-phase shims wired in `cutlass.rs` alongside.
+    (64, 64, 2),
+    (64, 64, 5),
+    (64, 64, 6),
+    (64, 64, 8),
+    (64, 64, 10),
+    (64, 128, 2),
+    (64, 128, 5),
+    (64, 128, 6),
+    (64, 128, 7),
+    (64, 128, 8),
+    (128, 64, 2),
+    (128, 64, 5),
+    (128, 64, 6),
+    (128, 64, 7),
+    (128, 64, 8),
+    (128, 128, 2),
+    (128, 128, 5),
+    (128, 128, 6),
+    (64, 256, 2),
+    (64, 256, 3),
+    (64, 256, 4),
+    (64, 256, 5),
+    (128, 256, 2),
+    (128, 256, 4),
+    (256, 64, 2),
+    (256, 64, 5),
+    (256, 64, 6),
+    (256, 128, 2),
 ];
+
+/// CUTLASS GEMM tiles compiled with `GemmIdentityThreadblockSwizzle<8>`
+/// (the `_sw_` family in `cutlass_standalone_gemm.cu`). Subset of
+/// `CUTLASS_TILE_ZOO` plus stage variants the swizzle path adds — only
+/// the tiles + stages with matching `_sw_` instantiations in the .cu
+/// are listed here. The DP races these against the basic family per
+/// `(M, N, K)` bucket; calibrated CSV rows decide which wins.
+const CUTLASS_SW_TILE_ZOO: &[(u32, u32, u32)] = &[
+    (64, 128, 3),
+    (64, 128, 4),
+    (64, 256, 2),
+    (64, 256, 3),
+    (128, 128, 2),
+    (128, 128, 3),
+    (128, 128, 4),
+    (128, 256, 2),
+    (128, 256, 3),
+    (256, 64, 3),
+    (256, 64, 4),
+];
+
+/// Tile-variant tag. Encoded as `u32` end-to-end (Impl field, OpInstance
+/// literal, runtime Instruction field) because the codegen pipeline
+/// only emits primitive integer literals via `quote!`. Decoded back to
+/// the strongly-typed `ferrite_kernels::cutlass::GemmVariant` in the
+/// runtime dispatcher.
+///
+/// Keep these constants in sync with
+/// `ferrite_kernels::cutlass::GemmVariant`. Adding a new family
+/// (`K64` / `W8` / `K64W8` next) extends both the kernel-side enum and
+/// this constant set.
+pub const GEMM_VARIANT_BASIC: u32 = 0;
+pub const GEMM_VARIANT_SW: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct CutlassGemmImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
+    /// `GEMM_VARIANT_*` discriminator. `Basic` (default) is the
+    /// `cutlass_<TM>x<TN>_s<S>` family; `Sw` is
+    /// `cutlass_<TM>x<TN>_sw_s<S>` (8-wide threadblock swizzle).
+    pub variant: u32,
 }
 
 impl CutlassGemmImpl {
@@ -10610,28 +10716,68 @@ impl CutlassGemmImpl {
     }
 
     fn static_name(&self) -> &'static str {
-        // Names are compile-time-known per CUTLASS_TILE_ZOO entry.
-        match (self.tile_m, self.tile_n, self.stages) {
-            (16, 64, 3) => "cutlass_16x64_s3",
-            (16, 64, 4) => "cutlass_16x64_s4",
-            (16, 128, 3) => "cutlass_16x128_s3",
-            (16, 128, 4) => "cutlass_16x128_s4",
-            (32, 64, 3) => "cutlass_32x64_s3",
-            (32, 64, 4) => "cutlass_32x64_s4",
-            (32, 128, 3) => "cutlass_32x128_s3",
-            (32, 128, 4) => "cutlass_32x128_s4",
-            (32, 256, 3) => "cutlass_32x256_s3",
-            (64, 64, 3) => "cutlass_64x64_s3",
-            (64, 64, 4) => "cutlass_64x64_s4",
-            (64, 128, 3) => "cutlass_64x128_s3",
-            (64, 128, 4) => "cutlass_64x128_s4",
-            (128, 64, 3) => "cutlass_128x64_s3",
-            (128, 64, 4) => "cutlass_128x64_s4",
-            (128, 128, 3) => "cutlass_128x128_s3",
-            (128, 128, 4) => "cutlass_128x128_s4",
-            (128, 256, 3) => "cutlass_128x256_s3",
-            (256, 64, 3) => "cutlass_256x64_s3",
-            (256, 64, 4) => "cutlass_256x64_s4",
+        // Names are compile-time-known per zoo entry.
+        match (self.variant, self.tile_m, self.tile_n, self.stages) {
+            (GEMM_VARIANT_BASIC, 16, 64, 3) => "cutlass_16x64_s3",
+            (GEMM_VARIANT_BASIC, 16, 64, 4) => "cutlass_16x64_s4",
+            (GEMM_VARIANT_BASIC, 16, 128, 3) => "cutlass_16x128_s3",
+            (GEMM_VARIANT_BASIC, 16, 128, 4) => "cutlass_16x128_s4",
+            (GEMM_VARIANT_BASIC, 32, 64, 3) => "cutlass_32x64_s3",
+            (GEMM_VARIANT_BASIC, 32, 64, 4) => "cutlass_32x64_s4",
+            (GEMM_VARIANT_BASIC, 32, 128, 3) => "cutlass_32x128_s3",
+            (GEMM_VARIANT_BASIC, 32, 128, 4) => "cutlass_32x128_s4",
+            (GEMM_VARIANT_BASIC, 32, 256, 3) => "cutlass_32x256_s3",
+            (GEMM_VARIANT_BASIC, 64, 64, 3) => "cutlass_64x64_s3",
+            (GEMM_VARIANT_BASIC, 64, 64, 4) => "cutlass_64x64_s4",
+            (GEMM_VARIANT_BASIC, 64, 128, 3) => "cutlass_64x128_s3",
+            (GEMM_VARIANT_BASIC, 64, 128, 4) => "cutlass_64x128_s4",
+            (GEMM_VARIANT_BASIC, 128, 64, 3) => "cutlass_128x64_s3",
+            (GEMM_VARIANT_BASIC, 128, 64, 4) => "cutlass_128x64_s4",
+            (GEMM_VARIANT_BASIC, 128, 128, 3) => "cutlass_128x128_s3",
+            (GEMM_VARIANT_BASIC, 128, 128, 4) => "cutlass_128x128_s4",
+            (GEMM_VARIANT_BASIC, 128, 256, 3) => "cutlass_128x256_s3",
+            (GEMM_VARIANT_BASIC, 256, 64, 3) => "cutlass_256x64_s3",
+            (GEMM_VARIANT_BASIC, 256, 64, 4) => "cutlass_256x64_s4",
+            (GEMM_VARIANT_SW, 64, 128, 3) => "cutlass_64x128_sw_s3",
+            (GEMM_VARIANT_SW, 64, 128, 4) => "cutlass_64x128_sw_s4",
+            (GEMM_VARIANT_SW, 64, 256, 2) => "cutlass_64x256_sw_s2",
+            (GEMM_VARIANT_SW, 64, 256, 3) => "cutlass_64x256_sw_s3",
+            (GEMM_VARIANT_SW, 128, 128, 2) => "cutlass_128x128_sw_s2",
+            (GEMM_VARIANT_SW, 128, 128, 3) => "cutlass_128x128_sw_s3",
+            (GEMM_VARIANT_SW, 128, 128, 4) => "cutlass_128x128_sw_s4",
+            (GEMM_VARIANT_SW, 128, 256, 2) => "cutlass_128x256_sw_s2",
+            (GEMM_VARIANT_SW, 128, 256, 3) => "cutlass_128x256_sw_s3",
+            (GEMM_VARIANT_SW, 256, 64, 3) => "cutlass_256x64_sw_s3",
+            (GEMM_VARIANT_SW, 256, 64, 4) => "cutlass_256x64_sw_s4",
+            // Deep-stage / stages-2 basic-tile variants.
+            (GEMM_VARIANT_BASIC, 64, 64, 2) => "cutlass_64x64_s2",
+            (GEMM_VARIANT_BASIC, 64, 64, 5) => "cutlass_64x64_s5",
+            (GEMM_VARIANT_BASIC, 64, 64, 6) => "cutlass_64x64_s6",
+            (GEMM_VARIANT_BASIC, 64, 64, 8) => "cutlass_64x64_s8",
+            (GEMM_VARIANT_BASIC, 64, 64, 10) => "cutlass_64x64_s10",
+            (GEMM_VARIANT_BASIC, 64, 128, 2) => "cutlass_64x128_s2",
+            (GEMM_VARIANT_BASIC, 64, 128, 5) => "cutlass_64x128_s5",
+            (GEMM_VARIANT_BASIC, 64, 128, 6) => "cutlass_64x128_s6",
+            (GEMM_VARIANT_BASIC, 64, 128, 7) => "cutlass_64x128_s7",
+            (GEMM_VARIANT_BASIC, 64, 128, 8) => "cutlass_64x128_s8",
+            (GEMM_VARIANT_BASIC, 128, 64, 2) => "cutlass_128x64_s2",
+            (GEMM_VARIANT_BASIC, 128, 64, 5) => "cutlass_128x64_s5",
+            (GEMM_VARIANT_BASIC, 128, 64, 6) => "cutlass_128x64_s6",
+            (GEMM_VARIANT_BASIC, 128, 64, 7) => "cutlass_128x64_s7",
+            (GEMM_VARIANT_BASIC, 128, 64, 8) => "cutlass_128x64_s8",
+            (GEMM_VARIANT_BASIC, 128, 128, 2) => "cutlass_128x128_s2",
+            (GEMM_VARIANT_BASIC, 128, 128, 5) => "cutlass_128x128_s5",
+            (GEMM_VARIANT_BASIC, 128, 128, 6) => "cutlass_128x128_s6",
+            (GEMM_VARIANT_BASIC, 64, 256, 2) => "cutlass_64x256_s2",
+            (GEMM_VARIANT_BASIC, 64, 256, 3) => "cutlass_64x256_s3",
+            (GEMM_VARIANT_BASIC, 64, 256, 4) => "cutlass_64x256_s4",
+            (GEMM_VARIANT_BASIC, 64, 256, 5) => "cutlass_64x256_s5",
+            (GEMM_VARIANT_BASIC, 128, 256, 2) => "cutlass_128x256_s2",
+            (GEMM_VARIANT_BASIC, 128, 256, 4) => "cutlass_128x256_s4",
+            (GEMM_VARIANT_BASIC, 256, 64, 2) => "cutlass_256x64_s2",
+            (GEMM_VARIANT_BASIC, 256, 64, 5) => "cutlass_256x64_s5",
+            (GEMM_VARIANT_BASIC, 256, 64, 6) => "cutlass_256x64_s6",
+            (GEMM_VARIANT_BASIC, 256, 128, 2) => "cutlass_256x128_s2",
             _ => "cutlass_unknown",
         }
     }
@@ -10776,6 +10922,7 @@ impl Implementation for CutlassGemmImpl {
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
+                ("variant", syn::parse_quote!(u32)),
                 ("n", syn::parse_quote!(u32)),
                 ("k", syn::parse_quote!(u32)),
             ],
@@ -10808,6 +10955,7 @@ impl Implementation for CutlassGemmImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
+        let variant = self.variant;
         let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
             .expect("CutlassGemm: weight (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
@@ -10820,6 +10968,7 @@ impl Implementation for CutlassGemmImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
+                quote! { #variant },
                 quote! { #n },
                 quote! { #k },
             ],
@@ -11107,40 +11256,84 @@ pub struct CutlassGemmAddImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
+    /// `GEMM_VARIANT_*` discriminator — same enum as `CutlassGemmImpl`.
+    /// `Basic` is `cutlass_<TM>x<TN>_s<S>_add`; `Sw` is
+    /// `cutlass_<TM>x<TN>_sw_s<S>_add`. The underlying kernel symbol
+    /// is the same SW launch fn called with `beta=1.0` — no new csrc
+    /// needed; only CSV plumbing + DP wiring.
+    pub variant: u32,
 }
 
 impl CutlassGemmAddImpl {
     fn csv_name(&self) -> &'static str {
         // Dedicated `_add` CSV row measured at beta=1.0 — captures
         // the epilogue's extra `[M, N]` aux-read cost that the plain
-        // tile row (beta=0.0) doesn't see. Necessary for fair DP
-        // comparison against `(singleton gemm + fused_add_rms_norm)`
-        // on residual-stream chains.
+        // tile row (beta=0.0) doesn't see.
         self.impl_name()
     }
 
     fn impl_name(&self) -> &'static str {
-        match (self.tile_m, self.tile_n, self.stages) {
-            (16, 64, 3) => "cutlass_16x64_s3_add",
-            (16, 64, 4) => "cutlass_16x64_s4_add",
-            (16, 128, 3) => "cutlass_16x128_s3_add",
-            (16, 128, 4) => "cutlass_16x128_s4_add",
-            (32, 64, 3) => "cutlass_32x64_s3_add",
-            (32, 64, 4) => "cutlass_32x64_s4_add",
-            (32, 128, 3) => "cutlass_32x128_s3_add",
-            (32, 128, 4) => "cutlass_32x128_s4_add",
-            (32, 256, 3) => "cutlass_32x256_s3_add",
-            (64, 64, 3) => "cutlass_64x64_s3_add",
-            (64, 64, 4) => "cutlass_64x64_s4_add",
-            (64, 128, 3) => "cutlass_64x128_s3_add",
-            (64, 128, 4) => "cutlass_64x128_s4_add",
-            (128, 64, 3) => "cutlass_128x64_s3_add",
-            (128, 64, 4) => "cutlass_128x64_s4_add",
-            (128, 128, 3) => "cutlass_128x128_s3_add",
-            (128, 128, 4) => "cutlass_128x128_s4_add",
-            (128, 256, 3) => "cutlass_128x256_s3_add",
-            (256, 64, 3) => "cutlass_256x64_s3_add",
-            (256, 64, 4) => "cutlass_256x64_s4_add",
+        match (self.variant, self.tile_m, self.tile_n, self.stages) {
+            (GEMM_VARIANT_BASIC, 16, 64, 3) => "cutlass_16x64_s3_add",
+            (GEMM_VARIANT_BASIC, 16, 64, 4) => "cutlass_16x64_s4_add",
+            (GEMM_VARIANT_BASIC, 16, 128, 3) => "cutlass_16x128_s3_add",
+            (GEMM_VARIANT_BASIC, 16, 128, 4) => "cutlass_16x128_s4_add",
+            (GEMM_VARIANT_BASIC, 32, 64, 3) => "cutlass_32x64_s3_add",
+            (GEMM_VARIANT_BASIC, 32, 64, 4) => "cutlass_32x64_s4_add",
+            (GEMM_VARIANT_BASIC, 32, 128, 3) => "cutlass_32x128_s3_add",
+            (GEMM_VARIANT_BASIC, 32, 128, 4) => "cutlass_32x128_s4_add",
+            (GEMM_VARIANT_BASIC, 32, 256, 3) => "cutlass_32x256_s3_add",
+            (GEMM_VARIANT_BASIC, 64, 64, 3) => "cutlass_64x64_s3_add",
+            (GEMM_VARIANT_BASIC, 64, 64, 4) => "cutlass_64x64_s4_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 3) => "cutlass_64x128_s3_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 4) => "cutlass_64x128_s4_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 3) => "cutlass_128x64_s3_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 4) => "cutlass_128x64_s4_add",
+            (GEMM_VARIANT_BASIC, 128, 128, 3) => "cutlass_128x128_s3_add",
+            (GEMM_VARIANT_BASIC, 128, 128, 4) => "cutlass_128x128_s4_add",
+            (GEMM_VARIANT_BASIC, 128, 256, 3) => "cutlass_128x256_s3_add",
+            (GEMM_VARIANT_BASIC, 256, 64, 3) => "cutlass_256x64_s3_add",
+            (GEMM_VARIANT_BASIC, 256, 64, 4) => "cutlass_256x64_s4_add",
+            (GEMM_VARIANT_SW, 64, 128, 3) => "cutlass_64x128_sw_s3_add",
+            (GEMM_VARIANT_SW, 64, 128, 4) => "cutlass_64x128_sw_s4_add",
+            (GEMM_VARIANT_SW, 64, 256, 2) => "cutlass_64x256_sw_s2_add",
+            (GEMM_VARIANT_SW, 64, 256, 3) => "cutlass_64x256_sw_s3_add",
+            (GEMM_VARIANT_SW, 128, 128, 2) => "cutlass_128x128_sw_s2_add",
+            (GEMM_VARIANT_SW, 128, 128, 3) => "cutlass_128x128_sw_s3_add",
+            (GEMM_VARIANT_SW, 128, 128, 4) => "cutlass_128x128_sw_s4_add",
+            (GEMM_VARIANT_SW, 128, 256, 2) => "cutlass_128x256_sw_s2_add",
+            (GEMM_VARIANT_SW, 128, 256, 3) => "cutlass_128x256_sw_s3_add",
+            (GEMM_VARIANT_SW, 256, 64, 3) => "cutlass_256x64_sw_s3_add",
+            (GEMM_VARIANT_SW, 256, 64, 4) => "cutlass_256x64_sw_s4_add",
+            // Deep-stage / stages-2 basic-tile add variants.
+            (GEMM_VARIANT_BASIC, 64, 64, 2) => "cutlass_64x64_s2_add",
+            (GEMM_VARIANT_BASIC, 64, 64, 5) => "cutlass_64x64_s5_add",
+            (GEMM_VARIANT_BASIC, 64, 64, 6) => "cutlass_64x64_s6_add",
+            (GEMM_VARIANT_BASIC, 64, 64, 8) => "cutlass_64x64_s8_add",
+            (GEMM_VARIANT_BASIC, 64, 64, 10) => "cutlass_64x64_s10_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 2) => "cutlass_64x128_s2_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 5) => "cutlass_64x128_s5_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 6) => "cutlass_64x128_s6_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 7) => "cutlass_64x128_s7_add",
+            (GEMM_VARIANT_BASIC, 64, 128, 8) => "cutlass_64x128_s8_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 2) => "cutlass_128x64_s2_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 5) => "cutlass_128x64_s5_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 6) => "cutlass_128x64_s6_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 7) => "cutlass_128x64_s7_add",
+            (GEMM_VARIANT_BASIC, 128, 64, 8) => "cutlass_128x64_s8_add",
+            (GEMM_VARIANT_BASIC, 128, 128, 2) => "cutlass_128x128_s2_add",
+            (GEMM_VARIANT_BASIC, 128, 128, 5) => "cutlass_128x128_s5_add",
+            (GEMM_VARIANT_BASIC, 128, 128, 6) => "cutlass_128x128_s6_add",
+            (GEMM_VARIANT_BASIC, 64, 256, 2) => "cutlass_64x256_s2_add",
+            (GEMM_VARIANT_BASIC, 64, 256, 3) => "cutlass_64x256_s3_add",
+            (GEMM_VARIANT_BASIC, 64, 256, 4) => "cutlass_64x256_s4_add",
+            (GEMM_VARIANT_BASIC, 64, 256, 5) => "cutlass_64x256_s5_add",
+            (GEMM_VARIANT_BASIC, 128, 256, 2) => "cutlass_128x256_s2_add",
+            (GEMM_VARIANT_BASIC, 128, 256, 4) => "cutlass_128x256_s4_add",
+            (GEMM_VARIANT_BASIC, 256, 64, 2) => "cutlass_256x64_s2_add",
+            (GEMM_VARIANT_BASIC, 256, 64, 5) => "cutlass_256x64_s5_add",
+            (GEMM_VARIANT_BASIC, 256, 64, 6) => "cutlass_256x64_s6_add",
+            (GEMM_VARIANT_BASIC, 256, 128, 2) => "cutlass_256x128_s2_add",
             _ => "cutlass_unknown_add",
         }
     }
@@ -11305,6 +11498,7 @@ impl Implementation for CutlassGemmAddImpl {
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
+                ("variant", syn::parse_quote!(u32)),
                 ("n", syn::parse_quote!(u32)),
                 ("k", syn::parse_quote!(u32)),
             ],
@@ -11355,6 +11549,7 @@ impl Implementation for CutlassGemmAddImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
+        let variant = self.variant;
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassGemmAdd: gemm (N, K) must resolve from FUF + bounds");
         Some(vec![OpInstance::new(
@@ -11367,6 +11562,7 @@ impl Implementation for CutlassGemmAddImpl {
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
+                quote! { #variant },
                 quote! { #n },
                 quote! { #k },
             ],
@@ -17523,6 +17719,7 @@ mod tests {
             tile_m: 128,
             tile_n: 128,
             stages: 4,
+            variant: GEMM_VARIANT_BASIC,
         };
         let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(

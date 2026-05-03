@@ -273,7 +273,24 @@ pub enum Instruction<W> {
     DeepSeekMoe(u32, u32, u32, WtFn<W, DeepSeekV2MoELayer>),
     DeepSeekMoeFp8Block(u32, u32, u32, WtFn<W, DeepSeekV2Fp8BlockMoELayer>),
     DeepSeekMoeGgml(u32, u32, u32, WtFn<W, DeepSeekV2GgmlMoELayer>),
-    CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    /// `(in_slot, out_slot, layer, weight_fn, tile_m, tile_n, stages,
+    /// variant, n, k)`. `variant` is the `GEMM_VARIANT_*` discriminant
+    /// the proc-macro emits — decoded back to `cutlass::GemmVariant`
+    /// in the runtime body. Adding a new variant family means
+    /// extending both the kernel-side `GemmVariant` enum, the
+    /// proc-macro's `GEMM_VARIANT_*` constants, and this dispatch.
+    CutlassGemm(
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
     CutlassGemmSplitK(
         u32,
         u32,
@@ -286,7 +303,23 @@ pub enum Instruction<W> {
         u32,
         u32,
     ),
-    CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    /// `(in_slot, residual_slot, layer, weight_fn, tile_m, tile_n,
+    /// stages, variant, n, k)`. `variant` is the same `GEMM_VARIANT_*`
+    /// discriminant `Instruction::CutlassGemm` uses; the SW family
+    /// shares launch fns with the basic family — same kernel called
+    /// with `beta=1.0`.
+    CutlassGemmAdd(
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+    ),
     CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
@@ -1580,6 +1613,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
+                variant,
                 n,
                 k,
             ) => unsafe {
@@ -1587,10 +1621,23 @@ impl<W: CanonicalParams> Instruction<W> {
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
                 assert_weight_shape("CutlassGemm", w.dense_weight(), n, k, tp_active(ctx));
+                // Decode the proc-macro's GEMM_VARIANT_* constant into
+                // the strongly-typed kernel-side enum. Unknown values
+                // are a codegen-vs-runtime contract violation —
+                // adding a new variant requires updating both sides
+                // (see the matching const block in
+                // `ferrite-forward-macro/src/impl_lib.rs`).
+                let variant = match variant {
+                    0 => cutlass::GemmVariant::Basic,
+                    1 => cutlass::GemmVariant::Sw,
+                    other => panic!(
+                        "CutlassGemm: unknown variant id {other} — proc-macro emitted a tag the runtime doesn't decode"
+                    ),
+                };
                 let out = cutlass::cutlass_gemm(
                     *v,
                     w.dense_weight(),
-                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    cutlass::CutlassTile::with_variant(tile_m, tile_n, stages, variant),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -1629,6 +1676,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
+                variant,
                 n,
                 k,
             ) => unsafe {
@@ -1637,11 +1685,18 @@ impl<W: CanonicalParams> Instruction<W> {
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
                 assert_weight_shape("CutlassGemmAdd", w.dense_weight(), n, k, tp_active(ctx));
+                let variant = match variant {
+                    0 => cutlass::GemmVariant::Basic,
+                    1 => cutlass::GemmVariant::Sw,
+                    other => panic!(
+                        "CutlassGemmAdd: unknown variant id {other} — proc-macro / runtime contract drift"
+                    ),
+                };
                 cutlass::cutlass_gemm_add(
                     *v,
                     w.dense_weight(),
                     *residual,
-                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    cutlass::CutlassTile::with_variant(tile_m, tile_n, stages, variant),
                     ctx.device.compute_stream,
                 );
             },
@@ -2214,24 +2269,14 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                let out = w.forward(
-                    v,
-                    &mut ctx.device.cublas,
-                    &mut ctx.device.caching,
-                    ctx.device.compute_stream,
-                );
+                let out = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                let gate_up = w.forward(
-                    v,
-                    &mut ctx.device.cublas,
-                    &mut ctx.device.caching,
-                    ctx.device.compute_stream,
-                );
+                let gate_up = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 let out = kernels::silu_and_mul_fused(
                     *gate_up,
                     W::INTERMEDIATE_SIZE,
@@ -2244,12 +2289,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                let gate_up = w.forward(
-                    v,
-                    &mut ctx.device.cublas,
-                    &mut ctx.device.caching,
-                    ctx.device.compute_stream,
-                );
+                let gate_up = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 let out = kernels::gelu_and_mul_fused(
                     *gate_up,
                     W::INTERMEDIATE_SIZE,
@@ -2269,12 +2309,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
-                let qkv_packed = w.forward(
-                    v,
-                    &mut ctx.device.cublas,
-                    &mut ctx.device.caching,
-                    ctx.device.compute_stream,
-                );
+                let qkv_packed = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 let cos_sin = (cos_sin_fn)(ctx.wm, layer);
                 let out = if interleaved {
                     kernels::fused_qkv_interleaved_rope_cache(
@@ -2339,12 +2374,8 @@ impl<W: CanonicalParams> Instruction<W> {
                 let (q, k, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                     let w = (weight_fn)(ctx.wm, layer);
-                    let qkv_packed = w.forward(
-                        view_in,
-                        &mut ctx.device.cublas,
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                    );
+                    let qkv_packed =
+                        w.forward(view_in, &mut ctx.device.caching, ctx.device.compute_stream);
                     let cos_sin = (cos_sin_fn)(ctx.wm, layer);
                     kernels::fused_qkv_rope(
                         *qkv_packed,

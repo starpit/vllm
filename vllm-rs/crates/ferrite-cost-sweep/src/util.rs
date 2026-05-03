@@ -31,6 +31,23 @@ pub fn gpu_alloc_zeros(bytes: usize) -> u64 {
     }
 }
 
+/// `(free_bytes, total_bytes)` on device 0. Used by the sweep to gate
+/// the SplitK workspace alloc — at vocab-N M=4096 shapes the sk=8
+/// workspace is ~20 GB, which fits L40s/H100 but blows past L4's
+/// 24 GB once A / B / C / c_up are live. Querying actual free VRAM
+/// makes the gate hardware-aware instead of hard-coded for one GPU.
+pub fn gpu_mem_info() -> (usize, usize) {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    let rc = unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    assert_eq!(
+        rc,
+        sys::CUresult::CUDA_SUCCESS,
+        "cuMemGetInfo_v2 failed: {rc:?}"
+    );
+    (free, total)
+}
+
 /// Allocate `bytes` on device 0 and fill every byte with `pattern`. Used by
 /// the attention sweep to prime Q/K/V buffers with a small-positive bf16
 /// pattern (`0x3c`) so FA2 and FlashInfer see identical (non-pathological)
@@ -69,6 +86,26 @@ pub fn query_num_sm() -> i32 {
     unsafe { ferrite_cuda_core::driver::device_get_num_sm(device) }
         .expect("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT) failed")
 }
+
+/// Sentinel cost emitted when a kernel is detected as broken — matches
+/// `UNCALIBRATED_COST_US` in the proc-macro, so the DP reads these
+/// rows as "uncalibrated → skip" instead of "instant → always pick".
+///
+/// Triggered on three signals:
+/// 1. The probe call before timing returns rc ≠ 0 (e.g., CUTLASS's
+///    `can_implement` rejects the shape — most often SMEM > 99KB on
+///    sm89).
+/// 2. The measured per-launch cost is below `BROKEN_KERNEL_THRESHOLD_US`
+///    after subtracting launch overhead — kernel "ran" too fast to
+///    have done real work.
+/// 3. The probe call already raised a CUDA driver error (caught by
+///    the call site's existing `cudaGetLastError` discipline).
+pub const BROKEN_KERNEL_SENTINEL_US: f64 = 1.0e9;
+
+/// Anything below this is treated as "kernel did nothing". Real GEMM
+/// kernels at any shape we care about are >> 1µs; sub-µs measurements
+/// are silent failures (SMEM exhaustion, can_implement reject, etc.).
+pub const BROKEN_KERNEL_THRESHOLD_US: f64 = 0.5;
 
 /// Benchmark a closure that launches a single kernel:
 /// warmup + timed iterations via `cuEventElapsedTime`. Returns mean

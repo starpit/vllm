@@ -647,6 +647,7 @@ impl<W> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
+                variant,
                 n,
                 k,
             ) => (
@@ -659,6 +660,7 @@ impl<W> Instruction<W> {
                     F::ConstU32(tile_m),
                     F::ConstU32(tile_n),
                     F::ConstU32(stages),
+                    F::ConstU32(variant),
                     F::WeightShape { n, k },
                 ],
             ),
@@ -695,6 +697,7 @@ impl<W> Instruction<W> {
                 tile_m,
                 tile_n,
                 stages,
+                variant,
                 n,
                 k,
             ) => (
@@ -707,6 +710,7 @@ impl<W> Instruction<W> {
                     F::ConstU32(tile_m),
                     F::ConstU32(tile_n),
                     F::ConstU32(stages),
+                    F::ConstU32(variant),
                     F::WeightShape { n, k },
                 ],
             ),
@@ -1249,7 +1253,7 @@ mod tests {
     #[test]
     fn cutlass_gemm_add_keeps_tile_consts() {
         let i: Instruction<W> =
-            Instruction::CutlassGemmAdd(5, 6, 0, linear_wf, 128, 128, 3, 4096, 11008);
+            Instruction::CutlassGemmAdd(5, 6, 0, linear_wf, 128, 128, 3, 0, 4096, 11008);
         let n = i.normalize();
         assert_eq!(n.kind, "CutlassGemmAdd");
         assert_eq!(

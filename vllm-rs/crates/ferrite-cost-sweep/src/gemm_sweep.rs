@@ -63,37 +63,115 @@
 
 use cudarc::driver::sys;
 use ferrite_kernels::cutlass::{
-    cutlass_gemm_16x64_s3_launch, cutlass_gemm_16x64_s4_launch, cutlass_gemm_16x64_s4_sk2_launch,
-    cutlass_gemm_16x64_s4_sk4_launch, cutlass_gemm_16x64_s4_sk8_launch,
-    cutlass_gemm_16x128_s3_launch, cutlass_gemm_16x128_s4_launch,
-    cutlass_gemm_16x128_s4_sk2_launch, cutlass_gemm_16x128_s4_sk4_launch,
-    cutlass_gemm_16x128_s4_sk8_launch, cutlass_gemm_32x64_s3_launch, cutlass_gemm_32x64_s4_launch,
-    cutlass_gemm_32x128_s3_launch, cutlass_gemm_32x128_s4_launch, cutlass_gemm_32x256_s3_launch,
-    cutlass_gemm_64x64_s3_launch, cutlass_gemm_64x64_s4_launch, cutlass_gemm_64x64_s4_sk2_launch,
-    cutlass_gemm_64x64_s4_sk4_launch, cutlass_gemm_64x64_s4_sk8_launch,
-    cutlass_gemm_64x128_s3_launch, cutlass_gemm_64x128_s4_launch,
-    cutlass_gemm_64x128_s4_sk2_launch, cutlass_gemm_64x128_s4_sk4_launch,
-    cutlass_gemm_64x128_s4_sk8_launch, cutlass_gemm_128x64_s3_launch,
-    cutlass_gemm_128x64_s4_launch, cutlass_gemm_128x64_s4_sk2_launch,
-    cutlass_gemm_128x64_s4_sk4_launch, cutlass_gemm_128x64_s4_sk8_launch,
-    cutlass_gemm_128x128_s3_launch, cutlass_gemm_128x128_s4_launch,
-    cutlass_gemm_128x128_s4_sk2_launch, cutlass_gemm_128x128_s4_sk4_launch,
-    cutlass_gemm_128x128_s4_sk8_launch, cutlass_gemm_128x256_s3_launch,
-    cutlass_gemm_256x64_s3_launch, cutlass_gemm_256x64_s4_launch,
-    cutlass_gemm_bias_16x64_s3_launch, cutlass_gemm_bias_16x64_s4_launch,
-    cutlass_gemm_bias_16x128_s3_launch, cutlass_gemm_bias_16x128_s4_launch,
-    cutlass_gemm_bias_32x64_s3_launch, cutlass_gemm_bias_32x64_s4_launch,
-    cutlass_gemm_bias_32x128_s3_launch, cutlass_gemm_bias_32x128_s4_launch,
-    cutlass_gemm_bias_32x256_s3_launch, cutlass_gemm_bias_64x64_s3_launch,
-    cutlass_gemm_bias_64x64_s4_launch, cutlass_gemm_bias_64x128_s3_launch,
-    cutlass_gemm_bias_64x128_s4_launch, cutlass_gemm_bias_128x64_s3_launch,
-    cutlass_gemm_bias_128x64_s4_launch, cutlass_gemm_bias_128x128_s3_launch,
-    cutlass_gemm_bias_128x128_s4_launch, cutlass_gemm_bias_128x256_s3_launch,
-    cutlass_gemm_bias_256x64_s3_launch, cutlass_gemm_bias_256x64_s4_launch,
-    cutlass_gemm_silu_mul_launch, cutlass_gemv_launch,
+    cutlass_gemm_16x64_s3_launch,
+    cutlass_gemm_16x64_s4_launch,
+    cutlass_gemm_16x64_s4_sk2_launch,
+    cutlass_gemm_16x64_s4_sk4_launch,
+    cutlass_gemm_16x64_s4_sk8_launch,
+    cutlass_gemm_16x128_s3_launch,
+    cutlass_gemm_16x128_s4_launch,
+    cutlass_gemm_16x128_s4_sk2_launch,
+    cutlass_gemm_16x128_s4_sk4_launch,
+    cutlass_gemm_16x128_s4_sk8_launch,
+    cutlass_gemm_32x64_s3_launch,
+    cutlass_gemm_32x64_s4_launch,
+    cutlass_gemm_32x128_s3_launch,
+    cutlass_gemm_32x128_s4_launch,
+    cutlass_gemm_32x256_s3_launch,
+    // ── Deep-stage / stages-2 basic-tile family. Same kernel template
+    // as the basic tiles, just different stage counts; matches cuBLAS's
+    // mid-M picks observed via NVTX-tagged nsys traces.
+    cutlass_gemm_64x64_s2_launch,
+    cutlass_gemm_64x64_s3_launch,
+    cutlass_gemm_64x64_s4_launch,
+    cutlass_gemm_64x64_s4_sk2_launch,
+    cutlass_gemm_64x64_s4_sk4_launch,
+    cutlass_gemm_64x64_s4_sk8_launch,
+    cutlass_gemm_64x64_s5_launch,
+    cutlass_gemm_64x64_s6_launch,
+    cutlass_gemm_64x64_s8_launch,
+    cutlass_gemm_64x64_s10_launch,
+    cutlass_gemm_64x128_s2_launch,
+    cutlass_gemm_64x128_s3_launch,
+    cutlass_gemm_64x128_s4_launch,
+    cutlass_gemm_64x128_s4_sk2_launch,
+    cutlass_gemm_64x128_s4_sk4_launch,
+    cutlass_gemm_64x128_s4_sk8_launch,
+    cutlass_gemm_64x128_s5_launch,
+    cutlass_gemm_64x128_s6_launch,
+    cutlass_gemm_64x128_s7_launch,
+    cutlass_gemm_64x128_s8_launch,
+    // ── Swizzle (`_sw_`) family — `GemmIdentityThreadblockSwizzle<8>`.
+    cutlass_gemm_64x128_sw_s3_launch,
+    cutlass_gemm_64x128_sw_s4_launch,
+    cutlass_gemm_64x256_s2_launch,
+    cutlass_gemm_64x256_s3_launch,
+    cutlass_gemm_64x256_s4_launch,
+    cutlass_gemm_64x256_s5_launch,
+    cutlass_gemm_64x256_sw_s2_launch,
+    cutlass_gemm_64x256_sw_s3_launch,
+    cutlass_gemm_128x64_s2_launch,
+    cutlass_gemm_128x64_s3_launch,
+    cutlass_gemm_128x64_s4_launch,
+    cutlass_gemm_128x64_s4_sk2_launch,
+    cutlass_gemm_128x64_s4_sk4_launch,
+    cutlass_gemm_128x64_s4_sk8_launch,
+    cutlass_gemm_128x64_s5_launch,
+    cutlass_gemm_128x64_s6_launch,
+    cutlass_gemm_128x64_s7_launch,
+    cutlass_gemm_128x64_s8_launch,
+    cutlass_gemm_128x128_s2_launch,
+    cutlass_gemm_128x128_s3_launch,
+    cutlass_gemm_128x128_s4_launch,
+    cutlass_gemm_128x128_s4_sk2_launch,
+    cutlass_gemm_128x128_s4_sk4_launch,
+    cutlass_gemm_128x128_s4_sk8_launch,
+    cutlass_gemm_128x128_s5_launch,
+    cutlass_gemm_128x128_s6_launch,
+    cutlass_gemm_128x128_sw_s2_launch,
+    cutlass_gemm_128x128_sw_s3_launch,
+    cutlass_gemm_128x128_sw_s4_launch,
+    cutlass_gemm_128x256_s2_launch,
+    cutlass_gemm_128x256_s3_launch,
+    cutlass_gemm_128x256_s4_launch,
+    cutlass_gemm_128x256_sw_s2_launch,
+    cutlass_gemm_128x256_sw_s3_launch,
+    cutlass_gemm_256x64_s2_launch,
+    cutlass_gemm_256x64_s3_launch,
+    cutlass_gemm_256x64_s4_launch,
+    cutlass_gemm_256x64_s5_launch,
+    cutlass_gemm_256x64_s6_launch,
+    cutlass_gemm_256x64_sw_s3_launch,
+    cutlass_gemm_256x64_sw_s4_launch,
+    cutlass_gemm_256x128_s2_launch,
+    cutlass_gemm_bias_16x64_s3_launch,
+    cutlass_gemm_bias_16x64_s4_launch,
+    cutlass_gemm_bias_16x128_s3_launch,
+    cutlass_gemm_bias_16x128_s4_launch,
+    cutlass_gemm_bias_32x64_s3_launch,
+    cutlass_gemm_bias_32x64_s4_launch,
+    cutlass_gemm_bias_32x128_s3_launch,
+    cutlass_gemm_bias_32x128_s4_launch,
+    cutlass_gemm_bias_32x256_s3_launch,
+    cutlass_gemm_bias_64x64_s3_launch,
+    cutlass_gemm_bias_64x64_s4_launch,
+    cutlass_gemm_bias_64x128_s3_launch,
+    cutlass_gemm_bias_64x128_s4_launch,
+    cutlass_gemm_bias_128x64_s3_launch,
+    cutlass_gemm_bias_128x64_s4_launch,
+    cutlass_gemm_bias_128x128_s3_launch,
+    cutlass_gemm_bias_128x128_s4_launch,
+    cutlass_gemm_bias_128x256_s3_launch,
+    cutlass_gemm_bias_256x64_s3_launch,
+    cutlass_gemm_bias_256x64_s4_launch,
+    cutlass_gemm_silu_mul_launch,
+    cutlass_gemv_launch,
 };
 
-use crate::util::{bench_kernel, gpu_alloc_zeros};
+use crate::util::{
+    BROKEN_KERNEL_SENTINEL_US, BROKEN_KERNEL_THRESHOLD_US, bench_kernel, gpu_alloc_zeros,
+    gpu_mem_info,
+};
 
 // Elementwise kernels live in vllm-cuda's csrc and are declared
 // extern-private inside ferrite-kernels::kernels. The cost-sweep
@@ -422,15 +500,35 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
     let _ = (m_i, n_i, k_i);
 
     // ── CUTLASS tile zoo — the 16 variants the current solver registers ──
+    //
+    // Probe each kernel once with rc checking before timing. CUTLASS's
+    // `can_implement` returns -1 when SMEM exceeds sm89's 99KB cap or
+    // when other config gates fail (warp-shape misalignment, etc.).
+    // Without this probe, broken kernels record cost=0.0 in the CSV
+    // and the DP picks them as "instantly cheapest" — leading to
+    // garbage output at runtime (verified at `64x256_s5` /
+    // `256x128_s2` on L4: chat output became incoherent).
     macro_rules! bench_cutlass {
         ($($name:literal => $fn:ident),* $(,)?) => {
             $(
-                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                let probe_rc = unsafe {
                     $fn(
                         c as *mut u16, a as *const u16, b as *const u16,
                         m_i, n_i, k_i, 1.0, 0.0, stream as u64,
-                    );
-                }) - launch_overhead_us).max(0.0);
+                    )
+                };
+                let us = if probe_rc != 0 {
+                    BROKEN_KERNEL_SENTINEL_US
+                } else {
+                    let raw = bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                        $fn(
+                            c as *mut u16, a as *const u16, b as *const u16,
+                            m_i, n_i, k_i, 1.0, 0.0, stream as u64,
+                        );
+                    });
+                    let net = (raw - launch_overhead_us).max(0.0);
+                    if net < BROKEN_KERNEL_THRESHOLD_US { BROKEN_KERNEL_SENTINEL_US } else { net }
+                };
                 println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
             )*
         };
@@ -456,6 +554,51 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
         "cutlass_128x256_s3" => cutlass_gemm_128x256_s3_launch,
         "cutlass_256x64_s3"  => cutlass_gemm_256x64_s3_launch,
         "cutlass_256x64_s4"  => cutlass_gemm_256x64_s4_launch,
+        // ── Swizzle (`_sw_`) variants — `GemmIdentityThreadblockSwizzle<8>`
+        // boosts L2 locality at large grids (cuBLAS's documented choice
+        // for 128×128 at M=1024+; csrc note flagged the 128×128 variant
+        // as the worst remaining gap vs cuBLAS).
+        "cutlass_64x128_sw_s3"  => cutlass_gemm_64x128_sw_s3_launch,
+        "cutlass_64x128_sw_s4"  => cutlass_gemm_64x128_sw_s4_launch,
+        "cutlass_64x256_sw_s2"  => cutlass_gemm_64x256_sw_s2_launch,
+        "cutlass_64x256_sw_s3"  => cutlass_gemm_64x256_sw_s3_launch,
+        "cutlass_128x128_sw_s2" => cutlass_gemm_128x128_sw_s2_launch,
+        "cutlass_128x128_sw_s3" => cutlass_gemm_128x128_sw_s3_launch,
+        "cutlass_128x128_sw_s4" => cutlass_gemm_128x128_sw_s4_launch,
+        "cutlass_128x256_sw_s2" => cutlass_gemm_128x256_sw_s2_launch,
+        "cutlass_128x256_sw_s3" => cutlass_gemm_128x256_sw_s3_launch,
+        "cutlass_256x64_sw_s3"  => cutlass_gemm_256x64_sw_s3_launch,
+        "cutlass_256x64_sw_s4"  => cutlass_gemm_256x64_sw_s4_launch,
+        // Deep-stage / stages-2 basic-tile variants (28 new rows).
+        // Matches cuBLAS's mid-M picks (`stages_64x3`, `_32x6`, etc.).
+        "cutlass_64x64_s2"   => cutlass_gemm_64x64_s2_launch,
+        "cutlass_64x64_s5"   => cutlass_gemm_64x64_s5_launch,
+        "cutlass_64x64_s6"   => cutlass_gemm_64x64_s6_launch,
+        "cutlass_64x64_s8"   => cutlass_gemm_64x64_s8_launch,
+        "cutlass_64x64_s10"  => cutlass_gemm_64x64_s10_launch,
+        "cutlass_64x128_s2"  => cutlass_gemm_64x128_s2_launch,
+        "cutlass_64x128_s5"  => cutlass_gemm_64x128_s5_launch,
+        "cutlass_64x128_s6"  => cutlass_gemm_64x128_s6_launch,
+        "cutlass_64x128_s7"  => cutlass_gemm_64x128_s7_launch,
+        "cutlass_64x128_s8"  => cutlass_gemm_64x128_s8_launch,
+        "cutlass_128x64_s2"  => cutlass_gemm_128x64_s2_launch,
+        "cutlass_128x64_s5"  => cutlass_gemm_128x64_s5_launch,
+        "cutlass_128x64_s6"  => cutlass_gemm_128x64_s6_launch,
+        "cutlass_128x64_s7"  => cutlass_gemm_128x64_s7_launch,
+        "cutlass_128x64_s8"  => cutlass_gemm_128x64_s8_launch,
+        "cutlass_128x128_s2" => cutlass_gemm_128x128_s2_launch,
+        "cutlass_128x128_s5" => cutlass_gemm_128x128_s5_launch,
+        "cutlass_128x128_s6" => cutlass_gemm_128x128_s6_launch,
+        "cutlass_64x256_s2"  => cutlass_gemm_64x256_s2_launch,
+        "cutlass_64x256_s3"  => cutlass_gemm_64x256_s3_launch,
+        "cutlass_64x256_s4"  => cutlass_gemm_64x256_s4_launch,
+        "cutlass_64x256_s5"  => cutlass_gemm_64x256_s5_launch,
+        "cutlass_128x256_s2" => cutlass_gemm_128x256_s2_launch,
+        "cutlass_128x256_s4" => cutlass_gemm_128x256_s4_launch,
+        "cutlass_256x64_s2"  => cutlass_gemm_256x64_s2_launch,
+        "cutlass_256x64_s5"  => cutlass_gemm_256x64_s5_launch,
+        "cutlass_256x64_s6"  => cutlass_gemm_256x64_s6_launch,
+        "cutlass_256x128_s2" => cutlass_gemm_256x128_s2_launch,
     );
 
     // ── CUTLASS tile zoo, beta=1.0 residual-add variant ──
@@ -473,12 +616,24 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
     macro_rules! bench_cutlass_add {
         ($($name:literal => $fn:ident),* $(,)?) => {
             $(
-                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                let probe_rc = unsafe {
                     $fn(
                         c as *mut u16, a as *const u16, b as *const u16,
                         m_i, n_i, k_i, 1.0, 1.0, stream as u64,
-                    );
-                }) - launch_overhead_us).max(0.0);
+                    )
+                };
+                let us = if probe_rc != 0 {
+                    BROKEN_KERNEL_SENTINEL_US
+                } else {
+                    let raw = bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                        $fn(
+                            c as *mut u16, a as *const u16, b as *const u16,
+                            m_i, n_i, k_i, 1.0, 1.0, stream as u64,
+                        );
+                    });
+                    let net = (raw - launch_overhead_us).max(0.0);
+                    if net < BROKEN_KERNEL_THRESHOLD_US { BROKEN_KERNEL_SENTINEL_US } else { net }
+                };
                 println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
             )*
         };
@@ -504,6 +659,56 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
         "cutlass_128x256_s3_add" => cutlass_gemm_128x256_s3_launch,
         "cutlass_256x64_s3_add"  => cutlass_gemm_256x64_s3_launch,
         "cutlass_256x64_s4_add"  => cutlass_gemm_256x64_s4_launch,
+        // ── SW (`_sw_`) `_add` measurements ──
+        // Same SW launch fns as the basic Sw rows above, called with
+        // beta=1.0 to capture the residual aux-read cost. Picked by
+        // `CutlassGemmAddImpl{variant: Sw}` at body-residual GEMMs
+        // (o_proj, down_proj at large M) where SW already won the
+        // standalone bench but couldn't be picked when an Add forces
+        // routing through CutlassGemmAdd.
+        "cutlass_64x128_sw_s3_add"  => cutlass_gemm_64x128_sw_s3_launch,
+        "cutlass_64x128_sw_s4_add"  => cutlass_gemm_64x128_sw_s4_launch,
+        "cutlass_64x256_sw_s2_add"  => cutlass_gemm_64x256_sw_s2_launch,
+        "cutlass_64x256_sw_s3_add"  => cutlass_gemm_64x256_sw_s3_launch,
+        "cutlass_128x128_sw_s2_add" => cutlass_gemm_128x128_sw_s2_launch,
+        "cutlass_128x128_sw_s3_add" => cutlass_gemm_128x128_sw_s3_launch,
+        "cutlass_128x128_sw_s4_add" => cutlass_gemm_128x128_sw_s4_launch,
+        "cutlass_128x256_sw_s2_add" => cutlass_gemm_128x256_sw_s2_launch,
+        "cutlass_128x256_sw_s3_add" => cutlass_gemm_128x256_sw_s3_launch,
+        "cutlass_256x64_sw_s3_add"  => cutlass_gemm_256x64_sw_s3_launch,
+        "cutlass_256x64_sw_s4_add"  => cutlass_gemm_256x64_sw_s4_launch,
+        // Deep-stage / stages-2 _add measurements: same launch fns
+        // as the basic deep-stage rows but with `beta=1.0` so the
+        // residual aux-read cost shows in the CSV. `CutlassGemmAddImpl`
+        // picks these per (M, N, K) bucket.
+        "cutlass_64x64_s2_add"   => cutlass_gemm_64x64_s2_launch,
+        "cutlass_64x64_s5_add"   => cutlass_gemm_64x64_s5_launch,
+        "cutlass_64x64_s6_add"   => cutlass_gemm_64x64_s6_launch,
+        "cutlass_64x64_s8_add"   => cutlass_gemm_64x64_s8_launch,
+        "cutlass_64x64_s10_add"  => cutlass_gemm_64x64_s10_launch,
+        "cutlass_64x128_s2_add"  => cutlass_gemm_64x128_s2_launch,
+        "cutlass_64x128_s5_add"  => cutlass_gemm_64x128_s5_launch,
+        "cutlass_64x128_s6_add"  => cutlass_gemm_64x128_s6_launch,
+        "cutlass_64x128_s7_add"  => cutlass_gemm_64x128_s7_launch,
+        "cutlass_64x128_s8_add"  => cutlass_gemm_64x128_s8_launch,
+        "cutlass_128x64_s2_add"  => cutlass_gemm_128x64_s2_launch,
+        "cutlass_128x64_s5_add"  => cutlass_gemm_128x64_s5_launch,
+        "cutlass_128x64_s6_add"  => cutlass_gemm_128x64_s6_launch,
+        "cutlass_128x64_s7_add"  => cutlass_gemm_128x64_s7_launch,
+        "cutlass_128x64_s8_add"  => cutlass_gemm_128x64_s8_launch,
+        "cutlass_128x128_s2_add" => cutlass_gemm_128x128_s2_launch,
+        "cutlass_128x128_s5_add" => cutlass_gemm_128x128_s5_launch,
+        "cutlass_128x128_s6_add" => cutlass_gemm_128x128_s6_launch,
+        "cutlass_64x256_s2_add"  => cutlass_gemm_64x256_s2_launch,
+        "cutlass_64x256_s3_add"  => cutlass_gemm_64x256_s3_launch,
+        "cutlass_64x256_s4_add"  => cutlass_gemm_64x256_s4_launch,
+        "cutlass_64x256_s5_add"  => cutlass_gemm_64x256_s5_launch,
+        "cutlass_128x256_s2_add" => cutlass_gemm_128x256_s2_launch,
+        "cutlass_128x256_s4_add" => cutlass_gemm_128x256_s4_launch,
+        "cutlass_256x64_s2_add"  => cutlass_gemm_256x64_s2_launch,
+        "cutlass_256x64_s5_add"  => cutlass_gemm_256x64_s5_launch,
+        "cutlass_256x64_s6_add"  => cutlass_gemm_256x64_s6_launch,
+        "cutlass_256x128_s2_add" => cutlass_gemm_256x128_s2_launch,
     );
 
     // ── CUTLASS SplitK parallel variants ──
@@ -513,46 +718,85 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
     // cuBLAS winning (e.g. Qwen2-0.5B down_proj @ prefill).
     //
     // Each kernel needs an f32 scratch of `split_k × M × N × 4` bytes
-    // (GemmSplitKParallel contract). We allocate the largest at sk=8
-    // once and reuse it across splits — sizing matches the safe
-    // wrapper's `alloc.alloc_tensor(&[sk*M*N], F32)` at runtime.
+    // (GemmSplitKParallel contract). We size the workspace per the
+    // largest split (8) and reuse it — matches the safe wrapper's
+    // `alloc.alloc_tensor(&[sk*M*N], F32)` at runtime.
+    //
+    // Skip the SplitK rows when the workspace wouldn't fit alongside
+    // A / B / C / c_up that are already live. Query actual free VRAM
+    // so the gate is hardware-aware (L4 24 GB OOMs on `M=4096 ×
+    // N=151936` SK=8's 19.9 GB workspace; L40s 48 GB and H100 80 GB
+    // both fit it). 256 MB headroom covers driver fluctuations + the
+    // small bias_n buffer we'll allocate later in the same shape.
+    // Skipped shapes show up as missing CSV rows; the DP falls back
+    // to the predictor / roofline at those few uncalibrated SK
+    // points — vocab-class lm_head shapes don't benefit from SK
+    // anyway (the tile zoo already saturates SMs there).
     let ws_bytes = 8usize * (m as usize) * (n as usize) * 4;
-    let splitk_ws = gpu_alloc_zeros(ws_bytes);
-    macro_rules! bench_cutlass_splitk {
-        ($($name:literal => $fn:ident),* $(,)?) => {
-            $(
-                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
-                    $fn(
-                        c as *mut u16, a as *const u16, b as *const u16,
-                        m_i, n_i, k_i, 1.0, 0.0,
-                        splitk_ws as *mut u8,
-                        stream as u64,
-                    );
-                }) - launch_overhead_us).max(0.0);
-                println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
-            )*
-        };
+    let (free_vram, _total) = gpu_mem_info();
+    let safe_ws_bytes = free_vram.saturating_sub(256 * 1024 * 1024);
+    if ws_bytes <= safe_ws_bytes {
+        let splitk_ws = gpu_alloc_zeros(ws_bytes);
+        macro_rules! bench_cutlass_splitk {
+            ($($name:literal => $fn:ident),* $(,)?) => {
+                $(
+                    let probe_rc = unsafe {
+                        $fn(
+                            c as *mut u16, a as *const u16, b as *const u16,
+                            m_i, n_i, k_i, 1.0, 0.0,
+                            splitk_ws as *mut u8,
+                            stream as u64,
+                        )
+                    };
+                    let us = if probe_rc != 0 {
+                        BROKEN_KERNEL_SENTINEL_US
+                    } else {
+                        let raw = bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                            $fn(
+                                c as *mut u16, a as *const u16, b as *const u16,
+                                m_i, n_i, k_i, 1.0, 0.0,
+                                splitk_ws as *mut u8,
+                                stream as u64,
+                            );
+                        });
+                        let net = (raw - launch_overhead_us).max(0.0);
+                        if net < BROKEN_KERNEL_THRESHOLD_US { BROKEN_KERNEL_SENTINEL_US } else { net }
+                    };
+                    println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
+                )*
+            };
+        }
+        bench_cutlass_splitk!(
+            "cutlass_64x64_s4_split2"   => cutlass_gemm_64x64_s4_sk2_launch,
+            "cutlass_64x64_s4_split4"   => cutlass_gemm_64x64_s4_sk4_launch,
+            "cutlass_64x64_s4_split8"   => cutlass_gemm_64x64_s4_sk8_launch,
+            "cutlass_64x128_s4_split2"  => cutlass_gemm_64x128_s4_sk2_launch,
+            "cutlass_64x128_s4_split4"  => cutlass_gemm_64x128_s4_sk4_launch,
+            "cutlass_64x128_s4_split8"  => cutlass_gemm_64x128_s4_sk8_launch,
+            "cutlass_128x64_s4_split2"  => cutlass_gemm_128x64_s4_sk2_launch,
+            "cutlass_128x64_s4_split4"  => cutlass_gemm_128x64_s4_sk4_launch,
+            "cutlass_128x64_s4_split8"  => cutlass_gemm_128x64_s4_sk8_launch,
+            "cutlass_128x128_s4_split2" => cutlass_gemm_128x128_s4_sk2_launch,
+            "cutlass_128x128_s4_split4" => cutlass_gemm_128x128_s4_sk4_launch,
+            "cutlass_128x128_s4_split8" => cutlass_gemm_128x128_s4_sk8_launch,
+            "cutlass_16x64_s4_split2"   => cutlass_gemm_16x64_s4_sk2_launch,
+            "cutlass_16x64_s4_split4"   => cutlass_gemm_16x64_s4_sk4_launch,
+            "cutlass_16x64_s4_split8"   => cutlass_gemm_16x64_s4_sk8_launch,
+            "cutlass_16x128_s4_split2"  => cutlass_gemm_16x128_s4_sk2_launch,
+            "cutlass_16x128_s4_split4"  => cutlass_gemm_16x128_s4_sk4_launch,
+            "cutlass_16x128_s4_split8"  => cutlass_gemm_16x128_s4_sk8_launch,
+        );
+        unsafe {
+            sys::cuMemFree_v2(splitk_ws);
+        }
+    } else {
+        eprintln!(
+            "skipping splitk rows at M={m} N={n} K={k} — workspace would be \
+             {} MB, free VRAM {} MB",
+            ws_bytes / (1024 * 1024),
+            free_vram / (1024 * 1024)
+        );
     }
-    bench_cutlass_splitk!(
-        "cutlass_64x64_s4_split2"   => cutlass_gemm_64x64_s4_sk2_launch,
-        "cutlass_64x64_s4_split4"   => cutlass_gemm_64x64_s4_sk4_launch,
-        "cutlass_64x64_s4_split8"   => cutlass_gemm_64x64_s4_sk8_launch,
-        "cutlass_64x128_s4_split2"  => cutlass_gemm_64x128_s4_sk2_launch,
-        "cutlass_64x128_s4_split4"  => cutlass_gemm_64x128_s4_sk4_launch,
-        "cutlass_64x128_s4_split8"  => cutlass_gemm_64x128_s4_sk8_launch,
-        "cutlass_128x64_s4_split2"  => cutlass_gemm_128x64_s4_sk2_launch,
-        "cutlass_128x64_s4_split4"  => cutlass_gemm_128x64_s4_sk4_launch,
-        "cutlass_128x64_s4_split8"  => cutlass_gemm_128x64_s4_sk8_launch,
-        "cutlass_128x128_s4_split2" => cutlass_gemm_128x128_s4_sk2_launch,
-        "cutlass_128x128_s4_split4" => cutlass_gemm_128x128_s4_sk4_launch,
-        "cutlass_128x128_s4_split8" => cutlass_gemm_128x128_s4_sk8_launch,
-        "cutlass_16x64_s4_split2"   => cutlass_gemm_16x64_s4_sk2_launch,
-        "cutlass_16x64_s4_split4"   => cutlass_gemm_16x64_s4_sk4_launch,
-        "cutlass_16x64_s4_split8"   => cutlass_gemm_16x64_s4_sk8_launch,
-        "cutlass_16x128_s4_split2"  => cutlass_gemm_16x128_s4_sk2_launch,
-        "cutlass_16x128_s4_split4"  => cutlass_gemm_16x128_s4_sk4_launch,
-        "cutlass_16x128_s4_split8"  => cutlass_gemm_16x128_s4_sk8_launch,
-    );
 
     // ── GEMV (M=1 only) ──
     // SIMT kernel specialised for batch-1 decode.
@@ -615,13 +859,26 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
     macro_rules! bench_cutlass_bias {
         ($($name:literal => $fn:ident),* $(,)?) => {
             $(
-                let us = (bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                let probe_rc = unsafe {
                     $fn(
                         c as *mut u16, a as *const u16, b as *const u16,
                         bias_n as *const u16,
                         m_i, n_i, k_i, stream as u64,
-                    );
-                }) - launch_overhead_us).max(0.0);
+                    )
+                };
+                let us = if probe_rc != 0 {
+                    BROKEN_KERNEL_SENTINEL_US
+                } else {
+                    let raw = bench_kernel(stream, WARMUP, ITERS, || unsafe {
+                        $fn(
+                            c as *mut u16, a as *const u16, b as *const u16,
+                            bias_n as *const u16,
+                            m_i, n_i, k_i, stream as u64,
+                        );
+                    });
+                    let net = (raw - launch_overhead_us).max(0.0);
+                    if net < BROKEN_KERNEL_THRESHOLD_US { BROKEN_KERNEL_SENTINEL_US } else { net }
+                };
                 println!(concat!($name, ",{},{},{},{:.1}"), m, n, k, us);
             )*
         };
@@ -655,8 +912,9 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
         sys::cuMemFree_v2(c);
         sys::cuMemFree_v2(c_up);
         sys::cuMemFree_v2(bias_n);
-        sys::cuMemFree_v2(splitk_ws);
     }
+    // splitk_ws is freed inside the SAFE_WS_BYTES guard above; nothing
+    // to free here when the guard skipped allocation.
 }
 
 fn sweep_elementwise(stream: sys::CUstream, launch_overhead_us: f64) {

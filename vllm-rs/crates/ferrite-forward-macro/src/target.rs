@@ -288,7 +288,7 @@ impl CostTable {
             return Some(measured);
         }
         self.predictors
-            .get(&kernel.to_string())
+            .get(kernel)
             .and_then(|model| model.predict(m, n, k))
     }
 

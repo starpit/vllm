@@ -749,12 +749,12 @@ pub fn storage_format_for_weight(
     // never reach a Gemm tile (Embedding, RmsNorm, biases) have no
     // quantized representation on disk and must stay Dense.
     //
-    // `OpKind::DeepSeekMoe` carries one logical `moe[layer]` weight
-    // whose underlying experts are matmul-quantizable in V3/Kimi K2
-    // FP8 checkpoints, so it counts as reaching a matmul.
+    // `OpKind::Moe` carries one logical `moe[layer]` weight whose
+    // underlying experts are matmul-quantizable in V3/Kimi K2 FP8
+    // checkpoints, so it counts as reaching a matmul.
     let mut reached_by_matmul = false;
     for node in &fuf.nodes {
-        if node.op != OpKind::Gemm && node.op != OpKind::DeepSeekMoe {
+        if node.op != OpKind::Gemm && node.op != OpKind::Moe {
             continue;
         }
         for input in &node.inputs {

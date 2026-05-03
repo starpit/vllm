@@ -157,11 +157,18 @@ pub enum OpKind {
     /// `(positions, rotary, kv_cache[layer], block_table)`. Output:
     /// `[T, num_attention_heads * v_head_dim]`. Used by DeepSeek V2/V3.
     MlaAttention,
-    /// DeepSeek V2/V3 MoE block: gate routing + top-K fused GEMM for
-    /// routed experts (scaled by `routed_scaling_factor`) plus shared
-    /// expert with a plain add (no sigmoid gate). DSL form:
-    /// `moe_out = deepseek_moe(x, moe[layer])`. Shape-preserving.
-    DeepSeekMoe,
+    /// MoE block — gate routing + top-K fused GEMM for routed experts
+    /// plus an optional shared expert. The DSL form is the same across
+    /// every MoE arch: `moe_out = moe_block(x, moe[layer])`. Mirrors
+    /// HF Python naming (`MixtralSparseMoeBlock`,
+    /// `Qwen2MoeSparseMoeBlock`, `DeepseekV2MoE`). The forward math
+    /// (no shared / sigmoid-gated shared / scaled-plain-add shared)
+    /// is encoded in the loaded layer struct (`FusedMoELayer` /
+    /// `SharedFusedMoELayer` / `DeepSeekV2MoELayer` + their FP8/Ggml
+    /// flavors), and each is claimed by a distinct `Implementation`
+    /// keyed on the rust_type fingerprint of the `moe[layer]` weight
+    /// accessor. Shape-preserving.
+    Moe,
 }
 
 impl OpKind {
@@ -187,7 +194,7 @@ impl OpKind {
             // add the arm if a future pattern needs explicit reshape.
             "mla_split" => Some(Self::MlaSplit),
             "mla_attention" => Some(Self::MlaAttention),
-            "deepseek_moe" => Some(Self::DeepSeekMoe),
+            "moe_block" => Some(Self::Moe),
             _ => None,
         }
     }
@@ -211,7 +218,7 @@ impl OpKind {
             Self::Reshape => "reshape",
             Self::MlaSplit => "mla_split",
             Self::MlaAttention => "mla_attention",
-            Self::DeepSeekMoe => "deepseek_moe",
+            Self::Moe => "moe_block",
             // No DSL surface — produced only by the post-FUF lowering
             // pass at tp>1. `from_name` deliberately omits it so a
             // user can't write `all_reduce(...)` in a `#[forward]`

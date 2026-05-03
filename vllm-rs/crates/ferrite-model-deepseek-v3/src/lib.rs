@@ -64,7 +64,7 @@ fn deepseek_v3() {
             );
         } else {
             // DeepSeek MoE: sigmoid-routed experts + shared expert
-            mlp_out = deepseek_moe(normed2, moe[layer]);
+            mlp_out = moe_block(normed2, moe[layer]);
         }
         hidden_states = add(mlp_out, hidden_states);
     }

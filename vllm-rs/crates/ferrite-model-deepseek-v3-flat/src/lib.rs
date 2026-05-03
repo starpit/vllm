@@ -22,7 +22,7 @@
 //! K2-style routing fixture small enough to validate end-to-end on
 //! commodity hardware (real Kimi-K2 / K2.5 / K2.6 are 1T-scale).
 //!
-//! Routing flavor is config-driven through the `deepseek_moe(..)` op:
+//! Routing flavor is config-driven through the `moe_block(..)` op:
 //! `scoring_func="sigmoid"` + `topk_method="noaux_tc"` flips
 //! `use_sigmoid` in the loaded `DeepSeekV2MoELayer`, and `n_group` /
 //! `topk_group` / `routed_scaling_factor` thread through unchanged.
@@ -72,7 +72,7 @@ fn deepseek_v3_flat() {
             );
         } else {
             // DeepSeek MoE — sigmoid+noaux_tc routing chosen per-config.
-            mlp_out = deepseek_moe(normed2, moe[layer]);
+            mlp_out = moe_block(normed2, moe[layer]);
         }
         hidden_states = add(mlp_out, hidden_states);
     }

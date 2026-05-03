@@ -22,11 +22,32 @@ use quote::quote;
 
 use crate::classified::{ExternKind, OpKind, Program, WeightId};
 use crate::codegen::split_base_layer;
+use crate::config::ModelParams;
 use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
 use crate::target::TargetProfile;
+
+/// Ambient context for [`Implementation::applies_to`]. Carries the
+/// per-canonical model config + the resolved program so per-arch
+/// matchers can probe model-config keys (e.g. distinguish Mixtral's
+/// `num_local_experts` from Qwen-MoE's `num_experts` +
+/// `shared_expert_intermediate_size` from DeepSeek's
+/// `n_routed_experts` + `n_shared_experts`) before claiming an
+/// `OpKind::Moe` tile that every MoE Impl in the registry is
+/// otherwise eligible to claim.
+///
+/// `applies_to` runs once per (Impl, canonical) before any tile-
+/// level matching; an Impl that returns `false` is skipped entirely
+/// for that canonical, so the DP solver never sees it as a
+/// candidate. Default impl returns `true` — only Impls that genuinely
+/// need per-arch gating override.
+pub struct MatchContext<'a> {
+    pub program: &'a Program,
+    pub model: &'a ModelParams,
+    pub profile: &'a TargetProfile,
+}
 
 /// Ambient context passed to [`Implementation::cost_us`]. Carries
 /// everything a cost function might need to turn a MatchInfo into
@@ -458,6 +479,30 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// matches the impl's expected pattern. Quant-aware impls gate
     /// on weight storage via [`Fuf::storage_format_of`].
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo>;
+
+    /// Per-canonical / per-model gate, evaluated ONCE per (Impl,
+    /// canonical) before any tile-level matching. Returning `false`
+    /// disables this Impl for the current canonical (the solver
+    /// never sees it as a candidate at any seed). Returning `true`
+    /// (the default) lets `matches` decide structurally as before.
+    ///
+    /// Use this when an Impl must inspect the model config or the
+    /// resolved program to disambiguate from peer Impls that share
+    /// the same `OpKind`. Today the canonical example is the three
+    /// MoE Impls (`DeepSeekMoeRefImpl` / `FusedMoeRefImpl` /
+    /// `SharedFusedMoeRefImpl`) — every BF16 MoE arch produces
+    /// `OpKind::Moe` tiles, but only one Impl's load + forward is
+    /// correct for any given checkpoint, so each gates on
+    /// arch-distinctive config keys before claiming.
+    ///
+    /// The "once per canonical" semantics matter: this hook is
+    /// called outside the tile-parallel `matches` loop and must not
+    /// depend on `seed` / `fuf` structure. If you find yourself
+    /// wanting per-tile detail here, you actually want to encode
+    /// that in `matches` directly.
+    fn applies_to(&self, _ctx: &MatchContext) -> bool {
+        true
+    }
 
     /// Predicted wall-clock cost in microseconds for one
     /// invocation of this impl on the given match.
@@ -9916,13 +9961,13 @@ fn is_fp8_gemm(fuf: &Fuf, tile: TileId) -> bool {
     node.op == OpKind::Gemm && matches!(weight_storage_of(node), Some(StorageFormat::Fp8 { .. }))
 }
 
-/// True if `tile` is a `DeepSeekMoe` whose `moe[layer]` weight resolves to
+/// True if `tile` is a `Moe` whose `moe[layer]` weight resolves to
 /// blockwise FP8 storage (DeepSeek-V3 / Kimi K2 official checkpoint format).
 /// Used by `DeepSeekFp8BlockMoeImpl` to claim, and by `DeepSeekMoeRefImpl`
 /// (BF16) to defer.
 fn is_fp8_block_moe(fuf: &Fuf, tile: TileId) -> bool {
     let node = fuf.get(tile);
-    if node.op != OpKind::DeepSeekMoe {
+    if node.op != OpKind::Moe {
         return false;
     }
     matches!(
@@ -9934,12 +9979,12 @@ fn is_fp8_block_moe(fuf: &Fuf, tile: TileId) -> bool {
     )
 }
 
-/// True if `tile` is a `DeepSeekMoe` whose `moe[layer]` weight resolves to
+/// True if `tile` is a `Moe` whose `moe[layer]` weight resolves to
 /// GGML/GGUF storage. Used by `DeepSeekGgmlMoeImpl` to claim, and by
 /// `DeepSeekMoeRefImpl` (BF16) to defer.
 fn is_ggml_moe(fuf: &Fuf, tile: TileId) -> bool {
     let node = fuf.get(tile);
-    if node.op != OpKind::DeepSeekMoe {
+    if node.op != OpKind::Moe {
         return false;
     }
     matches!(weight_storage_of(node), Some(StorageFormat::Ggml))
@@ -14816,9 +14861,9 @@ impl Implementation for MlaAttentionImpl {
 
 // ── DeepSeekMoeRefImpl ───────────────────────────────────────────────────────
 //
-// Singleton for `OpKind::DeepSeekMoe` — DeepSeek MoE layer.
+// Singleton for `OpKind::Moe` claiming the BF16 DeepSeek MoE layer.
 //
-// DSL: moe_out = deepseek_moe(hidden_states, moe[layer])
+// DSL: moe_out = moe_block(hidden_states, moe[layer])
 //
 // The `moe[layer]` weight resolves to a `DeepSeekV2MoELayer` struct.
 // Emits a direct call to `DeepSeekV2MoELayer::forward`.
@@ -14838,10 +14883,12 @@ impl Implementation for DeepSeekMoeRefImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Defer to FP8-block / GGML MoE Impls for their respective checkpoint
         // formats — this Impl claims the BF16 path only.
+        // Defer to FP8-block / GGML MoE Impls for their respective checkpoint
+        // formats — this Impl claims the BF16 path only.
         if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
             return None;
         }
-        single_tile_match(fuf, seed, OpKind::DeepSeekMoe)
+        single_tile_match(fuf, seed, OpKind::Moe)
     }
 
     fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
@@ -14973,7 +15020,7 @@ impl Implementation for DeepSeekMoeRefImpl {
 
 // ── DeepSeekFp8BlockMoeImpl ──────────────────────────────────────────────────
 //
-// Singleton for `OpKind::DeepSeekMoe` over blockwise-FP8 expert weights —
+// Singleton for `OpKind::Moe` over blockwise-FP8 expert weights —
 // DeepSeek-V3 / Kimi K2 official checkpoints. Same DSL contract as
 // `DeepSeekMoeRefImpl`; the loaded type is `DeepSeekV2Fp8BlockMoELayer` and
 // the host-interpreter Op variant is `DeepSeekMoeFp8Block` (separate from
@@ -14996,7 +15043,7 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
         if !is_fp8_block_moe(fuf, seed) {
             return None;
         }
-        single_tile_match(fuf, seed, OpKind::DeepSeekMoe)
+        single_tile_match(fuf, seed, OpKind::Moe)
     }
 
     fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
@@ -15119,7 +15166,7 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
 
 // ── DeepSeekGgmlMoeImpl ──────────────────────────────────────────────────────
 //
-// Singleton for `OpKind::DeepSeekMoe` over GGML/GGUF expert weights —
+// Singleton for `OpKind::Moe` over GGML/GGUF expert weights —
 // DeepSeek-V2-Lite, Moonlight, K2 GGUFs. Same DSL contract as
 // `DeepSeekMoeRefImpl`; the loaded type is `DeepSeekV2GgmlMoELayer` and
 // the host-interpreter Op variant is `DeepSeekMoeGgml`.
@@ -15140,7 +15187,7 @@ impl Implementation for DeepSeekGgmlMoeImpl {
         if !is_ggml_moe(fuf, seed) {
             return None;
         }
-        single_tile_match(fuf, seed, OpKind::DeepSeekMoe)
+        single_tile_match(fuf, seed, OpKind::Moe)
     }
 
     fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {

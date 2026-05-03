@@ -53,9 +53,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::classified::OpKind;
+use crate::classified::{OpKind, Program};
+use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
-use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchInfo};
+use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchContext, MatchInfo};
 use crate::shape::{Inferred, Shape, extern_shape};
 use crate::target::TargetProfile;
 
@@ -245,6 +246,37 @@ pub fn solve(
     num_tokens_points: &[u64],
     sk_points: &[u64],
 ) -> Result<WorkloadAssignments, SolveError> {
+    solve_with_arch_filter(
+        fuf,
+        lib,
+        target,
+        None,
+        inferred,
+        bounds,
+        num_tokens_points,
+        sk_points,
+    )
+}
+
+/// Variant of [`solve`] that wires a per-canonical
+/// `(Program, ModelParams)` context into [`Implementation::arch_filter`].
+/// Production drive uses this path so per-arch matchers (today: the
+/// three MoE Impls — `DeepSeekMoeRefImpl` /  `FusedMoeRefImpl` /
+/// `SharedFusedMoeRefImpl`) can disambiguate by config keys before
+/// claiming. Tests that don't exercise per-arch gating stay on
+/// `solve` (no churn), which forwards `arch_ctx = None`; with no
+/// context the filter is treated as default-true.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_with_arch_filter(
+    fuf: &Fuf,
+    lib: &ImplementationLibrary,
+    target: &TargetProfile,
+    arch_ctx: Option<(&Program, &ModelParams)>,
+    inferred: &Inferred,
+    bounds: &BTreeMap<String, u64>,
+    num_tokens_points: &[u64],
+    sk_points: &[u64],
+) -> Result<WorkloadAssignments, SolveError> {
     use rayon::prelude::*;
 
     // Empty sk_points = legacy 1-D sweep. `sk_bucket = 0` is the
@@ -280,6 +312,25 @@ pub fn solve(
     // `matches()` returned Some. Per-point work then only re-checks
     // `workload_constraint` + computes `cost_us`, avoiding the
     // expensive structural match.
+    // Per-canonical Impl gate: evaluate `applies_to` once per Impl
+    // (sequentially — `Program`/`ModelParams` carry proc_macro2 Spans
+    // that aren't `Sync`) and cache the disabled set as a Vec<bool>
+    // keyed by ImplId. The parallel match loop below then only reads
+    // the bool, sidestepping the Sync issue while keeping the
+    // tile-level loop fully parallel.
+    let disabled_impls: Vec<bool> = if let Some((program, model)) = arch_ctx {
+        let ctx = MatchContext {
+            program,
+            model,
+            profile: target,
+        };
+        lib.iter_enumerated()
+            .map(|(_, imp)| !imp.applies_to(&ctx))
+            .collect()
+    } else {
+        vec![false; lib.len()]
+    };
+
     let t_cache = std::time::Instant::now();
     let match_cache: Vec<Vec<(ImplId, MatchInfo)>> = fuf
         .nodes
@@ -287,6 +338,9 @@ pub fn solve(
         .map(|node| {
             let mut out = Vec::new();
             for (imp_id, imp) in lib.iter_enumerated() {
+                if disabled_impls[imp_id.0 as usize] {
+                    continue;
+                }
                 if !imp.target_compatible(target) {
                     continue;
                 }

@@ -87,6 +87,14 @@ canonical const. **Loadbearing across every arch with mixed
 prefill/decode Impl picks** — assume more arches were latently
 wrong and just hadn't hit graph capture yet.
 
+**`applies_to` per-canonical Impl gate + MoE OpKind rename** — foundation for Tier-1 MoE arches (Mixtral / Qwen2-MoE / Qwen3-MoE) that ferrite doesn't support yet. Two pieces, no behavior change:
+
+1. `Implementation::applies_to(&self, ctx: &MatchContext) -> bool` — default-`true` trait hook + `solver::solve_with_arch_filter` non-breaking sibling that production drive uses. Evaluated once per (Impl, canonical) sequentially before the parallel match loop (proc_macro2 spans on `Program` aren't `Sync`); cached as `Vec<bool>` keyed by `ImplId`. Lets future MoE Impls probe `&Program` / `&ModelParams` for arch-distinctive config keys (e.g. `num_local_experts` ⇒ Mixtral, `num_experts` + `shared_expert_intermediate_size` ⇒ Qwen-MoE, `n_routed_experts` ⇒ DeepSeek) before claiming a `OpKind::Moe` tile every BF16 MoE Impl is otherwise eligible for.
+
+2. Rename `OpKind::DeepSeekMoe` → `OpKind::Moe`, DSL `deepseek_moe(..)` → `moe_block(..)` (HF naming match: `MixtralSparseMoeBlock`, `Qwen2MoeSparseMoeBlock`, `DeepseekV2MoE`). DSL bodies in `ferrite-model-deepseek-{v2,v3,v3-flat}` rebased. `Instruction::DeepSeekMoe` variant name kept — it carries `WtFn<W, DeepSeekV2MoELayer>` so it's type-anchored, not OpKind-anchored.
+
+207/207 macro tests preserved; deepseek-v2-lite expansion unchanged (331 tiles, 221 waves). No existing Impl overrides `applies_to` — gating is dormant until per-arch Impls (`FusedMoeRefImpl`, `SharedFusedMoeRefImpl`, updated `DeepSeekMoeRefImpl::applies_to`) land in the Tier-1 follow-up.
+
 `82a46a7b9` **dedup_quant_sig in canonical hashing** — a
 correctness fix for FP8 dispatch. The `dedup_signature()` used
 for cross-variant canonical equivalence didn't include the

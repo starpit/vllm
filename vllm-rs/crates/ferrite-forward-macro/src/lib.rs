@@ -645,10 +645,11 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 model.bounds.clone()
             };
             let t_solve = std::time::Instant::now();
-            let mut sfufs = solver::solve(
+            let mut sfufs = solver::solve_with_arch_filter(
                 &model_fuf,
                 &library,
                 &target_profile,
+                Some((&classified, model)),
                 &inferred,
                 &solve_bounds,
                 &args.workloads,

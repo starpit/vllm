@@ -401,7 +401,7 @@ pub fn apply_signature(
         }),
         OpKind::MlaSplit => sig_mla_split(solver, inputs),
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
-        OpKind::DeepSeekMoe => sig_deepseek_moe(solver, inputs),
+        OpKind::Moe => sig_moe(solver, inputs),
     }
 }
 
@@ -619,11 +619,13 @@ fn sig_mla_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Sh
     })
 }
 
-/// `deepseek_moe(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
-/// the second arg is a `DeepSeekV2MoELayer` struct (not a tensor) so it
-/// contributes an empty shape. Output = hidden_states shape.
-fn sig_deepseek_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::DeepSeekMoe, inputs, 2)?;
+/// `moe_block(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
+/// the second arg is a MoE layer struct (`FusedMoELayer` /
+/// `SharedFusedMoELayer` / `DeepSeekV2MoELayer` or their quant
+/// flavors) — not a tensor — so it contributes an empty shape.
+/// Output = hidden_states shape.
+fn sig_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::Moe, inputs, 2)?;
     Ok(OpSig {
         output: inputs[0].clone(),
     })
@@ -718,9 +720,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::MlaSplit => &[],
         // MlaAttention takes activation inputs + opaque externs; no tensor weight args.
         OpKind::MlaAttention => &[],
-        // DeepSeekMoe's moe[layer] is a struct (not a tensor) at arg 1;
+        // Moe's moe[layer] is a struct (not a tensor) at arg 1;
         // weight_arg_ranks governs shape-rank assertion only, so we skip it.
-        OpKind::DeepSeekMoe => &[],
+        OpKind::Moe => &[],
     }
 }
 

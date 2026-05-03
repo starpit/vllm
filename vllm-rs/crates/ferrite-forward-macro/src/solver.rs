@@ -833,13 +833,28 @@ mod tests {
             //   attn-residual Add + post_attn_layernorm → 1 (saves 1)
             //   MLP-residual Add + next-layer input_layernorm (or
             //     final norm, on the last layer) → 1 (saves 1)
-            // Total: 8 fewer subgraphs per layer.
+            // Total: 8 fewer subgraphs per layer — these per-layer
+            // fusions are structural and must always land.
+            //
+            // Plus an optional fleet-wide save at the lm_head boundary
+            // when CutlassFusedAddRmsNormGemm wins on cost: the
+            // (final-residual Add, final RmsNorm, lm_head Gemm) triple
+            // collapses into one subgraph instead of (Add+RmsNorm
+            // fused) + (lm_head Gemm) = 2. The DP solver picks this
+            // 3-tile fusion only at workload points where the CUTLASS
+            // tile zoo's calibrated cost beats the cuBLAS singleton at
+            // (M, vocab_size, hidden_size); at uncalibrated or
+            // unfavorable M it falls back to the 2-tile (Add+RmsNorm)
+            // pair plus a singleton lm_head Gemm.
             let nl = params.bounds["num_hidden_layers"] as usize;
-            assert_eq!(
-                sfuf.num_subgraphs(),
-                fuf.len() - 8 * nl,
-                "expected 8*NL fewer subgraphs than tiles at m={m} \
-                 (SwiGLU + QKV-rope + attn-residual + mlp-residual fusions)"
+            let actual_fewer = fuf.len() - sfuf.num_subgraphs();
+            let min_fewer = 8 * nl; // structural per-layer fusions
+            let max_fewer = 8 * nl + 1; // + optional lm_head triple
+            assert!(
+                actual_fewer == min_fewer || actual_fewer == max_fewer,
+                "at m={m}: expected fuf.len()-num_subgraphs() in \
+                 {{{min_fewer}, {max_fewer}}} (per-layer fusions, \
+                 plus optional lm_head NormGemm fusion), got {actual_fewer}",
             );
             assert!(
                 sfuf.predicted_us > 0.0 && sfuf.predicted_us.is_finite(),
@@ -955,19 +970,29 @@ mod tests {
                 if n_gemm == 3 && n_rope == 1 {
                     fused_count += 1;
                     let imp_id = sfuf.impl_of(sg).unwrap();
+                    let name = lib.get(imp_id).name();
                     // WorkloadConstraint-driven dispatch: decode (M=1)
-                    // picks the cache-fused variant, prefill (M>=2)
-                    // picks the split variant that keeps K/V contiguous
-                    // for the prefill attention path.
-                    let expected = if m == 1 {
+                    // picks a cache-fused variant, prefill (M>=2) picks
+                    // a split variant that keeps K/V contiguous for the
+                    // prefill attention path. Both the cuBLAS-backed
+                    // peer (`fused_qkv_rope_{cache,prefill}`) and the
+                    // CUTLASS-backed peers (`cutlass_*` — name reflects
+                    // the underlying GEMM tile shape) are valid; the
+                    // DP solver picks whichever is cheaper at the
+                    // calibrated workload point. Either is structurally
+                    // a fused-QKV-rope subgraph; what we forbid is a
+                    // stray Gemm singleton claiming part of the quad.
+                    let cublas_expected = if m == 1 {
                         "fused_qkv_rope_cache"
                     } else {
                         "fused_qkv_rope_prefill"
                     };
-                    assert_eq!(
-                        lib.get(imp_id).name(),
-                        expected,
-                        "subgraph at m={m} has QKV-rope topology but wrong impl",
+                    let is_cutlass_peer = name.starts_with("cutlass_");
+                    assert!(
+                        name == cublas_expected || is_cutlass_peer,
+                        "subgraph at m={m} has QKV-rope topology but \
+                         wrong impl: got {name}, expected {cublas_expected} \
+                         or any cutlass_* peer",
                     );
                 }
             }
@@ -1709,6 +1734,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "FlashInfer Impls are not registered in starter_library() \
+                while FI is disabled fleet-wide pending a fix for the \
+                persistent-kernel CUDA_ERROR_ILLEGAL_ADDRESS at tp>1 with \
+                num_kv_heads=1. Re-enable when the FI registration loop \
+                in impl_lib.rs is uncommented."]
     fn flashinfer_impls_picked_for_llama_3_2_1b_when_csv_has_rows() {
         // End-to-end solver regression: with the calibrated L4 CSV
         // (which has `flashinfer_attn_bf16_h64_nosoftcap_q32_k8` rows

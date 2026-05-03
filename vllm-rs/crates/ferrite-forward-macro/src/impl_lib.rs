@@ -14880,9 +14880,17 @@ impl Implementation for DeepSeekMoeRefImpl {
         true
     }
 
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // DeepSeek-V2 / V3 / Moonlight / Kimi-K2 are the only MoE
+        // arches whose `config.json` carries `n_routed_experts`
+        // (Mixtral uses `num_local_experts`; Qwen2/3-MoE use
+        // `num_experts`). Gate here so that the Tier-1 follow-up
+        // FusedMoe / SharedFusedMoe Impls can claim non-DeepSeek
+        // `OpKind::Moe` tiles without contention.
+        ctx.model.bounds.contains_key("n_routed_experts")
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        // Defer to FP8-block / GGML MoE Impls for their respective checkpoint
-        // formats — this Impl claims the BF16 path only.
         // Defer to FP8-block / GGML MoE Impls for their respective checkpoint
         // formats — this Impl claims the BF16 path only.
         if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
@@ -15403,6 +15411,80 @@ mod tests {
         // scale = 256^-0.5 = 1/16 = 0.0625. Exact in f32.
         assert_eq!(scale, 0.0625_f32);
         assert_eq!(attention_softcap_for(&model), 50.0_f32);
+    }
+
+    #[test]
+    fn deepseek_moe_applies_to_requires_n_routed_experts() {
+        // Locks the per-canonical gate semantics for the Tier-1 MoE
+        // follow-up: DeepSeekMoeRefImpl must skip canonicals whose
+        // config doesn't carry the DeepSeek-distinctive
+        // `n_routed_experts` key. Mixtral/Qwen-MoE configs (when
+        // they land) use `num_local_experts` / `num_experts` and
+        // must not be claimed by the DeepSeek Impl.
+        use crate::classified::Program;
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let program = Program {
+            statements: Vec::new(),
+            locals: Default::default(),
+            weights: Default::default(),
+            reshape_targets: Default::default(),
+        };
+
+        let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
+            name: name.to_string(),
+            source_stem: name.to_string(),
+            source_path: std::path::PathBuf::new(),
+            bounds: {
+                let mut b = std::collections::BTreeMap::new();
+                b.insert(key.to_string(), val);
+                b
+            },
+            scalars: std::collections::BTreeMap::new(),
+            quantization: None,
+            tie_word_embeddings: false,
+            architectures: Vec::new(),
+            extra_tracked_paths: Vec::new(),
+            rope_scaling: None,
+            rope_scaling_hash: None,
+        };
+
+        let imp = DeepSeekMoeRefImpl;
+
+        // DeepSeek-shaped: claims.
+        let m_ds = mk_model("deepseek_v2_lite_test", "n_routed_experts", 64);
+        let ctx_ds = MatchContext {
+            program: &program,
+            model: &m_ds,
+            profile: &profile,
+        };
+        assert!(
+            imp.applies_to(&ctx_ds),
+            "DeepSeekMoeRefImpl must claim configs with n_routed_experts"
+        );
+
+        // Mixtral-shaped: skips.
+        let m_mix = mk_model("mixtral_test", "num_local_experts", 8);
+        let ctx_mix = MatchContext {
+            program: &program,
+            model: &m_mix,
+            profile: &profile,
+        };
+        assert!(
+            !imp.applies_to(&ctx_mix),
+            "DeepSeekMoeRefImpl must defer when n_routed_experts is absent"
+        );
+
+        // Qwen-MoE-shaped: skips.
+        let m_qwen = mk_model("qwen3_moe_test", "num_experts", 128);
+        let ctx_qwen = MatchContext {
+            program: &program,
+            model: &m_qwen,
+            profile: &profile,
+        };
+        assert!(
+            !imp.applies_to(&ctx_qwen),
+            "DeepSeekMoeRefImpl must defer on Qwen-MoE configs"
+        );
     }
 
     #[test]

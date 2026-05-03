@@ -1753,3 +1753,328 @@ void fused_qkv_interleaved_rope_cache_prefill_bf16(
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// Fused GEMV + QKV split + RoPE + reshape_and_cache (DECODE, M=1)
+//
+// Replaces the (cutlass_gemv → fused_qkv_rope_cache) pair at decode with a
+// single launch. The qkv intermediate is never materialized in DRAM — the
+// per-output GEMV result lives in shared memory until rope/cache write.
+//
+// Grid: (num_heads,) where num_heads = (q_size + 2*kv_size) / head_size.
+// Block: WARPS*LANES threads (default 4*32 = 128). Each block computes one
+// complete head — head_size contiguous output rows of the QKV linear
+// projection, then applies rope (Q/K) or copies (V) and writes to the
+// matching destination (q_out for Q, paged k_cache/v_cache for K/V).
+//
+// GEMV layout (CUTLASS-style 1D row reduction):
+//   * 4 warps per block, each warp handles head_size/WARPS outputs
+//     interleaved (warp w → outputs w, w+WARPS, w+2*WARPS, ...).
+//   * Each output: 32 lanes cooperatively reduce K via shfl_xor_sync.
+//   * Adjacent lanes access adjacent K elements within the same row →
+//     fully coalesced.
+//   * `x[K]` is staged in shared memory once per block (vectorized) so the
+//     32-thread reduction reads x from smem instead of HBM.
+//
+// Restrictions for the fast path: head_size % WARPS == 0 and K_dim % VEC ==
+// 0 (the caller falls back to the legacy 2-launch path when these don't
+// hold). RoPE uses the NeoX (paired i, i+half) variant.
+// ---------------------------------------------------------------------------
+
+template <typename T, int WARPS, int LANES>
+__global__ void fused_gemv_qkv_rope_cache_neox_kernel(
+    T* __restrict__ q_out,                          // [q_size]
+    T* __restrict__ key_cache,                      // [num_blocks, block_size, num_kv_heads, head_dim]
+    T* __restrict__ value_cache,                    // [num_blocks, block_size, num_kv_heads, head_dim]
+    const T* __restrict__ x,                        // [K_dim]
+    const T* __restrict__ W,                        // [N, K_dim] row-major (N = q_size + 2*kv_size)
+    const T* __restrict__ bias,                     // [N] or nullptr
+    const uint32_t* __restrict__ positions,         // [1]
+    const T* __restrict__ cos_sin_cache,            // [max_pos, rotary_dim]
+    const int64_t* __restrict__ slot_mapping,       // [1]
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim)
+{
+    constexpr int VEC = VecType<T>::SIZE;
+
+    const int head_idx = blockIdx.x;
+    const int output_offset = head_idx * head_size;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / LANES;
+    const int lane = tid % LANES;
+    const int outputs_per_warp = head_size / WARPS;
+
+    extern __shared__ __align__(16) char smem_raw[];
+    T* smem_x = reinterpret_cast<T*>(smem_raw);
+    T* smem_y = smem_x + K_dim;
+
+    using Vec = typename VecType<T>::Type;
+    const Vec* x_vec = reinterpret_cast<const Vec*>(x);
+    Vec* smx_vec = reinterpret_cast<Vec*>(smem_x);
+    const int kv = K_dim / VEC;
+    for (int i = tid; i < kv; i += blockDim.x) {
+        smx_vec[i] = x_vec[i];
+    }
+    __syncthreads();
+
+    // GEMV phase: each warp computes outputs_per_warp outputs (interleaved).
+    for (int oi = 0; oi < outputs_per_warp; oi++) {
+        const int out_local = oi * WARPS + warp_id;
+        const int n = output_offset + out_local;
+        const T* w_row = W + (size_t)n * K_dim;
+
+        float acc = 0.0f;
+        // Lanes 0..LANES-1 stride through K in chunks of LANES*VEC.
+        for (int k = lane * VEC; k + VEC <= K_dim; k += LANES * VEC) {
+            float xbuf[VEC], wbuf[VEC];
+            unpack_vec<T>(vec_load(&w_row[k]), wbuf);
+            unpack_vec<T>(vec_load(&smem_x[k]), xbuf);
+            #pragma unroll
+            for (int j = 0; j < VEC; j++) acc += wbuf[j] * xbuf[j];
+        }
+
+        // Warp reduction.
+        #pragma unroll
+        for (int mask = LANES / 2; mask > 0; mask >>= 1) {
+            acc += __shfl_xor_sync(0xFFFFFFFF, acc, mask, LANES);
+        }
+
+        if (lane == 0) {
+            float b = bias ? float(bias[n]) : 0.0f;
+            smem_y[out_local] = static_cast<T>(acc + b);
+        }
+    }
+    __syncthreads();
+
+    // Rope / cache write phase.
+    const int64_t slot = slot_mapping[0];
+    const int pos = static_cast<int>(positions[0]);
+    const int half_rot = rotary_dim / 2;
+    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const T* sin_ptr = cos_ptr + half_rot;
+    const int half = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+    const int rot_full = 2 * half;
+
+    const int nqh = q_size / head_size;
+    const int nkh = kv_size / head_size;
+
+    T* dst = nullptr;
+    bool apply_rope;
+    if (head_idx < nqh) {
+        dst = q_out + head_idx * head_size;
+        apply_rope = true;
+    } else if (head_idx < nqh + nkh) {
+        if (slot < 0) return;
+        dst = key_cache + slot * kv_size + (head_idx - nqh) * head_size;
+        apply_rope = true;
+    } else {
+        if (slot < 0) return;
+        dst = value_cache + slot * kv_size + (head_idx - nqh - nkh) * head_size;
+        apply_rope = false;
+    }
+
+    if (apply_rope) {
+        for (int i = tid; i < half; i += blockDim.x) {
+            float xv = float(smem_y[i]);
+            float yv = float(smem_y[i + half]);
+            float c = float(cos_ptr[i]);
+            float s = float(sin_ptr[i]);
+            dst[i]        = static_cast<T>(xv * c - yv * s);
+            dst[i + half] = static_cast<T>(yv * c + xv * s);
+        }
+        for (int i = tid; i < (head_size - rot_full); i += blockDim.x) {
+            dst[rot_full + i] = smem_y[rot_full + i];
+        }
+    } else {
+        for (int i = tid; i < head_size; i += blockDim.x) {
+            dst[i] = smem_y[i];
+        }
+    }
+}
+
+// Interleaved-RoPE variant: pairs are (2i, 2i+1) within each rotary_dim
+// slice rather than (i, i+half).
+template <typename T, int WARPS, int LANES>
+__global__ void fused_gemv_qkv_interleaved_rope_cache_kernel(
+    T* __restrict__ q_out,
+    T* __restrict__ key_cache,
+    T* __restrict__ value_cache,
+    const T* __restrict__ x,
+    const T* __restrict__ W,
+    const T* __restrict__ bias,
+    const uint32_t* __restrict__ positions,
+    const T* __restrict__ cos_sin_cache,
+    const int64_t* __restrict__ slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim)
+{
+    constexpr int VEC = VecType<T>::SIZE;
+
+    const int head_idx = blockIdx.x;
+    const int output_offset = head_idx * head_size;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / LANES;
+    const int lane = tid % LANES;
+    const int outputs_per_warp = head_size / WARPS;
+
+    extern __shared__ __align__(16) char smem_raw[];
+    T* smem_x = reinterpret_cast<T*>(smem_raw);
+    T* smem_y = smem_x + K_dim;
+
+    using Vec = typename VecType<T>::Type;
+    const Vec* x_vec = reinterpret_cast<const Vec*>(x);
+    Vec* smx_vec = reinterpret_cast<Vec*>(smem_x);
+    const int kv = K_dim / VEC;
+    for (int i = tid; i < kv; i += blockDim.x) {
+        smx_vec[i] = x_vec[i];
+    }
+    __syncthreads();
+
+    for (int oi = 0; oi < outputs_per_warp; oi++) {
+        const int out_local = oi * WARPS + warp_id;
+        const int n = output_offset + out_local;
+        const T* w_row = W + (size_t)n * K_dim;
+
+        float acc = 0.0f;
+        for (int k = lane * VEC; k + VEC <= K_dim; k += LANES * VEC) {
+            float xbuf[VEC], wbuf[VEC];
+            unpack_vec<T>(vec_load(&w_row[k]), wbuf);
+            unpack_vec<T>(vec_load(&smem_x[k]), xbuf);
+            #pragma unroll
+            for (int j = 0; j < VEC; j++) acc += wbuf[j] * xbuf[j];
+        }
+
+        #pragma unroll
+        for (int mask = LANES / 2; mask > 0; mask >>= 1) {
+            acc += __shfl_xor_sync(0xFFFFFFFF, acc, mask, LANES);
+        }
+
+        if (lane == 0) {
+            float b = bias ? float(bias[n]) : 0.0f;
+            smem_y[out_local] = static_cast<T>(acc + b);
+        }
+    }
+    __syncthreads();
+
+    const int64_t slot = slot_mapping[0];
+    const int pos = static_cast<int>(positions[0]);
+    const int half_rot = rotary_dim / 2;
+    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const T* sin_ptr = cos_ptr + half_rot;
+    const int half = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+    const int rot_full = 2 * half;
+
+    const int nqh = q_size / head_size;
+    const int nkh = kv_size / head_size;
+
+    T* dst = nullptr;
+    bool apply_rope;
+    if (head_idx < nqh) {
+        dst = q_out + head_idx * head_size;
+        apply_rope = true;
+    } else if (head_idx < nqh + nkh) {
+        if (slot < 0) return;
+        dst = key_cache + slot * kv_size + (head_idx - nqh) * head_size;
+        apply_rope = true;
+    } else {
+        if (slot < 0) return;
+        dst = value_cache + slot * kv_size + (head_idx - nqh - nkh) * head_size;
+        apply_rope = false;
+    }
+
+    if (apply_rope) {
+        // Interleaved pairing (2i, 2i+1) within rot_full.
+        for (int i = tid; i < half; i += blockDim.x) {
+            float xv = float(smem_y[2 * i]);
+            float yv = float(smem_y[2 * i + 1]);
+            float c = float(cos_ptr[i]);
+            float s = float(sin_ptr[i]);
+            dst[2 * i]     = static_cast<T>(xv * c - yv * s);
+            dst[2 * i + 1] = static_cast<T>(yv * c + xv * s);
+        }
+        for (int i = tid; i < (head_size - rot_full); i += blockDim.x) {
+            dst[rot_full + i] = smem_y[rot_full + i];
+        }
+    } else {
+        for (int i = tid; i < head_size; i += blockDim.x) {
+            dst[i] = smem_y[i];
+        }
+    }
+}
+
+#define LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(KERNEL, T)                              \
+    do {                                                                          \
+        constexpr int WARPS = 4;                                                 \
+        constexpr int LANES = 32;                                                \
+        constexpr int THREADS = WARPS * LANES;                                   \
+        const int num_heads = (q_size + 2 * kv_size) / head_size;                \
+        const int smem_bytes = (K_dim + head_size) * static_cast<int>(sizeof(T));\
+        KERNEL<T, WARPS, LANES><<<num_heads, THREADS, smem_bytes, stream>>>(     \
+            (T*)q_out, (T*)key_cache, (T*)value_cache,                           \
+            (const T*)x, (const T*)W, (const T*)bias,                            \
+            (const uint32_t*)positions, (const T*)cos_sin_cache,                 \
+            (const int64_t*)slot_mapping,                                         \
+            q_size, kv_size, rotary_dim, head_size, K_dim);                      \
+    } while (0)
+
+extern "C" {
+
+void fused_gemv_qkv_rope_cache_neox_f32(
+    void* q_out, void* key_cache, void* value_cache,
+    const void* x, const void* W, const void* bias,
+    const void* positions, const void* cos_sin_cache, const void* slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim,
+    cudaStream_t stream)
+{
+    LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(fused_gemv_qkv_rope_cache_neox_kernel, float);
+}
+
+void fused_gemv_qkv_rope_cache_neox_f16(
+    void* q_out, void* key_cache, void* value_cache,
+    const void* x, const void* W, const void* bias,
+    const void* positions, const void* cos_sin_cache, const void* slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim,
+    cudaStream_t stream)
+{
+    LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(fused_gemv_qkv_rope_cache_neox_kernel, __half);
+}
+
+void fused_gemv_qkv_rope_cache_neox_bf16(
+    void* q_out, void* key_cache, void* value_cache,
+    const void* x, const void* W, const void* bias,
+    const void* positions, const void* cos_sin_cache, const void* slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim,
+    cudaStream_t stream)
+{
+    LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(fused_gemv_qkv_rope_cache_neox_kernel, __nv_bfloat16);
+}
+
+void fused_gemv_qkv_interleaved_rope_cache_f32(
+    void* q_out, void* key_cache, void* value_cache,
+    const void* x, const void* W, const void* bias,
+    const void* positions, const void* cos_sin_cache, const void* slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim,
+    cudaStream_t stream)
+{
+    LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(fused_gemv_qkv_interleaved_rope_cache_kernel, float);
+}
+
+void fused_gemv_qkv_interleaved_rope_cache_f16(
+    void* q_out, void* key_cache, void* value_cache,
+    const void* x, const void* W, const void* bias,
+    const void* positions, const void* cos_sin_cache, const void* slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim,
+    cudaStream_t stream)
+{
+    LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(fused_gemv_qkv_interleaved_rope_cache_kernel, __half);
+}
+
+void fused_gemv_qkv_interleaved_rope_cache_bf16(
+    void* q_out, void* key_cache, void* value_cache,
+    const void* x, const void* W, const void* bias,
+    const void* positions, const void* cos_sin_cache, const void* slot_mapping,
+    int q_size, int kv_size, int rotary_dim, int head_size, int K_dim,
+    cudaStream_t stream)
+{
+    LAUNCH_FUSED_GEMV_QKV_ROPE_CACHE(fused_gemv_qkv_interleaved_rope_cache_kernel, __nv_bfloat16);
+}
+
+} // extern "C"

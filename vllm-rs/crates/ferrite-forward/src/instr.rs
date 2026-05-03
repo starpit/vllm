@@ -1976,8 +1976,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 k,
             ) => unsafe {
                 // M=1 GEMV-backed peer of CutlassFusedQkvRopeCache.
-                // matches() rejects biased claims; runtime always uses
-                // the unbiased cutlass_gemv path.
+                // Fast path (Phase 2 fusion): single launch via
+                // `fused_gemv_qkv_rope_cache[_interleaved]` when the cache
+                // is dense and (N, K) % 8 == 0 + head_dim % 4 == 0.
+                // Falls back to the legacy 2-launch path (gemv → rope_cache)
+                // for FP8 caches and misaligned shapes.
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
@@ -1988,70 +1991,116 @@ impl<W: CanonicalParams> Instruction<W> {
                     k,
                     tp_active(ctx),
                 );
-                let qkv_packed = if let Some(bias) = w.dense_bias() {
-                    cutlass::cutlass_gemv_bias(
-                        *v,
-                        w.dense_weight(),
-                        bias,
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                    )
-                } else {
-                    cutlass::cutlass_gemv(
-                        *v,
-                        w.dense_weight(),
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                    )
-                };
                 let cos_sin = (cos_sin_fn)(ctx.wm, layer);
-                let out = if interleaved {
-                    kernels::fused_qkv_interleaved_rope_cache(
-                        *qkv_packed,
-                        *ctx.fwd.positions,
-                        cos_sin,
-                        *ctx.fwd.slot_mapping,
-                        *ctx.fwd.kv_cache.k_cache(layer as usize),
-                        *ctx.fwd.kv_cache.v_cache(layer as usize),
-                        W::Q_SIZE,
-                        W::KV_SIZE,
-                        W::NUM_Q_HEADS as usize,
-                        W::HEAD_DIM as usize,
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                    )
-                } else if ctx.fwd.kv_cache.is_fp8() {
-                    kernels::fused_qkv_rope_cache_fp8(
-                        *qkv_packed,
-                        *ctx.fwd.positions,
-                        cos_sin,
-                        *ctx.fwd.slot_mapping,
-                        *ctx.fwd.kv_cache.k_cache(layer as usize),
-                        *ctx.fwd.kv_cache.v_cache(layer as usize),
-                        ctx.fwd.kv_cache.k_scale_ptr(layer as usize),
-                        ctx.fwd.kv_cache.v_scale_ptr(layer as usize),
-                        W::Q_SIZE,
-                        W::KV_SIZE,
-                        W::NUM_Q_HEADS as usize,
-                        W::HEAD_DIM as usize,
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                    )
+                let head_dim = W::HEAD_DIM as usize;
+                let is_fp8 = ctx.fwd.kv_cache.is_fp8();
+                let aligned =
+                    packed_n.is_multiple_of(8) && k.is_multiple_of(8) && head_dim.is_multiple_of(4);
+
+                let out = if !is_fp8 && aligned {
+                    let bias = w.dense_bias();
+                    let k_cache = *ctx.fwd.kv_cache.k_cache(layer as usize);
+                    let v_cache = *ctx.fwd.kv_cache.v_cache(layer as usize);
+                    if interleaved {
+                        kernels::fused_gemv_qkv_interleaved_rope_cache(
+                            *v,
+                            w.dense_weight(),
+                            bias,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            *ctx.fwd.slot_mapping,
+                            k_cache,
+                            v_cache,
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            head_dim,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    } else {
+                        kernels::fused_gemv_qkv_rope_cache(
+                            *v,
+                            w.dense_weight(),
+                            bias,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            *ctx.fwd.slot_mapping,
+                            k_cache,
+                            v_cache,
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            head_dim,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    }
                 } else {
-                    kernels::fused_qkv_rope_cache(
-                        *qkv_packed,
-                        *ctx.fwd.positions,
-                        cos_sin,
-                        *ctx.fwd.slot_mapping,
-                        *ctx.fwd.kv_cache.k_cache(layer as usize),
-                        *ctx.fwd.kv_cache.v_cache(layer as usize),
-                        W::Q_SIZE,
-                        W::KV_SIZE,
-                        W::NUM_Q_HEADS as usize,
-                        W::HEAD_DIM as usize,
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                    )
+                    let qkv_packed = if let Some(bias) = w.dense_bias() {
+                        cutlass::cutlass_gemv_bias(
+                            *v,
+                            w.dense_weight(),
+                            bias,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    } else {
+                        cutlass::cutlass_gemv(
+                            *v,
+                            w.dense_weight(),
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    };
+                    if interleaved {
+                        kernels::fused_qkv_interleaved_rope_cache(
+                            *qkv_packed,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            *ctx.fwd.slot_mapping,
+                            *ctx.fwd.kv_cache.k_cache(layer as usize),
+                            *ctx.fwd.kv_cache.v_cache(layer as usize),
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            head_dim,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    } else if is_fp8 {
+                        kernels::fused_qkv_rope_cache_fp8(
+                            *qkv_packed,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            *ctx.fwd.slot_mapping,
+                            *ctx.fwd.kv_cache.k_cache(layer as usize),
+                            *ctx.fwd.kv_cache.v_cache(layer as usize),
+                            ctx.fwd.kv_cache.k_scale_ptr(layer as usize),
+                            ctx.fwd.kv_cache.v_scale_ptr(layer as usize),
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            head_dim,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    } else {
+                        kernels::fused_qkv_rope_cache(
+                            *qkv_packed,
+                            *ctx.fwd.positions,
+                            cos_sin,
+                            *ctx.fwd.slot_mapping,
+                            *ctx.fwd.kv_cache.k_cache(layer as usize),
+                            *ctx.fwd.kv_cache.v_cache(layer as usize),
+                            W::Q_SIZE,
+                            W::KV_SIZE,
+                            W::NUM_Q_HEADS as usize,
+                            head_dim,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        )
+                    }
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },

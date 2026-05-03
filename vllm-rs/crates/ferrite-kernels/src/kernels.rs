@@ -810,6 +810,110 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Fused GEMV + QKV split + RoPE + reshape_and_cache (DECODE M=1)
+    fn fused_gemv_qkv_rope_cache_neox_f16(
+        q: *mut u16,
+        key_cache: *mut u16,
+        value_cache: *mut u16,
+        x: *const u16,
+        w: *const u16,
+        bias: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        slot_mapping: *const i64,
+        q_size: i32,
+        kv_size: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        k_dim: i32,
+        stream: CUstream,
+    );
+    fn fused_gemv_qkv_rope_cache_neox_bf16(
+        q: *mut u16,
+        key_cache: *mut u16,
+        value_cache: *mut u16,
+        x: *const u16,
+        w: *const u16,
+        bias: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        slot_mapping: *const i64,
+        q_size: i32,
+        kv_size: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        k_dim: i32,
+        stream: CUstream,
+    );
+    fn fused_gemv_qkv_rope_cache_neox_f32(
+        q: *mut f32,
+        key_cache: *mut f32,
+        value_cache: *mut f32,
+        x: *const f32,
+        w: *const f32,
+        bias: *const f32,
+        positions: *const u32,
+        cos_sin_cache: *const f32,
+        slot_mapping: *const i64,
+        q_size: i32,
+        kv_size: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        k_dim: i32,
+        stream: CUstream,
+    );
+    fn fused_gemv_qkv_interleaved_rope_cache_f16(
+        q: *mut u16,
+        key_cache: *mut u16,
+        value_cache: *mut u16,
+        x: *const u16,
+        w: *const u16,
+        bias: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        slot_mapping: *const i64,
+        q_size: i32,
+        kv_size: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        k_dim: i32,
+        stream: CUstream,
+    );
+    fn fused_gemv_qkv_interleaved_rope_cache_bf16(
+        q: *mut u16,
+        key_cache: *mut u16,
+        value_cache: *mut u16,
+        x: *const u16,
+        w: *const u16,
+        bias: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        slot_mapping: *const i64,
+        q_size: i32,
+        kv_size: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        k_dim: i32,
+        stream: CUstream,
+    );
+    fn fused_gemv_qkv_interleaved_rope_cache_f32(
+        q: *mut f32,
+        key_cache: *mut f32,
+        value_cache: *mut f32,
+        x: *const f32,
+        w: *const f32,
+        bias: *const f32,
+        positions: *const u32,
+        cos_sin_cache: *const f32,
+        slot_mapping: *const i64,
+        q_size: i32,
+        kv_size: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        k_dim: i32,
+        stream: CUstream,
+    );
+
     // Fused QKV split + RoPE + FP8 quantize + cache write (BF16→FP8)
     fn fused_qkv_rope_cache_fp8_bf16(
         q: *mut u16,
@@ -5044,6 +5148,205 @@ pub unsafe fn fused_qkv_interleaved_rope_cache_prefill(
     }
 
     (q, k, v)
+}
+
+/// Fused GEMV + QKV split + RoPE + reshape_and_cache (DECODE M=1).
+///
+/// One-launch decode peer of `cutlass_gemv` followed by `fused_qkv_rope_cache`.
+/// `x` is the decode activation row `[1, K]`, `w` is the QKV linear weight
+/// `[N, K]` row-major where `N = q_size + 2*kv_size`. Optional `bias` is `[N]`.
+/// The kernel computes the GEMV, applies RoPE to Q/K, scatters K/V into the
+/// paged cache via `slot_mapping`, and returns the contiguous Q tile shaped
+/// `[1, num_q_heads, head_dim]`.
+///
+/// Fast-path restrictions: `head_size % 4 == 0` (warp count) and `K % 8 == 0`
+/// (vec-load alignment for bf16/f16) — caller must fall back to the legacy
+/// 2-launch path when these don't hold.
+///
+/// # Safety
+/// All tensor pointers must be valid for the duration of `stream`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fused_gemv_qkv_rope_cache(
+    x: GpuTensor,
+    w: GpuTensor,
+    bias: Option<GpuTensor>,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    slot_mapping: GpuTensor,
+    key_cache: GpuTensor,
+    value_cache: GpuTensor,
+    q_size: usize,
+    kv_size: usize,
+    num_q_heads: usize,
+    head_dim: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    debug_assert_eq!(x.ndim(), 2);
+    debug_assert_eq!(x.dim(0), 1, "fused_gemv_qkv_rope_cache: M must be 1");
+    debug_assert_eq!(w.ndim(), 2);
+    debug_assert_eq!(w.dim(1), x.dim(1), "K mismatch");
+    debug_assert_eq!(w.dim(0), q_size + 2 * kv_size, "N mismatch");
+
+    let k_dim = x.dim(1) as i32;
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+
+    let q = alloc.alloc_tensor(&[1, num_q_heads, head_dim], x.dtype());
+    let bias_ptr = bias.as_ref().map_or(std::ptr::null(), |b| b.raw_ptr());
+
+    match x.dtype() {
+        DType::F16 => fused_gemv_qkv_rope_cache_neox_f16(
+            q.as_mut_ptr(),
+            key_cache.raw_ptr() as *mut u16,
+            value_cache.raw_ptr() as *mut u16,
+            x.as_ptr(),
+            w.as_ptr(),
+            bias_ptr as *const u16,
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            slot_mapping.as_ptr() as *const i64,
+            q_size as i32,
+            kv_size as i32,
+            rotary_dim,
+            head_dim as i32,
+            k_dim,
+            stream,
+        ),
+        DType::BF16 => fused_gemv_qkv_rope_cache_neox_bf16(
+            q.as_mut_ptr(),
+            key_cache.raw_ptr() as *mut u16,
+            value_cache.raw_ptr() as *mut u16,
+            x.as_ptr(),
+            w.as_ptr(),
+            bias_ptr as *const u16,
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            slot_mapping.as_ptr() as *const i64,
+            q_size as i32,
+            kv_size as i32,
+            rotary_dim,
+            head_dim as i32,
+            k_dim,
+            stream,
+        ),
+        DType::F32 => fused_gemv_qkv_rope_cache_neox_f32(
+            q.as_mut_ptr(),
+            key_cache.raw_ptr() as *mut f32,
+            value_cache.raw_ptr() as *mut f32,
+            x.as_ptr(),
+            w.as_ptr(),
+            bias_ptr as *const f32,
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            slot_mapping.as_ptr() as *const i64,
+            q_size as i32,
+            kv_size as i32,
+            rotary_dim,
+            head_dim as i32,
+            k_dim,
+            stream,
+        ),
+        _ => panic!(
+            "fused_gemv_qkv_rope_cache: unsupported dtype {:?}",
+            x.dtype()
+        ),
+    }
+
+    q
+}
+
+/// Interleaved-RoPE peer of [`fused_gemv_qkv_rope_cache`] (Cohere/CommandR).
+///
+/// # Safety
+/// Same as [`fused_gemv_qkv_rope_cache`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fused_gemv_qkv_interleaved_rope_cache(
+    x: GpuTensor,
+    w: GpuTensor,
+    bias: Option<GpuTensor>,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    slot_mapping: GpuTensor,
+    key_cache: GpuTensor,
+    value_cache: GpuTensor,
+    q_size: usize,
+    kv_size: usize,
+    num_q_heads: usize,
+    head_dim: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    debug_assert_eq!(x.ndim(), 2);
+    debug_assert_eq!(x.dim(0), 1);
+    debug_assert_eq!(w.ndim(), 2);
+    debug_assert_eq!(w.dim(1), x.dim(1), "K mismatch");
+    debug_assert_eq!(w.dim(0), q_size + 2 * kv_size, "N mismatch");
+
+    let k_dim = x.dim(1) as i32;
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+
+    let q = alloc.alloc_tensor(&[1, num_q_heads, head_dim], x.dtype());
+    let bias_ptr = bias.as_ref().map_or(std::ptr::null(), |b| b.raw_ptr());
+
+    match x.dtype() {
+        DType::F16 => fused_gemv_qkv_interleaved_rope_cache_f16(
+            q.as_mut_ptr(),
+            key_cache.raw_ptr() as *mut u16,
+            value_cache.raw_ptr() as *mut u16,
+            x.as_ptr(),
+            w.as_ptr(),
+            bias_ptr as *const u16,
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            slot_mapping.as_ptr() as *const i64,
+            q_size as i32,
+            kv_size as i32,
+            rotary_dim,
+            head_dim as i32,
+            k_dim,
+            stream,
+        ),
+        DType::BF16 => fused_gemv_qkv_interleaved_rope_cache_bf16(
+            q.as_mut_ptr(),
+            key_cache.raw_ptr() as *mut u16,
+            value_cache.raw_ptr() as *mut u16,
+            x.as_ptr(),
+            w.as_ptr(),
+            bias_ptr as *const u16,
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            slot_mapping.as_ptr() as *const i64,
+            q_size as i32,
+            kv_size as i32,
+            rotary_dim,
+            head_dim as i32,
+            k_dim,
+            stream,
+        ),
+        DType::F32 => fused_gemv_qkv_interleaved_rope_cache_f32(
+            q.as_mut_ptr(),
+            key_cache.raw_ptr() as *mut f32,
+            value_cache.raw_ptr() as *mut f32,
+            x.as_ptr(),
+            w.as_ptr(),
+            bias_ptr as *const f32,
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            slot_mapping.as_ptr() as *const i64,
+            q_size as i32,
+            kv_size as i32,
+            rotary_dim,
+            head_dim as i32,
+            k_dim,
+            stream,
+        ),
+        _ => panic!(
+            "fused_gemv_qkv_interleaved_rope_cache: unsupported dtype {:?}",
+            x.dtype()
+        ),
+    }
+
+    q
 }
 
 /// Fused QKV split + RoPE + FP8 quantize + cache write (decode, NeoX RoPE).
@@ -12134,6 +12437,195 @@ mod tests_fused_qkv_rope_cache {
                     "FP8 interleaved V cache mismatch at {i}: ref=0x{:02X} fused=0x{:02X}",
                     ref_vc[i],
                     fused_vc[i]
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// Compare fused_gemv_qkv_rope_cache (one launch) against the legacy
+    /// 2-launch path: cutlass_gemv (or cutlass_gemv_bias) + fused_qkv_rope_cache.
+    /// Verifies Q output, k_cache, and v_cache all match within bf16 tolerance.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_fused_gemv_qkv_rope_cache_neox() {
+        unsafe {
+            run_fused_gemv_qkv_rope_cache_neox(false);
+            run_fused_gemv_qkv_rope_cache_neox(true);
+        }
+    }
+
+    unsafe fn run_fused_gemv_qkv_rope_cache_neox(with_bias: bool) {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+
+            let num_q_heads = 4;
+            let num_kv_heads = 2;
+            let head_dim = 8;
+            let rotary_dim = 8;
+            let q_size = num_q_heads * head_dim;
+            let kv_size = num_kv_heads * head_dim;
+            let total_dim = q_size + 2 * kv_size;
+            let k_dim = 64; // K must be a multiple of VEC=8.
+            let block_size = 16;
+            let num_blocks = 2;
+            let pos: u32 = 5;
+            let max_pos = (pos as usize) + 4;
+            let slot: i64 = 7;
+
+            // Random-ish input vector and weight.
+            let x_f32: Vec<f32> = (0..k_dim)
+                .map(|i| (i as f32 * 0.13 + 0.21).sin() * 0.7)
+                .collect();
+            let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            let w_f32: Vec<f32> = (0..total_dim * k_dim)
+                .map(|i| (i as f32 * 0.07 + 0.13).cos() * 0.4)
+                .collect();
+            let w_bf16: Vec<u16> = w_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            let bias_bf16: Vec<u16> = if with_bias {
+                (0..total_dim)
+                    .map(|i| f32_to_bf16((i as f32 * 0.19 - 0.5).sin() * 0.3))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let positions = vec![pos];
+            let slot_mapping = vec![slot];
+            let cos_sin_cache = build_cos_sin_cache(max_pos, rotary_dim, 10000.0);
+
+            // Two parallel uploads — one per code path so we can compare results.
+            let x_ref = upload_bf16(&x_bf16, stream);
+            let x_fus = upload_bf16(&x_bf16, stream);
+            let w_ref = upload_bf16(&w_bf16, stream);
+            let w_fus = upload_bf16(&w_bf16, stream);
+            let bias_ref = if with_bias {
+                Some(upload_bf16(&bias_bf16, stream))
+            } else {
+                None
+            };
+            let bias_fus = if with_bias {
+                Some(upload_bf16(&bias_bf16, stream))
+            } else {
+                None
+            };
+            let pos_ref = upload_u32(&positions, stream);
+            let pos_fus = upload_u32(&positions, stream);
+            let slot_ref = upload_i64(&slot_mapping, stream);
+            let slot_fus = upload_i64(&slot_mapping, stream);
+            let cs_ref = upload_bf16(&cos_sin_cache, stream);
+            let cs_fus = upload_bf16(&cos_sin_cache, stream);
+
+            // --- Reference path: cutlass_gemv[_bias] + fused_qkv_rope_cache ---
+            let qkv_ref = if let Some(b_ptr) = bias_ref {
+                crate::cutlass::cutlass_gemv_bias(
+                    GpuTensor::new(x_ref, &[1, k_dim], DType::BF16),
+                    GpuTensor::new(w_ref, &[total_dim, k_dim], DType::BF16),
+                    GpuTensor::new(b_ptr, &[total_dim], DType::BF16),
+                    &mut alloc,
+                    stream,
+                )
+            } else {
+                crate::cutlass::cutlass_gemv(
+                    GpuTensor::new(x_ref, &[1, k_dim], DType::BF16),
+                    GpuTensor::new(w_ref, &[total_dim, k_dim], DType::BF16),
+                    &mut alloc,
+                    stream,
+                )
+            };
+
+            let cache_elems = num_blocks * block_size * num_kv_heads * head_dim;
+            let ref_kc = upload_bf16(&vec![0u16; cache_elems], stream);
+            let ref_vc = upload_bf16(&vec![0u16; cache_elems], stream);
+
+            let ref_q = fused_qkv_rope_cache(
+                qkv_ref.as_gpu_tensor(),
+                GpuTensor::new(pos_ref, &[1], DType::U32),
+                GpuTensor::new(cs_ref, &[max_pos, rotary_dim], DType::BF16),
+                GpuTensor::new(slot_ref, &[1], DType::I64),
+                GpuTensor::new(
+                    ref_kc,
+                    &[num_blocks, block_size, num_kv_heads, head_dim],
+                    DType::BF16,
+                ),
+                GpuTensor::new(
+                    ref_vc,
+                    &[num_blocks, block_size, num_kv_heads, head_dim],
+                    DType::BF16,
+                ),
+                q_size,
+                kv_size,
+                num_q_heads,
+                head_dim,
+                &mut alloc,
+                stream,
+            );
+
+            // --- Fused path: fused_gemv_qkv_rope_cache ---
+            let fus_kc = upload_bf16(&vec![0u16; cache_elems], stream);
+            let fus_vc = upload_bf16(&vec![0u16; cache_elems], stream);
+
+            let bias_tensor = bias_fus.map(|p| GpuTensor::new(p, &[total_dim], DType::BF16));
+
+            let fus_q = fused_gemv_qkv_rope_cache(
+                GpuTensor::new(x_fus, &[1, k_dim], DType::BF16),
+                GpuTensor::new(w_fus, &[total_dim, k_dim], DType::BF16),
+                bias_tensor,
+                GpuTensor::new(pos_fus, &[1], DType::U32),
+                GpuTensor::new(cs_fus, &[max_pos, rotary_dim], DType::BF16),
+                GpuTensor::new(slot_fus, &[1], DType::I64),
+                GpuTensor::new(
+                    fus_kc,
+                    &[num_blocks, block_size, num_kv_heads, head_dim],
+                    DType::BF16,
+                ),
+                GpuTensor::new(
+                    fus_vc,
+                    &[num_blocks, block_size, num_kv_heads, head_dim],
+                    DType::BF16,
+                ),
+                q_size,
+                kv_size,
+                num_q_heads,
+                head_dim,
+                &mut alloc,
+                stream,
+            );
+
+            // --- Compare Q ---
+            let rq = download_bf16_raw(ref_q.as_gpu_tensor().raw_ptr(), q_size, stream);
+            let fq = download_bf16_raw(fus_q.as_gpu_tensor().raw_ptr(), q_size, stream);
+            for i in 0..q_size {
+                let r = bf16_to_f32(rq[i]);
+                let f = bf16_to_f32(fq[i]);
+                assert!(
+                    (r - f).abs() < 5e-3,
+                    "Q[{i}] (bias={with_bias}) ref={r} fused={f}"
+                );
+            }
+
+            // --- Compare paged caches ---
+            let rkc = download_bf16_raw(ref_kc, cache_elems, stream);
+            let fkc = download_bf16_raw(fus_kc, cache_elems, stream);
+            for i in 0..cache_elems {
+                let r = bf16_to_f32(rkc[i]);
+                let f = bf16_to_f32(fkc[i]);
+                assert!(
+                    (r - f).abs() < 5e-3,
+                    "k_cache[{i}] (bias={with_bias}) ref={r} fused={f}"
+                );
+            }
+            let rvc = download_bf16_raw(ref_vc, cache_elems, stream);
+            let fvc = download_bf16_raw(fus_vc, cache_elems, stream);
+            for i in 0..cache_elems {
+                let r = bf16_to_f32(rvc[i]);
+                let f = bf16_to_f32(fvc[i]);
+                assert!(
+                    (r - f).abs() < 5e-3,
+                    "v_cache[{i}] (bias={with_bias}) ref={r} fused={f}"
                 );
             }
 

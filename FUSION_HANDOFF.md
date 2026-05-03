@@ -1,8 +1,24 @@
 # Real-Fusion Handoff
 
-**Branch:** `no-cublas` (post-Phase-1, uncommitted)
+**Branch:** `no-cublas` (post-Phase-2, uncommitted)
 **Off:** `ff-interpreter` @ `5e1ce868b`
 **Goal:** Close the ~2.6 ms/iter gap on qwen2.5-3b prefill 2048/1 vs cuBLAS-on baseline by making the IR-level "fused" Cutlass instructions actually fused at the GPU level.
+
+## STATE 2026-05-03 (Phase 2 landed)
+
+**Phase 2 (CutlassFusedQkvRopeCacheGemv, BF16/F16) done.** New kernel `fused_gemv_qkv_rope_cache_neox` + `_interleaved` (in `pos_encoding_kernels.cu`) folds the GEMV + post-GEMV split + rope + paged kv-cache scatter into ONE launch. One block per QKV head (head_size contiguous outputs / block); 4-warp × 32-lane shfl-reduction over K with x[K] cached in smem; rope/cache write happens after the per-block GEMV completes (no inter-block dependency since rope pairs live within a single head). FP8 cache + (N,K) misalignment + `head_dim%4!=0` fall through to the legacy 2-launch (gemv + rope_cache_write) path.
+
+`instr.rs:CutlassFusedQkvRopeCacheGemv` now runs **1 kernel/decode-layer** on the BF16/F16 happy path (was 2: cutlass_gemv → fused_qkv_rope_cache).
+
+**Bench (L4, qwen2.5-3b prefill 2048/1, batch=1, 30 iter, 10 warmup):**
+- baseline (`037e63496`): 31.77 ms p50
+- Phase 1 (`c29a9965c`): 30.27 ms p50 (−1.50 ms)
+- **Phase 2 (this commit): 30.07 ms p50** (−0.20 ms / total −1.70 ms)
+- cuBLAS-on: 29.16 ms p50
+
+Gap to cuBLAS-on now **+0.91 ms** (was +1.11 ms post-Phase-1, +2.61 ms originally). Cumulative fusions have closed **65%** of the gap. The Phase 2 200 µs win is right at the 36-layer × ~5 µs launch-overhead estimate (slight overshoot from also eliminating the qkv intermediate's L2 round-trip).
+
+**Smoke:** `vllm chat Qwen/Qwen2.5-3B-Instruct` emits coherent haiku.
 
 ## STATE 2026-05-03 (Phase 1 landed)
 
@@ -17,7 +33,7 @@
 | instruction | instr.rs L | launches today | what's already fused | target |
 |---|---|---|---|---|
 | CutlassFusedQkvRopePrefill | 2058 | ~~3~~ → **2** (gemm + fused rope+cache) | rope+cache (NEW, BF16/F16) | done; Phase 1b: gemm fold |
-| CutlassFusedQkvRopeCacheGemv | 1968 | 2 (gemv→rope_cache_write) | rope+cache (real) | 1 kernel |
+| CutlassFusedQkvRopeCacheGemv | 1968 | ~~2~~ → **1** (single fused kernel) | gemv+rope+cache (NEW, BF16/F16) | done; FP8 fold deferred |
 | CutlassFusedGateUpSiluMul | 1752 | 2 (up_gemm→gate_silu_mul) | gate+silu+mul EVT (real) | 1 kernel |
 | CutlassFusedGateUpSiluMulPacked | 1824 | 2 (packed_gemm→silu_mul) | none | 1 kernel |
 | CutlassFusedRmsNormGemm | 671 | 2 (rms→gemm) | none | 1 kernel |
@@ -36,8 +52,8 @@ Per-iter savings descending. Pick the next phase based on prior measurement.
 ### Phase 1 — CutlassFusedQkvRopePrefill — DONE
 Folded rope + paged kv-cache scatter into one kernel (`fused_qkv_rope_cache_prefill_*` in `pos_encoding_kernels.cu`). Gemm still separate. 2 launches per prefill layer instead of 3. Measured −1.50 ms / iter on qwen2.5-3b prefill 2048/1 (more than the rough ~180 µs estimate — HBM round-trip elimination on the contiguous K/V intermediate read also helps). Phase 1b (fold gemm in too via custom epilogue) deferred — measure other phases first.
 
-### Phase 2 — CutlassFusedQkvRopeCacheGemv (decode equivalent)
-Mirror of Phase 1 for decode M=1. Currently 2 launches (gemv + rope_cache_write). Fold rope + cache write into a single GEMV-shaped kernel. ~180 µs/iter.
+### Phase 2 — CutlassFusedQkvRopeCacheGemv (decode equivalent) — DONE
+Mirror of Phase 1 for decode M=1. Was 2 launches (gemv + rope_cache_write); now 1. New `fused_gemv_qkv_rope_cache_neox/_interleaved` kernel: 1 block per QKV head, 4-warp × 32-lane shfl-reduction over K with x[K] in smem, in-block rope/cache after gemv (no inter-block dep — rope pairs are within a head). FP8 + (N, K)%8 != 0 + head_dim%4 != 0 still fall through to the legacy 2-launch path. Measured −0.20 ms / iter on qwen2.5-3b prefill 2048/1 — at the 36-layer × ~5 µs launch-overhead estimate.
 
 ### Phase 3 — CutlassFusedRmsNormGemm + AddRmsNormGemm
 Add an "input scaling prologue" to the basic Cutlass GEMM macro so the row-wise rms norm + per-element norm-weight scale can be applied during the activation read. The norm reduction itself happens in a tiny pre-kernel (scale[N] f32 output) since CUTLASS mainloops can't do cross-CTA row reductions cleanly. Saves the rms_norm kernel launch + the activation HBM write/read round-trip. ~150 µs/iter.

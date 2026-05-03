@@ -195,6 +195,12 @@ pub struct ServeArgs {
     #[arg(long, value_parser = parse_json_map)]
     pub default_chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
 
+    /// Chat template override. Accepts either an inline Jinja string
+    /// or a path to a `tokenizer_config.json` / `.jinja` file. Used
+    /// for GGUFs whose metadata lacks `tokenizer.chat_template`.
+    #[arg(long)]
+    pub chat_template: Option<String>,
+
     /// Enable automatic tool choice (model decides when to call tools).
     #[arg(long)]
     pub enable_auto_tool_choice: bool,
@@ -438,6 +444,12 @@ pub struct ChatArgs {
     /// Disable CUDA graphs (use eager mode).
     #[arg(long)]
     pub enforce_eager: bool,
+
+    /// Chat template override. Accepts either an inline Jinja string
+    /// or a path to a `tokenizer_config.json` / `.jinja` file. Useful
+    /// for GGUFs whose metadata lacks `tokenizer.chat_template`.
+    #[arg(long)]
+    pub chat_template: Option<String>,
 }
 
 impl ChatArgs {

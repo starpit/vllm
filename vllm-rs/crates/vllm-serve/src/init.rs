@@ -107,6 +107,15 @@ pub struct VllmConfig {
     /// "external_launcher" reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT
     /// from env and uses TCP-based NCCL init for inter-process TP.
     pub distributed_executor_backend: String,
+    /// Optional chat template override.
+    ///
+    /// If `Some`, takes precedence over every auto-detected source
+    /// (GGUF metadata `tokenizer.chat_template`, `tokenizer_config.json`,
+    /// `chat_template.jinja`). Accepts either an inline Jinja template
+    /// string or a filesystem path that gets read as the template body.
+    /// Required for GGUFs (e.g. mmnga's Moonlight) whose converters
+    /// dropped the template and whose source HF repo isn't co-located.
+    pub chat_template: Option<String>,
 }
 
 impl Default for VllmConfig {
@@ -144,6 +153,7 @@ impl Default for VllmConfig {
             kv_cache_dtype: "auto".to_string(),
             calculate_kv_scales: false,
             distributed_executor_backend: "auto".to_string(),
+            chat_template: None,
         }
     }
 }
@@ -852,7 +862,10 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         "init engine (load model, create kv cache) took {:.2} seconds",
         init_start.elapsed().as_secs_f64()
     );
-    let chat_template = core.model_dir.as_deref().and_then(try_load_chat_template);
+    let chat_template = core
+        .model_dir
+        .as_deref()
+        .and_then(|dir| resolve_chat_template(config.chat_template.as_deref(), dir));
     Ok(InitializedSyncStack {
         client: core.client,
         tokenizer: core.tokenizer,
@@ -921,7 +934,7 @@ pub fn initialize_stack(
             let chat_template = core
                 .model_dir
                 .as_ref()
-                .and_then(|dir| try_load_chat_template(dir));
+                .and_then(|dir| resolve_chat_template(config.chat_template.as_deref(), dir));
             if let Some(tpl) = chat_template {
                 info!("Chat template loaded from tokenizer_config.json");
                 AsyncEngine::with_tokenizer_and_template(
@@ -1280,7 +1293,7 @@ fn initialize_stack_multinode(
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
             if let Some(ref dir) = model_dir {
-                if let Some(ct) = try_load_chat_template(dir) {
+                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
                     info!("Chat template loaded from tokenizer_config.json");
                     AsyncEngine::with_tokenizer_and_template(
                         client,
@@ -1781,7 +1794,7 @@ fn initialize_stack_tp_pp(
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
             if let Some(ref dir) = model_dir {
-                if let Some(ct) = try_load_chat_template(dir) {
+                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
                     info!("Chat template loaded from tokenizer_config.json");
                     AsyncEngine::with_tokenizer_and_template(
                         client,
@@ -2101,7 +2114,7 @@ fn initialize_stack_tp(
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
             if let Some(ref dir) = model_dir {
-                if let Some(ct) = try_load_chat_template(dir) {
+                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
                     info!("Chat template loaded from tokenizer_config.json");
                     AsyncEngine::with_tokenizer_and_template(
                         client,
@@ -2426,7 +2439,7 @@ fn initialize_stack_external(
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
             if let Some(ref dir) = model_dir {
-                if let Some(ct) = try_load_chat_template(dir) {
+                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
                     info!("Chat template loaded from tokenizer_config.json");
                     AsyncEngine::with_tokenizer_and_template(
                         client,
@@ -2482,6 +2495,104 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))
 }
 
+/// Resolve a chat template, honoring an explicit operator override
+/// (`config.chat_template`) before falling back to auto-detection.
+///
+/// `override_str` is interpreted as a filesystem path if the value
+/// names a readable file; otherwise treated as inline Jinja. This
+/// covers `--chat-template /path/to/tokenizer_config.json` as well
+/// as raw template strings.
+pub(crate) fn resolve_chat_template(
+    override_str: Option<&str>,
+    model_dir: &Path,
+) -> Option<ChatTemplate> {
+    if let Some(s) = override_str {
+        let trimmed = s.trim();
+        let from_path = std::path::Path::new(trimmed);
+        let raw: Option<String> = if from_path.is_file() {
+            // Either a .jinja template or a tokenizer_config.json. If
+            // the file parses as JSON with a `chat_template` field,
+            // use that; otherwise treat the file body as raw Jinja.
+            std::fs::read_to_string(from_path).ok().map(|body| {
+                match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => v
+                        .get("chat_template")
+                        .and_then(|x| x.as_str().map(String::from))
+                        .unwrap_or(body),
+                    Err(_) => body,
+                }
+            })
+        } else {
+            Some(trimmed.to_string())
+        };
+        if let Some(template_str) = raw {
+            match ChatTemplate::new(template_str) {
+                Ok(mut tpl) => {
+                    // GGUFs almost always lack bos/eos at the
+                    // template-string level — the original
+                    // tokenizer_config.json renders them via
+                    // `{{- bos_token }}` / `{{ eos_token }}`. When the
+                    // override is paired with a GGUF, pull bos/eos
+                    // from the file's metadata (same path the
+                    // auto-detect branch uses) so an operator-supplied
+                    // template still gets the right special tokens.
+                    if let Some(gguf_path) = gguf_in_or_under(model_dir)
+                        && let Ok(gguf) = ferrite_gguf::GgufFile::open(&gguf_path)
+                    {
+                        tpl = apply_gguf_special_tokens(&gguf, tpl);
+                    }
+                    info!("Chat template loaded from --chat-template override");
+                    return Some(tpl);
+                }
+                Err(e) => {
+                    info!("Failed to parse --chat-template override: {e}");
+                }
+            }
+        }
+    }
+    try_load_chat_template(model_dir)
+}
+
+/// Helper used by both `resolve_chat_template` and `try_load_chat_template`:
+/// locate the .gguf file at, or directly inside, `model_dir`.
+fn gguf_in_or_under(model_dir: &Path) -> Option<std::path::PathBuf> {
+    if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf") {
+        Some(model_dir.to_path_buf())
+    } else if model_dir.is_dir() {
+        std::fs::read_dir(model_dir).ok().and_then(|mut it| {
+            it.find_map(|entry| {
+                let p = entry.ok()?.path();
+                (p.extension().is_some_and(|e| e == "gguf")).then_some(p)
+            })
+        })
+    } else {
+        None
+    }
+}
+
+/// Pull bos/eos token strings out of GGUF metadata and stamp them
+/// onto a `ChatTemplate`. Does nothing if either id or the tokens
+/// array is missing.
+fn apply_gguf_special_tokens(gguf: &ferrite_gguf::GgufFile, mut tpl: ChatTemplate) -> ChatTemplate {
+    if let Some(tokens_val) = gguf.metadata().get("tokenizer.ggml.tokens")
+        && let Ok(tokens) = tokens_val.to_vec()
+    {
+        let resolve =
+            |id: u32| -> Option<String> { tokens.get(id as usize)?.to_string().ok().cloned() };
+        if let Some(bos_id) = gguf.get_metadata_u32("tokenizer.ggml.bos_token_id")
+            && let Some(s) = resolve(bos_id)
+        {
+            tpl = tpl.with_bos_token(s);
+        }
+        if let Some(eos_id) = gguf.get_metadata_u32("tokenizer.ggml.eos_token_id")
+            && let Some(s) = resolve(eos_id)
+        {
+            tpl = tpl.with_eos_token(s);
+        }
+    }
+    tpl
+}
+
 /// Try to load a chat template. Sources tried, in order:
 /// 1. `model_dir/tokenizer_config.json` (HF convention).
 /// 2. `model_dir/chat_template.jinja` (some quantized repos).
@@ -2491,49 +2602,13 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
 fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     // GGUF: read from metadata. Try direct file, then look for any
     // .gguf file in the directory.
-    let gguf_candidate: Option<std::path::PathBuf> =
-        if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf") {
-            Some(model_dir.to_path_buf())
-        } else if model_dir.is_dir() {
-            std::fs::read_dir(model_dir).ok().and_then(|mut it| {
-                it.find_map(|entry| {
-                    let p = entry.ok()?.path();
-                    (p.extension().is_some_and(|e| e == "gguf")).then_some(p)
-                })
-            })
-        } else {
-            None
-        };
-    if let Some(gguf_path) = gguf_candidate
+    if let Some(gguf_path) = gguf_in_or_under(model_dir)
         && let Ok(gguf) = ferrite_gguf::GgufFile::open(&gguf_path)
         && let Some(template_str) = ferrite_gguf::gguf_chat_template(&gguf)
     {
         match ChatTemplate::new(template_str) {
-            Ok(mut tpl) => {
-                // Resolve bos_token / eos_token strings from the GGUF
-                // metadata (`tokenizer.ggml.{bos,eos}_token_id` →
-                // `tokens[id]`) so the Jinja template's
-                // `{{- bos_token }}` / `{{ eos_token }}` placeholders
-                // render correctly. Without this the prompt is missing
-                // the leading `<|begin_of_text|>` and the model gets
-                // an out-of-distribution input → garbage output.
-                if let Some(tokens_val) = gguf.metadata().get("tokenizer.ggml.tokens")
-                    && let Ok(tokens) = tokens_val.to_vec()
-                {
-                    let resolve = |id: u32| -> Option<String> {
-                        tokens.get(id as usize)?.to_string().ok().cloned()
-                    };
-                    if let Some(bos_id) = gguf.get_metadata_u32("tokenizer.ggml.bos_token_id")
-                        && let Some(s) = resolve(bos_id)
-                    {
-                        tpl = tpl.with_bos_token(s);
-                    }
-                    if let Some(eos_id) = gguf.get_metadata_u32("tokenizer.ggml.eos_token_id")
-                        && let Some(s) = resolve(eos_id)
-                    {
-                        tpl = tpl.with_eos_token(s);
-                    }
-                }
+            Ok(tpl) => {
+                let tpl = apply_gguf_special_tokens(&gguf, tpl);
                 info!("Chat template loaded from GGUF metadata");
                 return Some(tpl);
             }

@@ -50,9 +50,18 @@ There are NO arch-keyed god-switches anywhere; no GGUF code in
 **Inference-coherent at tp=1** (greedy "Paris" smoke through `vllm
 chat`): Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B,
 Mistral-7B-Instruct-v0.3, Gemma-2-2B, Gemma-3-1B, **DeepSeek-V2-Lite**,
-**Phi-3.5-mini**. The SentencePiece path (`tokenizer.ggml.model =
-"llama"`) synthesizes BPE merges from vocab+scores via a direct port
-of HF's `generate_merges` — see `build_sentencepiece_tokenizer`.
+**Phi-3.5-mini**, **Moonlight-16B-A3B (V3-flat)**. The SentencePiece
+path (`tokenizer.ggml.model = "llama"`) synthesizes BPE merges from
+vocab+scores via a direct port of HF's `generate_merges` — see
+`build_sentencepiece_tokenizer`.
+
+Moonlight via mmnga's GGUF needs `--chat-template
+/path/to/tokenizer_config.json` because the converter dropped the
+template; the source HF repo's tokenizer_config.json is the right
+input. The CLI flag accepts inline Jinja, a `.jinja` path, or a
+`tokenizer_config.json` path (extracts the `chat_template` field);
+bos/eos resolve from the GGUF's metadata so the rendered prompt has
+the right special tokens.
 
 **Known broken / out of scope here:** CommandR-35B (decodes only PAD
 on L4, needs >40 GB GPU to disambiguate IQ1_S quality cliff vs real
@@ -156,6 +165,21 @@ arch bug).
   V2-Lite / Gemma-3-1B unchanged. `gguf_inference_smoke` integration
   test now covers Phi-3.5-mini and DeepSeek-V2-Lite alongside
   Llama-3.2-1B + Mistral-7B-v0.3 — 4 fixtures, all green serial.
+* **Operator chat-template override (`--chat-template`).** Many
+  GGUF converters drop `tokenizer.chat_template` from the metadata
+  (e.g. mmnga's Moonlight-16B-A3B-Instruct-gguf) — `vllm chat`
+  previously hard-failed with `model does not have a chat template`.
+  Added a `chat_template: Option<String>` field on `VllmConfig`, an
+  `LLMBuilder::chat_template` setter, and matching `--chat-template`
+  flags on `vllm chat` + `vllm serve`. The value is interpreted as
+  inline Jinja, a `.jinja` file, or a `tokenizer_config.json` (the
+  `chat_template` field is extracted automatically). When the model
+  is a GGUF, bos/eos token strings still resolve from the file's
+  `tokenizer.ggml.{bos,eos}_token_id` so the rendered prompt has
+  the right special tokens. Verified: Moonlight Q4_K_M with
+  `--chat-template /path/to/moonshotai_Moonlight_tokenizer_config.json`
+  now greedy-coherent ("The capital of France is Paris.") — closes
+  the V3-flat GGUF forward verification on a real fixture.
 
 ## Open follow-ups
 
@@ -177,10 +201,9 @@ arch bug).
   gate matmul → all-NaN logits → token 0 PAD output. Replaced with
   `kernels::fp8_post_scale_multiply` (genuinely per-row), adding a F32
   variant of the row-scale kernel since the existing one only had BF16/F16.
-  Verified: V2-Lite reproducer below now outputs "Paris." Moonlight
-  (V3-flat) GGUF loads but `vllm chat` fails on missing chat template
-  in mradermacher's GGUF — separate issue (chat template extraction
-  from GGUF metadata, out of scope here).
+  Verified: V2-Lite reproducer below now outputs "Paris."
+  Moonlight (V3-flat) is also now coherent end-to-end via
+  `--chat-template` (see "Operator chat-template override" below).
 
   Reproducer (now coherent):
   ```
@@ -190,94 +213,20 @@ arch bug).
   # Outputs: " Paris.\n\nUser: ..."
   ```
 
-* **(former blocker, now resolved) DeepSeek V2 / V3 GGUF — MoE loader DONE; forward gives garbage.**
-  Loader (a)-shape landed: separate `DeepSeekV2GgmlMoELayer` accessor +
-  `Instruction::DeepSeekMoeGgml` + `DeepSeekGgmlMoeImpl` claim on
-  `is_ggml_moe(fuf, tile)` + `FieldLoad::DeepSeekV2GgmlMoe` codegen arm.
-  `GgmlFusedMoELayer.gate` reverted back to `Linear` (the GGUF loader's
-  dense path already converts the F32 router gate to model dtype, so a
-  plain dense Linear is the right field type — see
-  `ferrite-kernels::ggml::load_gguf_into_weights` lines 1635–1679).
-  Loader interleaves `fused_{gate,up}_exps` byte slabs into a single
-  quantized `w1 = [E, 2*inter, hidden]`, frees originals via
-  `unrecord_alloc + driver::mem_free`, and re-`record_alloc`s the new
-  buffer. Shared experts: `gate_proj + up_proj` byte-concat into a fused
-  `GgmlLinear[2*shared_inter, hidden]`; `down_proj` lives as its own
-  `GgmlLinear`. Gate-up dtype must match (interleaved into shared w1);
-  `down` may use a higher-precision quant (typical Q4_K_M ships
-  gate/up=Q4_K, down=Q8_0). V2-Lite Q4_K_M loads cleanly through this
-  path now — no missing-weight errors.
+* **DeepSeek V2/V3 Q-path coverage** (resolved). V2 MoE was the
+  long-standing blocker; V3-flat coherence followed once
+  `--chat-template` unblocked Moonlight. Q-path table below for
+  reference:
 
-  **But inference output is `!!!!!!!!!!`** (token 0 / PAD repeated) on
-  V2-Lite Q4_K_M, both with and without `FERRITE_USE_REFERENCE=1` (so
-  not a quantized-matmul kernel bug). Reproducer:
-  ```
-  ./vllm-rs/target/release/vllm chat \
-    --model ~/.cache/huggingface/hub/models--mradermacher--DeepSeek-V2-Lite-GGUF/snapshots/0f37fdf276e8094747457f0ae4d40f2e8d2521f9/DeepSeek-V2-Lite.Q4_K_M.gguf \
-    --max-tokens 30 --temperature 0 --prompt "What is the capital of France?"
-  # Today: "!!!!!!!!!!"
-  # Expected: "The capital of France is Paris."
-  ```
+  | Q path         | V2 MoE (softmax, scale=1)        | V3 MoE (sigmoid + noaux_tc, scale=2.5) |
+  | -------------- | -------------------------------- | -------------------------------------- |
+  | flat (no LoRA) | `ferrite-model-deepseek-v2`  ✓   | `ferrite-model-deepseek-v3-flat` ✓ (Moonlight, Kimi K2 family) |
+  | LoRA (q_a/q_b) | (DeepSeek-V2 non-Lite — n/a)     | `ferrite-model-deepseek-v3`  ✓         |
 
-  Per `feedback_v2lite_was_verified.md`, the underlying ferrite V2
-  MLA / attention / norms / sampling were verified end-to-end through
-  the BF16 safetensors path *before* the GGUF work — so the bug is in
-  the GGUF-specific surface, not in the ferrite V2 forward.
-
-  **What's been ruled out:**
-  - YaRN params: V2-Lite GGUF (mradermacher's) ships only
-    `rope.scaling.{type,factor,original_context_length}`, omitting
-    `mscale`, `mscale_all_dim`, `beta_fast`, `beta_slow`. The
-    `metadata_defaults` mechanism was extended to support dotted keys
-    that splice into nested config objects (`rope_scaling.mscale`),
-    and V2's `quantizations.json` declares the four V2-typical
-    YaRN defaults. Confirmed via `FERRITE_GGUF_TRACE` that
-    `rope_scaling` post-defaults has all six fields. **However**:
-    ferrite bakes YaRN at *compile time* from the per-variant
-    config (`ferrite-forward-macro/src/config.rs::extract_rope_scaling`,
-    line 829), reading the merged JSON which is the BASE
-    `deepseek-v2-lite.json` (already complete). So the runtime
-    `metadata_defaults` is wasted for the ferrite path — only
-    helps the vllm-cuda hand-written V2 path which is not on
-    today's GGUF dispatch route. Defaults left in place as future
-    defense.
-
-  **Open suspects** (next session triage):
-  (1) `DeepSeekV2GgmlMoELayer::load_gguf` byte interleave / concat
-  arithmetic — most plausible. The hand-written reference is
-  `vllm-cuda::deepseek_v2::load_gguf` lines 1620–1764; my mirror
-  is in `ferrite-kernels::layers_moe::DeepSeekV2GgmlMoELayer`.
-  Compare expert-slab byte offsets carefully.
-  (2) Shared-expert gate+up concat order. Hand-written and mine
-  both put gate first then up. Confirm `silu_and_mul_fused`
-  expects [gate | up] — yes (gate in first half, up in second).
-  (3) `down_exps` direct reuse as `w2`. Storage `nrows = E*hidden,
-  ncols = inter` — is this what `indexed_moe_forward` expects for
-  `w2` slicing per expert? Check `ggml.rs::ggml_moe_forward`
-  + the kernel.
-  (4) Layer-0 dense path: V2-Lite has `first_k_dense_replace=1`;
-  layer 0 uses `mlp.gate_proj/up_proj/down_proj` via the standard
-  ferrite GEMM Impls. Should be solid (other archs share this
-  path) but worth verifying tensors load correctly.
-
-  Triage path: dump hidden-state norms after embedding, after layer
-  0, after layer 1's attention, after layer 1's MoE → compare
-  against Python vLLM ground truth for the same prompt. No V2-Lite
-  safetensors cached locally (~30 GB; only 2.8 GB free on /).
-  Reproducer at top of bullet. Q-path coverage table below still
-  holds; Moonlight V3-flat awaits the same fix.
-
-  Q-path coverage in the project (`v3-flat` is in this worktree's
-  workspace post-rebase):
-
-  | Q path        | V2 MoE (softmax, scale=1)         | V3 MoE (sigmoid + noaux_tc, scale=2.5)  |
-  | ------------- | --------------------------------- | --------------------------------------- |
-  | flat (no LoRA) | `ferrite-model-deepseek-v2`  ✓  | `ferrite-model-deepseek-v3-flat` ✓ (Moonlight, Kimi K2 family) |
-  | LoRA (q_a/q_b) | (DeepSeek-V2 non-Lite — n/a)    | `ferrite-model-deepseek-v3`  ✓          |
-
-  Test fixtures cached:
+  Test fixtures (both in `gguf_inference_smoke`):
   - `mradermacher/DeepSeek-V2-Lite-GGUF` `Q4_K_M` (~10 GB) — V2 path
   - `mmnga/Moonlight-16B-A3B-Instruct-gguf` `Q4_K_M` (~10.5 GB) — V3-flat path
+
 * **CommandR forward correctness on a bigger GPU.** Reproducer:
   ```
   ./vllm-rs/target/release/vllm chat \
@@ -314,10 +263,15 @@ arch bug).
     HF reference ids.
   - **End-to-end inference** — `gguf_inference_smoke` shells out
     to the built `vllm` binary and asserts greedy "Paris" coherent
-    on Llama-3.2-1B, Mistral-7B-v0.3, DeepSeek-V2-Lite, and
-    Phi-3.5-mini GGUFs. Locks down the load + dispatch + forward
-    pipeline; needs a built binary + GPU. Moonlight (V3-flat) is
-    held back pending GGUF chat-template extraction. Run:
+    on Llama-3.2-1B, Mistral-7B-v0.3, DeepSeek-V2-Lite, Phi-3.5-mini,
+    and Moonlight-16B-A3B (V3-flat) GGUFs. Locks down the load +
+    dispatch + forward pipeline; needs a built binary + GPU.
+    Moonlight uses the vendored chat template at
+    `crates/ferrite-gguf/test_fixtures/moonshotai_moonlight_chat_template.jinja`
+    via `--chat-template`. The test sleeps 2 s between fixtures so
+    the CUDA driver has time to reclaim the prior subprocess's GPU
+    memory — without it, the larger fixtures (V2-Lite, Moonlight)
+    can flake on `CUDA_ERROR_OUT_OF_MEMORY`. Run:
     ```
     cargo build --manifest-path vllm-rs/Cargo.toml -p vllm-cli \
         --features cuda --release

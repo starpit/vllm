@@ -1646,51 +1646,85 @@ mod tests {
             return;
         }
 
-        // (label, gguf-path-suffix-under-HF-cache).
-        let cases: &[(&str, &str)] = &[
+        // (label, gguf-path-suffix-under-HF-cache, optional
+        // chat-template fixture filename relative to
+        // `crates/ferrite-gguf/test_fixtures/`). The chat-template
+        // override is only needed for GGUFs that ship without
+        // `tokenizer.chat_template` in metadata — e.g. mmnga's
+        // Moonlight conversion.
+        let cases: &[(&str, &str, Option<&str>)] = &[
             (
                 "Llama-3.2-1B (BPE)",
                 "models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/b69aef112e9f895e6f98d7ae0949f72ff09aa401/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+                None,
             ),
             (
                 "Mistral-7B-v0.3 (SP)",
                 "models--bartowski--Mistral-7B-Instruct-v0.3-GGUF/snapshots/61fd4167fff3ab01ee1cfe0da183fa27a944db48/Mistral-7B-Instruct-v0.3-IQ2_S.gguf",
+                None,
             ),
             (
                 "DeepSeek-V2-Lite (MoE)",
                 "models--mradermacher--DeepSeek-V2-Lite-GGUF/snapshots/0f37fdf276e8094747457f0ae4d40f2e8d2521f9/DeepSeek-V2-Lite.Q4_K_M.gguf",
+                None,
             ),
             (
                 "Phi-3.5-mini (fused qkv + gate_up)",
                 "models--bartowski--Phi-3.5-mini-instruct-GGUF/snapshots/6d70da17e749a471ccb62ade694486011a75cda3/Phi-3.5-mini-instruct-Q4_K_M.gguf",
+                None,
+            ),
+            (
+                "Moonlight-16B-A3B (V3-flat)",
+                "models--mmnga--Moonlight-16B-A3B-Instruct-gguf/snapshots/eb4728b376af0f3e168dc96d23cd21818c5738f6/Moonlight-16B-A3B-Instruct-Q4_K_M.gguf",
+                Some("moonshotai_moonlight_chat_template.jinja"),
             ),
         ];
 
+        let fixtures_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_fixtures");
         let mut ran = 0;
-        for (label, suffix) in cases {
+        for (i, (label, suffix, chat_template_fixture)) in cases.iter().enumerate() {
+            // Brief inter-fixture pause: each subprocess exits promptly
+            // after `vllm chat` produces coherent output, but the CUDA
+            // driver can take a moment to fully reclaim the previous
+            // process's GPU memory. Without this, the next fixture's
+            // weight load can hit `CUDA_ERROR_OUT_OF_MEMORY` even when
+            // total demand is well under VRAM. 2s is empirically enough
+            // on L4; total inflation is bounded at ~10s for 5 fixtures.
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
             let path = format!("{home}/.cache/huggingface/hub/{suffix}");
             if !std::path::Path::new(&path).exists() {
                 eprintln!("[skip] {label}: {path} not found");
                 continue;
             }
-            // `timeout 120` — wraps `vllm chat`. Coherent output
+            // `timeout 180` — wraps `vllm chat`. Coherent output
             // exits cleanly; garbage loops forever (per
-            // `feedback_no_run_chat`). 120s is plenty for both
-            // small models on L4.
+            // `feedback_no_run_chat`). 180s for the larger MoE
+            // fixtures (Moonlight), 120s would suffice for the rest
+            // but uniform timeout keeps the case loop simple.
+            let chat_template_path: Option<std::path::PathBuf> =
+                chat_template_fixture.map(|name| fixtures_dir.join(name));
+            let mut argv: Vec<String> = vec![
+                "180".into(),
+                bin.to_str().expect("vllm bin path is utf-8").into(),
+                "chat".into(),
+                "--model".into(),
+                path.clone(),
+                "--max-tokens".into(),
+                "30".into(),
+                "--temperature".into(),
+                "0".into(),
+                "--prompt".into(),
+                prompt.into(),
+            ];
+            if let Some(ref ct_path) = chat_template_path {
+                argv.push("--chat-template".into());
+                argv.push(ct_path.to_string_lossy().into_owned());
+            }
             let output = std::process::Command::new("timeout")
-                .args([
-                    "120",
-                    bin.to_str().expect("vllm bin path is utf-8"),
-                    "chat",
-                    "--model",
-                    &path,
-                    "--max-tokens",
-                    "30",
-                    "--temperature",
-                    "0",
-                    "--prompt",
-                    prompt,
-                ])
+                .args(&argv)
                 .output()
                 .unwrap_or_else(|e| panic!("spawn `timeout vllm chat`: {e}"));
             let stdout = String::from_utf8_lossy(&output.stdout);

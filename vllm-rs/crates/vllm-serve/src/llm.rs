@@ -320,6 +320,15 @@ impl LLMBuilder {
         self
     }
 
+    /// Set an explicit chat template override. Accepts either inline
+    /// Jinja or a path to a `tokenizer_config.json` / `.jinja` file.
+    /// Used to inject a template for GGUFs (e.g. mmnga's Moonlight)
+    /// whose metadata dropped the field.
+    pub fn chat_template(mut self, tpl: impl Into<String>) -> Self {
+        self.config.chat_template = Some(tpl.into());
+        self
+    }
+
     /// Set the CUDA graph configuration for decode acceleration.
     pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
         self.config.cuda_graph_config = Some(config);

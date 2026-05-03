@@ -118,6 +118,9 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     }
     builder = builder.tensor_parallel_size(args.tensor_parallel_size);
     builder = builder.enforce_eager(args.enforce_eager);
+    if let Some(ref tpl) = args.chat_template {
+        builder = builder.chat_template(tpl.clone());
+    }
     let mut llm = builder.build()?;
     let startup_ms = t0.elapsed().as_secs_f64() * 1000.0;
 

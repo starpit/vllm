@@ -1241,7 +1241,11 @@ impl Fp8SharedFusedMoELayer {
 /// 7. indexed_moe_forward(w2, q8_activated, indices) → [batch*topk, hidden] f32
 /// 8. Scale by topk_weights, sum across topk → [batch, hidden] f32
 pub struct GgmlFusedMoELayer {
-    /// Gate projection: `[hidden_size, num_experts]`.
+    /// Gate projection: `[num_experts, hidden_size]` dense.
+    /// llama.cpp converters store the router gate as F32 unconditionally
+    /// (even in Q4_K_M GGUFs), so the ferrite GGUF loader puts it in
+    /// `gguf_dense` already cast to model dtype — a plain dense `Linear`
+    /// is the right type. (FP8/AWQ/etc. router gates are similarly dense.)
     pub gate: Linear,
     /// Stacked gate+up weights: `[num_experts, 2*intermediate_size, hidden_size]` quantized.
     /// GgmlStorage with nrows = num_experts * 2 * intermediate_size, ncols = hidden_size.
@@ -1282,7 +1286,7 @@ impl GgmlFusedMoELayer {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
-        // 1. Gate: router_logits = hidden_states @ gate_weight^T
+        // 1. Gate: router_logits = hidden_states @ gate_weight^T (dense Linear).
         let router_logits =
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
@@ -1393,16 +1397,32 @@ impl GgmlFusedMoELayer {
         );
         drop(topk_ids); // indices no longer needed
 
-        // 8. Scale by topk_weights and sum across topk → [num_tokens, hidden_size] f32
-        // broadcast_mul_inplace: out2[row, :] *= topk_weights_flat[row]
-        // topk_weights is [num_tokens, topk] f32 (num_tokens*topk contiguous elements),
-        // out2 is [num_tokens*topk, hidden] f32. Pass topk_weights directly — the kernel
-        // just reads num_rows scalar values from the scale pointer.
-        kernels::broadcast_mul_inplace(
-            out2.as_gpu_tensor(),
-            *topk_weights.view(), // [num_tokens, topk] — num_tokens*topk contiguous f32s
-            stream,
-        );
+        // 8. Scale by topk_weights and sum across topk → [num_tokens, hidden_size] f32.
+        //
+        // out2 is `[num_tokens * topk, hidden]` f32; topk_weights is
+        // `[num_tokens, topk]` f32 (also num_tokens*topk contiguous f32s). We
+        // need `out2[row, :] *= topk_weights[row]` — *row*-wise scaling.
+        //
+        // `kernels::broadcast_mul_inplace` is the WRONG primitive here: its
+        // kernel does `out2[r, c] *= scale[c]` — column-wise — and indexes
+        // `scale[c]` for c in [0, hidden), reading num_tokens*topk past the
+        // end of the topk_weights buffer (= UB; corrupts output to ±Inf/NaN
+        // and the bug propagates through the residual stream into every
+        // downstream MoE layer's gate matmul). Use `fp8_post_scale_multiply`,
+        // which is genuinely per-row (`output[i, :] *= scales[i]`).
+        // Reshape via `with_view` because the kernel asserts `output.ndim()==2`
+        // and `scales.ndim()==1` and that `output.dim(0)==scales.dim(0)`.
+        let topk_view = topk_weights.view();
+        let topk_flat = unsafe {
+            ferrite_cuda_core::tensor::TensorView::from_raw(
+                ferrite_cuda_core::tensor::GpuTensor::new(
+                    topk_view.raw_ptr(),
+                    &[num_tokens * self.top_k],
+                    ferrite_cuda_core::dtype::DType::F32,
+                ),
+            )
+        };
+        kernels::fp8_post_scale_multiply(out2.as_gpu_tensor(), *topk_flat, stream);
         drop(topk_weights);
 
         let output = kernels::moe_sum(
@@ -1428,6 +1448,315 @@ impl GgmlFusedMoELayer {
         } else {
             output
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeekV2GgmlMoELayer (GGML-quantized DeepSeek MoE)
+// ---------------------------------------------------------------------------
+
+/// GGUF/GGML-quantized analog of [`DeepSeekV2MoELayer`]. Used for any
+/// DeepSeek-family GGUF (V2-Lite, Moonlight V3-flat, K2 GGUFs).
+///
+/// Forward shape mirrors `DeepSeekV2MoELayer::forward` — only the
+/// expert storage changes (`GgmlFusedMoELayer` for routed experts;
+/// `GgmlLinear` for shared gate_up + down).
+pub struct DeepSeekV2GgmlMoELayer {
+    pub moe: GgmlFusedMoELayer,
+    /// Shared expert fused gate+up: concatenated `GgmlLinear`
+    /// `[2 * shared_inter, hidden_size]`.
+    pub shared_gate_up: crate::layers::GgmlLinear,
+    /// Shared expert down: `GgmlLinear` `[hidden_size, shared_inter]`.
+    pub shared_down: crate::layers::GgmlLinear,
+    pub shared_intermediate_size: usize,
+    pub routed_scaling_factor: f32,
+}
+
+impl DeepSeekV2GgmlMoELayer {
+    /// Forward pass: `output = routed_scaling_factor * moe(x) + shared_expert(x)`.
+    ///
+    /// `moe.forward` returns the input dtype (cast back from f32 inside).
+    /// `shared_gate_up.forward` casts back to input dtype too (GgmlLinear
+    /// internal contract). So both `moe_out` and `shared_out` are
+    /// `input_dtype` at the `add_inplace` seam — same shape as
+    /// `DeepSeekV2MoELayer::forward`'s terminal add.
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let stream = device.compute_stream;
+
+        // Routed experts (GGML).
+        let moe_out = self.moe.forward(hidden_states, device);
+        if self.routed_scaling_factor != 1.0 {
+            kernels::scale_inplace(*moe_out.view(), self.routed_scaling_factor, &device.cublas);
+        }
+
+        // Shared expert: silu(gate_up) → down. Both GgmlLinear; outputs match
+        // `hidden_states.dtype()` because GgmlLinear casts back from its
+        // internal f32 to the input dtype on exit.
+        let shared_gu = self
+            .shared_gate_up
+            .forward(hidden_states, &mut device.caching, stream);
+        let shared_activated = kernels::silu_and_mul_fused(
+            *shared_gu.view(),
+            self.shared_intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(shared_gu);
+        let shared_out =
+            self.shared_down
+                .forward(shared_activated.view(), &mut device.caching, stream);
+        drop(shared_activated);
+
+        // output = moe_out + shared_out (no sigmoid gate); both in input_dtype.
+        kernels::add_inplace(*moe_out.view(), *shared_out.view(), stream);
+        drop(shared_out);
+        moe_out
+    }
+
+    /// Load from GGUF weights. Mirrors the hand-written
+    /// `vllm-cuda::deepseek_v2::load_gguf` (model-side fused-3D MoE
+    /// expert layout): consumes `mlp.experts.fused_{gate,up,down}_exps.weight`
+    /// (already 3D `[num_experts, slab, hidden|inter]` after `ferrite-gguf`'s
+    /// rename) plus `mlp.shared_experts.{gate,up,down}_proj.weight` and
+    /// `mlp.gate.weight` (router).
+    ///
+    /// Interleaves gate+up byte slabs into a single quantized
+    /// `w1 = [E, 2*inter, hidden]` for the `indexed_moe_forward` kernel;
+    /// reuses the `down` tensor as `w2 = [E, hidden, inter]`. Frees the
+    /// per-component `gate_exps`/`up_exps` buffers after copy so net
+    /// memory matches the per-tensor sum (no doubling).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_gguf(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        use_sigmoid: bool,
+        n_expert_group: usize,
+        topk_group: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        use crate::ggml::GgmlStorage;
+        use ferrite_cuda_core::driver;
+        use ferrite_cuda_core::dtype::DType;
+        use ferrite_cuda_core::tensor::GpuTensor;
+
+        let inter = moe_intermediate_size;
+        let hidden = hidden_size;
+
+        // ── Router gate (dense BF16; ferrite-gguf loader converts the
+        // F32-on-disk gate to model dtype during load, so it lands in
+        // `gguf_dense` already shape-correct for a plain Linear). ──
+        let gate_name = format!("{prefix}.gate.weight");
+        let gate_w = gw
+            .take_gguf_dense(&gate_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+        let gate = Linear::new(gate_w, None);
+
+        // ── Routed expert weights (fused 3D) ──
+        // `mlp.experts.fused_gate_exps.weight` lands as a single GgmlStorage
+        // with `nrows = E * inter`, `ncols = hidden` (set by ggml.rs's 3D-flatten).
+        let gate_exps_name = format!("{prefix}.experts.fused_gate_exps.weight");
+        let up_exps_name = format!("{prefix}.experts.fused_up_exps.weight");
+        let down_exps_name = format!("{prefix}.experts.fused_down_exps.weight");
+
+        let gate_exps = gw
+            .quantized_map_mut()
+            .remove(&gate_exps_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_exps_name}"))?;
+        let up_exps = gw
+            .quantized_map_mut()
+            .remove(&up_exps_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {up_exps_name}"))?;
+        let down_exps = gw
+            .quantized_map_mut()
+            .remove(&down_exps_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {down_exps_name}"))?;
+
+        // gate + up must share dtype because we interleave their byte slabs
+        // into a single w1 quantized buffer; down lives in its own w2 storage
+        // and can use a different (often higher-precision) quant — Q4_K_M
+        // GGUFs typically ship gate/up=Q4_K, down=Q8_0.
+        anyhow::ensure!(
+            gate_exps.dtype == up_exps.dtype,
+            "DeepSeekV2GgmlMoELayer::load_gguf: gate/up expert quant dtype \
+             mismatch (gate={:?}, up={:?}); cannot interleave into shared w1",
+            gate_exps.dtype,
+            up_exps.dtype,
+        );
+
+        let qdtype = gate_exps.dtype;
+        let bs = qdtype.block_size();
+        let ts = qdtype.type_size();
+
+        // Each expert's gate slab: [inter, hidden] quantized.
+        // Each expert's up   slab: [inter, hidden] quantized (same size).
+        // w1 expert slab        : [2*inter, hidden] quantized — gate then up.
+        let expert_slab_bytes = (inter * hidden / bs) * ts;
+        let w1_expert_bytes = 2 * expert_slab_bytes;
+        let w1_total_bytes = n_routed_experts * w1_expert_bytes;
+        let w1_ptr = unsafe { driver::mem_alloc(w1_total_bytes)? };
+
+        for e in 0..n_routed_experts {
+            let gate_offset = e * expert_slab_bytes;
+            let up_offset = e * expert_slab_bytes;
+            let w1_gate_offset = e * w1_expert_bytes;
+            let w1_up_offset = w1_gate_offset + expert_slab_bytes;
+            unsafe {
+                driver::memcpy_dtod_async(
+                    w1_ptr.add(w1_gate_offset),
+                    gate_exps.ptr.add(gate_offset),
+                    expert_slab_bytes,
+                    stream,
+                )?;
+                driver::memcpy_dtod_async(
+                    w1_ptr.add(w1_up_offset),
+                    up_exps.ptr.add(up_offset),
+                    expert_slab_bytes,
+                    stream,
+                )?;
+            }
+        }
+
+        // Sync, then free the per-component buffers — w1 now owns the bytes.
+        unsafe {
+            driver::stream_synchronize(stream)?;
+            gw.unrecord_alloc(gate_exps.ptr);
+            driver::mem_free(gate_exps.ptr)?;
+            gw.unrecord_alloc(up_exps.ptr);
+            driver::mem_free(up_exps.ptr)?;
+        }
+        // Track w1 with the GpuWeights so its lifetime matches the model's.
+        gw.record_alloc(w1_ptr, w1_total_bytes);
+
+        let w1 = GgmlStorage {
+            ptr: w1_ptr,
+            len: w1_total_bytes,
+            dtype: qdtype,
+            nrows: n_routed_experts * 2 * inter,
+            ncols: hidden,
+        };
+        // w2 = down_exps unchanged: [E, hidden, inter] quantized
+        // (nrows = E * hidden, ncols = inter — already set by 3D flatten).
+        let w2 = down_exps;
+
+        // ── e_score_correction_bias (V3 / Kimi K2 sigmoid routing) ──
+        let e_score_correction_bias = if use_sigmoid {
+            let bias_name = format!("{prefix}.gate.e_score_correction_bias");
+            let bias_raw = gw.take(&bias_name)?;
+            let bias_f32 = if bias_raw.dtype() == DType::F32 {
+                bias_raw
+            } else {
+                let n = bias_raw.numel();
+                let f32_ptr = unsafe { driver::mem_alloc(n * 4)? };
+                let f32_bias = unsafe { GpuTensor::new(f32_ptr, &[n], DType::F32) };
+                unsafe { kernels::cast_bias_to_f32(bias_raw, f32_bias, stream) };
+                gw.record_alloc(f32_ptr, n * 4);
+                f32_bias
+            };
+            Some(bias_f32)
+        } else {
+            None
+        };
+
+        let moe = GgmlFusedMoELayer {
+            gate,
+            w1,
+            w2,
+            num_experts: n_routed_experts,
+            top_k,
+            intermediate_size: inter,
+            hidden_size: hidden,
+            renormalize: norm_topk_prob,
+            e_score_correction_bias,
+            n_expert_group,
+            topk_group,
+            // Outer DeepSeekV2GgmlMoELayer::forward applies routed_scaling_factor
+            // via scale_inplace; inner stays at 1.0 to avoid double application
+            // (matches DeepSeekV2MoELayer's split).
+            routed_scaling_factor: 1.0,
+        };
+
+        // ── Shared experts: concat gate_proj + up_proj into one fused slab ──
+        let shared_inter = n_shared_experts * moe_intermediate_size;
+        let shared_gate_name = format!("{prefix}.shared_experts.gate_proj.weight");
+        let shared_up_name = format!("{prefix}.shared_experts.up_proj.weight");
+        let shared_down_name = format!("{prefix}.shared_experts.down_proj.weight");
+
+        let shared_gate_s = gw
+            .quantized_map_mut()
+            .remove(&shared_gate_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {shared_gate_name}"))?;
+        let shared_up_s = gw
+            .quantized_map_mut()
+            .remove(&shared_up_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {shared_up_name}"))?;
+        let shared_down_s = gw
+            .quantized_map_mut()
+            .remove(&shared_down_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {shared_down_name}"))?;
+
+        anyhow::ensure!(
+            shared_gate_s.dtype == shared_up_s.dtype,
+            "DeepSeekV2GgmlMoELayer::load_gguf: shared gate/up quant dtype mismatch \
+             ({:?} vs {:?})",
+            shared_gate_s.dtype,
+            shared_up_s.dtype,
+        );
+
+        let se_qdtype = shared_gate_s.dtype;
+        let se_bs = se_qdtype.block_size();
+        let se_ts = se_qdtype.type_size();
+        let se_slab_bytes = (shared_inter * hidden / se_bs) * se_ts;
+        let se_total_bytes = 2 * se_slab_bytes;
+        let se_ptr = unsafe { driver::mem_alloc(se_total_bytes)? };
+        unsafe {
+            driver::memcpy_dtod_async(se_ptr, shared_gate_s.ptr, se_slab_bytes, stream)?;
+            driver::memcpy_dtod_async(
+                se_ptr.add(se_slab_bytes),
+                shared_up_s.ptr,
+                se_slab_bytes,
+                stream,
+            )?;
+            driver::stream_synchronize(stream)?;
+            gw.unrecord_alloc(shared_gate_s.ptr);
+            driver::mem_free(shared_gate_s.ptr)?;
+            gw.unrecord_alloc(shared_up_s.ptr);
+            driver::mem_free(shared_up_s.ptr)?;
+        }
+        gw.record_alloc(se_ptr, se_total_bytes);
+
+        let shared_gate_up = crate::layers::GgmlLinear {
+            storage: GgmlStorage {
+                ptr: se_ptr,
+                len: se_total_bytes,
+                dtype: se_qdtype,
+                nrows: 2 * shared_inter,
+                ncols: hidden,
+            },
+            bias: None,
+        };
+        let shared_down = crate::layers::GgmlLinear {
+            storage: shared_down_s,
+            bias: None,
+        };
+
+        Ok(Self {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_intermediate_size: shared_inter,
+            routed_scaling_factor,
+        })
     }
 }
 

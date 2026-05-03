@@ -710,6 +710,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 "nosoftcap",
                 "deepseek_moe_ref",
                 "deepseek_moe_fp8_block",
+                "deepseek_moe_ggml",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
             ];

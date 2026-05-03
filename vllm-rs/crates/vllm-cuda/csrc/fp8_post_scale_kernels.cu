@@ -161,6 +161,22 @@ __global__ void fp8_requantize_rows_kernel(
     }
 }
 
+// F32 variant — used by GGML MoE forward to apply per-task topk weights.
+__global__ void row_scale_multiply_f32_kernel(
+    float* __restrict__ output,          // [M, N] F32
+    const float* __restrict__ scales,    // [M] f32
+    int N)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float scale = scales[row];
+    const int row_offset = row * N;
+
+    for (int i = tid; i < N; i += blockDim.x) {
+        output[row_offset + i] *= scale;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // C entry points
 // ---------------------------------------------------------------------------
@@ -189,6 +205,18 @@ void fp8_row_scale_multiply_f16(
 {
     const int threads = 256;
     row_scale_multiply_f16_kernel<<<M, threads, 0, stream>>>(
+        output, scales, N);
+}
+
+void fp8_row_scale_multiply_f32(
+    float* output,              // [M, N] F32 — modified in place
+    const float* scales,        // [M] f32
+    int M,
+    int N,
+    cudaStream_t stream)
+{
+    const int threads = 256;
+    row_scale_multiply_f32_kernel<<<M, threads, 0, stream>>>(
         output, scales, N);
 }
 

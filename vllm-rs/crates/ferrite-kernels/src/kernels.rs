@@ -2951,6 +2951,13 @@ unsafe extern "C" {
         n: i32,
         stream: CUstream,
     );
+    fn fp8_row_scale_multiply_f32(
+        output: *mut f32,
+        scales: *const f32,
+        m: i32,
+        n: i32,
+        stream: CUstream,
+    );
     fn fp8_requantize_rows(
         weight: *mut u8,
         k: i32,
@@ -2986,6 +2993,13 @@ pub unsafe fn fp8_post_scale_multiply(output: GpuTensor, scales: GpuTensor, stre
         ),
         DType::F16 => fp8_row_scale_multiply_f16(
             output.as_mut_ptr(),
+            scales.as_ptr() as *const f32,
+            m as i32,
+            n as i32,
+            stream,
+        ),
+        DType::F32 => fp8_row_scale_multiply_f32(
+            output.as_mut_ptr() as *mut f32,
             scales.as_ptr() as *const f32,
             m as i32,
             n as i32,

@@ -105,13 +105,30 @@ pub fn apply_metadata(spec: &GgufArchSpec, gguf: &crate::GgufFile, config: &mut 
         }
     }
     for &(extra_key, val) in spec.metadata_defaults {
-        if config.extra.contains_key(extra_key) {
-            continue;
-        }
         let v = match val {
             GgufDefault::U32(n) => serde_json::json!(n),
             GgufDefault::F32(f) => serde_json::json!(f as f64),
         };
+        // Dotted keys splice into a nested object inside `extra`. Today
+        // only one level of nesting is supported (`parent.child`); used
+        // for filling in missing `rope_scaling.{mscale, mscale_all_dim,
+        // beta_fast, beta_slow}` on YaRN GGUFs whose converter omitted
+        // those tuning knobs (e.g. mradermacher's DeepSeek-V2-Lite).
+        if let Some((parent_key, child_key)) = extra_key.split_once('.') {
+            let parent = config
+                .extra
+                .entry(parent_key.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = parent.as_object_mut()
+                && !obj.contains_key(child_key)
+            {
+                obj.insert(child_key.to_string(), v);
+            }
+            continue;
+        }
+        if config.extra.contains_key(extra_key) {
+            continue;
+        }
         config.extra.insert(extra_key.to_string(), v);
     }
 
@@ -164,8 +181,11 @@ macro_rules! register {
                 metadata_u32: &[ $($( ($mu_g, $mu_e) ),*)? ],
                 metadata_f32: &[ $($( ($mf_g, $mf_e) ),*)? ],
                 metadata_defaults: &[
-                    $($( ($mdu_k, $crate::GgufDefault::U32($mdu_v)) ),*)?
-                    $($( , ($mdf_k, $crate::GgufDefault::F32($mdf_v)) )*)?
+                    // Trailing commas (rather than between-item commas)
+                    // so concatenating the two repetition groups keeps
+                    // valid syntax when either side is empty.
+                    $($( ($mdu_k, $crate::GgufDefault::U32($mdu_v)), )*)?
+                    $($( ($mdf_k, $crate::GgufDefault::F32($mdf_v)), )*)?
                 ],
                 llama3_rope_scaling_inference:
                     $crate::register!(@bool false $($rope)?),

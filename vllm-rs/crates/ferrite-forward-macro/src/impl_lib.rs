@@ -2118,6 +2118,7 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(MlaAttentionImpl));
     lib.push(Box::new(DeepSeekMoeRefImpl));
     lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
+    lib.push(Box::new(DeepSeekGgmlMoeImpl));
 
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
@@ -9933,6 +9934,17 @@ fn is_fp8_block_moe(fuf: &Fuf, tile: TileId) -> bool {
     )
 }
 
+/// True if `tile` is a `DeepSeekMoe` whose `moe[layer]` weight resolves to
+/// GGML/GGUF storage. Used by `DeepSeekGgmlMoeImpl` to claim, and by
+/// `DeepSeekMoeRefImpl` (BF16) to defer.
+fn is_ggml_moe(fuf: &Fuf, tile: TileId) -> bool {
+    let node = fuf.get(tile);
+    if node.op != OpKind::DeepSeekMoe {
+        return false;
+    }
+    matches!(weight_storage_of(node), Some(StorageFormat::Ggml))
+}
+
 /// GGML/GGUF counterpart of [`is_marlin_gemm`]. A Gemm whose weight
 /// resolves to `StorageFormat::Ggml` — the GGUF impl family claims
 /// these; every other impl rejects them via their own storage
@@ -14824,9 +14836,9 @@ impl Implementation for DeepSeekMoeRefImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        // Defer to `DeepSeekFp8BlockMoeImpl` for FP8-block checkpoints —
-        // this Impl claims the BF16 path only.
-        if is_fp8_block_moe(fuf, seed) {
+        // Defer to FP8-block / GGML MoE Impls for their respective checkpoint
+        // formats — this Impl claims the BF16 path only.
+        if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
             return None;
         }
         single_tile_match(fuf, seed, OpKind::DeepSeekMoe)
@@ -15095,6 +15107,150 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         Some(vec![OpInstance::new(
             syn::Ident::new("DeepSeekMoeFp8Block", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── DeepSeekGgmlMoeImpl ──────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::DeepSeekMoe` over GGML/GGUF expert weights —
+// DeepSeek-V2-Lite, Moonlight, K2 GGUFs. Same DSL contract as
+// `DeepSeekMoeRefImpl`; the loaded type is `DeepSeekV2GgmlMoELayer` and
+// the host-interpreter Op variant is `DeepSeekMoeGgml`.
+//
+#[derive(Debug, Default)]
+pub struct DeepSeekGgmlMoeImpl;
+
+impl Implementation for DeepSeekGgmlMoeImpl {
+    fn name(&self) -> &'static str {
+        "deepseek_moe_ggml"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        if !is_ggml_moe(fuf, seed) {
+            return None;
+        }
+        single_tile_match(fuf, seed, OpKind::DeepSeekMoe)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "DeepSeekMoeGgml",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("DeepSeekMoeGgml: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("DeepSeekMoeGgml: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("DeepSeekMoeGgml", proc_macro2::Span::call_site()),
             vec![
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },

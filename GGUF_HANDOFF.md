@@ -1,8 +1,10 @@
 # Ferrite GGUF integration — handoff
 
-Branch: `worktree-ff-gguf`. Tip: see `git log -1`. Last big landing:
-the Gemma `norm_weight_offset` fix (rmsnorm garbage-output bug, see
-"Phases landed" below). Rebased onto `ff-interpreter` 2026-05-02.
+Branch: `worktree-ff-gguf`. Tip: see `git log -1`. Last big landings:
+DeepSeek V2-Lite GGUF coherent end-to-end (`c105fea17`, fixes a
+row-vs-column scale bug in `GgmlFusedMoELayer.forward`'s topk-weight
+application) and the GGML MoE accessor + dispatch (`d1191c03a`).
+Rebased onto `ff-interpreter` 2026-05-02.
 
 ## Hit the ground running
 
@@ -47,7 +49,7 @@ There are NO arch-keyed god-switches anywhere; no GGUF code in
 
 **Inference-coherent at tp=1** (greedy "Paris" smoke through `vllm
 chat`): Llama-3.2-1B/3B, Qwen2.5-0.5B, Qwen3-0.6B, Granite-3.1-2B,
-Mistral-7B-Instruct-v0.3, **Gemma-2-2B**, **Gemma-3-1B**.
+Mistral-7B-Instruct-v0.3, Gemma-2-2B, Gemma-3-1B, **DeepSeek-V2-Lite**.
 
 **Tokenizer-only verified** (CPU round-trip, NO inference run):
 Phi-3.5-mini. The SentencePiece path (`tokenizer.ggml.model =
@@ -157,35 +159,108 @@ arch bug).
   split MLP. (b) The LongRoPE `rope_scaling_hash` doesn't match.
   Triage: print which variant `Weights::load` returns at runtime,
   and add a `phi-3.5-mini-128k.json` config with longrope scaling.
-* **DeepSeek V2 / V3 GGUF — MoE loader is the only remaining blocker.**
-  Steps 1 (quantizations.json on all three deepseek crates) and 2
-  (yarn rope_scaling reconstruction in `gguf_model_config`) landed
-  with the `gguf_archs` dispatch refactor (see Phases above).
-  V2-Lite Q4_K_M and Moonlight-16B-A3B-Instruct Q4_K_M both
-  download cleanly, both fingerprint-match the right forward arch
-  (V2 catches V2-Lite; V3-flat catches Moonlight), both fail at the
-  same point: `DeepSeekV2MoELayer::load` asks for
-  `model.layers.{N}.mlp.experts.{e}.gate_proj.weight` per expert,
-  which is the safetensors layout. GGUF ships fused 3D
-  `mlp.experts.fused_{gate,up,down}_exps.weight`. The hand-written
-  `vllm-cuda::deepseek_v2::load_gguf` (lines 1620–1707) is the
-  reference: takes the three fused tensors, interleaves gate+up
-  into a `[num_experts, 2*inter, hidden]` quantized w1, uses the
-  fused down as w2, builds a `GgmlFusedMoELayer`. Need either
-  (a) a separate `DeepSeekV2GgmlMoELayer` accessor type + Impl
-  variant that the codegen picks when expert storage is `Ggml`, or
-  (b) `DeepSeekV2MoELayer.moe` becomes an enum (`Bf16(FusedMoELayer)
-  | Ggml(GgmlFusedMoELayer)`) and `load` branches on storage. Same
-  for `shared_gate_up` / `shared_down` (currently dense `Linear`).
-  (a) is more invasive (DP solver + Impl library + codegen) but
-  cleaner; (b) is contained but couples bf16/quant in one type.
-  Reproducer:
+* **DeepSeek V2 / V3 GGUF — DONE.** V2-Lite Q4_K_M coherent end-to-end
+  through the ferrite path. Two fixes landed: (1) the GGML MoE accessor
+  + dispatch (see "Phases landed" → "DeepSeek V2 GGML MoE wiring") and
+  (2) a row-vs-column-scale primitive bug in `GgmlFusedMoELayer.forward`:
+  the topk-weight scaling used `kernels::broadcast_mul_inplace`, whose
+  underlying CUDA kernel does `out[r,c] *= scale[c]` (column-wise) but
+  was being called expecting `out[r,:] *= scale[r]` (row-wise). The
+  kernel read `hidden=2048` scale elements when only `num_tokens*topk=48`
+  existed → out-of-bounds read on topk_weights → garbage scales →
+  ±Inf/NaN in `moe_out` → propagates into every downstream MoE layer's
+  gate matmul → all-NaN logits → token 0 PAD output. Replaced with
+  `kernels::fp8_post_scale_multiply` (genuinely per-row), adding a F32
+  variant of the row-scale kernel since the existing one only had BF16/F16.
+  Verified: V2-Lite reproducer below now outputs "Paris." Moonlight
+  (V3-flat) GGUF loads but `vllm chat` fails on missing chat template
+  in mradermacher's GGUF — separate issue (chat template extraction
+  from GGUF metadata, out of scope here).
+
+  Reproducer (now coherent):
   ```
   ./vllm-rs/target/release/vllm chat \
     --model ~/.cache/huggingface/hub/models--mradermacher--DeepSeek-V2-Lite-GGUF/snapshots/0f37fdf276e8094747457f0ae4d40f2e8d2521f9/DeepSeek-V2-Lite.Q4_K_M.gguf \
-    --max-tokens 5 --temperature 0 --prompt "Hi"
-  # Errors: weight not found: model.layers.1.mlp.experts.0.gate_proj.weight
+    --max-tokens 30 --temperature 0 --prompt "What is the capital of France?"
+  # Outputs: " Paris.\n\nUser: ..."
   ```
+
+* **(former blocker, now resolved) DeepSeek V2 / V3 GGUF — MoE loader DONE; forward gives garbage.**
+  Loader (a)-shape landed: separate `DeepSeekV2GgmlMoELayer` accessor +
+  `Instruction::DeepSeekMoeGgml` + `DeepSeekGgmlMoeImpl` claim on
+  `is_ggml_moe(fuf, tile)` + `FieldLoad::DeepSeekV2GgmlMoe` codegen arm.
+  `GgmlFusedMoELayer.gate` reverted back to `Linear` (the GGUF loader's
+  dense path already converts the F32 router gate to model dtype, so a
+  plain dense Linear is the right field type — see
+  `ferrite-kernels::ggml::load_gguf_into_weights` lines 1635–1679).
+  Loader interleaves `fused_{gate,up}_exps` byte slabs into a single
+  quantized `w1 = [E, 2*inter, hidden]`, frees originals via
+  `unrecord_alloc + driver::mem_free`, and re-`record_alloc`s the new
+  buffer. Shared experts: `gate_proj + up_proj` byte-concat into a fused
+  `GgmlLinear[2*shared_inter, hidden]`; `down_proj` lives as its own
+  `GgmlLinear`. Gate-up dtype must match (interleaved into shared w1);
+  `down` may use a higher-precision quant (typical Q4_K_M ships
+  gate/up=Q4_K, down=Q8_0). V2-Lite Q4_K_M loads cleanly through this
+  path now — no missing-weight errors.
+
+  **But inference output is `!!!!!!!!!!`** (token 0 / PAD repeated) on
+  V2-Lite Q4_K_M, both with and without `FERRITE_USE_REFERENCE=1` (so
+  not a quantized-matmul kernel bug). Reproducer:
+  ```
+  ./vllm-rs/target/release/vllm chat \
+    --model ~/.cache/huggingface/hub/models--mradermacher--DeepSeek-V2-Lite-GGUF/snapshots/0f37fdf276e8094747457f0ae4d40f2e8d2521f9/DeepSeek-V2-Lite.Q4_K_M.gguf \
+    --max-tokens 30 --temperature 0 --prompt "What is the capital of France?"
+  # Today: "!!!!!!!!!!"
+  # Expected: "The capital of France is Paris."
+  ```
+
+  Per `feedback_v2lite_was_verified.md`, the underlying ferrite V2
+  MLA / attention / norms / sampling were verified end-to-end through
+  the BF16 safetensors path *before* the GGUF work — so the bug is in
+  the GGUF-specific surface, not in the ferrite V2 forward.
+
+  **What's been ruled out:**
+  - YaRN params: V2-Lite GGUF (mradermacher's) ships only
+    `rope.scaling.{type,factor,original_context_length}`, omitting
+    `mscale`, `mscale_all_dim`, `beta_fast`, `beta_slow`. The
+    `metadata_defaults` mechanism was extended to support dotted keys
+    that splice into nested config objects (`rope_scaling.mscale`),
+    and V2's `quantizations.json` declares the four V2-typical
+    YaRN defaults. Confirmed via `FERRITE_GGUF_TRACE` that
+    `rope_scaling` post-defaults has all six fields. **However**:
+    ferrite bakes YaRN at *compile time* from the per-variant
+    config (`ferrite-forward-macro/src/config.rs::extract_rope_scaling`,
+    line 829), reading the merged JSON which is the BASE
+    `deepseek-v2-lite.json` (already complete). So the runtime
+    `metadata_defaults` is wasted for the ferrite path — only
+    helps the vllm-cuda hand-written V2 path which is not on
+    today's GGUF dispatch route. Defaults left in place as future
+    defense.
+
+  **Open suspects** (next session triage):
+  (1) `DeepSeekV2GgmlMoELayer::load_gguf` byte interleave / concat
+  arithmetic — most plausible. The hand-written reference is
+  `vllm-cuda::deepseek_v2::load_gguf` lines 1620–1764; my mirror
+  is in `ferrite-kernels::layers_moe::DeepSeekV2GgmlMoELayer`.
+  Compare expert-slab byte offsets carefully.
+  (2) Shared-expert gate+up concat order. Hand-written and mine
+  both put gate first then up. Confirm `silu_and_mul_fused`
+  expects [gate | up] — yes (gate in first half, up in second).
+  (3) `down_exps` direct reuse as `w2`. Storage `nrows = E*hidden,
+  ncols = inter` — is this what `indexed_moe_forward` expects for
+  `w2` slicing per expert? Check `ggml.rs::ggml_moe_forward`
+  + the kernel.
+  (4) Layer-0 dense path: V2-Lite has `first_k_dense_replace=1`;
+  layer 0 uses `mlp.gate_proj/up_proj/down_proj` via the standard
+  ferrite GEMM Impls. Should be solid (other archs share this
+  path) but worth verifying tensors load correctly.
+
+  Triage path: dump hidden-state norms after embedding, after layer
+  0, after layer 1's attention, after layer 1's MoE → compare
+  against Python vLLM ground truth for the same prompt. No V2-Lite
+  safetensors cached locally (~30 GB; only 2.8 GB free on /).
+  Reproducer at top of bullet. Q-path coverage table below still
+  holds; Moonlight V3-flat awaits the same fix.
 
   Q-path coverage in the project (`v3-flat` is in this worktree's
   workspace post-rebase):

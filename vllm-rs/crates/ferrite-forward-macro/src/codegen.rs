@@ -170,6 +170,22 @@ enum FieldLoad {
         n_expert_group: usize,
         topk_group: usize,
     },
+    /// GGML/GGUF analog of `DeepSeekV2Moe` — V2-Lite, Moonlight, K2 GGUFs.
+    /// Calls `DeepSeekV2GgmlMoELayer::load_gguf` with the same per-arch
+    /// constants. Expert weights stay quantized end-to-end.
+    DeepSeekV2GgmlMoe {
+        prefix: String,
+        n_routed_experts: usize,
+        n_shared_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+        use_sigmoid: bool,
+        n_expert_group: usize,
+        topk_group: usize,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -329,6 +345,9 @@ fn plan_field_load(
     let is_deepseek_v2_fp8_block_moe = ty.ends_with("::DeepSeekV2Fp8BlockMoELayer")
         || ty == "DeepSeekV2Fp8BlockMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer");
+    let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
+        || ty == "DeepSeekV2GgmlMoELayer"
+        || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     let is_rmsnorm =
@@ -587,6 +606,31 @@ fn plan_field_load(
         let prefix = prefixes.into_iter().next().unwrap();
         let cfg = read_deepseek_moe_cfg(model);
         return FieldLoad::DeepSeekV2Fp8BlockMoe {
+            prefix,
+            n_routed_experts: cfg.n_routed_experts,
+            n_shared_experts: cfg.n_shared_experts,
+            top_k: cfg.top_k,
+            moe_intermediate_size: cfg.moe_intermediate_size,
+            hidden_size: cfg.hidden_size,
+            norm_topk_prob: cfg.norm_topk_prob,
+            routed_scaling_factor: cfg.routed_scaling_factor,
+            use_sigmoid: cfg.use_sigmoid,
+            n_expert_group: cfg.n_expert_group,
+            topk_group: cfg.topk_group,
+        };
+    }
+
+    if is_deepseek_v2_ggml_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "DeepSeekV2GgmlMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let cfg = read_deepseek_moe_cfg(model);
+        return FieldLoad::DeepSeekV2GgmlMoe {
             prefix,
             n_routed_experts: cfg.n_routed_experts,
             n_shared_experts: cfg.n_shared_experts,
@@ -2774,6 +2818,47 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::DeepSeekV2GgmlMoe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                let #name = ::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer::load_gguf(
+                    gw,
+                    #prefix,
+                    #n_routed_experts,
+                    #n_shared_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #hidden_size,
+                    #norm_topk_prob,
+                    #routed_scaling_factor,
+                    #use_sigmoid,
+                    #n_expert_group,
+                    #topk_group,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -3129,6 +3214,52 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #n_expert_group,
                             #topk_group,
                             __fp8_dtype,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        FieldLoad::DeepSeekV2GgmlMoe {
+            prefix,
+            n_routed_experts,
+            n_shared_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+            routed_scaling_factor,
+            use_sigmoid,
+            n_expert_group,
+            topk_group,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let n_routed_experts = *n_routed_experts;
+            let n_shared_experts = *n_shared_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            let routed_scaling_factor = *routed_scaling_factor;
+            let use_sigmoid = *use_sigmoid;
+            let n_expert_group = *n_expert_group;
+            let topk_group = *topk_group;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer::load_gguf(
+                            gw,
+                            &#p,
+                            #n_routed_experts,
+                            #n_shared_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #hidden_size,
+                            #norm_topk_prob,
+                            #routed_scaling_factor,
+                            #use_sigmoid,
+                            #n_expert_group,
+                            #topk_group,
                             stream,
                         )
                     })

@@ -19,6 +19,7 @@ arch-gemma3        = ["dep:ferrite-model-gemma3"]
 arch-granite       = ["dep:ferrite-model-granite"]
 arch-llama         = ["dep:ferrite-model-llama"]
 arch-mistral       = ["dep:ferrite-model-mistral"]
+arch-mixtral       = ["dep:ferrite-model-mixtral"]
 arch-phi3          = ["dep:ferrite-model-phi3"]
 arch-qwen2         = ["dep:ferrite-model-qwen2"]
 arch-qwen3         = ["dep:ferrite-model-qwen3"]
@@ -33,6 +34,7 @@ all-arches = [
     "arch-granite",
     "arch-llama",
     "arch-mistral",
+    "arch-mixtral",
     "arch-phi3",
     "arch-qwen2",
     "arch-qwen3",
@@ -45,6 +47,7 @@ cuda = [
     "ferrite-model-granite?/cuda",
     "ferrite-model-llama?/cuda",
     "ferrite-model-mistral?/cuda",
+    "ferrite-model-mixtral?/cuda",
     "ferrite-model-phi3?/cuda",
     "ferrite-model-qwen2?/cuda",
     "ferrite-model-qwen3?/cuda",
@@ -66,6 +69,7 @@ nccl = [
     "ferrite-model-granite?/nccl",
     "ferrite-model-llama?/nccl",
     "ferrite-model-mistral?/nccl",
+    "ferrite-model-mixtral?/nccl",
     "ferrite-model-phi3?/nccl",
     "ferrite-model-qwen2?/nccl",
     "ferrite-model-qwen3?/nccl",
@@ -83,6 +87,7 @@ ferrite-model-gemma3       = { path = "../ferrite-model-gemma3",       optional 
 ferrite-model-granite      = { path = "../ferrite-model-granite",      optional = true }
 ferrite-model-llama        = { path = "../ferrite-model-llama",        optional = true }
 ferrite-model-mistral      = { path = "../ferrite-model-mistral",      optional = true }
+ferrite-model-mixtral      = { path = "../ferrite-model-mixtral",      optional = true }
 ferrite-model-phi3         = { path = "../ferrite-model-phi3",         optional = true }
 ferrite-model-qwen2        = { path = "../ferrite-model-qwen2",        optional = true }
 ferrite-model-qwen3        = { path = "../ferrite-model-qwen3",        optional = true }

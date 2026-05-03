@@ -130,6 +130,98 @@ pub struct FusedMoELayer {
 }
 
 impl FusedMoELayer {
+    /// Load a Mixtral-style BF16 fused MoE layer from safetensors.
+    ///
+    /// Mirrors `vllm-cuda/src/model/mixtral.rs::MixtralDecoderLayer::load_moe`
+    /// at single-rank (tp=1). Mixtral's on-disk weight names:
+    /// - `{prefix}.gate.weight` — `[num_experts, hidden_size]`, dense BF16.
+    /// - `{prefix}.experts.{e}.w1.weight` — `[intermediate_size, hidden_size]` (gate_proj).
+    /// - `{prefix}.experts.{e}.w3.weight` — `[intermediate_size, hidden_size]` (up_proj).
+    /// - `{prefix}.experts.{e}.w2.weight` — `[hidden_size, intermediate_size]` (down_proj).
+    ///
+    /// Stacked into:
+    /// - `w1`: `[num_experts, 2*intermediate_size, hidden_size]` (gate+up fused).
+    /// - `w2`: `[num_experts, hidden_size, intermediate_size]`.
+    ///
+    /// `routed_scaling_factor` defaults to 1.0; `renormalize` is false (Mixtral
+    /// does not renormalize topk weights). Sigmoid bias / grouped routing /
+    /// expert-group selection all default off — those branches are reserved for
+    /// the DeepSeek-V3 family, not for Mixtral or Qwen3-MoE.
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        use ferrite_cuda_core::driver;
+
+        let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
+
+        let first_w1 = format!("{prefix}.experts.0.w1.weight");
+        let (_, dtype) = gw
+            .tensor_info(&first_w1)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_w1}"))?;
+        let elem = dtype.size_bytes();
+
+        let w1_bytes = num_experts * 2 * intermediate_size * hidden_size * elem;
+        let w2_bytes = num_experts * hidden_size * intermediate_size * elem;
+        let w1_ptr = unsafe { driver::mem_alloc(w1_bytes)? };
+        let w2_ptr = unsafe { driver::mem_alloc(w2_bytes)? };
+
+        let gate_proj_bytes = intermediate_size * hidden_size * elem;
+        for e in 0..num_experts {
+            let w1_name = format!("{prefix}.experts.{e}.w1.weight");
+            let w3_name = format!("{prefix}.experts.{e}.w3.weight");
+            let w2_name = format!("{prefix}.experts.{e}.w2.weight");
+            let expert_w1_off = e * 2 * intermediate_size * hidden_size * elem;
+            let expert_w2_off = e * hidden_size * intermediate_size * elem;
+            unsafe {
+                gw.take_into(&w1_name, w1_ptr.add(expert_w1_off), stream)?;
+                gw.take_into(
+                    &w3_name,
+                    w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                    stream,
+                )?;
+                gw.take_into(&w2_name, w2_ptr.add(expert_w2_off), stream)?;
+            }
+        }
+
+        let w1 = unsafe {
+            GpuTensor::new(
+                w1_ptr,
+                &[num_experts, 2 * intermediate_size, hidden_size],
+                dtype,
+            )
+        };
+        let w2 = unsafe {
+            GpuTensor::new(
+                w2_ptr,
+                &[num_experts, hidden_size, intermediate_size],
+                dtype,
+            )
+        };
+
+        Ok(FusedMoELayer {
+            gate,
+            w1,
+            w2,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            renormalize: false,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
     /// Forward pass — full MoE pipeline.
     ///
     /// Always uses `forward_fused` (WMMA kernel). The fused kernel is a plain

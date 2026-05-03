@@ -454,11 +454,7 @@ impl MarlinLinear {
             .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
         let size_k = qw_shape[0];
         let size_n = qw_shape[1] * 8;
-        let num_groups = if group_size > 0 {
-            size_k / group_size
-        } else {
-            1
-        };
+        let num_groups = size_k.checked_div(group_size).unwrap_or(1);
 
         // Upload qweight → GPU, repack AWQ → Marlin, free original.
         let qweight_gpu = weights.take(&qw_name)?;
@@ -611,11 +607,7 @@ impl MarlinLinear {
         let (qw_fused, qw_shape, _) = concat_cpu_dim1(&qw_refs);
         let size_k = qw_shape[0];
         let size_n = qw_shape[1] * 8;
-        let num_groups = if group_size > 0 {
-            size_k / group_size
-        } else {
-            1
-        };
+        let num_groups = size_k.checked_div(group_size).unwrap_or(1);
 
         // Upload fused qweight and repack once.
         let qw_nbytes = qw_fused.len();
@@ -764,11 +756,7 @@ impl MarlinLinear {
             // compressed-tensors: [N, K/8]
             GptqLayout::WeightPacked => (qw_shape[1] * 8, qw_shape[0]),
         };
-        let num_groups = if group_size > 0 {
-            size_k / group_size
-        } else {
-            1
-        };
+        let num_groups = size_k.checked_div(group_size).unwrap_or(1);
 
         // GPTQ symmetric stores zero points on disk as a formality.
         // Python vLLM never passes them to Marlin — consume and drop.
@@ -1090,11 +1078,7 @@ impl MarlinLinear {
         let (qw_fused, qw_shape, _) = concat_cpu_dim1(&qw_refs);
         let size_k = qw_shape[0] * 8;
         let size_n = qw_shape[1];
-        let num_groups = if group_size > 0 {
-            size_k / group_size
-        } else {
-            1
-        };
+        let num_groups = size_k.checked_div(group_size).unwrap_or(1);
 
         // g_idx BEFORE repack — repack consumes sort_indices.
         let (g_idx_gpu, sort_indices_gpu, has_act_order) = if let Some(g_idx) = g_idx_i32 {

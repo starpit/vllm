@@ -104,11 +104,7 @@ fn load_gptq_marlin_linear(
     };
 
     let group_size = cfg.group_size;
-    let num_groups = if group_size > 0 {
-        size_k / group_size
-    } else {
-        1
-    };
+    let num_groups = size_k.checked_div(group_size).unwrap_or(1);
 
     // GPTQ uses uint4b8 scalar type which bakes in the zero-point (bias=8).
     // Python vLLM never passes zero-points for GPTQ — just consume and discard.
@@ -408,11 +404,7 @@ fn load_fused_gptq_marlin(
     let size_k = qw_shape[0] * 8;
     let size_n = qw_shape[1];
     let group_size = cfg.group_size;
-    let num_groups = if group_size > 0 {
-        size_k / group_size
-    } else {
-        1
-    };
+    let num_groups = size_k.checked_div(group_size).unwrap_or(1);
 
     // Handle g_idx for desc_act — must be done BEFORE repack.
     let (g_idx_gpu, sort_indices_gpu, has_act_order) = if let Some(g_idx) = g_idx_i32 {
@@ -1882,16 +1874,8 @@ pub fn load_marlin_moe_layer(
         ),
     };
 
-    let num_groups_w1 = if group_size > 0 {
-        hidden_size / group_size
-    } else {
-        1
-    };
-    let num_groups_w2 = if group_size > 0 {
-        intermediate_size / group_size
-    } else {
-        1
-    };
+    let num_groups_w1 = hidden_size.checked_div(group_size).unwrap_or(1);
+    let num_groups_w2 = intermediate_size.checked_div(group_size).unwrap_or(1);
 
     // Marlin tile size: each u32 contains 8 INT4 values (4 bits each).
     // Marlin-packed shape for [K, N]: [K*N/8] u32.

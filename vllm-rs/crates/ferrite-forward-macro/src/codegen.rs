@@ -949,6 +949,7 @@ fn collect_accessors(
 fn emit_fingerprint_check(
     model: &ModelParams,
     manifest: &crate::weights_manifest::WeightsManifest,
+    tp_world_size: u8,
 ) -> TokenStream {
     let num_hidden_layers = *model
         .bounds
@@ -1045,7 +1046,21 @@ fn emit_fingerprint_check(
     let fp8_marker_tensor = fp8_marker_tensor.as_str();
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
-    let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size as usize);
+    // GGUF's on-disk loader (`GgufGpuWeights::load`) pre-shards
+    // `ShardDim0` tensors — including `embed_tokens` — at file-read
+    // time (`ferrite-kernels/src/ggml.rs::gguf_shard_kind_for_hf_name`).
+    // At tp>1 the per-rank embed shape is `[vocab_size / tp, hidden]`,
+    // so the fingerprint's vocab literal must match the sharded dim-0.
+    // Safetensors variants keep the full tensor in memory (sharding
+    // happens inside the codegen-emitted `_sharded` load helpers AFTER
+    // `fingerprint_matches` runs), so their vocab literal stays whole.
+    let vocab_for_fp = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Ggml) if tp_world_size > 1 => {
+            vocab_size / (tp_world_size as u64)
+        }
+        _ => vocab_size,
+    };
+    let vocab_lit = proc_macro2::Literal::usize_unsuffixed(vocab_for_fp as usize);
 
     // HF-config disambiguator: variants of the same arch that share
     // on-disk tensor shapes (Phi-3-mini-4k vs Phi-3.5-mini-128k) only
@@ -1770,10 +1785,24 @@ fn emit_weights_struct(
                     quote! { (#suffix, #rows_lit) }
                 })
                 .collect();
+            let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
             calls.push(quote! {
                 for __l in 0..#num_hidden_layers {
                     let __pp = ::std::format!("model.layers.{}.{}", __l, #packed_prefix);
-                    gw.synthesize_packed_row_split_sizes(&__pp, &[ #(#pairs),* ])?;
+                    // `_tp` variant handles the GGUF quantized parent at
+                    // tp > 1 — fused `attn_qkv` / `ffn_up` are
+                    // replicated on every rank by the GGUF loader's
+                    // shard-kind rule table (the fused name isn't in
+                    // there), so the packed-splits prelude carves
+                    // per-rank views directly. At tp == 1 and for
+                    // safetensors parents, delegates to the unsharded
+                    // path below.
+                    gw.synthesize_packed_row_split_sizes_tp(
+                        &__pp,
+                        &[ #(#pairs),* ],
+                        tp_rank as usize,
+                        #tp_world_lit as usize,
+                    )?;
                 }
             });
         }
@@ -1798,7 +1827,7 @@ fn emit_weights_struct(
             }
         })
         .collect();
-    let fingerprint_method = emit_fingerprint_check(model, manifest);
+    let fingerprint_method = emit_fingerprint_check(model, manifest, tp_world_size);
 
     // Detect whether this arch uses `rotary_local` (dual-rotary,
     // e.g. Gemma3). If so, emit a `rotary_local: RotaryCache` field
@@ -4828,7 +4857,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one V3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
         assert!(
             ts.contains("q_a_proj.weight_scale_inv"),
             "MLA arch FP8-block fingerprint should sniff q_a_proj.weight_scale_inv, got:\n{ts}",
@@ -4867,7 +4896,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one deepseek-v3-flat FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "flat-Q MLA FP8-block fingerprint should use q_proj.weight_scale_inv \
@@ -4901,7 +4930,7 @@ mod fingerprint_tests {
                 )
             })
             .expect("at least one Qwen3 FP8-block variant");
-        let ts = emit_fingerprint_check(model, &manifest).to_string();
+        let ts = emit_fingerprint_check(model, &manifest, 1).to_string();
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",

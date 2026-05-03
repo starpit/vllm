@@ -933,16 +933,8 @@ fn load_marlin_moe_layer_mixtral(
         ),
     };
 
-    let num_groups_w1 = if group_size > 0 {
-        hidden_size / group_size
-    } else {
-        1
-    };
-    let num_groups_w2 = if group_size > 0 {
-        intermediate_size / group_size
-    } else {
-        1
-    };
+    let num_groups_w1 = hidden_size.checked_div(group_size).unwrap_or(1);
+    let num_groups_w2 = intermediate_size.checked_div(group_size).unwrap_or(1);
 
     let w1_n = 2 * intermediate_size;
     let w1_packed_per_expert = hidden_size * w1_n / 8;

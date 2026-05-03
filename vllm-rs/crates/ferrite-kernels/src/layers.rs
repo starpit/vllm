@@ -129,6 +129,34 @@ fn load_gguf_dense_concat(
     Ok(LinearLayer::Dense(Linear { weight, bias }))
 }
 
+/// Narrow a replicated full-size 1D bias down to the rank's shard.
+///
+/// GGUF biases ship 1D and land in `gguf_dense` full-sized on every
+/// rank (the shard-kind rule `Replicate`s ndim<2 tensors). For a
+/// column-parallel Linear at tp>1, each rank's weight produces
+/// `[tokens, out_full/world]` and the bias must match that second dim
+/// — otherwise `bias_add_inplace` reads the wrong slice. This returns
+/// a view into the same GPU allocation offset by `rank * (out_full/world)`
+/// elements.
+///
+/// `per_rank_out` is the weight's per-rank out-feature count (storage
+/// row count for quantized, or `dim(0)` for dense).
+fn per_rank_bias_slice(
+    full: ferrite_cuda_core::tensor::GpuTensor,
+    rank: usize,
+    world: usize,
+    per_rank_out: usize,
+) -> ferrite_cuda_core::tensor::GpuTensor {
+    debug_assert_eq!(full.ndim(), 1, "GGUF bias must be 1D");
+    debug_assert_eq!(
+        full.dim(0),
+        per_rank_out * world,
+        "bias length must equal per-rank out × world"
+    );
+    let start = rank * per_rank_out;
+    full.narrow_dim0(start, per_rank_out)
+}
+
 fn try_synthesize_packed_slice(weights: &mut GpuWeights, prefix: &str) -> Result<()> {
     let (parent, suffix) = match prefix.rsplit_once('.') {
         Some(split) => split,
@@ -1059,6 +1087,61 @@ impl LinearLayer {
         rank: usize,
         world: usize,
     ) -> Result<Self> {
+        // GGUF fast-path. The GGUF loader pre-shards quantized linears
+        // at file-read time per `gguf_shard_kind_for_hf_name`:
+        //   ShardDim0 → rows split, bias is 1D so always `Replicate`.
+        //   ShardDim1 → per-row column slice, bias is 1D `Replicate`.
+        // Both cases land the quantized storage in `weights.quantized`
+        // with per-rank shape and the optional bias in `gguf_dense`
+        // with full shape. The safetensors `Linear::load_sharded` path
+        // would error with "weight not found" on either — those maps
+        // are only consulted by `take_quantized_linear` / `take`.
+        let weight_name = format!("{prefix}.weight");
+        if let Some(storage) = weights.take_quantized_linear(&weight_name) {
+            let bias_name = format!("{prefix}.bias");
+            // Bias rules per-dim at tp > 1:
+            //   dim=0 (column-parallel): bias shards along dim 0 too.
+            //     The GGUF loader replicates 1D tensors (`gguf_shard_kind_for_hf_name`
+            //     returns `Replicate` for ndim<2), so each rank currently holds
+            //     the full `[out_full]` bias. Narrow it to the per-rank slice
+            //     here — matches Python vLLM's `ColumnParallelLinear` weight
+            //     loader + `Qwen2`'s biased q/k/v/o at tp>1.
+            //   dim=1 (row-parallel): bias is added once per output element,
+            //     after the NCCL all-reduce. Python vLLM's `RowParallelLinear`
+            //     adds it only on rank 0; adding on every rank would sum
+            //     `world * bias`. Keep on rank 0, drop on others.
+            let bias = if weights.contains(&bias_name) {
+                match dim {
+                    1 if rank != 0 => None,
+                    0 if world > 1 => weights
+                        .take(&bias_name)
+                        .ok()
+                        .map(|b| per_rank_bias_slice(b, rank, world, storage.nrows)),
+                    _ => weights.take(&bias_name).ok(),
+                }
+            } else {
+                None
+            };
+            return Ok(Self::Ggml(Box::new(GgmlLinear { storage, bias })));
+        }
+        if let Some(w) = weights.take_gguf_dense(&weight_name) {
+            // F16/F32 GGUF: linear weight lives in `gguf_dense`, already
+            // per-rank sharded. Same bias rule as the quantized branch.
+            let bias_name = format!("{prefix}.bias");
+            let bias = if weights.contains(&bias_name) {
+                match dim {
+                    1 if rank != 0 => None,
+                    0 if world > 1 => weights
+                        .take(&bias_name)
+                        .ok()
+                        .map(|b| per_rank_bias_slice(b, rank, world, w.dim(0))),
+                    _ => weights.take(&bias_name).ok(),
+                }
+            } else {
+                None
+            };
+            return Ok(Self::Dense(Linear::new(w, bias)));
+        }
         Ok(Self::Dense(Linear::load_sharded(
             weights, prefix, dim, rank, world,
         )?))
@@ -1224,6 +1307,82 @@ impl LinearLayer {
     ) -> Result<Self> {
         if prefixes.is_empty() {
             anyhow::bail!("load_dense_concat_sharded: empty prefix list");
+        }
+
+        // GGUF fast-path. The GGUF loader pre-shards every source at
+        // file-read time (fused QKV and gate_up sources are all
+        // ShardDim0 → per-rank rows). Each per-prefix tensor is already
+        // `[out_i / world, in]`; we just collect them without touching
+        // the bytes. Mirrors the tp=1 `load_dense_concat_or_ggml` path.
+        let weight_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.weight")).collect();
+        let all_gguf_quantized = weight_names
+            .iter()
+            .all(|n| weights.contains_quantized_linear(n));
+        if all_gguf_quantized {
+            // Prefer the zero-copy `GgmlConcat` path — the storages
+            // share the underlying GPU buffers in `GpuWeights.quantized`
+            // (take is non-destructive). No byte-pack, no extra H2D,
+            // no dequant. Concat is always column-parallel (ShardDim0),
+            // so each branch's bias (if present) must be narrowed to
+            // the per-rank slice matching `storage.nrows` — Qwen2's
+            // biased q/k/v at tp>1 is the canonical example. GGUF 1D
+            // biases are `Replicate` on-disk (full length on every rank),
+            // so we compute the rank slice here against the replicated
+            // allocation.
+            let mut storages: Vec<crate::ggml::GgmlStorage> = Vec::with_capacity(prefixes.len());
+            for name in &weight_names {
+                let s = weights
+                    .take_quantized_linear(name)
+                    .ok_or_else(|| anyhow::anyhow!("load_dense_concat_sharded: missing {name}"))?;
+                storages.push(s);
+            }
+            let first_ncols = storages[0].ncols;
+            for s in &storages[1..] {
+                if s.ncols != first_ncols {
+                    anyhow::bail!(
+                        "load_dense_concat_sharded: ncols mismatch ({} vs {})",
+                        first_ncols,
+                        s.ncols
+                    );
+                }
+            }
+            let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+            let any_bias = bias_names.iter().any(|n| weights.contains(n));
+            let all_bias = bias_names.iter().all(|n| weights.contains(n));
+            if any_bias && !all_bias {
+                anyhow::bail!(
+                    "load_dense_concat_sharded: inconsistent biases across prefixes {:?}",
+                    prefixes
+                );
+            }
+            let mut biases: Vec<Option<GpuTensor>> = vec![None; prefixes.len()];
+            if all_bias {
+                for (i, n) in bias_names.iter().enumerate() {
+                    let full = weights.take(n)?;
+                    biases[i] = Some(if world > 1 {
+                        per_rank_bias_slice(full, rank, world, storages[i].nrows)
+                    } else {
+                        full
+                    });
+                }
+            }
+            let _ = stream;
+            let branches: Vec<GgmlLinear> = storages
+                .into_iter()
+                .zip(biases)
+                .map(|(s, bias)| GgmlLinear { storage: s, bias })
+                .collect();
+            return Ok(Self::GgmlConcat(branches));
+        }
+        let all_gguf_dense = weight_names.iter().all(|n| weights.gguf_dense_contains(n));
+        if all_gguf_dense {
+            // F16/F32 GGUF: tensors are in `gguf_dense` already per-rank
+            // sharded (ShardDim0). `load_gguf_dense_concat` packs them
+            // row-wise into one `[sum(rows_per_rank), cols]` buffer —
+            // the contract it already has, just with per-rank inputs
+            // instead of unsharded ones.
+            let _ = (rank, world);
+            return load_gguf_dense_concat(weights, prefixes, stream);
         }
 
         // Same packed-source fallback as the unsharded path.
@@ -1555,6 +1714,16 @@ impl Embedding {
         world: usize,
     ) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
+        // GGUF fast-path: `GgufGpuWeights::load` pre-shards `embed_tokens`
+        // as ShardDim0 at file-read time (see `gguf_shard_kind_for_hf_name`
+        // in `ferrite-kernels/src/ggml.rs`), so the per-rank tensor is
+        // already in `gguf_dense` with shape `[vocab/world, hidden]`.
+        // Take it as-is; the safetensors `take_shard` path below would
+        // miss because the tensor was never inserted into the CPU
+        // `tensors` map.
+        if let Some(t) = weights.take_gguf_dense(&weight_name) {
+            return Ok(Self::new(t));
+        }
         let weight = weights.take_shard(&weight_name, 0, rank, world)?;
         Ok(Self::new(weight))
     }

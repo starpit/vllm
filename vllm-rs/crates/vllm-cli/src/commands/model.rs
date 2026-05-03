@@ -66,7 +66,7 @@ pub async fn run_model_list(args: ListArgs) -> anyhow::Result<()> {
 
     match args.sort {
         ListSort::Name => models.sort_by(|a, b| a.model_id.cmp(&b.model_id)),
-        ListSort::Size => models.sort_by(|a, b| b.size.cmp(&a.size)),
+        ListSort::Size => models.sort_by_key(|b| std::cmp::Reverse(b.size)),
     }
 
     if models.is_empty() {

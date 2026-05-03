@@ -674,9 +674,22 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
         let mut hf_config = None;
         let mut model_dir = None;
         let mut dtype_elem_bytes: usize = 2;
+        // GGUF sources carry the tokenizer in the file's metadata, not as
+        // a sibling `tokenizer.json` on disk. `CudaWorker::load_model`
+        // reconstructs it and stashes it in `preloaded_tokenizer`. The
+        // tp=1 path (`initialize_core`) harvests this via
+        // `take_preloaded_tokenizer()` and falls back to
+        // `try_load_tokenizer(dir)` only when there's no preloaded one.
+        // The tp>1 path previously skipped this and went straight to
+        // `try_load_tokenizer` — which returns `None` for GGUF (no
+        // sibling tokenizer.json) and silently dropped the real
+        // tokenizer, leaving the engine with a byte-level fallback that
+        // tokenized `<|begin_of_text|>` as literal ASCII bytes (prompt
+        // became 235 garbage tokens, all downstream inference followed).
+        let mut preloaded_tokenizer: Option<tokenizers::Tokenizer> = None;
 
         for (rank, handle) in handles.into_iter().enumerate() {
-            let worker = handle
+            let mut worker = handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
                 .with_context(|| format!("worker {rank} init failed"))?;
@@ -684,6 +697,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 hf_config = worker.hf_config().cloned();
                 model_dir = worker.model_dir().map(|p| p.to_path_buf());
                 dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
+                preloaded_tokenizer = worker.take_preloaded_tokenizer();
             }
             cuda_workers.push(worker);
         }
@@ -824,9 +838,17 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 
         let client = InprocClient::new(engine_config, Box::new(executor));
 
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok())
+        // Prefer the GGUF-preloaded tokenizer harvested from rank 0's
+        // worker above. Falls back to `try_load_tokenizer(dir)` for
+        // safetensors where a sibling `tokenizer.json` lives next to
+        // the weights. Mirrors `initialize_core`'s tp=1 flow.
+        let tokenizer = preloaded_tokenizer
+            .map(Tokenizer::from_hf_tokenizer)
+            .or_else(|| {
+                model_dir
+                    .as_ref()
+                    .and_then(|dir| try_load_tokenizer(dir).ok())
+            })
             .map(|tok| {
                 info!("Tokenizer loaded");
                 Arc::new(tok)
@@ -977,11 +999,10 @@ pub fn initialize_stack(
             .get("patch_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(14) as usize;
-        let num_patches = if patch_size > 0 {
-            (image_size / patch_size).pow(2)
-        } else {
-            256
-        };
+        let num_patches = image_size
+            .checked_div(patch_size)
+            .map(|v| v.pow(2))
+            .unwrap_or(256);
 
         // Qwen2-VL uses <|image_pad|> token (151655) instead of image_token_index.
         let image_token_index = if is_qwen2_vl {

@@ -228,16 +228,14 @@ impl SshSession {
                         }
                     }
                 }
-                ChannelMsg::ExtendedData { data, ext } => {
-                    if ext == 1 {
-                        // stderr
-                        stderr_buf.push_str(&String::from_utf8_lossy(&data));
-                        while let Some(pos) = stderr_buf.find('\n') {
-                            let line = stderr_buf[..pos].to_string();
-                            stderr_buf = stderr_buf[pos + 1..].to_string();
-                            if let Some(m) = multi {
-                                let _ = m.println(format!("    {line}"));
-                            }
+                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                    // stderr
+                    stderr_buf.push_str(&String::from_utf8_lossy(&data));
+                    while let Some(pos) = stderr_buf.find('\n') {
+                        let line = stderr_buf[..pos].to_string();
+                        stderr_buf = stderr_buf[pos + 1..].to_string();
+                        if let Some(m) = multi {
+                            let _ = m.println(format!("    {line}"));
                         }
                     }
                 }

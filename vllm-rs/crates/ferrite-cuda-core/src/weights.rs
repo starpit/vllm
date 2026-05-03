@@ -833,7 +833,7 @@ impl GpuWeights {
                 Some((name.clone(), mmap, r.data_offset, r.size_bytes, r.dtype))
             })
             .collect();
-        work.sort_by(|a, b| b.3.cmp(&a.3)); // Largest first.
+        work.sort_by_key(|b| std::cmp::Reverse(b.3)); // Largest first.
 
         let state = Arc::new(PrecastState {
             ready: Mutex::new(HashMap::new()),
@@ -1193,6 +1193,130 @@ impl GpuWeights {
         let sized: Vec<(&str, usize)> =
             split_targets.iter().map(|t| (*t, rows_per_slice)).collect();
         self.synthesize_packed_row_split_sizes(packed_prefix, &sized)
+    }
+
+    /// Tensor-parallel-aware split. Carves per-rank views out of a
+    /// GGUF packed parent (e.g. Phi-3's `self_attn.qkv_proj` fused
+    /// across q/k/v heads) so downstream `_sharded` loaders see slices
+    /// that are already the right per-rank shape.
+    ///
+    /// At tp_world_size == 1, identical to
+    /// [`Self::synthesize_packed_row_split_sizes`].
+    ///
+    /// At tp_world_size > 1 with a **quantized** parent (`ShardDim0`
+    /// replicated across ranks by the GGUF loader because the fused
+    /// parent's name isn't in the shard-kind rule table), carves each
+    /// child slice at offset `slice_start + tp_rank * (slice_rows / tp)`
+    /// with `slice_rows / tp` rows. Each child ends up per-rank sized
+    /// and its `.weight` entry goes into `self.quantized` for the
+    /// subsequent `_sharded` load helpers to consume as-is (they see
+    /// the correct per-rank shape and skip further sharding).
+    ///
+    /// Safetensors parents at tp > 1 fall through to the unsharded
+    /// carve: the CPU slices keep their full sizes and the downstream
+    /// `Linear::load_sharded(dim=0, …)` does the per-rank `take_shard`.
+    ///
+    /// `split_targets` takes **full** per-slice row counts (what the
+    /// unsharded manifest declares). Per-rank division is done inside
+    /// this helper against `tp_world_size`; each `full_rows` must be
+    /// divisible by `tp_world_size`, else bail.
+    pub fn synthesize_packed_row_split_sizes_tp(
+        &mut self,
+        packed_prefix: &str,
+        split_targets: &[(&str, usize)],
+        tp_rank: usize,
+        tp_world_size: usize,
+    ) -> Result<bool> {
+        if tp_world_size <= 1 {
+            return self.synthesize_packed_row_split_sizes(packed_prefix, split_targets);
+        }
+        if tp_rank >= tp_world_size {
+            anyhow::bail!(
+                "synthesize_packed_row_split_sizes_tp: tp_rank ({tp_rank}) >= \
+                 tp_world_size ({tp_world_size})"
+            );
+        }
+        if split_targets.is_empty() {
+            anyhow::bail!("synthesize_packed_row_split_sizes_tp: empty split_targets");
+        }
+        let grandparent = packed_prefix
+            .rsplit_once('.')
+            .map(|(p, _)| p)
+            .ok_or_else(|| anyhow::anyhow!("packed prefix has no parent: {packed_prefix}"))?;
+        let packed_weight_name = format!("{packed_prefix}.weight");
+
+        // Quantized-parent path: Phi-3 family at tp > 1 ships the
+        // fused `attn_qkv` / `ffn_up` parent as a block-quantized
+        // GgmlStorage, replicated across ranks by the GGUF loader
+        // (the fused-parent name isn't in `gguf_shard_kind_for_hf_name`).
+        // Carve per-rank views directly here so `_sharded` helpers
+        // below see children of the right shape.
+        if self.quantized.contains_key(&packed_weight_name) {
+            let packed = self
+                .quantized
+                .remove(&packed_weight_name)
+                .expect("contains");
+            let total_rows = packed.nrows;
+            let hidden = packed.ncols;
+            let full_sum: usize = split_targets.iter().map(|(_, r)| *r).sum();
+            if full_sum != total_rows {
+                anyhow::bail!(
+                    "synthesize_packed_row_split_sizes_tp: `{packed_weight_name}` rows \
+                     ({total_rows}) != sum of full split sizes ({full_sum}) across {:?}",
+                    split_targets
+                        .iter()
+                        .map(|(s, r)| format!("{s}={r}"))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            for (t, r) in split_targets {
+                if !r.is_multiple_of(tp_world_size) {
+                    anyhow::bail!(
+                        "synthesize_packed_row_split_sizes_tp: slice `{t}` rows ({r}) \
+                         not divisible by tp_world_size ({tp_world_size}) in \
+                         `{packed_weight_name}`"
+                    );
+                }
+            }
+            let block_elems = packed.dtype.block_size();
+            let type_size = packed.dtype.type_size();
+            if !hidden.is_multiple_of(block_elems) {
+                anyhow::bail!(
+                    "synthesize_packed_row_split_sizes_tp: `{packed_weight_name}` ncols \
+                     ({hidden}) not divisible by block_size ({block_elems}, dtype {:?})",
+                    packed.dtype,
+                );
+            }
+            let row_bytes = (hidden / block_elems) * type_size;
+            let mut full_row_offset = 0usize;
+            for (target, full_rows) in split_targets {
+                let per_rank_rows = full_rows / tp_world_size;
+                let rank_row_offset = full_row_offset + tp_rank * per_rank_rows;
+                let slice_bytes = per_rank_rows * row_bytes;
+                // Row-aligned byte offset inside the replicated parent
+                // buffer. Each row is a whole number of GGML blocks
+                // (validated above via `hidden % block_elems == 0`) so
+                // the pointer arithmetic never straddles a block boundary.
+                let child_ptr = unsafe { packed.ptr.add(rank_row_offset * row_bytes) };
+                let child = crate::ggml_quant::GgmlStorage {
+                    ptr: child_ptr,
+                    len: slice_bytes,
+                    dtype: packed.dtype,
+                    nrows: per_rank_rows,
+                    ncols: hidden,
+                };
+                let vname = format!("{grandparent}.{target}.weight");
+                self.quantized.insert(vname, child);
+                full_row_offset += full_rows;
+            }
+            return Ok(true);
+        }
+
+        // Safetensors parent: fall through to the unsharded carve.
+        // Downstream `Linear::load_sharded(dim=0, …)` applies per-rank
+        // `take_shard` to each full-size slice, yielding the same
+        // per-rank shape the quantized path produces above.
+        self.synthesize_packed_row_split_sizes(packed_prefix, split_targets)
     }
 
     /// Sized-split sibling of `synthesize_packed_row_split`. Takes

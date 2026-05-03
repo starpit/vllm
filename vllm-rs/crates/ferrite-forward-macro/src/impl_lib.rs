@@ -2047,6 +2047,14 @@ pub fn starter_library() -> ImplementationLibrary {
             variant: GEMM_VARIANT_SW,
         }));
     }
+    for tile in CUTLASS_WMMA_TILE_ZOO {
+        lib.push(Box::new(CutlassGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+            variant: GEMM_VARIANT_WMMA,
+        }));
+    }
     // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
     // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
     // FusedAddRmsNormImpl per layer-residual chain by cost.
@@ -2065,6 +2073,14 @@ pub fn starter_library() -> ImplementationLibrary {
     //         variant: GEMM_VARIANT_SW,
     //     }));
     // }
+    for tile in CUTLASS_WMMA_TILE_ZOO {
+        lib.push(Box::new(CutlassGemmAddImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+            variant: GEMM_VARIANT_WMMA,
+        }));
+    }
     // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
     // Closes the small-N/large-K tall-skinny shape class where the
     // standard tile zoo leaves cuBLAS winning. target_compatible
@@ -10683,6 +10699,12 @@ const CUTLASS_SW_TILE_ZOO: &[(u32, u32, u32)] = &[
     (256, 64, 4),
 ];
 
+/// Wmma bf16 tiles — match cuBLAS's small-M wmma picks. cuBLAS dispatches
+/// `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_<TB>_*` for these
+/// shapes at decode M=1..8. Only stages=2 since cuBLAS only picks _128x2
+/// and _64x2 in observed regime maps.
+const CUTLASS_WMMA_TILE_ZOO: &[(u32, u32, u32)] = &[(16, 16, 2), (32, 32, 2)];
+
 /// Tile-variant tag. Encoded as `u32` end-to-end (Impl field, OpInstance
 /// literal, runtime Instruction field) because the codegen pipeline
 /// only emits primitive integer literals via `quote!`. Decoded back to
@@ -10695,6 +10717,7 @@ const CUTLASS_SW_TILE_ZOO: &[(u32, u32, u32)] = &[
 /// this constant set.
 pub const GEMM_VARIANT_BASIC: u32 = 0;
 pub const GEMM_VARIANT_SW: u32 = 1;
+pub const GEMM_VARIANT_WMMA: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct CutlassGemmImpl {
@@ -10749,6 +10772,9 @@ impl CutlassGemmImpl {
             (GEMM_VARIANT_SW, 128, 256, 3) => "cutlass_128x256_sw_s3",
             (GEMM_VARIANT_SW, 256, 64, 3) => "cutlass_256x64_sw_s3",
             (GEMM_VARIANT_SW, 256, 64, 4) => "cutlass_256x64_sw_s4",
+            // Wmma bf16 variants — match cuBLAS small-M wmma picks.
+            (GEMM_VARIANT_WMMA, 16, 16, 2) => "cutlass_16x16_wmma_s2",
+            (GEMM_VARIANT_WMMA, 32, 32, 2) => "cutlass_32x32_wmma_s2",
             // Deep-stage / stages-2 basic-tile variants.
             (GEMM_VARIANT_BASIC, 64, 64, 2) => "cutlass_64x64_s2",
             (GEMM_VARIANT_BASIC, 64, 64, 5) => "cutlass_64x64_s5",
@@ -11305,6 +11331,9 @@ impl CutlassGemmAddImpl {
             (GEMM_VARIANT_SW, 128, 256, 3) => "cutlass_128x256_sw_s3_add",
             (GEMM_VARIANT_SW, 256, 64, 3) => "cutlass_256x64_sw_s3_add",
             (GEMM_VARIANT_SW, 256, 64, 4) => "cutlass_256x64_sw_s4_add",
+            // Wmma bf16 add variants — small-M residual-add at o_proj decode.
+            (GEMM_VARIANT_WMMA, 16, 16, 2) => "cutlass_16x16_wmma_s2_add",
+            (GEMM_VARIANT_WMMA, 32, 32, 2) => "cutlass_32x32_wmma_s2_add",
             // Deep-stage / stages-2 basic-tile add variants.
             (GEMM_VARIANT_BASIC, 64, 64, 2) => "cutlass_64x64_s2_add",
             (GEMM_VARIANT_BASIC, 64, 64, 5) => "cutlass_64x64_s5_add",

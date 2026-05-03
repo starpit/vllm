@@ -58,6 +58,12 @@ pub enum GemmVariant {
     /// large-M shapes where the default identity swizzle re-fetches
     /// activation rows past L2 capacity.
     Sw,
+    /// `OpClassWmmaTensorOp` + `nvcuda::wmma::mma_sync` 16×16×16 inst
+    /// shape — matches cuBLAS's small-M `cutlass_80_wmma_tensorop_*`
+    /// kernels that beat plain `mma 16×8×16` at decode shapes
+    /// (TB 16×16, 32×32 with K=64/128). Requires the bf16 Wmma<>
+    /// spec from `cutlass_wmma_bf16.h` (vendored CUTLASS lacks it).
+    Wmma,
 }
 
 impl CutlassTile {
@@ -88,6 +94,10 @@ impl CutlassTile {
             }
             GemmVariant::Sw => format!(
                 "cutlass_{}x{}_sw_s{}",
+                self.tile_m, self.tile_n, self.stages
+            ),
+            GemmVariant::Wmma => format!(
+                "cutlass_{}x{}_wmma_s{}",
                 self.tile_m, self.tile_n, self.stages
             ),
         }
@@ -775,6 +785,47 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
     pub fn cutlass_gemm_256x64_sw_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+
+    // ── Wmma bf16 variants (cuBLAS regime-map matches) ──
+    //
+    // `cutlass_gemm_wmma_<TBxTB>_k<TBK>_s<S>_launch` — uses
+    // `OpClassWmmaTensorOp` + `nvcuda::wmma 16×16×16` instruction. Adds
+    // bf16 wmma support via `csrc/cutlass_wmma_bf16.h` (vendored CUTLASS
+    // ships only f16 + int4 wmma). Threadblock shapes match cuBLAS's
+    // observed picks: 16×16, 32×32 with K∈{64,128} stages=2.
+    pub fn cutlass_gemm_wmma_16x16_k128_s2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_wmma_32x32_k128_s2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_wmma_32x32_k64_s2_launch(
         c: *mut u16,
         a: *const u16,
         b: *const u16,
@@ -1619,6 +1670,13 @@ fn launch_fn_for(tile: CutlassTile) -> CutlassLaunchFn {
         (GemmVariant::Basic, 256, 64, 5) => cutlass_gemm_256x64_s5_launch,
         (GemmVariant::Basic, 256, 64, 6) => cutlass_gemm_256x64_s6_launch,
         (GemmVariant::Basic, 256, 128, 2) => cutlass_gemm_256x128_s2_launch,
+        // Wmma bf16 variants — match cuBLAS's small-M wmma picks. The
+        // `cutlass_<TM>x<TN>_wmma_s<S>` CSV name maps to one of the
+        // `cutlass_gemm_wmma_<TM>x<TN>_k<TBK>_s<S>_launch` symbols.
+        // Only stages=2 is exposed today; cuBLAS doesn't pick higher
+        // stages for these tiles in practice.
+        (GemmVariant::Wmma, 16, 16, 2) => cutlass_gemm_wmma_16x16_k128_s2_launch,
+        (GemmVariant::Wmma, 32, 32, 2) => cutlass_gemm_wmma_32x32_k128_s2_launch,
         other => panic!(
             "cutlass: unsupported tile {:?} — add its extern declaration + csv entry",
             other,
@@ -3095,6 +3153,10 @@ pub unsafe fn cutlass_gemm(
     match tile.variant {
         GemmVariant::Basic => unsafe { cutlass_gemm_cached(a, b, tile, alloc, stream) },
         GemmVariant::Sw => unsafe { cutlass_gemm_legacy(a, b, tile, alloc, stream) },
+        // Wmma kernels only have the legacy `_launch` symbol — the
+        // 2-phase `_make_op` / `_run_op` shims aren't compiled in
+        // `cutlass_standalone_gemm.cu` for the Wmma family today.
+        GemmVariant::Wmma => unsafe { cutlass_gemm_legacy(a, b, tile, alloc, stream) },
     }
 }
 

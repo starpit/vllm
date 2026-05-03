@@ -1630,6 +1630,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let variant = match variant {
                     0 => cutlass::GemmVariant::Basic,
                     1 => cutlass::GemmVariant::Sw,
+                    2 => cutlass::GemmVariant::Wmma,
                     other => panic!(
                         "CutlassGemm: unknown variant id {other} — proc-macro emitted a tag the runtime doesn't decode"
                     ),
@@ -1688,6 +1689,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let variant = match variant {
                     0 => cutlass::GemmVariant::Basic,
                     1 => cutlass::GemmVariant::Sw,
+                    2 => cutlass::GemmVariant::Wmma,
                     other => panic!(
                         "CutlassGemmAdd: unknown variant id {other} — proc-macro / runtime contract drift"
                     ),

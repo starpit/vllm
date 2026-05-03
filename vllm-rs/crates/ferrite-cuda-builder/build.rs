@@ -425,11 +425,14 @@ fn build_cutlass_standalone_gemm(cache_dir: &str, rerun_files: &mut Vec<String>)
     const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
 
     let sources = vec!["../../crates/vllm-cuda/csrc/cutlass_standalone_gemm.cu".to_string()];
+    let watch = ["../../crates/vllm-cuda/csrc/cutlass_wmma_bf16.h"];
     rerun_files.extend(sources.iter().cloned());
+    rerun_files.extend(watch.iter().map(|s| s.to_string()));
 
     cudaforge::KernelBuilder::new()
         .out_dir(cache_dir)
         .source_files(sources)
+        .watch(watch.iter().map(|s| s.to_string()))
         .with_cutlass(Some(CUTLASS_COMMIT))
         .arg("-std=c++17")
         .arg("-O3")

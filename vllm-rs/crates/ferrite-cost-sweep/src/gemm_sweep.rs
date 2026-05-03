@@ -165,6 +165,8 @@ use ferrite_kernels::cutlass::{
     cutlass_gemm_bias_256x64_s3_launch,
     cutlass_gemm_bias_256x64_s4_launch,
     cutlass_gemm_silu_mul_launch,
+    cutlass_gemm_wmma_16x16_k128_s2_launch,
+    cutlass_gemm_wmma_32x32_k128_s2_launch,
     cutlass_gemv_launch,
 };
 
@@ -472,8 +474,36 @@ const ROPE_CONFIGS: &[(&str, u32, u32, u32, u32)] = &[
 /// Run the sweep. Writes CSV rows to stdout. `launch_overhead_us` is
 /// subtracted from every measurement so reported timings are
 /// compute-only — matches the convention `CostTable` expects.
+///
+/// `FERRITE_SWEEP_NK_FILTER`: comma-separated `N×K` pairs (e.g.
+/// `2048x2048,11008x2048`). If set, only those (N, K) tuples are
+/// swept; the elementwise/rope passes are skipped. Targeted-sweep
+/// mode for fast wmma cost-table updates.
 pub fn run(launch_overhead_us: f64) {
     let stream: sys::CUstream = std::ptr::null_mut();
+
+    if let Ok(filter) = std::env::var("FERRITE_SWEEP_NK_FILTER") {
+        let pairs: Vec<(u32, u32)> = filter
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                let mut parts = s.split('x');
+                let n: u32 = parts.next()?.parse().ok()?;
+                let k: u32 = parts.next()?.parse().ok()?;
+                Some((n, k))
+            })
+            .collect();
+        eprintln!(
+            "FERRITE_SWEEP_NK_FILTER active: {} (N, K) pairs",
+            pairs.len()
+        );
+        for (n, k) in pairs {
+            for &m in M_VALUES {
+                bench_one_shape(stream, m, n, k, launch_overhead_us);
+            }
+        }
+        return;
+    }
 
     for &(n, k) in NK_SHAPES {
         for &m in M_VALUES {
@@ -599,6 +629,11 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
         "cutlass_256x64_s5"  => cutlass_gemm_256x64_s5_launch,
         "cutlass_256x64_s6"  => cutlass_gemm_256x64_s6_launch,
         "cutlass_256x128_s2" => cutlass_gemm_256x128_s2_launch,
+        // Wmma bf16 variants — match cuBLAS small-M wmma picks. Different
+        // OpClass (OpClassWmmaTensorOp) + 16x16x16 wmma instr vs the
+        // 16x8x16 mma everywhere else. csv naming: `cutlass_<TM>x<TN>_wmma_s<S>`.
+        "cutlass_16x16_wmma_s2" => cutlass_gemm_wmma_16x16_k128_s2_launch,
+        "cutlass_32x32_wmma_s2" => cutlass_gemm_wmma_32x32_k128_s2_launch,
     );
 
     // ── CUTLASS tile zoo, beta=1.0 residual-add variant ──
@@ -709,6 +744,10 @@ fn bench_one_shape(stream: sys::CUstream, m: u32, n: u32, k: u32, launch_overhea
         "cutlass_256x64_s5_add"  => cutlass_gemm_256x64_s5_launch,
         "cutlass_256x64_s6_add"  => cutlass_gemm_256x64_s6_launch,
         "cutlass_256x128_s2_add" => cutlass_gemm_256x128_s2_launch,
+        // Wmma bf16 add variants — used by `CutlassGemmAddImpl` for the
+        // residual-add at o_proj on small-M decode.
+        "cutlass_16x16_wmma_s2_add" => cutlass_gemm_wmma_16x16_k128_s2_launch,
+        "cutlass_32x32_wmma_s2_add" => cutlass_gemm_wmma_32x32_k128_s2_launch,
     );
 
     // ── CUTLASS SplitK parallel variants ──

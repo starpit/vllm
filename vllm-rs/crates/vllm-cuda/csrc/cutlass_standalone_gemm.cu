@@ -6,6 +6,9 @@
 // A: RowMajor bf16, B: ColumnMajor bf16, C: RowMajor bf16
 
 #include <cutlass/cutlass.h>
+// MUST come before <cutlass/gemm/device/gemm.h> — adds Wmma<bf16,...> specialization
+// that vendored CUTLASS doesn't ship, used by the wmma kernel family below.
+#include "cutlass_wmma_bf16.h"
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_splitk_parallel.h>
 #include <cutlass/gemm/device/gemv.h>
@@ -632,6 +635,56 @@ CUTLASS_SPLITK_K64_LAUNCH_ONLY(64, 64, 4, 4)
 CUTLASS_SPLITK_K64_LAUNCH_ONLY(64, 64, 4, 8)
 CUTLASS_SPLITK_K64(128, 128, 64, 32, 64, 3, 2)
 CUTLASS_SPLITK_K64_LAUNCH_ONLY(128, 128, 3, 4)
+
+// ── WMMA bf16 kernel family ──
+// Matches cuBLAS's `cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_*_*x*_tn_align8`
+// kernels — used heavily for tiny-M shapes (decode QKV/up/down at M=1..2).
+// Instruction shape is fixed at 16x16x16 (the only bf16 wmma instr CUTLASS
+// emits via nvcuda::wmma::mma_sync). Threadblock shapes match cuBLAS's
+// observed picks: 16x16, 32x32 with stages 2.
+//
+// NOTE: requires `cutlass_wmma_bf16.h` (included at the top of this file)
+// which adds the Wmma<bf16, ...> spec missing from vendored CUTLASS.
+#define CUTLASS_GEMM_WMMA_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)  \
+    using GemmWmma_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm< \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                              \
+        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                           \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                              \
+        float,                                                                       \
+        cutlass::arch::OpClassWmmaTensorOp,                                          \
+        cutlass::arch::Sm80,                                                         \
+        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                 \
+        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                           \
+        cutlass::gemm::GemmShape<16, 16, 16>,                                       \
+        cutlass::epilogue::thread::LinearCombination<                                \
+            cutlass::bfloat16_t, 8, float, float>,                                   \
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                \
+        STAGES                                                                       \
+    >;
+
+#define CUTLASS_GEMM_WMMA_LAUNCH(TB_M, TB_N, TB_K, STAGES)                              \
+    extern "C" int cutlass_gemm_wmma_##TB_M##x##TB_N##_k##TB_K##_s##STAGES##_launch(     \
+        void* C, const void* A, const void* B,                                           \
+        int M, int N, int K,                                                             \
+        float alpha, float beta,                                                         \
+        uint64_t stream                                                                  \
+    ) {                                                                                  \
+        return run_gemm<GemmWmma_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                 \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                        \
+    }
+
+#define CUTLASS_GEMM_WMMA(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)         \
+    CUTLASS_GEMM_WMMA_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)      \
+    CUTLASS_GEMM_WMMA_LAUNCH(TB_M, TB_N, TB_K, STAGES)
+
+// cuBLAS's actual picks at qwen2.5-3b decode M=1 shapes:
+//   wmma 16x16_128x2  (TB 16x16, K=128, stages=2) — main pick
+//   wmma 32x32_128x2  (TB 32x32, K=128, stages=2)
+//   wmma 32x32_64x2   (TB 32x32, K=64,  stages=2)
+// Warp shape: same as TB (1 warp/block), since wmma frags are warp-scoped.
+CUTLASS_GEMM_WMMA(16, 16, 128, 16, 16, 128, 2)
+CUTLASS_GEMM_WMMA(32, 32, 128, 32, 32, 128, 2)
+CUTLASS_GEMM_WMMA(32, 32,  64, 32, 32,  64, 2)
 
 // ── CUTLASS GEMV (M=1 specialization) ──
 //

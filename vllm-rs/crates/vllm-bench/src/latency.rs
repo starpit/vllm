@@ -13,25 +13,6 @@ use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
 
 use crate::args::BenchLatencyArgs;
 
-// NVTX shape-marker FFI — only used to bracket the timed bench loop
-// so nsys can attribute kernel time to "bench_iter" exclusively,
-// excluding model load / warmup. Linked dynamically via
-// libnvToolsExt; calls are no-ops when not run under nsys.
-#[link(name = "nvToolsExt")]
-unsafe extern "C" {
-    fn nvtxRangePushA(message: *const std::os::raw::c_char) -> std::os::raw::c_int;
-    fn nvtxRangePop() -> std::os::raw::c_int;
-}
-
-fn nvtx_push(msg: &str) {
-    let c = std::ffi::CString::new(msg).unwrap_or_default();
-    unsafe { nvtxRangePushA(c.as_ptr()) };
-}
-
-fn nvtx_pop() {
-    unsafe { nvtxRangePop() };
-}
-
 // ---------------------------------------------------------------------------
 // LLM construction
 // ---------------------------------------------------------------------------
@@ -263,20 +244,12 @@ pub(crate) fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
                 .with_style(bench_style.clone())
                 .with_message(msg);
             let mut latencies = Vec::with_capacity(args.num_iters);
-            // NVTX bracket lets nsys filter to JUST the timed iters,
-            // excluding model-load + warmup kernel launches that
-            // otherwise dominate `cuda_gpu_kern_sum` totals.
-            nvtx_push("bench_iters");
-            for i in 0..args.num_iters {
-                let push_msg = format!("iter_{i}");
-                nvtx_push(&push_msg);
+            for _ in 0..args.num_iters {
                 let start = Instant::now();
                 llm.generate(&dummy_prompts, Some(sampling_params.clone()))?;
                 latencies.push(start.elapsed().as_secs_f64());
-                nvtx_pop();
                 pb.inc(1);
             }
-            nvtx_pop();
             pb.finish();
 
             results.push(BenchResult {

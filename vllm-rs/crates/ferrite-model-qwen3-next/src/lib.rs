@@ -34,20 +34,39 @@ use ferrite_forward::forward;
     workloads = [1, 8, 64, 512, 4096],
 )]
 fn qwen3_next() {
+    // All RMSNorm weights in Qwen3-Next ride the Gemma `(1 + w)`
+    // convention (see HF `Qwen3NextRMSNorm.forward`:
+    // `output * (1.0 + self.weight.float())`). The `+ 1.0` on each
+    // weight ref is claimed by the solver's ScalarOffsetRmsNormImpl
+    // (or its FusedAddRmsNormWithOffset peer) which emits the
+    // single rms_norm kernel call with `weight_offset = 1.0`. Same
+    // convention Gemma2 uses; missing it halves every norm output
+    // (the file stores `weight ≈ 1.0`, so HF computes `* 2.0` while
+    // ferrite-without-offset computes `* 1.0`). The exception is the
+    // GDN inner norm (`Qwen3NextRMSNormGated`, init=ones) which is
+    // a plain RMSNorm — it lives inside Qwen3NextGdnLayer and does
+    // not surface as an `rmsnorm(...)` call here.
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
-        normed = rmsnorm(hidden_states, input_layernorm[layer]);
+        normed = rmsnorm(hidden_states, input_layernorm[layer] + 1.0);
         if layer % full_attn_period == full_attn_remainder {
-            attn_out = gated_attention(normed, self_attn[layer], positions, rotary, kv_cache[layer], block_table);
+            attn_out = gated_attention(
+                normed,
+                self_attn[layer],
+                positions,
+                rotary,
+                kv_cache[layer],
+                block_table,
+            );
         } else {
             attn_out = gdn_attention(normed, linear_attn[layer]);
         }
         hidden_states = add(attn_out, hidden_states);
 
-        normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+        normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer] + 1.0);
         mlp_out = moe_block(normed2, mlp[layer]);
         hidden_states = add(mlp_out, hidden_states);
     }
-    normed = rmsnorm(hidden_states, norm);
+    normed = rmsnorm(hidden_states, norm + 1.0);
     logits = gemm(normed, lm_head);
 }

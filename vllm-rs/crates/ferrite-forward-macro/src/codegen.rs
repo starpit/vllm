@@ -3885,6 +3885,21 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     let v_head_dim = *model.bounds.get("v_head_dim").unwrap_or(&0) as usize;
     let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
+    // Vision-tower constants. Set in `#[vision_forward]` configs via
+    // `vision_num_heads` / `vision_head_dim` bounds; absent in text
+    // configs so the defaults (0 / 0.0) match the trait defaults
+    // declared in `ferrite_forward::CanonicalParams`. Q_SIZE is the
+    // rank-2 last-dim (`H*D`) the FUF carries; VISION_ATTN_SCALE is
+    // `1/sqrt(head_dim)`.
+    let vision_num_heads = *model.bounds.get("vision_num_heads").unwrap_or(&0) as u32;
+    let vision_head_dim = *model.bounds.get("vision_head_dim").unwrap_or(&0) as u32;
+    let vision_q_size = (vision_num_heads as usize) * (vision_head_dim as usize);
+    let vision_attn_scale: f32 = if vision_head_dim > 0 {
+        1.0_f32 / (vision_head_dim as f32).sqrt()
+    } else {
+        0.0
+    };
+
     // attention_multiplier (Granite override) → query_pre_attn_scalar
     // (Gemma2) → 1/sqrt(head_dim). Default 0.0 if no attention path.
     let attn_scale: f32 = if let Some(s) = model.scalars.get("attention_multiplier") {
@@ -3950,6 +3965,10 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
     let final_logit_softcapping_lit = proc_macro2::Literal::f32_unsuffixed(final_logit_softcapping);
     let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
+    let vision_num_heads_lit = proc_macro2::Literal::u32_unsuffixed(vision_num_heads);
+    let vision_head_dim_lit = proc_macro2::Literal::u32_unsuffixed(vision_head_dim);
+    let vision_q_size_lit = proc_macro2::Literal::usize_unsuffixed(vision_q_size);
+    let vision_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(vision_attn_scale);
 
     // MRoPE section override. `Some([t, h, w])` only when the
     // config carries `rope_scaling.mrope_section` (Qwen2-VL /
@@ -4000,6 +4019,10 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
             const FINAL_LOGIT_SOFTCAPPING: f32 = #final_logit_softcapping_lit;
             const QK_HEAD_DIM: usize = #qk_head_dim_lit;
             const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+            const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
+            const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
+            const VISION_Q_SIZE: usize = #vision_q_size_lit;
+            const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
             #mrope_section_tokens
         }
     }

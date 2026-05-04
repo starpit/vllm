@@ -2124,4 +2124,63 @@ mod tests {
         assert_eq!(OpKind::from_name("quick_gelu"), Some(OpKind::QuickGelu));
         assert_eq!(OpKind::from_name("gelu_erf"), Some(OpKind::GeluErf));
     }
+
+    #[test]
+    fn dsl_authored_reshape_threads_through_shape_infer() {
+        // End-to-end gate for G.5.c: a DSL body that writes
+        // `out = reshape(x, [a, b])` must classify and shape-infer
+        // without recovery, with the output local picking up the
+        // declared dims from `Program::reshape_targets` exactly the
+        // way a synthesized reshape would.
+        //
+        // The body is intentionally minimal — just enough to prove
+        // the wiring chain:
+        //   parse → classify → shape::infer → Inferred.locals[out]
+        // is the dims we wrote in the DSL.
+        let p = {
+            let file: syn::File = syn::parse_str(
+                "fn _carrier() { y = reshape(input_layernorm, [num_tokens, hidden_size]); }",
+            )
+            .expect("syn parse");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            crate::classify::classify(&ast).expect("classify")
+        };
+
+        // Sanity: classify recorded the target shape.
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p
+            .reshape_targets
+            .get(&target)
+            .expect("reshape_targets entry");
+        assert_eq!(dims, &vec![bound("num_tokens"), bound("hidden_size")]);
+
+        // shape::infer must pick those dims up directly (no
+        // ReshapeRecovery, no Mismatch). The empty manifest path is
+        // the simplest cell since this body never references a
+        // weight that needs anchoring.
+        let manifest = crate::weights_manifest::WeightsManifest::empty();
+        let bounds = std::collections::BTreeMap::from([
+            ("num_tokens".to_string(), 256_u64),
+            ("hidden_size".to_string(), 1280_u64),
+        ]);
+        let inferred = infer(&p, &manifest, &bounds).expect("shape::infer must succeed");
+
+        // The reshape's output local carries the exact dims we wrote.
+        let out_shape = inferred
+            .locals
+            .get(&target)
+            .expect("inferred shape for `y`");
+        assert_eq!(
+            out_shape,
+            &vec![bound("num_tokens"), bound("hidden_size")],
+            "DSL-authored reshape output must equal the declared target shape",
+        );
+    }
 }

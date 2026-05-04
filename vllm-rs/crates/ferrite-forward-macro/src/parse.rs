@@ -20,7 +20,7 @@
 use syn::spanned::Spanned;
 use syn::{BinOp, Block, Expr as SynExpr, ExprLit, Lit, Pat, Stmt as SynStmt};
 
-use crate::ast::{Ast, BoolExpr, BoundExpr, Expr, Stmt};
+use crate::ast::{Ast, BoolExpr, BoundExpr, DimSpec, Expr, Stmt};
 
 pub type ParseResult<T> = Result<T, syn::Error>;
 
@@ -283,6 +283,43 @@ fn parse_bound(expr: &SynExpr) -> ParseResult<BoundExpr> {
     }
 }
 
+/// Parse the second argument of `reshape(source, [..])` — an array
+/// literal of integer literals and bound identifiers. Each element
+/// is one output dimension.
+fn parse_dim_array(expr: &SynExpr) -> ParseResult<Vec<DimSpec>> {
+    let arr = match unwrap_parens(expr) {
+        SynExpr::Array(a) => a,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "reshape target shape must be an array literal `[dim0, dim1, ...]`",
+            ));
+        }
+    };
+    if arr.elems.is_empty() {
+        return Err(syn::Error::new(
+            arr.span(),
+            "reshape target shape must have at least one dim",
+        ));
+    }
+    arr.elems
+        .iter()
+        .map(|e| match unwrap_parens(e) {
+            SynExpr::Lit(ExprLit {
+                lit: Lit::Int(i), ..
+            }) => Ok(DimSpec::Lit(i.base10_parse()?)),
+            SynExpr::Path(p) if p.path.get_ident().is_some() => {
+                Ok(DimSpec::Bound(p.path.get_ident().unwrap().clone()))
+            }
+            other => Err(syn::Error::new(
+                other.span(),
+                "reshape dim must be an integer literal or a bound identifier \
+                 (bound-arithmetic is deferred — see ast::Expr::Reshape)",
+            )),
+        })
+        .collect()
+}
+
 pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
     match expr {
         // A simple identifier — `hidden_states`, `input_ids`.
@@ -346,6 +383,26 @@ pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
                     }
                 };
                 return Ok(Expr::SqrtBound(ident));
+            }
+            if op == "reshape" {
+                // `reshape(source, [dim0, dim1, ...])` — DSL-authored
+                // reshape with explicit target shape. The second arg
+                // is an array literal whose elements are each either
+                // an integer literal or a bound identifier. See
+                // `ast::Expr::Reshape` for the deferral note on
+                // bound-arithmetic dims.
+                if c.args.len() != 2 {
+                    return Err(syn::Error::new(
+                        op.span(),
+                        "`reshape(source, [dim0, dim1, ...])` takes exactly two arguments",
+                    ));
+                }
+                let source = parse_expr(&c.args[0])?;
+                let target_shape = parse_dim_array(&c.args[1])?;
+                return Ok(Expr::Reshape {
+                    source: Box::new(source),
+                    target_shape,
+                });
             }
             if op == "scalar" || op == "recip_scalar" {
                 if c.args.len() != 1 {
@@ -790,5 +847,94 @@ mod tests {
             }
             _ => panic!("expected for-loop"),
         }
+    }
+
+    #[test]
+    fn reshape_with_bound_dims_parses() {
+        let ast = parse("y = reshape(x, [num_tokens, vision_embed_dim]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                target,
+                value:
+                    Expr::Reshape {
+                        source: _,
+                        target_shape,
+                    },
+            } => {
+                assert_eq!(target.to_string(), "y");
+                assert_eq!(target_shape.len(), 2);
+                assert!(matches!(&target_shape[0], DimSpec::Bound(i) if i == "num_tokens"));
+                assert!(matches!(&target_shape[1], DimSpec::Bound(i) if i == "vision_embed_dim"));
+            }
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_literal_dims_parses() {
+        let ast = parse("y = reshape(x, [256, 1280]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => {
+                assert!(matches!(target_shape[0], DimSpec::Lit(256)));
+                assert!(matches!(target_shape[1], DimSpec::Lit(1280)));
+            }
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_wrong_arity_is_rejected() {
+        // 1 arg / 3 args — both rejected with the arity message.
+        let body = "y = reshape(x);";
+        let file: syn::File =
+            syn::parse_str(&format!("fn _carrier() {{ {body} }}")).expect("syntactic parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("expected arity error");
+        assert!(
+            err.to_string().contains("exactly two arguments"),
+            "expected arity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reshape_with_non_array_second_arg_is_rejected() {
+        let body = "y = reshape(x, hidden_size);";
+        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {body} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("expected non-array error");
+        assert!(
+            err.to_string().contains("array literal"),
+            "expected array-literal error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reshape_with_arithmetic_dim_is_rejected() {
+        // G.5.c is "literal-or-bound only"; bound-arithmetic
+        // (`num_tokens / vision_merge_factor`) is deferred. Reject
+        // explicitly so a well-formed but unsupported body fails with
+        // the deferred-feature message rather than parsing into
+        // something the rest of the pipeline can't cope with.
+        let body = "y = reshape(x, [num_tokens / 4, hidden_size]);";
+        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {body} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("expected deferred-feature error");
+        assert!(
+            err.to_string()
+                .contains("integer literal or a bound identifier"),
+            "expected deferred-feature error, got: {err}"
+        );
     }
 }

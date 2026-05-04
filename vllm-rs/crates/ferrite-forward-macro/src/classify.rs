@@ -16,6 +16,7 @@ use crate::classified::{
     BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
     WeightTable,
 };
+use crate::shape::Dim;
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
 
@@ -42,7 +43,7 @@ pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program
         statements,
         locals: cx.locals,
         weights: cx.weights,
-        reshape_targets: std::collections::HashMap::new(),
+        reshape_targets: cx.reshape_targets,
     })
 }
 
@@ -55,6 +56,12 @@ struct Ctx {
     /// For-loops push their induction variable and pop it on exit.
     scope: HashMap<String, Vec<LocalId>>,
     prelude: Prelude,
+    /// DSL-authored reshape targets accumulated during classify.
+    /// Identical surface to `shape::apply_reshape_hints`'s synthesized
+    /// reshapes — both flow into `Program::reshape_targets` keyed by
+    /// the producing `LocalId`. See [`Ctx::classify_stmt`] for the
+    /// `ast::Expr::Reshape` Assign-arm intercept.
+    reshape_targets: HashMap<LocalId, Vec<Dim>>,
 }
 
 impl Ctx {
@@ -65,6 +72,40 @@ impl Ctx {
     fn classify_stmt(&mut self, stmt: &ast::Stmt) -> ClassifyResult<Stmt> {
         match stmt {
             ast::Stmt::Assign { target, value } => {
+                // `out = reshape(source, [d0, d1, ...])` is the only
+                // place an `ast::Expr::Reshape` is admitted. We
+                // intercept here (before `classify_expr`) so the
+                // target shape can be threaded into
+                // `program.reshape_targets` keyed by the freshly
+                // bound `LocalId`. The classified Stmt drops the
+                // explicit shape and becomes a Reshape OpKind call —
+                // identical surface to the synthesized form from
+                // `shape::apply_reshape_hints`, so every downstream
+                // pass (CFG / FUF / shape::infer / solver / codegen)
+                // already knows how to handle it.
+                if let ast::Expr::Reshape {
+                    source,
+                    target_shape,
+                } = value
+                {
+                    let source = self.classify_expr(source)?;
+                    let id = self.bind(target.clone());
+                    let dims: Vec<Dim> = target_shape
+                        .iter()
+                        .map(|s| match s {
+                            ast::DimSpec::Lit(n) => Dim::Lit(*n),
+                            ast::DimSpec::Bound(ident) => Dim::Bound(ident.to_string()),
+                        })
+                        .collect();
+                    self.reshape_targets.insert(id, dims);
+                    return Ok(Stmt::Assign {
+                        target: id,
+                        value: Expr::Call {
+                            op: OpKind::Reshape,
+                            args: vec![source],
+                        },
+                    });
+                }
                 // Classify RHS first so that `x = f(x)` reads the
                 // previous binding of `x`, not the new one.
                 let value = self.classify_expr(value)?;
@@ -351,6 +392,16 @@ impl Ctx {
                 name: name.clone(),
                 recip: *recip,
             }),
+            // `reshape(...)` is only admitted as the top-level RHS of
+            // an `Assign`, where `classify_stmt` intercepts it to
+            // record the target shape on `Program::reshape_targets`.
+            // Reaching here means the user nested it inside another
+            // expression (e.g. `y = relu(reshape(x, [..]))`) — that
+            // would silently lose the target shape, so reject early.
+            ast::Expr::Reshape { .. } => Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`reshape(source, [..])` may only appear as the top-level RHS of an assignment",
+            )),
         }
     }
 
@@ -882,6 +933,79 @@ mod tests {
             },
             other => panic!("expected assign, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dsl_authored_reshape_records_target_shape() {
+        // `reshape(x, [num_tokens, vision_embed_dim])` — the G.5.c
+        // "literal-or-bound" surface. The classified Stmt must match
+        // the shape of `apply_reshape_hints`'s synthesized form: a
+        // Reshape OpKind call with the source as its only arg, plus
+        // an entry in `program.reshape_targets` keyed by the new
+        // local. Bound names round-trip as `Dim::Bound(name)`,
+        // literals as `Dim::Lit(n)`.
+        let p = classify_vision_src("y = reshape(pixels, [num_tokens, vision_embed_dim]);");
+        let (target, call_args) = match &p.statements[0] {
+            Stmt::Assign {
+                target,
+                value: Expr::Call { op, args },
+            } => {
+                assert_eq!(*op, OpKind::Reshape, "must lower to OpKind::Reshape");
+                (*target, args.clone())
+            }
+            other => panic!("expected Stmt::Assign with reshape call, got {other:?}"),
+        };
+        assert_eq!(p.locals.name(target).to_string(), "y");
+        // Source arg preserved verbatim — `pixels` resolves to the
+        // vision-prelude extern.
+        assert_eq!(call_args.len(), 1);
+        assert!(matches!(
+            call_args[0],
+            Expr::Extern {
+                kind: ExternKind::Pixels,
+                index: None,
+            }
+        ));
+        // Target shape recorded.
+        let dims = p
+            .reshape_targets
+            .get(&target)
+            .expect("reshape_targets entry");
+        assert_eq!(dims.len(), 2);
+        match &dims[0] {
+            Dim::Bound(name) => assert_eq!(name, "num_tokens"),
+            other => panic!("expected Bound, got {other:?}"),
+        }
+        match &dims[1] {
+            Dim::Bound(name) => assert_eq!(name, "vision_embed_dim"),
+            other => panic!("expected Bound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsl_authored_reshape_with_literal_dim() {
+        // Literal dims survive as `Dim::Lit(n)`.
+        let p = classify_vision_src("y = reshape(pixels, [num_tokens, 1280]);");
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p.reshape_targets.get(&target).unwrap();
+        assert!(matches!(dims[0], Dim::Bound(ref n) if n == "num_tokens"));
+        assert!(matches!(dims[1], Dim::Lit(1280)));
+    }
+
+    #[test]
+    fn nested_reshape_is_rejected() {
+        // Nesting would silently lose the target shape (no LocalId
+        // to key reshape_targets on), so it must error at classify
+        // time, not produce wrong code at codegen.
+        let err =
+            classify_err("y = layer_norm(reshape(hidden_states, [num_tokens, hidden_size]), ln);");
+        assert!(
+            err.to_string().contains("top-level RHS of an assignment"),
+            "expected top-level-RHS error, got: {err}"
+        );
     }
 
     #[test]

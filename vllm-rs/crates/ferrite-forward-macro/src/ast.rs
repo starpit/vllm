@@ -104,4 +104,31 @@ pub enum Expr {
     /// time. `recip == true` folds to `1.0 / scalars[name]`, used
     /// for divisors like Granite's `logits_scaling`.
     ConfigScalar { name: Ident, recip: bool },
+    /// `reshape(source, [d0, d1, ...])` — DSL-authored reshape with
+    /// an explicit target shape. The target shape is preserved here
+    /// for `classify` to thread into [`Program::reshape_targets`]
+    /// keyed by the producing `LocalId`; the classified form drops
+    /// the target list and becomes
+    /// `Expr::Call { op: OpKind::Reshape, args: [source] }`,
+    /// matching the synthesized-reshape shape from
+    /// `shape::apply_reshape_hints`.
+    ///
+    /// G.5.c surface is "literal-or-bound only" — each `DimSpec`
+    /// is an integer literal or a bare bound name. Bound-arithmetic
+    /// (`num_tokens / vision_merge_factor`) is deliberately deferred
+    /// until the merger reshape needs it.
+    Reshape {
+        source: Box<Expr>,
+        target_shape: Vec<DimSpec>,
+    },
+}
+
+/// One dim of a [`Expr::Reshape`] target shape. Restricted to the
+/// minimal G.5.c surface: integer literal or a config-bound name.
+#[derive(Clone, Debug)]
+pub enum DimSpec {
+    /// Concrete integer dim, e.g. `4`.
+    Lit(u64),
+    /// Symbolic bound name, e.g. `vision_embed_dim`.
+    Bound(Ident),
 }

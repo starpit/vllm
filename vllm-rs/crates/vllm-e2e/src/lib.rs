@@ -177,6 +177,17 @@ impl TestModels {
     #[cfg(feature = "cuda")]
     pub const QWEN3_MOE: &str = "TroyDoesAI/Qwen3-MoE-3B";
 
+    /// Qwen3-Next dev/debug fixture. The `Qwen3NextForCausalLM`
+    /// architecture (hybrid GDN + full-attention) only ships at 80B
+    /// from Qwen; this Goekdeniz "Dev" upload is the only small
+    /// real-arch checkpoint that fits an L4 (~140 MB on disk, 4
+    /// layers, 4 experts, hidden_size=8). Output is gibberish
+    /// (`max_position_embeddings=32`, undertrained), but greedy
+    /// decode is deterministic — enough for a token-level golden
+    /// that pins the GDN + gated-attention math.
+    #[cfg(feature = "cuda")]
+    pub const QWEN3_NEXT_DEV: &str = "Goekdeniz-Guelmez/Qwen3Next-Dev";
+
     // -----------------------------------------------------------------------
     // MLX-only models (metal backend)
     // -----------------------------------------------------------------------

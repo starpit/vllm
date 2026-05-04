@@ -1,0 +1,10 @@
+{
+  "embed_tokens": ["vocab_size", "hidden_size"],
+  "input_layernorm": ["hidden_size"],
+  "lm_head": ["hidden_size", "vocab_size"],
+  "mlp": ["hidden_size"],
+  "norm": ["hidden_size"],
+  "post_attention_layernorm": ["hidden_size"],
+  "self_attn": ["hidden_size"],
+  "linear_attn": ["hidden_size"]
+}

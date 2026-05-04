@@ -2183,4 +2183,90 @@ mod tests {
             "DSL-authored reshape output must equal the declared target shape",
         );
     }
+
+    #[test]
+    fn vision_prelude_externs_shape_infer_under_qwen2_vl_2b_bounds() {
+        // G.5.d checkpoint: a vision-prelude DSL body referencing
+        // `pixels` / `cos` / `sin` must shape-infer cleanly under the
+        // qwen2-vl-2b config, with each extern's shape resolving to
+        // the bound names declared in `extern_shape`. No production
+        // change at G.5.d — the test pins the already-wired chain
+        // (`extern_shape` arms ← G.5.b vision-config bounds) so a
+        // future edit that desyncs the two trips here, before it
+        // reaches a `#[vision_forward]` expansion.
+        let p = {
+            let file: syn::File = syn::parse_str(
+                "fn _carrier() {\n\
+                 pixels_out = pixels;\n\
+                 cos_out = cos;\n\
+                 sin_out = sin;\n\
+                 }",
+            )
+            .expect("syn parse");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            crate::classify::classify_with(&ast, crate::classified::Prelude::Vision)
+                .expect("classify (vision prelude)")
+        };
+
+        // Bounds come from the real qwen2-vl-2b config (G.5.b).
+        // `extern_shape` for `Pixels` anchors on `vision_in_features`;
+        // for `Cos`/`Sin` on `vision_rope_half_dim`. `num_tokens` is
+        // the workload axis the vision encoder reuses (batched-total
+        // flat L per the handoff §"Open question 1" resolution).
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("ferrite-model-qwen2-vl")
+            .join("configs");
+        let configs = crate::config::load_dir(&dir).expect("load qwen2-vl configs");
+        let cfg = configs
+            .iter()
+            .find(|c| c.source_stem == "qwen2-vl-2b")
+            .expect("qwen2-vl-2b config present");
+        let mut bounds: std::collections::BTreeMap<String, u64> = cfg.bounds.clone();
+        bounds.insert("num_tokens".into(), 256);
+
+        let manifest = crate::weights_manifest::WeightsManifest::empty();
+        let inferred = infer(&p, &manifest, &bounds).expect("shape::infer must succeed");
+
+        // Each statement's target carries the shape from its extern's
+        // arm in `extern_shape`. Bound names — not Lit ints — close
+        // through `Solver::close_shape`; this mirrors how the FUF
+        // consumes shapes (numerical evaluation lives at codegen).
+        let target_named = |name: &str| -> LocalId {
+            for s in &p.statements {
+                if let Stmt::Assign { target, .. } = s
+                    && *p.locals.name(*target) == name
+                {
+                    return *target;
+                }
+            }
+            panic!("missing target {name}");
+        };
+        assert_eq!(
+            inferred.locals.get(&target_named("pixels_out")).unwrap(),
+            &vec![bound("num_tokens"), bound("vision_in_features")],
+            "`pixels` extern must resolve to [num_tokens, vision_in_features]",
+        );
+        assert_eq!(
+            inferred.locals.get(&target_named("cos_out")).unwrap(),
+            &vec![bound("num_tokens"), bound("vision_rope_half_dim")],
+            "`cos` extern must resolve to [num_tokens, vision_rope_half_dim]",
+        );
+        assert_eq!(
+            inferred.locals.get(&target_named("sin_out")).unwrap(),
+            &vec![bound("num_tokens"), bound("vision_rope_half_dim")],
+            "`sin` extern must resolve to [num_tokens, vision_rope_half_dim]",
+        );
+
+        // Closing the loop: those bound names exist in qwen2-vl-2b's
+        // config bounds, so a downstream consumer (e.g. a real
+        // `#[vision_forward]` expansion at G.5.e) will be able to
+        // numerically evaluate the inferred shapes.
+        assert_eq!(bounds.get("vision_in_features"), Some(&1176));
+        assert_eq!(bounds.get("vision_rope_half_dim"), Some(&40));
+    }
 }

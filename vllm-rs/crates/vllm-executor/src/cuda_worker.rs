@@ -208,6 +208,19 @@ enum CudaModel {
 }
 
 impl CudaModel {
+    /// Hybrid arches that need an auxiliary recurrent-state pool
+    /// alongside the paged KV cache (Mamba-style conv1d / SSM state).
+    /// True for the hand-written `Qwen3Next` variant and for ferrite
+    /// loads whose `arch_name() == "qwen3_next"`. Drives the dispatch
+    /// site that builds GDN tensors before forward.
+    fn is_qwen3_next(&self) -> bool {
+        match self {
+            Self::Qwen3Next(_) => true,
+            Self::Ferrite(m) => m.weights.arch_name() == "qwen3_next",
+            _ => false,
+        }
+    }
+
     fn num_layers(&self) -> usize {
         match self {
             Self::Llama(m) => m.model.layers.len(),
@@ -748,6 +761,12 @@ impl CudaModel {
     }
 
     /// Forward pass for Qwen3Next with GDN context.
+    ///
+    /// Routes to either the hand-written `Qwen3Next::forward` (legacy
+    /// path, single `vllm-cuda` model) or to the ferrite forward
+    /// vtable with `ForwardCtx::{gdn_state, gdn_state_indices}`
+    /// populated. Both paths consume the same per-request state
+    /// pool + state-indices tensors built by `build_gdn_tensors`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn forward_qwen3_next(
         &self,
@@ -786,6 +805,39 @@ impl CudaModel {
                     device,
                     last_token_indices,
                 )
+            },
+            Self::Ferrite(m) => unsafe {
+                let _ = (gdn_cu_seqlens, num_seqs);
+                let num_tokens = input_ids.dim(0) as u64;
+                let ctx = ferrite_forward::ForwardCtx {
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    mm_embeds: None,
+                    embed_patches: &[],
+                    gdn_state: Some(gdn_state_pool),
+                    gdn_state_indices: Some(gdn_state_indices),
+                    #[cfg(feature = "nccl")]
+                    tp_group: m.tp_group.as_ref(),
+                };
+                let logits = m.weights.forward(&ctx, device, num_tokens);
+                match last_token_indices {
+                    Some(idx) if idx.dim(0) < num_tokens as usize => {
+                        vllm_cuda::kernels::embedding_gather(
+                            logits.as_gpu_tensor(),
+                            *idx,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                    _ => logits,
+                }
             },
             _ => panic!("forward_qwen3_next called on non-Qwen3Next model"),
         }
@@ -5331,6 +5383,18 @@ impl Worker for CudaWorker {
                         arch
                     );
                 }
+                // Hybrid arches need an auxiliary recurrent-state pool
+                // alongside the paged KV cache. Today only `qwen3_next`
+                // qualifies; the existing `gdn_state_pool` /
+                // `qwen3_next_config` worker fields back both the
+                // ferrite and the hand-written paths. We populate the
+                // config here so `init_kv_cache_pool` builds the pool
+                // for ferrite loads too. New hybrid arches would extend
+                // this branch (or, longer term, a `FerriteWeights`
+                // method that exposes the per-arch state requirements).
+                if ferrite_weights.arch_name() == "qwen3_next" {
+                    self.qwen3_next_config = Some(qwen3_next_config_from_hf(&hf_config)?);
+                }
                 Some(CudaModel::Ferrite(Box::new(FerriteModel {
                     weights: ferrite_weights,
                     mm,
@@ -8662,8 +8726,12 @@ impl CudaWorker {
                     None
                 };
 
-                if matches!(model, CudaModel::Qwen3Next(_)) {
-                    // Build GDN forward context.
+                if model.is_qwen3_next() {
+                    // Build GDN forward context. Covers both the
+                    // hand-written `CudaModel::Qwen3Next` legacy path
+                    // and ferrite-loaded `qwen3_next` arches; the
+                    // dispatch inside `forward_qwen3_next` routes
+                    // accordingly.
                     let gdn_pool = gdn_pool_ref.unwrap();
                     let meta = &prepared.attn_meta;
 

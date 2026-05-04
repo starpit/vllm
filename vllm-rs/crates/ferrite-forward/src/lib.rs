@@ -5,7 +5,7 @@
 //! the generated code depends on: most importantly [`ForwardCtx`],
 //! the ambient-args bundle the emitted forward fn takes.
 
-pub use ferrite_forward_macro::forward;
+pub use ferrite_forward_macro::{forward, vision_forward};
 
 #[cfg(feature = "cuda")]
 pub mod attack_surface;

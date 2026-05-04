@@ -821,6 +821,11 @@ fn compile_common(
                 "shared_fused_moe_ref",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
+                // Vision-side unary elementwise ops (G.4). Shape-
+                // preserving, no matmul — same class as the text-side
+                // `scalar_mul_inplace` / `tanh_softcap_inplace` lines.
+                "quick_gelu_inplace",
+                "gelu_erf_inplace",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
@@ -1008,6 +1013,7 @@ fn compile_common(
             &manifest,
             canonical_override.as_ref(),
             sm.tp_world_size,
+            mode.emit_arch_dispatch,
         );
         let stub_items = &sm.stub_items;
         per_model_ts.push(quote! {

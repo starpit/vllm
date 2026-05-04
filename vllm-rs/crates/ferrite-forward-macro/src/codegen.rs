@@ -1581,6 +1581,7 @@ fn emit_weights_struct(
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
     tp_world_size: u8,
+    emit_fingerprint: bool,
 ) -> TokenStream {
     let accessors = match collect_accessors(program, fuf, sfufs, lib, model) {
         Ok(a) => a,
@@ -1967,7 +1968,17 @@ fn emit_weights_struct(
             }
         })
         .collect();
-    let fingerprint_method = emit_fingerprint_check(model, manifest, tp_world_size);
+    // Vision encoders skip the fingerprint emission entirely — they
+    // route through the hand-written `FerriteMmRegistration` instead
+    // of the inventory-based arch dispatcher, so `fingerprint_matches`
+    // is unreachable. Skipping also avoids the `num_hidden_layers` /
+    // `hidden_size` / `vocab_size` panics in `emit_fingerprint_check`
+    // — vision configs (`vision_*` + `d_model` only) lack those keys.
+    let fingerprint_method = if emit_fingerprint {
+        emit_fingerprint_check(model, manifest, tp_world_size)
+    } else {
+        TokenStream::new()
+    };
 
     // Detect whether this arch uses `rotary_local` (dual-rotary,
     // e.g. Gemma3). If so, emit a `rotary_local: RotaryCache` field
@@ -4039,7 +4050,23 @@ pub fn emit_model(
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
+    emit_fingerprint: bool,
 ) -> TokenStream {
+    // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
+    // entire FUF is the backbone. `emit_fingerprint == false` is the
+    // discriminator (set by `#[vision_forward]` via `CompileMode`)
+    // and is reused here to gate three places: the
+    // `backbone_output_for` panic that requires a Tile-input final
+    // gemm, the `lower_bucket` `skip_subgraph` carve-out for the
+    // lm_head row, and the lm_head static-slice/instructions
+    // emission. With the gate flipped, the whole FUF lowers into
+    // BACKBONE_M_<wp> and LM_HEAD_M_<wp> emits as `&[]` so the
+    // existing FORWARD_TABLE / `run` / `run_backbone` runtime paths
+    // need no further change — `run` runs the backbone, then a
+    // zero-iteration loop over the empty lm_head, then returns
+    // `take_owned(terminal_slot)`; `run_backbone` is byte-equivalent
+    // to `run` minus the trailing memcpy.
+    let is_vision = !emit_fingerprint;
     if let Some(canonical) = canonical_override {
         return emit_shim_model(
             program,
@@ -4050,6 +4077,7 @@ pub fn emit_model(
             manifest,
             canonical,
             tp_world_size,
+            emit_fingerprint,
         );
     }
     let weights = emit_weights_struct(
@@ -4061,6 +4089,7 @@ pub fn emit_model(
         manifest,
         WeightsEmitMode::Canonical,
         tp_world_size,
+        emit_fingerprint,
     );
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
@@ -4110,7 +4139,14 @@ pub fn emit_model(
     let last_node_id = last_non_splice_node(fuf)
         .expect("non-empty FUF expected")
         .id;
-    let backbone_out = backbone_output_for(fuf);
+    // Vision: the whole FUF is the backbone, so the "backbone output"
+    // is the last node's slot 0 directly. Decoder: walk the terminal
+    // gemm's first input per the `gemm(<tile>, lm_head)` contract.
+    let backbone_out = if is_vision {
+        (last_node_id, 0u8)
+    } else {
+        backbone_output_for(fuf)
+    };
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
@@ -4147,6 +4183,10 @@ pub fn emit_model(
         let terminal_slot = slots.of(last_node_id, 0);
         let num_slots = slots.total();
 
+        // Vision: the whole FUF (including the terminal subgraph)
+        // lowers into the backbone slice. Decoder: stop at
+        // `terminal_sg` so the lm_head row emits separately below.
+        let backbone_skip = if is_vision { None } else { Some(terminal_sg) };
         let lowered_bb = lower_bucket(
             fuf,
             sfuf,
@@ -4155,7 +4195,7 @@ pub fn emit_model(
             model,
             lib,
             &bounds,
-            Some(terminal_sg),
+            backbone_skip,
             &protected_bb,
             &mut arch_opcodes,
             backbone_out,
@@ -4166,30 +4206,48 @@ pub fn emit_model(
         // terminal subgraph's `fan_out` against the same slot map.
         // No aliases, no drops, no recursion — terminal is the last
         // subgraph in topological order.
-        let term_imp_id = sfuf
-            .impl_of(terminal_sg)
-            .expect("terminal subgraph has an Impl assignment");
-        let term_imp = lib.get(term_imp_id);
-        let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
-        let term_match = crate::impl_lib::MatchInfo {
-            claimed_tiles: term_claimed.clone(),
-            boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
-                fuf,
-                &term_claimed,
-            ),
-            boundary_outputs: term_claimed,
-        };
-        let term_emits = term_imp
-            .fan_out(&term_match, fuf, program, &bounds, &slots)
-            .expect("terminal subgraph's Impl must implement fan_out");
-        // Eval body lives in `ferrite_forward::Instruction::eval`
-        // — `arch_opcodes` keeps the shape registration for
-        // `emit_bucket_static_slice`'s shape-checking pass.
-        arch_opcodes.register(term_imp.opcode_shape());
-        let lowered_lm = crate::interpreter_codegen::LoweredBucket {
-            instances: term_emits,
-            num_slots,
-            final_slot: terminal_slot,
+        //
+        // Vision encoders have no lm_head: the terminal subgraph
+        // already lowered into `lowered_bb` above. Emit an empty
+        // LoweredBucket so the FORWARD_TABLE row's `lm_head` slice
+        // becomes `&[]` and the runtime `run`'s `run_slice(lm_head)`
+        // is a zero-iteration loop. `final_slot` reuses
+        // `backbone_slot` since both `run` and `run_backbone`
+        // ultimately `take_owned(terminal_slot)` (which the
+        // bucket-table sets to `backbone_slot` for vision via
+        // `terminal_slot = backbone_slot` below).
+        let lowered_lm = if is_vision {
+            crate::interpreter_codegen::LoweredBucket {
+                instances: vec![],
+                num_slots,
+                final_slot: backbone_slot,
+            }
+        } else {
+            let term_imp_id = sfuf
+                .impl_of(terminal_sg)
+                .expect("terminal subgraph has an Impl assignment");
+            let term_imp = lib.get(term_imp_id);
+            let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
+            let term_match = crate::impl_lib::MatchInfo {
+                claimed_tiles: term_claimed.clone(),
+                boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
+                    fuf,
+                    &term_claimed,
+                ),
+                boundary_outputs: term_claimed,
+            };
+            let term_emits = term_imp
+                .fan_out(&term_match, fuf, program, &bounds, &slots)
+                .expect("terminal subgraph's Impl must implement fan_out");
+            // Eval body lives in `ferrite_forward::Instruction::eval`
+            // — `arch_opcodes` keeps the shape registration for
+            // `emit_bucket_static_slice`'s shape-checking pass.
+            arch_opcodes.register(term_imp.opcode_shape());
+            crate::interpreter_codegen::LoweredBucket {
+                instances: term_emits,
+                num_slots,
+                final_slot: terminal_slot,
+            }
         };
 
         canonical_lowered.insert(
@@ -4499,6 +4557,7 @@ fn emit_shim_model(
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical: &Ident,
     tp_world_size: u8,
+    emit_fingerprint: bool,
 ) -> TokenStream {
     let weights = emit_weights_struct(
         program,
@@ -4509,6 +4568,7 @@ fn emit_shim_model(
         manifest,
         WeightsEmitMode::Shim { canonical },
         tp_world_size,
+        emit_fingerprint,
     );
 
     // Per-bucket fn surfaces are gone — dispatch lives on the

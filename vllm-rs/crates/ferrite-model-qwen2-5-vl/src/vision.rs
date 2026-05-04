@@ -34,6 +34,14 @@ use ferrite_forward::{
 };
 use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{Linear, RmsNorm};
+use ferrite_vision::{
+    bf16_slice_as_bytes, build_cu_seqlens_i32, i32_slice_as_bytes, pad_linear_k_to_mult8,
+    u32_slice_as_bytes,
+};
+
+/// Common geometric vision config from `ferrite-vision`. The arch-specific
+/// extras (`intermediate_size`, `window_size`) hang off [`VisionExtras`].
+pub use ferrite_vision::VisionConfig;
 
 // ── Vision-encoder family constants ────────────────────────────────
 //
@@ -46,7 +54,6 @@ const NUM_HEADS: u32 = 16;
 const WINDOW_SIZE: u32 = 112;
 const FULLATT_BLOCK_INDEXES: &[u32] = &[7, 15, 23, 31];
 const NORM_EPS: f32 = 1e-6;
-const ROPE_THETA: f32 = 10000.0;
 
 /// One Qwen2.5-VL vision transformer block. Pre-RMSNorm + 2D-rope-aware
 /// varlen attention + pre-RMSNorm SwiGLU MLP.
@@ -94,46 +101,6 @@ impl VisionBlockWeights {
     }
 }
 
-/// Pad a `[D0, K]` Linear's weight to `[D0, K_pad]` where `K_pad =
-/// round_up(K, 8)`. Tail columns are zero so the GEMM
-/// `out[i, j] = sum_k input[i, k] * weight[j, k]` is unchanged when the
-/// activation feeds zeros into those padded columns.
-unsafe fn pad_linear_k_to_mult8(
-    linear: Linear,
-    weights: &mut GpuWeights,
-    stream: CUstream,
-) -> Result<Linear> {
-    let w = linear.weight;
-    debug_assert_eq!(w.ndim(), 2);
-    let d0 = w.dim(0);
-    let k = w.dim(1);
-    let k_pad = k.next_multiple_of(8);
-    if k_pad == k {
-        return Ok(linear);
-    }
-    let dtype = w.dtype();
-    let elem = dtype.size_bytes();
-    let src_pitch = k * elem;
-    let dst_pitch = k_pad * elem;
-    let total_bytes = d0 * dst_pitch;
-    let new_ptr = unsafe { driver::mem_alloc(total_bytes) }?;
-    weights.record_alloc(new_ptr, total_bytes);
-    unsafe { driver::memset_d8(new_ptr, 0, total_bytes, stream) }?;
-    let src_base = w.raw_ptr() as *const u8;
-    for r in 0..d0 {
-        unsafe {
-            driver::memcpy_dtod_async(
-                new_ptr.add(r * dst_pitch),
-                src_base.add(r * src_pitch),
-                src_pitch,
-                stream,
-            )?;
-        }
-    }
-    let new_w = unsafe { GpuTensor::new(new_ptr, &[d0, k_pad], dtype) };
-    Ok(Linear::new(new_w, linear.bias))
-}
-
 /// `Qwen2_5_VLPatchMerger` — RMSNorm + 2-layer GELU MLP projecting
 /// `[L, embed_dim]` → `[L / spatial_merge_size², d_model]`.
 pub struct VisionMergerWeights {
@@ -158,28 +125,29 @@ pub struct VisionWeights {
     pub blocks: Vec<VisionBlockWeights>,
     pub merger: VisionMergerWeights,
     pub config: VisionConfig,
+    pub extras: VisionExtras,
 }
 
+/// Qwen2.5-VL-specific vision config that doesn't fit the shared
+/// [`VisionConfig`] (which carries the geometric fields every VL/MM
+/// arch shares). `intermediate_size` is the SwiGLU width and replaces
+/// embed×ratio sizing; `window_size` drives the windowed-attention
+/// permutation that's specific to this arch.
 #[derive(Clone, Copy, Debug)]
-pub struct VisionConfig {
-    pub embed_dim: u32,
-    pub depth: u32,
-    pub num_heads: u32,
+pub struct VisionExtras {
     /// SwiGLU intermediate width (Qwen2.5-VL-3B: 3420). Not embed_dim·ratio.
     pub intermediate_size: u32,
-    pub patch_size: u32,
-    pub temporal_patch_size: u32,
-    pub spatial_merge_size: u32,
-    pub in_chans: u32,
-    /// Text-decoder hidden the merger projects into (= `out_hidden_size`).
-    pub d_model: u32,
-    pub norm_eps: f32,
     /// Spatial window edge in pixels (config: 112).
     pub window_size: u32,
 }
 
 impl VisionWeights {
-    pub fn load(weights: &mut GpuWeights, config: VisionConfig, stream: CUstream) -> Result<Self> {
+    pub fn load(
+        weights: &mut GpuWeights,
+        config: VisionConfig,
+        extras: VisionExtras,
+        stream: CUstream,
+    ) -> Result<Self> {
         let in_chans = config.in_chans as usize;
         let t = config.temporal_patch_size as usize;
         let p = config.patch_size as usize;
@@ -206,6 +174,7 @@ impl VisionWeights {
             blocks,
             merger,
             config,
+            extras,
         })
     }
 
@@ -230,9 +199,10 @@ impl VisionWeights {
         device: &mut GpuDevice,
     ) -> OwnedTensor {
         let cfg = &self.config;
+        let extras = &self.extras;
         let total_l = pixels.dim(0);
-        let head_dim = (cfg.embed_dim / cfg.num_heads) as usize;
-        let half_rot = head_dim / 2;
+        let head_dim = cfg.head_dim();
+        let half_rot = cfg.half_rot();
         let dtype = pixels.dtype();
         let stream = device.compute_stream;
         let scale = (head_dim as f32).powf(-0.5);
@@ -249,7 +219,7 @@ impl VisionWeights {
         );
 
         // 2. Per-token RoPE cos/sin in natural (pre-window) order, bf16.
-        let (cos_host, sin_host) = build_rope_cos_sin_bf16(grid_thw, cfg, total_l);
+        let (cos_host, sin_host) = cfg.build_rope_cos_sin_bf16(grid_thw, total_l);
         let cos_natural = device.alloc_gpu_tensor_from_host(
             &[total_l, half_rot],
             dtype,
@@ -270,7 +240,7 @@ impl VisionWeights {
             i32_slice_as_bytes(&cu_seqlens_full_host),
         );
         let (window_index_host, cu_window_seqlens_host, max_seqlen_window) =
-            build_window_index_cu_seqlens(grid_thw, cfg);
+            build_window_index_cu_seqlens(grid_thw, cfg, extras);
         debug_assert_eq!(window_index_host.len(), l_merged);
         let cu_window_seqlens = device.alloc_gpu_tensor_from_host(
             &[cu_window_seqlens_host.len()],
@@ -404,7 +374,7 @@ impl VisionWeights {
             // the first I cols of each half and zero on the trailing
             // I_pad - I cols. silu(0)·up==0 keeps the padded slots zero
             // through the next GEMM's K=I_pad contraction.
-            let i = cfg.intermediate_size as usize;
+            let i = extras.intermediate_size as usize;
             let i_pad = i.next_multiple_of(8);
             let act = pack_gate_up(
                 gate_out.as_gpu_tensor(),
@@ -515,89 +485,6 @@ unsafe fn pack_gate_up(
     packed
 }
 
-// ── 2D RoPE cos/sin construction ───────────────────────────────────
-//
-// Identical to Qwen2-VL's natural-order build (Python
-// `Qwen2VisionTransformer.rot_pos_emb`); window permutation is applied
-// downstream via `embedding_gather` on the result, mirroring Python
-// vLLM's `Qwen2_5_VisionTransformer.forward` `rotary_pos_emb[window_index]`.
-
-fn build_rope_cos_sin_bf16(
-    grid_thw: &[(u32, u32, u32)],
-    cfg: &VisionConfig,
-    total_l: usize,
-) -> (Vec<u16>, Vec<u16>) {
-    let head_dim = (cfg.embed_dim / cfg.num_heads) as usize;
-    let half_rot = head_dim / 2;
-    let freq_axis_dim = half_rot / 2;
-    let s = cfg.spatial_merge_size as usize;
-
-    let inv_freq: Vec<f32> = (0..freq_axis_dim)
-        .map(|i| 1.0 / ROPE_THETA.powf((2 * i) as f32 / (half_rot as f32)))
-        .collect();
-
-    let mut cos = Vec::<u16>::with_capacity(total_l * half_rot);
-    let mut sin = Vec::<u16>::with_capacity(total_l * half_rot);
-    for &(t, h, w) in grid_thw {
-        let (h, w, t) = (h as usize, w as usize, t as usize);
-        debug_assert_eq!(h % s, 0);
-        debug_assert_eq!(w % s, 0);
-        let h_blocks = h / s;
-        let w_blocks = w / s;
-        let frame_len = h * w;
-        let mut hpos = vec![0u32; frame_len];
-        let mut wpos = vec![0u32; frame_len];
-        let mut idx = 0usize;
-        for hb in 0..h_blocks {
-            for wb in 0..w_blocks {
-                for sh in 0..s {
-                    for sw in 0..s {
-                        hpos[idx] = (hb * s + sh) as u32;
-                        wpos[idx] = (wb * s + sw) as u32;
-                        idx += 1;
-                    }
-                }
-            }
-        }
-        for _ in 0..t {
-            for token in 0..frame_len {
-                let hp = hpos[token] as f32;
-                let wp = wpos[token] as f32;
-                for &f in inv_freq.iter() {
-                    let theta_h = hp * f;
-                    cos.push(f32_to_bf16(theta_h.cos()));
-                    sin.push(f32_to_bf16(theta_h.sin()));
-                }
-                for &f in inv_freq.iter() {
-                    let theta_w = wp * f;
-                    cos.push(f32_to_bf16(theta_w.cos()));
-                    sin.push(f32_to_bf16(theta_w.sin()));
-                }
-            }
-        }
-    }
-    debug_assert_eq!(cos.len(), total_l * half_rot);
-    (cos, sin)
-}
-
-fn build_cu_seqlens_i32(grid_thw: &[(u32, u32, u32)]) -> (Vec<i32>, usize) {
-    let mut cu = Vec::<i32>::with_capacity(grid_thw.len() + 1);
-    cu.push(0);
-    let mut max_seqlen = 0usize;
-    let mut acc: i32 = 0;
-    for &(t, h, w) in grid_thw {
-        let seg = (h as usize) * (w as usize);
-        for _ in 0..t {
-            acc += seg as i32;
-            cu.push(acc);
-            if seg > max_seqlen {
-                max_seqlen = seg;
-            }
-        }
-    }
-    (cu, max_seqlen)
-}
-
 // ── Window-index + cu_window_seqlens ───────────────────────────────
 //
 // Mirrors Python `Qwen2_5_VisionTransformer.get_window_index_thw`.
@@ -616,11 +503,12 @@ fn build_cu_seqlens_i32(grid_thw: &[(u32, u32, u32)]) -> (Vec<i32>, usize) {
 fn build_window_index_cu_seqlens(
     grid_thw: &[(u32, u32, u32)],
     cfg: &VisionConfig,
+    extras: &VisionExtras,
 ) -> (Vec<u32>, Vec<i32>, usize) {
     let s = cfg.spatial_merge_size as usize;
     let s2 = s * s;
     let p = cfg.patch_size as usize;
-    let win_cells = (cfg.window_size as usize) / s / p;
+    let win_cells = (extras.window_size as usize) / s / p;
     debug_assert!(win_cells > 0, "window_size/S/patch_size must be > 0");
 
     let total_merged: usize = grid_thw
@@ -703,80 +591,6 @@ fn invert_permutation(perm: &[u32]) -> Vec<u32> {
     inv
 }
 
-fn f32_to_bf16(v: f32) -> u16 {
-    half::bf16::from_f32(v).to_bits()
-}
-
-fn bf16_slice_as_bytes(s: &[u16]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
-}
-
-fn i32_slice_as_bytes(s: &[i32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
-}
-
-fn u32_slice_as_bytes(s: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
-}
-
-// ── Patch flatten (CHW pixels → [L, C·T·P²] bf16) ───────────────────
-//
-// Identical to Qwen2-VL — pixel patch ordering is unchanged across the
-// VL family. Phase G factors this out once a third consumer arrives.
-
-pub fn patches_from_normalized_chw(
-    pixels: &[f32],
-    height: u32,
-    width: u32,
-    cfg: &VisionConfig,
-) -> (Vec<u16>, (u32, u32, u32)) {
-    let p = cfg.patch_size as usize;
-    let s = cfg.spatial_merge_size as usize;
-    let t = cfg.temporal_patch_size as usize;
-    let c = cfg.in_chans as usize;
-    let h = height as usize;
-    let w = width as usize;
-    assert_eq!(pixels.len(), c * h * w);
-    assert_eq!(h % (p * s), 0);
-    assert_eq!(w % (p * s), 0);
-    let grid_h = h / p;
-    let grid_w = w / p;
-    let g_h = grid_h / s;
-    let g_w = grid_w / s;
-    let grid_t: u32 = 1;
-    let l = (grid_t as usize) * grid_h * grid_w;
-    let feat = c * t * p * p;
-    let mut out = vec![0u16; l * feat];
-    let mut out_idx = 0usize;
-    let stride_c = h * w;
-    let stride_h = w;
-    for gh in 0..g_h {
-        for gw in 0..g_w {
-            for mh in 0..s {
-                for mw in 0..s {
-                    for ci in 0..c {
-                        for _ti in 0..t {
-                            let img_h_base = gh * (s * p) + mh * p;
-                            let img_w_base = gw * (s * p) + mw * p;
-                            for ph in 0..p {
-                                let img_h = img_h_base + ph;
-                                let row = ci * stride_c + img_h * stride_h + img_w_base;
-                                for pw in 0..p {
-                                    let v = pixels[row + pw];
-                                    out[out_idx] = f32_to_bf16(v);
-                                    out_idx += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    debug_assert_eq!(out_idx, l * feat);
-    (out, (grid_t, grid_h as u32, grid_w as u32))
-}
-
 // ── MultimodalForward impl ─────────────────────────────────────────
 
 impl MultimodalForward for VisionWeights {
@@ -796,7 +610,7 @@ impl MultimodalForward for VisionWeights {
         let mut grid_thw: Vec<(u32, u32, u32)> = Vec::with_capacity(pixel_batches.len());
         for img in pixel_batches {
             let (mut patch_rows, gthw) =
-                patches_from_normalized_chw(img.pixels, img.height, img.width, cfg);
+                cfg.patches_from_normalized_chw(img.pixels, img.height, img.width);
             all_patches.append(&mut patch_rows);
             grid_thw.push(gthw);
         }
@@ -932,16 +746,18 @@ fn try_load_mm_qwen2_5_vl(
         embed_dim,
         depth,
         num_heads: NUM_HEADS,
-        intermediate_size,
         patch_size,
         temporal_patch_size,
         spatial_merge_size,
         in_chans,
         d_model,
         norm_eps: NORM_EPS,
+    };
+    let extras = VisionExtras {
+        intermediate_size,
         window_size: WINDOW_SIZE,
     };
-    let vw = VisionWeights::load(gw, config, stream)?;
+    let vw = VisionWeights::load(gw, config, extras, stream)?;
     Ok(Some(Box::new(vw) as Box<dyn MultimodalForward>))
 }
 

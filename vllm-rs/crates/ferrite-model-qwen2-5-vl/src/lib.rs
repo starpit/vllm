@@ -22,8 +22,10 @@
 //! - tokens are gather-permuted into window order on entry (and unpermuted
 //!   after the merger) so window/full layers share the same flat tensor.
 //!
-//! Patch-flatten (pixels → `[L, C·T·P²]`) is identical, so [`vision::patches_from_normalized_chw`]
-//! re-uses the qwen2-vl ordering.
+//! Host-side glue (rope cos/sin tables, varlen `cu_seqlens`, pixel patch
+//! flatten, K-pad-to-multiple-of-8, trace dump) lives in the shared
+//! `ferrite-vision` crate and is methods-on / re-exports of
+//! `ferrite_vision::VisionConfig`.
 
 #[cfg(feature = "cuda")]
 pub mod vision;

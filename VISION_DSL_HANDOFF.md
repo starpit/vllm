@@ -7,7 +7,7 @@
 
 ## Phases
 
-**G.1 — `ferrite-vision` host-glue crate.** Extract from `ferrite-model-qwen2-vl` and `ferrite-model-qwen2-5-vl`: `build_cu_seqlens_i32`, `build_rope_cos_sin_bf16` (parameterized over rope-table layout), `patches_from_normalized_chw`, `pad_linear_k_to_mult8` for the Q2.5-VL cuBLAS K=3420 trick, `TraceDump`. Mechanical extraction; no DSL changes. Both VL crates depend on it.
+**G.1 — `ferrite-vision` host-glue crate. (DONE.)** Lifted from both VL crates: `VisionConfig` (common geometric fields) with `build_rope_cos_sin_bf16` + `patches_from_normalized_chw` as methods, plus free-fn `build_cu_seqlens_i32`, `pad_linear_k_to_mult8` (Q2.5-VL cuBLAS K=3420 fix), `TraceDump`, byte-slice helpers. Both VL crates re-export `pub use ferrite_vision::VisionConfig` and now carry only their arch-specific extras (Qwen2.5-VL: `VisionExtras { intermediate_size, window_size }`). Behavior-preserving — no DSL changes.
 
 **G.2 — New OpKinds in `ferrite-forward-macro`.** Add to the `OpKind` enum (`classified.rs:67`): `VarlenAttention`, `VisionRope`, `QuickGelu`, `GeluErf`. Existing `Gelu` stays tanh-form (its current consumers are the SwiGLU-adjacent fusion patterns). Each new variant gets a shape signature in `shape.rs` and `from_name` arm. Gate behind a codegen unit test before any consumer wiring.
 
@@ -37,7 +37,7 @@
 
 ## Where to start
 
-G.1 first — mechanical extraction, unblocks G.5/G.6 cleanup pass, no design risk. Then G.2 + G.3 in parallel; G.4 follows. G.5 is the integration test for the whole stack — every preceding phase converges there.
+G.1 done. Next: G.2 + G.3 in parallel; G.4 follows. G.5 is the integration test for the whole stack — every preceding phase converges there.
 
 ## Verification at every phase
 

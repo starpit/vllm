@@ -7,13 +7,14 @@ description = "Ferrite Qwen2.5-VL vision tower (text decoder is shared via ferri
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
-nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-vision/cuda"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-vision/nccl"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-forward = { path = "../ferrite-forward" }
+ferrite-vision = { path = "../ferrite-vision" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 half = { workspace = true }

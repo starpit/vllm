@@ -63,3 +63,43 @@ changed to primitives — single-line edit, not an arch arm).
 210/210 macro tests pass; ferrite-models + vllm-cli release build
 clean. The Impl is dormant until Phase 5 lands the
 `ferrite-model-qwen3-next` crate that emits `gdn_attention(...)`.
+
+Committed: `e617bdfb1`.
+
+## 2026-05-04 — Phase 3 partial-RoPE: already covered
+
+Read of `ferrite-kernels/src/rotary.rs:524-607` shows
+`RotaryCache::new_partial_from_stream` ships partial-rotary
+support (kernel passes non-rotary tail through unchanged), and
+`ferrite-forward-macro/src/codegen.rs:2155-2350` already routes to
+the partial constructor when `partial_rotary_factor` is in the
+model config. So Phase 3's partial-RoPE half is **free** — Qwen3-Next
+gets it just by advertising `partial_rotary_factor=0.25` from the
+new arch's `model.json`. No code change needed.
+
+## 2026-05-04 — Phase 3 output gate: design decision
+
+`attn_output_gate=True` doubles the Q-projection output and applies
+`attn * sigmoid(gate)` before `o_proj`. This is true math, not a
+fusion — `feedback_opkind_is_math_not_fusion` says new math gets
+its own OpKind. Decomposing into `split` + `sigmoid` + `mul` would
+require new DSL primitives that no other arch needs.
+
+Plan: introduce `OpKind::GatedAttention` paralleling `MlaAttention`
+(single tile wrapping multiple kernel calls). Inputs:
+`(q_gate, k, v, positions, rotary, kv_cache[layer], block_table)`
+where `q_gate: [T, 2 * num_heads * head_dim]`. The Impl extracts
+q/gate, applies q_norm/k_norm + partial RoPE, runs flash-attention,
+sigmoid-gate-multiplies the output, and returns `[T, num_heads * head_dim]`
+ready for `o_proj`. Same structural template as
+`GdnAttentionRefImpl` from Phase 1+2.
+
+## 2026-05-04 — Phase 4: SharedFusedMoeRefImpl fence landed
+
+Single-line refinement of the Tier-1 Qwen-MoE Impl's `applies_to`:
+adds `&& !b.contains_key("linear_num_value_heads")` to the
+exclusion list, plus a comment block explaining the
+Qwen3-Next-distinctive bound. 210/210 macro tests pass;
+ferrite-models clean (Qwen3-MoE configs unaffected — none ship
+that bound). The fence is dormant until Phase 5 introduces a
+Qwen3-Next config that would otherwise collide.

@@ -16576,10 +16576,19 @@ impl Implementation for SharedFusedMoeRefImpl {
         // shared-expert checkpoints; both share the same weight
         // naming and routing kernel, so a single Impl gate on
         // `num_experts` covers them.
+        //
+        // Qwen3-Next ALSO ships `num_experts` and a Qwen3-MoE-shaped
+        // routed/shared expert block, so without an extra fence this
+        // Impl would claim Qwen3-Next's `OpKind::Moe` tiles too. The
+        // exclusion on `linear_num_value_heads` keeps Qwen3-Next on
+        // its dedicated path; nothing else in the registry advertises
+        // that bound, so non-Qwen3-Next Qwen-MoE checkpoints continue
+        // to match here unchanged.
         let b = &ctx.model.bounds;
         b.contains_key("num_experts")
             && !b.contains_key("num_local_experts")
             && !b.contains_key("n_routed_experts")
+            && !b.contains_key("linear_num_value_heads")
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {

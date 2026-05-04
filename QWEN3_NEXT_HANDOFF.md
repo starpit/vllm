@@ -103,3 +103,25 @@ Qwen3-Next-distinctive bound. 210/210 macro tests pass;
 ferrite-models clean (Qwen3-MoE configs unaffected — none ship
 that bound). The fence is dormant until Phase 5 introduces a
 Qwen3-Next config that would otherwise collide.
+
+Committed: `fbda91186`.
+
+## 2026-05-04 — Phase 3 complete
+
+Wholesale: new `ferrite-kernels::layers_attn_gated` module with
+`Qwen3NextGatedAttentionLayer::{load, forward}` (port of
+`Qwen3NextFullAttention` — fused QKV + q/gate split + per-head Gemma
+RMSNorm + Q-only partial RoPE + paged-cache KV write + FA2 with
+on-the-fly K rotation + sigmoid output gate + `o_proj`).
+`OpKind::GatedAttention` (parser/classify/shape sig),
+`Instruction::GatedAttention(in, out, layer, weight_fn, cos_sin_fn)`
+with eval threading `ForwardCtx` runtime args plus the model-wide
+rotary cache through to the layer's forward; `info.rs` arm;
+`FieldLoad::GatedAttention` planner reading
+`num_attention_heads` / `num_key_value_heads` / `head_dim` /
+`rms_norm_eps` / `attn_output_gate` from `model.json`; emit
+arms for `unindexed_let` and `layered_load_body`;
+`GatedAttentionRefImpl` singleton (gates on `linear_num_value_heads`);
+`NON_GEMM_NAMES` += `gated_attention_ref`. 210/210 macro tests pass;
+ferrite-models build clean. Dormant until Phase 5 emits
+`gated_attention(...)` from the Qwen3-Next DSL.

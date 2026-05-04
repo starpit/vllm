@@ -36,6 +36,7 @@ use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
+use ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer;
 use ferrite_kernels::layers_gdn::Qwen3NextGdnLayer;
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
@@ -269,6 +270,21 @@ pub enum Instruction<W> {
     /// bundle for one layer. Per-request recurrent state is read
     /// from `ForwardCtx::gdn_state` + `gdn_state_indices`.
     GdnAttention(u32, u32, u32, WtFn<W, Qwen3NextGdnLayer>),
+    /// Qwen3-Next full attention with output gating + partial RoPE.
+    /// Carries `(in_slot, out_slot, layer, weight_fn, cos_sin_fn)`.
+    /// The per-layer accessor resolves the qkv_proj / o_proj / q_norm /
+    /// k_norm bundle; `cos_sin_fn` resolves the model-wide rotary
+    /// cache (whose `dim(1)` is the partial `rotary_dim`). The eval
+    /// performs the doubled-Q split, per-head Q/K RMSNorm, Q-only
+    /// rotation, paged-cache write, FA2, sigmoid output gate, and
+    /// `o_proj`.
+    GatedAttention(
+        u32,
+        u32,
+        u32,
+        WtFn<W, Qwen3NextGatedAttentionLayer>,
+        CosSinFn<W>,
+    ),
     CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassGemmSplitK(
         u32,
@@ -1566,6 +1582,27 @@ impl<W: CanonicalParams> Instruction<W> {
                     state_indices,
                     ctx.fwd.cu_seqlens_q,
                     num_seqs,
+                    ctx.device,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GatedAttention(in_slot, out_slot, layer, weight_fn, cos_sin_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let out = w.forward(
+                    v,
+                    ctx.fwd.positions,
+                    ctx.fwd.slot_mapping,
+                    ctx.fwd.cu_seqlens_q,
+                    ctx.fwd.seqused_k,
+                    ctx.fwd.block_table,
+                    ctx.fwd.max_seqlen_q,
+                    ctx.fwd.max_seqlen_k,
+                    ctx.fwd.kv_cache,
+                    layer as usize,
+                    cos_sin,
                     ctx.device,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));

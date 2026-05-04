@@ -413,6 +413,7 @@ pub fn apply_signature(
         // re-unifies and agrees.
         OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
         OpKind::GdnAttention => sig_gdn_attention(solver, inputs),
+        OpKind::GatedAttention => sig_gated_attention(solver, inputs),
     }
 }
 
@@ -663,6 +664,18 @@ fn sig_gdn_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Sh
     })
 }
 
+/// `gated_attention(x: [T, H], attn[layer])` → `[T, H]`. The
+/// gated-attention block ends with an `o_proj` GEMM that projects
+/// back to `hidden_size`, so the output shape matches the input
+/// `[T, H]`. The second arg is a `Qwen3NextGatedAttentionLayer`
+/// struct (not a tensor) — its shape is empty.
+fn sig_gated_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GatedAttention, inputs, 2)?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
 /// Elementwise unary ops (silu, gelu, …) preserve shape.
 fn sig_unary_elementwise(
     _solver: &mut Solver,
@@ -761,6 +774,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // Same as Moe — `gdn[layer]` is a `Qwen3NextGdnLayer`
         // struct, not a tensor.
         OpKind::GdnAttention => &[],
+        // Same as Moe — `attn[layer]` is a
+        // `Qwen3NextGatedAttentionLayer` struct, not a tensor.
+        OpKind::GatedAttention => &[],
     }
 }
 

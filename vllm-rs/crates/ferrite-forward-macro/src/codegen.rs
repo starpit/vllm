@@ -224,6 +224,18 @@ enum FieldLoad {
         rms_norm_eps: f32,
         gdn_layer_idx: usize,
     },
+    /// Qwen3-Next full-attention layer with output gating + partial
+    /// RoPE. Calls `Qwen3NextGatedAttentionLayer::load`. Per-layer
+    /// numerics are baked at codegen time so the loader takes only
+    /// `(gw, prefix, …, stream)`.
+    GatedAttention {
+        prefix: String,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rms_norm_eps: f32,
+        attn_output_gate: bool,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -392,6 +404,9 @@ fn plan_field_load(
     let is_gdn_attention = ty.ends_with("::Qwen3NextGdnLayer")
         || ty == "Qwen3NextGdnLayer"
         || ty.ends_with("layers_gdn::Qwen3NextGdnLayer");
+    let is_gated_attention = ty.ends_with("::Qwen3NextGatedAttentionLayer")
+        || ty == "Qwen3NextGatedAttentionLayer"
+        || ty.ends_with("layers_attn_gated::Qwen3NextGatedAttentionLayer");
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
@@ -792,6 +807,45 @@ fn plan_field_load(
             moe_intermediate_size,
             shared_expert_intermediate_size,
             hidden_size,
+        };
+    }
+
+    if is_gated_attention {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "Qwen3NextGatedAttentionLayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let read_usize = |key: &str, default: u64| -> usize {
+            v.get(key)
+                .and_then(|x| x.as_u64())
+                .unwrap_or_else(|| model.bounds.get(key).copied().unwrap_or(default))
+                as usize
+        };
+        let num_q_heads = read_usize("num_attention_heads", 16);
+        let num_kv_heads = read_usize("num_key_value_heads", 2);
+        let head_dim = read_usize("head_dim", 256);
+        let rms_norm_eps = v
+            .get("rms_norm_eps")
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or_else(|| model.scalars.get("rms_norm_eps").copied().unwrap_or(1e-6) as f32);
+        let attn_output_gate = v
+            .get("attn_output_gate")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        return FieldLoad::GatedAttention {
+            prefix,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rms_norm_eps,
+            attn_output_gate,
         };
     }
 
@@ -3211,6 +3265,32 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::GatedAttention {
+            prefix,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rms_norm_eps,
+            attn_output_gate,
+        } => {
+            let num_q_heads = *num_q_heads;
+            let num_kv_heads = *num_kv_heads;
+            let head_dim = *head_dim;
+            let rms_norm_eps = *rms_norm_eps;
+            let attn_output_gate = *attn_output_gate;
+            quote! {
+                let #name = ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer::load(
+                    gw,
+                    #prefix,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    #rms_norm_eps,
+                    #attn_output_gate,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -3715,6 +3795,41 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #conv_kernel_size,
                             #rms_norm_eps,
                             layer as usize,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        // Qwen3-Next's `attn[layer]` accessor is also sparse (hybrid),
+        // routed through `emit_unindexed_let`; this arm covers the
+        // hypothetical all-full-attention contiguous case.
+        FieldLoad::GatedAttention {
+            prefix,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rms_norm_eps,
+            attn_output_gate,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let num_q_heads = *num_q_heads;
+            let num_kv_heads = *num_kv_heads;
+            let head_dim = *head_dim;
+            let rms_norm_eps = *rms_norm_eps;
+            let attn_output_gate = *attn_output_gate;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        let _ = layer;
+                        ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer::load(
+                            gw,
+                            &#p,
+                            #num_q_heads,
+                            #num_kv_heads,
+                            #head_dim,
+                            #rms_norm_eps,
+                            #attn_output_gate,
                             stream,
                         )
                     })

@@ -30,6 +30,8 @@ pub mod kv_cache;
 #[cfg(feature = "cuda")]
 pub mod layers;
 #[cfg(feature = "cuda")]
+pub mod layers_attn_gated;
+#[cfg(feature = "cuda")]
 pub mod layers_gdn;
 #[cfg(feature = "cuda")]
 pub mod layers_moe;
@@ -47,6 +49,8 @@ pub use layers::{
     Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
+#[cfg(feature = "cuda")]
+pub use layers_attn_gated::Qwen3NextGatedAttentionLayer;
 #[cfg(feature = "cuda")]
 pub use layers_gdn::{GdnStatePool, Qwen3NextGdnLayer};
 #[cfg(feature = "cuda")]

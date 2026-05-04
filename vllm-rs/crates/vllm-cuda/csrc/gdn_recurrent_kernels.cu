@@ -133,7 +133,11 @@ __global__ void fused_recurrent_gdn_fwd_kernel(
     }
 }
 
-// RMSNormGated: out = rms_norm(x) * weight * sigmoid(z)
+// RMSNormGated: out = rms_norm(x) * weight * silu(z)  where silu(z) = z * sigmoid(z).
+// Mirrors `Qwen3NextRMSNormGated.forward` in HF transformers'
+// `modeling_qwen3_next.py` — the `* z` factor is load-bearing; using
+// `sigmoid(z)` alone caps the gate at [0, 1] and collapses the GDN
+// output to ~1e-5 magnitude (Phase 6c regression).
 // x, z: [total_rows, head_v_dim] where total_rows = num_tokens * num_v_heads
 // One block per row.
 __global__ void rms_norm_gated_kernel(
@@ -184,8 +188,8 @@ __global__ void rms_norm_gated_kernel(
     for (int i = threadIdx.x; i < head_v_dim; i += blockDim.x) {
         float normed = x_row[i] * rms * weight[i];
         float z_val = z_row[i];
-        float sig = 1.0f / (1.0f + expf(-z_val));
-        o_row[i] = normed * sig;
+        float silu = z_val / (1.0f + expf(-z_val));
+        o_row[i] = normed * silu;
     }
 }
 

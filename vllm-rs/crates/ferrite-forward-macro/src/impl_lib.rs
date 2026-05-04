@@ -2176,6 +2176,17 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(FusedMoeRefImpl));
     lib.push(Box::new(SharedFusedMoeRefImpl));
 
+    // ── Vision-tower ops (Phase G.4) ─────────────────────────────
+    // One Impl per vision OpKind from G.2. Pairs with the
+    // `OpKind::from_name` arms added in G.4 so `varlen_attention(...)`
+    // / `vision_rope(...)` / `quick_gelu(...)` / `gelu_erf(...)` parse
+    // ⟺ codegen stays total. Unreachable until `#[vision_forward]`
+    // bodies land in G.5+.
+    lib.push(Box::new(VarlenAttentionImpl));
+    lib.push(Box::new(VisionRopeImpl));
+    lib.push(Box::new(QuickGeluImpl));
+    lib.push(Box::new(GeluErfImpl));
+
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
     // (`flashinfer/attention/persistent.cuh:641`) hit at tp>1 with
@@ -17252,6 +17263,458 @@ impl Implementation for MmEmbedSpliceImpl {
         Some(vec![OpInstance::new(
             syn::Ident::new("SpliceMmEmbeds", proc_macro2::Span::call_site()),
             vec![quote! { #slot_idx }],
+        )])
+    }
+}
+
+// ── Vision-tower Impls (Phase G.4) ───────────────────────────────
+//
+// Singleton matchers for the four vision OpKinds added in G.2
+// (`VarlenAttention`, `VisionRope`, `QuickGelu`, `GeluErf`). Each
+// claims one tile, calls one existing kernel, and emits one
+// `Instruction` row. No fusion peers yet — each is the only Impl
+// for its OpKind, so the DP solver has a deterministic claim.
+//
+// All four are unreachable until a `#[vision_forward]` body lands
+// (G.5+); registering them now keeps `OpKind::from_name`'s vision
+// arms total (parse ⟺ codegen) per the handoff bar.
+
+#[derive(Debug, Default)]
+pub struct VarlenAttentionImpl;
+
+impl Implementation for VarlenAttentionImpl {
+    fn name(&self) -> &'static str {
+        "varlen_attention"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::VarlenAttention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same analytic shape as text-side prefill attention. The
+        // calibrated FA2 CSV is text-shape-keyed today; vision
+        // workloads need their own sweep before peer Impls compete on
+        // cost (see `feedback_calibrate_before_new_impl`). Until then
+        // the analytic estimate is the best we have.
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    // ── Host-interpreter codegen ────────────────────────────────
+    //
+    // Variant `VarlenAttention { q_slot, k_slot, v_slot, out_slot }`.
+    // cu_seqlens / max_seqlen flow through `ForwardCtx::cu_seqlens_q`
+    // / `max_seqlen_q` (vision_forward populates with vision-batch
+    // values before invoking the interpreter). Scale, head count, and
+    // q_size are baked in `W::VISION_*` consts.
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "VarlenAttention",
+            vec![
+                ("q_slot", syn::parse_quote!(u32)),
+                ("k_slot", syn::parse_quote!(u32)),
+                ("v_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => {
+                    panic!("VarlenAttention: input {idx} must be a Tile (got {other:?})")
+                }
+            }
+        };
+        let (q_id, q_in) = resolve(0);
+        let (k_id, k_in) = resolve(1);
+        let (v_id, v_in) = resolve(2);
+        let q_slot = slots.of(q_id, q_in);
+        let k_slot = slots.of(k_id, k_in);
+        let v_slot = slots.of(v_id, v_in);
+        let out_slot = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("VarlenAttention", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #q_slot },
+                quote! { #k_slot },
+                quote! { #v_slot },
+                quote! { #out_slot },
+            ],
+        )])
+    }
+}
+
+// ── VisionRopeImpl ───────────────────────────────────────────────
+//
+// Singleton on `OpKind::VisionRope`. Claims the 2-output pair-
+// rotation tile `(q', k') = vision_rope(q, k, cos, sin)` and emits
+// two `vision_rope_apply` calls (one for q, one for k) wrapped in
+// a single `Instruction::VisionRope` row. Both outputs are
+// take-owned-and-reinsert (in-place mutation pattern, same as
+// `TanhSoftCap`); the DSL's q' / k' bind to the same OwnedTensors
+// as q / k.
+
+#[derive(Debug, Default)]
+pub struct VisionRopeImpl;
+
+impl Implementation for VisionRopeImpl {
+    fn name(&self) -> &'static str {
+        "vision_rope"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::VisionRope)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: read + write q + k once each, plus cos/sin
+        // (small). Use the elementwise estimator over the q/k inputs
+        // — same shape as `Add` cost.
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        // The kernel mutates q and k in place; the eval body
+        // take_owned's both upstream tile-outputs and reinserts
+        // them at q_out_slot / k_out_slot. Codegen drop-pass must
+        // not schedule a Free for either upstream.
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut consumed = Vec::with_capacity(2);
+        for idx in 0..2 {
+            if let Some(FufInput::Tile { id, slot }) = node.inputs.get(idx) {
+                consumed.push((*id, *slot));
+            }
+        }
+        consumed
+    }
+
+    // ── Host-interpreter codegen ────────────────────────────────
+    //
+    // Variant `VisionRope { q_slot, k_slot, q_out_slot, k_out_slot }`.
+    // cos / sin flow through `ForwardCtx::vision_rope_cos` /
+    // `vision_rope_sin` (populated by `vision_forward` per call).
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "VisionRope",
+            vec![
+                ("q_slot", syn::parse_quote!(u32)),
+                ("k_slot", syn::parse_quote!(u32)),
+                ("q_out_slot", syn::parse_quote!(u32)),
+                ("k_out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => panic!("VisionRope: input {idx} must be a Tile (got {other:?})"),
+            }
+        };
+        let (q_id, q_in) = resolve(0);
+        let (k_id, k_in) = resolve(1);
+        let q_slot = slots.of(q_id, q_in);
+        let k_slot = slots.of(k_id, k_in);
+        let q_out_slot = slots.of(tile, 0);
+        let k_out_slot = slots.of(tile, 1);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("VisionRope", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #q_slot },
+                quote! { #k_slot },
+                quote! { #q_out_slot },
+                quote! { #k_out_slot },
+            ],
+        )])
+    }
+}
+
+// ── QuickGeluImpl ────────────────────────────────────────────────
+//
+// Singleton on `OpKind::QuickGelu`. Mirror of `TanhSoftCapImpl`'s
+// take-owned + in-place mutate + reinsert pattern. The kernel
+// `quick_gelu_inplace` mutates the buffer; the OwnedTensor moves
+// from `in_slot` to `out_slot`.
+
+#[derive(Debug, Default)]
+pub struct QuickGeluImpl;
+
+impl Implementation for QuickGeluImpl {
+    fn name(&self) -> &'static str {
+        "quick_gelu_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::QuickGelu)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("quick_gelu input is a tile");
+        vec![src]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "QuickGelu",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("QuickGelu: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("QuickGelu", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
+        )])
+    }
+}
+
+// ── GeluErfImpl ──────────────────────────────────────────────────
+//
+// Mirror of `QuickGeluImpl` — same shape, different kernel
+// (`gelu_erf_inplace`). Distinct OpKind because the numerics differ:
+// quick_gelu uses the 1.702-sigmoid approximation, gelu_erf uses
+// the exact erf form. Vision/CLIP-class arches calibrate weights
+// for one or the other; mismatching is silently wrong.
+
+#[derive(Debug, Default)]
+pub struct GeluErfImpl;
+
+impl Implementation for GeluErfImpl {
+    fn name(&self) -> &'static str {
+        "gelu_erf_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GeluErf)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("gelu_erf input is a tile");
+        vec![src]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GeluErf",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GeluErf: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GeluErf", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
         )])
     }
 }

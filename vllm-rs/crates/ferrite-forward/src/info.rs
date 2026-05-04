@@ -437,6 +437,30 @@ impl<W> Instruction<W> {
                     F::ConstBool(interleaved),
                 ],
             ),
+            Instruction::VarlenAttention(q_slot, k_slot, v_slot, out_slot) => (
+                "VarlenAttention",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(k_slot),
+                    F::Slot(v_slot),
+                    F::Slot(out_slot),
+                ],
+            ),
+            Instruction::VisionRope(q_slot, k_slot, q_out_slot, k_out_slot) => (
+                "VisionRope",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(k_slot),
+                    F::Slot(q_out_slot),
+                    F::Slot(k_out_slot),
+                ],
+            ),
+            Instruction::QuickGelu(in_slot, out_slot) => {
+                ("QuickGelu", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
+            Instruction::GeluErf(in_slot, out_slot) => {
+                ("GeluErf", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
             Instruction::FlashInferAttentionDecode(
                 in_slot,
                 out_slot,

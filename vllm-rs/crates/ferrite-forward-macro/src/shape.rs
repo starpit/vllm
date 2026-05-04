@@ -2108,4 +2108,20 @@ mod tests {
         assert_ne!(OpKind::Gelu, OpKind::GeluErf);
         assert_ne!(OpKind::QuickGelu, OpKind::GeluErf);
     }
+
+    #[test]
+    fn vision_op_names_resolve_via_from_name() {
+        // G.4 gate: every name `OpKind::as_str` returns must round-
+        // trip through `from_name`, otherwise classify rejects DSL
+        // bodies that wrote the op (parse-then-reject violation).
+        // Locks in the four arms added in G.4 lockstep with the
+        // existing matchers in `impl_lib::starter_library`.
+        assert_eq!(
+            OpKind::from_name("varlen_attention"),
+            Some(OpKind::VarlenAttention)
+        );
+        assert_eq!(OpKind::from_name("vision_rope"), Some(OpKind::VisionRope));
+        assert_eq!(OpKind::from_name("quick_gelu"), Some(OpKind::QuickGelu));
+        assert_eq!(OpKind::from_name("gelu_erf"), Some(OpKind::GeluErf));
+    }
 }

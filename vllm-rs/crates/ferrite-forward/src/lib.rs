@@ -236,6 +236,17 @@ mod ctx {
         /// `embed_patches` is empty.
         pub mm_embeds: Option<TensorView<'a>>,
         pub embed_patches: &'a [EmbedPatch],
+        /// Vision-tower 2D RoPE cos table, shape `[total_L, head_dim/2]`,
+        /// bf16. Built host-side from `grid_thw` per vision-encoder call;
+        /// the caller (`vision_forward`) uploads it and sets the field
+        /// before invoking the vision interpreter. `None` for text-side
+        /// forward calls — the `Instruction::VisionRope` arm panics on
+        /// `expect` if reached without these set, mirroring the
+        /// `tp_group` contract for `Instruction::AllReduce` at tp>1.
+        pub vision_rope_cos: Option<TensorView<'a>>,
+        /// Vision-tower 2D RoPE sin table. Same shape / population /
+        /// invariants as [`Self::vision_rope_cos`].
+        pub vision_rope_sin: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when

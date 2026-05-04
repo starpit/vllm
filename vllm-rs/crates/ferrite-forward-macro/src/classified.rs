@@ -314,6 +314,19 @@ impl OpKind {
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
+            // Vision-tower ops. Unambiguous names: the four below are
+            // unused on the decoder side, so the lookup is shared with
+            // the decoder prelude — a `#[forward]` body that wrote
+            // `varlen_attention(...)` would parse but get rejected by
+            // the decoder-side externs (cu_seqlens / max_seqlen are
+            // only resolvable under `Prelude::Vision`). Pairs with the
+            // shape signatures in `shape::sig_varlen_attention`,
+            // `sig_vision_rope`, and `sig_unary_elementwise` (the two
+            // GELU variants).
+            "varlen_attention" => Some(Self::VarlenAttention),
+            "vision_rope" => Some(Self::VisionRope),
+            "quick_gelu" => Some(Self::QuickGelu),
+            "gelu_erf" => Some(Self::GeluErf),
             "silu" => Some(Self::Silu),
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),

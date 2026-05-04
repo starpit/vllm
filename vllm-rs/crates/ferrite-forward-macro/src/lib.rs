@@ -365,6 +365,18 @@ struct CompileMode {
     /// True for `#[forward]` (which fans out over `{1, 2, 4, 8}` at
     /// nccl-enabled), false for `#[vision_forward]` (always tp=1).
     enable_tp_fanout: bool,
+    /// True for `#[forward]`, false for `#[vision_forward]`. Gates
+    /// emission of the arch-level dispatcher (`enum Weights`,
+    /// `FerriteArchRegistration` inventory submission, per-variant
+    /// HF-bounds accessors). Vision encoders reach their compiled
+    /// `Weights` via the hand-written `FerriteMmRegistration` in
+    /// each VL crate's `vision.rs`; HF `architectures` strings like
+    /// `Qwen2VLForConditionalGeneration` are claimed by the text-side
+    /// `qwen2` arch, not the vision encoder. Skipping here also
+    /// avoids the `collect_dispatch_bounds` panic — vision configs
+    /// don't carry `num_hidden_layers` / `hidden_size` /
+    /// `num_attention_heads` / `vocab_size`.
+    emit_arch_dispatch: bool,
 }
 
 impl CompileMode {
@@ -373,12 +385,14 @@ impl CompileMode {
         apply_tp_lowering: true,
         apply_mm_splice: true,
         enable_tp_fanout: true,
+        emit_arch_dispatch: true,
     };
     const VISION: Self = Self {
         prelude: classified::Prelude::Vision,
         apply_tp_lowering: false,
         apply_mm_splice: false,
         enable_tp_fanout: false,
+        emit_arch_dispatch: false,
     };
 }
 
@@ -1003,12 +1017,19 @@ fn compile_common(
             }
         });
 
-        arch_dispatch_arms.push(DispatchArm {
-            model_ident: model_mod,
-            source_stem: sm.model.source_stem.clone(),
-            bounds: collect_dispatch_bounds(sm.model),
-            tp_world_size: sm.tp_world_size,
-        });
+        // Decoder fan-in to the arch-level dispatcher. Vision
+        // encoders skip — see `CompileMode::emit_arch_dispatch`.
+        // `collect_dispatch_bounds` panics on configs lacking the
+        // decoder-only `DISPATCH_FIELDS` (vision configs carry
+        // `vision_*` keys instead), so the call itself is gated.
+        if mode.emit_arch_dispatch {
+            arch_dispatch_arms.push(DispatchArm {
+                model_ident: model_mod,
+                source_stem: sm.model.source_stem.clone(),
+                bounds: collect_dispatch_bounds(sm.model),
+                tp_world_size: sm.tp_world_size,
+            });
+        }
     }
 
     // Union of HF `architectures: [..]` strings across every compiled
@@ -1027,14 +1048,27 @@ fn compile_common(
     hf_arches.sort();
     hf_arches.dedup();
 
-    let arch_ident = Ident::new(&arch_name, carrier.sig.ident.span());
-    let arch_dispatch_ts = emit_arch_dispatcher(
-        &arch_ident,
-        &hf_arches,
-        &arch_dispatch_arms,
-        &models_dir,
-        carrier.sig.ident.span(),
-    )?;
+    // Vision encoders intentionally skip the arch-dispatcher emission
+    // (no `enum Weights`, no `FerriteArchRegistration` inventory). The
+    // hand-written `FerriteMmRegistration` in each VL crate's
+    // `vision.rs` claims its HF arch string and constructs the
+    // multimodal forward over the macro-emitted per-variant
+    // `Weights` types directly. `arch_dispatch_arms` is empty under
+    // VISION mode, so this is also covered by `emit_arch_dispatcher`'s
+    // empty-arms early-return — but the explicit skip here makes the
+    // intent visible at the call site.
+    let arch_dispatch_ts = if mode.emit_arch_dispatch {
+        let arch_ident = Ident::new(&arch_name, carrier.sig.ident.span());
+        emit_arch_dispatcher(
+            &arch_ident,
+            &hf_arches,
+            &arch_dispatch_arms,
+            &models_dir,
+            carrier.sig.ident.span(),
+        )?
+    } else {
+        proc_macro2::TokenStream::new()
+    };
 
     // Emit items INLINE at the carrier's scope (no wrapping mod).
     // The carrier fn itself is consumed — it was only a host for

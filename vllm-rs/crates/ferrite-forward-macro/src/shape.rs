@@ -821,13 +821,16 @@ fn sig_gdn_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Sh
     })
 }
 
-/// `gated_attention(x: [T, H], attn[layer])` → `[T, H]`. The
-/// gated-attention block ends with an `o_proj` GEMM that projects
-/// back to `hidden_size`, so the output shape matches the input
-/// `[T, H]`. The second arg is a `Qwen3NextGatedAttentionLayer`
-/// struct (not a tensor) — its shape is empty.
+/// `gated_attention(x, attn[layer], positions, rotary, kv_cache[layer], block_table)`
+/// → `[T, H]`. The gated-attention block ends with an `o_proj` GEMM
+/// that projects back to `hidden_size`, so the output shape matches
+/// the input `[T, H]`. The trailing four args are opaque externs
+/// (positions, rotary, kv_cache, block_table) with empty shapes —
+/// they don't constrain the inferred output, but they DO appear as
+/// `FufInput::Extern` rows on the resulting node so the codegen
+/// recognises this op consumes the rotary cache and the paged KV pool.
 fn sig_gated_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::GatedAttention, inputs, 2)?;
+    expect_args(OpKind::GatedAttention, inputs, 6)?;
     Ok(OpSig {
         output: inputs[0].clone(),
     })

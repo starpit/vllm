@@ -125,3 +125,42 @@ arms for `unindexed_let` and `layered_load_body`;
 `NON_GEMM_NAMES` += `gated_attention_ref`. 210/210 macro tests pass;
 ferrite-models build clean. Dormant until Phase 5 emits
 `gated_attention(...)` from the Qwen3-Next DSL.
+
+Committed: `c30b1f37d`.
+
+## 2026-05-04 — Phase 4 fence reverted in Phase 5
+
+Phase 4's `linear_num_value_heads` exclusion in
+`SharedFusedMoeRefImpl::applies_to` turned out to be too eager: when
+the Phase 5 arch crate landed it caused a "no Impl matched tile … op
+Moe" error on Qwen3-Next configs because the dedicated peer Impl the
+fence was anticipating doesn't exist (the plan deferred it as
+"likely unnecessary — math is identical"). Math IS identical, so the
+right answer per the plan is to let `SharedFusedMoeRefImpl` claim
+Qwen3-Next MoE tiles too. The exclusion is removed in the Phase 5
+commit; the comment block stays, recasting the rationale ("Qwen3-Next
+reuses the same MoE math, attention is fenced separately").
+
+## 2026-05-04 — Phase 5 complete
+
+New `ferrite-model-qwen3-next` crate with:
+- DSL body: hybrid
+  `if layer % full_attn_period == full_attn_remainder { gated_attention(...) } else { gdn_attention(...) }`,
+  then standard `moe_block(normed2, mlp[layer])` for every layer.
+- `gated_attention` DSL form takes
+  `(x, attn[layer], positions, rotary, kv_cache[layer], block_table)`
+  so the FUF carries `ExternKind::Rotary` + `ExternKind::KvCache` +
+  `ExternKind::BlockTable` and the codegen plants the `rotary` field
+  on `Weights`. (Initial 2-arg form caused the codegen to omit the
+  rotary cache; fixed by widening the shape signature to 6 args.)
+- `configs/qwen3-next-4-layer.json` (smoke: 3 GDN + 1 gated layer) →
+  27 tiles · 19 waves.
+- `configs/qwen3-next-80b-a3b-instruct.json` → 291 tiles · 194 waves.
+- Workspace + `ferrite-models` registration with `arch-qwen3-next`
+  feature; included in `all-arches`.
+
+210/210 macro tests pass; ferrite-models + vllm-cli release builds
+clean. Compile-verified, NOT inference-verified — the executor
+still needs a `Qwen3NextForCausalLM → Ferrite` arm in
+`cuda_worker.rs` and per-request `ForwardCtx::{gdn_state,
+gdn_state_indices}` wiring before Phase 6 can run a real prompt.

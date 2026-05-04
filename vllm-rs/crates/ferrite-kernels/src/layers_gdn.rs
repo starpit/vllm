@@ -24,6 +24,7 @@ use ferrite_cuda_core::alloc::OwnedTensor;
 use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::driver;
 use ferrite_cuda_core::dtype::DType;
+use ferrite_cuda_core::dump;
 use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 use ferrite_cuda_core::weights::GpuWeights;
 
@@ -339,6 +340,18 @@ impl Qwen3NextGdnLayer {
         let ba = self
             .in_proj_ba
             .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        dump::dump_tile(
+            "gdn.in_proj_qkvz",
+            self.gdn_layer_idx as u32,
+            &qkvz.as_gpu_tensor(),
+            stream,
+        );
+        dump::dump_tile(
+            "gdn.in_proj_ba",
+            self.gdn_layer_idx as u32,
+            &ba.as_gpu_tensor(),
+            stream,
+        );
 
         // 2. QKVZ + BA fan-out (also produces mixed = Q||K||V for conv1d).
         let (_q_split, _k_split, _v_split, z_owned, a_owned, b_owned, mixed_owned) =
@@ -363,6 +376,15 @@ impl Qwen3NextGdnLayer {
         let a_gpu = *a_owned.view();
         let b_gpu = *b_owned.view();
         let z_gpu = *z_owned.view();
+        dump::dump_tile("gdn.split.z", self.gdn_layer_idx as u32, &z_gpu, stream);
+        dump::dump_tile("gdn.split.a", self.gdn_layer_idx as u32, &a_gpu, stream);
+        dump::dump_tile("gdn.split.b", self.gdn_layer_idx as u32, &b_gpu, stream);
+        dump::dump_tile(
+            "gdn.split.mixed_qkv",
+            self.gdn_layer_idx as u32,
+            &mixed_qkv,
+            stream,
+        );
 
         // Per-layer index adjustment for the shared state pool.
         let num_gdn_layers = state_pool.num_gdn_layers;
@@ -442,6 +464,13 @@ impl Qwen3NextGdnLayer {
             }
         }
 
+        dump::dump_tile(
+            "gdn.conv_out",
+            self.gdn_layer_idx as u32,
+            &conv_out.view(),
+            stream,
+        );
+
         // 4. Conv-output split into post-conv Q, K, V.
         let (q_owned, k_owned, v_owned) = kernels::gdn_conv_split(
             *conv_out.view(),
@@ -461,6 +490,9 @@ impl Qwen3NextGdnLayer {
         let q_gpu = *q_owned.view();
         let k_gpu = *k_owned.view();
         let v_gpu = *v_owned.view();
+        dump::dump_tile("gdn.post_conv.q", self.gdn_layer_idx as u32, &q_gpu, stream);
+        dump::dump_tile("gdn.post_conv.k", self.gdn_layer_idx as u32, &k_gpu, stream);
+        dump::dump_tile("gdn.post_conv.v", self.gdn_layer_idx as u32, &v_gpu, stream);
 
         // 5. Fused gating → (g, beta).
         let g_gpu = device
@@ -478,6 +510,18 @@ impl Qwen3NextGdnLayer {
             self.dt_bias,
             self.num_v_heads,
             num_tokens,
+            stream,
+        );
+        dump::dump_tile(
+            "gdn.gating.g",
+            self.gdn_layer_idx as u32,
+            &g_gpu.view(),
+            stream,
+        );
+        dump::dump_tile(
+            "gdn.gating.beta",
+            self.gdn_layer_idx as u32,
+            &beta_gpu.view(),
             stream,
         );
 
@@ -506,6 +550,12 @@ impl Qwen3NextGdnLayer {
             self.head_v_dim,
             stream,
         );
+        dump::dump_tile(
+            "gdn.recurrent.o",
+            self.gdn_layer_idx as u32,
+            &o_gpu.view(),
+            stream,
+        );
         drop(g_gpu);
         drop(beta_gpu);
 
@@ -524,6 +574,12 @@ impl Qwen3NextGdnLayer {
             self.norm_eps,
             self.head_v_dim,
             total_rows,
+            stream,
+        );
+        dump::dump_tile(
+            "gdn.normed",
+            self.gdn_layer_idx as u32,
+            &normed.view(),
             stream,
         );
         drop(o_gpu);

@@ -2186,6 +2186,11 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(VisionRopeImpl));
     lib.push(Box::new(QuickGeluImpl));
     lib.push(Box::new(GeluErfImpl));
+    // Pixels materialization (Phase G.5.e.1). Synthesized by
+    // `vision_lowering::materialize_pixels` after `fuf::unroll`
+    // under `Prelude::Vision`; the Impl runs only when that pass
+    // produced a tile. Decoder bodies never see this OpKind.
+    lib.push(Box::new(LoadPixelsImpl));
 
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
@@ -17278,6 +17283,102 @@ impl Implementation for MmEmbedSpliceImpl {
 // All four are unreachable until a `#[vision_forward]` body lands
 // (G.5+); registering them now keeps `OpKind::from_name`'s vision
 // arms total (parse ⟺ codegen) per the handoff bar.
+
+// ── LoadPixelsImpl (Phase G.5.e.1) ───────────────────────────────
+//
+// Singleton claiming `OpKind::LoadPixels` — synthesized by the
+// `vision_lowering::materialize_pixels` pass between `fuf::unroll`
+// and the solver. No FUF inputs, no weight inputs: the runtime tile
+// is built from `ctx.fwd.pixels` (the view the vision-side host
+// wrapper writes onto `ForwardCtx` before invoking the interpreter,
+// mirroring how text-side `Embed` reads `ctx.input_ids`). Emits a
+// single `Instruction::LoadPixels { out_slot }` row.
+//
+// This is the vision-side analog of `EmbedRefImpl`: both publish a
+// tile from an ambient `ForwardCtx` field rather than a tile
+// dataflow. The text path packs the read into `Embed` directly
+// (which also has a weight input — embed_tokens); the vision path
+// has no weight to anchor on, so the materialization needs its own
+// OpKind + Impl.
+
+#[derive(Debug, Default)]
+pub struct LoadPixelsImpl;
+
+impl Implementation for LoadPixelsImpl {
+    fn name(&self) -> &'static str {
+        "load_pixels"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::LoadPixels || !node.inputs.is_empty() {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: Vec::new(),
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        // Pure host-side metadata wrap of `ctx.fwd.pixels` — no
+        // device work and no alternative covering, so the DP
+        // tiebreaker value doesn't affect routing. Same zero-cost
+        // story as `MmEmbedSpliceImpl`.
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("LoadPixels", vec![("out_slot", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        _fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let out_slot = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("LoadPixels", proc_macro2::Span::call_site()),
+            vec![quote! { #out_slot }],
+        )])
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct VarlenAttentionImpl;

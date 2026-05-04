@@ -299,6 +299,25 @@ pub enum OpKind {
     /// keyed on the rust_type fingerprint of the `moe[layer]` weight
     /// accessor. Shape-preserving.
     Moe,
+    /// Vision-prelude pixels materialization. Synthesized by
+    /// `vision_lowering::materialize_pixels` between `fuf::unroll`
+    /// and the solver: takes zero FUF inputs and produces a single
+    /// rank-2 output `[num_tokens, vision_in_features]` whose runtime
+    /// value is `ctx.fwd.pixels` wrapped into a tile.
+    ///
+    /// Mirrors the role `EmbedRefImpl` plays for `input_ids` on the
+    /// decoder side: every downstream vision Impl
+    /// (`VarlenAttention` / `VisionRope` / `QuickGelu` / `GeluErf`)
+    /// reads its first input as `FufInput::Tile { id, slot }`, so the
+    /// extern → tile transition has to happen exactly once,
+    /// up-front, rather than being hand-unrolled into every per-Impl
+    /// `fan_out`.
+    ///
+    /// No DSL surface — `from_name` deliberately omits it. The
+    /// lowering pass writes `outputs[0]` directly (same pattern as
+    /// `AllGather` and `MmEmbedSplice`), so `apply_signature` rejects
+    /// this OpKind.
+    LoadPixels,
 }
 
 impl OpKind {
@@ -377,6 +396,9 @@ impl OpKind {
             // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
             // doc-comment. No DSL surface.
             Self::MmEmbedSplice => "mm_embed_splice",
+            // Vision lowering-pass-only op kind — see
+            // `OpKind::LoadPixels` doc-comment. No DSL surface.
+            Self::LoadPixels => "load_pixels",
         }
     }
 }

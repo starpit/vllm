@@ -423,6 +423,7 @@ impl CudaModel {
                     embed_patches,
                     vision_rope_cos: None,
                     vision_rope_sin: None,
+                    pixels: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -627,6 +628,7 @@ impl CudaModel {
                     embed_patches,
                     vision_rope_cos: None,
                     vision_rope_sin: None,
+                    pixels: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };

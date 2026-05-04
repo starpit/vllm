@@ -247,6 +247,25 @@ mod ctx {
         /// Vision-tower 2D RoPE sin table. Same shape / population /
         /// invariants as [`Self::vision_rope_cos`].
         pub vision_rope_sin: Option<TensorView<'a>>,
+        /// Vision-tower input patches buffer, shape `[num_tokens,
+        /// vision_in_features]`, bf16. The vision encoder's
+        /// `vision_forward` host wrapper packs per-image CHW pixels
+        /// into this rank-2 layout (one row per patch, channels-times-
+        /// patch-area columns), uploads it, and sets the field before
+        /// invoking the vision interpreter. `None` for text-side
+        /// forward calls — `Instruction::LoadPixels` panics on
+        /// `expect` if reached without it set, mirroring the
+        /// [`Self::vision_rope_cos`] contract.
+        ///
+        /// Synthesized by `vision_lowering::materialize_pixels` after
+        /// `fuf::unroll`: every vision-prelude `pixels` extern in the
+        /// DSL classifies into a `FufInput::Extern` and is rewritten
+        /// to a `FufInput::Tile` whose producer is a single
+        /// `OpKind::LoadPixels` node; that node's runtime
+        /// counterpart copies this view into a tile-table OwnedTensor
+        /// the rest of the encoder consumes. See
+        /// [`crate::Instruction::LoadPixels`] for the eval body.
+        pub pixels: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when

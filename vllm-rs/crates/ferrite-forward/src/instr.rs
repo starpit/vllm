@@ -255,6 +255,25 @@ pub enum Instruction<W> {
     /// elementwise mutation, take-owned + kernel + reinsert. Same
     /// shape as `TanhSoftCap` / `ScalarMul` consume-pattern.
     QuickGelu(u32, u32),
+    /// Materialize the vision-prelude `pixels` extern as a tile:
+    /// `(out_slot)`. Reads `ctx.fwd.pixels` (the rank-2
+    /// `[num_tokens, vision_in_features]` view the
+    /// `vision_forward` host wrapper writes onto `ForwardCtx`
+    /// before invoking the vision interpreter), allocates a fresh
+    /// `OwnedTensor` of the same shape/dtype, D2D-copies the
+    /// pixels view into it, and publishes the result at `out_slot`.
+    ///
+    /// The copy is what lets the consume-pattern vision Impls
+    /// (`QuickGelu` / `GeluErf` / `VisionRope`) downstream of
+    /// `pixels` read it as a tile-table `Owned` entry — `take_owned`
+    /// requires `Owned`, and a borrowed `External` wrapper around
+    /// `ctx.fwd.pixels` would panic on the first such consumer.
+    /// In G.5.f's real encoder body the first op on pixels is a
+    /// non-consuming `gemm` (`patch_embed`), so the copy is paid
+    /// once per encoder invocation regardless. Synthesized
+    /// exclusively by `vision_lowering::materialize_pixels` —
+    /// never appears in any DSL.
+    LoadPixels(u32),
     /// Erf-form GELU activation: same shape as `QuickGelu`. Distinct
     /// numerics (`0.5 * x * (1 + erf(x / sqrt(2)))`).
     GeluErf(u32, u32),
@@ -1290,6 +1309,26 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
+            Instruction::LoadPixels(out_slot) => unsafe {
+                let view = ctx.fwd.pixels.expect(
+                    "Instruction::LoadPixels invoked without ForwardCtx::pixels — \
+                     caller (vision_forward host wrapper) must populate this view \
+                     before driving the vision interpreter, mirroring the \
+                     vision_rope_cos / vision_rope_sin contract",
+                );
+                let raw = view.as_raw();
+                let shape: Vec<usize> = raw.shape().iter().map(|&d| d as usize).collect();
+                let owned = ctx.device.caching.alloc_tensor(&shape, raw.dtype());
+                let bytes = raw.size_bytes();
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*owned).raw_ptr(),
+                    raw.raw_ptr(),
+                    bytes,
+                    ctx.device.compute_stream,
+                )
+                .expect("LoadPixels D2D copy");
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            },
             Instruction::FlashInferAttentionDecode(
                 in_slot,
                 out_slot,

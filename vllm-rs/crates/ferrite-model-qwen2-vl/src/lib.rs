@@ -17,3 +17,12 @@
 
 #[cfg(feature = "cuda")]
 pub mod vision;
+
+// Stub `#[vision_forward]` body closing G.5.e — see
+// `dsl_body.rs` for the full story. Compiles to a per-(model,
+// workload) bucket of generated kernels under
+// `ferrite_models::qwen2_vl::*`; not yet consumed by the
+// imperative `vision::VisionWeights::vision_forward` (G.5.f
+// rewrites that wrapper to call into the generated body).
+#[cfg(feature = "cuda")]
+pub mod dsl_body;

@@ -45,6 +45,7 @@ mod shape;
 mod solver;
 mod target;
 mod tp_lowering;
+mod vision_lowering;
 mod viz_dump;
 mod weights_manifest;
 
@@ -722,6 +723,16 @@ fn compile_common(
             if mode.apply_mm_splice {
                 tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
             }
+            // Vision-prelude `pixels` extern → tile materialization
+            // (G.5.e.1). Synthesizes a single `OpKind::LoadPixels`
+            // node and rewrites every downstream `FufInput::Extern`
+            // referencing pixels to read its slot 0. No-op when the
+            // body has no pixels reference. Vision-only — decoder
+            // bodies have no `Pixels` extern (the prelude split
+            // makes the two extern sets disjoint).
+            if mode.prelude == classified::Prelude::Vision {
+                vision_lowering::materialize_pixels(&mut model_fuf);
+            }
 
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
@@ -826,6 +837,11 @@ fn compile_common(
                 // `scalar_mul_inplace` / `tanh_softcap_inplace` lines.
                 "quick_gelu_inplace",
                 "gelu_erf_inplace",
+                // Vision-prelude pixels materialization (G.5.e.1).
+                // Synthesized by `vision_lowering::materialize_pixels`;
+                // emits a single D2D copy that wraps `ctx.fwd.pixels`
+                // into a tile-table OwnedTensor. Not a compute kernel.
+                "load_pixels",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =

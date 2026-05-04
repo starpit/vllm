@@ -461,6 +461,7 @@ impl<W> Instruction<W> {
             Instruction::GeluErf(in_slot, out_slot) => {
                 ("GeluErf", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
+            Instruction::LoadPixels(out_slot) => ("LoadPixels", vec![F::Slot(out_slot)]),
             Instruction::FlashInferAttentionDecode(
                 in_slot,
                 out_slot,

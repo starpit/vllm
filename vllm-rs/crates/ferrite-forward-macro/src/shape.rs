@@ -423,6 +423,20 @@ pub fn apply_signature(
         // this arm via `apply_signature` is fine: sig_unary_elementwise
         // re-unifies and agrees.
         OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
+        // LoadPixels has no FUF inputs (the runtime tile is built
+        // from `ctx.fwd.pixels`). The materialize_pixels pass writes
+        // `outputs[0] = extern_shape(ExternKind::Pixels)` directly
+        // when inserting the node; the FUF-level shape unifier never
+        // re-derives it. Reaching this arm is a compiler bug — same
+        // story as `AllGather` and `Reshape`.
+        OpKind::LoadPixels => Err(ShapeError::BadArgs {
+            op: OpKind::LoadPixels,
+            reason: "apply_signature should not be called on LoadPixels; \
+                     the vision_lowering::materialize_pixels pass sets \
+                     FufNode.outputs[0] to extern_shape(Pixels) directly \
+                     when inserting the node post-FUF-build"
+                .into(),
+        }),
     }
 }
 
@@ -783,6 +797,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Moe => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
         OpKind::MmEmbedSplice => &[],
+        // LoadPixels has zero FUF inputs (the tile is materialized
+        // from `ctx.fwd.pixels` at runtime), so no weight-arg ranks.
+        OpKind::LoadPixels => &[],
     }
 }
 
@@ -2268,5 +2285,37 @@ mod tests {
         // numerically evaluate the inferred shapes.
         assert_eq!(bounds.get("vision_in_features"), Some(&1176));
         assert_eq!(bounds.get("vision_rope_half_dim"), Some(&40));
+    }
+
+    #[test]
+    fn load_pixels_is_lowering_only_op_kind() {
+        // G.5.e.1 contract: `LoadPixels` is produced exclusively by
+        // the `vision_lowering::materialize_pixels` pass between
+        // `fuf::unroll` and the solver. It must NOT be reachable via
+        // `from_name` (no parse-then-reject — a user that wrote
+        // `load_pixels(...)` in a `#[vision_forward]` body classifies
+        // as an unknown op rather than an OpKind that any consumer is
+        // unprepared for), and `apply_signature` must error out on it
+        // (mirrors `AllGather` / `Reshape` — the materialize pass
+        // writes `outputs[0]` directly when constructing the node).
+        assert_eq!(OpKind::LoadPixels.as_str(), "load_pixels");
+        assert_eq!(OpKind::from_name("load_pixels"), None);
+        assert_eq!(weight_arg_ranks(OpKind::LoadPixels), &[]);
+
+        let mut solver = Solver::new();
+        let err = apply_signature(&mut solver, OpKind::LoadPixels, &[]);
+        match err {
+            Err(ShapeError::BadArgs { op, reason }) => {
+                assert_eq!(op, OpKind::LoadPixels);
+                assert!(
+                    reason.contains("materialize_pixels"),
+                    "reason must point at the lowering pass, got: {reason}",
+                );
+            }
+            Err(other) => {
+                panic!("LoadPixels apply_signature must return BadArgs, got error: {other:?}")
+            }
+            Ok(_) => panic!("LoadPixels apply_signature must error, not succeed"),
+        }
     }
 }

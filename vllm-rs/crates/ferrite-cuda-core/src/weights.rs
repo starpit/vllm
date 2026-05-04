@@ -996,6 +996,13 @@ impl GpuWeights {
 
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
+            // The cast destination (`maybe_cast_cpu`) is a SHARED pinned
+            // buffer (`self.cast_pinned`) that the next slow-path take()
+            // will overwrite. Sync the stream before returning so the
+            // next call's cast doesn't race the in-flight H2D from this
+            // call. (The fast path already syncs after H2D so it can
+            // free the per-tensor pinned buffer.)
+            driver::stream_synchronize(self.stream)?;
         }
 
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
@@ -1031,7 +1038,10 @@ impl GpuWeights {
             return Ok(size);
         }
 
-        // Slow path.
+        // Slow path. Same shared-cast-buffer race as `take()` —
+        // sync before returning so the next slow-path take() doesn't
+        // overwrite `self.cast_pinned` while this H2D is still reading
+        // from it.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         let used_shared_pinned = data == self.cast_pinned.0 as *const u8;

@@ -207,6 +207,23 @@ enum FieldLoad {
         shared_expert_intermediate_size: usize,
         hidden_size: usize,
     },
+    /// Qwen3-Next GDN linear-attention layer. Calls
+    /// `Qwen3NextGdnLayer::load`. The variant carries everything
+    /// the loader needs baked at codegen time: the per-layer
+    /// `prefix` (e.g. `model.layers.5.linear_attn`), the head /
+    /// dimension counts, the conv1d kernel size, the layer-norm
+    /// epsilon, and the precomputed `gdn_layer_idx` (count of
+    /// `linear_attention` entries in `layer_types[..L]`).
+    GdnAttention {
+        prefix: String,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_kernel_size: usize,
+        rms_norm_eps: f32,
+        gdn_layer_idx: usize,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -372,6 +389,9 @@ fn plan_field_load(
     let is_shared_fused_moe = ty.ends_with("::SharedFusedMoELayer")
         || ty == "SharedFusedMoELayer"
         || ty.ends_with("layers_moe::SharedFusedMoELayer");
+    let is_gdn_attention = ty.ends_with("::Qwen3NextGdnLayer")
+        || ty == "Qwen3NextGdnLayer"
+        || ty.ends_with("layers_gdn::Qwen3NextGdnLayer");
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
@@ -772,6 +792,71 @@ fn plan_field_load(
             moe_intermediate_size,
             shared_expert_intermediate_size,
             hidden_size,
+        };
+    }
+
+    if is_gdn_attention {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "Qwen3NextGdnLayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        // Per-layer numerics — read from config.json with model.bounds
+        // fallback (same dual-source pattern as the SharedFusedMoe arm).
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let read_usize = |key: &str, default: u64| -> usize {
+            v.get(key)
+                .and_then(|x| x.as_u64())
+                .unwrap_or_else(|| model.bounds.get(key).copied().unwrap_or(default))
+                as usize
+        };
+        let num_k_heads = read_usize("linear_num_key_heads", 16);
+        let num_v_heads = read_usize("linear_num_value_heads", 32);
+        let head_k_dim = read_usize("linear_key_head_dim", 128);
+        let head_v_dim = read_usize("linear_value_head_dim", 128);
+        let conv_kernel_size = read_usize("linear_conv_kernel_dim", 4);
+        let rms_norm_eps = v
+            .get("rms_norm_eps")
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or_else(|| model.scalars.get("rms_norm_eps").copied().unwrap_or(1e-6) as f32);
+        // `gdn_layer_idx` is the count of `linear_attention` entries
+        // in `layer_types[..L]`, where L is this accessor's transformer
+        // layer index. The hand-written `Qwen3NextGdnLayer::forward`
+        // uses it to address into the shared `GdnStatePool`.
+        let layer_idx = accessor
+            .source_weights
+            .first()
+            .and_then(|(_, idx)| *idx)
+            .unwrap_or(0) as usize;
+        let gdn_layer_idx: usize = v
+            .get("layer_types")
+            .and_then(|lt| lt.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .take(layer_idx)
+                    .filter(|t| t.as_str() == Some("linear_attention"))
+                    .count()
+            })
+            // Fallback when the canonical config doesn't ship `layer_types`
+            // explicitly: the default Qwen3-Next pattern is `linear_attention`
+            // at every layer where `(i + 1) % 4 != 0` (i.e. 3 out of every 4).
+            // Counting linear-attention layers in `[..layer_idx]` under that
+            // pattern is `layer_idx - layer_idx / 4`.
+            .unwrap_or(layer_idx - layer_idx / 4);
+        return FieldLoad::GdnAttention {
+            prefix,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_size,
+            rms_norm_eps,
+            gdn_layer_idx,
         };
     }
 
@@ -3094,6 +3179,38 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::GdnAttention {
+            prefix,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_size,
+            rms_norm_eps,
+            gdn_layer_idx,
+        } => {
+            let num_k_heads = *num_k_heads;
+            let num_v_heads = *num_v_heads;
+            let head_k_dim = *head_k_dim;
+            let head_v_dim = *head_v_dim;
+            let conv_kernel_size = *conv_kernel_size;
+            let rms_norm_eps = *rms_norm_eps;
+            let gdn_layer_idx = *gdn_layer_idx;
+            quote! {
+                let #name = ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load(
+                    gw,
+                    #prefix,
+                    #num_k_heads,
+                    #num_v_heads,
+                    #head_k_dim,
+                    #head_v_dim,
+                    #conv_kernel_size,
+                    #rms_norm_eps,
+                    #gdn_layer_idx,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -3554,6 +3671,50 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #moe_intermediate_size,
                             #shared_expert_intermediate_size,
                             #hidden_size,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        // Qwen3-Next is hybrid (every 4th layer is full-attention),
+        // so the `gdn[layer]` accessor lands as `LayeredSparse` and
+        // routes through [`emit_unindexed_let`] per-entry, not this
+        // helper. The arm exists for `match` totality; if a future
+        // arch declares an all-`linear_attention` config, hitting
+        // this path emits a Vec where the per-iteration load reuses
+        // the layer index as the GDN-layer index (since every layer
+        // is GDN, the two coincide).
+        FieldLoad::GdnAttention {
+            prefix,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_size,
+            rms_norm_eps,
+            gdn_layer_idx: _,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let num_k_heads = *num_k_heads;
+            let num_v_heads = *num_v_heads;
+            let head_k_dim = *head_k_dim;
+            let head_v_dim = *head_v_dim;
+            let conv_kernel_size = *conv_kernel_size;
+            let rms_norm_eps = *rms_norm_eps;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load(
+                            gw,
+                            &#p,
+                            #num_k_heads,
+                            #num_v_heads,
+                            #head_k_dim,
+                            #head_v_dim,
+                            #conv_kernel_size,
+                            #rms_norm_eps,
+                            layer as usize,
                             stream,
                         )
                     })

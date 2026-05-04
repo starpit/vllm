@@ -36,6 +36,7 @@ use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
+use ferrite_kernels::layers_gdn::Qwen3NextGdnLayer;
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
     SharedFusedMoELayer,
@@ -261,6 +262,13 @@ pub enum Instruction<W> {
     /// `FusedMoe` (with `renormalize=true`); the shared expert is a
     /// SwiGLU MLP gated by `sigmoid(shared_expert_gate(x))`.
     SharedFusedMoe(u32, u32, u32, WtFn<W, SharedFusedMoELayer>),
+    /// Qwen3-Next Gated Delta Net linear-attention layer. Carries
+    /// `(in_slot, out_slot, layer, weight_fn)` — the per-layer
+    /// `Qwen3NextGdnLayer` accessor resolves the in_proj_qkvz /
+    /// in_proj_ba / conv1d / dt_bias / A_log / norm / out_proj
+    /// bundle for one layer. Per-request recurrent state is read
+    /// from `ForwardCtx::gdn_state` + `gdn_state_indices`.
+    GdnAttention(u32, u32, u32, WtFn<W, Qwen3NextGdnLayer>),
     CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     CutlassGemmSplitK(
         u32,
@@ -1532,6 +1540,34 @@ impl<W: CanonicalParams> Instruction<W> {
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
                 let out = w.forward(v, ctx.device);
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GdnAttention(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                // The pool + per-request slot table are wired in by
+                // the worker; we cannot fabricate them locally and
+                // still get correct recurrence.
+                let pool = ctx
+                    .fwd
+                    .gdn_state
+                    .expect("GdnAttention: ForwardCtx::gdn_state must be Some for hybrid arches");
+                let state_indices = ctx.fwd.gdn_state_indices.expect(
+                    "GdnAttention: ForwardCtx::gdn_state_indices must be Some for hybrid arches",
+                );
+                // `cu_seqlens_q` is `[num_seqs + 1] i32`; the GDN
+                // forward needs the sequence count and the same
+                // boundary tensor.
+                let num_seqs = (*ctx.fwd.cu_seqlens_q).dim(0).saturating_sub(1);
+                let out = w.forward(
+                    v,
+                    pool,
+                    state_indices,
+                    ctx.fwd.cu_seqlens_q,
+                    num_seqs,
+                    ctx.device,
+                );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::CutlassGemm(

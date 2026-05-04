@@ -166,128 +166,46 @@ impl Qwen3NextConfig {
 // ---------------------------------------------------------------------------
 // GDN recurrent state (GPU-resident)
 // ---------------------------------------------------------------------------
+//
+// The struct + low-level methods now live in
+// `ferrite_kernels::layers_gdn::GdnStatePool`. Re-exported here so
+// existing call sites (this file, `cuda_worker.rs`) keep their
+// `vllm_cuda::model::qwen3_next::GdnStatePool` import path. The
+// config-aware constructor is the small `make_gdn_state_pool` helper
+// below; the canonical primitive constructor is
+// `GdnStatePool::new(num_slots, num_gdn_layers, conv_dim, …)`.
+pub use ferrite_kernels::layers_gdn::GdnStatePool;
 
-/// GPU-resident GDN state pool for all requests across all GDN layers.
+/// Construct a [`GdnStatePool`] sized from a [`Qwen3NextConfig`].
 ///
-/// Layout:
-/// - `conv_states`: `[num_slots, num_gdn_layers, conv_dim, kernel_size - 1]` (f32)
-/// - `ssm_states`:  `[num_slots, num_gdn_layers, num_v_heads, head_v_dim, head_k_dim]` (f32)
+/// Counts GDN layers as the number of `linear_attention` entries
+/// in `layer_types`, then forwards to
+/// [`GdnStatePool::new`](ferrite_kernels::layers_gdn::GdnStatePool::new).
 ///
-/// Slots are indexed by request. When a request completes, its slot is freed.
-pub struct GdnStatePool {
-    /// `[num_slots * num_gdn_layers, conv_dim, kernel_size - 1]` (f32 on GPU).
-    pub conv_states: GpuTensor,
-    /// `[num_slots * num_gdn_layers, num_v_heads, head_v_dim, head_k_dim]` (f32 on GPU).
-    pub ssm_states: GpuTensor,
-    pub num_slots: usize,
-    pub num_gdn_layers: usize,
-    pub conv_dim: usize,
-    pub kernel_size: usize,
-    pub num_v_heads: usize,
-    pub head_v_dim: usize,
-    pub head_k_dim: usize,
-}
-
-impl GdnStatePool {
-    /// Allocate the state pool on GPU. All states are zero-initialized.
-    pub unsafe fn new(
-        config: &Qwen3NextConfig,
-        num_slots: usize,
-        stream: cudarc::driver::sys::CUstream,
-    ) -> Result<Self> {
-        let num_gdn_layers = config
-            .layer_types
-            .iter()
-            .filter(|t| t.as_str() == "linear_attention")
-            .count();
-        let conv_dim = config.conv_dim();
-        let kernel_size = config.linear_conv_kernel_dim;
-        let state_len = kernel_size - 1;
-        let num_v_heads = config.linear_num_value_heads;
-        let head_v_dim = config.linear_value_head_dim;
-        let head_k_dim = config.linear_key_head_dim;
-
-        let conv_elems = num_slots * num_gdn_layers * conv_dim * state_len;
-        let ssm_elems = num_slots * num_gdn_layers * num_v_heads * head_v_dim * head_k_dim;
-
-        let conv_bytes = conv_elems * 4; // f32
-        let ssm_bytes = ssm_elems * 4;
-
-        let conv_ptr = crate::driver::mem_alloc(conv_bytes)?;
-        let ssm_ptr = crate::driver::mem_alloc(ssm_bytes)?;
-
-        // Zero-initialize
-        crate::driver::memset_d8(conv_ptr, 0, conv_bytes, stream)?;
-        crate::driver::memset_d8(ssm_ptr, 0, ssm_bytes, stream)?;
-
-        let conv_states = GpuTensor::new(
-            conv_ptr,
-            &[num_slots * num_gdn_layers, conv_dim, state_len],
-            DType::F32,
-        );
-        let ssm_states = GpuTensor::new(
-            ssm_ptr,
-            &[
-                num_slots * num_gdn_layers,
-                num_v_heads * head_v_dim,
-                head_k_dim,
-            ],
-            DType::F32,
-        );
-
-        Ok(Self {
-            conv_states,
-            ssm_states,
-            num_slots,
-            num_gdn_layers,
-            conv_dim,
-            kernel_size,
-            num_v_heads,
-            head_v_dim,
-            head_k_dim,
-        })
-    }
-
-    /// Get the conv_state sub-tensor for a given GDN layer.
-    /// Returns `[num_slots, conv_dim, state_len]` view.
-    pub fn conv_state_for_layer(&self, _gdn_layer_idx: usize) -> GpuTensor {
-        // Layout is [num_slots * num_gdn_layers, conv_dim, state_len].
-        // Layer `gdn_layer_idx` for slot `s` is at index `s * num_gdn_layers + gdn_layer_idx`.
-        // The kernel handles indexing via state_indices; we return the full tensor.
-        self.conv_states
-    }
-
-    /// Get the ssm_state sub-tensor for a given GDN layer.
-    pub fn ssm_state_for_layer(&self, _gdn_layer_idx: usize) -> GpuTensor {
-        self.ssm_states
-    }
-
-    /// Zero out all GDN state (conv + ssm) for a given slot.
-    /// Call this when a new sequence is assigned to the slot.
-    pub unsafe fn clear_slot(
-        &self,
-        slot_idx: usize,
-        stream: cudarc::driver::sys::CUstream,
-    ) -> Result<()> {
-        let state_len = self.kernel_size - 1;
-        let conv_bytes_per_layer = self.conv_dim * state_len * 4; // f32
-        let ssm_bytes_per_layer = self.num_v_heads * self.head_v_dim * self.head_k_dim * 4;
-
-        for layer in 0..self.num_gdn_layers {
-            let flat_idx = slot_idx * self.num_gdn_layers + layer;
-
-            // Clear conv state
-            let conv_offset = flat_idx * conv_bytes_per_layer;
-            let conv_ptr = self.conv_states.raw_ptr().add(conv_offset);
-            crate::driver::memset_d8(conv_ptr, 0, conv_bytes_per_layer, stream)?;
-
-            // Clear ssm state
-            let ssm_offset = flat_idx * ssm_bytes_per_layer;
-            let ssm_ptr = self.ssm_states.raw_ptr().add(ssm_offset);
-            crate::driver::memset_d8(ssm_ptr, 0, ssm_bytes_per_layer, stream)?;
-        }
-        Ok(())
-    }
+/// # Safety
+/// Same safety contract as the underlying constructor — `stream`
+/// must be a valid CUDA stream; the returned pool owns device
+/// allocations.
+pub unsafe fn make_gdn_state_pool(
+    config: &Qwen3NextConfig,
+    num_slots: usize,
+    stream: cudarc::driver::sys::CUstream,
+) -> Result<GdnStatePool> {
+    let num_gdn_layers = config
+        .layer_types
+        .iter()
+        .filter(|t| t.as_str() == "linear_attention")
+        .count();
+    GdnStatePool::new(
+        num_slots,
+        num_gdn_layers,
+        config.conv_dim(),
+        config.linear_conv_kernel_dim,
+        config.linear_num_value_heads,
+        config.linear_value_head_dim,
+        config.linear_key_head_dim,
+        stream,
+    )
 }
 
 // ---------------------------------------------------------------------------

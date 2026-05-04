@@ -193,6 +193,7 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
 mod ctx {
     use ferrite_cuda_core::tensor::TensorView;
     use ferrite_kernels::kv_cache::KvCachePool;
+    use ferrite_kernels::layers_gdn::GdnStatePool;
 
     use super::EmbedPatch;
 
@@ -236,6 +237,15 @@ mod ctx {
         /// `embed_patches` is empty.
         pub mm_embeds: Option<TensorView<'a>>,
         pub embed_patches: &'a [EmbedPatch],
+        // Gated Delta Net (Qwen3-Next) per-request recurrent state.
+        // `None` for every non-hybrid arch — the
+        // `Instruction::GdnAttention` arm is the only consumer, and
+        // it only fires when the DSL body uses `gdn_attention(...)`.
+        // `gdn_state_indices` is `[num_seqs] i32` — the per-request
+        // slot IDs into `gdn_state`. Both are constructed by
+        // `vllm-executor::cuda_worker` for Qwen3-Next requests.
+        pub gdn_state: Option<&'a GdnStatePool>,
+        pub gdn_state_indices: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when

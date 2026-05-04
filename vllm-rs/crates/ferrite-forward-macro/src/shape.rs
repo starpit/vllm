@@ -412,6 +412,7 @@ pub fn apply_signature(
         // this arm via `apply_signature` is fine: sig_unary_elementwise
         // re-unifies and agrees.
         OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
+        OpKind::GdnAttention => sig_gdn_attention(solver, inputs),
     }
 }
 
@@ -649,6 +650,19 @@ fn sig_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> 
     })
 }
 
+/// `gdn_attention(x: [T, H], gdn[layer])` → `[T, H]`. Shape-preserving
+/// — GDN's recurrence collapses sequence-length internally and the
+/// `out_proj` projects back to the model's hidden dim. The second
+/// arg is a `Qwen3NextGdnLayer` struct (not a tensor), so its shape
+/// is empty. State (`conv_state` / `ssm_state`) lives on
+/// `ForwardCtx::gdn_state` and never appears in the IR's input list.
+fn sig_gdn_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GdnAttention, inputs, 2)?;
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
 /// Elementwise unary ops (silu, gelu, …) preserve shape.
 fn sig_unary_elementwise(
     _solver: &mut Solver,
@@ -744,6 +758,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Moe => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
         OpKind::MmEmbedSplice => &[],
+        // Same as Moe — `gdn[layer]` is a `Qwen3NextGdnLayer`
+        // struct, not a tensor.
+        OpKind::GdnAttention => &[],
     }
 }
 

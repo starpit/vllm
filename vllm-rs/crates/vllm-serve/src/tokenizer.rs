@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use tokenizers::Tokenizer as HfTokenizer;
+use tokenizers::{AddedToken, Tokenizer as HfTokenizer};
 
 use crate::error::{ServeError, ServeResult};
 
@@ -49,6 +49,52 @@ impl Tokenizer {
             special_ids,
             eos_token_id,
         }
+    }
+
+    /// Register additional special tokens that the underlying
+    /// `tokenizer.json::added_tokens` list missed.
+    ///
+    /// HuggingFace tokenizer files split special-token configuration
+    /// across two artifacts: `tokenizer.json::added_tokens` (the
+    /// authoritative list the Rust `tokenizers` crate honors) and
+    /// `tokenizer_config.json::additional_special_tokens` (a string
+    /// list `transformers` reads at load time and merges in). Some
+    /// checkpoints — notably Qwen2-VL — register
+    /// `<|image_pad|>` / `<|video_pad|>` / `<|vision_pad|>` only in
+    /// the latter, so the chat template's `<|image_pad|>` emission
+    /// subword-splits inside the Rust loader and
+    /// `expand_image_placeholders` finds zero occurrences.
+    ///
+    /// Mirrors `transformers`' merge: tokens already present in the
+    /// vocabulary keep their existing ID and just get flagged
+    /// `special` so the pre-tokenizer respects them; tokens absent
+    /// from the vocabulary are appended (uncommon — flagged in a
+    /// debug log).
+    pub fn register_additional_special_tokens(&mut self, contents: &[String]) {
+        let added: Vec<AddedToken> = contents
+            .iter()
+            .filter(|c| {
+                // Skip entries the tokenizer already treats as
+                // special — re-adding via `add_special_tokens` would
+                // append a fresh ID and break vocabulary alignment.
+                self.inner.token_to_id(c).is_none_or(|id| {
+                    let dec = self.inner.get_added_tokens_decoder();
+                    !dec.get(&id).map(|t| t.special).unwrap_or(false)
+                })
+            })
+            .map(|c| AddedToken::from(c.clone(), true))
+            .collect();
+        if added.is_empty() {
+            return;
+        }
+        let names: Vec<&str> = added.iter().map(|t| t.content.as_str()).collect();
+        tracing::info!(
+            "Registering {} additional special tokens missing from tokenizer.json: {:?}",
+            added.len(),
+            names
+        );
+        self.inner.add_special_tokens(&added);
+        self.special_ids = Self::collect_special_ids(&self.inner);
     }
 
     /// Encode text into token IDs.

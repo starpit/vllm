@@ -1990,6 +1990,15 @@ pub fn starter_library() -> ImplementationLibrary {
     // for `OpKind::AllGather` nodes the lowering pass inserts after
     // the lm_head Gemm at tp>1.
     lib.push(Box::new(AllGatherImpl));
+    // Multimodal embed splice — the only matcher for
+    // `OpKind::MmEmbedSplice` nodes the lowering pass
+    // (`tp_lowering::insert_mm_splices`) inserts after every Embed.
+    // At tp>1 sits after the AllReduce that `insert_all_reduces`
+    // chained onto the Embed, so the D2D-overwrite runs on reduced
+    // embeddings (not pre-reduce partials). At tp=1 sits directly
+    // on the Embed output — equivalent to the pre-refactor inline
+    // splice that lived inside `Instruction::Embed::eval`.
+    lib.push(Box::new(MmEmbedSpliceImpl));
     // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
     // + RmsNorm. Claimed by the DP in preference to the 2-tile
     // FusedAddRmsNorm + standalone ScalarOffset because it's a
@@ -15729,6 +15738,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let scale = attention_scale_for(&model);
@@ -16421,6 +16431,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {
@@ -17108,6 +17119,136 @@ impl Implementation for AllGatherImpl {
         Some(vec![OpInstance::new(
             syn::Ident::new("AllGather", proc_macro2::Span::call_site()),
             vec![quote! { #in_idx }, quote! { #out_idx }],
+        )])
+    }
+}
+
+// ── MmEmbedSpliceImpl ────────────────────────────────────────────
+//
+// Single-tile in-place impl claiming an `OpKind::MmEmbedSplice` node
+// — the post-Embed multimodal splice the lowering pass
+// (`tp_lowering::insert_mm_splices`) inserts after every Embed. At
+// tp>1 the `insert_all_reduces` pass has already inserted an
+// `AllReduce` between the Embed and its consumers, so this
+// MmEmbedSplice ends up wired *after* the AllReduce — the mm_embeds
+// D2D-overwrite thus runs on the fully-reduced embedding instead of
+// on each rank's partial masked-gather (which would get summed × tp
+// on the reduce). Lowers to `Instruction::SpliceMmEmbeds(slot)`.
+//
+// Identity-shape in-place mutation; output aliases the input slot
+// (same pattern as AllReduce). Unconditionally inserted at every tp
+// including tp=1 — at tp=1 it sits directly on the Embed output and
+// reproduces the pre-refactor inline splice.
+//
+// At runtime, `Instruction::SpliceMmEmbeds::eval` short-circuits
+// when `ForwardCtx::embed_patches` is empty (text-only batches), so
+// the cost is one taken-branch check per forward pass.
+
+#[derive(Debug, Default)]
+pub struct MmEmbedSpliceImpl;
+
+impl Implementation for MmEmbedSpliceImpl {
+    fn name(&self) -> &'static str {
+        "mm_embed_splice"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // No profile gating — the splice is a D2D memcpy sequence
+        // available on every CUDA target.
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::MmEmbedSplice || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        // Cost is proportional to the projected vision-encoder output
+        // size, which is per-request and not a function of
+        // num_tokens in the way model ops are. Zero-cost for the DP —
+        // there's no alternative covering (no other Impl claims this
+        // OpKind), so the tiebreaker value doesn't affect routing.
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Output aliases the single tile input — splice mutates the
+        // input buffer directly via D2D memcpy, no separate output
+        // buffer. Same pattern as AllReduceImpl.
+        let splice_id = claimed_tiles[0];
+        let node = fuf.get(splice_id);
+        let input_src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((splice_id, 0), input_src)]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("SpliceMmEmbeds", vec![("slot", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let splice_id = m.claimed_tiles[0];
+        let node = fuf.get(splice_id);
+        let (input_id, input_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("MmEmbedSplice: input 0 must be a Tile (got {other:?})"),
+        };
+        let slot_idx = slots.of(input_id, input_slot);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("SpliceMmEmbeds", proc_macro2::Span::call_site()),
+            vec![quote! { #slot_idx }],
         )])
     }
 }

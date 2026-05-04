@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use tracing::warn;
+use vllm_common::multimodal::MultimodalData;
 use vllm_common::{BlockKind, Request, RequestStatus};
 use vllm_config::{SchedulerConfig, SchedulerPolicy, SpansConfig};
 
@@ -209,6 +210,56 @@ impl SimpleBlockTracker {
     /// in a sequence and for relocatable span blocks.
     const NONE_HASH: u64 = 0;
 
+    /// Stable per-image hash over (height, width, raw pixel bytes).
+    ///
+    /// Process-local determinism is sufficient: the prefix cache lives only
+    /// inside the engine process, and `std::hash::DefaultHasher` is SipHash
+    /// with a fixed key, so two `MultimodalData::images[i]` with identical
+    /// contents produce identical hashes within the run.
+    fn hash_image(img: &vllm_common::multimodal::ImageData) -> u64 {
+        let mut h = std::hash::DefaultHasher::new();
+        img.height.hash(&mut h);
+        img.width.hash(&mut h);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                img.pixels.as_ptr() as *const u8,
+                std::mem::size_of_val(img.pixels.as_slice()),
+            )
+        };
+        bytes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Build a per-block list of image hashes whose placeholder range
+    /// overlaps that block's token range. Returns `None` for text-only
+    /// requests so the hash is byte-identical to the pre-MM behavior.
+    fn build_mm_extras(
+        mm: Option<&MultimodalData>,
+        num_full_blocks: usize,
+        block_size: usize,
+    ) -> Option<Vec<Vec<u64>>> {
+        let mm = mm?;
+        if mm.images.is_empty() || num_full_blocks == 0 {
+            return None;
+        }
+        let mut per_block = vec![Vec::<u64>::new(); num_full_blocks];
+        for (i, ph) in mm.image_placeholders.iter().enumerate() {
+            let img = match mm.images.get(i) {
+                Some(img) => img,
+                None => continue,
+            };
+            let img_hash = Self::hash_image(img);
+            let start_blk = ph.offset / block_size;
+            let end_blk = (ph.offset + ph.length)
+                .div_ceil(block_size)
+                .min(num_full_blocks);
+            for slot in per_block.iter_mut().take(end_blk).skip(start_blk) {
+                slot.push(img_hash);
+            }
+        }
+        Some(per_block)
+    }
+
     /// Hash a block with parent-chain awareness for spans.
     ///
     /// `kind` is looked up from the request's `block_annotations` map:
@@ -217,12 +268,17 @@ impl SimpleBlockTracker {
     /// - `Some(Prefixed)`: all tokens before this block are folded into
     ///   the hash, forcing recomputation when context differs.
     /// - `None`: normal parent-chained hashing.
+    ///
+    /// `mm_extras` are image hashes whose placeholder range overlaps this
+    /// block (empty slice for text-only blocks → no hasher writes →
+    /// byte-identical to the pre-MM hash).
     fn hash_block_with_parent(
         &self,
         parent_hash: u64,
         block_tokens: &[u32],
         all_tokens_before_block: &[u32],
         kind: Option<BlockKind>,
+        mm_extras: &[u64],
     ) -> u64 {
         let effective_parent = if kind == Some(BlockKind::Relocatable) {
             if self.spans_config.debug {
@@ -247,18 +303,26 @@ impl SimpleBlockTracker {
             all_tokens_before_block.hash(&mut hasher);
         }
 
+        for k in mm_extras {
+            k.hash(&mut hasher);
+        }
+
         hasher.finish()
     }
 
     /// Compute block hashes for an entire token sequence, returning one hash
     /// per full block. When `annotations` is provided, uses span-aware
-    /// hashing for annotated blocks.
+    /// hashing for annotated blocks. When `mm` is `Some`, blocks whose token
+    /// range overlaps an image placeholder fold the corresponding image
+    /// hashes into their per-block hash so different images break the prefix.
     fn hash_all_blocks(
         &self,
         all_tokens: &[u32],
         annotations: Option<&vllm_common::BlockAnnotations>,
+        mm: Option<&MultimodalData>,
     ) -> Vec<u64> {
         let num_full_blocks = all_tokens.len() / self.block_size;
+        let mm_extras = Self::build_mm_extras(mm, num_full_blocks, self.block_size);
         let mut hashes = Vec::with_capacity(num_full_blocks);
         let mut parent_hash = Self::NONE_HASH;
         for i in 0..num_full_blocks {
@@ -267,7 +331,9 @@ impl SimpleBlockTracker {
             let block_tokens = &all_tokens[start..end];
             let tokens_before = &all_tokens[..start];
             let kind = annotations.and_then(|a| a.get(&i).copied());
-            let hash = self.hash_block_with_parent(parent_hash, block_tokens, tokens_before, kind);
+            let extras: &[u64] = mm_extras.as_ref().map(|v| v[i].as_slice()).unwrap_or(&[]);
+            let hash =
+                self.hash_block_with_parent(parent_hash, block_tokens, tokens_before, kind, extras);
             parent_hash = hash;
             hashes.push(hash);
         }
@@ -350,7 +416,8 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             if num_cached_blocks > 0 {
                 let all_tokens = &request.all_token_ids;
                 let annotations = request.block_annotations.as_ref();
-                let all_hashes = self.hash_all_blocks(all_tokens, annotations);
+                let all_hashes =
+                    self.hash_all_blocks(all_tokens, annotations, request.mm_data.as_ref());
                 let has_relocatable = annotations.is_some();
                 let mut cached_ids = Vec::new();
                 let mut hashes = Vec::new();
@@ -423,7 +490,11 @@ impl KVCacheManagerOps for SimpleBlockTracker {
 
         // Pre-compute block hashes before mutably borrowing allocations.
         let all_hashes = if self.enable_caching {
-            Some(self.hash_all_blocks(&request.all_token_ids, request.block_annotations.as_ref()))
+            Some(self.hash_all_blocks(
+                &request.all_token_ids,
+                request.block_annotations.as_ref(),
+                request.mm_data.as_ref(),
+            ))
         } else {
             None
         };
@@ -502,7 +573,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         // that allocate_slots missed (additional==0 early return).
         let all_tokens = &request.all_token_ids;
         let annotations = request.block_annotations.as_ref();
-        let all_hashes = self.hash_all_blocks(all_tokens, annotations);
+        let all_hashes = self.hash_all_blocks(all_tokens, annotations, request.mm_data.as_ref());
         let num_full_blocks = all_tokens.len() / self.block_size;
 
         let (block_ids_groups, _) = match self.allocations.get(&request.request_id) {
@@ -571,7 +642,7 @@ impl KVCacheManagerOps for SimpleBlockTracker {
 
         let all_tokens = &request.all_token_ids;
         let annotations = request.block_annotations.as_ref();
-        let hashes = self.hash_all_blocks(all_tokens, annotations);
+        let hashes = self.hash_all_blocks(all_tokens, annotations, request.mm_data.as_ref());
         let has_relocatable = annotations.is_some();
 
         if !has_relocatable {
@@ -3454,7 +3525,7 @@ mod tests {
         // at different positions produces different hashes.
         let tracker = SimpleBlockTracker::new(16, 4);
         let tokens: Vec<u32> = (0..12).collect(); // 3 full blocks of size 4
-        let hashes = tracker.hash_all_blocks(&tokens, None);
+        let hashes = tracker.hash_all_blocks(&tokens, None, None);
         assert_eq!(hashes.len(), 3);
         // Block 0 has parent NONE_HASH, so its hash includes NONE_HASH + content.
         // Block 1 chains from block 0's hash, block 2 from block 1's.
@@ -3463,7 +3534,7 @@ mod tests {
         assert_ne!(hashes[1], hashes[2]);
         assert_ne!(hashes[0], hashes[2]);
         // Same tokens, same order → same hashes.
-        let hashes2 = tracker.hash_all_blocks(&tokens, None);
+        let hashes2 = tracker.hash_all_blocks(&tokens, None, None);
         assert_eq!(hashes, hashes2);
     }
 
@@ -3481,8 +3552,8 @@ mod tests {
         let mut ann = std::collections::BTreeMap::new();
         ann.insert(1, BlockKind::Relocatable);
 
-        let hashes_a = tracker.hash_all_blocks(&seq_a, Some(&ann));
-        let hashes_b = tracker.hash_all_blocks(&seq_b, Some(&ann));
+        let hashes_a = tracker.hash_all_blocks(&seq_a, Some(&ann), None);
+        let hashes_b = tracker.hash_all_blocks(&seq_b, Some(&ann), None);
 
         // First blocks differ (different tokens).
         assert_ne!(hashes_a[0], hashes_b[0]);
@@ -3503,8 +3574,8 @@ mod tests {
         let mut ann = std::collections::BTreeMap::new();
         ann.insert(1, BlockKind::Prefixed);
 
-        let hashes_a = tracker.hash_all_blocks(&seq_a, Some(&ann));
-        let hashes_b = tracker.hash_all_blocks(&seq_b, Some(&ann));
+        let hashes_a = tracker.hash_all_blocks(&seq_a, Some(&ann), None);
+        let hashes_b = tracker.hash_all_blocks(&seq_b, Some(&ann), None);
 
         // First blocks differ.
         assert_ne!(hashes_a[0], hashes_b[0]);
@@ -3593,8 +3664,8 @@ mod tests {
         // [A, B] and [B, A] — block content is the same but order differs.
         let seq1: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
         let seq2: Vec<u32> = vec![4, 5, 6, 7, 0, 1, 2, 3];
-        let hashes1 = tracker.hash_all_blocks(&seq1, None);
-        let hashes2 = tracker.hash_all_blocks(&seq2, None);
+        let hashes1 = tracker.hash_all_blocks(&seq1, None, None);
+        let hashes2 = tracker.hash_all_blocks(&seq2, None, None);
         // Block 0 differs (different content).
         assert_ne!(hashes1[0], hashes2[0]);
         // Block 1 also differs (same content but different parent).
@@ -3965,11 +4036,11 @@ mod tests {
 
         // Inner's all_token_ids: prompt [1,2,3,4,5,6,7,8] + output [100,2,0,0]
         let inner_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 2, 0, 0];
-        let inner_hashes = tracker.hash_all_blocks(&inner_tokens, None);
+        let inner_hashes = tracker.hash_all_blocks(&inner_tokens, None, None);
 
         // Outer's prompt contains the same 12 tokens as a prefix.
         let outer_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 2, 0, 0, 200, 201, 202, 203];
-        let outer_hashes = tracker.hash_all_blocks(&outer_tokens, None);
+        let outer_hashes = tracker.hash_all_blocks(&outer_tokens, None, None);
 
         // First 3 blocks should have identical hashes.
         assert_eq!(inner_hashes.len(), 3);

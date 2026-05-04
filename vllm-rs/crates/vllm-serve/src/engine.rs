@@ -249,6 +249,11 @@ pub struct AsyncEngine {
     /// Multimodal model type for preprocessing dispatch.
     /// "siglip" (Gemma3), "qwen2_vl" (Qwen2-VL/Qwen2.5-VL), or empty.
     mm_model_type: String,
+    /// Qwen2-VL `smart_resize` clamp from `preprocessor_config.json`.
+    /// Defaults match Qwen2-VL-2B's shipped config (3136 / 12_845_056); the
+    /// init layer overrides them when the file is present.
+    mm_min_pixels: usize,
+    mm_max_pixels: usize,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
     /// Maximum time the step loop can have pending requests with no output
@@ -290,6 +295,8 @@ impl AsyncEngine {
             mm_tokens_per_image: 0,
             mm_image_size: 0,
             mm_model_type: String::new(),
+            mm_min_pixels: 3136,
+            mm_max_pixels: 12_845_056,
             is_pooling: false,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
@@ -431,6 +438,17 @@ impl AsyncEngine {
     /// e.g., "qwen2_vl" for Qwen2-VL/Qwen2.5-VL.
     pub fn set_mm_model_type(&mut self, model_type: &str) {
         self.mm_model_type = model_type.to_string();
+    }
+
+    /// Override the Qwen2-VL `smart_resize` clamp. Driven by
+    /// `preprocessor_config.json`'s `min_pixels` / `max_pixels` so the
+    /// preprocessor matches HF's `Qwen2VLImageProcessor` byte-for-byte —
+    /// the shipped Qwen2-VL-2B values (3136 / 12_845_056) are *much*
+    /// smaller than `256*28*28 / 1280*28*28` and the mismatch was forcing
+    /// 224×224 inputs up to 448×448, garbling downstream encoder output.
+    pub fn set_mm_image_processor_pixel_limits(&mut self, min_pixels: usize, max_pixels: usize) {
+        self.mm_min_pixels = min_pixels;
+        self.mm_max_pixels = max_pixels;
     }
 
     /// Get the model name.
@@ -3042,8 +3060,8 @@ impl AsyncEngine {
                                 dyn_image.height() as usize,
                                 dyn_image.width() as usize,
                                 factor,
-                                256 * 28 * 28,  // min_pixels
-                                1280 * 28 * 28, // max_pixels
+                                self.mm_min_pixels,
+                                self.mm_max_pixels,
                             );
                             vllm_model::image::preprocess_qwen2_vl(&dyn_image, target_h, target_w)
                         } else {
@@ -3059,11 +3077,29 @@ impl AsyncEngine {
             return Ok(None);
         }
 
+        // Per-image expanded placeholder count: for Qwen2-VL, the
+        // smart_resize output is variable per image (e.g. 1344×728 or
+        // 448×448 depending on aspect ratio + the min/max-pixels
+        // bracket), so the post-merger token count `(h/28)·(w/28)`
+        // varies. Fall back to the static `self.mm_tokens_per_image`
+        // for arches whose vision encoder produces a fixed count
+        // (SigLIP-class).
+        let per_image_counts: Vec<usize> = images
+            .iter()
+            .map(|img| {
+                if self.mm_model_type == "qwen2_vl" {
+                    (img.height / 28) * (img.width / 28)
+                } else {
+                    self.mm_tokens_per_image
+                }
+            })
+            .collect();
+
         // Expand image placeholders in token IDs.
-        let placeholders = vllm_model::image::expand_image_placeholders(
+        let placeholders = vllm_model::image::expand_image_placeholders_per_image(
             token_ids,
             image_token_id,
-            self.mm_tokens_per_image,
+            &per_image_counts,
         );
 
         if placeholders.len() != images.len() {

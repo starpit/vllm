@@ -571,7 +571,10 @@ fn initialize_core(
                 })
         });
 
-    let tokenizer = loaded_tokenizer.map(|tok| {
+    let tokenizer = loaded_tokenizer.map(|mut tok| {
+        if let Some(dir) = model_dir.as_ref() {
+            patch_additional_special_tokens(&mut tok, dir);
+        }
         info!("Tokenizer loaded");
         Arc::new(tok)
     });
@@ -1044,6 +1047,25 @@ pub fn initialize_stack(
         engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
         if is_qwen2_vl {
             engine.set_mm_model_type("qwen2_vl");
+            // Read `preprocessor_config.json::{min_pixels,max_pixels}` so
+            // `smart_resize` matches HF's `Qwen2VLImageProcessor` exactly.
+            // Qwen2-VL-2B ships 3136 / 12_845_056; the previous hard-coded
+            // 256·28² / 1280·28² were ~64× too large at the floor and were
+            // forcing 224×224 inputs up to 448×448 patches.
+            if let Some(dir) = core.model_dir.as_ref()
+                && let Ok(s) = std::fs::read_to_string(dir.join("preprocessor_config.json"))
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
+                && let (Some(mn), Some(mx)) = (
+                    v.get("min_pixels").and_then(|x| x.as_u64()),
+                    v.get("max_pixels").and_then(|x| x.as_u64()),
+                )
+            {
+                engine.set_mm_image_processor_pixel_limits(mn as usize, mx as usize);
+                info!(
+                    "Qwen2-VL preprocessor: min_pixels={}, max_pixels={}",
+                    mn, mx
+                );
+            }
         }
     }
 
@@ -2127,10 +2149,18 @@ fn initialize_stack_tp(
         let client: Box<dyn vllm_engine::core_client::EngineCoreClient + Send> =
             Box::new(InprocClient::new(engine_config, Box::new(executor)));
 
-        // Load tokenizer and build engine.
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok());
+        // Load tokenizer. Apply the same `additional_special_tokens`
+        // patch as the single-rank path — Qwen2-VL chat templates
+        // reference `<|image_pad|>` / `<|video_pad|>` which live on
+        // `tokenizer_config.json::additional_special_tokens` but are
+        // missing from `tokenizer.json` for some HF mirrors, so the
+        // chat renderer errors out without this patch.
+        let tokenizer = model_dir.as_ref().and_then(|dir| {
+            try_load_tokenizer(dir).ok().map(|mut tok| {
+                patch_additional_special_tokens(&mut tok, dir);
+                tok
+            })
+        });
 
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
@@ -2164,6 +2194,86 @@ fn initialize_stack_tp(
         }
         if config.runner == "pooling" {
             engine.set_is_pooling(true);
+        }
+
+        // Multimodal config — mirrors the single-rank `initialize_stack`
+        // path (same `hf_config.extra.vision_config` probe, same Qwen2-VL
+        // detection, same preprocessor-pixel-limits read). Without this
+        // block, the engine has no image_token_id / tokens_per_image /
+        // mm_model_type, so image placeholders never expand, the vision
+        // pipeline never engages, and image-bearing requests decode as
+        // text-only with the image content silently dropped.
+        if let Some(vision_config) = hf_config.extra.get("vision_config") {
+            let is_qwen2_vl = hf_config.architectures.iter().any(|a| {
+                a == "Qwen2VLForConditionalGeneration" || a == "Qwen2_5_VLForConditionalGeneration"
+            });
+
+            let image_size = vision_config
+                .get("image_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if is_qwen2_vl { 392 } else { 224 }) as usize;
+            let patch_size = vision_config
+                .get("patch_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(14) as usize;
+            let num_patches = image_size
+                .checked_div(patch_size)
+                .map(|v| v.pow(2))
+                .unwrap_or(256);
+
+            let image_token_index = if is_qwen2_vl {
+                hf_config
+                    .extra
+                    .get("image_token_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(151655) as u32
+            } else {
+                hf_config
+                    .extra
+                    .get("image_token_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(255999) as u32
+            };
+
+            let mm_tokens_per_image = if is_qwen2_vl {
+                let spatial_merge = vision_config
+                    .get("spatial_merge_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(2) as usize;
+                let grid = image_size / patch_size;
+                let merged_grid = grid / spatial_merge;
+                merged_grid * merged_grid
+            } else {
+                hf_config
+                    .extra
+                    .get("mm_tokens_per_image")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(num_patches)
+            };
+
+            info!(
+                "Multimodal config: image_token_id={}, tokens_per_image={}, image_size={}",
+                image_token_index, mm_tokens_per_image, image_size,
+            );
+            engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
+            if is_qwen2_vl {
+                engine.set_mm_model_type("qwen2_vl");
+                if let Some(dir) = model_dir.as_ref()
+                    && let Ok(s) = std::fs::read_to_string(dir.join("preprocessor_config.json"))
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
+                    && let (Some(mn), Some(mx)) = (
+                        v.get("min_pixels").and_then(|x| x.as_u64()),
+                        v.get("max_pixels").and_then(|x| x.as_u64()),
+                    )
+                {
+                    engine.set_mm_image_processor_pixel_limits(mn as usize, mx as usize);
+                    info!(
+                        "Qwen2-VL preprocessor: min_pixels={}, max_pixels={}",
+                        mn, mx
+                    );
+                }
+            }
         }
 
         let engine = Arc::new(engine);
@@ -2514,6 +2624,42 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
     }
     Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))
+}
+
+/// Mirror `transformers`' `AutoTokenizer` behavior: after the
+/// `tokenizer.json::added_tokens` list is loaded, scan
+/// `tokenizer_config.json::additional_special_tokens` (a string list)
+/// and register any entries missing from the former. Required for
+/// arches like Qwen2-VL / Qwen2.5-VL that declare
+/// `<|image_pad|>` / `<|video_pad|>` / `<|vision_pad|>` only in
+/// `tokenizer_config.json` — without this, the chat template's
+/// `<|image_pad|>` emission subword-splits at encode time and
+/// `expand_image_placeholders` finds zero occurrences. Idempotent;
+/// no-op when `tokenizer_config.json` is absent or has no
+/// `additional_special_tokens` field. Applied to every tokenizer
+/// path (preloaded via cuda_worker's bare HfTokenizer load AND
+/// `try_load_tokenizer`'s fallback path) so configurations converge.
+fn patch_additional_special_tokens(tok: &mut Tokenizer, model_dir: &Path) {
+    let config_path = model_dir.join("tokenizer_config.json");
+    let Ok(bytes) = std::fs::read(&config_path) else {
+        return;
+    };
+    let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let Some(arr) = cfg
+        .get("additional_special_tokens")
+        .and_then(|v| v.as_array())
+    else {
+        return;
+    };
+    let contents: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    if !contents.is_empty() {
+        tok.register_additional_special_tokens(&contents);
+    }
 }
 
 /// Resolve a chat template, honoring an explicit operator override

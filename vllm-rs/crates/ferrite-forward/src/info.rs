@@ -1004,6 +1004,7 @@ impl<W> Instruction<W> {
             }
             Instruction::Alias(dst, src) => ("Alias", vec![F::Slot(dst), F::Slot(src)]),
             Instruction::Free(slot) => ("Free", vec![F::Slot(slot)]),
+            Instruction::SpliceMmEmbeds(slot) => ("SpliceMmEmbeds", vec![F::Slot(slot)]),
         };
         NormalizedStep { kind, fields }
     }

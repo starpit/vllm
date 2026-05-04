@@ -1221,6 +1221,13 @@ fn emit_fingerprint_check(
         Some(crate::config::RopeScaling::Llama3 { .. }) => Some("llama3"),
         Some(crate::config::RopeScaling::LongRope { .. }) => Some("longrope"),
         Some(crate::config::RopeScaling::Yarn { .. }) => Some("yarn"),
+        // Qwen2-VL / Qwen2.5-VL: `extract_rope_scaling` doesn't fold
+        // `"mrope"` into a `RopeScaling` variant (it doesn't drive the
+        // text-side `RotaryCache` — `mrope_section` lives on
+        // `CanonicalParams::MROPE_SECTION` instead), but the fingerprint
+        // still has to expect `Some("mrope")` from the live HF config
+        // or the variant will reject its own checkpoint.
+        None if model.mrope_section.is_some() => Some("mrope"),
         None => None,
     };
     let rope_scaling_check: TokenStream = match rope_scaling_expected {
@@ -3717,10 +3724,22 @@ struct CanonicalLowered {
 /// first arg, since `forward_backbone` has no defined behavior for
 /// architectures whose terminal is anything other than `gemm(<tile>,
 /// lm_head)`.
+/// Walk the FUF from the end, skipping any `OpKind::MmEmbedSplice`
+/// nodes that `tp_lowering::insert_mm_splices` appended after
+/// `insert_all_reduces` / `insert_lm_head_allgather`. The "last node"
+/// for backbone-output / terminal-subgraph identification must be
+/// the lm_head Gemm (tp=1) or its AllGather wrapper (tp>1); the
+/// splice nodes live at array-tail for ease of `push`-based insertion
+/// but are semantically adjacent to the Embed they hang off of.
+fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
+    fuf.nodes
+        .iter()
+        .rev()
+        .find(|n| n.op != crate::classified::OpKind::MmEmbedSplice)
+}
+
 fn backbone_output_for(fuf: &Fuf) -> (TileId, u8) {
-    let last_node = fuf
-        .nodes
-        .last()
+    let last_node = last_non_splice_node(fuf)
         .expect("FUF must be non-empty to emit a forward fn");
     let lm_head_node = if last_node.op == crate::classified::OpKind::AllGather {
         // tp>1: skip past the AllGather to the lm_head Gemm whose
@@ -3933,6 +3952,36 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     let final_logit_softcapping_lit = proc_macro2::Literal::f32_unsuffixed(final_logit_softcapping);
     let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
 
+    // MRoPE section override. `Some([t, h, w])` only when the
+    // config carries `rope_scaling.mrope_section` (Qwen2-VL /
+    // Qwen2.5-VL); every text-only arch keeps the default `None`
+    // and the rope kernel takes the legacy 1D-positions fast path.
+    // Sum-equals-`head_dim/2` is checked here (panic at expansion
+    // time, not at runtime) — text decode of a misconfigured
+    // multimodal variant never compiles past this guard.
+    let mrope_section_tokens = match model.mrope_section {
+        Some([t, h, w]) => {
+            let pair_count = head_dim / 2;
+            if t + h + w != pair_count {
+                let msg = format!(
+                    "model `{}`: rope_scaling.mrope_section [{t}, {h}, {w}] sums to {} \
+                     but head_dim/2 = {pair_count}. Fix the config so the sum matches.",
+                    model.source_stem,
+                    t + h + w,
+                );
+                return quote! { compile_error!(#msg); };
+            }
+            let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
+            let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
+            let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
+            quote! {
+                const MROPE_SECTION: ::core::option::Option<[u32; 3]> =
+                    ::core::option::Option::Some([#t_lit, #h_lit, #w_lit]);
+            }
+        }
+        None => quote! {},
+    };
+
     quote! {
         #[cfg(feature = "cuda")]
         impl ::ferrite_forward::CanonicalParams for Weights {
@@ -3952,6 +4001,7 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
             const FINAL_LOGIT_SOFTCAPPING: f32 = #final_logit_softcapping_lit;
             const QK_HEAD_DIM: usize = #qk_head_dim_lit;
             const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+            #mrope_section_tokens
         }
     }
 }
@@ -4030,7 +4080,14 @@ pub fn emit_model(
             /* terminal_slot */ u32,
         ),
     > = BTreeMap::new();
-    let last_node_id = fuf.nodes.last().expect("non-empty FUF expected").id;
+    // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
+    // AllGather (tp>1), not one of the post-Embed `MmEmbedSplice` nodes
+    // that `tp_lowering::insert_mm_splices` appends. Those sit at fuf-
+    // array-tail but semantically belong near the Embed; walking past
+    // them with `last_non_splice_node` recovers the real terminal.
+    let last_node_id = last_non_splice_node(fuf)
+        .expect("non-empty FUF expected")
+        .id;
     let backbone_out = backbone_output_for(fuf);
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
@@ -4480,6 +4537,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         }
     }
 

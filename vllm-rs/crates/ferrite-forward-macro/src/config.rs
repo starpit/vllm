@@ -86,6 +86,14 @@ pub struct ModelParams {
     /// Phi-4-mini-instruct vs Phi-4-mini-reasoning. `None` when the
     /// config has no `rope_scaling`.
     pub rope_scaling_hash: Option<u64>,
+    /// Qwen2-VL / Qwen2.5-VL `rope_scaling.mrope_section`: rotary-pair
+    /// counts for the (T, H, W) axes of the multimodal RoPE
+    /// generalization. Sums to `head_dim/2`. Drives the per-variant
+    /// `const MROPE_SECTION: Option<[u32; 3]> = Some([..]);` override
+    /// emitted on `impl CanonicalParams`. `None` for every text-only
+    /// arch (the rope kernel takes the legacy 1D-positions path).
+    /// See `~/.claude/plans/distributed-mapping-map.md` Phase A/B.
+    pub mrope_section: Option<[u32; 3]>,
 }
 
 /// Arch-agnostic rope-scaling flavor parsed from `config.json`.
@@ -678,6 +686,7 @@ fn model_params_from_json(
         .unwrap_or_default();
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
+    let mrope_section = extract_mrope_section(json);
 
     Ok(ModelParams {
         name,
@@ -691,7 +700,26 @@ fn model_params_from_json(
         extra_tracked_paths,
         rope_scaling,
         rope_scaling_hash,
+        mrope_section,
     })
+}
+
+/// Extract `rope_scaling.mrope_section` as a fixed `[u32; 3]`. Returns
+/// `None` when the field is absent (every text-only arch) or has
+/// fewer than three entries (malformed configs are silently
+/// rejected — text-side fallback). Qwen2-VL writes it as
+/// `[16, 24, 24]`; Qwen2.5-VL the same. The values must sum to
+/// `head_dim/2`; that invariant is checked at emission time
+/// against `bounds["head_dim"]`.
+fn extract_mrope_section(json: &serde_json::Value) -> Option<[u32; 3]> {
+    let arr = json.get("rope_scaling")?.get("mrope_section")?.as_array()?;
+    if arr.len() < 3 {
+        return None;
+    }
+    let a = arr[0].as_u64()? as u32;
+    let b = arr[1].as_u64()? as u32;
+    let c = arr[2].as_u64()? as u32;
+    Some([a, b, c])
 }
 
 /// Macro-side mirror of `ferrite_forward::hash_json_value` — the

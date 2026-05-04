@@ -23,3 +23,4 @@ ferrite-forward = { path = "../ferrite-forward" }
 ferrite-gguf = { path = "../ferrite-gguf" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+half = { workspace = true }

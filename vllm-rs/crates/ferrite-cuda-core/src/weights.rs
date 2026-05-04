@@ -919,6 +919,75 @@ impl GpuWeights {
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
     }
 
+    /// Same as [`take`] but creates the returned `GpuTensor` with a
+    /// caller-provided shape instead of the on-disk shape. The two
+    /// shapes must agree on total element count. Used to flatten
+    /// `>MAX_DIMS`-dim tensors at load time — e.g. Qwen2-VL's
+    /// `visual.patch_embed.proj.weight` which lands as a 5D Conv3d
+    /// weight on disk but the runtime treats it as a 2D GEMM kernel
+    /// (stride==kernel collapses the conv).
+    ///
+    /// [`take`]: Self::take
+    pub fn take_with_shape(&mut self, name: &str, shape: &[usize]) -> Result<GpuTensor> {
+        if let Some(t) = self.gguf_dense.remove(name) {
+            // GGUF tensors don't usually overflow MAX_DIMS, but if a
+            // future arch's GGUF spec lands a 5D tensor, the same
+            // reshape applies. Same-size invariant.
+            let new_numel: usize = shape.iter().product();
+            anyhow::ensure!(
+                t.numel() == new_numel,
+                "take_with_shape: {name} numel mismatch (gguf {} vs new {new_numel})",
+                t.numel(),
+            );
+            return Ok(unsafe { GpuTensor::new(t.raw_ptr(), shape, t.dtype()) });
+        }
+
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let on_disk_numel: usize = cpu_ref.shape.iter().product();
+        let new_numel: usize = shape.iter().product();
+        anyhow::ensure!(
+            on_disk_numel == new_numel,
+            "take_with_shape: {name} on-disk shape {:?} (numel {on_disk_numel}) != new shape {:?} (numel {new_numel})",
+            cpu_ref.shape,
+            shape,
+        );
+
+        if let Some(entry) = self.take_precast(name) {
+            let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
+            self.gpu_allocs
+                .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, entry.size_bytes) });
+            unsafe {
+                driver::memcpy_htod_async(
+                    gpu_ptr,
+                    entry.pinned_ptr as *const u8,
+                    entry.size_bytes,
+                    self.stream,
+                )?;
+            }
+            let tensor = unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) };
+            unsafe {
+                driver::stream_synchronize(self.stream)?;
+                driver::mem_free_host(entry.pinned_ptr).ok();
+            }
+            return Ok(tensor);
+        }
+
+        let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+
+        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
+        self.gpu_allocs
+            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
+
+        unsafe {
+            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
+        }
+
+        Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
+    }
+
     /// Copy a tensor's data directly to an offset within an existing GPU buffer.
     ///
     /// Used for fused weight loading (QKV, gate_up) — pre-allocate the fused

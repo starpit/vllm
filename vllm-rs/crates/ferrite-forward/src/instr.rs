@@ -64,6 +64,16 @@ pub trait CanonicalParams {
     const QK_HEAD_DIM: usize;
     /// MlaAttention scale: `1/sqrt(qk_head_dim)` w/ YaRN correction.
     const MLA_ATTN_SCALE: f32;
+    /// MRoPE (Qwen2-VL / Qwen2.5-VL) section split `[T, H, W]` (rotary
+    /// pairs assigned to time / height / width axes; sum equals
+    /// `head_dim/2`). `None` for every text-only arch — the rope kernel
+    /// takes the legacy 1D-positions fast path. `Some([a,b,c])` selects
+    /// the MRoPE path: kernel reads three position values per token
+    /// (positions tensor shape `[3, n_tokens]`) and dispatches each
+    /// rotary pair through the section that owns it. Default `None` so
+    /// existing arches need no override; Qwen2-VL sets it via the
+    /// proc-macro emit path. Plan: `~/.claude/plans/distributed-mapping-map.md`.
+    const MROPE_SECTION: Option<[u32; 3]> = None;
 }
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
@@ -103,6 +113,16 @@ pub enum Instruction<W> {
     /// (lm_head is vocab-parallel `ShardDim0`).
     #[cfg(feature = "nccl")]
     AllGather(u32, u32),
+    /// Multimodal embed splice — D2D-copy projected vision-encoder
+    /// rows into the placeholder positions of the post-embed hidden
+    /// states in-place. Always inserted by `tp_lowering::insert_mm_splices`
+    /// after every `Instruction::Embed` (after the vocab-parallel
+    /// `Instruction::AllReduce` at tp>1, so the splice runs on the
+    /// fully-reduced embedding and its D2D overwrite is NOT summed
+    /// across ranks). At runtime the op is a no-op when
+    /// `ForwardCtx::embed_patches` is empty (text-only batches) —
+    /// one extra slot check per forward pass, cost negligible.
+    SpliceMmEmbeds(u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
     FusedAddRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
@@ -373,7 +393,12 @@ impl<W: CanonicalParams> Instruction<W> {
                 // each rank a disjoint slice of the global vocab.
                 // Per-Embed call follows with an AllReduce-sum
                 // (injected by tp_lowering when shard-kind for the
-                // embed weight is ShardDim0).
+                // embed weight is ShardDim0), and then a
+                // `SpliceMmEmbeds` pass (also injected by tp_lowering)
+                // that D2D-copies the vision-encoder embeddings into
+                // the image-placeholder rows. The splice MUST run
+                // after the AllReduce so its overwrite doesn't get
+                // multiplied by `tp_world_size` on the sum.
                 let vocab_per_rank = weight.dim(0) as u32;
                 #[cfg(feature = "nccl")]
                 let vocab_offset = ctx
@@ -392,6 +417,35 @@ impl<W: CanonicalParams> Instruction<W> {
                     ctx.device.compute_stream,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::SpliceMmEmbeds(slot) => unsafe {
+                // Text-only batches: skip. One branch per forward pass.
+                if ctx.fwd.embed_patches.is_empty() {
+                    return;
+                }
+                let out = tile_ref(ctx.tiles, slot).as_gpu_tensor(ctx.tiles);
+                let mm = ctx
+                    .fwd
+                    .mm_embeds
+                    .expect("mm_embeds required when embed_patches is non-empty");
+                let hidden = out.dim(1);
+                let elem_bytes = out.dtype().size_bytes();
+                let row_bytes = hidden * elem_bytes;
+                let dst_base = out.raw_ptr();
+                let src_base = mm.raw_ptr();
+                let mut src_row: usize = 0;
+                for patch in ctx.fwd.embed_patches.iter() {
+                    let length = patch.length as usize;
+                    let dst = dst_base.add((patch.token_offset as usize) * row_bytes);
+                    let src = src_base.add(src_row * row_bytes);
+                    let _ = ferrite_cuda_core::driver::memcpy_dtod_async(
+                        dst,
+                        src,
+                        length * row_bytes,
+                        ctx.device.compute_stream,
+                    );
+                    src_row += length;
+                }
             },
             Instruction::RmsNorm(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
@@ -804,6 +858,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::KV_SIZE,
                         W::NUM_Q_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -941,6 +996,7 @@ impl<W: CanonicalParams> Instruction<W> {
                             W::NUM_Q_HEADS as usize,
                             W::NUM_KV_HEADS as usize,
                             W::HEAD_DIM as usize,
+                            W::MROPE_SECTION,
                             &mut ctx.device.caching,
                             ctx.device.compute_stream,
                         )
@@ -1663,6 +1719,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::KV_SIZE,
                         W::NUM_Q_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -1726,6 +1783,7 @@ impl<W: CanonicalParams> Instruction<W> {
                             W::NUM_Q_HEADS as usize,
                             W::NUM_KV_HEADS as usize,
                             W::HEAD_DIM as usize,
+                            W::MROPE_SECTION,
                             &mut ctx.device.caching,
                             ctx.device.compute_stream,
                         )
@@ -1819,6 +1877,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::KV_SIZE,
                         W::NUM_Q_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -1850,6 +1909,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::NUM_Q_HEADS as usize,
                         W::NUM_KV_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -1978,6 +2038,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::KV_SIZE,
                         W::NUM_Q_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -2013,6 +2074,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::NUM_Q_HEADS as usize,
                         W::NUM_KV_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -2119,6 +2181,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::KV_SIZE,
                         W::NUM_Q_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -2154,6 +2217,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::NUM_Q_HEADS as usize,
                         W::NUM_KV_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -2261,6 +2325,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::KV_SIZE,
                         W::NUM_Q_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -2296,6 +2361,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         W::NUM_Q_HEADS as usize,
                         W::NUM_KV_HEADS as usize,
                         W::HEAD_DIM as usize,
+                        W::MROPE_SECTION,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )

@@ -142,28 +142,62 @@ __global__ void rotary_embedding_kernel(
 // Replaces separate split_qkv + rotary_embedding kernels (saves 1 launch).
 // ---------------------------------------------------------------------------
 
+// Pick which of three cos/sin rows owns rotary index `r`. For the
+// legacy 1D-positions path (`positions_stride0 == 0` ⇒ caller-supplied
+// `sec0 = sec01 = half_rot`), all three rows are identical pointers
+// (cos0_row == cos1_row == cos2_row), and the compiler const-folds the
+// branch — the 1D fast path pays zero.
+template<typename T>
+__device__ __forceinline__ const T* mrope_pick_row(
+    int r, int sec0, int sec01,
+    const T* row0, const T* row1, const T* row2)
+{
+    return (r < sec0) ? row0 : ((r < sec01) ? row1 : row2);
+}
+
 template <typename T>
 __global__ void fused_qkv_rope_kernel(
-    T* __restrict__ q_out,                   // [num_tokens, q_size]
-    T* __restrict__ k_out,                   // [num_tokens, kv_size]
-    T* __restrict__ v_out,                   // [num_tokens, kv_size]
-    const T* __restrict__ qkv,               // [num_tokens, total_dim]
-    const uint32_t* __restrict__ positions,  // [num_tokens]
-    const T* __restrict__ cos_sin_cache,     // [max_pos, rotary_dim]
-    int q_size,                              // = num_q_heads * head_size
-    int kv_size,                             // = num_kv_heads * head_size
-    int total_dim,                           // = q_size + 2 * kv_size
-    int rotary_dim,                          // = 2 * half_rot
-    int head_size)
+    T* __restrict__ q_out,                      // [num_tokens, q_size]
+    T* __restrict__ k_out,                      // [num_tokens, kv_size]
+    T* __restrict__ v_out,                      // [num_tokens, kv_size]
+    const T* __restrict__ qkv,                  // [num_tokens, total_dim]
+    const uint32_t* __restrict__ positions,     // [num_tokens] OR [3, num_tokens] if mrope
+    const T* __restrict__ cos_sin_cache,        // [max_pos, rotary_dim]
+    int q_size,                                 // = num_q_heads * head_size
+    int kv_size,                                // = num_kv_heads * head_size
+    int total_dim,                              // = q_size + 2 * kv_size
+    int rotary_dim,                             // = 2 * half_rot
+    int head_size,
+    int positions_stride0,                      // 0 for 1D positions; n_tokens for [3, n_tokens]
+    int mrope_sec0,                             // section boundary 0..sec0 use axis 0; ignored if stride0==0
+    int mrope_sec01)                            // section boundary sec0..sec01 use axis 1; sec01.. use axis 2
 {
     constexpr int VEC = VecType<T>::SIZE;
 
     const int token_idx = blockIdx.x;
-    const int pos = static_cast<int>(positions[token_idx]);
     const int half_rot = rotary_dim / 2;
-    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    const T* sin_ptr = cos_ptr + half_rot;
     const int half = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+
+    // Three positions per token in MRoPE mode (positions_stride0 != 0);
+    // degenerate to a single position in legacy 1D mode (pos0 == pos1
+    // == pos2; section boundaries pinned to half_rot so all rotary
+    // indices pick row 0 — identical to today's 1D fast path).
+    const bool mrope = (positions_stride0 != 0);
+    const int pos0 = static_cast<int>(positions[token_idx]);
+    const int pos1 = mrope ? static_cast<int>(positions[positions_stride0 + token_idx]) : pos0;
+    const int pos2 = mrope ? static_cast<int>(positions[2 * positions_stride0 + token_idx]) : pos0;
+    const T* cos0_row = cos_sin_cache + pos0 * rotary_dim;
+    const T* cos1_row = cos_sin_cache + pos1 * rotary_dim;
+    const T* cos2_row = cos_sin_cache + pos2 * rotary_dim;
+    const T* sin0_row = cos0_row + half_rot;
+    const T* sin1_row = cos1_row + half_rot;
+    const T* sin2_row = cos2_row + half_rot;
+    const int sec0  = mrope ? mrope_sec0  : half_rot;
+    const int sec01 = mrope ? mrope_sec01 : half_rot;
+    // MRoPE assumes section boundaries are VEC-aligned (true for
+    // Qwen2-VL [16,24,24] @ VEC=4/8). Non-aligned sections would make
+    // the vectorized cos/sin loads straddle two rows; not supported.
+
     const int half_vecs = half / VEC;
     const int half_tail = half_vecs * VEC;
 
@@ -183,12 +217,15 @@ __global__ void fused_qkv_rope_kernel(
         const int h = tid / half_vecs;
         const int vi = tid % half_vecs;
         const int b = h * head_size + vi * VEC;
+        const int r0 = vi * VEC;
+        const T* cos_row = mrope_pick_row<T>(r0, sec0, sec01, cos0_row, cos1_row, cos2_row);
+        const T* sin_row = mrope_pick_row<T>(r0, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
         float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
         unpack_vec<T>(vec_load(&row[b]), xbuf);
         unpack_vec<T>(vec_load(&row[b + half]), ybuf);
-        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
-        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+        unpack_vec<T>(vec_load(&cos_row[r0]), cbuf);
+        unpack_vec<T>(vec_load(&sin_row[r0]), sbuf);
 
         float ox[VEC], oy[VEC];
         #pragma unroll
@@ -205,11 +242,13 @@ __global__ void fused_qkv_rope_kernel(
         const int h = tid / (half - half_tail);
         const int r = half_tail + tid % (half - half_tail);
         const int b = h * head_size;
+        const T* cos_row = mrope_pick_row<T>(r, sec0, sec01, cos0_row, cos1_row, cos2_row);
+        const T* sin_row = mrope_pick_row<T>(r, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
         float x = static_cast<float>(row[b + r]);
         float y = static_cast<float>(row[b + r + half]);
-        float c = static_cast<float>(cos_ptr[r]);
-        float s = static_cast<float>(sin_ptr[r]);
+        float c = static_cast<float>(cos_row[r]);
+        float s = static_cast<float>(sin_row[r]);
 
         q[b + r]        = static_cast<T>(x * c - y * s);
         q[b + r + half] = static_cast<T>(y * c + x * s);
@@ -229,12 +268,15 @@ __global__ void fused_qkv_rope_kernel(
         const int h = tid / half_vecs;
         const int vi = tid % half_vecs;
         const int b = h * head_size + vi * VEC;
+        const int r0 = vi * VEC;
+        const T* cos_row = mrope_pick_row<T>(r0, sec0, sec01, cos0_row, cos1_row, cos2_row);
+        const T* sin_row = mrope_pick_row<T>(r0, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
         float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
         unpack_vec<T>(vec_load(&k_row[b]), xbuf);
         unpack_vec<T>(vec_load(&k_row[b + half]), ybuf);
-        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
-        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+        unpack_vec<T>(vec_load(&cos_row[r0]), cbuf);
+        unpack_vec<T>(vec_load(&sin_row[r0]), sbuf);
 
         float ox[VEC], oy[VEC];
         #pragma unroll
@@ -250,11 +292,13 @@ __global__ void fused_qkv_rope_kernel(
         const int h = tid / (half - half_tail);
         const int r = half_tail + tid % (half - half_tail);
         const int b = h * head_size;
+        const T* cos_row = mrope_pick_row<T>(r, sec0, sec01, cos0_row, cos1_row, cos2_row);
+        const T* sin_row = mrope_pick_row<T>(r, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
         float x = static_cast<float>(k_row[b + r]);
         float y = static_cast<float>(k_row[b + r + half]);
-        float c = static_cast<float>(cos_ptr[r]);
-        float s = static_cast<float>(sin_ptr[r]);
+        float c = static_cast<float>(cos_row[r]);
+        float s = static_cast<float>(sin_row[r]);
 
         k[b + r]        = static_cast<T>(x * c - y * s);
         k[b + r + half] = static_cast<T>(y * c + x * s);
@@ -283,17 +327,18 @@ __global__ void fused_qkv_rope_kernel(
 // C entry points
 // ---------------------------------------------------------------------------
 
-#define LAUNCH_FUSED_QKV_ROPE(T)                                               \
-    do {                                                                        \
-        int half = rotary_dim / 2;                                             \
-        int nqh = q_size / head_size;                                          \
-        int work = nqh * half;                                                 \
-        int threads = (work < 512) ? work : 512;                               \
-        if (threads < 1) threads = 1;                                          \
-        fused_qkv_rope_kernel<T><<<num_tokens, threads, 0, stream>>>(          \
-            (T*)q_out, (T*)k_out, (T*)v_out, (const T*)qkv,                   \
-            (const uint32_t*)positions, (const T*)cos_sin_cache,               \
-            q_size, kv_size, total_dim, rotary_dim, head_size);                \
+#define LAUNCH_FUSED_QKV_ROPE(T)                                                 \
+    do {                                                                          \
+        int half = rotary_dim / 2;                                                \
+        int nqh = q_size / head_size;                                             \
+        int work = nqh * half;                                                    \
+        int threads = (work < 512) ? work : 512;                                  \
+        if (threads < 1) threads = 1;                                             \
+        fused_qkv_rope_kernel<T><<<num_tokens, threads, 0, stream>>>(             \
+            (T*)q_out, (T*)k_out, (T*)v_out, (const T*)qkv,                       \
+            (const uint32_t*)positions, (const T*)cos_sin_cache,                  \
+            q_size, kv_size, total_dim, rotary_dim, head_size,                    \
+            positions_stride0, mrope_sec0, mrope_sec01);                          \
     } while (0)
 
 extern "C" {
@@ -302,7 +347,9 @@ void fused_qkv_rope_f32(
     void* q_out, void* k_out, void* v_out, const void* qkv,
     const void* positions, const void* cos_sin_cache,
     int q_size, int kv_size, int total_dim, int rotary_dim,
-    int head_size, int num_tokens, cudaStream_t stream)
+    int head_size, int num_tokens,
+    int positions_stride0, int mrope_sec0, int mrope_sec01,
+    cudaStream_t stream)
 {
     LAUNCH_FUSED_QKV_ROPE(float);
 }
@@ -311,7 +358,9 @@ void fused_qkv_rope_f16(
     void* q_out, void* k_out, void* v_out, const void* qkv,
     const void* positions, const void* cos_sin_cache,
     int q_size, int kv_size, int total_dim, int rotary_dim,
-    int head_size, int num_tokens, cudaStream_t stream)
+    int head_size, int num_tokens,
+    int positions_stride0, int mrope_sec0, int mrope_sec01,
+    cudaStream_t stream)
 {
     LAUNCH_FUSED_QKV_ROPE(__half);
 }
@@ -320,7 +369,9 @@ void fused_qkv_rope_bf16(
     void* q_out, void* k_out, void* v_out, const void* qkv,
     const void* positions, const void* cos_sin_cache,
     int q_size, int kv_size, int total_dim, int rotary_dim,
-    int head_size, int num_tokens, cudaStream_t stream)
+    int head_size, int num_tokens,
+    int positions_stride0, int mrope_sec0, int mrope_sec01,
+    cudaStream_t stream)
 {
     LAUNCH_FUSED_QKV_ROPE(__nv_bfloat16);
 }
@@ -344,24 +395,42 @@ __global__ void fused_qkv_rope_cache_kernel(
     T* __restrict__ key_cache,                      // [num_blocks, block_size, num_kv_heads, head_dim]
     T* __restrict__ value_cache,                    // [num_blocks, block_size, num_kv_heads, head_dim]
     const T* __restrict__ qkv,                      // [num_tokens, total_dim]
-    const uint32_t* __restrict__ positions,         // [num_tokens]
+    const uint32_t* __restrict__ positions,         // [num_tokens] OR [3, num_tokens] if mrope
     const T* __restrict__ cos_sin_cache,            // [max_pos, rotary_dim]
     const int64_t* __restrict__ slot_mapping,       // [num_tokens]
     int q_size,                                     // = num_q_heads * head_size
     int kv_size,                                    // = num_kv_heads * head_size
     int total_dim,                                  // = q_size + 2 * kv_size
     int rotary_dim,                                 // = 2 * half_rot
-    int head_size)
+    int head_size,
+    int positions_stride0,                          // 0 for 1D positions; n_tokens for [3, n_tokens]
+    int mrope_sec0,                                 // section boundary 0..sec0 use axis 0
+    int mrope_sec01)                                // section boundary sec0..sec01 use axis 1
 {
     constexpr int VEC = VecType<T>::SIZE;
 
     const int token_idx = blockIdx.x;
     const int64_t slot = slot_mapping[token_idx];
-    const int pos = static_cast<int>(positions[token_idx]);
     const int half_rot = rotary_dim / 2;
-    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
-    const T* sin_ptr = cos_ptr + half_rot;
     const int half = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+
+    // MRoPE (Qwen2-VL): three positions per token; legacy 1D mode
+    // collapses to pos0 == pos1 == pos2 with sec boundaries pinned to
+    // half_rot — kernel takes the existing fast path (compiler
+    // const-folds the picker branch).
+    const bool mrope = (positions_stride0 != 0);
+    const int pos0 = static_cast<int>(positions[token_idx]);
+    const int pos1 = mrope ? static_cast<int>(positions[positions_stride0 + token_idx]) : pos0;
+    const int pos2 = mrope ? static_cast<int>(positions[2 * positions_stride0 + token_idx]) : pos0;
+    const T* cos0_row = cos_sin_cache + pos0 * rotary_dim;
+    const T* cos1_row = cos_sin_cache + pos1 * rotary_dim;
+    const T* cos2_row = cos_sin_cache + pos2 * rotary_dim;
+    const T* sin0_row = cos0_row + half_rot;
+    const T* sin1_row = cos1_row + half_rot;
+    const T* sin2_row = cos2_row + half_rot;
+    const int sec0  = mrope ? mrope_sec0  : half_rot;
+    const int sec01 = mrope ? mrope_sec01 : half_rot;
+
     const int half_vecs = half / VEC;
     const int half_tail = half_vecs * VEC;
 
@@ -379,12 +448,15 @@ __global__ void fused_qkv_rope_cache_kernel(
         const int h = tid / half_vecs;
         const int vi = tid % half_vecs;
         const int b = h * head_size + vi * VEC;
+        const int r0 = vi * VEC;
+        const T* cos_row = mrope_pick_row<T>(r0, sec0, sec01, cos0_row, cos1_row, cos2_row);
+        const T* sin_row = mrope_pick_row<T>(r0, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
         float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
         unpack_vec<T>(vec_load(&row[b]), xbuf);
         unpack_vec<T>(vec_load(&row[b + half]), ybuf);
-        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
-        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+        unpack_vec<T>(vec_load(&cos_row[r0]), cbuf);
+        unpack_vec<T>(vec_load(&sin_row[r0]), sbuf);
 
         float ox[VEC], oy[VEC];
         #pragma unroll
@@ -401,11 +473,13 @@ __global__ void fused_qkv_rope_cache_kernel(
         const int h = tid / (half - half_tail);
         const int r = half_tail + tid % (half - half_tail);
         const int b = h * head_size;
+        const T* cos_row = mrope_pick_row<T>(r, sec0, sec01, cos0_row, cos1_row, cos2_row);
+        const T* sin_row = mrope_pick_row<T>(r, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
         float x = static_cast<float>(row[b + r]);
         float y = static_cast<float>(row[b + r + half]);
-        float c = static_cast<float>(cos_ptr[r]);
-        float s = static_cast<float>(sin_ptr[r]);
+        float c = static_cast<float>(cos_row[r]);
+        float s = static_cast<float>(sin_row[r]);
 
         q[b + r]        = static_cast<T>(x * c - y * s);
         q[b + r + half] = static_cast<T>(y * c + x * s);
@@ -434,12 +508,15 @@ __global__ void fused_qkv_rope_cache_kernel(
             const int h = tid / half_vecs;
             const int vi = tid % half_vecs;
             const int b = h * head_size + vi * VEC;
+            const int r0 = vi * VEC;
+            const T* cos_row = mrope_pick_row<T>(r0, sec0, sec01, cos0_row, cos1_row, cos2_row);
+            const T* sin_row = mrope_pick_row<T>(r0, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
             float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
             unpack_vec<T>(vec_load(&k_row[b]), xbuf);
             unpack_vec<T>(vec_load(&k_row[b + half]), ybuf);
-            unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
-            unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+            unpack_vec<T>(vec_load(&cos_row[r0]), cbuf);
+            unpack_vec<T>(vec_load(&sin_row[r0]), sbuf);
 
             float ox[VEC], oy[VEC];
             #pragma unroll
@@ -455,11 +532,13 @@ __global__ void fused_qkv_rope_cache_kernel(
             const int h = tid / (half - half_tail);
             const int r = half_tail + tid % (half - half_tail);
             const int b = h * head_size;
+            const T* cos_row = mrope_pick_row<T>(r, sec0, sec01, cos0_row, cos1_row, cos2_row);
+            const T* sin_row = mrope_pick_row<T>(r, sec0, sec01, sin0_row, sin1_row, sin2_row);
 
             float x = static_cast<float>(k_row[b + r]);
             float y = static_cast<float>(k_row[b + r + half]);
-            float c = static_cast<float>(cos_ptr[r]);
-            float s = static_cast<float>(sin_ptr[r]);
+            float c = static_cast<float>(cos_row[r]);
+            float s = static_cast<float>(sin_row[r]);
 
             k_dst[b + r]        = static_cast<T>(x * c - y * s);
             k_dst[b + r + half] = static_cast<T>(y * c + x * s);
@@ -499,7 +578,8 @@ __global__ void fused_qkv_rope_cache_kernel(
             (T*)q_out, (T*)key_cache, (T*)value_cache, (const T*)qkv,           \
             (const uint32_t*)positions, (const T*)cos_sin_cache,                \
             (const int64_t*)slot_mapping,                                        \
-            q_size, kv_size, total_dim, rotary_dim, head_size);                 \
+            q_size, kv_size, total_dim, rotary_dim, head_size,                  \
+            positions_stride0, mrope_sec0, mrope_sec01);                        \
     } while (0)
 
 extern "C" {
@@ -508,7 +588,9 @@ void fused_qkv_rope_cache_f32(
     void* q_out, void* key_cache, void* value_cache, const void* qkv,
     const void* positions, const void* cos_sin_cache, const void* slot_mapping,
     int q_size, int kv_size, int total_dim, int rotary_dim,
-    int head_size, int num_tokens, cudaStream_t stream)
+    int head_size, int num_tokens,
+    int positions_stride0, int mrope_sec0, int mrope_sec01,
+    cudaStream_t stream)
 {
     LAUNCH_FUSED_QKV_ROPE_CACHE(float);
 }
@@ -517,7 +599,9 @@ void fused_qkv_rope_cache_f16(
     void* q_out, void* key_cache, void* value_cache, const void* qkv,
     const void* positions, const void* cos_sin_cache, const void* slot_mapping,
     int q_size, int kv_size, int total_dim, int rotary_dim,
-    int head_size, int num_tokens, cudaStream_t stream)
+    int head_size, int num_tokens,
+    int positions_stride0, int mrope_sec0, int mrope_sec01,
+    cudaStream_t stream)
 {
     LAUNCH_FUSED_QKV_ROPE_CACHE(__half);
 }
@@ -526,7 +610,9 @@ void fused_qkv_rope_cache_bf16(
     void* q_out, void* key_cache, void* value_cache, const void* qkv,
     const void* positions, const void* cos_sin_cache, const void* slot_mapping,
     int q_size, int kv_size, int total_dim, int rotary_dim,
-    int head_size, int num_tokens, cudaStream_t stream)
+    int head_size, int num_tokens,
+    int positions_stride0, int mrope_sec0, int mrope_sec01,
+    cudaStream_t stream)
 {
     LAUNCH_FUSED_QKV_ROPE_CACHE(__nv_bfloat16);
 }
@@ -1362,5 +1448,87 @@ void rotary_paged_k_cache_bf16(
     if (inverse) { LAUNCH_ROTARY_PAGED(__nv_bfloat16, true); }
     else         { LAUNCH_ROTARY_PAGED(__nv_bfloat16, false); }
 }
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
+// Vision 2D RoPE apply
+//
+// Applies neox-style rotary embedding to a [seq_len, num_heads, head_size]
+// tensor in-place using precomputed `cos` / `sin` of shape
+// `[seq_len, head_size/2]`. This is the ViT path used by Qwen2-VL's
+// vision encoder: Q and K are applied separately via two calls (no packed
+// QKV, no KV cache writeback, no positions table — cos/sin already
+// indexed by the caller per the per-image grid).
+//
+// Math (matches Python vLLM `ApplyRotaryEmb.forward_static` neox path):
+//   x1, x2 = chunk(x, 2, dim=-1)
+//   o1 = x1 * cos - x2 * sin
+//   o2 = x2 * cos + x1 * sin
+//   out = cat([o1, o2], dim=-1)
+//
+// In-place: writes back to the same buffer. One thread per (token, head,
+// half-pair). cos/sin are broadcast across heads (read once per
+// token+pair, no per-head index).
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void vision_rope_apply_kernel(
+    T* __restrict__ x,
+    const T* __restrict__ cos,
+    const T* __restrict__ sin,
+    int num_heads,
+    int head_size,
+    int half)
+{
+    const int token_idx = blockIdx.x;
+    const int per_head = num_heads * half;
+
+    for (int tid = threadIdx.x; tid < per_head; tid += blockDim.x) {
+        const int h  = tid / half;
+        const int hi = tid % half;
+
+        const int base = token_idx * num_heads * head_size + h * head_size;
+        const int x1_idx = base + hi;
+        const int x2_idx = base + hi + half;
+        const int cs_idx = token_idx * half + hi;
+
+        const float x1 = static_cast<float>(x[x1_idx]);
+        const float x2 = static_cast<float>(x[x2_idx]);
+        const float c  = static_cast<float>(cos[cs_idx]);
+        const float s  = static_cast<float>(sin[cs_idx]);
+
+        x[x1_idx] = static_cast<T>(x1 * c - x2 * s);
+        x[x2_idx] = static_cast<T>(x2 * c + x1 * s);
+    }
+}
+
+extern "C" {
+
+#define LAUNCH_VISION_ROPE(T)                                                  \
+    do {                                                                       \
+        const int half = head_size / 2;                                        \
+        const int per_head = num_heads * half;                                 \
+        const int threads = (per_head < 256) ? per_head : 256;                 \
+        if (per_head <= 0 || seq_len <= 0) return;                             \
+        vision_rope_apply_kernel<T><<<seq_len, threads, 0, stream>>>(          \
+            reinterpret_cast<T*>(x), reinterpret_cast<const T*>(cos),          \
+            reinterpret_cast<const T*>(sin), num_heads, head_size, half);      \
+    } while (0)
+
+void vision_rope_apply_f32(
+    void* x, const void* cos, const void* sin,
+    int seq_len, int num_heads, int head_size, cudaStream_t stream)
+{ LAUNCH_VISION_ROPE(float); }
+
+void vision_rope_apply_f16(
+    void* x, const void* cos, const void* sin,
+    int seq_len, int num_heads, int head_size, cudaStream_t stream)
+{ LAUNCH_VISION_ROPE(__half); }
+
+void vision_rope_apply_bf16(
+    void* x, const void* cos, const void* sin,
+    int seq_len, int num_heads, int head_size, cudaStream_t stream)
+{ LAUNCH_VISION_ROPE(__nv_bfloat16); }
 
 } // extern "C"

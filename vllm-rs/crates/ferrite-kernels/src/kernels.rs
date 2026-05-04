@@ -302,6 +302,19 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // QuickGELU (in-place pointwise): x[i] = x[i] * sigmoid(1.702 * x[i]).
+    // Used by Qwen2-VL's vision MLP. NOT the same as gelu_tanh/gelu_erf;
+    // the 1.702 multiplier is the OpenAI/CLIP approximation.
+    fn quick_gelu_inplace_f16(x: *mut u16, n_elements: c_int, stream: CUstream);
+    fn quick_gelu_inplace_bf16(x: *mut u16, n_elements: c_int, stream: CUstream);
+    fn quick_gelu_inplace_f32(x: *mut f32, n_elements: c_int, stream: CUstream);
+
+    // GELU (erf form, PyTorch nn.GELU() default): x * 0.5 * (1 + erf(x / sqrt(2))).
+    // Used by Qwen2-VL's PatchMerger between its two Linear layers.
+    fn gelu_erf_inplace_f16(x: *mut u16, n_elements: c_int, stream: CUstream);
+    fn gelu_erf_inplace_bf16(x: *mut u16, n_elements: c_int, stream: CUstream);
+    fn gelu_erf_inplace_f32(x: *mut f32, n_elements: c_int, stream: CUstream);
+
     // Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
     fn tanh_softcap_inplace_f16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
     fn tanh_softcap_inplace_bf16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
@@ -539,7 +552,10 @@ unsafe extern "C" {
     fn bias_add_bf16(out: *mut c_void, bias: *const c_void, m: c_int, n: c_int, stream: CUstream);
     fn bias_add_f32(out: *mut c_void, bias: *const c_void, m: c_int, n: c_int, stream: CUstream);
 
-    // Fused QKV split + RoPE (replaces split_qkv + rotary_embedding)
+    // Fused QKV split + RoPE (replaces split_qkv + rotary_embedding).
+    // MRoPE (Qwen2-VL): positions_stride0 = n_tokens for [3, n_tokens]
+    // positions; mrope_sec0/sec01 are cumulative section boundaries.
+    // Legacy 1D path: positions_stride0 = 0 (mrope_sec0/sec01 ignored).
     fn fused_qkv_rope_f16(
         q: *mut u16,
         k: *mut u16,
@@ -553,6 +569,9 @@ unsafe extern "C" {
         rotary_dim: i32,
         head_size: i32,
         num_tokens: i32,
+        positions_stride0: i32,
+        mrope_sec0: i32,
+        mrope_sec01: i32,
         stream: CUstream,
     );
     fn fused_qkv_rope_bf16(
@@ -568,6 +587,9 @@ unsafe extern "C" {
         rotary_dim: i32,
         head_size: i32,
         num_tokens: i32,
+        positions_stride0: i32,
+        mrope_sec0: i32,
+        mrope_sec01: i32,
         stream: CUstream,
     );
     fn fused_qkv_rope_f32(
@@ -583,10 +605,14 @@ unsafe extern "C" {
         rotary_dim: i32,
         head_size: i32,
         num_tokens: i32,
+        positions_stride0: i32,
+        mrope_sec0: i32,
+        mrope_sec01: i32,
         stream: CUstream,
     );
 
-    // Fused QKV split + RoPE + reshape_and_cache (decode path)
+    // Fused QKV split + RoPE + reshape_and_cache (decode path).
+    // MRoPE params have the same semantics as fused_qkv_rope_*.
     fn fused_qkv_rope_cache_f16(
         q: *mut u16,
         key_cache: *mut u16,
@@ -601,6 +627,9 @@ unsafe extern "C" {
         rotary_dim: i32,
         head_size: i32,
         num_tokens: i32,
+        positions_stride0: i32,
+        mrope_sec0: i32,
+        mrope_sec01: i32,
         stream: CUstream,
     );
     fn fused_qkv_rope_cache_bf16(
@@ -617,6 +646,9 @@ unsafe extern "C" {
         rotary_dim: i32,
         head_size: i32,
         num_tokens: i32,
+        positions_stride0: i32,
+        mrope_sec0: i32,
+        mrope_sec01: i32,
         stream: CUstream,
     );
     fn fused_qkv_rope_cache_f32(
@@ -633,6 +665,41 @@ unsafe extern "C" {
         rotary_dim: i32,
         head_size: i32,
         num_tokens: i32,
+        positions_stride0: i32,
+        mrope_sec0: i32,
+        mrope_sec01: i32,
+        stream: CUstream,
+    );
+
+    // Vision 2D RoPE apply (in-place). Used by Qwen2-VL ViT — applies
+    // neox-style rotary to a `[seq_len, num_heads, head_size]` buffer
+    // using precomputed `cos`/`sin` of shape `[seq_len, head_size/2]`.
+    // Caller invokes once for Q and once for K (no packed QKV here).
+    fn vision_rope_apply_f16(
+        x: *mut u16,
+        cos: *const u16,
+        sin: *const u16,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_size: c_int,
+        stream: CUstream,
+    );
+    fn vision_rope_apply_bf16(
+        x: *mut u16,
+        cos: *const u16,
+        sin: *const u16,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_size: c_int,
+        stream: CUstream,
+    );
+    fn vision_rope_apply_f32(
+        x: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        seq_len: c_int,
+        num_heads: c_int,
+        head_size: c_int,
         stream: CUstream,
     );
 
@@ -1874,6 +1941,55 @@ pub unsafe fn gelu_and_mul_fused(
         ),
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// QuickGELU (in-place pointwise)
+// ---------------------------------------------------------------------------
+
+/// In-place QuickGELU: `x[i] = x[i] * sigmoid(1.702 * x[i])`.
+///
+/// Used by Qwen2-VL's vision MLP (the OpenAI/CLIP approximation —
+/// NOT the same as `gelu_and_mul_fused`'s tanh-form approximation
+/// or `gelu_erf`). The 1.702 multiplier is tuned to approximate
+/// erf-GELU more cheaply.
+///
+/// # Safety
+/// `x` must be valid GPU memory; in-place write semantics — caller
+/// serializes against any other kernel touching the buffer.
+pub unsafe fn quick_gelu_inplace(x: GpuTensor, stream: CUstream) {
+    let n = x.numel() as c_int;
+    if n == 0 {
+        return;
+    }
+    match x.dtype() {
+        DType::F16 => quick_gelu_inplace_f16(x.as_mut_ptr(), n, stream),
+        DType::BF16 => quick_gelu_inplace_bf16(x.as_mut_ptr(), n, stream),
+        DType::F32 => quick_gelu_inplace_f32(x.as_mut_ptr(), n, stream),
+        _ => panic!("quick_gelu_inplace: unsupported dtype {:?}", x.dtype()),
+    }
+}
+
+/// In-place GELU (erf form): `x[i] = x[i] * 0.5 * (1 + erf(x[i] / sqrt(2)))`.
+///
+/// Matches PyTorch `nn.GELU()` default (`approximate='none'`). Used by
+/// Qwen2-VL's `Qwen2VisionPatchMerger.mlp[1]`. Distinct from
+/// `quick_gelu_inplace` (1.702 sigmoid approximation) and the tanh-form
+/// `gelu_and_mul_fused`.
+///
+/// # Safety
+/// Same as [`quick_gelu_inplace`].
+pub unsafe fn gelu_erf_inplace(x: GpuTensor, stream: CUstream) {
+    let n = x.numel() as c_int;
+    if n == 0 {
+        return;
+    }
+    match x.dtype() {
+        DType::F16 => gelu_erf_inplace_f16(x.as_mut_ptr(), n, stream),
+        DType::BF16 => gelu_erf_inplace_bf16(x.as_mut_ptr(), n, stream),
+        DType::F32 => gelu_erf_inplace_f32(x.as_mut_ptr(), n, stream),
+        _ => panic!("gelu_erf_inplace: unsupported dtype {:?}", x.dtype()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4497,10 +4613,21 @@ pub unsafe fn rotary_paged_k_cache(
 /// saving 1 kernel launch per layer per step.
 ///
 /// * `qkv`: `[num_tokens, q_size + 2*kv_size]` — fused QKV GEMM output
-/// * `positions`: `[num_tokens]` u32
+/// * `positions`: `[num_tokens]` u32 (1D, broadcast across MRoPE axes when
+///   `mrope_section.is_some()`) or `[3, num_tokens]` u32 (per-axis values for
+///   image-bearing batches on MRoPE arches). Shape is read at runtime; the
+///   kernel takes its broadcast path via `positions_stride0 = 0` when 1D.
 /// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+/// * `mrope_section`: `None` for text arches; `Some([T,H,W])` for MRoPE arches
+///   (Qwen2-VL / Qwen2.5-VL). Cumulative boundaries computed inside. The
+///   `Some + 1D positions` combo matches Python vLLM's
+///   `arange(n).expand(3, -1)` view: kernel reads `positions[token_idx]` for
+///   every axis, dispatch by section is moot because all axes return the same
+///   value, so the result is numerically identical to standard 1D rope on the
+///   same `inv_freq` table.
 /// * Returns: `(q, k, v)` where q is `[num_tokens, num_q_heads, head_dim]`,
 ///   k and v are `[num_tokens, num_kv_heads, head_dim]`.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn fused_qkv_rope(
     qkv: GpuTensor,
     positions: GpuTensor,
@@ -4510,6 +4637,7 @@ pub unsafe fn fused_qkv_rope(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    mrope_section: Option<[u32; 3]>,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> (OwnedTensor, OwnedTensor, OwnedTensor) {
@@ -4522,6 +4650,26 @@ pub unsafe fn fused_qkv_rope(
     let q = alloc.alloc_tensor(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
     let k = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
     let v = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+
+    // MRoPE: positions tensor shape determines stride0 — `[3, n_tokens]`
+    // (real per-axis values for image-bearing batches) → stride0 = n_tokens;
+    // `[n_tokens]` (1D, every axis reads the same broadcast value, including
+    // text-only Qwen2-VL) → stride0 = 0. The kernel uses
+    // `positions_stride0 != 0` as the mrope flag, so 1D positions on an
+    // mrope arch take the broadcast path with sec0/sec01 collapsed —
+    // numerically identical to standard 1D rope on the same inv_freq table.
+    // Mirrors Python vLLM's `arange(n).expand(3, -1)` stride-0 view.
+    let (positions_stride0, mrope_sec0, mrope_sec01) = match mrope_section {
+        Some([t, h, _w]) => {
+            let stride0 = if positions.ndim() == 2 && positions.dim(0) == 3 {
+                num_tokens as i32
+            } else {
+                0
+            };
+            (stride0, t as i32, (t + h) as i32)
+        }
+        None => (0, 0, 0),
+    };
 
     match qkv.dtype() {
         DType::F16 => fused_qkv_rope_f16(
@@ -4537,6 +4685,9 @@ pub unsafe fn fused_qkv_rope(
             rotary_dim,
             head_dim as i32,
             num_tokens as i32,
+            positions_stride0,
+            mrope_sec0,
+            mrope_sec01,
             stream,
         ),
         DType::BF16 => fused_qkv_rope_bf16(
@@ -4552,6 +4703,9 @@ pub unsafe fn fused_qkv_rope(
             rotary_dim,
             head_dim as i32,
             num_tokens as i32,
+            positions_stride0,
+            mrope_sec0,
+            mrope_sec01,
             stream,
         ),
         DType::F32 => fused_qkv_rope_f32(
@@ -4567,6 +4721,9 @@ pub unsafe fn fused_qkv_rope(
             rotary_dim,
             head_dim as i32,
             num_tokens as i32,
+            positions_stride0,
+            mrope_sec0,
+            mrope_sec01,
             stream,
         ),
         _ => panic!("fused_qkv_rope: unsupported dtype {:?}", qkv.dtype()),
@@ -4580,6 +4737,12 @@ pub unsafe fn fused_qkv_rope(
 /// Reads the fused QKV GEMM output, applies RoPE, writes Q to a contiguous
 /// output buffer, and writes K/V directly into the paged KV cache. Returns
 /// only Q — no intermediate K/V allocations needed.
+///
+/// `mrope_section`: see [`fused_qkv_rope`] — same shape-driven stride0 logic.
+/// `None` for text arches; `Some([T,H,W])` for MRoPE arches with stride0
+/// chosen at runtime from `positions.dims()` so a text-only batch on an
+/// MRoPE arch reuses the kernel's broadcast path (Python parity with
+/// `arange(n).expand(3, -1)`).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn fused_qkv_rope_cache(
     qkv: GpuTensor,
@@ -4592,6 +4755,7 @@ pub unsafe fn fused_qkv_rope_cache(
     kv_size: usize,
     num_q_heads: usize,
     head_dim: usize,
+    mrope_section: Option<[u32; 3]>,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
@@ -4602,6 +4766,18 @@ pub unsafe fn fused_qkv_rope_cache(
     debug_assert_eq!(total_dim, q_size + 2 * kv_size);
 
     let q = alloc.alloc_tensor(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
+
+    let (positions_stride0, mrope_sec0, mrope_sec01) = match mrope_section {
+        Some([t, h, _w]) => {
+            let stride0 = if positions.ndim() == 2 && positions.dim(0) == 3 {
+                num_tokens as i32
+            } else {
+                0
+            };
+            (stride0, t as i32, (t + h) as i32)
+        }
+        None => (0, 0, 0),
+    };
 
     match qkv.dtype() {
         DType::F16 => fused_qkv_rope_cache_f16(
@@ -4618,6 +4794,9 @@ pub unsafe fn fused_qkv_rope_cache(
             rotary_dim,
             head_dim as i32,
             num_tokens as i32,
+            positions_stride0,
+            mrope_sec0,
+            mrope_sec01,
             stream,
         ),
         DType::BF16 => fused_qkv_rope_cache_bf16(
@@ -4634,6 +4813,9 @@ pub unsafe fn fused_qkv_rope_cache(
             rotary_dim,
             head_dim as i32,
             num_tokens as i32,
+            positions_stride0,
+            mrope_sec0,
+            mrope_sec01,
             stream,
         ),
         DType::F32 => fused_qkv_rope_cache_f32(
@@ -4650,12 +4832,82 @@ pub unsafe fn fused_qkv_rope_cache(
             rotary_dim,
             head_dim as i32,
             num_tokens as i32,
+            positions_stride0,
+            mrope_sec0,
+            mrope_sec01,
             stream,
         ),
         _ => panic!("fused_qkv_rope_cache: unsupported dtype {:?}", qkv.dtype()),
     }
 
     q
+}
+
+/// Apply 2D vision RoPE (neox-style halves) to `x` in-place.
+///
+/// Used by Qwen2-VL's vision encoder. `x` is `[seq_len, num_heads, head_size]`,
+/// `cos` and `sin` are `[seq_len, head_size/2]`. Math matches Python vLLM's
+/// `ApplyRotaryEmb.forward_static` neox path:
+///
+/// ```text
+/// x1, x2 = chunk(x, 2, dim=-1)
+/// out = cat([x1*cos - x2*sin, x2*cos + x1*sin], dim=-1)
+/// ```
+///
+/// Distinct from the text-side rope kernels: no packed QKV, no KV-cache
+/// writeback, no positions table — caller indexes cos/sin per the per-image
+/// grid before the call. Invoke once for Q and once for K.
+///
+/// # Safety
+/// All tensor pointers must be valid GPU memory; shapes must match
+/// `[seq_len, num_heads, head_size]` for `x` and `[seq_len, head_size/2]`
+/// for `cos`/`sin`. Caller serializes against any other kernel using these
+/// tensors (this kernel writes `x` in-place).
+pub unsafe fn vision_rope_apply(x: GpuTensor, cos: GpuTensor, sin: GpuTensor, stream: CUstream) {
+    debug_assert_eq!(x.dtype(), cos.dtype());
+    debug_assert_eq!(x.dtype(), sin.dtype());
+    debug_assert_eq!(x.ndim(), 3);
+    debug_assert_eq!(cos.ndim(), 2);
+    debug_assert_eq!(sin.ndim(), 2);
+
+    let seq_len = x.dim(0) as i32;
+    let num_heads = x.dim(1) as i32;
+    let head_size = x.dim(2) as i32;
+    debug_assert_eq!(cos.dim(0), x.dim(0));
+    debug_assert_eq!(sin.dim(0), x.dim(0));
+    debug_assert_eq!(cos.dim(1) * 2, x.dim(2));
+    debug_assert_eq!(sin.dim(1) * 2, x.dim(2));
+
+    match x.dtype() {
+        DType::F16 => vision_rope_apply_f16(
+            x.as_mut_ptr(),
+            cos.as_ptr(),
+            sin.as_ptr(),
+            seq_len,
+            num_heads,
+            head_size,
+            stream,
+        ),
+        DType::BF16 => vision_rope_apply_bf16(
+            x.as_mut_ptr(),
+            cos.as_ptr(),
+            sin.as_ptr(),
+            seq_len,
+            num_heads,
+            head_size,
+            stream,
+        ),
+        DType::F32 => vision_rope_apply_f32(
+            x.as_mut_ptr(),
+            cos.as_ptr(),
+            sin.as_ptr(),
+            seq_len,
+            num_heads,
+            head_size,
+            stream,
+        ),
+        _ => panic!("vision_rope_apply: unsupported dtype {:?}", x.dtype()),
+    }
 }
 
 /// Fused interleaved QKV split + RoPE + reshape_and_cache (decode path, Cohere/CommandR).
@@ -10999,6 +11251,7 @@ mod tests_fused_qkv_rope_cache {
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );
@@ -11048,6 +11301,7 @@ mod tests_fused_qkv_rope_cache {
                 kv_size,
                 num_q_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );
@@ -11090,6 +11344,220 @@ mod tests_fused_qkv_rope_cache {
                 assert!(
                     (r - f).abs() < 1e-3,
                     "V cache mismatch at {i}: ref={r} fused={f}"
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// MRoPE (Qwen2-VL): positions tensor is `[3, num_tokens]` and
+    /// `mrope_section = Some([T,H,W])` partitions the half_rot rotary
+    /// pairs across three position axes. Verify the fused_qkv_rope
+    /// kernel against an independent CPU reference computation, AND
+    /// verify the degenerate case (all three position rows equal)
+    /// matches the legacy 1D path bit-for-bit.
+    ///
+    /// **Currently gated out**: `cargo test -p ferrite-kernels` cannot
+    /// link the test binary because it pulls in CUDA `.a` symbols
+    /// (`mha_varlen_fwd` etc.) that only resolve when `vllm-cli`
+    /// consumes both ferrite-kernels and vllm-cuda. The MRoPE math
+    /// will be exercised end-to-end at Phase B (`vllm chat --image`
+    /// on Qwen2-VL with `MROPE_SECTION = Some([16,24,24])`); a Python
+    /// vLLM byte-for-byte greedy match is the real verifier. The
+    /// CPU reference below stays in tree as the ground-truth spec
+    /// for that future verifier.
+    #[test]
+    #[ignore]
+    #[cfg(any())] // disabled — see docstring above
+    fn test_cuda_fused_qkv_rope_mrope() {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+
+            let num_tokens: usize = 4;
+            let num_q_heads: usize = 2;
+            let num_kv_heads: usize = 1;
+            let head_dim: usize = 8;
+            let rotary_dim: usize = 8;
+            let half_rot: usize = rotary_dim / 2; // 4
+            let q_size = num_q_heads * head_dim;
+            let kv_size = num_kv_heads * head_dim;
+            let total_dim = q_size + 2 * kv_size;
+
+            // mrope_section [2, 1, 1] sums to half_rot = 4. VEC-aligned
+            // not strictly required at this small size (scalar tail
+            // handles unaligned remainder).
+            let mrope_section: [u32; 3] = [2, 1, 1];
+
+            // Positions [3, num_tokens] in row-major: T row, H row, W row.
+            let pos_t: [u32; 4] = [0, 1, 2, 3];
+            let pos_h: [u32; 4] = [2, 3, 4, 5];
+            let pos_w: [u32; 4] = [5, 6, 7, 8];
+            let mut positions_3d: Vec<u32> = Vec::with_capacity(3 * num_tokens);
+            positions_3d.extend_from_slice(&pos_t);
+            positions_3d.extend_from_slice(&pos_h);
+            positions_3d.extend_from_slice(&pos_w);
+
+            let qkv_f32: Vec<f32> = (0..num_tokens * total_dim)
+                .map(|i| (i as f32 * 0.37 + 0.13).sin() * 2.0)
+                .collect();
+            let qkv_bf16: Vec<u16> = qkv_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            let max_pos: usize = 16;
+            let cos_sin_cache = build_cos_sin_cache(max_pos, rotary_dim, 10000.0);
+
+            // ---------- Path A: MRoPE on GPU ----------
+            let qkv_ptr = upload_bf16(&qkv_bf16, stream);
+            let pos_ptr = upload_u32(&positions_3d, stream);
+            let cache_ptr = upload_bf16(&cos_sin_cache, stream);
+
+            let (q_gpu, k_gpu, _v_gpu) = fused_qkv_rope(
+                GpuTensor::new(qkv_ptr, &[num_tokens, total_dim], DType::BF16),
+                GpuTensor::new(pos_ptr, &[3, num_tokens], DType::U32),
+                GpuTensor::new(cache_ptr, &[max_pos, rotary_dim], DType::BF16),
+                q_size,
+                kv_size,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                Some(mrope_section),
+                &mut alloc,
+                stream,
+            );
+            let q_out_bits =
+                download_bf16_raw(q_gpu.as_gpu_tensor().raw_ptr(), num_tokens * q_size, stream);
+            let k_out_bits = download_bf16_raw(
+                k_gpu.as_gpu_tensor().raw_ptr(),
+                num_tokens * kv_size,
+                stream,
+            );
+
+            // ---------- Path B: CPU reference ----------
+            // For each token t, head h, rotary index r in [0, half_rot):
+            //   axis = (r < sec0) ? 0 : (r < sec01) ? 1 : 2
+            //   pos = positions[axis, t]
+            //   c = cache[pos, r], s = cache[pos, half_rot + r]
+            //   x = qkv[t, h_off + r], y = qkv[t, h_off + half_rot + r]
+            //   out[h_off + r]            = x*c - y*s
+            //   out[h_off + half_rot + r] = y*c + x*s
+            let sec0 = mrope_section[0] as usize;
+            let sec01 = sec0 + mrope_section[1] as usize;
+            let pick_pos = |t: usize, r: usize| -> u32 {
+                let axis = if r < sec0 {
+                    0
+                } else if r < sec01 {
+                    1
+                } else {
+                    2
+                };
+                positions_3d[axis * num_tokens + t]
+            };
+            let mut q_ref = vec![0u16; num_tokens * q_size];
+            let mut k_ref = vec![0u16; num_tokens * kv_size];
+            for t in 0..num_tokens {
+                for h in 0..num_q_heads {
+                    let h_off_in = t * total_dim + h * head_dim;
+                    let h_off_out = t * q_size + h * head_dim;
+                    for r in 0..half_rot {
+                        let pos = pick_pos(t, r) as usize;
+                        let c = bf16_to_f32(cos_sin_cache[pos * rotary_dim + r]);
+                        let s = bf16_to_f32(cos_sin_cache[pos * rotary_dim + half_rot + r]);
+                        let x = bf16_to_f32(qkv_bf16[h_off_in + r]);
+                        let y = bf16_to_f32(qkv_bf16[h_off_in + half_rot + r]);
+                        q_ref[h_off_out + r] = f32_to_bf16(x * c - y * s);
+                        q_ref[h_off_out + half_rot + r] = f32_to_bf16(y * c + x * s);
+                    }
+                }
+                for h in 0..num_kv_heads {
+                    let h_off_in = t * total_dim + q_size + h * head_dim;
+                    let h_off_out = t * kv_size + h * head_dim;
+                    for r in 0..half_rot {
+                        let pos = pick_pos(t, r) as usize;
+                        let c = bf16_to_f32(cos_sin_cache[pos * rotary_dim + r]);
+                        let s = bf16_to_f32(cos_sin_cache[pos * rotary_dim + half_rot + r]);
+                        let x = bf16_to_f32(qkv_bf16[h_off_in + r]);
+                        let y = bf16_to_f32(qkv_bf16[h_off_in + half_rot + r]);
+                        k_ref[h_off_out + r] = f32_to_bf16(x * c - y * s);
+                        k_ref[h_off_out + half_rot + r] = f32_to_bf16(y * c + x * s);
+                    }
+                }
+            }
+
+            // Compare with bf16 tolerance.
+            for (i, (&g, &r)) in q_out_bits.iter().zip(q_ref.iter()).enumerate() {
+                let dg = bf16_to_f32(g);
+                let dr = bf16_to_f32(r);
+                let diff = (dg - dr).abs();
+                let scale = dg.abs().max(dr.abs()).max(1.0);
+                assert!(
+                    diff / scale < 2e-2,
+                    "Q[{i}] MRoPE mismatch: gpu={dg} ref={dr} (rel_diff={})",
+                    diff / scale
+                );
+            }
+            for (i, (&g, &r)) in k_out_bits.iter().zip(k_ref.iter()).enumerate() {
+                let dg = bf16_to_f32(g);
+                let dr = bf16_to_f32(r);
+                let diff = (dg - dr).abs();
+                let scale = dg.abs().max(dr.abs()).max(1.0);
+                assert!(
+                    diff / scale < 2e-2,
+                    "K[{i}] MRoPE mismatch: gpu={dg} ref={dr} (rel_diff={})",
+                    diff / scale
+                );
+            }
+
+            // ---------- Degenerate consistency: all three rows equal ----------
+            // Fill positions_3d so all three axes carry the same row →
+            // MRoPE output must equal the legacy 1D output bit-for-bit.
+            let positions_1d: Vec<u32> = pos_t.to_vec();
+            let mut positions_3d_eq = Vec::with_capacity(3 * num_tokens);
+            positions_3d_eq.extend_from_slice(&positions_1d);
+            positions_3d_eq.extend_from_slice(&positions_1d);
+            positions_3d_eq.extend_from_slice(&positions_1d);
+
+            let qkv_ptr_a = upload_bf16(&qkv_bf16, stream);
+            let pos_ptr_a = upload_u32(&positions_3d_eq, stream);
+            let cache_ptr_a = upload_bf16(&cos_sin_cache, stream);
+            let (q_a, _k_a, _v_a) = fused_qkv_rope(
+                GpuTensor::new(qkv_ptr_a, &[num_tokens, total_dim], DType::BF16),
+                GpuTensor::new(pos_ptr_a, &[3, num_tokens], DType::U32),
+                GpuTensor::new(cache_ptr_a, &[max_pos, rotary_dim], DType::BF16),
+                q_size,
+                kv_size,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                Some(mrope_section),
+                &mut alloc,
+                stream,
+            );
+            let q_a_bits =
+                download_bf16_raw(q_a.as_gpu_tensor().raw_ptr(), num_tokens * q_size, stream);
+
+            let qkv_ptr_b = upload_bf16(&qkv_bf16, stream);
+            let pos_ptr_b = upload_u32(&positions_1d, stream);
+            let cache_ptr_b = upload_bf16(&cos_sin_cache, stream);
+            let (q_b, _k_b, _v_b) = fused_qkv_rope(
+                GpuTensor::new(qkv_ptr_b, &[num_tokens, total_dim], DType::BF16),
+                GpuTensor::new(pos_ptr_b, &[num_tokens], DType::U32),
+                GpuTensor::new(cache_ptr_b, &[max_pos, rotary_dim], DType::BF16),
+                q_size,
+                kv_size,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                None,
+                &mut alloc,
+                stream,
+            );
+            let q_b_bits =
+                download_bf16_raw(q_b.as_gpu_tensor().raw_ptr(), num_tokens * q_size, stream);
+
+            for (i, (&a, &b)) in q_a_bits.iter().zip(q_b_bits.iter()).enumerate() {
+                assert_eq!(
+                    a, b,
+                    "Degenerate MRoPE Q[{i}] differs from 1D path: mrope=0x{a:04x} 1d=0x{b:04x}"
                 );
             }
 
@@ -11155,6 +11623,7 @@ mod tests_fused_qkv_rope_cache {
                 kv_size,
                 num_q_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );
@@ -11278,6 +11747,7 @@ mod tests_fused_qkv_rope_cache {
                 kv_size,
                 num_q_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );
@@ -11392,6 +11862,7 @@ mod tests_fused_qkv_rope_cache {
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );
@@ -11449,6 +11920,7 @@ mod tests_fused_qkv_rope_cache {
                 kv_size,
                 num_q_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );
@@ -11613,6 +12085,7 @@ mod tests_fused_qkv_rope_cache {
                 kv_size,
                 num_q_heads,
                 head_dim,
+                None,
                 &mut alloc,
                 stream,
             );

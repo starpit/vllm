@@ -363,3 +363,137 @@ void broadcast_mul_inplace_bf16(
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// QuickGELU activation (in-place pointwise)
+//
+// QuickGELU = x * sigmoid(1.702 * x). This is the OpenAI/CLIP-style
+// approximation used by Qwen2-VL's vision MLP (and the classic
+// HuggingFace `quick_gelu` activation). NOT the same as `gelu_tanh`
+// or `gelu_erf` — the multiplier 1.702 is tuned to approximate
+// erf-GELU more cheaply than the tanh form.
+//
+// Vectorized 128-bit loads/stores; one thread block per row, threads
+// stride across the d-dim.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float quick_gelu(float x) {
+    return x / (1.0f + expf(-1.702f * x));
+}
+
+template <typename T>
+__global__ void quick_gelu_inplace_kernel(T* __restrict__ x, int n_elements) {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const int total_vecs = n_elements / VEC_SIZE;
+    const int tail_start = total_vecs * VEC_SIZE;
+
+    // Vectorized loop: one warp-stride per vec.
+    for (int vi = blockIdx.x * blockDim.x + threadIdx.x;
+         vi < total_vecs;
+         vi += blockDim.x * gridDim.x)
+    {
+        T* slot = x + vi * VEC_SIZE;
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(slot), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            buf[j] = quick_gelu(buf[j]);
+        }
+        vec_store(slot, pack_vec<T>(buf));
+    }
+
+    // Scalar tail (only block 0's first warp handles it; trivial).
+    if (blockIdx.x == 0) {
+        for (int i = tail_start + threadIdx.x; i < n_elements; i += blockDim.x) {
+            x[i] = static_cast<T>(quick_gelu(static_cast<float>(x[i])));
+        }
+    }
+}
+
+extern "C" {
+
+#define LAUNCH_QUICK_GELU(T)                                                   \
+    do {                                                                       \
+        if (n_elements <= 0) return;                                           \
+        const int VEC = VecType<T>::SIZE;                                      \
+        const int total_vecs = n_elements / VEC;                               \
+        const int threads = 256;                                               \
+        const int blocks = (total_vecs > 0) ? min(1024, (total_vecs + threads - 1) / threads) : 1; \
+        quick_gelu_inplace_kernel<T><<<blocks, threads, 0, stream>>>(          \
+            reinterpret_cast<T*>(x), n_elements);                              \
+    } while (0)
+
+void quick_gelu_inplace_f32(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_QUICK_GELU(float); }
+
+void quick_gelu_inplace_f16(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_QUICK_GELU(__half); }
+
+void quick_gelu_inplace_bf16(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_QUICK_GELU(__nv_bfloat16); }
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
+// GELU (erf form) — in-place pointwise
+//
+// Standard PyTorch `nn.GELU()` (default `approximate='none'`):
+//   x * 0.5 * (1 + erf(x / sqrt(2)))
+//
+// Used by Qwen2-VL's `Qwen2VisionPatchMerger.mlp[1]` (sandwiched between
+// the two Linear layers). NOT the same as `gelu_and_mul_fused` (which
+// uses the tanh approximation) or `quick_gelu_inplace`.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void gelu_erf_inplace_kernel(T* __restrict__ x, int n_elements) {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const int total_vecs = n_elements / VEC_SIZE;
+    const int tail_start = total_vecs * VEC_SIZE;
+
+    for (int vi = blockIdx.x * blockDim.x + threadIdx.x;
+         vi < total_vecs;
+         vi += blockDim.x * gridDim.x)
+    {
+        T* slot = x + vi * VEC_SIZE;
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(slot), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            buf[j] = gelu_erf(buf[j]);
+        }
+        vec_store(slot, pack_vec<T>(buf));
+    }
+
+    if (blockIdx.x == 0) {
+        for (int i = tail_start + threadIdx.x; i < n_elements; i += blockDim.x) {
+            x[i] = static_cast<T>(gelu_erf(static_cast<float>(x[i])));
+        }
+    }
+}
+
+extern "C" {
+
+#define LAUNCH_GELU_ERF(T)                                                     \
+    do {                                                                       \
+        if (n_elements <= 0) return;                                           \
+        const int VEC = VecType<T>::SIZE;                                      \
+        const int total_vecs = n_elements / VEC;                               \
+        const int threads = 256;                                               \
+        const int blocks = (total_vecs > 0) ? min(1024, (total_vecs + threads - 1) / threads) : 1; \
+        gelu_erf_inplace_kernel<T><<<blocks, threads, 0, stream>>>(            \
+            reinterpret_cast<T*>(x), n_elements);                              \
+    } while (0)
+
+void gelu_erf_inplace_f32(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_GELU_ERF(float); }
+
+void gelu_erf_inplace_f16(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_GELU_ERF(__half); }
+
+void gelu_erf_inplace_bf16(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_GELU_ERF(__nv_bfloat16); }
+
+} // extern "C"

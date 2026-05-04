@@ -117,6 +117,24 @@ pub enum OpKind {
     /// Python vLLM's `tensor_model_parallel_all_gather` on the
     /// `LogitsProcessor` path. Lowers to `Instruction::AllGather`.
     AllGather,
+    /// Multimodal embed splice: D2D-copies projected vision-encoder
+    /// embeddings into the placeholder rows of the post-embed hidden
+    /// states. Identity-shape in-place mutation: `(x: [...]) -> [...]`.
+    /// Never appears in any per-arch DSL — produced exclusively by
+    /// `tp_lowering::insert_mm_splices`, which walks the FUF post-
+    /// `insert_all_reduces` and appends one `MmEmbedSplice` after
+    /// every `OpKind::Embed` (or after the `AllReduce` the tp pass
+    /// chained onto it). Runs on every rank; at runtime the op is a
+    /// no-op for text-only batches (empty `ForwardCtx::embed_patches`).
+    ///
+    /// Lives at the TP pass's layer (not the DSL) so the splice runs
+    /// AFTER the vocab-parallel Embed's AllReduce-sum at tp>1, where
+    /// otherwise each rank would overwrite the patch rows and the
+    /// AllReduce would multiply the splice by `tp_world_size`. At
+    /// tp=1 no AllReduce fires, and the splice sits directly on the
+    /// Embed output — same semantics as the pre-refactor
+    /// `Instruction::Embed::eval` inline splice.
+    MmEmbedSplice,
     /// Broadcast-add of a learned per-feature bias vector across the
     /// batch/token dimensions: `bias_add(x: [..., D], b: [D]) -> [..., D]`.
     /// Semantically distinct from `Add` — `Add` is same-shape
@@ -227,6 +245,9 @@ impl OpKind {
             // Same DSL-omission story as AllReduce — only the
             // lowering pass produces this op kind.
             Self::AllGather => "all_gather",
+            // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
+            // doc-comment. No DSL surface.
+            Self::MmEmbedSplice => "mm_embed_splice",
         }
     }
 }

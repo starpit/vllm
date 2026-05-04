@@ -134,6 +134,15 @@ pub struct RotaryCache {
     /// `[max_pos, rotary_dim/2]` separate sin cache (used by FA2 fused RoPE).
     pub sin_cache: GpuTensor,
     pub head_dim: usize,
+    /// MRoPE section lengths (T/H/W) for arches with multimodal RoPE
+    /// (Qwen2-VL, Qwen2.5-VL). `None` for every text-only arch — the
+    /// kernel takes the existing 1D-positions fast path. `Some([a,b,c])`
+    /// with `a+b+c == rotary_dim/2` selects the MRoPE path: kernel reads
+    /// three position values per token and dispatches each rotary pair
+    /// through the section that owns it. Plumbed through Phase A1; the
+    /// MRoPE math path itself lands in Phase A2. See
+    /// `~/.claude/plans/distributed-mapping-map.md`.
+    pub mrope_section: Option<[u32; 3]>,
 }
 
 /// Allocate + upload a `[max_pos, rotary_dim]` f32 cos|sin cache to
@@ -290,6 +299,7 @@ impl RotaryCache {
             cos_cache,
             sin_cache,
             head_dim,
+            mrope_section: None,
         })
     }
 
@@ -414,6 +424,7 @@ impl RotaryCache {
             cos_cache,
             sin_cache,
             head_dim,
+            mrope_section: None,
         })
     }
 
@@ -518,6 +529,7 @@ impl RotaryCache {
             cos_cache,
             sin_cache,
             head_dim: rope_head_dim,
+            mrope_section: None,
         })
     }
 
@@ -603,6 +615,7 @@ impl RotaryCache {
             cos_cache,
             sin_cache,
             head_dim,
+            mrope_section: None,
         })
     }
 

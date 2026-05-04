@@ -2188,6 +2188,7 @@ dependencies = [
  "ferrite-forward",
  "ferrite-gguf",
  "ferrite-kernels",
+ "half",
  "tracing",
 ]
 
@@ -2200,6 +2201,18 @@ dependencies = [
  "ferrite-forward",
  "ferrite-gguf",
  "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
+name = "ferrite-model-qwen2-vl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "half",
  "tracing",
 ]
 
@@ -2244,6 +2257,7 @@ dependencies = [
  "ferrite-model-phi3",
  "ferrite-model-qwen2",
  "ferrite-model-qwen2-moe",
+ "ferrite-model-qwen2-vl",
  "ferrite-model-qwen3",
  "ferrite-model-qwen3-moe",
 ]
@@ -7898,6 +7912,7 @@ name = "vllm-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "half",
  "reqwest 0.12.28",
  "safetensors 0.7.0",

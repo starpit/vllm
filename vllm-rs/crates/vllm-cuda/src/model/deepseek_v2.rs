@@ -217,6 +217,7 @@ pub unsafe fn yarn_rotary_cache(
         cos_cache: GpuTensor::new(std::ptr::null_mut(), &[0, 0], dtype),
         sin_cache: GpuTensor::new(std::ptr::null_mut(), &[0, 0], dtype),
         head_dim: rope_dim,
+        mrope_section: None,
     })
 }
 

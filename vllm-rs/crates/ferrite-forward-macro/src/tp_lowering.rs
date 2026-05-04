@@ -266,6 +266,55 @@ pub fn insert_lm_head_allgather(fuf: &mut Fuf, program: &Program, tp_world_size:
     }
 }
 
+/// Walk the FUF and inject `OpKind::MmEmbedSplice` after every
+/// `OpKind::Embed`. Runs **after** `insert_all_reduces` so at tp>1
+/// the insertion sees the already-rewired state: if the Embed had
+/// a vocab-parallel AllReduce chained onto it, the splice reads
+/// that AllReduce's output. At tp=1 the splice reads the Embed
+/// directly.
+///
+/// Unconditional at every tp (including tp=1) — the splice op is
+/// a runtime no-op when `ForwardCtx::embed_patches` is empty, so
+/// text-only batches pay one branch per forward pass. This
+/// replaces the pre-refactor inline splice inside
+/// `Instruction::Embed::eval`, which was wrong at tp>1 (every
+/// rank's D2D overwrite got summed by the post-Embed AllReduce,
+/// multiplying mm_embeds by `tp_world_size`).
+pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
+    let mut insertions: Vec<TileId> = Vec::new();
+    for node in &fuf.nodes {
+        if node.op != OpKind::Embed {
+            continue;
+        }
+        let embed_id = node.id;
+        let reduce_id = fuf.nodes.iter().find_map(|n| {
+            if n.op != OpKind::AllReduce {
+                return None;
+            }
+            match n.inputs.first() {
+                Some(FufInput::Tile { id, .. }) if *id == embed_id => Some(n.id),
+                _ => None,
+            }
+        });
+        insertions.push(reduce_id.unwrap_or(embed_id));
+    }
+
+    for src_id in insertions {
+        let src_shape = fuf.get(src_id).outputs[0].clone();
+        let new_id = TileId(fuf.nodes.len() as u32);
+        fuf.nodes.push(FufNode {
+            id: new_id,
+            op: OpKind::MmEmbedSplice,
+            inputs: vec![FufInput::Tile {
+                id: src_id,
+                slot: 0,
+            }],
+            outputs: vec![src_shape],
+        });
+        rewire_consumers(fuf, src_id, new_id);
+    }
+}
+
 /// Rewire every consumer of `(old_id, slot 0)` to read `(new_id,
 /// slot 0)` instead. Skips `old_id` (no self-reference) and
 /// `new_id` (which intentionally reads from `old_id` as the

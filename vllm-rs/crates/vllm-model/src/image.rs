@@ -101,7 +101,7 @@ pub fn preprocess_qwen2_vl(img: &DynamicImage, target_h: usize, target_w: usize)
     let resized = img.resize_exact(
         target_w as u32,
         target_h as u32,
-        FilterType::Triangle, // bilinear
+        FilterType::CatmullRom, // bicubic — matches HF Qwen2VLImageProcessor.resample=3
     );
     let rgb = resized.to_rgb8();
 
@@ -199,6 +199,51 @@ pub fn expand_image_placeholders(
                 length: num_tokens_per_image,
             });
             i += num_tokens_per_image;
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Per-image variant of [`expand_image_placeholders`]. Each occurrence
+/// of `image_token_id` in `token_ids` is expanded by `counts[k]`
+/// (where `k` is the image index, 0-based in scan order). Required for
+/// arches like Qwen2-VL whose vision encoder produces a variable
+/// post-merger token count per image — the count depends on each
+/// image's `smart_resize` output dimensions, which are different for
+/// different aspect ratios. Walking `counts` in lockstep with
+/// `image_token_id` occurrences mirrors the
+/// `extract_images_from_messages` ordering.
+///
+/// If `counts` is shorter than the number of placeholder occurrences,
+/// the trailing extras stay unexpanded (length 1) — the caller is
+/// responsible for matching `images.len() == counts.len()`. The
+/// returned ranges only cover the indices that were expanded.
+pub fn expand_image_placeholders_per_image(
+    token_ids: &mut Vec<u32>,
+    image_token_id: u32,
+    counts: &[usize],
+) -> Vec<vllm_common::multimodal::PlaceholderRange> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    let mut k = 0;
+    while i < token_ids.len() {
+        if token_ids[i] == image_token_id {
+            if k >= counts.len() {
+                // No more per-image counts — leave trailing placeholders alone.
+                i += 1;
+                continue;
+            }
+            let n = counts[k];
+            let offset = i;
+            let extra = n.saturating_sub(1);
+            for _ in 0..extra {
+                token_ids.insert(i + 1, image_token_id);
+            }
+            ranges.push(vllm_common::multimodal::PlaceholderRange { offset, length: n });
+            i += n;
+            k += 1;
         } else {
             i += 1;
         }

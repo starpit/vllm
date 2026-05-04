@@ -402,6 +402,14 @@ pub fn apply_signature(
         OpKind::MlaSplit => sig_mla_split(solver, inputs),
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
         OpKind::Moe => sig_moe(solver, inputs),
+        // MmEmbedSplice: identity-shape one-input in-place. Same
+        // signature as AllReduce — the splice mutates the embed
+        // output buffer, shape unchanged. Never inserted by the DSL;
+        // the lowering pass `insert_mm_splices` writes the node
+        // post-FUF-build with outputs[0] == inputs[0], so reaching
+        // this arm via `apply_signature` is fine: sig_unary_elementwise
+        // re-unifies and agrees.
+        OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
     }
 }
 
@@ -723,6 +731,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // Moe's moe[layer] is a struct (not a tensor) at arg 1;
         // weight_arg_ranks governs shape-rank assertion only, so we skip it.
         OpKind::Moe => &[],
+        // MmEmbedSplice takes one activation input, no tensor weight.
+        OpKind::MmEmbedSplice => &[],
     }
 }
 

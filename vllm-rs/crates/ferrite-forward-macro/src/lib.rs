@@ -617,6 +617,14 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             // byte-identical to single-rank builds.
             tp_lowering::insert_all_reduces(&mut model_fuf, &classified, tp_world_size);
             tp_lowering::insert_lm_head_allgather(&mut model_fuf, &classified, tp_world_size);
+            // Multimodal post-Embed splice. Unconditional at every tp
+            // (including tp=1) — runtime no-op for text-only batches.
+            // Must run AFTER `insert_all_reduces` so at tp>1 the
+            // splice sits on the reduced embedding (not each rank's
+            // partial masked-gather, which the pre-refactor inline
+            // splice inside `Instruction::Embed::eval` mistakenly
+            // overwrote).
+            tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
 
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
@@ -750,6 +758,15 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                         // row-parallel gemms + vocab-parallel embed;
                         // AllGather after lm_head). Maps to NCCL —
                         // semantically distinct from compute kernels.
+                        Some(7) // comm
+                    } else if name == "mm_embed_splice" {
+                        // Multimodal post-Embed D2D splice inserted by
+                        // `tp_lowering::insert_mm_splices`. Not a
+                        // compute kernel — runs a sequence of
+                        // memcpy_dtod_async calls per image placeholder.
+                        // Bucketed alongside the comm kernels since
+                        // they share the "not a GEMM / not a normal
+                        // per-token kernel" shape.
                         Some(7) // comm
                     } else if name.starts_with("fused_") || name == "gemm_ref" {
                         Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)

@@ -319,6 +319,7 @@ impl LlamaAttention {
                         self.kv_size,
                         self.num_q_heads,
                         self.head_dim,
+                        None,
                         &mut device.caching,
                         device.compute_stream,
                     )

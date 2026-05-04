@@ -495,6 +495,7 @@ impl Gemma2Attention {
                     self.kv_size,
                     self.num_q_heads,
                     self.head_dim,
+                    None,
                     &mut device.caching,
                     device.compute_stream,
                 )
@@ -562,6 +563,7 @@ impl Gemma2Attention {
             self.num_q_heads,
             self.num_kv_heads,
             self.head_dim,
+            None,
             &mut device.caching,
             device.compute_stream,
         );

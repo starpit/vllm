@@ -425,8 +425,10 @@ impl TestModels {
     pub const MODERNBERT_BASE: &str = "answerdotai/ModernBERT-base";
 
     // Qwen2-VL multimodal (vision-language) models
-    // Tier 3: ~3.8 GB BF16 SafeTensors — Candle path
-    pub const QWEN2_VL_2B_INSTRUCT: &str = "unsloth/Qwen2-VL-2B-Instruct";
+    // Tier 3: ~4.4 GB BF16 SafeTensors — ferrite-model-qwen2 path. The
+    // unsloth single-file mirror does not match the loader's shard probe
+    // and falls through to the cuda-backend match (no Qwen2-VL arm).
+    pub const QWEN2_VL_2B_INSTRUCT: &str = "Qwen/Qwen2-VL-2B-Instruct";
     // Tier 4: ~4.6 GB 4-bit quantized — MLX path
     pub const QWEN2_VL_7B_4BIT: &str = "mlx-community/Qwen2-VL-7B-4bit";
 }

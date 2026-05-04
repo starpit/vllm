@@ -12,7 +12,12 @@
 //! bias rides through one fused kernel launch, not a separate add.
 //!
 //! One `#[forward]` body per architecture; per-model configs fan out
-//! via `crates/ferrite-model-qwen2/configs/*.json`.
+//! via `crates/ferrite-model-qwen2/configs/*.json`. The `qwen2-vl-2b.json`
+//! config registers this text-decoder forward for arch
+//! `Qwen2VLForConditionalGeneration`; the vision tower for that arch
+//! lives in the sibling `ferrite-model-qwen2-vl` crate, which contributes
+//! its own `MultimodalForward` registration via `inventory::submit!`.
+//! Qwen2.5-VL is `ferrite-model-qwen2-5-vl` (different vision math).
 
 use ferrite_forward::forward;
 

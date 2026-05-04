@@ -194,6 +194,8 @@ mod ctx {
     use ferrite_cuda_core::tensor::TensorView;
     use ferrite_kernels::kv_cache::KvCachePool;
 
+    use super::EmbedPatch;
+
     /// Ambient runtime args the emitted forward fn needs. The
     /// caller builds a `ForwardCtx` per forward call and passes
     /// it in. Fields are the union of what any ported kernel
@@ -205,6 +207,15 @@ mod ctx {
     /// threaded through here.
     pub struct ForwardCtx<'a> {
         pub input_ids: TensorView<'a>,
+        /// Positions tensor. Shape contract:
+        /// - Text arches (`W::MROPE_SECTION == None`): `[n_tokens]` u32.
+        /// - MRoPE arches (Qwen2-VL etc. with `W::MROPE_SECTION == Some(_)`):
+        ///   `[3, n_tokens]` u32 — rows are (T, H, W) coordinates;
+        ///   the rope kernel reads each rotary index from the row that
+        ///   `mrope_section` assigns it to. Must be set up by whoever
+        ///   constructs the `ForwardCtx` (currently the `Self::Ferrite`
+        ///   arm in `vllm-executor::cuda_worker`); ferrite-forward
+        ///   itself is shape-agnostic past the kernel boundary.
         pub positions: TensorView<'a>,
         pub slot_mapping: TensorView<'a>,
         pub cu_seqlens_q: TensorView<'a>,
@@ -213,6 +224,18 @@ mod ctx {
         pub max_seqlen_q: usize,
         pub max_seqlen_k: usize,
         pub kv_cache: &'a KvCachePool,
+        /// Multimodal embed splice. `mm_embeds` carries the projected
+        /// vision-encoder output `[total_mm_tokens, hidden]` produced by
+        /// [`super::MultimodalForward::vision_forward`]; `embed_patches`
+        /// names the destination ranges in the input-id sequence. After
+        /// the `Instruction::Embed` arm gathers `embed_tokens`, it
+        /// D2D-copies each patch's slice from `mm_embeds` into the
+        /// gather output's corresponding rows. Empty `embed_patches` =
+        /// text-only batch, no splice — byte-identical to pre-MM
+        /// behavior. `mm_embeds = None` is only valid when
+        /// `embed_patches` is empty.
+        pub mm_embeds: Option<TensorView<'a>>,
+        pub embed_patches: &'a [EmbedPatch],
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when
@@ -366,6 +389,157 @@ mod dispatcher {
 
     inventory::collect!(FerriteArchRegistration);
 
+    // ── Multimodal sibling surface ────────────────────────────────
+    //
+    // `MultimodalForward` is a sibling trait, NOT a default-method
+    // extension on `FerriteWeights`. Text-only arches don't
+    // implement it. Discovery uses a sibling inventory row so the
+    // text-side `FerriteArchRegistration` stays untouched and
+    // text-only arches never need to know MM exists. cuda_worker
+    // calls `try_load_mm` after `try_load` succeeds; an arch with
+    // no MM submission yields `Ok(None)` and the worker proceeds
+    // text-only. Phase B of the multimodal plan
+    // (`~/.claude/plans/distributed-mapping-map.md`) lands the
+    // surface; per-arch impls land in Phase D.
+
+    /// One image's preprocessed pixel input, post-CPU-normalization.
+    /// Pixels are uploaded to GPU by `vision_forward`; CPU-side
+    /// `MultimodalData` (`vllm-common::ImageData`) is the boundary
+    /// type the engine plumbs in, this is the interior shape the
+    /// vision encoder consumes.
+    #[derive(Debug)]
+    pub struct PixelInput<'a> {
+        /// Flat normalized pixels in CHW layout, length =
+        /// `3 * height * width`. Borrowed; `vision_forward` uploads
+        /// to GPU and the borrow ends when it returns.
+        pub pixels: &'a [f32],
+        pub height: u32,
+        pub width: u32,
+    }
+
+    /// One projected image's embedding location in the token
+    /// sequence, plus a slice of the encoder output that occupies
+    /// it. The slice is `[token_offset .. token_offset + length]`
+    /// of `vision_forward`'s returned `OwnedTensor`. Mirrors
+    /// `vllm-common::PlaceholderRange` but in token-space (post-
+    /// expansion); cuda_worker's splice consumes these directly.
+    ///
+    /// `grid_t` / `grid_h_merged` / `grid_w_merged` carry the
+    /// per-image grid dimensions (post spatial-merge) so the
+    /// executor can build `[3, n_tokens]` MRoPE positions for image-
+    /// bearing batches on Qwen2-VL-class arches: image tokens
+    /// scan in `(t, h, w)` row-major order with each row of the
+    /// positions tensor holding the corresponding axis's coordinate.
+    /// Caller (cuda_worker) initializes these to zero when
+    /// constructing the input `placeholders`; `vision_forward` fills
+    /// them on the returned `Vec<EmbedPatch>` by zipping its
+    /// per-image `grid_thw` with `placeholders`. Text-only arches
+    /// that never call `vision_forward` leave them at zero —
+    /// `length == grid_t * grid_h_merged * grid_w_merged` is the
+    /// post-merger invariant for filled patches.
+    #[derive(Debug, Clone, Default)]
+    pub struct EmbedPatch {
+        /// Position in the input-id sequence where this image's
+        /// projected embeddings start.
+        pub token_offset: u32,
+        /// Number of token slots this image occupies (= number of
+        /// rows in the corresponding slice of the projected
+        /// `OwnedTensor`).
+        pub length: u32,
+        /// Temporal-axis grid size (1 for still images on Qwen2-VL,
+        /// >1 for video frames).
+        pub grid_t: u32,
+        /// Height-axis grid size after spatial merge (= raw `grid_h
+        /// / spatial_merge_size`).
+        pub grid_h_merged: u32,
+        /// Width-axis grid size after spatial merge (= raw `grid_w
+        /// / spatial_merge_size`).
+        pub grid_w_merged: u32,
+    }
+
+    /// Sibling trait to [`FerriteWeights`]. Implemented ONLY by
+    /// arches with a vision component — the qwen2 carrier-fn's
+    /// emitted `Weights` does NOT implement it; only the Qwen2-VL
+    /// variant's wrapper does. No `unimplemented!` defaults: arches
+    /// that don't carry a vision encoder simply don't implement
+    /// the trait, and their inventory rows don't surface here.
+    ///
+    /// Phase D of the multimodal plan lands the first impl
+    /// (qwen2 vision encoder). Until then this trait has zero
+    /// callers and `try_load_mm` always returns `Ok(None)`.
+    pub trait MultimodalForward: Send + Sync {
+        /// Encode one or more pixel batches and project into the
+        /// language model's hidden space.
+        ///
+        /// Returns:
+        /// - An `OwnedTensor` `[total_mm_tokens, hidden]` — the
+        ///   stacked projected embeddings for every image, in the
+        ///   order they appear in the input batch.
+        /// - A `Vec<EmbedPatch>` of the same length as `pixel_batches`
+        ///   recording where each image's slice lands in the token
+        ///   sequence. `cuda_worker`'s splice consumes these to D2D-
+        ///   copy each slice into the corresponding `Embed` tile rows.
+        ///
+        /// # Safety
+        /// `device` must be the live CUDA device the encoder
+        /// kernels launch on; the caller must keep `pixel_batches`
+        /// alive for the duration of the call (the host-side
+        /// borrow ends before any returned GPU memory is read).
+        unsafe fn vision_forward(
+            &self,
+            pixel_batches: &[PixelInput<'_>],
+            placeholders: &[EmbedPatch],
+            device: &mut GpuDevice,
+        ) -> (OwnedTensor, Vec<EmbedPatch>);
+
+        /// Pure-CPU companion to [`Self::vision_forward`]. Returns one
+        /// `(grid_t, grid_h_merged, grid_w_merged)` tuple per input image
+        /// — the same metadata that `vision_forward` would fill on each
+        /// returned [`EmbedPatch`], without launching any GPU work.
+        ///
+        /// The cached-prefix path (`tokens_before > 0` for an MM-bearing
+        /// req: vision encoder already ran on a prior step and the
+        /// projected embeds live in cached KV blocks) uses this to
+        /// reconstruct the same per-image grid info that
+        /// `cuda_worker::build_mrope_positions_2d` needs to compute
+        /// MRoPE positions for the cached tokens. Without it, fall-back
+        /// 1D positions for the trailing new tokens disagree with the
+        /// 3D MRoPE positions used to encode the cached KV → attention
+        /// goes haywire and the model emits `<|im_end|>` immediately.
+        fn embed_patch_grids(&self, pixel_batches: &[PixelInput<'_>]) -> Vec<(u32, u32, u32)>;
+    }
+
+    /// Sibling MM-load fn. Same dispatch shape as [`ArchTryLoadFn`]
+    /// — caller's `GpuWeights` already carries every tensor on disk
+    /// (including `visual.*` for an MM checkpoint), so this fn
+    /// extracts the vision sub-tree and returns a handle. Returns
+    /// `Ok(None)` when the arch claims the HF arch string but the
+    /// live checkpoint has no vision tensors (text-only checkpoint
+    /// loaded through an MM-capable arch entry — falls through).
+    pub type MmTryLoadFn = fn(
+        &mut GpuWeights,
+        CUstream,
+        usize, // max_model_len
+        u8,    // tp_rank
+        HfFingerprint<'_>,
+    ) -> ::anyhow::Result<Option<Box<dyn MultimodalForward>>>;
+
+    /// Sibling registration row. One per arch that ships a vision
+    /// encoder. `hf_arches` and `gguf_archs` follow the same rules
+    /// as [`FerriteArchRegistration`] but the keys typically only
+    /// list the multimodal-conditional-generation variants
+    /// (e.g. `Qwen2VLForConditionalGeneration`, NOT plain
+    /// `Qwen2ForCausalLM`).
+    pub struct FerriteMmRegistration {
+        pub arch_name: &'static str,
+        pub hf_arches: &'static [&'static str],
+        pub gguf_archs: &'static [&'static str],
+        pub tp_world_size: u8,
+        pub try_load_mm: MmTryLoadFn,
+    }
+
+    inventory::collect!(FerriteMmRegistration);
+
     /// Top-level ferrite loader. Walks every `#[forward]`-registered
     /// arch; the first whose `hf_arches` list contains `arch_hint`
     /// AND whose `tp_world_size` matches the runtime `tp_world_size`
@@ -411,10 +585,38 @@ mod dispatcher {
             .find_map(|reg| (reg.try_load)(gw, stream, max_model_len, tp_rank, hf).transpose())
             .transpose()
     }
+
+    /// MM-handle counterpart to [`try_load`]. Walks
+    /// [`FerriteMmRegistration`] rows for the same
+    /// `(arch_hint, tp_world_size)` filter. Returns `Ok(None)`
+    /// when no MM-capable arch claims the HF identifier — the
+    /// expected case for text-only checkpoints, where cuda_worker
+    /// proceeds with `embed_patches: &[]`. Phase D of the
+    /// multimodal plan lands the first row.
+    pub fn try_load_mm(
+        gw: &mut GpuWeights,
+        stream: CUstream,
+        arch_hint: &str,
+        tp_world_size: u8,
+        tp_rank: u8,
+        max_model_len: usize,
+        hf: HfFingerprint<'_>,
+    ) -> ::anyhow::Result<Option<Box<dyn MultimodalForward>>> {
+        inventory::iter::<FerriteMmRegistration>()
+            .filter(|reg| {
+                (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
+                    && reg.tp_world_size == tp_world_size
+            })
+            .find_map(|reg| (reg.try_load_mm)(gw, stream, max_model_len, tp_rank, hf).transpose())
+            .transpose()
+    }
 }
 
 #[cfg(feature = "cuda")]
-pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
+pub use dispatcher::{
+    EmbedPatch, FerriteArchRegistration, FerriteMmRegistration, FerriteWeights, HfFingerprint,
+    MmTryLoadFn, MultimodalForward, PixelInput, try_load, try_load_mm,
+};
 
 /// Re-export `inventory` so the `#[forward]`-macro-emitted
 /// `inventory::submit!` block resolves without the consuming crate

@@ -104,9 +104,36 @@ pub struct CudaWorkerConfig {
     pub max_model_len: Option<usize>,
 }
 
+/// Per-image MRoPE metadata in seq space, used by
+/// [`CudaWorker::build_mrope_positions_2d`] to walk the entire seq for
+/// each MM-bearing req (including the cached-prefix portion) so the
+/// cursor lands at the same position the encoder used to encode KV.
+///
+/// Tuple is `(seq_offset, length, grid_t, grid_h_merged, grid_w_merged)`
+/// where `seq_offset` is relative to the req's full sequence start (NOT
+/// batch start) — the same coordinate system as `PlaceholderRange.offset`.
+type SeqMmInfo = (u32, u32, u32, u32, u32);
+
 // ---------------------------------------------------------------------------
 // Model enum (dispatches to LLaMA / Qwen2 / Gemma2)
 // ---------------------------------------------------------------------------
+
+/// Per-forward multimodal inputs threaded into `CudaModel::forward` /
+/// `hidden_states`. Built once per step in `execute_model_inner` from the
+/// active batch's cached `MultimodalData`, consumed only by the
+/// `Self::Ferrite` arm — every other (text-only) arm ignores it.
+///
+/// `mm_embeds` is the projected vision-encoder output `[total_mm_tokens,
+/// hidden]` produced by `MultimodalForward::vision_forward`;
+/// `embed_patches` names where each image's slice lands in the flat input-
+/// id sequence (token-space). The Ferrite arm copies both into
+/// `ForwardCtx`, where `Instruction::Embed::eval` D2D-splices each patch
+/// into the gather output. Empty / `None` is the text-only no-op path —
+/// byte-identical to before MM landed.
+pub struct MmForwardInputs<'a> {
+    pub mm_embeds: TensorView<'a>,
+    pub embed_patches: &'a [ferrite_forward::EmbedPatch],
+}
 
 /// A dense-bf16 Llama loaded through the new ferrite-forward
 /// compiler. Holds the specialized `Weights` enum (one variant per
@@ -126,6 +153,17 @@ pub struct CudaWorkerConfig {
 /// here.
 pub struct FerriteModel {
     pub weights: Box<dyn ferrite_forward::FerriteWeights>,
+    /// Vision-encoder handle for multimodal arches. `Some(_)` only
+    /// when the loaded checkpoint carries `visual.*` tensors AND the
+    /// arch has submitted a `FerriteMmRegistration` row claiming the
+    /// HF arch string. cuda_worker calls
+    /// `mm.vision_forward(pixel_batches, placeholders, device)` when
+    /// the request batch carries `mm_data`; the result threads into
+    /// `ForwardCtx.mm_embeds` / `embed_patches` for the
+    /// `Instruction::Embed::eval` splice. `None` for every text-only
+    /// arch — the splice arm sees `embed_patches.is_empty()` and
+    /// degenerates to plain `embedding_gather_masked`.
+    pub mm: Option<Box<dyn ferrite_forward::MultimodalForward>>,
     /// NCCL communicator the worker injects via `set_tp_group` after
     /// construction. Threaded into `ForwardCtx::tp_group` on every
     /// forward call — the universal `Instruction::AllReduce` arm
@@ -315,6 +353,7 @@ impl CudaModel {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
+        mm_inputs: Option<&MmForwardInputs<'_>>,
     ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Llama(m) => unsafe {
@@ -366,6 +405,10 @@ impl CudaModel {
             // to the per-arch `forward_backbone(&weights, &ctx, ...)`.
             Self::Ferrite(m) => unsafe {
                 let num_tokens = input_ids.dim(0) as u64;
+                let (mm_embeds, embed_patches) = match mm_inputs {
+                    Some(mm) => (Some(mm.mm_embeds), mm.embed_patches),
+                    None => (None, &[][..]),
+                };
                 let ctx = ferrite_forward::ForwardCtx {
                     input_ids,
                     positions,
@@ -376,6 +419,8 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
+                    mm_embeds,
+                    embed_patches,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -501,6 +546,7 @@ impl CudaModel {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<TensorView<'_>>,
+        mm_inputs: Option<&MmForwardInputs<'_>>,
     ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Llama(m) => unsafe {
@@ -561,6 +607,10 @@ impl CudaModel {
             // in the DSL so the user can place it before lm_head.
             Self::Ferrite(m) => unsafe {
                 let num_tokens = input_ids.dim(0) as u64;
+                let (mm_embeds, embed_patches) = match mm_inputs {
+                    Some(mm) => (Some(mm.mm_embeds), mm.embed_patches),
+                    None => (None, &[][..]),
+                };
                 let ctx = ferrite_forward::ForwardCtx {
                     input_ids,
                     positions,
@@ -571,6 +621,8 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
+                    mm_embeds,
+                    embed_patches,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -1675,6 +1727,13 @@ pub struct CudaWorker {
     prompt_lengths: HashMap<String, usize>,
     /// Per-request block annotations for span-aware RoPE.
     annotation_buffers: HashMap<String, vllm_common::BlockAnnotations>,
+    /// Per-request multimodal data (images), only populated for requests
+    /// scheduled at first as image-bearing. The vision encoder runs once
+    /// per request at first prefill, so the cached entry is removed after
+    /// that step (image tokens beyond the first prefill chunk continue to
+    /// reference the spliced embeds via the KV cache's stored attention
+    /// keys/values — no re-encode needed).
+    mm_data_buffers: HashMap<String, vllm_common::MultimodalData>,
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
@@ -1801,6 +1860,7 @@ impl CudaWorker {
             token_buffers: HashMap::new(),
             prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
+            mm_data_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
@@ -2499,6 +2559,219 @@ impl CudaWorker {
             max_seqlen_q,
             max_seqlen_k,
         ))
+    }
+
+    /// Run the vision encoder for any active request whose first prefill
+    /// chunk includes its image placeholders. Returns
+    /// `(mm_embeds, embed_patches)` ready to thread into
+    /// `MmForwardInputs` — `mm_embeds` is `[total_mm_tokens, hidden]`,
+    /// `embed_patches[i].token_offset` is the destination row in the
+    /// flat input-id sequence (post batch concatenation).
+    ///
+    /// Returns `None` when there's nothing to encode this step:
+    /// - non-Ferrite arch, or Ferrite arch with no MM handle (text-only),
+    /// - no req in the active batch carries `mm_data`,
+    /// - no MM-bearing req is at its first scheduling step
+    ///   (`tokens_before == 0`).
+    ///
+    /// MVP: assumes the prefill chunk for an MM-bearing req covers ALL
+    /// its image placeholders (no chunked-prefill split across image
+    /// boundaries). For typical Qwen2-VL-2B prompts (256 tokens / image)
+    /// this holds inside a single 2048-token prefill chunk; the chunked
+    /// case is a follow-up.
+    ///
+    /// # Safety
+    /// `device` must be the live CUDA device the encoder kernels
+    /// launch on. The returned `OwnedTensor` is on `device.compute_stream`
+    /// — the caller must keep it alive across the language-side
+    /// `model.forward` call so the `Instruction::Embed::eval` D2D
+    /// splice still has live source memory.
+    unsafe fn run_mm_vision_forward(
+        model: &CudaModel,
+        mm_data_buffers: &HashMap<String, vllm_common::MultimodalData>,
+        prepared: &PreparedInputs,
+        device: &mut GpuDevice,
+    ) -> Option<(OwnedTensor, Vec<ferrite_forward::EmbedPatch>)> {
+        let CudaModel::Ferrite(fm) = model else {
+            return None;
+        };
+        let mm = fm.mm.as_ref()?;
+        let meta = &prepared.attn_meta;
+        let mut pixel_inputs: Vec<ferrite_forward::PixelInput<'_>> = Vec::new();
+        let mut placeholders: Vec<ferrite_forward::EmbedPatch> = Vec::new();
+        for (i, req) in prepared.req_inputs.iter().enumerate() {
+            let Some(mm_data) = mm_data_buffers.get(&req.req_id) else {
+                continue;
+            };
+            // Only run vision_forward for the first prefill chunk —
+            // subsequent decode steps consume already-spliced KV cache.
+            if meta.tokens_before[i] != 0 {
+                continue;
+            }
+            let batch_offset = meta.query_start_loc[i] as u32;
+            for (img, ph) in mm_data.images.iter().zip(mm_data.image_placeholders.iter()) {
+                pixel_inputs.push(ferrite_forward::PixelInput {
+                    pixels: &img.pixels,
+                    height: img.height as u32,
+                    width: img.width as u32,
+                });
+                placeholders.push(ferrite_forward::EmbedPatch {
+                    token_offset: batch_offset + ph.offset as u32,
+                    length: ph.length as u32,
+                    // Filled by `vision_forward` from per-image
+                    // `grid_thw` + `spatial_merge_size`. Default zero
+                    // here is invalid for MRoPE; the encoder must
+                    // populate before the executor reads them.
+                    grid_t: 0,
+                    grid_h_merged: 0,
+                    grid_w_merged: 0,
+                });
+            }
+        }
+        if pixel_inputs.is_empty() {
+            return None;
+        }
+        let (out, patches) = unsafe { mm.vision_forward(&pixel_inputs, &placeholders, device) };
+        Some((out, patches))
+    }
+
+    /// Build per-req seq-space MM info for **every** MM-bearing req in
+    /// the active batch — including ones whose vision encoder already
+    /// ran on a prior step (cached prefix). Empty inner `Vec` for any
+    /// req without mm_data. Returns an all-empty outer `Vec` when no
+    /// req carries mm_data (text-only batch → caller falls back to 1D
+    /// positions, byte-identical to pre-MM behavior).
+    ///
+    /// Tuple is `(seq_offset, length, grid_t, grid_h_merged, grid_w_merged)`
+    /// in seq space (offset relative to the req's full sequence start,
+    /// not batch start). [`Self::build_mrope_positions_2d`] walks the
+    /// entire seq — including the cached prefix — so the cursor lands
+    /// at the same position the encoder used to write KV the first
+    /// time around.
+    fn build_per_req_mm_seq_info(
+        model: &CudaModel,
+        mm_data_buffers: &HashMap<String, vllm_common::MultimodalData>,
+        prepared: &PreparedInputs,
+    ) -> Vec<Vec<SeqMmInfo>> {
+        let mut per_req: Vec<Vec<SeqMmInfo>> = vec![Vec::new(); prepared.req_inputs.len()];
+        let CudaModel::Ferrite(fm) = model else {
+            return per_req;
+        };
+        let Some(mm) = fm.mm.as_ref() else {
+            return per_req;
+        };
+        let mut any = false;
+        for (i, req) in prepared.req_inputs.iter().enumerate() {
+            let Some(mm_data) = mm_data_buffers.get(&req.req_id) else {
+                continue;
+            };
+            if mm_data.images.is_empty() {
+                continue;
+            }
+            let pixel_inputs: Vec<ferrite_forward::PixelInput<'_>> = mm_data
+                .images
+                .iter()
+                .map(|img| ferrite_forward::PixelInput {
+                    pixels: &img.pixels,
+                    height: img.height as u32,
+                    width: img.width as u32,
+                })
+                .collect();
+            let grids = mm.embed_patch_grids(&pixel_inputs);
+            for (ph, &(gt, mh, mw)) in mm_data.image_placeholders.iter().zip(grids.iter()) {
+                per_req[i].push((ph.offset as u32, ph.length as u32, gt, mh, mw));
+            }
+            // Sort by seq offset so the walk visits patches in order.
+            per_req[i].sort_by_key(|t| t.0);
+            any = true;
+        }
+        if !any {
+            return Vec::new();
+        }
+        per_req
+    }
+
+    /// Build `[3, n_tokens]` u32 MRoPE positions for an image-bearing
+    /// batch. Mirrors Python vLLM's
+    /// `Qwen2VLForConditionalGeneration.get_input_positions_tensor`:
+    /// text tokens get `(cursor, cursor, cursor)` with `cursor`
+    /// incrementing by 1; image tokens scan the post-spatial-merge
+    /// grid in `(t, h, w)` row-major and emit `(st+t, st+h, st+w)`
+    /// where `st` is the cursor at image entry; cursor advances by
+    /// `max(grid_t, grid_h_merged, grid_w_merged)` after each image.
+    ///
+    /// Walks **every** seq position from 0 to `tokens_before + q_len`,
+    /// advancing the cursor through preceding image patches even when
+    /// they lie entirely in the cached prefix. Positions are written
+    /// only for tokens in the current q range — but the cursor that
+    /// gets written is the same one the encoder used to encode the
+    /// cached KV, so `cached==prompt-1` (Bug 3) decodes correctly.
+    /// Reqs with no patches get the linear cursor for every row —
+    /// numerically identical to text-only 1D rope through the kernel's
+    /// broadcast path, but in the 2D shape so a mixed batch (text req +
+    /// image req) can share one positions tensor.
+    fn build_mrope_positions_2d(
+        prepared: &PreparedInputs,
+        per_req_mm: &[Vec<SeqMmInfo>],
+    ) -> Vec<u32> {
+        let n_tokens = prepared.flat_positions.len();
+        let mut t_row = vec![0u32; n_tokens];
+        let mut h_row = vec![0u32; n_tokens];
+        let mut w_row = vec![0u32; n_tokens];
+        let meta = &prepared.attn_meta;
+
+        for (req_idx, req_patches) in per_req_mm.iter().enumerate() {
+            let req_start_batch = meta.query_start_loc[req_idx];
+            let q_len = meta.q_lens[req_idx] as u32;
+            let num_computed = meta.tokens_before[req_idx] as u32;
+            let q_seq_end = num_computed + q_len;
+
+            let mut cursor = 0u32;
+            let mut seq_pos = 0u32;
+            let mut patch_iter = req_patches.iter().peekable();
+
+            while seq_pos < q_seq_end {
+                if let Some(&&(s_off, length, gt, mh, mw)) = patch_iter.peek()
+                    && s_off == seq_pos
+                {
+                    let st = cursor;
+                    let stride_hw = mh * mw;
+                    for img_idx in 0..length {
+                        let pos_seq = seq_pos + img_idx;
+                        if pos_seq >= num_computed && pos_seq < q_seq_end {
+                            let local_q = (pos_seq - num_computed) as usize;
+                            let flat_idx = req_start_batch + local_q;
+                            let t = img_idx / stride_hw;
+                            let rem = img_idx % stride_hw;
+                            let h = rem / mw;
+                            let w = rem % mw;
+                            t_row[flat_idx] = st + t;
+                            h_row[flat_idx] = st + h;
+                            w_row[flat_idx] = st + w;
+                        }
+                    }
+                    cursor = st + gt.max(mh).max(mw);
+                    seq_pos += length;
+                    patch_iter.next();
+                    continue;
+                }
+                if seq_pos >= num_computed {
+                    let local_q = (seq_pos - num_computed) as usize;
+                    let flat_idx = req_start_batch + local_q;
+                    t_row[flat_idx] = cursor;
+                    h_row[flat_idx] = cursor;
+                    w_row[flat_idx] = cursor;
+                }
+                cursor += 1;
+                seq_pos += 1;
+            }
+        }
+
+        let mut out = Vec::with_capacity(3 * n_tokens);
+        out.extend_from_slice(&t_row);
+        out.extend_from_slice(&h_row);
+        out.extend_from_slice(&w_row);
+        out
     }
 
     /// Build GDN state_indices and cu_seqlens for Qwen3Next forward.
@@ -5084,8 +5357,32 @@ impl Worker for CudaWorker {
                     arch,
                     ferrite_weights.arch_name(),
                 );
+                // Probe for a sibling `MultimodalForward` registration.
+                // Same `(arch_hint, tp_world_size)` filter as the text
+                // try_load above; returns `Ok(None)` for text-only
+                // arches and for MM-capable arches whose live
+                // checkpoint has no `visual.*` tensors. The handle
+                // rides on `FerriteModel.mm` and is consumed at
+                // forward time when the batch carries `mm_data`.
+                let mm = ferrite_forward::try_load_mm(
+                    &mut weights,
+                    stream,
+                    arch.as_str(),
+                    ferrite_tp,
+                    ferrite_rank,
+                    max_model_len,
+                    hf_fp,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward MM load: {e}")))?;
+                if mm.is_some() {
+                    info!(
+                        "CudaWorker: loaded {} vision encoder via ferrite-forward",
+                        arch
+                    );
+                }
                 Some(CudaModel::Ferrite(Box::new(FerriteModel {
                     weights: ferrite_weights,
+                    mm,
                     #[cfg(feature = "nccl")]
                     tp_group: None,
                     tp_world_size: self.config.tp_world_size,
@@ -6089,6 +6386,7 @@ impl Worker for CudaWorker {
                 &dummy_kv,
                 device,
                 None,
+                None,
             );
             if let Err(e) = driver::stream_synchronize(device.compute_stream) {
                 tracing::error!("Memory profiling forward failed: {e}");
@@ -6381,6 +6679,7 @@ impl Worker for CudaWorker {
                             kv_ref,
                             dev,
                             None, // no last_token_indices (decode: all tokens are last)
+                            None, // text-only decode: no MM splice
                         )
                     })
                 };
@@ -6489,6 +6788,7 @@ impl Worker for CudaWorker {
                                     kv_ref,
                                     dev,
                                     Some(TensorView::from_raw(inputs.last_token_indices)),
+                                    None, // graph-captured prefill is text-only
                                 )
                             })
                         };
@@ -6726,6 +7026,7 @@ impl Worker for CudaWorker {
                     num_tokens,
                     kv_cache,
                     device,
+                    None,
                 )
             };
 
@@ -6788,6 +7089,7 @@ impl CudaWorker {
             self.token_buffers.remove(req_id);
             self.prompt_lengths.remove(req_id);
             self.annotation_buffers.remove(req_id);
+            self.mm_data_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
             #[cfg(feature = "guided-decoding")]
@@ -6841,6 +7143,10 @@ impl CudaWorker {
             if let Some(ref ann) = new_req.block_annotations {
                 self.annotation_buffers
                     .insert(new_req.req_id.clone(), ann.clone());
+            }
+            if let Some(ref mm) = new_req.mm_data {
+                self.mm_data_buffers
+                    .insert(new_req.req_id.clone(), mm.clone());
             }
             if let Some(ref params) = new_req.sampling_params {
                 self.sampling_params_map
@@ -7364,6 +7670,7 @@ impl CudaWorker {
                     max_seqlen_k,
                     kv_cache,
                     device,
+                    None,
                 )
             };
 
@@ -7413,9 +7720,23 @@ impl CudaWorker {
         // We allow padding to the nearest captured graph size (e.g. BS=3 → graph BS=4).
         // PP last stage: skip CUDA graphs for now — use eager forward with forward_pp.
         let is_decode = prepared.attn_meta.q_lens.iter().all(|&q| q == 1);
+        // MM-bearing reqs MUST take the eager path: the decode CUDA graph was
+        // captured with 1D position tensors (single rope-kernel invocation
+        // per layer); replaying it for an MM-bearing req would feed 1D
+        // positions to the MRoPE kernel, which disagrees with the 3D
+        // positions used to encode the cached visual KV → attention misfires
+        // and the model emits `<|im_end|>` immediately (Bug 3, the symmetric
+        // counterpart of Bug 1's prefill-graph gate at `use_prefill_graph`).
+        // The eager else-branch below builds `[3, n_tokens]` positions via
+        // `build_all_mm_position_patches` whether or not the encoder runs
+        // this step.
+        let any_mm_in_batch = prepared
+            .req_inputs
+            .iter()
+            .any(|r| self.mm_data_buffers.contains_key(&r.req_id));
         let graph_bs = if pp_active {
             None // PP stages use eager forward only
-        } else if is_decode {
+        } else if is_decode && !any_mm_in_batch {
             self.graph_runner
                 .as_ref()
                 .and_then(|r| r.nearest_graph_size(num_reqs))
@@ -7638,6 +7959,13 @@ impl CudaWorker {
                         kv_cache,
                         device,
                         last_token_indices.as_ref().map(|t| t.view()),
+                        // Mixed-batch eager prefill: MM splice not yet plumbed
+                        // through this slow path. Single-prefill flows go
+                        // through the eager main-forward branch below where
+                        // mm_inputs is built. A VL prefill that lands in the
+                        // mixed path (rare — would require concurrent decode
+                        // reqs at first-image-prefill step) is a follow-up.
+                        None,
                     )
                 }
             };
@@ -8077,6 +8405,9 @@ impl CudaWorker {
         // intermediate forward-pass buffers reuse the same addresses as during
         // `_logits_owned` keeps the OwnedTensor alive for eager-forward paths
         // so the GPU memory backing `logits` survives until sampling completes.
+        // `_mm_holder` keeps the vision-encoder OwnedTensor alive for the
+        // same reason on the MM splice path (text-only batches: stays None).
+        let mut _mm_holder: Option<(OwnedTensor, Vec<ferrite_forward::EmbedPatch>)> = None;
         let (_logits_owned, logits) = if use_graph {
             // CUDA graph replay (non-greedy: in-graph argmax result is
             // discarded; we re-sample with temperature on the logits).
@@ -8260,9 +8591,15 @@ impl CudaWorker {
             // Check if we can use a prefill graph: single request, fresh prefill
             // (tokens_before == 0 means q_len == seq_len, so the model uses contiguous
             // FA2 — not paged — which is safe to capture in a CUDA graph).
+            // MM-bearing reqs MUST take the eager path: the captured prefill graph
+            // does not include the vision encoder + Embed splice, so replaying it
+            // would skip vision_forward entirely and hand the decoder placeholder
+            // tokens with no visual content (hallucinated output).
             let meta = &prepared.attn_meta;
+            let req_has_mm = self.mm_data_buffers.contains_key(&meta.req_ids[0]);
             let use_prefill_graph = num_reqs == 1
                 && meta.tokens_before[0] == 0
+                && !req_has_mm
                 && self
                     .prefill_graph_runner
                     .as_ref()
@@ -8456,10 +8793,57 @@ impl CudaWorker {
                     let logits = *owned;
                     (Some(owned), logits)
                 } else {
+                    // Run vision encoder for any MM-bearing req at its
+                    // first prefill step; output rides into model.forward
+                    // via mm_inputs and the `Instruction::Embed::eval`
+                    // splice. The OwnedTensor lands in `_mm_holder` so
+                    // its caching-allocator slot stays live until end of
+                    // the surrounding fn — the splice D2D-copies on
+                    // `device.compute_stream` and a parallel allocation
+                    // could otherwise alias the same memory region
+                    // before the splice kernel actually runs.
+                    _mm_holder = unsafe {
+                        Self::run_mm_vision_forward(model, &self.mm_data_buffers, &prepared, device)
+                    };
+                    // For image-bearing batches on MRoPE arches, override
+                    // the 1D `gpu_positions` with a `[3, n_tokens]` u32
+                    // tensor where image tokens carry their (T,H,W) grid
+                    // coordinates (Python parity with
+                    // `Qwen2VLForConditionalGeneration.get_input_positions_tensor`).
+                    //
+                    // Per-req seq-space MM info covers EVERY MM-bearing
+                    // req in the batch — including ones with
+                    // `tokens_before > 0` (cached prefix) where the
+                    // encoder didn't run this step. Load-bearing for the
+                    // cached-prefix path: the MRoPE positions written
+                    // for the trailing new tokens must match the cursor
+                    // the encoder advanced to when it wrote the cached
+                    // KV blocks, otherwise attention misfires (Bug 3).
+                    // Text-only batches get an empty outer `Vec` and keep
+                    // the pre-built 1D `gpu_positions` (broadcast path).
+                    let per_req_mm =
+                        Self::build_per_req_mm_seq_info(model, &self.mm_data_buffers, &prepared);
+                    let gpu_positions_2d = if !per_req_mm.is_empty() {
+                        let pos_2d = Self::build_mrope_positions_2d(&prepared, &per_req_mm);
+                        let mut t = Self::h2d_u32(&pos_2d, device)?;
+                        unsafe { t.reshape(&[3, total_tokens], GpuDType::U32) };
+                        Some(t)
+                    } else {
+                        None
+                    };
+                    let positions_view = match &gpu_positions_2d {
+                        Some(t) => t.view(),
+                        None => gpu_positions.view(),
+                    };
+                    let mm_inputs: Option<MmForwardInputs<'_>> =
+                        _mm_holder.as_ref().map(|(t, p)| MmForwardInputs {
+                            mm_embeds: t.view(),
+                            embed_patches: p.as_slice(),
+                        });
                     let owned = unsafe {
                         model.forward(
                             gpu_input_ids.view(),
-                            gpu_positions.view(),
+                            positions_view,
                             slot_mapping.view(),
                             cu_seqlens_q.view(),
                             seqused_k.view(),
@@ -8469,8 +8853,10 @@ impl CudaWorker {
                             kv_cache,
                             device,
                             last_token_indices.as_ref().map(|t| t.view()),
+                            mm_inputs.as_ref(),
                         )
                     };
+                    drop(gpu_positions_2d);
                     let logits = *owned;
                     (Some(owned), logits)
                 }

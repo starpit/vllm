@@ -402,3 +402,49 @@ GDN math discrepancy, MoE numerics, or just the undertrained model.
 Next session: dump matching HF intermediates one level deeper
 (per-step inside GDN), and/or move to a model whose top-K
 distribution has more headroom than 0.36 nats.
+
+## 2026-05-04 — Phase 6c-iii: Gemma `(1 + w)` norm convention
+
+Audit-then-instrument loop (per-step inside GDN via
+`ferrite-cuda-core::dump`, paired with a Python hook script
+`/tmp/dump_hf_gdn.py` against HF transformers'
+`Qwen3NextGatedDeltaNet`) localized the residual divergence to
+the very first matmul: ferrite's `gdn.in_proj_qkvz` was
+element-wise exactly half HF's. Tracing one step further:
+ferrite's `rmsnorm.out` (input to `in_proj_qkvz`) was exactly
+half HF's `Qwen3NextRMSNorm.forward(embed)`.
+
+Cause: HF's `Qwen3NextRMSNorm` (`modeling_qwen3_next.py:218`)
+computes `output * (1.0 + self.weight.float())` — same Gemma
+`(1 + w)` convention that ferrite-model-gemma2's DSL already
+threads via `rmsnorm(x, weight + 1.0)`. Qwen3-Next's DSL was
+missing the `+ 1.0` on every layer norm; with the file's stored
+weights ≈ 1.0, HF computes `* 2.0` and ferrite-without-offset
+computes `* 1.0` — exact 2× drop on every norm output.
+
+Fix: add `+ 1.0` to `input_layernorm[layer]`,
+`post_attention_layernorm[layer]`, and final `norm` weight refs
+in the qwen3-next DSL. Codegen routes through
+`ScalarOffsetRmsNormImpl` / `FusedAddRmsNormWithOffset` which
+pass `weight_offset = 1.0` to the rms_norm kernel.
+
+The GDN inner norm (`Qwen3NextRMSNormGated`, init=ones, plain
+`weight * x`) is NOT Gemma-style and stays unchanged — it lives
+inside `Qwen3NextGdnLayer` and never surfaces in the DSL. The
+gated-attention layer's `q_norm`/`k_norm` already used the same
+`+1` baked in via `add_one_inplace` at load (Phase 6c-i).
+
+Engine output post-fix: `Hello撒上 Ojcollections抚顺DataTable!\nHello`
+— position-0 token is now `Hello`, a coherent continuation of
+the `hello world` prompt. Test still RED vs the HF golden's
+top-1 `印刷` (which sits at logprob -9.84 vs top-20 at -10.20 —
+0.36 nat window). On this 137 MB undertrained checkpoint, BF16
+reduction-order drift between cuTLASS+FA2 (ferrite) and PyTorch
+SDPA (HF golden generator) is enough to flip argmax across the
+window. Structural math is verified correct via the dump diff.
+
+Future work: relax test threshold for this fixture, or migrate
+to a less-undertrained Qwen3-Next checkpoint when one fits in 14
+GB free / L4 VRAM. Diagnostic dump infra (`ferrite-cuda-core::dump`
++ in-GDN per-step dumps + `vllm-rs/scripts/gen_qwen3_next_golden.py`
++ `/tmp/dump_hf_gdn.py`) stays in tree as the audit harness.

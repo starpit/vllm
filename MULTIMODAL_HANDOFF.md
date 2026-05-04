@@ -1,18 +1,18 @@
-# Multimodal (Qwen2-VL) — handoff
+# Multimodal (Qwen2-VL / Qwen2.5-VL) — handoff
 
 **Branch:** `feat/rust`, worktree `.claude/worktrees/multimodal`.
-**Target arch:** `Qwen2VLForConditionalGeneration`. Text decoder = `ferrite-model-qwen2`.
-**Status:** **2B is e2e-coherent at tp=1 AND tp=2.** Real-image chat works (red circle, blue square, streamlit screenshot). Bugs 1, 2, 3 fixed at tp=1; Phase F TP=2 landed with replicated-per-rank ViT + post-AllReduce splice op. VisionConfig derives from weight shapes — 7B/72B *should* load through the same registration without code edits, but unverified.
+**Target arches:** `Qwen2VLForConditionalGeneration`, `Qwen2_5_VLForConditionalGeneration`. Text decoder = `ferrite-model-qwen2` (shared).
+**Status:** **Qwen2-VL-2B and Qwen2.5-VL-3B both e2e-coherent at tp=1.** Real-image chat works on both (Qwen2.5-VL-3B verified on 224×224 red circle and the streamlit screenshot — "vLLM Chat Assistant" identified correctly; Qwen2-VL-2B also coherent at tp=2). Each VL arch has its own crate and registers via `inventory::submit!`. Shape-derived VisionConfigs — 7B/72B (Qwen2-VL) and 7B/72B (Qwen2.5-VL) *should* load without code edits, unverified.
 
 ## What remains
 
-1. **Verify 7B / 72B load + decode coherently.** Shape-derived VisionConfig should make this a no-code-edit `vllm chat` run. Failure mode would be an unanticipated tensor name in the loader's shape probe (`GpuWeights::tensor_shape_any`).
+1. **Verify 7B / 72B (both Qwen2-VL and Qwen2.5-VL) load + decode coherently.** Shape-derived VisionConfigs should make this no-code-edit `vllm chat` runs. Failure mode would be an unanticipated tensor name in either loader's shape probe (`GpuWeights::tensor_shape_any`).
 
-2. **First-20-token byte-match vs Python vLLM.** Currently diverges at token 3 on a synthetic gradient input — both responses are coherent and correctly identify the gradient. Three-way diff an earlier session **clears the encoder** (ferrite-vs-pyvllm cosine ≥ pyvllm-vs-HF at every block; patch_embed bit-exact; merger 0.993 vs 0.971). Residual = sub-bf16-eps logit drift flipping argmax. Not a wiring bug — only chase if byte-exact is a hard requirement.
+2. **Qwen2.5-VL TP=2.** Single-rank works; TP=2 inventory rows are emitted (`#[cfg(feature = "nccl")]`) but not exercised. Same replicated-per-rank ViT + post-AllReduce `MmEmbedSplice` op handles it for free at the FUF level — likely just a verify step.
 
-3. **Qwen2.5-VL** (own crate, `ferrite-model-qwen2-5-vl`, depending on `ferrite-model-qwen2` for text). Vision tower has different math from Qwen2-VL — window attention with periodic full-attention, RMSNorm in vision blocks, revised 2D RoPE, plus FPS/time embeddings for video. New kernel(s) likely required for windowed varlen attention.
+3. **First-20-token byte-match vs Python vLLM (Qwen2-VL).** Currently diverges at token 3 on a synthetic gradient input — both responses are coherent and correctly identify the gradient. Three-way diff an earlier session **clears the encoder** (ferrite-vs-pyvllm cosine ≥ pyvllm-vs-HF at every block; patch_embed bit-exact; merger 0.993 vs 0.971). Residual = sub-bf16-eps logit drift flipping argmax. Not a wiring bug — only chase if byte-exact is a hard requirement.
 
-4. **Phase G — Gemma3-MM / SigLIP** (own crate, `ferrite-model-gemma3-mm`). First SigLIP integration — second concrete consumer that justifies factoring shared ViT building blocks (LN/varlen-attn/MLP/projector wrappers) out of qwen2-vl into a `ferrite-vision` shared module. Plug-in surface is `MultimodalForward` + `inventory::submit!`. Non-ferrite touch budget = 0 (per Phase F's precedent).
+4. **Phase G — Gemma3-MM / SigLIP** (own crate, `ferrite-model-gemma3-mm`). First SigLIP integration — third concrete consumer that justifies factoring shared ViT building blocks (LN/varlen-attn/MLP/projector wrappers) out of `ferrite-model-qwen2-vl` and `ferrite-model-qwen2-5-vl` into a `ferrite-vision` shared module. Plug-in surface is `MultimodalForward` + `inventory::submit!`. Non-ferrite touch budget = 0 (per Phase F's precedent).
 
 ## How to verify nothing regressed
 
@@ -38,7 +38,12 @@ TP=2 sanity suite (`test_cuda_tp2_qwen2_vl_*`): text-only, single image (red cir
 
 Fixtures: `vllm-rs/crates/vllm-e2e/tests/fixtures/{red_circle_224,blue_square_224}.png` + `docs/assets/deployment/streamlit-chat.png`.
 
-Smoke: `vllm chat` on `Qwen/Qwen2-VL-2B-Instruct` with `--image=docs/assets/deployment/streamlit-chat.png "what does the page say?"` should return a coherent description of the streamlit chat page. Text-only `"What is the capital of France?"` should return "The capital of France is Paris."
+Smoke: spin up `vllm serve <model> --enforce-eager --port 17777` and POST `/v1/chat/completions` with an `image_url` data-URI (`vllm chat` has no `--image` flag yet — the e2e tests use the OpenAI-compatible serving path). Both arches should return:
+- 224×224 red-circle PNG → mentions "red" and "circle".
+- `docs/assets/deployment/streamlit-chat.png` → identifies it as a chat interface (Qwen2.5-VL-3B reliably names "vLLM Chat Assistant").
+- text-only "What is the capital of France?" → "The capital of France is Paris."
+
+Build `vllm-cli` with `FERRITE_MODELS=qwen2-vl-2b,qwen2.5-vl-3b` (or omit to compile every variant). The `qwen2.5-vl-3b` stem in the env var matches the `configs/qwen2.5-vl-3b.json` file basename — the dot is significant (`qwen2-5-vl` will not match).
 
 Numerical-golden harness (only needed if you suspect a vision-encoder regression). The `tests/` dir didn't move with the split; harness lives at:
 - `crates/ferrite-model-qwen2/tests/golden_gen_qwen2_vl_vision.py` — dumps HF intermediates on a deterministic 224×224 input. Run via `~/vllm/.venv`.
@@ -51,8 +56,9 @@ Numerical-golden harness (only needed if you suspect a vision-encoder regression
 |---|---|
 | Worker MM dispatch (encoder run, MRoPE 2D, MM-bearing graph gates) | `vllm-executor/src/cuda_worker.rs` — `run_mm_vision_forward`, `build_per_req_mm_seq_info`, `build_mrope_positions_2d`, `mm_data_buffers`, the `use_prefill_graph` gate at ~8600 + the symmetric decode-graph gate at ~7729 |
 | Splice site (vision embeds → token positions) | `ferrite-forward/src/instr.rs` — `Instruction::Embed::eval` |
-| Vision tower, weights, registration | `ferrite-model-qwen2-vl/src/vision.rs` — `VisionWeights`, `VisionConfig` (shape-derived), `vision_forward`, `MultimodalForward` impl, `inventory::submit!` rows at tp ∈ {1,2,4,8}. Crate is paired with `ferrite-model-qwen2` (shared text decoder); `configs/qwen2-vl-2b.json` over there registers the text forward for the same arch string. |
-| Vision-only kernels | `ferrite-kernels/src/{rotary,kernels}.rs` — `vision_rope_apply`, `quick_gelu_inplace`, `gelu_erf_inplace` |
+| Vision tower, weights, registration | `ferrite-model-qwen2-vl/src/vision.rs` (Qwen2-VL) and `ferrite-model-qwen2-5-vl/src/vision.rs` (Qwen2.5-VL) — `VisionWeights`, `VisionConfig` (shape-derived), `vision_forward`, `MultimodalForward` impl, `inventory::submit!` rows at tp ∈ {1,2,4,8}. Both crates pair with `ferrite-model-qwen2` (shared text decoder); `configs/qwen2-vl-2b.json` and `configs/qwen2.5-vl-3b.json` over there register the text forward for each arch string. |
+| Umbrella linker keepalives | `ferrite-models/src/lib.rs` — `extern crate ferrite_model_<arch> as _keep_<arch>` and `pub use ferrite_model_<arch> as <arch>` for **every** per-arch crate. Without the `_keep_*` line the linker GCs `inventory::submit!` rows; symptom is "MM loader matches the arch but vision_forward never runs", model replies "I can't see any image". |
+| Vision-only kernels | `ferrite-kernels/src/{rotary,kernels}.rs` — `vision_rope_apply`, `quick_gelu_inplace`, `gelu_erf_inplace`; `embedding_gather` is reused for the Qwen2.5-VL window permute / reverse-permute (no new kernel). |
 | Per-image-bytes block hash (Bug 2 fix) | `SimpleBlockTracker::hash_all_blocks` |
 | Image preprocessor (bicubic + smart_resize) | `vllm-model::image::preprocess_qwen2_vl` |
 | Tokenizer special-token patch | `Tokenizer::register_additional_special_tokens` + `init.rs::patch_additional_special_tokens` |
@@ -78,6 +84,10 @@ VisionConfig was then generalized to derive from weight shapes (no more 2B const
 2. **`backbone_output_for` / `last_node_id` skip splice tails.** `insert_mm_splices` pushes new FufNodes at array-tail, which would otherwise displace the lm_head Gemm / AllGather as `fuf.nodes.last()`. New `last_non_splice_node` helper walks the tail skipping `OpKind::MmEmbedSplice` so both callers recover the real terminal.
 3. **Vision registrations at tp ∈ {1, 2, 4, 8}.** `vision.rs` emits one `inventory::submit!` per tp (≥2 gated on `nccl`). Each rank loads the full `visual.*` weights (replicated) and runs `vision_forward` independently — mm_embeds are identical per-rank, the post-AllReduce splice overwrites patch rows on every rank, and the subsequent text-decoder forward sees consistent hidden states.
 4. **`initialize_stack_tp` MM wiring.** The tp-path was missing `set_multimodal_config` / `set_mm_model_type` / `set_mm_image_processor_pixel_limits` and the `patch_additional_special_tokens` call. Without them the engine dropped image content silently at the chat-template level (image_url → text pass-through). Block copied from the single-rank `initialize_stack`.
+
+**Qwen2.5-VL crate (this commit).** Sibling to `ferrite-model-qwen2-vl`. Vision math deltas vs Qwen2-VL: block norms (norm1/norm2) and merger.ln_q switched from LayerNorm (weight + bias) to RMSNorm (weight only); block MLP swapped `fc1 → QuickGELU → fc2` for SwiGLU `down_proj(silu(gate_proj(x)) · up_proj(x))` with explicit `intermediate_size=3420` (not embed×ratio); 28-of-32 blocks run windowed varlen attention bucketed by 112-px windows (the 4 in `fullatt_block_indexes=[7,15,23,31]` use full image-frame attention); tokens + cos/sin are gather-permuted into window order on entry and unpermuted post-merger via `embedding_gather` (no new kernel). Patch flatten and merger MLP shape unchanged. Family-wide constants (`num_heads=16`, `window_size=112`, `fullatt_block_indexes`, `norm_eps=1e-6`) baked into the loader; everything else (`embed_dim`, `depth`, `intermediate_size`, `d_model`, etc.) derived from weight shapes. Inventory rows at tp ∈ {1,2,4,8}.
+
+**Q2.5-VL gotcha — cuBLAS K=3420.** Qwen2.5-VL's vision MLP picks a deliberately not-power-of-two intermediate (3420 = 4×3×5×3×19; mod 4 but not mod 8). cuBLAS BF16 GEMM on K=3420 fails on every cublasLt algo and the cublasGemmEx fallback errors with `CUBLAS_STATUS_INTERNAL_ERROR` — every other GEMM in the tower has K mod 8. Fix: at load time pad `down_proj.weight` from `[E, 3420]` to `[E, 3424]` with 4 zero columns (`pad_linear_k_to_mult8` in `vision.rs`); at runtime concatenate `gate_proj(x)` and `up_proj(x)` into a `[L, 2·3424]` zero-init buffer before `silu_and_mul_fused(_, 3424)` so the trailing 4 cols of each half are zero (`silu(0)·0 = 0` keeps the padded slots zero through the next GEMM's K=3424 contraction). All math identical to the unpadded reference. The packing trade-off vs `LinearLayer::load_dense_concat` is 2 extra D2D copies per layer (per-row, total ~60 µs added on a 256-token vision batch) — the alternative would be a custom 2-tensor silu+mul kernel.
 
 ## Non-goals (do not attempt under this handoff)
 

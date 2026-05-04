@@ -13,14 +13,30 @@ use syn::Ident;
 
 use crate::ast::{self, BoundExpr};
 use crate::classified::{
-    BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Program, Stmt, WeightTable,
+    BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
+    WeightTable,
 };
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
 
-/// Classify the AST.
+/// Classify the AST against the decoder prelude. Convenience entry
+/// point used by unit tests in adjacent modules; production code in
+/// `compile_common` calls [`classify_with`] with an explicit prelude.
+#[allow(dead_code)]
 pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
-    let mut cx = Ctx::default();
+    classify_with(ast, Prelude::Decoder)
+}
+
+/// Classify the AST against a specific prelude. The prelude selects
+/// which extern names are recognized — decoder bodies use
+/// `input_ids`/`positions`/etc., vision bodies use
+/// `pixels`/`cu_seqlens`/etc. — and is otherwise inert: every
+/// downstream pass operates on the same `Program` shape.
+pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program> {
+    let mut cx = Ctx {
+        prelude,
+        ..Ctx::default()
+    };
     let statements = cx.classify_stmts(&ast.statements)?;
     Ok(Program {
         statements,
@@ -38,6 +54,7 @@ struct Ctx {
     /// line SSA: a new assignment shadows the previous binding.
     /// For-loops push their induction variable and pop it on exit.
     scope: HashMap<String, Vec<LocalId>>,
+    prelude: Prelude,
 }
 
 impl Ctx {
@@ -365,7 +382,7 @@ impl Ctx {
         if let Some(id) = self.lookup_local(ident) {
             return Ok(Expr::Local(id));
         }
-        if let Some(kind) = ExternKind::from_name(&name) {
+        if let Some(kind) = ExternKind::from_name_for(&name, self.prelude) {
             return Ok(Expr::Extern { kind, index });
         }
         // Weight ref by bare ident (e.g. `embed_tokens`, `lm_head`,
@@ -477,7 +494,7 @@ mod tests {
             _ => unreachable!(),
         };
         let ast = parse_block(block).expect("DSL parse");
-        classify(&ast).expect("classification")
+        classify_with(&ast, Prelude::Decoder).expect("classification")
     }
 
     fn classify_err(src: &str) -> syn::Error {
@@ -487,7 +504,18 @@ mod tests {
             _ => unreachable!(),
         };
         let ast = parse_block(block).expect("DSL parse");
-        classify(&ast).expect_err("expected classification error")
+        classify_with(&ast, Prelude::Decoder).expect_err("expected classification error")
+    }
+
+    fn classify_vision_src(src: &str) -> Program {
+        let file: syn::File =
+            syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("syntactic parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let ast = parse_block(block).expect("DSL parse");
+        classify_with(&ast, Prelude::Vision).expect("classification")
     }
 
     #[test]
@@ -776,5 +804,102 @@ mod tests {
         //   embed_tokens, norm, lm_head = 3
         //   TOTAL = 12.
         assert_eq!(p.weights.len(), 12, "unique weights interned");
+    }
+
+    // ── Vision prelude routing (G.3) ─────────────────────────────
+
+    #[test]
+    fn vision_prelude_recognizes_pixels_extern() {
+        // Under the vision prelude, `pixels` is the encoder's data
+        // input — analogous to `input_ids` under the decoder prelude.
+        // Classify must tag it as `ExternKind::Pixels`, not as a
+        // weight ref.
+        let p = classify_vision_src("x = layer_norm(pixels, ln_q);");
+        match &p.statements[0] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Call { args, .. } => assert!(
+                    matches!(
+                        args[0],
+                        Expr::Extern {
+                            kind: ExternKind::Pixels,
+                            index: None
+                        }
+                    ),
+                    "pixels resolves to ExternKind::Pixels under vision prelude, got {:?}",
+                    args[0],
+                ),
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_prelude_recognizes_full_vision_extern_set() {
+        // All six vision externs map: pixels, cu_seqlens, cos, sin,
+        // grid_thw, max_seqlen. Pin the routing in one place so a
+        // future shape-signature edit doesn't silently relabel any
+        // of them as weights.
+        let cases: &[(&str, ExternKind)] = &[
+            ("pixels", ExternKind::Pixels),
+            ("cu_seqlens", ExternKind::CuSeqlens),
+            ("cos", ExternKind::Cos),
+            ("sin", ExternKind::Sin),
+            ("grid_thw", ExternKind::GridThw),
+            ("max_seqlen", ExternKind::MaxSeqlen),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                ExternKind::from_name_for(name, Prelude::Vision),
+                Some(*expected),
+                "vision extern `{name}` routes",
+            );
+            assert_eq!(
+                ExternKind::from_name_for(name, Prelude::Decoder),
+                None,
+                "vision extern `{name}` is invisible under decoder prelude",
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_externs_invisible_under_vision_prelude() {
+        // Disjoint preludes: `input_ids` is unrecognized in a vision
+        // body. With no extern match, classify falls through to the
+        // weight-ref path and interns it as a single-segment weight
+        // — observable as a non-zero weight count for a body that
+        // only writes the would-be extern.
+        let p = classify_vision_src("x = layer_norm(input_ids, ln);");
+        match &p.statements[0] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Call { args, .. } => match &args[0] {
+                    Expr::Weight { .. } => { /* expected: weight ref, not extern */ }
+                    other => panic!(
+                        "input_ids must NOT resolve to an extern under vision prelude, got {other:?}",
+                    ),
+                },
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_externs_invisible_under_decoder_prelude() {
+        // Mirror of the above: `pixels` does not exist under the
+        // decoder prelude — it lands as a weight ref, not an extern.
+        let p = classify_src("x = layer_norm(pixels, ln);");
+        match &p.statements[0] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Call { args, .. } => match &args[0] {
+                    Expr::Weight { .. } => { /* expected */ }
+                    other => panic!(
+                        "pixels must NOT resolve to an extern under decoder prelude, got {other:?}",
+                    ),
+                },
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected assign, got {other:?}"),
+        }
     }
 }

@@ -312,13 +312,81 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ForwardArgs);
     let carrier = parse_macro_input!(item as ItemFn);
 
-    match compile(&args, &carrier) {
+    match compile_common(&args, &carrier, CompileMode::DECODER) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+/// Vision-encoder sibling of [`forward`]. Compiles a
+/// `#[vision_forward]` body into the same FUF / solver / codegen
+/// pipeline as the decoder macro, with three local overrides:
+///   - the classifier sees the **vision prelude** (`pixels`,
+///     `cu_seqlens`, `cos`, `sin`, `grid_thw`, `max_seqlen`) instead
+///     of the decoder prelude.
+///   - the per-(model, tp) fanout is pinned to `tp_world_size = 1`
+///     because vision encoders run replicated in v1 (no AllReduce /
+///     AllGather lowering).
+///   - the multimodal post-Embed splice pass is skipped — it
+///     belongs on the decoder side, not the encoder side.
+///
+/// Workload bucketing reuses the existing `workloads = [...]`
+/// attribute slot; the decode-iter / sk-bucket axis names from
+/// `#[forward]` map cleanly onto vision's batched-total flat L
+/// (per the G.3 handoff resolution).
+#[proc_macro_attribute]
+pub fn vision_forward(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as ForwardArgs);
+    let carrier = parse_macro_input!(item as ItemFn);
+
+    match compile_common(&args, &carrier, CompileMode::VISION) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Per-macro overrides on the shared compile pipeline. Selected
+/// once at the proc-macro entry; threaded through the prelude /
+/// fanout / lowering passes so the body of [`compile_common`]
+/// stays almost-uniform across the decoder and vision variants.
+#[derive(Clone, Copy)]
+struct CompileMode {
+    /// Selects the DSL extern set used by [`classify::classify_with`].
+    prelude: classified::Prelude,
+    /// True for `#[forward]` (decoder), false for `#[vision_forward]`.
+    /// Gates the row-parallel AllReduce + lm_head AllGather lowering
+    /// passes: vision is replicated in v1 so they're skipped.
+    apply_tp_lowering: bool,
+    /// True for `#[forward]`, false for `#[vision_forward]`. Gates
+    /// the post-Embed multimodal splice pass — that splice belongs
+    /// on the decoder's text-side hidden states, not the encoder's
+    /// patch hidden states.
+    apply_mm_splice: bool,
+    /// True for `#[forward]` (which fans out over `{1, 2, 4, 8}` at
+    /// nccl-enabled), false for `#[vision_forward]` (always tp=1).
+    enable_tp_fanout: bool,
+}
+
+impl CompileMode {
+    const DECODER: Self = Self {
+        prelude: classified::Prelude::Decoder,
+        apply_tp_lowering: true,
+        apply_mm_splice: true,
+        enable_tp_fanout: true,
+    };
+    const VISION: Self = Self {
+        prelude: classified::Prelude::Vision,
+        apply_tp_lowering: false,
+        apply_mm_splice: false,
+        enable_tp_fanout: false,
+    };
+}
+
+fn compile_common(
+    args: &ForwardArgs,
+    carrier: &ItemFn,
+    mode: CompileMode,
+) -> syn::Result<proc_macro2::TokenStream> {
     // CARGO_MANIFEST_DIR at macro-expansion time is the invoking
     // crate's root. Target path resolves against it; the configs
     // directory is `<MANIFEST_DIR>/configs/` for per-arch crates,
@@ -337,7 +405,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     // ── Front end: parse + classify ───────────────────────────────
     let ast = parse::parse_block(&carrier.block)
         .map_err(|e| syn::Error::new(args.span, format!("parse: {e}")))?;
-    let mut classified = classify::classify(&ast)
+    let mut classified = classify::classify_with(&ast, mode.prelude)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
 
     // ── Load configs + manifest + target ──────────────────────────
@@ -559,7 +627,15 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
     // proc-macro per-feature-set, so consumers without nccl still
     // get the fast tp=1-only macro.)
     let nccl_enabled = cfg!(feature = "nccl");
-    let tp_set: &[u8] = if nccl_enabled { &[1, 2, 4, 8] } else { &[1] };
+    // Vision macros opt out of the tp fanout entirely — the encoder
+    // is replicated in v1 (no AllReduce / AllGather lowering, no
+    // sharded weight surface). Decoder macros keep the existing
+    // {1, 2, 4, 8} set under nccl-enabled, [1] otherwise.
+    let tp_set: &[u8] = if mode.enable_tp_fanout && nccl_enabled {
+        &[1, 2, 4, 8]
+    } else {
+        &[1]
+    };
 
     let mut solved: Vec<SolvedModel<'_>> = Vec::with_capacity(models.len() * tp_set.len());
 
@@ -614,17 +690,24 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             // Tensor-parallel lowering pass. At tp=1 (every existing
             // SolvedModel until task #7's canonical fanout lands) this is
             // a strict no-op — the FUF flowing into the solver is
-            // byte-identical to single-rank builds.
-            tp_lowering::insert_all_reduces(&mut model_fuf, &classified, tp_world_size);
-            tp_lowering::insert_lm_head_allgather(&mut model_fuf, &classified, tp_world_size);
+            // byte-identical to single-rank builds. Vision encoders
+            // skip the pass entirely (no AllReduce/AllGather; replicated
+            // in v1 per the G.3 handoff resolution).
+            if mode.apply_tp_lowering {
+                tp_lowering::insert_all_reduces(&mut model_fuf, &classified, tp_world_size);
+                tp_lowering::insert_lm_head_allgather(&mut model_fuf, &classified, tp_world_size);
+            }
             // Multimodal post-Embed splice. Unconditional at every tp
             // (including tp=1) — runtime no-op for text-only batches.
             // Must run AFTER `insert_all_reduces` so at tp>1 the
             // splice sits on the reduced embedding (not each rank's
             // partial masked-gather, which the pre-refactor inline
             // splice inside `Instruction::Embed::eval` mistakenly
-            // overwrote).
-            tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
+            // overwrote). Vision encoders skip — splice belongs on
+            // the decoder side, not the encoder side.
+            if mode.apply_mm_splice {
+                tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
+            }
 
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel

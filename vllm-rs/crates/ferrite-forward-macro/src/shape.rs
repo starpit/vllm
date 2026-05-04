@@ -813,6 +813,30 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         ExternKind::RotaryLocal => vec![],
         ExternKind::BlockTable => vec![],
         ExternKind::KvCache => vec![],
+        // Vision externs. `Pixels` has the per-row patch shape that
+        // shape inference needs to anchor the encoder's first GEMM
+        // (`patch_embed_proj`); `Cos`/`Sin` carry the per-row half-
+        // dim RoPE tables. The remaining vision externs are opaque
+        // (varlen index / per-image grid / scalar) — same role as
+        // the decoder's `BlockTable`/`KvCache`. Bound names anchor
+        // to vision-config fields populated by per-arch crates in
+        // G.5; until then they're symbolic placeholders that resolve
+        // only when a real vision config is loaded.
+        ExternKind::Pixels => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_in_features".into()),
+        ],
+        ExternKind::Cos => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_rope_half_dim".into()),
+        ],
+        ExternKind::Sin => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_rope_half_dim".into()),
+        ],
+        ExternKind::CuSeqlens => vec![],
+        ExternKind::GridThw => vec![],
+        ExternKind::MaxSeqlen => vec![],
     }
 }
 

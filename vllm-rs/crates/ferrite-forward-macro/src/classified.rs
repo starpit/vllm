@@ -29,8 +29,19 @@ pub struct LocalId(pub u32);
 pub struct WeightId(pub u32);
 
 /// The fixed enum of non-weight parameters. Every model uses the
-/// same names and shapes for these; the `#[forward]` macro knows
-/// about them by name.
+/// same names and shapes for these; the `#[forward]` /
+/// `#[vision_forward]` macros know about them by name.
+///
+/// Two prelude families share the enum:
+///   - **Decoder** (text-side `#[forward]`): `InputIds`, `Positions`,
+///     `Rotary`, `RotaryLocal`, `BlockTable`, `KvCache`.
+///   - **Vision** (image-side `#[vision_forward]`): `Pixels`,
+///     `CuSeqlens`, `Cos`, `Sin`, `GridThw`, `MaxSeqlen`.
+///
+/// The two preludes are disjoint by design — a vision body can't
+/// read `kv_cache` and a decoder body can't read `pixels`. Which
+/// names a given DSL body can name is selected by the [`Prelude`]
+/// passed into [`crate::classify::classify`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExternKind {
     InputIds,
@@ -42,18 +53,87 @@ pub enum ExternKind {
     RotaryLocal,
     BlockTable,
     KvCache,
+    /// Vision-encoder pixel/patch tensor: per-row patch of shape
+    /// `[total_l, in_chans * temporal_patch_size * patch_size²]`
+    /// produced by the host-side `patches_from_normalized_chw`
+    /// helper. Replaces the decoder's `InputIds` as the encoder's
+    /// data input.
+    Pixels,
+    /// Variable-length attention cumulative-seqlens index, shape
+    /// `[num_images + 1]` of i32. Vision encoders run varlen
+    /// flash-attn over a concatenated multi-image batch — `CuSeqlens`
+    /// is the ragged-batch boundary index, analogous to the paged
+    /// `BlockTable` for decoder attention but flat (no paging).
+    CuSeqlens,
+    /// 2D RoPE cos table, shape `[total_l, head_dim/2]`. Built
+    /// host-side from `grid_thw` and uploaded as bf16. Distinct from
+    /// decoder `Rotary` because vision RoPE has no positional
+    /// extern (positions live in `cos`/`sin` themselves) and is
+    /// applied via `vision_rope` rather than `rope_append`.
+    Cos,
+    /// 2D RoPE sin table, shape mirrors [`Cos`].
+    Sin,
+    /// Per-image grid `(t, h, w)` triples, shape `[num_images, 3]`
+    /// of u32. Drives host-side cu_seqlens / cos / sin builders
+    /// (already lifted to `ferrite-vision`); kept as an extern so
+    /// future ops like a `windowed_varlen_attention` can read it
+    /// directly when the windowed-block dispatch is DSL-visible.
+    GridThw,
+    /// Scalar i32 — the maximum per-image post-patch token count in
+    /// the current batch. Sized as a kernel input to varlen flash-
+    /// attn for shared-mem tile sizing. Shape `[]` (rank-0 / scalar).
+    MaxSeqlen,
+}
+
+/// Which DSL prelude (extern + op name set) is in scope when a
+/// classified body is built. Every `#[forward]` body uses
+/// [`Prelude::Decoder`]; every `#[vision_forward]` body uses
+/// [`Prelude::Vision`].
+///
+/// The two preludes are disjoint, but the downstream IR
+/// ([`Program`], [`crate::fuf::Fuf`]) shares one type and one
+/// pipeline — preludes only influence what NAMES the parser /
+/// classifier accept on input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Prelude {
+    /// Text decoder: input_ids / positions / rotary / kv_cache /
+    /// block_table externs; full text-side OpKind set.
+    #[default]
+    Decoder,
+    /// Vision encoder: pixels / cu_seqlens / cos / sin / grid_thw /
+    /// max_seqlen externs; vision-extended OpKind set
+    /// (VarlenAttention / VisionRope / QuickGelu / GeluErf
+    /// reachable in addition to the shared core).
+    Vision,
 }
 
 impl ExternKind {
-    /// Map a DSL identifier to its `ExternKind`, if any.
+    /// Map a DSL identifier to its `ExternKind`, if any. Decoder-
+    /// prelude entry point — kept for callers that pre-date the
+    /// prelude split. Equivalent to `from_name_for(name, Prelude::Decoder)`.
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "input_ids" => Some(Self::InputIds),
-            "positions" => Some(Self::Positions),
-            "rotary" => Some(Self::Rotary),
-            "rotary_local" => Some(Self::RotaryLocal),
-            "block_table" => Some(Self::BlockTable),
-            "kv_cache" => Some(Self::KvCache),
+        Self::from_name_for(name, Prelude::Decoder)
+    }
+
+    /// Prelude-aware extern lookup. Decoder bodies see the text-side
+    /// extern set; vision bodies see the vision-side set. The two
+    /// sets are disjoint — `pixels` is unrecognized in a decoder
+    /// body and `input_ids` is unrecognized in a vision body, both
+    /// raising classify-time errors per the strict-DSL rule.
+    pub fn from_name_for(name: &str, prelude: Prelude) -> Option<Self> {
+        match (prelude, name) {
+            (Prelude::Decoder, "input_ids") => Some(Self::InputIds),
+            (Prelude::Decoder, "positions") => Some(Self::Positions),
+            (Prelude::Decoder, "rotary") => Some(Self::Rotary),
+            (Prelude::Decoder, "rotary_local") => Some(Self::RotaryLocal),
+            (Prelude::Decoder, "block_table") => Some(Self::BlockTable),
+            (Prelude::Decoder, "kv_cache") => Some(Self::KvCache),
+            (Prelude::Vision, "pixels") => Some(Self::Pixels),
+            (Prelude::Vision, "cu_seqlens") => Some(Self::CuSeqlens),
+            (Prelude::Vision, "cos") => Some(Self::Cos),
+            (Prelude::Vision, "sin") => Some(Self::Sin),
+            (Prelude::Vision, "grid_thw") => Some(Self::GridThw),
+            (Prelude::Vision, "max_seqlen") => Some(Self::MaxSeqlen),
             _ => None,
         }
     }

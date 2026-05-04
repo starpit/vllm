@@ -2467,6 +2467,7 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(FusedMoeRefImpl));
         lib.push(Box::new(SharedFusedMoeRefImpl));
         lib.push(Box::new(GdnAttentionRefImpl));
+        lib.push(Box::new(GatedAttentionRefImpl));
 
         // ── Vision-tower ops (Phase G.4) ─────────────────────────────
         // One Impl per vision OpKind from G.2. Pairs with the
@@ -16871,6 +16872,169 @@ impl Implementation for GdnAttentionRefImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── GatedAttentionRefImpl ────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::GatedAttention` — Qwen3-Next full-attention
+// with sigmoid output gate + partial RoPE. `applies_to` matches
+// `GdnAttentionRefImpl` (gates on the same `linear_num_value_heads`
+// bound) — the two singletons partition Qwen3-Next's two layer types
+// without overlap because each claims a distinct `OpKind`.
+//
+// DSL: attn_out = gated_attention(hidden_states, attn[layer])
+#[derive(Debug, Default)]
+pub struct GatedAttentionRefImpl;
+
+impl Implementation for GatedAttentionRefImpl {
+    fn name(&self) -> &'static str {
+        "gated_attention_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // Same Qwen3-Next-distinctive fence as `GdnAttentionRefImpl`.
+        // No other registry arch advertises `linear_num_value_heads`,
+        // so the gate keeps `gated_attention(...)` claims confined to
+        // Qwen3-Next configs.
+        ctx.model.bounds.contains_key("linear_num_value_heads")
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GatedAttention)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GatedAttention",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer
+                    ),
+                ),
+                (
+                    "cos_sin_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GatedAttention: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GatedAttention: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        // Qwen3-Next hybrid arches use a single global rotary cache
+        // (no per-layer / `rotary_local` variant). Emit
+        // `Weights::rotary_cos_sin` directly — matches the
+        // `MlaAttentionImpl` non-local fallback at line 14848.
+        let cos_sin_ident = syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GatedAttention", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+                quote! { Weights::#cos_sin_ident },
             ],
         )])
     }

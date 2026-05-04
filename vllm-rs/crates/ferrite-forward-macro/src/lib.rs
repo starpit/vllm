@@ -933,6 +933,7 @@ fn compile_common(
                 "fused_moe_ref",
                 "shared_fused_moe_ref",
                 "gdn_attention_ref",
+                "gated_attention_ref",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
                 "mean_sub_rms_norm",

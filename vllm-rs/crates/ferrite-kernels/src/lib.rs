@@ -39,11 +39,13 @@ pub mod kv_cache;
 // builds. The `impl` blocks that use cudarc / `CachingAllocator` / etc. are
 // individually `#[cfg(feature = "cuda")]`-gated inside each file.
 pub mod layers;
-// `layers_gdn` is dual-mode: struct definitions for `GdnStatePool` and
-// `Qwen3NextGdnLayer` compile without `cuda` so `Instruction::GdnAttention`
-// resolves under metal; the cudarc-driving impls are individually
-// `#[cfg(feature = "cuda")]`-gated inside the file. Same pattern as
-// `layers` / `layers_moe`.
+// `layers_attn_gated` and `layers_gdn` are dual-mode: struct definitions
+// for `Qwen3NextGatedAttentionLayer` / `GdnStatePool` /
+// `Qwen3NextGdnLayer` compile without `cuda` so `Instruction::{Gated,
+// Gdn}Attention` resolve under metal; the cudarc-driving impls are
+// individually `#[cfg(feature = "cuda")]`-gated inside each file. Same
+// pattern as `layers` / `layers_moe`.
+pub mod layers_attn_gated;
 pub mod layers_gdn;
 pub mod layers_moe;
 #[cfg(feature = "cuda")]
@@ -69,6 +71,7 @@ pub use layers::{
     Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
+pub use layers_attn_gated::Qwen3NextGatedAttentionLayer;
 pub use layers_gdn::{GdnStatePool, Qwen3NextGdnLayer};
 pub use layers_moe::{DeepSeekV2MoELayer, MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling};

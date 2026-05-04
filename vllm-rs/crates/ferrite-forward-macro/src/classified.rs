@@ -446,6 +446,18 @@ pub enum OpKind {
     /// from `Attention` / `MlaAttention` — recurrent linear
     /// attention with conv1d state, no rotary, no paged KV cache.
     GdnAttention,
+    /// Qwen3-Next full-attention block with output gating (the
+    /// `full_attention` layers of the hybrid arch). Wraps fused QKV
+    /// projection, q/gate split (Q output is doubled when
+    /// `attn_output_gate=True`), per-head Q/K Gemma-style RMSNorm,
+    /// partial RoPE (Q rotated explicitly; K rotated on-the-fly by
+    /// FA2), paged-cache KV write, FlashAttention-2, sigmoid output
+    /// gate (`attn *= sigmoid(gate)`), and `o_proj` GEMM. DSL form:
+    /// `attn_out = gated_attention(hidden, attn[layer])`. Output:
+    /// `[T, hidden]`. Distinct math from `Attention` (the doubled-Q +
+    /// sigmoid epilog and Q-only-rotation are not expressible as a
+    /// generic-attention fusion).
+    GatedAttention,
 }
 
 impl OpKind {
@@ -490,6 +502,7 @@ impl OpKind {
             "avg_pool_2d" => Some(Self::AvgPool2d),
             "pos_embed" => Some(Self::PosEmbed),
             "gdn_attention" => Some(Self::GdnAttention),
+            "gated_attention" => Some(Self::GatedAttention),
             _ => None,
         }
     }
@@ -520,6 +533,7 @@ impl OpKind {
             Self::MlaAttention => "mla_attention",
             Self::Moe => "moe_block",
             Self::GdnAttention => "gdn_attention",
+            Self::GatedAttention => "gated_attention",
             // No DSL surface — produced only by the post-FUF lowering
             // pass at tp>1. `from_name` deliberately omits it so a
             // user can't write `all_reduce(...)` in a `#[forward]`

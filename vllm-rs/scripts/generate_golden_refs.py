@@ -212,6 +212,12 @@ MODELS = {
     # Phi-4-mini-reasoning — GQA 24/8, partial=0.75, longrope, tied
     # (identical shape to Phi-4-mini-instruct). Fits on L4.
     "phi4_mini_reasoning": "microsoft/Phi-4-mini-reasoning",
+    # Qwen2-MoE / Qwen1.5-MoE A2.7B-Chat slimmed to 2 layers — real
+    # trained weights from `Qwen/Qwen1.5-MoE-A2.7B-Chat` pruned to 2
+    # decoder layers. Single coherent L4-fitting Qwen2-MoE fixture
+    # for the new ferrite-model-qwen2-moe arch crate. Ships no
+    # tokenizer; the script borrows Qwen1.5-MoE-A2.7B-Chat's.
+    "qwen2_moe_slimed": "JacobAndersson/slimed-qwen-3",
     # Mixtral 8x248M DPO-tuned — `MixtralForCausalLM` (BF16, 8 experts,
     # top-2, 12 layers, ~2B params). Real DPO-tuned chat fine-tune that
     # produces coherent English. Single-rank coherence golden for the
@@ -252,6 +258,16 @@ def generate_for_model(model_id: str, output_key: str):
     kwargs = {"model": model_id, "max_model_len": 2048}
     if output_key.startswith("moonlight_"):
         kwargs["trust_remote_code"] = True
+    # `JacobAndersson/slimed-qwen-{1,2,3}` ship only weights + config
+    # — no tokenizer. Borrow Qwen1.5-MoE-A2.7B-Chat's BPE so the
+    # Python golden + Rust engine both encode prompts the same way.
+    # The checkpoint also ships `torch_dtype: "float16"` while ferrite
+    # auto-casts to BF16; pin BF16 on the Python side so both sides
+    # see the same precision (a 2-layer trim is sensitive to the
+    # mantissa difference — argmax flips at position 0 otherwise).
+    if output_key == "qwen2_moe_slimed":
+        kwargs["tokenizer"] = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
+        kwargs["dtype"] = "bfloat16"
     if is_fp8:
         kwargs["enforce_eager"] = True
         # Ferrite defaults to FlashInfer for FP8; match that in the

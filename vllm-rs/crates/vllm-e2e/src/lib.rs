@@ -299,6 +299,20 @@ impl TestModels {
     pub const COMMAND_R_1L_CUDA: &str = "Citaman/command-r-1-layer";
     // MoE models for CUDA — safetensors BF16.
     //
+    // Qwen2-MoE / Qwen1.5-MoE A2.7B-Chat slimmed to 2 layers
+    // (`Qwen2MoeForCausalLM`, BF16/FP16, full hidden=2048, 60 routed
+    // experts × top-4, shared expert intermediate=5632, ~3GB FP16).
+    // The single coherent L4-fitting Qwen2-MoE fixture: real trained
+    // weights from Qwen1.5-MoE-A2.7B-Chat with all but 2 decoder
+    // layers pruned (mergekit-style trim, mirrors the
+    // `Citaman/command-r-1-layer` pattern). Used to exercise the
+    // `SharedFusedMoELayer::load` + forward path with
+    // `shared_expert_intermediate_size > 0` (Qwen3-MoE-Instruct
+    // ships shared_inter=0 fleet-wide; this is the only available
+    // path for the routed+shared MoE branch). Ships no tokenizer —
+    // see `ensure_slimed_qwen_tokenizer` in e_correctness for
+    // borrowing Qwen1.5-MoE-A2.7B-Chat's vocab files.
+    pub const QWEN2_MOE_SLIMED_CUDA: &str = "JacobAndersson/slimed-qwen-3";
     // Mixtral 8x248M DPO-tuned — `MixtralForCausalLM` (BF16, 8 experts,
     // top-2, 12 layers, hidden=1024, intermediate=4096, ~2B total
     // params, ~4GB BF16). Real DPO-tuned chat fine-tune (oasst2 +

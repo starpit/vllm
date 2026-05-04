@@ -22,6 +22,7 @@ arch-mistral       = ["dep:ferrite-model-mistral"]
 arch-mixtral       = ["dep:ferrite-model-mixtral"]
 arch-phi3          = ["dep:ferrite-model-phi3"]
 arch-qwen2         = ["dep:ferrite-model-qwen2"]
+arch-qwen2-moe     = ["dep:ferrite-model-qwen2-moe"]
 arch-qwen3         = ["dep:ferrite-model-qwen3"]
 arch-qwen3-moe     = ["dep:ferrite-model-qwen3-moe"]
 
@@ -38,6 +39,7 @@ all-arches = [
     "arch-mixtral",
     "arch-phi3",
     "arch-qwen2",
+    "arch-qwen2-moe",
     "arch-qwen3",
     "arch-qwen3-moe",
 ]
@@ -52,6 +54,7 @@ cuda = [
     "ferrite-model-mixtral?/cuda",
     "ferrite-model-phi3?/cuda",
     "ferrite-model-qwen2?/cuda",
+    "ferrite-model-qwen2-moe?/cuda",
     "ferrite-model-qwen3?/cuda",
     "ferrite-model-qwen3-moe?/cuda",
     "ferrite-model-deepseek-v2?/cuda",
@@ -75,6 +78,7 @@ nccl = [
     "ferrite-model-mixtral?/nccl",
     "ferrite-model-phi3?/nccl",
     "ferrite-model-qwen2?/nccl",
+    "ferrite-model-qwen2-moe?/nccl",
     "ferrite-model-qwen3?/nccl",
     "ferrite-model-qwen3-moe?/nccl",
     "ferrite-model-deepseek-v2?/nccl",
@@ -94,5 +98,6 @@ ferrite-model-mistral      = { path = "../ferrite-model-mistral",      optional 
 ferrite-model-mixtral      = { path = "../ferrite-model-mixtral",      optional = true }
 ferrite-model-phi3         = { path = "../ferrite-model-phi3",         optional = true }
 ferrite-model-qwen2        = { path = "../ferrite-model-qwen2",        optional = true }
+ferrite-model-qwen2-moe    = { path = "../ferrite-model-qwen2-moe",    optional = true }
 ferrite-model-qwen3        = { path = "../ferrite-model-qwen3",        optional = true }
 ferrite-model-qwen3-moe    = { path = "../ferrite-model-qwen3-moe",    optional = true }

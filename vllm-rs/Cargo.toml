@@ -33,6 +33,7 @@ members = [
     "crates/ferrite-model-mixtral",
     "crates/ferrite-model-phi3",
     "crates/ferrite-model-qwen2",
+    "crates/ferrite-model-qwen2-moe",
     "crates/ferrite-model-qwen3",
     "crates/ferrite-model-qwen3-moe",
     "crates/ferrite-model-deepseek-v2",

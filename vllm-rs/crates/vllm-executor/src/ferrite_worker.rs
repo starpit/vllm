@@ -473,6 +473,12 @@ impl CudaModel {
                     vision_window_index: None,
                     vision_reverse_indices: None,
                     vision_position_ids: None,
+                    // GDN state is Qwen3-Next-only and threaded
+                    // through a dedicated dispatch path; the
+                    // ferrite forward dispatcher today doesn't run
+                    // hybrid arches so both fields are None here.
+                    gdn_state: None,
+                    gdn_state_indices: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -683,6 +689,11 @@ impl CudaModel {
                     vision_window_index: None,
                     vision_reverse_indices: None,
                     vision_position_ids: None,
+                    // See companion `Self::Ferrite` arm above —
+                    // hybrid GDN dispatch is not yet wired through
+                    // this path, so both fields are None.
+                    gdn_state: None,
+                    gdn_state_indices: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -6310,7 +6321,7 @@ impl Worker for FerriteWorker {
         if let Some(ref config) = self.qwen3_next_config {
             let dev = self.device.as_ref().unwrap();
             let gdn_pool = unsafe {
-                vllm_cuda::model::qwen3_next::GdnStatePool::new(
+                vllm_cuda::model::qwen3_next::make_gdn_state_pool(
                     config,
                     num_gpu_blocks,
                     dev.compute_stream,

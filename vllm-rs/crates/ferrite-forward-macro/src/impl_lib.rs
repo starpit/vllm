@@ -2466,6 +2466,7 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
         lib.push(Box::new(FusedMoeRefImpl));
         lib.push(Box::new(SharedFusedMoeRefImpl));
+        lib.push(Box::new(GdnAttentionRefImpl));
 
         // ── Vision-tower ops (Phase G.4) ─────────────────────────────
         // One Impl per vision OpKind from G.2. Pairs with the
@@ -16696,6 +16697,166 @@ impl Implementation for SharedFusedMoeRefImpl {
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         Some(vec![OpInstance::new(
             syn::Ident::new("SharedFusedMoe", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── GdnAttentionRefImpl ───────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::GdnAttention` — Qwen3-Next Gated Delta Net
+// linear-attention layer. Distinguished from the Qwen3-MoE
+// `SharedFusedMoeRefImpl` by an `applies_to` gate on
+// `linear_num_value_heads` (Qwen3-Next-distinctive — no other arch in
+// the registry ships this bound, including Qwen3-MoE).
+//
+// DSL: gdn_out = gdn_attention(hidden_states, gdn[layer])
+//
+// `gdn[layer]` resolves to a `Qwen3NextGdnLayer` struct loaded by
+// `FieldLoad::GdnAttention`; the per-request recurrent state is read
+// from `ForwardCtx::gdn_state` + `gdn_state_indices` at eval time.
+#[derive(Debug, Default)]
+pub struct GdnAttentionRefImpl;
+
+impl Implementation for GdnAttentionRefImpl {
+    fn name(&self) -> &'static str {
+        "gdn_attention_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // Qwen3-Next is the only arch in the registry that ships
+        // `linear_num_value_heads` in its config — it sizes the GDN
+        // recurrent state. Fence on it so a future Qwen3-Next-flavored
+        // sibling Impl that consumes a non-GDN tile doesn't fire on
+        // architectures whose layer set has no `gdn_attention(...)`.
+        ctx.model.bounds.contains_key("linear_num_value_heads")
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GdnAttention)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        // No calibration sweep covers GDN yet — use the same
+        // placeholder the Tier-1 MoE Impls land with. The DP picks
+        // are unaffected because there is no peer Impl for
+        // `OpKind::GdnAttention` (it's a singleton match).
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GdnAttention",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GdnAttention: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("GdnAttention: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GdnAttention", proc_macro2::Span::call_site()),
             vec![
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },

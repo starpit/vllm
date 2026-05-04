@@ -431,6 +431,21 @@ pub enum OpKind {
     /// reuses `kernels::embedding_gather_masked` (the same kernel
     /// `Instruction::Embed` calls) reading `ctx.fwd.position_ids`.
     PosEmbed,
+    /// Gated Delta Net (GDN) linear-attention block, used by the
+    /// `linear_attention` layers of Qwen3-Next. Wraps the full
+    /// pipeline (`in_proj_qkvz` + `in_proj_ba` GEMMs → QKVZ split
+    /// → causal conv1d → fused gating → fused recurrent
+    /// gated-delta-rule → RMSNormGated → `out_proj` GEMM) in a
+    /// single tile so the IR doesn't fan out into seven separate
+    /// nodes. Per-request recurrent state lives on
+    /// `ForwardCtx::gdn_state` / `gdn_state_indices`; per-layer
+    /// weights flow as the second arg accessor (`gdn[layer]`),
+    /// resolving to a `Qwen3NextGdnLayer` struct.
+    /// DSL form: `gdn_out = gdn_attention(x, gdn[layer])`.
+    /// Output shape: `[T, hidden]` (same as input). Distinct math
+    /// from `Attention` / `MlaAttention` — recurrent linear
+    /// attention with conv1d state, no rotary, no paged KV cache.
+    GdnAttention,
 }
 
 impl OpKind {
@@ -474,6 +489,7 @@ impl OpKind {
             "embedding_gather" => Some(Self::EmbeddingGather),
             "avg_pool_2d" => Some(Self::AvgPool2d),
             "pos_embed" => Some(Self::PosEmbed),
+            "gdn_attention" => Some(Self::GdnAttention),
             _ => None,
         }
     }
@@ -503,6 +519,7 @@ impl OpKind {
             Self::MlaSplit => "mla_split",
             Self::MlaAttention => "mla_attention",
             Self::Moe => "moe_block",
+            Self::GdnAttention => "gdn_attention",
             // No DSL surface — produced only by the post-FUF lowering
             // pass at tp>1. `from_name` deliberately omits it so a
             // user can't write `all_reduce(...)` in a `#[forward]`

@@ -1116,6 +1116,12 @@ impl GpuWeights {
         }
 
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+        // HEAD's `alloc_and_copy_host` allocator abstraction is
+        // synchronous (allocate + memcpy + implicit sync), superseding
+        // the manual `mem_alloc + memcpy_htod_async +
+        // stream_synchronize` triple from 136763e0a. The shared-cast
+        // race that commit guarded against can't happen here because
+        // the new allocator returns only after the H2D completes.
         let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
     }
@@ -1151,7 +1157,10 @@ impl GpuWeights {
             return Ok(size);
         }
 
-        // Slow path.
+        // Slow path. Same shared-cast-buffer race as `take()` —
+        // sync before returning so the next slow-path take() doesn't
+        // overwrite `self.cast_pinned` while this H2D is still reading
+        // from it.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         // If the cast wrote into our shared `cast_scratch`, sync the

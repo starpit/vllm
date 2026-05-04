@@ -164,3 +164,52 @@ clean. Compile-verified, NOT inference-verified — the executor
 still needs a `Qwen3NextForCausalLM → Ferrite` arm in
 `cuda_worker.rs` and per-request `ForwardCtx::{gdn_state,
 gdn_state_indices}` wiring before Phase 6 can run a real prompt.
+
+Committed: `a257d7aca`.
+
+## 2026-05-04 — clarification: load-side dispatch was already correct
+
+Initial Phase 6 framing said "cuda_worker arm dispatching
+Qwen3NextForCausalLM to the Ferrite path" was needed. Reread of
+`cuda_worker.rs:5077` — `ferrite_forward::try_load(...)` already
+runs unconditionally before any per-arch hand-written switch, so
+once `ferrite-model-qwen3-next` registers `Qwen3NextForCausalLM`
+in its `architectures` (it does), the load is owned by ferrite.
+The hand-written `vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM`
+fallback at line ~5741 is unreachable for ferrite-claimed loads.
+Phase 6 work is therefore confined to *runtime* wiring.
+
+## 2026-05-04 — Phase 6a: executor runtime wiring (compile-clean)
+
+Three surgical edits to `vllm-executor/src/cuda_worker.rs`:
+- After ferrite ownership is set and before kv_cache pool init,
+  if `ferrite_weights.arch_name() == "qwen3_next"` populate
+  `self.qwen3_next_config` from `qwen3_next_config_from_hf(&hf_config)`.
+  `init_kv_cache_pool` then constructs the existing `gdn_state_pool`
+  for ferrite loads too — same code path the legacy
+  `CudaModel::Qwen3Next` variant uses.
+- New `CudaModel::is_qwen3_next()` helper returns true for both the
+  legacy hand-written variant and ferrite loads whose `arch_name()`
+  matches. The dispatch site (the prepared-batch branch) now
+  predicates on this method instead of `matches!(model, CudaModel::Qwen3Next(_))`.
+- `forward_qwen3_next` gains a `Self::Ferrite` arm: builds
+  `ForwardCtx` with `gdn_state` and `gdn_state_indices` populated,
+  calls `m.weights.forward(...)`, and applies the same
+  last-token-gather epilog the generic Ferrite branch uses. Legacy
+  `Qwen3Next` arm unchanged.
+
+vllm-cli release build clean; fmt + clippy clean. NOT inference-verified
+yet — needs a Qwen3-Next checkpoint on disk (none cached locally,
+and the official 80B-A3B-Instruct is ~80GB). Compile-clean is the
+honest claim until a real run lands.
+
+## Open follow-ups
+
+- **Phase 6b — real inference run.** With a Qwen3-Next checkpoint
+  available, run `timeout 60 vllm chat -m Qwen/Qwen3-Next-80B-A3B-Instruct`
+  (or smaller variant) → check for coherent output, then a
+  Python-vLLM logits parity check at decode step 0.
+- **TP / quant / GGUF.** Out of scope per the plan; will need
+  per-format peer Impls and the GDN state pool's TP-aware sharding
+  (today the pool is unsharded — `feedback_ferrite_weights_unsharded`
+  applies). Document any divergence here when those land.

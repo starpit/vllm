@@ -34,7 +34,7 @@ use ferrite_kernels::cutlass;
 use ferrite_kernels::flashinfer;
 use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{
-    Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, LinearLayer, MarlinLinear, RmsNorm,
+    Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
@@ -99,7 +99,24 @@ pub type CosSinFn<W> = for<'a> fn(&'a W, u32) -> GpuTensor;
 pub enum Instruction<W> {
     Embed(u32, WtFn<W, Embedding>),
     RmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
-    LayerNorm(u32, u32, u32, WtFn<W, CohereLayerNorm>),
+    /// CohereLayerNorm-flavored norm (subtracts mean before scaling).
+    /// Claimed from the `(mean, sub, rmsnorm)` math trio in the DSL.
+    /// Weight is typed `RmsNorm` because the DSL author writes
+    /// `rmsnorm(centered, w)`; the wrapper struct is structurally
+    /// identical to the now-retired `CohereLayerNorm` (one `weight`
+    /// + one `eps`), and the kernel reads only those two fields.
+    MeanSubRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
+    /// Torch-style LayerNorm with bias. Claimed from the 4-tile pattern
+    /// `(mean, sub, rmsnorm, bias_add)` in the DSL — extends the
+    /// `MeanSubRmsNorm` math trio with a learned bias addition. Weight
+    /// is typed `LayerNorm` (not `RmsNorm`) so the loader auto-pulls
+    /// `<prefix>.weight` AND `<prefix>.bias` together; the matcher's
+    /// `required_weights` returns one accessor whose source is the
+    /// rmsnorm's weight ref. The DSL bias-weight ref (e.g.
+    /// `attn_norm.bias[layer]`) is structural-only — same trick the
+    /// dense `(Gemm, BiasAdd)` fusion plays via `LinearLayer`.
+    /// Used by encoder models like ModernBERT.
+    MeanSubRmsNormBiasAdd(u32, u32, u32, WtFn<W, LayerNorm>),
     Reshape(u32, u32, [u32; MAX_DIMS], [u8; MAX_DIMS], u8),
     Add(u32, u32),
     /// Tensor-parallel all-reduce-sum on the slot in place. Inserted
@@ -145,12 +162,15 @@ pub enum Instruction<W> {
         u32,
         u32,
     ),
-    /// LayerNorm→Gemm sibling for Cohere-style architectures.
-    CutlassFusedLayerNormGemm(
+    /// Norm→Gemm fusion for CohereLayerNorm-flavored norms.
+    /// Claimed from the `(mean, sub, rmsnorm, gemm)` 4-tile pattern
+    /// where the Gemm is the sole consumer of the rmsnorm output.
+    /// Runs `cohere_layer_norm` then `cutlass_gemm` sequentially.
+    CutlassFusedMeanSubRmsNormGemm(
         u32,
         u32,
         u32,
-        WtFn<W, CohereLayerNorm>,
+        WtFn<W, RmsNorm>,
         WtFn<W, LinearLayer>,
         u32,
         u32,
@@ -214,6 +234,14 @@ pub enum Instruction<W> {
     ),
     AttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
     AttentionPrefillContiguous(u32, u32, u32, u32, bool),
+    /// Bidirectional / encoder attention. Reads contiguous Q/K/V from
+    /// the upstream tile slots; calls `flash_attn_contiguous` with
+    /// `is_causal=false` and a null cos_sin pointer (RoPE applied
+    /// separately upstream). No KV cache, no per-layer cos_sin —
+    /// the encoder DSL form is `attention(q, k, v)` (3 args). Q/K/V
+    /// must already be 3D `[T, heads, head_dim]` from the upstream
+    /// projection chain. Output is reshaped to `[T, Q_SIZE]`.
+    EncoderAttention(u32, u32, u32, u32),
     SlidingAttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
     SlidingAttentionPrefillContiguous(u32, u32, u32, u32, bool),
     FlashInferAttentionDecode(u32, u32, u32, CosSinFn<W>, u32, bool),
@@ -460,7 +488,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::LayerNorm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::MeanSubRmsNorm(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
@@ -468,6 +496,30 @@ impl<W: CanonicalParams> Instruction<W> {
                     *v,
                     w.weight,
                     w.eps,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer, weight_fn) => unsafe {
+                // `LayerNorm`'s `bias` is `Option<GpuTensor>`; this Impl
+                // is only emitted when the DSL has a downstream
+                // `bias_add`, which means the loader is expected to
+                // populate the bias. Empty bias is a loader/DSL
+                // mismatch — surface it via `expect` rather than
+                // silently dropping the bias term and producing wrong
+                // numerics.
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let ln = (weight_fn)(ctx.wm, layer);
+                let bias = ln
+                    .bias
+                    .expect("MeanSubRmsNormBiasAdd: LayerNorm.bias must be Some");
+                let out = kernels::layer_norm_bias(
+                    *v,
+                    ln.weight,
+                    bias,
+                    ln.eps,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -623,7 +675,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::CutlassFusedLayerNormGemm(
+            Instruction::CutlassFusedMeanSubRmsNormGemm(
                 in_slot,
                 out_slot,
                 layer,
@@ -640,7 +692,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let nw = (norm_wf)(ctx.wm, layer);
                 let gw = (gemm_wf)(ctx.wm, layer);
                 assert_weight_shape(
-                    "CutlassFusedLayerNormGemm",
+                    "CutlassFusedMeanSubRmsNormGemm",
                     gw.dense_weight(),
                     n,
                     k,
@@ -1082,6 +1134,46 @@ impl<W: CanonicalParams> Instruction<W> {
                         ::std::ptr::null::<u8>(),
                         0,
                         interleaved,
+                    )
+                };
+                unsafe {
+                    let nt = (*out).dim(0);
+                    let dt = (*out).dtype();
+                    out.reshape(&[nt, W::Q_SIZE], dt);
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            }
+            Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => {
+                // Encoder/bidirectional self-attention: same FA2 kernel
+                // as the prefill prefill path but with `is_causal=false`
+                // (every query attends to every key in its sequence). No
+                // softcap (encoder models don't use it), no sliding
+                // window (full attention), no fused RoPE (RoPE applied
+                // upstream — null cos_sin pointer + rotary_dim=0 makes
+                // flash-attn skip its fused rotary). cu_seqlens_q is
+                // reused as cu_seqlens_k since K and V live alongside Q
+                // for self-attention.
+                let mut out = unsafe {
+                    let q = tile_ref(ctx.tiles, q_slot).as_view(ctx.tiles);
+                    let k = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
+                    let v = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
+                    kernels::flash_attn_contiguous(
+                        *q,
+                        *k,
+                        *v,
+                        *ctx.fwd.cu_seqlens_q,
+                        *ctx.fwd.cu_seqlens_q,
+                        ctx.fwd.max_seqlen_q,
+                        ctx.fwd.max_seqlen_q,
+                        W::ATTN_SCALE,
+                        false,
+                        0.0,
+                        -1,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                        ::std::ptr::null::<u8>(),
+                        0,
+                        false,
                     )
                 };
                 unsafe {
@@ -2551,6 +2643,7 @@ unsafe fn run_slice<W: CanonicalParams>(
     instructions: &[Instruction<W>],
     ctx: &mut InterpreterCtx<'_, W>,
 ) {
+    let dump = debug_dump::DumpHook::from_env();
     let mut i = 0usize;
     while i < instructions.len() {
         match instructions[i] {
@@ -2560,9 +2653,16 @@ unsafe fn run_slice<W: CanonicalParams>(
                 let body = &instructions[body_start..body_end];
                 for l in 0..count {
                     ctx.layer_offset = l;
-                    for instr in body {
+                    for (j, instr) in body.iter().enumerate() {
                         unsafe {
                             instr.eval(ctx);
+                        }
+                        if let Some(d) = dump.as_ref() {
+                            d.dump(
+                                &format!("loop_iter_{}_body_{}", l, j),
+                                ctx.tiles,
+                                ctx.device.compute_stream,
+                            );
                         }
                     }
                 }
@@ -2573,7 +2673,111 @@ unsafe fn run_slice<W: CanonicalParams>(
                 unsafe {
                     instr.eval(ctx);
                 }
+                if let Some(d) = dump.as_ref() {
+                    d.dump(
+                        &format!("instr_{}", i),
+                        ctx.tiles,
+                        ctx.device.compute_stream,
+                    );
+                }
                 i += 1;
+            }
+        }
+    }
+}
+
+/// Per-instruction hidden-state dumper.
+///
+/// Activated by `FERRITE_DEBUG_DUMP_PATH=<file>`. After each
+/// `Instruction::eval`, copies the first row of every Owned tile slot
+/// to host, casts BF16/F16 → F32, and appends one JSONL row to the
+/// path: `{"label": "...", "slot": N, "shape": [..], "first8":
+/// [..]}`. Buffers are line-buffered so a process kill mid-forward
+/// still yields usable diagnostics.
+///
+/// Cost: one D2H + stream sync per slot per instruction. Useful
+/// only for single-request bisection runs; never enable in
+/// production.
+mod debug_dump {
+    use super::TileEntry;
+    use ferrite_cuda_core::CUstream;
+    use ferrite_cuda_core::driver::{memcpy_dtoh_async, stream_synchronize};
+    use ferrite_cuda_core::dtype::DType;
+    use std::cell::RefCell;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    pub struct DumpHook {
+        file: RefCell<std::fs::File>,
+    }
+
+    impl DumpHook {
+        pub fn from_env() -> Option<Self> {
+            let path: PathBuf = std::env::var_os("FERRITE_DEBUG_DUMP_PATH")?.into();
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()?;
+            Some(Self {
+                file: RefCell::new(f),
+            })
+        }
+
+        pub fn dump(&self, label: &str, tiles: &[Option<TileEntry>], stream: CUstream) {
+            // Sync first to ensure prior async ops have completed.
+            unsafe {
+                let _ = stream_synchronize(stream);
+            }
+            for (slot, entry) in tiles.iter().enumerate() {
+                let Some(e) = entry else { continue };
+                // Only dump Owned tiles — Views alias another slot,
+                // and Reshaped is a metadata-only rewrap. Skipping
+                // them avoids double-dumping the same storage.
+                let TileEntry::Owned(t) = e else { continue };
+                let gt = t.as_gpu_tensor();
+                if gt.ndim() < 1 {
+                    continue;
+                }
+                // First-row size in bytes.
+                let row_elems: usize = (1..gt.ndim()).map(|d| gt.dim(d)).product();
+                let row_elems = row_elems.max(1);
+                let take = row_elems.min(64);
+                let dt = gt.dtype();
+                let bytes_per = dt.size_bytes();
+                let buf_len = take * bytes_per;
+                let mut host: Vec<u8> = vec![0u8; buf_len];
+                unsafe {
+                    let _ = memcpy_dtoh_async(host.as_mut_ptr(), gt.as_ptr(), buf_len, stream);
+                    let _ = stream_synchronize(stream);
+                }
+                let first8: Vec<f32> = match dt {
+                    DType::F32 => host
+                        .chunks_exact(4)
+                        .take(take)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect(),
+                    // BF16 → F32: pad with two zero LSBs to widen to a
+                    // 32-bit IEEE float. Lossless because BF16 shares
+                    // F32's 8-bit exponent.
+                    DType::BF16 => host
+                        .chunks_exact(2)
+                        .take(take)
+                        .map(|b| f32::from_le_bytes([0, 0, b[0], b[1]]))
+                        .collect(),
+                    // F16 → F32: requires real conversion (different
+                    // exponent width). Skip for the dump — every arch
+                    // we care about uses BF16/F32.
+                    _ => continue,
+                };
+                let shape: Vec<usize> = (0..gt.ndim()).map(|d| gt.dim(d)).collect();
+                let line = format!(
+                    "{{\"label\":\"{label}\",\"slot\":{slot},\"shape\":{shape:?},\"first8\":{first8:?}}}\n"
+                );
+                if let Ok(mut f) = self.file.try_borrow_mut() {
+                    let _ = f.write_all(line.as_bytes());
+                }
             }
         }
     }

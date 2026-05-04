@@ -30,6 +30,8 @@ extern crate ferrite_model_llama as _keep_llama;
 extern crate ferrite_model_mistral as _keep_mistral;
 #[cfg(feature = "arch-mixtral")]
 extern crate ferrite_model_mixtral as _keep_mixtral;
+#[cfg(feature = "arch-modernbert")]
+extern crate ferrite_model_modernbert as _keep_modernbert;
 #[cfg(feature = "arch-phi3")]
 extern crate ferrite_model_phi3 as _keep_phi3;
 #[cfg(feature = "arch-qwen2")]
@@ -65,6 +67,8 @@ pub use ferrite_model_llama as llama;
 pub use ferrite_model_mistral as mistral;
 #[cfg(feature = "arch-mixtral")]
 pub use ferrite_model_mixtral as mixtral;
+#[cfg(feature = "arch-modernbert")]
+pub use ferrite_model_modernbert as modernbert;
 #[cfg(feature = "arch-phi3")]
 pub use ferrite_model_phi3 as phi3;
 #[cfg(feature = "arch-qwen2")]

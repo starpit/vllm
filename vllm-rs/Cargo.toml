@@ -31,6 +31,7 @@ members = [
     "crates/ferrite-model-llama",
     "crates/ferrite-model-mistral",
     "crates/ferrite-model-mixtral",
+    "crates/ferrite-model-modernbert",
     "crates/ferrite-model-phi3",
     "crates/ferrite-model-qwen2",
     "crates/ferrite-model-qwen2-moe",

@@ -205,7 +205,6 @@ enum CudaModel {
     CommandR(vllm_cuda::model::commandr::CommandRForCausalLM),
     Qwen3Next(vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM),
     DeepSeekV2(vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM),
-    ModernBert(vllm_cuda::model::modernbert::ModernBertModel),
 }
 
 impl CudaModel {
@@ -223,8 +222,17 @@ impl CudaModel {
             // Only full attention layers need KV cache.
             Self::Qwen3Next(m) => m.num_kv_layers(),
             Self::DeepSeekV2(m) => m.model.layers.len(),
-            // Encoder: no KV cache, but we need at least 1 "layer" for pool allocation.
-            Self::ModernBert(_) => 0,
+        }
+    }
+
+    /// Whether this model is a ferrite-compiled encoder (no lm_head Gemm,
+    /// returns hidden states from `forward_backbone`). Encoders skip CUDA
+    /// graph capture and use the fixed-estimate profiling path. Today only
+    /// modernbert qualifies; add new arch names here as they land.
+    fn is_ferrite_encoder(&self) -> bool {
+        match self {
+            Self::Ferrite(m) => matches!(m.weights.arch_name(), "modernbert"),
+            _ => false,
         }
     }
 
@@ -250,7 +258,6 @@ impl CudaModel {
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.num_kv_heads,
             Self::Qwen3Next(m) => m.num_kv_heads(),
             Self::DeepSeekV2(m) => m.model.layers[0].self_attn.num_heads,
-            Self::ModernBert(_) => 0, // Encoder: no KV cache heads.
         }
     }
 
@@ -267,7 +274,6 @@ impl CudaModel {
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.head_dim,
             Self::Qwen3Next(m) => m.head_dim(),
             Self::DeepSeekV2(m) => m.model.layers[0].self_attn.qk_head_dim,
-            Self::ModernBert(m) => m.layers[0].attn.head_dim,
         }
     }
 
@@ -284,7 +290,6 @@ impl CudaModel {
             Self::CommandR(m) => m.lm_head.out_features(),
             Self::Qwen3Next(m) => m.lm_head.out_features(),
             Self::DeepSeekV2(m) => m.lm_head.out_features(),
-            Self::ModernBert(m) => m.embeddings.tok_embeddings.vocab_size(),
         }
     }
 
@@ -312,7 +317,6 @@ impl CudaModel {
             Self::CommandR(m) => m.lm_head.in_features(),
             Self::Qwen3Next(m) => m.lm_head.in_features(),
             Self::DeepSeekV2(m) => m.lm_head.in_features(),
-            Self::ModernBert(m) => m.hidden_size,
         }
     }
 
@@ -330,7 +334,6 @@ impl CudaModel {
             Self::CommandR(_) => {}  // TP not yet supported
             Self::Qwen3Next(_) => {} // TP not yet supported
             Self::DeepSeekV2(m) => m.set_tp_group(group),
-            Self::ModernBert(_) => {} // Encoder: TP not yet supported
             Self::Ferrite(m) => m.tp_group = Some(group),
         }
     }
@@ -513,20 +516,6 @@ impl CudaModel {
                     device,
                 )
             },
-            Self::ModernBert(m) => unsafe {
-                m.forward(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                )
-            },
         }
     }
 
@@ -606,6 +595,18 @@ impl CudaModel {
             // ferrite-level optimization would expose a gather op
             // in the DSL so the user can place it before lm_head.
             Self::Ferrite(m) => unsafe {
+                // Encoder arches (modernbert) have no lm_head — both `forward`
+                // and `forward_backbone` return hidden states. Routing those
+                // through the logit-gather path below would mis-shape the
+                // gather. Pooling callers use `hidden_states()` instead; this
+                // arm is the logit-generation path and must hard-fail for
+                // encoders.
+                if self.is_ferrite_encoder() {
+                    panic!(
+                        "{}: encoder model does not support logit generation; use hidden_states()",
+                        m.weights.arch_name()
+                    );
+                }
                 let num_tokens = input_ids.dim(0) as u64;
                 let (mm_embeds, embed_patches) = match mm_inputs {
                     Some(mm) => (Some(mm.mm_embeds), mm.embed_patches),
@@ -732,11 +733,6 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
-            Self::ModernBert(_) => {
-                panic!(
-                    "ModernBert: encoder model does not support logit generation; use hidden_states()"
-                );
-            }
         }
     }
 
@@ -1527,62 +1523,6 @@ fn deepseek_v2_config_from_hf(
         topk_group,
         scoring_func,
         yarn_rope_scaling,
-    })
-}
-
-fn modernbert_config_from_hf(
-    hf: &HfModelConfig,
-) -> ExecutorResult<vllm_cuda::model::modernbert::ModernBertConfig> {
-    let hidden_size = hf
-        .hidden_size
-        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
-    let num_attention_heads = hf
-        .num_attention_heads
-        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
-
-    Ok(vllm_cuda::model::modernbert::ModernBertConfig {
-        vocab_size: hf.vocab_size.unwrap_or(50368),
-        hidden_size,
-        num_hidden_layers: hf.num_hidden_layers.unwrap_or(22),
-        num_attention_heads,
-        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
-        max_position_embeddings: hf.max_position_embeddings.unwrap_or(8192),
-        layer_norm_eps: hf.layer_norm_eps.unwrap_or(1e-5),
-        attention_bias: hf
-            .extra
-            .get("attention_bias")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        mlp_bias: hf
-            .extra
-            .get("mlp_bias")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        norm_bias: hf
-            .extra
-            .get("norm_bias")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        global_attn_every_n_layers: hf
-            .extra
-            .get("global_attn_every_n_layers")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3) as usize,
-        local_attention: hf
-            .extra
-            .get("local_attention")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(128) as usize,
-        global_rope_theta: hf
-            .extra
-            .get("global_rope_theta")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(160000.0),
-        local_rope_theta: hf
-            .extra
-            .get("local_rope_theta")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(10000.0),
     })
 }
 
@@ -6089,17 +6029,6 @@ impl Worker for CudaWorker {
                     .map_err(|e| ExecutorError::WorkerInit(format!("CommandR load: {e}")))?;
                     CudaModel::CommandR(m)
                 }
-                "ModernBertModel" | "ModernBertForMaskedLM" => {
-                    let config = modernbert_config_from_hf(&hf_config)?;
-                    let m = vllm_cuda::model::modernbert::ModernBertModel::load(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
-                    .map_err(|e| ExecutorError::WorkerInit(format!("ModernBert load: {e}")))?;
-                    CudaModel::ModernBert(m)
-                }
                 _ => {
                     return Err(ExecutorError::WorkerInit(format!(
                         "unsupported architecture for cuda-backend: {arch}. \
@@ -6108,7 +6037,8 @@ impl Worker for CudaWorker {
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
                      Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM, \
                      Qwen3NextForCausalLM, DeepseekV2ForCausalLM, DeepSeekV3ForCausalLM, \
-                     DeepseekV3ForCausalLM, ModernBertModel"
+                     DeepseekV3ForCausalLM, ModernBertModel, ModernBertForMaskedLM \
+                     (last two via ferrite-forward)"
                     )));
                 }
             }
@@ -6135,6 +6065,7 @@ impl Worker for CudaWorker {
             "last" => vllm_model::embedding::PoolingStrategy::Last,
             "cls" => vllm_model::embedding::PoolingStrategy::Cls,
             "mean" => vllm_model::embedding::PoolingStrategy::Mean,
+            "all" | "all_tokens" => vllm_model::embedding::PoolingStrategy::AllTokens,
             _ => {
                 // "auto": detect from 1_Pooling/config.json, default to Last.
                 vllm_model::embedding::detect_pooling_strategy(&model_dir)
@@ -6252,10 +6183,7 @@ impl Worker for CudaWorker {
         //   max_num_batched_tokens can still OOM on the attention side
         let pp_active = self.pp_config.is_some_and(|pp| pp.pp_size > 1);
         let is_moe = self.model.as_ref().is_some_and(|m| m.is_moe());
-        let is_encoder = self
-            .model
-            .as_ref()
-            .is_some_and(|m| matches!(m, CudaModel::ModernBert(_)));
+        let is_encoder = self.model.as_ref().is_some_and(|m| m.is_ferrite_encoder());
         if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active || is_moe || is_encoder {
             let tag = if self.uses_ggml {
                 "GGML"
@@ -6521,7 +6449,7 @@ impl Worker for CudaWorker {
         }
 
         // Encoder models don't support CUDA graph capture (no decode loop).
-        if matches!(model, CudaModel::ModernBert(_)) {
+        if model.is_ferrite_encoder() {
             self.config.cuda_graph_mode = CudaGraphMode::None;
             info!("CudaWorker: encoder model — disabling CUDA graphs");
         }

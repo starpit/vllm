@@ -21,8 +21,8 @@ use ferrite_cuda_core::DType;
 use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
 use ferrite_kernels::layers::{
-    Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear,
-    LinearLayer, MarlinLinear, RmsNorm,
+    Bnb4bitLinear, Embedding, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear, LayerNorm, LinearLayer,
+    MarlinLinear, RmsNorm,
 };
 use ferrite_kernels::layers_quant::MarlinFormat;
 
@@ -86,14 +86,21 @@ pub fn load_layered_rms_norm(
         .collect()
 }
 
-pub fn load_layered_cohere_layer_norm(
+/// Layered LayerNorm load — pulls `<prefix>.weight` AND optional
+/// `<prefix>.bias` together. Used by the `MeanSubRmsNormBiasAddImpl`
+/// 4-tile fusion (encoder models like ModernBERT). The `bias` field
+/// is `Option<GpuTensor>`; the eval path consumes `Some(bias)` when
+/// the fusion fires (the matcher only claims the pattern when a
+/// `bias_add` tile is downstream of the rmsnorm, so the loader must
+/// have produced the bias — see `MeanSubRmsNormBiasAdd` instr).
+pub fn load_layered_layer_norm(
     gw: &mut GpuWeights,
     n_layers: u32,
     suffix: &str,
     eps: f32,
-) -> Result<Vec<CohereLayerNorm>> {
+) -> Result<Vec<LayerNorm>> {
     (0..n_layers)
-        .map(|layer| CohereLayerNorm::load(gw, &layer_weight_path(layer, suffix), eps))
+        .map(|layer| LayerNorm::load(gw, &layer_weight_path(layer, suffix), eps))
         .collect()
 }
 

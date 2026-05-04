@@ -67,11 +67,6 @@ impl ExternKind {
 pub enum OpKind {
     Embed,
     RmsNorm,
-    /// Full LayerNorm with mean subtraction (and weight; bias-free in
-    /// the variants seen so far): `y = w * (x - mean(x)) / sqrt(var(x) + eps)`.
-    /// Distinct math from `RmsNorm` (which omits the mean subtraction).
-    /// Used by Cohere's CommandR family.
-    LayerNorm,
     Gemm,
     RopeAppend,
     /// RoPE that pairs adjacent elements `(2i, 2i+1)` for rotation
@@ -97,6 +92,24 @@ pub enum OpKind {
     /// large pre-softmax magnitudes.
     TanhSoftCap,
     Add,
+    /// Tensor-tensor elementwise subtract: `sub(x, y) -> x - y`.
+    /// Shape-preserving like `Add`. Exists as a math primitive so
+    /// the LayerNorm pattern can be written as
+    /// `(mean, sub, rmsnorm)` and claimed by a fusion Impl rather
+    /// than the DSL hiding the centering math behind a `layer_norm`
+    /// opcode. Like `Silu` / `Mul`, has no singleton Impl — every
+    /// `Sub` tile must be claimed by a fusion Impl or the solver
+    /// reports `UnclaimedTile`.
+    Sub,
+    /// Last-dim reduction: `mean(x: [..., D]) -> [..., D]`. The output
+    /// is shape-preserving (rather than rank-reducing) because Mean
+    /// only ever appears inside the `(mean, sub, rmsnorm)` fusion
+    /// pattern claimed by the LayerNorm Impl — the produced tile is
+    /// never actually materialized as a standalone kernel, so the
+    /// shape system records identity to keep the downstream `sub(x,
+    /// mean_x)` legal under same-shape binary elementwise unification.
+    /// Like `Silu` / `Mul`, has no singleton Impl.
+    Mean,
     /// Tensor-parallel all-reduce-sum across `tp_world_size` ranks,
     /// in place. Identity-shape: `(x: [...]) -> [...]`. Never appears
     /// in any per-arch DSL — produced exclusively by the lowering
@@ -196,7 +209,6 @@ impl OpKind {
         match name {
             "embed" => Some(Self::Embed),
             "rmsnorm" => Some(Self::RmsNorm),
-            "layer_norm" => Some(Self::LayerNorm),
             "gemm" => Some(Self::Gemm),
             "rope_append" => Some(Self::RopeAppend),
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
@@ -206,6 +218,8 @@ impl OpKind {
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),
             "add" => Some(Self::Add),
+            "sub" => Some(Self::Sub),
+            "mean" => Some(Self::Mean),
             "bias_add" => Some(Self::BiasAdd),
             // `Reshape` is synthesized by shape inference, not DSL-
             // writable today. Intentionally not listed in `from_name`;
@@ -221,7 +235,6 @@ impl OpKind {
         match self {
             Self::Embed => "embed",
             Self::RmsNorm => "rmsnorm",
-            Self::LayerNorm => "layer_norm",
             Self::Gemm => "gemm",
             Self::RopeAppend => "rope_append",
             Self::RopeAppendInterleaved => "rope_append_interleaved",
@@ -231,6 +244,8 @@ impl OpKind {
             Self::Gelu => "gelu",
             Self::TanhSoftCap => "tanh_softcap",
             Self::Add => "add",
+            Self::Sub => "sub",
+            Self::Mean => "mean",
             Self::BiasAdd => "bias_add",
             Self::Mul => "mul",
             Self::Reshape => "reshape",

@@ -708,7 +708,6 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
             const NON_GEMM_NAMES: &[&str] = &[
                 "embed_ref",
                 "rmsnorm_ref",
-                "layer_norm_ref",
                 "add_ref",
                 "reshape_ref",
                 "rope_append_ref",
@@ -724,6 +723,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                 "shared_fused_moe_ref",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
+                "mean_sub_rms_norm",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
@@ -738,6 +738,7 @@ fn compile(args: &ForwardArgs, carrier: &ItemFn) -> syn::Result<proc_macro2::Tok
                     } else if name.starts_with("attention_")
                         || name.starts_with("sliding_attention_")
                         || name.starts_with("fa2_")
+                        || name == "encoder_attention"
                     {
                         Some(0) // fa2
                     } else if name.starts_with("marlin") {

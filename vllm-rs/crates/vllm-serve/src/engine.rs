@@ -1415,9 +1415,16 @@ impl AsyncEngine {
     }
 
     /// Tokenize a single text string for embedding.
+    ///
+    /// Special tokens are added by default — encoder pooling models
+    /// (BERT/ModernBERT family) require [CLS]/[SEP] (or their arch-
+    /// specific equivalents) for the pooled hidden state to match
+    /// the model's training distribution. Matches Python vLLM's
+    /// embedding path, which calls `tokenizer.encode(text,
+    /// add_special_tokens=True)` by default for the same reason.
     fn tokenize_embed_text(&self, text: &str) -> ServeResult<Vec<u32>> {
         if let Some(ref tokenizer) = self.tokenizer {
-            tokenizer.encode(text, false)
+            tokenizer.encode(text, true)
         } else {
             // Fallback: byte-level tokenization (for testing without a tokenizer).
             Ok(text.bytes().map(|b| b as u32).collect())

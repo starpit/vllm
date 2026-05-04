@@ -10,7 +10,6 @@ pub mod gemma2;
 pub mod gemma3;
 pub mod llama;
 pub mod mixtral;
-pub mod modernbert;
 pub mod qwen2;
 pub mod qwen2_moe;
 pub mod qwen3_moe;

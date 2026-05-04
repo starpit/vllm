@@ -76,12 +76,10 @@ enum FieldLoad {
     /// `RmsNorm::load(gw, prefix, eps)`. `eps` is baked in from the
     /// model config (`rms_norm_eps`).
     RmsNorm(String, f32),
-    /// `CohereLayerNorm::load(gw, prefix, eps)`. Same shape as
-    /// `RmsNorm` — single weight tensor + scalar eps — but the eps
-    /// source is the `layer_norm_eps` config field rather than
-    /// `rms_norm_eps`. Used for arches whose pre-attention norm is
-    /// a full LayerNorm with weight only (Cohere's CommandR family).
-    CohereLayerNorm(String, f32),
+    /// `LayerNorm::load(gw, prefix, eps)` — pulls `<prefix>.weight` AND
+    /// optional `<prefix>.bias`. Used by `MeanSubRmsNormBiasAddImpl`
+    /// (encoder models like ModernBERT).
+    LayerNorm(String, f32),
     /// `LinearLayer::load_dense(gw, prefix)`.
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
@@ -381,9 +379,8 @@ fn plan_field_load(
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     let is_rmsnorm =
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
-    let is_cohere_layer_norm = ty.ends_with("::CohereLayerNorm")
-        || ty == "CohereLayerNorm"
-        || ty.ends_with("layers::CohereLayerNorm");
+    let is_layer_norm =
+        ty.ends_with("::LayerNorm") || ty == "LayerNorm" || ty.ends_with("layers::LayerNorm");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
     let is_marlin = ty.ends_with("::MarlinLinear")
@@ -895,16 +892,20 @@ fn plan_field_load(
         );
         let eps = rms_norm_eps(model);
         FieldLoad::RmsNorm(prefixes.into_iter().next().unwrap(), eps)
-    } else if is_cohere_layer_norm {
+    } else if is_layer_norm {
         assert_eq!(
             prefixes.len(),
             1,
-            "CohereLayerNorm accessor `{}` with {} sources",
+            "LayerNorm accessor `{}` with {} sources",
             accessor.name,
             prefixes.len()
         );
-        let eps = layer_norm_eps(model);
-        FieldLoad::CohereLayerNorm(prefixes.into_iter().next().unwrap(), eps)
+        // Same eps source as RmsNorm — `rms_norm_eps` already accepts
+        // the `layer_norm_eps` JSON key (CommandR convention) as a
+        // fallback. ModernBERT writes `norm_eps` / `layer_norm_eps`,
+        // both already in the fallback chain (see `rms_norm_eps`).
+        let eps = rms_norm_eps(model);
+        FieldLoad::LayerNorm(prefixes.into_iter().next().unwrap(), eps)
     } else if is_linear {
         // Tied-embedding special case: if this accessor is the
         // `lm_head` and the model's config.json has
@@ -943,10 +944,12 @@ fn plan_field_load(
 }
 
 fn rms_norm_eps(model: &ModelParams) -> f32 {
-    // HF configs carry `rms_norm_eps` as a top-level float. The
-    // config loader today captures only integer bounds; read the
-    // JSON directly for this float. Fall back to the HF default if
-    // absent (Llama/Qwen2/Mistral all set it explicitly).
+    // HF configs carry `rms_norm_eps` (RMSNorm convention used by
+    // Llama/Qwen2/Mistral/etc.) or `layer_norm_eps` (CohereLayerNorm
+    // convention used by CommandR). Both name the same numerical
+    // role — the eps inside the row-normalization kernel — so the
+    // RmsNorm-typed weight loader accepts either. Reads the JSON
+    // directly because the bounds map captures only integers.
     let fallback: f32 = 1e-5;
     let Ok(s) = std::fs::read_to_string(&model.source_path) else {
         return fallback;
@@ -954,27 +957,9 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
         return fallback;
     };
-    v.get("rms_norm_eps")
-        .and_then(|x| x.as_f64())
-        .map(|x| x as f32)
-        .unwrap_or(fallback)
-}
-
-fn layer_norm_eps(model: &ModelParams) -> f32 {
-    // Cohere/CommandR config carries `layer_norm_eps` (full LayerNorm
-    // epsilon — distinct field from `rms_norm_eps`). Same JSON-read
-    // shape as `rms_norm_eps` since the integer-only bounds map
-    // doesn't capture floats.
-    let fallback: f32 = 1e-5;
-    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
-        return fallback;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return fallback;
-    };
-    v.get("layer_norm_eps")
-        .and_then(|x| x.as_f64())
-        .map(|x| x as f32)
+    let read = |key| v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32);
+    read("rms_norm_eps")
+        .or_else(|| read("layer_norm_eps"))
         .unwrap_or(fallback)
 }
 
@@ -1125,23 +1110,37 @@ fn emit_fingerprint_check(
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
-    // Packed-source archs (Phi-3 family) ship `self_attn.qkv_proj.weight`
-    // on disk instead of the per-slice `self_attn.q_proj.weight` that
-    // the default fingerprint looks for. Detect via manifest's
-    // `__packed_splits__` section: if the arch declares
-    // `self_attn.qkv_proj` as a packed parent, sniff THAT tensor
-    // instead — without this, the fingerprint misses and ferrite
-    // falls back to the hand-written path even when it has a
-    // compiled variant for this arch.
-    // MLA archs (DeepSeek V3) have `q_a_proj` instead of `q_proj`
-    // on disk — use that as the fingerprint leaf for these archs.
-    let fp_leaf: &str = if manifest.packed_splits.contains_key("self_attn.qkv_proj") {
-        "self_attn.qkv_proj"
+    // Pick a layered tensor that ACTUALLY EXISTS ON DISK to use as the
+    // fingerprint sniff. Packed parents come first (Phi-3 ships
+    // `self_attn.qkv_proj.weight` on disk; ModernBERT ships
+    // `attn.Wqkv.weight`; the per-slice virtual entries get carved at
+    // load time, AFTER fingerprint matching). Then MLA archs (DeepSeek
+    // V3) which use `q_a_proj` instead of `q_proj`. Then plain
+    // `self_attn.q_proj` (llama-style decoder fleet) and finally
+    // `attn.q_proj` (encoder-style without `self_` prefix). Without
+    // this, the fingerprint misses and ferrite returns Ok(None) even
+    // when it has a compiled variant for this arch.
+    let fp_leaf_owned: String = if let Some(parent) = manifest
+        .packed_splits
+        .iter()
+        .find(|(_, children)| {
+            children
+                .iter()
+                .any(|c| c == "self_attn.q_proj" || c == "attn.q_proj")
+        })
+        .map(|(k, _)| k.clone())
+    {
+        parent
     } else if manifest.entries.contains_key("self_attn.q_a_proj") {
-        "self_attn.q_a_proj"
+        "self_attn.q_a_proj".to_string()
+    } else if manifest.entries.contains_key("self_attn.q_proj") {
+        "self_attn.q_proj".to_string()
+    } else if manifest.entries.contains_key("attn.q_proj") {
+        "attn.q_proj".to_string()
     } else {
-        "self_attn.q_proj"
+        "self_attn.q_proj".to_string()
     };
+    let fp_leaf: &str = fp_leaf_owned.as_str();
     let last_tensor = format!("model.layers.{last_layer}.{fp_leaf}.{suffix}");
     let one_past_tensor = format!("model.layers.{num_hidden_layers}.{fp_leaf}.{suffix}");
     let opposite_tensor = format!("model.layers.0.{fp_leaf}.{opposite_suffix}");
@@ -1505,6 +1504,26 @@ fn emit_fingerprint_check(
         _ => quote! {},
     };
 
+    // The embedding tensor's on-disk path varies per arch — llama uses
+    // `model.embed_tokens.weight`, ModernBERT uses
+    // `model.embeddings.tok_embeddings.weight`. The manifest entry whose
+    // shape is `[vocab_size, hidden_size]` is the embedding table; use
+    // its key (with `model.` prefix + `.weight` suffix) as the
+    // fingerprint sniff. Fall back to the llama-style path when no
+    // entry matches, preserving the previous behavior for any arch
+    // whose manifest predates this generalization.
+    let embed_path: String = manifest
+        .entries
+        .iter()
+        .find(|(_, shape)| {
+            shape.len() == 2
+                && matches!(&shape[0], crate::shape::Dim::Bound(s) if s == "vocab_size")
+                && matches!(&shape[1], crate::shape::Dim::Bound(s) if s == "hidden_size")
+        })
+        .map(|(k, _)| format!("model.{k}.weight"))
+        .unwrap_or_else(|| "model.embed_tokens.weight".to_string());
+    let embed_path_lit = proc_macro2::Literal::string(embed_path.as_str());
+
     quote! {
         /// Per-variant compile-time fingerprint check. See
         /// macro's `emit_fingerprint_check` for the rules.
@@ -1513,7 +1532,7 @@ fn emit_fingerprint_check(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
             hf: ::ferrite_forward::HfFingerprint<'_>,
         ) -> bool {
-            match gw.tensor_shape_any("model.embed_tokens.weight") {
+            match gw.tensor_shape_any(#embed_path_lit) {
                 Some(ref shape)
                     if shape.len() >= 2
                         && shape[0] == #vocab_lit
@@ -2706,10 +2725,8 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
         FieldLoad::RmsNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
         },
-        FieldLoad::CohereLayerNorm(prefix, eps) => quote! {
-            let #name = ::ferrite_kernels::layers::CohereLayerNorm::load(
-                gw, #prefix, #eps,
-            )?;
+        FieldLoad::LayerNorm(prefix, eps) => quote! {
+            let #name = ::ferrite_kernels::layers::LayerNorm::load(gw, #prefix, #eps)?;
         },
         FieldLoad::LinearDense(prefix) => {
             // Per-Linear shard kind: q/k/v/gate/up/lm_head/embed →
@@ -3199,10 +3216,10 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                 ::ferrite_forward::load_layered_rms_norm(gw, #n_lit, #suffix, #eps)?
             }
         }
-        FieldLoad::CohereLayerNorm(prefix, eps) => {
+        FieldLoad::LayerNorm(prefix, eps) => {
             let suffix = layered_suffix(prefix);
             quote! {
-                ::ferrite_forward::load_layered_cohere_layer_norm(gw, #n_lit, #suffix, #eps)?
+                ::ferrite_forward::load_layered_layer_norm(gw, #n_lit, #suffix, #eps)?
             }
         }
         FieldLoad::LinearDense(prefix) => {
@@ -3714,16 +3731,6 @@ struct CanonicalLowered {
     lm_head: crate::interpreter_codegen::LoweredBucket,
 }
 
-/// Resolve the `(TileId, u8)` whose `OwnedTensor` is the backbone's
-/// "return value" — the input the terminal `gemm(<tile>, lm_head)`
-/// would have read. At tp>1 the lowering pass inserts an
-/// `OpKind::AllGather` after the lm_head Gemm; the AllGather
-/// becomes the new last node, so we walk one hop back to recover
-/// the lm_head Gemm before reading its hidden-state input.
-/// Panics if the resulting "lm_head Gemm" doesn't have a tile-input
-/// first arg, since `forward_backbone` has no defined behavior for
-/// architectures whose terminal is anything other than `gemm(<tile>,
-/// lm_head)`.
 /// Walk the FUF from the end, skipping any `OpKind::MmEmbedSplice`
 /// nodes that `tp_lowering::insert_mm_splices` appended after
 /// `insert_all_reduces` / `insert_lm_head_allgather`. The "last node"
@@ -3738,30 +3745,69 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
         .find(|n| n.op != crate::classified::OpKind::MmEmbedSplice)
 }
 
-fn backbone_output_for(fuf: &Fuf) -> (TileId, u8) {
+/// How the FUF's terminal node maps onto the backbone/lm_head split.
+///
+/// - [`BackboneLayout::Decoder`] — the FUF ends in `gemm(<tile>,
+///   lm_head)` (or that gemm followed by an `AllGather` at tp>1).
+///   The backbone is everything except the terminal subgraph; the
+///   `(TileId, u8)` it carries is the lm_head Gemm's hidden-state
+///   input — the slot `forward_backbone` returns and the slot the
+///   lm_head slice reads.
+/// - [`BackboneLayout::Encoder`] — the FUF's terminal is NOT
+///   `gemm(_, lm_head)` (e.g. ModernBERT, where the encoder output
+///   IS the final hidden state — there's no LM head to split off).
+///   The whole pipeline is the backbone, the lm_head slice is empty,
+///   and `forward` returns the FUF's last-node output directly.
+#[derive(Clone, Copy, Debug)]
+enum BackboneLayout {
+    Decoder { backbone_out: (TileId, u8) },
+    Encoder,
+}
+
+/// Classify the FUF's terminal as decoder vs encoder. A decoder
+/// terminal is `gemm(<tile>, <lm_head_weight>)`, optionally followed
+/// by an `AllGather` (inserted by tp>1 lowering on the vocab-parallel
+/// lm_head Gemm). Walks past trailing `MmEmbedSplice` nodes via
+/// [`last_non_splice_node`] — those hang off the embedding and are
+/// not the terminal.
+fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
+    const LM_HEAD_PREFIX: &str = "lm_head";
+
     let last_node = last_non_splice_node(fuf)
         .expect("FUF must be non-empty to emit a forward fn");
     let lm_head_node = if last_node.op == crate::classified::OpKind::AllGather {
-        // tp>1: skip past the AllGather to the lm_head Gemm whose
-        // hidden-state input we're after. AllGather has exactly one
-        // tile input (its source Gemm) by construction.
-        let lm_head_id = match last_node.inputs.first() {
-            Some(FufInput::Tile { id, .. }) => *id,
-            _ => panic!(
-                "tp>1 AllGather: first input must be a Tile (got {:?})",
-                last_node.inputs.first(),
-            ),
-        };
-        fuf.get(lm_head_id)
+        // tp>1: walk past the AllGather to the underlying Gemm.
+        // AllGather has exactly one tile input by construction.
+        match last_node.inputs.first() {
+            Some(FufInput::Tile { id, .. }) => fuf.get(*id),
+            _ => return BackboneLayout::Encoder,
+        }
     } else {
         last_node
     };
+
+    // Decoder shape: `gemm(<tile>, <lm_head weight>)`.
+    if lm_head_node.op != crate::classified::OpKind::Gemm {
+        return BackboneLayout::Encoder;
+    }
+    let weight_is_lm_head = matches!(
+        lm_head_node.inputs.get(1),
+        Some(FufInput::Weight { id, .. })
+            if program
+                .weights
+                .path(*id)
+                .first()
+                .map(|s| s.as_str())
+                == Some(LM_HEAD_PREFIX)
+    );
+    if !weight_is_lm_head {
+        return BackboneLayout::Encoder;
+    }
     match lm_head_node.inputs.first() {
-        Some(FufInput::Tile { id, slot }) => (*id, *slot),
-        _ => panic!(
-            "forward_backbone: lm_head Gemm's first input is not a Tile \
-             (DSL must end in `gemm(<tile>, lm_head)`)"
-        ),
+        Some(FufInput::Tile { id, slot }) => BackboneLayout::Decoder {
+            backbone_out: (*id, *slot),
+        },
+        _ => BackboneLayout::Encoder,
     }
 }
 
@@ -4088,7 +4134,14 @@ pub fn emit_model(
     let last_node_id = last_non_splice_node(fuf)
         .expect("non-empty FUF expected")
         .id;
-    let backbone_out = backbone_output_for(fuf);
+    let layout = backbone_layout(fuf, program);
+    // For encoder layouts the FUF's terminal IS the backbone output
+    // (no lm_head split); decoder layouts carry the lm_head Gemm's
+    // hidden-state input as the backbone output.
+    let backbone_out = match layout {
+        BackboneLayout::Decoder { backbone_out } => backbone_out,
+        BackboneLayout::Encoder => (last_node_id, 0),
+    };
     for (i, wp) in bucket_points.iter().enumerate() {
         if bucket_canonical[i] != *wp {
             continue;
@@ -4099,16 +4152,25 @@ pub fn emit_model(
             .get(wp)
             .expect("schedule populated every key");
         let bounds = bounds_for_wp(model, *wp, tp_world_size);
-        let terminal_sg = sfuf
-            .subgraph_of(last_node_id)
-            .expect("terminal tile must be in a subgraph");
+        // Decoder mode skips the terminal subgraph in the backbone
+        // lowering and emits it as a separate LM_HEAD slice. Encoder
+        // mode lowers the entire pipeline as the backbone (no split).
+        let skip_subgraph = match layout {
+            BackboneLayout::Decoder { .. } => Some(
+                sfuf.subgraph_of(last_node_id)
+                    .expect("terminal tile must be in a subgraph"),
+            ),
+            BackboneLayout::Encoder => None,
+        };
 
-        // Backbone — protect backbone_out (carries through to lm_head
-        // OR the DtoD copy) AND the terminal slot (so backbone's drop
-        // pass leaves it for lm_head to write).
+        // Protect the backbone output (`take_owned` reads it). For
+        // decoder we additionally protect the terminal slot so the
+        // backbone's drop pass leaves it free for lm_head to write.
         let mut protected_bb: HashSet<(TileId, u8)> = HashSet::new();
         protected_bb.insert(backbone_out);
-        protected_bb.insert((last_node_id, 0));
+        if matches!(layout, BackboneLayout::Decoder { .. }) {
+            protected_bb.insert((last_node_id, 0));
+        }
 
         // Per-bucket colored slot map. Computed once and shared
         // between backbone lowering and the lm_head fan_out so they
@@ -4122,7 +4184,12 @@ pub fn emit_model(
             &protected_bb,
         );
         let backbone_slot = slots.of(backbone_out.0, backbone_out.1);
-        let terminal_slot = slots.of(last_node_id, 0);
+        // In encoder mode `take_owned` of the backbone-output slot is
+        // also the terminal — the same slot index plays both roles.
+        let terminal_slot = match layout {
+            BackboneLayout::Decoder { .. } => slots.of(last_node_id, 0),
+            BackboneLayout::Encoder => backbone_slot,
+        };
         let num_slots = slots.total();
 
         let lowered_bb = lower_bucket(
@@ -4133,41 +4200,52 @@ pub fn emit_model(
             model,
             lib,
             &bounds,
-            Some(terminal_sg),
+            skip_subgraph,
             &protected_bb,
             &mut arch_opcodes,
             backbone_out,
             &slots,
         );
 
-        // LM_HEAD — one row, computed by directly invoking the
-        // terminal subgraph's `fan_out` against the same slot map.
-        // No aliases, no drops, no recursion — terminal is the last
-        // subgraph in topological order.
-        let term_imp_id = sfuf
-            .impl_of(terminal_sg)
-            .expect("terminal subgraph has an Impl assignment");
-        let term_imp = lib.get(term_imp_id);
-        let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
-        let term_match = crate::impl_lib::MatchInfo {
-            claimed_tiles: term_claimed.clone(),
-            boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
-                fuf,
-                &term_claimed,
-            ),
-            boundary_outputs: term_claimed,
-        };
-        let term_emits = term_imp
-            .fan_out(&term_match, fuf, program, &bounds, &slots)
-            .expect("terminal subgraph's Impl must implement fan_out");
-        // Eval body lives in `ferrite_forward::Instruction::eval`
-        // — `arch_opcodes` keeps the shape registration for
-        // `emit_bucket_static_slice`'s shape-checking pass.
-        arch_opcodes.register(term_imp.opcode_shape());
-        let lowered_lm = crate::interpreter_codegen::LoweredBucket {
-            instances: term_emits,
-            num_slots,
-            final_slot: terminal_slot,
+        // LM_HEAD — only emitted in decoder mode. One row, computed
+        // by directly invoking the terminal subgraph's `fan_out`
+        // against the same slot map. Encoder mode emits an empty
+        // slice (the whole pipeline already ran in the backbone).
+        let lowered_lm = match layout {
+            BackboneLayout::Decoder { .. } => {
+                let terminal_sg =
+                    skip_subgraph.expect("decoder layout always has a terminal subgraph");
+                let term_imp_id = sfuf
+                    .impl_of(terminal_sg)
+                    .expect("terminal subgraph has an Impl assignment");
+                let term_imp = lib.get(term_imp_id);
+                let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
+                let term_match = crate::impl_lib::MatchInfo {
+                    claimed_tiles: term_claimed.clone(),
+                    boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
+                        fuf,
+                        &term_claimed,
+                    ),
+                    boundary_outputs: term_claimed,
+                };
+                let term_emits = term_imp
+                    .fan_out(&term_match, fuf, program, &bounds, &slots)
+                    .expect("terminal subgraph's Impl must implement fan_out");
+                // Eval body lives in `ferrite_forward::Instruction::eval`
+                // — `arch_opcodes` keeps the shape registration for
+                // `emit_bucket_static_slice`'s shape-checking pass.
+                arch_opcodes.register(term_imp.opcode_shape());
+                crate::interpreter_codegen::LoweredBucket {
+                    instances: term_emits,
+                    num_slots,
+                    final_slot: terminal_slot,
+                }
+            }
+            BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
+                instances: Vec::new(),
+                num_slots,
+                final_slot: terminal_slot,
+            },
         };
 
         canonical_lowered.insert(
@@ -4369,6 +4447,48 @@ pub fn emit_model(
         };
     };
 
+    // Encoder layouts have no lm_head split — `forward_backbone` is
+    // semantically identical to `forward`. Decoder layouts return the
+    // pre-lm_head activation via a DtoD memcpy of the protected
+    // backbone slot. Both shapes are dispatched via the same
+    // `FORWARD_TABLE` row.
+    let forward_backbone_fn = match layout {
+        BackboneLayout::Decoder { .. } => quote! {
+            /// Backbone-only dispatch (no lm_head). Returns a fresh
+            /// OwnedTensor (memcpy of the backbone tile).
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn forward_backbone(
+                wm: &Weights,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                num_tokens: u64,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                let e = ::ferrite_forward::find_bucket(
+                    FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
+                );
+                unsafe {
+                    ::ferrite_forward::run_backbone(e.4, wm, ctx, device, e.6, e.7)
+                }
+            }
+        },
+        BackboneLayout::Encoder => quote! {
+            /// Backbone-only dispatch — for encoder architectures the
+            /// whole pipeline IS the backbone, so this delegates to
+            /// `forward` (no lm_head, no DtoD memcpy).
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments)]
+            pub unsafe fn forward_backbone(
+                wm: &Weights,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                num_tokens: u64,
+            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+                unsafe { forward(wm, ctx, device, num_tokens) }
+            }
+        },
+    };
+
     quote! {
         #weights
 
@@ -4398,23 +4518,7 @@ pub fn emit_model(
             }
         }
 
-        /// Backbone-only dispatch (no lm_head). Returns a fresh
-        /// OwnedTensor (memcpy of the backbone tile).
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments)]
-        pub unsafe fn forward_backbone(
-            wm: &Weights,
-            ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            num_tokens: u64,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let e = ::ferrite_forward::find_bucket(
-                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
-            );
-            unsafe {
-                ::ferrite_forward::run_backbone(e.4, wm, ctx, device, e.6, e.7)
-            }
-        }
+        #forward_backbone_fn
 
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
         /// row, with backbone + lm_head normalized for non-generic
@@ -4763,7 +4867,7 @@ mod tests {
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
-                rust_type: quote! { ::ferrite_kernels::layers::CohereLayerNorm },
+                rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
                 source_weights: vec![],
             },
         ];
@@ -4868,7 +4972,7 @@ mod tests {
             },
             WeightAccessor {
                 name: format_ident!("input_layernorm_1"),
-                rust_type: quote! { ::ferrite_kernels::layers::CohereLayerNorm },
+                rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
                 source_weights: vec![],
             },
         ];
@@ -5233,6 +5337,226 @@ mod fingerprint_tests {
         assert!(
             ts.contains("q_proj.weight_scale_inv"),
             "non-MLA FP8-block fingerprint should still use q_proj, got:\n{ts}",
+        );
+    }
+
+    /// Build a minimal `Program` whose `WeightTable` carries one
+    /// entry — `lm_head` — at WeightId(0). Other tests can intern
+    /// additional weights to push `lm_head` off slot 0; this helper
+    /// keeps the encoder/decoder layout test focused on what matters
+    /// (the dotted weight name carried at the FUF terminal).
+    fn layout_test_program(weight_paths: &[&[&str]]) -> crate::classified::Program {
+        let mut weights = crate::classified::WeightTable::default();
+        for path in weight_paths {
+            let segments: Vec<String> = path.iter().map(|s| (*s).to_string()).collect();
+            let _ = weights.intern_str(segments);
+        }
+        crate::classified::Program {
+            statements: Vec::new(),
+            locals: Default::default(),
+            weights,
+            reshape_targets: Default::default(),
+        }
+    }
+
+    fn shape_2d() -> Vec<crate::shape::Dim> {
+        use crate::shape::Dim;
+        vec![Dim::Lit(4), Dim::Lit(16)]
+    }
+
+    /// Decoder layout: FUF ends in `gemm(<tile>, lm_head)`.
+    /// `backbone_layout` reports `Decoder` and the carried
+    /// `(TileId, slot)` is the lm_head Gemm's hidden-state input.
+    #[test]
+    fn backbone_layout_recognizes_decoder_terminator() {
+        use crate::classified::{ExternKind, OpKind, WeightId};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::quantization::StorageFormat;
+
+        let program = layout_test_program(&[&["lm_head", "weight"]]);
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape_2d()],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(0),
+                            slot: 0,
+                        },
+                        FufInput::Weight {
+                            id: WeightId(0),
+                            index: None,
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![shape_2d()],
+                },
+            ],
+        };
+        match backbone_layout(&fuf, &program) {
+            BackboneLayout::Decoder { backbone_out } => {
+                assert_eq!(
+                    backbone_out,
+                    (TileId(0), 0),
+                    "decoder backbone-out must be the lm_head Gemm's first tile input",
+                );
+            }
+            BackboneLayout::Encoder => panic!("expected Decoder layout, got Encoder"),
+        }
+    }
+
+    /// Encoder layout: FUF ends in something other than
+    /// `gemm(_, lm_head)` (here a plain `Add` — same shape ModernBERT
+    /// produces at the encoder output). `backbone_layout` returns
+    /// `Encoder`; the FUF's terminal is itself the backbone output.
+    #[test]
+    fn backbone_layout_recognizes_encoder_terminator() {
+        use crate::classified::{ExternKind, OpKind};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+
+        let program = layout_test_program(&[]);
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape_2d()],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Add,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(0),
+                            slot: 0,
+                        },
+                        FufInput::Tile {
+                            id: TileId(0),
+                            slot: 0,
+                        },
+                    ],
+                    outputs: vec![shape_2d()],
+                },
+            ],
+        };
+        assert!(
+            matches!(backbone_layout(&fuf, &program), BackboneLayout::Encoder),
+            "FUF terminating in Add must classify as Encoder",
+        );
+    }
+
+    /// Decoder terminator with a tp>1 AllGather appended after the
+    /// lm_head Gemm. `backbone_layout` walks past the AllGather to
+    /// find the underlying Gemm and reports `Decoder` with the right
+    /// hidden-state input.
+    #[test]
+    fn backbone_layout_walks_past_allgather_to_decoder_gemm() {
+        use crate::classified::{ExternKind, OpKind, WeightId};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::quantization::StorageFormat;
+
+        let program = layout_test_program(&[&["lm_head", "weight"]]);
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape_2d()],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(0),
+                            slot: 0,
+                        },
+                        FufInput::Weight {
+                            id: WeightId(0),
+                            index: None,
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![shape_2d()],
+                },
+                FufNode {
+                    id: TileId(2),
+                    op: OpKind::AllGather,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(1),
+                        slot: 0,
+                    }],
+                    outputs: vec![shape_2d()],
+                },
+            ],
+        };
+        match backbone_layout(&fuf, &program) {
+            BackboneLayout::Decoder { backbone_out } => assert_eq!(backbone_out, (TileId(0), 0)),
+            BackboneLayout::Encoder => panic!("expected Decoder past AllGather"),
+        }
+    }
+
+    /// Terminal Gemm whose second input is some non-`lm_head` weight
+    /// (e.g. a plain `down_proj`) is NOT a decoder lm_head row —
+    /// classify it as Encoder so the lowering doesn't try to split a
+    /// nonexistent lm_head off.
+    #[test]
+    fn backbone_layout_non_lm_head_gemm_is_encoder() {
+        use crate::classified::{ExternKind, OpKind, WeightId};
+        use crate::fuf::{Fuf, FufInput, FufNode, TileId};
+        use crate::quantization::StorageFormat;
+
+        let program = layout_test_program(&[&["mlp", "down_proj", "weight"]]);
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![shape_2d()],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: TileId(0),
+                            slot: 0,
+                        },
+                        FufInput::Weight {
+                            id: WeightId(0),
+                            index: None,
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![shape_2d()],
+                },
+            ],
+        };
+        assert!(
+            matches!(backbone_layout(&fuf, &program), BackboneLayout::Encoder),
+            "Gemm whose 2nd input is not `lm_head` must classify as Encoder",
         );
     }
 }

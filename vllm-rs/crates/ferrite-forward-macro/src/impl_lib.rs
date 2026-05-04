@@ -435,9 +435,6 @@ pub fn rust_type_for_weight_consumed_by(op: OpKind) -> TokenStream {
     match op {
         OpKind::Embed => quote! { ::ferrite_kernels::layers::Embedding },
         OpKind::RmsNorm => quote! { ::ferrite_kernels::layers::RmsNorm },
-        // Cohere-flavored full LayerNorm (weight only, no bias). The
-        // `eps` rides on the wrapper struct, same shape as RmsNorm.
-        OpKind::LayerNorm => quote! { ::ferrite_kernels::layers::CohereLayerNorm },
         OpKind::Gemm => quote! { ::ferrite_kernels::layers::LinearLayer },
         // Ops that don't consume weights in the DSL's typical
         // patterns. If the DSL routes a weight into one of these
@@ -939,6 +936,27 @@ fn single_tile_match(fuf: &Fuf, seed: TileId, op: OpKind) -> Option<MatchInfo> {
     })
 }
 
+/// True if the tile carries a `KvCache` extern in its inputs — the
+/// distinguishing mark of decoder-style 5-arg `attention(q, k, v,
+/// kv_cache, block_table)`. Encoder-style 3-arg `attention(q, k, v)`
+/// has no such extern and produces a tile with exactly 3 Tile inputs.
+/// Used by every decoder attention Impl's `matches` to reject encoder
+/// tiles, and by `EncoderAttentionImpl::matches` to reject decoder
+/// tiles. Centralizing the predicate keeps the routing rule in one
+/// place — adding a new attention Impl only needs to declare which
+/// side of the boundary it serves.
+fn attention_has_kv_cache_extern(fuf: &Fuf, seed: TileId) -> bool {
+    fuf.get(seed).inputs.iter().any(|i| {
+        matches!(
+            i,
+            FufInput::Extern {
+                kind: ExternKind::KvCache,
+                ..
+            }
+        )
+    })
+}
+
 fn elementwise_cost(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     let node = ctx.fuf.get(m.claimed_tiles[0]);
     let mut bytes = 0u64;
@@ -1373,127 +1391,6 @@ impl Implementation for RmsNormRefImpl {
         )])
     }
 }
-/// Reference HostCallback impl for `OpKind::LayerNorm`. Hand-written
-/// (parallel to [`RmsNormRefImpl`]) to expose the host-interpreter
-/// `opcode_shape` / `fan_out` overrides. Same
-/// per-claim weight selector pattern: `weight_fn` + `layer` fields
-/// pick the right `CohereLayerNorm` accessor at runtime; the variant
-/// declaration is structurally identical for every LayerNorm tile in
-/// the arch (CommandR has one — the singular `layer_norm` per block —
-/// but the shape stays uniform with RmsNorm so the Impl reads the
-/// same way to a future maintainer).
-#[derive(Debug, Default)]
-pub struct LayerNormRefImpl;
-
-impl Implementation for LayerNormRefImpl {
-    fn name(&self) -> &'static str {
-        "layer_norm_ref"
-    }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
-    }
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let info = single_tile_match(fuf, seed, OpKind::LayerNorm)?;
-        if let Some(s) = weight_storage_of(fuf.get(seed))
-            && !matches!(s, StorageFormat::Dense)
-        {
-            return None;
-        }
-        Some(info)
-    }
-    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        elementwise_cost(m, ctx)
-    }
-    fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources::ZERO
-    }
-    fn launch_kind(&self) -> LaunchKind {
-        LaunchKind::HostCallback
-    }
-    fn supported_input_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn supported_output_handoffs(&self) -> &[Handoff] {
-        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
-        H
-    }
-    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
-    }
-    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
-        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
-    }
-    fn is_compute_bound(&self) -> bool {
-        false
-    }
-
-    // ── Host-interpreter codegen ────────────────────────────────
-    //
-    // Variant `LayerNorm { in_slot, out_slot, layer, weight_fn }`.
-    // Identical shape to RmsNorm — different kernel symbol
-    // (`cohere_layer_norm`) and different weight wrapper type
-    // (`CohereLayerNorm`).
-
-    fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new(
-            "LayerNorm",
-            vec![
-                ("in_slot", syn::parse_quote!(u32)),
-                ("out_slot", syn::parse_quote!(u32)),
-                ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::CohereLayerNorm
-                    ),
-                ),
-            ],
-        )
-    }
-
-    fn fan_out(
-        &self,
-        m: &MatchInfo,
-        fuf: &Fuf,
-        program: &Program,
-        _bounds: &BTreeMap<String, u64>,
-        slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
-        let tile = m.claimed_tiles[0];
-        let node = fuf.get(tile);
-        let (in_id, in_slot) = match node.inputs.first() {
-            Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => panic!(
-                "LayerNorm: first input must be a Tile (got {other:?}); \
-                 the FUF tile shape doesn't match what fan_out expects"
-            ),
-        };
-        let in_slot_idx = slots.of(in_id, in_slot);
-        let out_slot_idx = slots.of(tile, 0);
-        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
-        let acc = accessors
-            .first()
-            .expect("LayerNorm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
-        let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("LayerNorm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { Weights::#base_ident },
-            ],
-        )])
-    }
-}
-
 /// Reference HostCallback impl for `OpKind::Gemm`. Hand-written
 /// (parallel to [`RmsNormRefImpl`]) to expose the host-interpreter
 /// `opcode_shape` / `fan_out` overrides. Bias
@@ -1851,7 +1748,18 @@ pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
-    lib.push(Box::new(LayerNormRefImpl));
+    // CohereLayerNorm-flavored norm: claims `(Mean, Sub, RmsNorm)`
+    // and emits `cohere_layer_norm`. The DSL stays pure math
+    // (`mu = mean(x); centered = sub(x, mu); rmsnorm(centered, w)`);
+    // this Impl does the structural fusion back to one kernel call.
+    lib.push(Box::new(MeanSubRmsNormImpl));
+    // Torch-style LayerNorm with bias: claims the 4-tile pattern
+    // `(Mean, Sub, RmsNorm, BiasAdd)` and emits `layer_norm_bias`.
+    // Solver's claim-size-DESC sort lets this absorb the bias at
+    // sites where the trio's RmsNorm output flows into a `bias_add`
+    // (e.g. ModernBERT). Sites without a `bias_add` consumer fall
+    // through to the trio.
+    lib.push(Box::new(MeanSubRmsNormBiasAddImpl));
     // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
     // expansion time (i.e. when `forward!` runs during a build) drops
     // every cuBLAS-routing Impl from the library, forcing dispatch
@@ -1967,7 +1875,10 @@ pub fn starter_library() -> ImplementationLibrary {
             tile_n: tile.1,
             stages: tile.2,
         }));
-        lib.push(Box::new(CutlassFusedLayerNormGemmImpl {
+        // CohereLayerNorm-flavored peer: claims `(Mean, Sub, RmsNorm,
+        // Gemm)` and emits `cohere_layer_norm + cutlass_gemm`. Cost
+        // calibration shared with the `CutlassFusedRmsNormGemm` row.
+        lib.push(Box::new(CutlassFusedMeanSubRmsNormGemmImpl {
             tile_m: tile.0,
             tile_n: tile.1,
             stages: tile.2,
@@ -2067,6 +1978,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // Matching attention pair — decode reads from cache, prefill
     // reads the contiguous K/V produced by the prefill QKV impl.
     lib.push(Box::new(AttentionPrefillContiguousImpl));
+    // Encoder/bidirectional attention — claims the 3-arg
+    // `attention(q, k, v)` form (no kv_cache). All other attention
+    // Impls reject 3-arg via `attention_has_kv_cache_extern`, so this
+    // is the sole path for encoder models like ModernBERT.
+    lib.push(Box::new(EncoderAttentionImpl));
     // Sliding-window variants of the attention pair. Claim
     // `OpKind::SlidingAttention` so the DSL author opts into window
     // masking per-tile (e.g. alternating layers via `if` in the DSL
@@ -3726,6 +3642,18 @@ impl Implementation for FusedGateUpGeluMulImpl {
 // in-place `scale_inplace` kernel call (cublas S-axpy / scalEx)
 // and move-consumes the upstream OwnedTensor as the output.
 //
+// **Unity passthrough.** `x * 1.0` is mathematically a no-op; the
+// DSL uses it as a structural alias when an `if`/`else` merge-carry
+// must bind the same name in both arms but one arm's value is just
+// the source tile (e.g. ModernBERT's layer-0 attn-norm identity).
+// Detected at compile time via the FUF's `Scalar(1.0)` input and
+// emitted as an `output_alias` (no kernel call, no consume) — the
+// downstream consumers read the source's slot directly. Without
+// this, ScalarMul would `take_owned` the source even when the
+// source has other live consumers (the residual add later in the
+// same iteration), and those consumers would panic at runtime
+// reading a slot that's been emptied.
+//
 // Tensor × tensor Muls (SwiGLU / GELU MLP fusions) have Tile+Tile
 // inputs and are claimed by `FusedGateUp{Silu,Gelu}MulImpl`; they
 // reject any Mul with non-Tile inputs, so the two Impl families
@@ -3733,6 +3661,45 @@ impl Implementation for FusedGateUpGeluMulImpl {
 
 #[derive(Debug, Default)]
 pub struct ScalarMulImpl;
+
+impl ScalarMulImpl {
+    /// Extract the FUF's scalar literal from a single-tile claim.
+    /// Returns `f32::NAN` for malformed claims (matcher invariants
+    /// guarantee one Scalar input, so this only fires if the matcher
+    /// is bypassed).
+    fn scale_of(claimed_tiles: &[TileId], fuf: &Fuf) -> f32 {
+        let tile = match claimed_tiles.first() {
+            Some(&t) => t,
+            None => return f32::NAN,
+        };
+        for inp in &fuf.get(tile).inputs {
+            if let FufInput::Scalar(v) = inp {
+                return *v as f32;
+            }
+        }
+        f32::NAN
+    }
+
+    /// Whether the matched `x * scale` is mathematically `x` and
+    /// therefore reducible to an alias of the source tile.
+    fn is_unity_passthrough(claimed_tiles: &[TileId], fuf: &Fuf) -> bool {
+        Self::scale_of(claimed_tiles, fuf) == 1.0
+    }
+
+    /// `(src_tile, src_slot)` of the Tile input. Helpers shared by
+    /// `output_alias` / `consumes_input_tiles` / `fan_out`.
+    fn tile_input(claimed_tiles: &[TileId], fuf: &Fuf) -> (TileId, u8) {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        node.inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("ScalarMul has a Tile input")
+    }
+}
 
 impl Implementation for ScalarMulImpl {
     fn name(&self) -> &'static str {
@@ -3818,21 +3785,44 @@ impl Implementation for ScalarMulImpl {
         false
     }
 
-    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
-        // The kernel mutates the upstream buffer in place and the
-        // emit moves it into the output binding — codegen must not
-        // schedule a drop for the upstream local.
-        let tile = claimed_tiles[0];
-        let node = fuf.get(tile);
-        let src = node
-            .inputs
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Unity passthrough: the output IS the input's storage —
+        // declare the output as a same-shape alias of the source
+        // tile so `colored_slot_map` collapses the two onto the
+        // same color. Combined with the empty `fan_out` and empty
+        // `consumes_input_tiles` below, this turns `x * 1.0` into
+        // a structural identity at codegen with no kernel call.
+        if Self::is_unity_passthrough(claimed_tiles, fuf) {
+            let src = Self::tile_input(claimed_tiles, fuf);
+            let dst = (claimed_tiles[0], 0u8);
+            return vec![(dst, Some(src))];
+        }
+        // Default: own the output buffer (the in-place ScalarMul
+        // path moves the upstream's storage into the new local
+        // — see `consumes_input_tiles`).
+        claimed_tiles
             .iter()
-            .find_map(|i| match i {
-                FufInput::Tile { id, slot } => Some((*id, *slot)),
-                _ => None,
+            .flat_map(|&t| {
+                let n = fuf.get(t).outputs.len().max(1);
+                (0..n as u8).map(move |s| ((t, s), None))
             })
-            .expect("ScalarMul has a Tile input");
-        vec![src]
+            .collect()
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        // Unity passthrough emits no kernel and aliases the source
+        // — there's nothing to consume.
+        if Self::is_unity_passthrough(claimed_tiles, fuf) {
+            return Vec::new();
+        }
+        // Default: the kernel mutates the upstream buffer in place
+        // and the emit moves it into the output binding — codegen
+        // must not schedule a drop for the upstream local.
+        vec![Self::tile_input(claimed_tiles, fuf)]
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -3843,6 +3833,10 @@ impl Implementation for ScalarMulImpl {
     // `out_slot`. The codegen drop-pass already excludes the
     // upstream from `Free` (see `consumes_input_tiles`), so the
     // take→reinsert pattern is balanced.
+    //
+    // Unity passthrough (scale == 1.0) returns `Some(vec![])`:
+    // `output_alias` already collapsed the output onto the source's
+    // slot, so emitting no instruction is the correct lowering.
 
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
@@ -3863,24 +3857,12 @@ impl Implementation for ScalarMulImpl {
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
+        if Self::is_unity_passthrough(&m.claimed_tiles, fuf) {
+            return Some(Vec::new());
+        }
         let tile = m.claimed_tiles[0];
-        let node = fuf.get(tile);
-        let (in_id, in_slot) = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Tile { id, slot } => Some((*id, *slot)),
-                _ => None,
-            })
-            .expect("ScalarMul: claim has a Tile input");
-        let scale: f32 = node
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Scalar(v) => Some(*v as f32),
-                _ => None,
-            })
-            .expect("ScalarMul: claim has a Scalar input");
+        let (in_id, in_slot) = Self::tile_input(&m.claimed_tiles, fuf);
+        let scale = Self::scale_of(&m.claimed_tiles, fuf);
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
         Some(vec![OpInstance::new(
@@ -4428,7 +4410,431 @@ impl Implementation for FusedAddRmsNormImpl {
     }
 }
 
-// ── CutlassFusedRmsNormGemmImpl / CutlassFusedLayerNormGemmImpl / CutlassFusedAddRmsNormGemmImpl ──
+// ── MeanSubRmsNormImpl ───────────────────────────────────────────
+//
+// Multi-tile impl claiming `(Mean, Sub, RmsNorm)` where
+// `Sub.lhs == Mean.input` and `RmsNorm.input == Sub.output`. This
+// is the math factorization of LayerNorm:
+//
+//     mu       = mean(x)
+//     centered = sub(x, mu)
+//     normed   = rmsnorm(centered, w)
+//
+// equals `w * (x - mean(x)) / sqrt(var(x) + eps)` — identical to
+// the `cohere_layer_norm` kernel's math. The DSL stays a pure
+// math expression; this Impl claims the trio and emits one
+// `cohere_layer_norm` call. Net runtime effect vs the previous
+// retired `OpKind::LayerNorm` singleton path: same kernel, same launch
+// count, same memory traffic.
+//
+// Seeded on the Mean: topologically upstream of Sub and RmsNorm,
+// so the solver processes it first. The Sub/RmsNorm get pulled
+// into the claim; an unmatched lone Mean (no `(Sub, RmsNorm)`
+// downstream) returns `None` and surfaces as
+// `SolveError::UnclaimedTile` — the same library-gap signal the
+// Silu/Mul precedent uses.
+
+#[derive(Debug, Default)]
+pub struct MeanSubRmsNormImpl;
+
+impl Implementation for MeanSubRmsNormImpl {
+    fn name(&self) -> &'static str {
+        "mean_sub_rms_norm"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let mean_node = fuf.get(seed);
+        if mean_node.op != OpKind::Mean {
+            return None;
+        }
+        // Mean's single input must be a Tile — the source tensor x.
+        let x_id = match mean_node.inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            _ => return None,
+        };
+        // Find a Sub whose lhs is x and rhs is the Mean output.
+        let sub_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::Sub
+                && n.inputs.len() == 2
+                && matches!(&n.inputs[0], FufInput::Tile { id, .. } if *id == x_id)
+                && matches!(&n.inputs[1], FufInput::Tile { id, .. } if *id == seed)
+        })?;
+        // Find an RmsNorm whose first input is the Sub's output.
+        let rmsnorm_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::RmsNorm
+                && matches!(
+                    n.inputs.first(),
+                    Some(FufInput::Tile { id, .. }) if *id == sub_node.id
+                )
+        })?;
+
+        let mut claimed = vec![seed, sub_node.id, rmsnorm_node.id];
+        claimed.sort();
+
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            // Boundary input: just the upstream tile x. RmsNorm's
+            // weight is a Weight (not a Tile), surfaced via
+            // `required_weights`.
+            boundary_inputs: vec![x_id],
+            // Boundary output: only the RmsNorm result; the Mean
+            // and Sub outputs are internal to the fusion.
+            boundary_outputs: vec![rmsnorm_node.id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same bandwidth as today's standalone LayerNorm: read x +
+        // read w, write normed. Mean and Sub are folded into the
+        // single kernel — no separate launches. Reuse
+        // `elementwise_cost` keyed on the RmsNorm tile to model the
+        // real read/write traffic.
+        let rmsnorm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("MeanSubRmsNorm: claim contains RmsNorm");
+        let single = MatchInfo {
+            claimed_tiles: vec![rmsnorm_id],
+            boundary_inputs: m.boundary_inputs.clone(),
+            boundary_outputs: m.boundary_outputs.clone(),
+        };
+        elementwise_cost(&single, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    // Default `required_weights` suffices: the only weight in the
+    // claim is the RmsNorm's, consumed by `OpKind::RmsNorm` →
+    // typed as `RmsNorm` by `rust_type_for_weight_consumed_by`.
+
+    // ── Host-interpreter codegen ────────────────────────────────
+    //
+    // Variant `MeanSubRmsNorm { in_slot, out_slot, layer, weight_fn }`.
+    // Same payload shape as the existing `LayerNorm` opcode but the
+    // weight type is `RmsNorm` instead of `CohereLayerNorm`. The two
+    // wrapper structs are byte-identical (`weight: GpuTensor + eps:
+    // f32`) and the emitted kernel reads only those two fields, so
+    // the runtime path is unchanged.
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "MeanSubRmsNorm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        // The upstream tile x feeding the Mean is the kernel input.
+        let mean_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mean)
+            .expect("MeanSubRmsNorm: claim contains Mean");
+        let mean_node = fuf.get(mean_id);
+        let (x_id, x_in_slot) = match mean_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("MeanSubRmsNorm: Mean's input must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(x_id, x_in_slot);
+
+        // The RmsNorm output is the fusion's output.
+        let rmsnorm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("MeanSubRmsNorm: claim contains RmsNorm");
+        let out_slot_idx = slots.of(rmsnorm_id, 0);
+
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("MeanSubRmsNorm: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("MeanSubRmsNorm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── MeanSubRmsNormBiasAddImpl ────────────────────────────────────
+//
+// 4-tile fusion `(Mean, Sub, RmsNorm, BiasAdd)`. Extends
+// [`MeanSubRmsNormImpl`] with one extra tile — a `BiasAdd` whose
+// tile-input is the rmsnorm output. Math:
+//
+//     mu       = mean(x)
+//     centered = sub(x, mu)
+//     normed   = rmsnorm(centered, w)
+//     biased   = bias_add(normed, b)
+//
+// equals `w * (x - mean(x)) / sqrt(var(x) + eps) + b` — the torch-
+// flavored LayerNorm. Emits one `kernels::layer_norm_bias` call.
+//
+// Routing: claim-size-DESC sort means this beats the 3-tile
+// `MeanSubRmsNormImpl` whenever a `BiasAdd` is downstream of the
+// RmsNorm, and falls through to the trio otherwise. The DSL bias
+// weight ref (e.g. `attn_norm.bias[layer]`) is structural — the
+// `required_weights` accessor names the rmsnorm's weight prefix and
+// types it `LayerNorm`, so the loader pulls `<prefix>.weight` AND
+// `<prefix>.bias` together via `LayerNorm::load`. Same trick the
+// dense `(Gemm, BiasAdd)` fusion plays with `LinearLayer`.
+//
+// Used by encoder models like ModernBERT.
+
+#[derive(Debug, Default)]
+pub struct MeanSubRmsNormBiasAddImpl;
+
+impl Implementation for MeanSubRmsNormBiasAddImpl {
+    fn name(&self) -> &'static str {
+        "mean_sub_rms_norm_bias_add"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let mean_node = fuf.get(seed);
+        if mean_node.op != OpKind::Mean {
+            return None;
+        }
+        let x_id = match mean_node.inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            _ => return None,
+        };
+        // Sub: lhs=x, rhs=Mean output.
+        let sub_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::Sub
+                && n.inputs.len() == 2
+                && matches!(&n.inputs[0], FufInput::Tile { id, .. } if *id == x_id)
+                && matches!(&n.inputs[1], FufInput::Tile { id, .. } if *id == seed)
+        })?;
+        // RmsNorm: input[0]=Sub output.
+        let rmsnorm_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::RmsNorm
+                && matches!(
+                    n.inputs.first(),
+                    Some(FufInput::Tile { id, .. }) if *id == sub_node.id
+                )
+        })?;
+        // BiasAdd: input[0]=RmsNorm output, input[1]=Weight (the bias).
+        // The bias's exact path isn't checked here — the loader maps
+        // the rmsnorm's weight prefix to `LayerNorm::load` which pulls
+        // `<prefix>.bias` from disk. A DSL author who points the
+        // bias at an unrelated path will see a load-time error.
+        let bias_add_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::BiasAdd
+                && n.inputs.len() == 2
+                && matches!(
+                    n.inputs.first(),
+                    Some(FufInput::Tile { id, .. }) if *id == rmsnorm_node.id
+                )
+                && matches!(&n.inputs[1], FufInput::Weight { .. })
+        })?;
+
+        let mut claimed = vec![seed, sub_node.id, rmsnorm_node.id, bias_add_node.id];
+        claimed.sort();
+
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            // Boundary input: just x.
+            boundary_inputs: vec![x_id],
+            // Boundary output: BiasAdd's result is the live downstream tile.
+            boundary_outputs: vec![bias_add_node.id],
+        })
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same bandwidth profile as the trio — `layer_norm_bias`
+        // reads x + w + b and writes one output, all elementwise. The
+        // bias is hidden_size which is dwarfed by x's [T, hidden]
+        // traffic, so charging the rmsnorm tile's elementwise_cost is
+        // a tight upper bound.
+        let rmsnorm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("MeanSubRmsNormBiasAdd: claim contains RmsNorm");
+        let single = MatchInfo {
+            claimed_tiles: vec![rmsnorm_id],
+            boundary_inputs: m.boundary_inputs.clone(),
+            boundary_outputs: m.boundary_outputs.clone(),
+        };
+        elementwise_cost(&single, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // ONE accessor typed `LayerNorm`, source = the RmsNorm's
+        // weight ref. The codegen FieldLoad picker sees the
+        // `LayerNorm` rust_type and emits `LayerNorm::load(gw, prefix,
+        // eps)` which pulls `<prefix>.weight` AND `<prefix>.bias`
+        // together. The DSL's BiasAdd-side weight ref doesn't appear
+        // in the accessor list — same trick as
+        // `FusedGemmBiasImpl` (which exposes `LinearLayer` for a Gemm
+        // whose `.bias` rides through the loader).
+        let rmsnorm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("claim contains RmsNorm");
+        let rmsnorm_weight =
+            first_weight_ref(fuf.get(rmsnorm_id)).expect("RmsNorm tile carries a weight reference");
+        let sources = vec![rmsnorm_weight];
+        let name = fused_accessor_name(program, &sources);
+        vec![WeightAccessor {
+            name,
+            rust_type: quote! { ::ferrite_kernels::layers::LayerNorm },
+            source_weights: sources,
+        }]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "MeanSubRmsNormBiasAdd",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LayerNorm
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let mean_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Mean)
+            .expect("claim contains Mean");
+        let mean_node = fuf.get(mean_id);
+        let (x_id, x_in_slot) = match mean_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("MeanSubRmsNormBiasAdd: Mean's input must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(x_id, x_in_slot);
+
+        // Output is the BiasAdd's result.
+        let bias_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::BiasAdd)
+            .expect("claim contains BiasAdd");
+        let out_slot_idx = slots.of(bias_add_id, 0);
+
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors.first().expect("required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("MeanSubRmsNormBiasAdd", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── CutlassFusedRmsNormGemmImpl / CutlassFusedMeanSubRmsNormGemmImpl / CutlassFusedAddRmsNormGemmImpl ──
 //
 // Norm→Gemm fusion family. Captures the 1095 lm_head + 563 body
 // `Norm→Gemm` cuBLAS picks identified by `attack_surface.rs`'s
@@ -4783,15 +5189,28 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
     }
 }
 
+// ── CutlassFusedMeanSubRmsNormGemmImpl ───────────────────────────
+//
+// Norm→Gemm fusion for CohereLayerNorm-flavored norms. Claims the
+// 4-tile pattern `(Mean, Sub, RmsNorm, Gemm)` where the Gemm is
+// the sole consumer of the RmsNorm output. Runs `cohere_layer_norm`
+// then `cutlass_gemm` sequentially — calibration shared with the
+// `CutlassFusedRmsNormGemm` CSV row.
+
 #[derive(Debug, Clone)]
-pub struct CutlassFusedLayerNormGemmImpl {
+pub struct CutlassFusedMeanSubRmsNormGemmImpl {
     pub tile_m: u32,
     pub tile_n: u32,
     pub stages: u32,
 }
 
-impl CutlassFusedLayerNormGemmImpl {
+impl CutlassFusedMeanSubRmsNormGemmImpl {
     fn csv_name(&self) -> &'static str {
+        // Share calibration with the LayerNorm-Gemm flavor — the
+        // emitted kernel pair is identical (cohere_layer_norm +
+        // cutlass_gemm). Using the RmsNorm-Gemm csv name would
+        // mis-attribute cost since the rms variant skips the mean
+        // subtraction and is measurably faster on the norm side.
         CutlassFusedRmsNormGemmImpl {
             tile_m: self.tile_m,
             tile_n: self.tile_n,
@@ -4801,7 +5220,7 @@ impl CutlassFusedLayerNormGemmImpl {
     }
 }
 
-impl Implementation for CutlassFusedLayerNormGemmImpl {
+impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
     fn name(&self) -> &'static str {
         self.csv_name()
     }
@@ -4809,28 +5228,75 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
         profile.cost_table.has_kernel(self.csv_name())
     }
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let (norm_id, gemm_id) = match_norm_gemm_pair(fuf, seed, OpKind::LayerNorm)?;
-        let norm_node = fuf.get(norm_id);
-        let activation_in = first_tile_input(norm_node)?.0;
-        let mut claimed = [norm_id, gemm_id];
+        // Seed on Mean. Walk the trio, then look for a single Gemm
+        // consuming the RmsNorm's output.
+        let mean_node = fuf.get(seed);
+        if mean_node.op != OpKind::Mean {
+            return None;
+        }
+        let x_id = match mean_node.inputs.first() {
+            Some(FufInput::Tile { id, .. }) => *id,
+            _ => return None,
+        };
+        let sub_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::Sub
+                && n.inputs.len() == 2
+                && matches!(&n.inputs[0], FufInput::Tile { id, .. } if *id == x_id)
+                && matches!(&n.inputs[1], FufInput::Tile { id, .. } if *id == seed)
+        })?;
+        let rmsnorm_node = fuf.nodes.iter().find(|n| {
+            n.op == OpKind::RmsNorm
+                && matches!(
+                    n.inputs.first(),
+                    Some(FufInput::Tile { id, .. }) if *id == sub_node.id
+                )
+        })?;
+        if let Some(s) = weight_storage_of(rmsnorm_node)
+            && !matches!(s, StorageFormat::Dense)
+        {
+            return None;
+        }
+        // Sole consumer of the RmsNorm must be a dense Gemm whose
+        // first tile input is the RmsNorm output.
+        let mut consumers = fuf
+            .nodes
+            .iter()
+            .filter(|n| consumes_tile(n, rmsnorm_node.id));
+        let only = consumers.next()?;
+        if consumers.next().is_some() {
+            return None;
+        }
+        if only.op != OpKind::Gemm || !matches!(weight_storage_of(only), Some(StorageFormat::Dense))
+        {
+            return None;
+        }
+        match first_tile_input(only) {
+            Some((id, slot)) if id == rmsnorm_node.id && slot == 0 => {}
+            _ => return None,
+        }
+        let mut claimed = vec![seed, sub_node.id, rmsnorm_node.id, only.id];
         claimed.sort();
         Some(MatchInfo {
-            claimed_tiles: claimed.to_vec(),
-            boundary_inputs: vec![activation_in],
-            boundary_outputs: vec![gemm_id],
+            claimed_tiles: claimed,
+            boundary_inputs: vec![x_id],
+            boundary_outputs: vec![only.id],
         })
     }
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        let norm_id = *m
+        // Mirror `CutlassFusedRmsNormGemmImpl::cost_us`: same
+        // norm+gemm decomposition. The norm cost is keyed on the
+        // RmsNorm tile (the only one with real activation traffic;
+        // Mean and Sub fold into the same kernel).
+        let rmsnorm_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| ctx.fuf.get(**t).op == OpKind::LayerNorm)
-            .expect("CutlassFusedLayerNormGemm: claim contains LayerNorm");
+            .find(|t| ctx.fuf.get(**t).op == OpKind::RmsNorm)
+            .expect("CutlassFusedMeanSubRmsNormGemm: claim contains RmsNorm");
         let gemm_id = *m
             .claimed_tiles
             .iter()
             .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
-            .expect("CutlassFusedLayerNormGemm: claim contains Gemm");
+            .expect("CutlassFusedMeanSubRmsNormGemm: claim contains Gemm");
         let gemm_node = ctx.fuf.get(gemm_id);
         let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
             return UNCALIBRATED_COST_US;
@@ -4842,13 +5308,10 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
             .profile
             .cost_us_for(self.csv_name(), mm, nn, kk)
             .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk));
-        // Norm cost MUST equal `LayerNormRefImpl::cost_us` byte-for-byte
-        // (`elementwise_cost` on the norm tile) — see the matching
-        // CutlassFusedRmsNormGemm comment.
         let norm_singleton = MatchInfo {
-            claimed_tiles: vec![norm_id],
+            claimed_tiles: vec![rmsnorm_id],
             boundary_inputs: m.boundary_inputs.clone(),
-            boundary_outputs: vec![norm_id],
+            boundary_outputs: vec![rmsnorm_id],
         };
         let norm_us = elementwise_cost(&norm_singleton, ctx);
         gemm_us + norm_us
@@ -4882,9 +5345,9 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
         fuf: &Fuf,
         program: &Program,
     ) -> Vec<WeightAccessor> {
-        // Deterministic order: norm accessor first, gemm accessor second.
+        // Norm accessor first, gemm accessor second.
         let mut out = Vec::new();
-        for &kind in &[OpKind::LayerNorm, OpKind::Gemm] {
+        for &kind in &[OpKind::RmsNorm, OpKind::Gemm] {
             for &tid in claimed_tiles {
                 let node = fuf.get(tid);
                 if node.op != kind {
@@ -4906,7 +5369,7 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
     }
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
-            "CutlassFusedLayerNormGemm",
+            "CutlassFusedMeanSubRmsNormGemm",
             vec![
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
@@ -4914,11 +5377,7 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
                 (
                     "norm_wf",
                     syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::CohereLayerNorm
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
                     ),
                 ),
                 (
@@ -4943,47 +5402,48 @@ impl Implementation for CutlassFusedLayerNormGemmImpl {
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
-        let norm_id = *m
+        let mean_id = *m
             .claimed_tiles
             .iter()
-            .find(|t| fuf.get(**t).op == OpKind::LayerNorm)
-            .expect("CutlassFusedLayerNormGemm: claim contains LayerNorm");
+            .find(|t| fuf.get(**t).op == OpKind::Mean)
+            .expect("CutlassFusedMeanSubRmsNormGemm: claim contains Mean");
+        let mean_node = fuf.get(mean_id);
+        let (in_id, in_slot) = match mean_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedMeanSubRmsNormGemm: Mean's input must be a Tile (got {other:?})"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
         let gemm_id = *m
             .claimed_tiles
             .iter()
             .find(|t| fuf.get(**t).op == OpKind::Gemm)
-            .expect("CutlassFusedLayerNormGemm: claim contains Gemm");
-        let norm_node = fuf.get(norm_id);
+            .expect("CutlassFusedMeanSubRmsNormGemm: claim contains Gemm");
         let gemm_node = fuf.get(gemm_id);
-        let (in_id, in_slot) = match norm_node.inputs.first() {
-            Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => {
-                panic!(
-                    "CutlassFusedLayerNormGemm: norm's first input must be a Tile (got {other:?})"
-                )
-            }
-        };
-        let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(gemm_id, 0);
         let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
         let norm_acc = accessors
             .first()
-            .expect("CutlassFusedLayerNormGemm: required_weights[0]");
+            .expect("CutlassFusedMeanSubRmsNormGemm: required_weights[0]");
         let gemm_acc = accessors
             .get(1)
-            .expect("CutlassFusedLayerNormGemm: required_weights[1]");
+            .expect("CutlassFusedMeanSubRmsNormGemm: required_weights[1]");
         let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
         let layer = norm_layer.unwrap_or(0) as u32;
         let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
         let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
-            .expect("CutlassFusedLayerNormGemm: gemm (N, K) must resolve from FUF + bounds");
+            .expect("CutlassFusedMeanSubRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
         Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedLayerNormGemm", proc_macro2::Span::call_site()),
+            syn::Ident::new(
+                "CutlassFusedMeanSubRmsNormGemm",
+                proc_macro2::Span::call_site(),
+            ),
             vec![
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
@@ -7134,6 +7594,12 @@ impl Implementation for AttentionViaCacheImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Decoder-only: requires the 5-arg `attention(q, k, v,
+        // kv_cache, block_table)` form. Encoder-style 3-arg tiles are
+        // claimed by `EncoderAttentionImpl`.
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
         single_tile_match(fuf, seed, OpKind::Attention)
     }
 
@@ -8341,6 +8807,10 @@ impl Implementation for AttentionPrefillContiguousImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
         single_tile_match(fuf, seed, OpKind::Attention)
     }
 
@@ -8455,6 +8925,143 @@ impl Implementation for AttentionPrefillContiguousImpl {
     }
 }
 
+// ── EncoderAttentionImpl ─────────────────────────────────────────
+//
+// Bidirectional / encoder self-attention. Singleton matcher on the
+// 3-arg `OpKind::Attention` form `attention(q, k, v)` — the encoder
+// DSL has no `kv_cache` extern and no `block_table`, which is the
+// exact shape `attention_has_kv_cache_extern` rejects for the
+// decoder Impls. Reads contiguous Q/K/V from the upstream tile
+// slots (identical layout to what `AttentionPrefillContiguousImpl`
+// consumes from `FusedQkvRopePrefill`) and emits
+// `Instruction::EncoderAttention { q_slot, k_slot, v_slot,
+// out_slot }`. The eval body in `instr.rs` calls
+// `flash_attn_contiguous` with `is_causal=false` and a null cos_sin
+// pointer.
+//
+// Workload: every token count (encoders process the whole sequence
+// at once — no decode bucket). Singleton — sliding-window encoder
+// variants land separately as they need a window-size constant.
+
+#[derive(Debug, Default)]
+pub struct EncoderAttentionImpl;
+
+impl Implementation for EncoderAttentionImpl {
+    fn name(&self) -> &'static str {
+        "encoder_attention"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        // Encoders see every token in one pass — every workload point
+        // is "prefill"-shaped. No decode/prefill split.
+        WorkloadConstraint::NumTokensRange {
+            min: 1,
+            max: u32::MAX,
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Encoder-only: requires the 3-arg `attention(q, k, v)` form
+        // (no `kv_cache` extern). Decoder 5-arg tiles are claimed by
+        // `AttentionViaCacheImpl` / `AttentionPrefillContiguousImpl`.
+        if attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same FA2 kernel as the decoder prefill path; the calibrated
+        // CSV row applies (FA2 sweep doesn't distinguish causal vs
+        // bidirectional — masking is a kernel-internal cost-neutral
+        // template parameter). Falls back to the analytic formula.
+        cost_attention_calibrated(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "EncoderAttention",
+            vec![
+                ("q_slot", syn::parse_quote!(u32)),
+                ("k_slot", syn::parse_quote!(u32)),
+                ("v_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => {
+                    panic!("EncoderAttention: input {idx} must be a Tile (got {other:?})")
+                }
+            }
+        };
+        let (q_id, q_in) = resolve(0);
+        let (k_id, k_in) = resolve(1);
+        let (v_id, v_in) = resolve(2);
+        let q_slot = slots.of(q_id, q_in);
+        let k_slot = slots.of(k_id, k_in);
+        let v_slot = slots.of(v_id, v_in);
+        let out_slot = slots.of(tile, 0);
+
+        Some(vec![OpInstance::new(
+            syn::Ident::new("EncoderAttention", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #q_slot },
+                quote! { #k_slot },
+                quote! { #v_slot },
+                quote! { #out_slot },
+            ],
+        )])
+    }
+}
+
 // ── SlidingAttentionViaCacheImpl ─────────────────────────────────
 //
 // Mirror of [`AttentionViaCacheImpl`] for [`OpKind::SlidingAttention`].
@@ -8482,6 +9089,10 @@ impl Implementation for SlidingAttentionViaCacheImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
         single_tile_match(fuf, seed, OpKind::SlidingAttention)
     }
 
@@ -8629,6 +9240,10 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
         single_tile_match(fuf, seed, OpKind::SlidingAttention)
     }
 
@@ -14333,6 +14948,10 @@ impl Implementation for FlashInferAttentionDecodeImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
         single_tile_match(fuf, seed, OpKind::Attention)
     }
 
@@ -14486,6 +15105,10 @@ impl Implementation for FlashInferAttentionPrefillImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
         single_tile_match(fuf, seed, OpKind::Attention)
     }
 
@@ -15780,6 +16403,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -15852,6 +16476,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -15946,6 +16571,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -16453,9 +17079,77 @@ mod tests {
     // the 0-pick can be traced to cost / DP behavior, not a silent
     // matcher reject.
 
+    /// 5-node FUF mirroring the post-migration commandr lm_head shape:
+    /// `Embed → Mean → Sub → RmsNorm → Gemm`. This is the cohere
+    /// (mean-subtract) flavor expressed in math primitives. The
+    /// (Mean, Sub, RmsNorm, Gemm) 4-tile claim is what
+    /// `CutlassFusedMeanSubRmsNormGemmImpl` matches.
+    fn fused_mean_sub_rmsnorm_gemm_test_fuf() -> Fuf {
+        use crate::shape::Dim;
+        let t0 = TileId(0);
+        let t1 = TileId(1);
+        let t2 = TileId(2);
+        let t3 = TileId(3);
+        let t4 = TileId(4);
+        Fuf {
+            nodes: vec![
+                FufNode {
+                    id: t0,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: crate::classified::ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t1,
+                    op: OpKind::Mean,
+                    inputs: vec![FufInput::Tile { id: t0, slot: 0 }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t2,
+                    op: OpKind::Sub,
+                    inputs: vec![
+                        FufInput::Tile { id: t0, slot: 0 },
+                        FufInput::Tile { id: t1, slot: 0 },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t3,
+                    op: OpKind::RmsNorm,
+                    inputs: vec![
+                        FufInput::Tile { id: t2, slot: 0 },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(0),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t4,
+                    op: OpKind::Gemm,
+                    inputs: vec![
+                        FufInput::Tile { id: t3, slot: 0 },
+                        FufInput::Weight {
+                            id: crate::classified::WeightId(1),
+                            index: None,
+                            storage: crate::quantization::StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
+                },
+            ],
+        }
+    }
+
     fn fused_norm_gemm_test_fuf(norm_kind: OpKind) -> Fuf {
         use crate::shape::Dim;
-        // 3-node FUF mirroring commandr lm_head:
+        // 3-node FUF mirroring the rmsnorm flavor of lm_head:
         //   t0  Embed       → s0 [bf16, 1×8192]   (activation)
         //   t1  Norm        → s0 [bf16, 1×8192]   (consumes t0 slot 0)
         //   t2  Gemm        → s0 [bf16, 1×256000] (consumes t1 slot 0,
@@ -16505,9 +17199,9 @@ mod tests {
     }
 
     #[test]
-    fn cutlass_fused_layer_norm_gemm_2tile_matches_commandr_lm_head_shape() {
-        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
-        let imp = CutlassFusedLayerNormGemmImpl {
+    fn cutlass_fused_mean_sub_rmsnorm_gemm_4tile_matches_commandr_lm_head_shape() {
+        let fuf = fused_mean_sub_rmsnorm_gemm_test_fuf();
+        let imp = CutlassFusedMeanSubRmsNormGemmImpl {
             tile_m: 16,
             tile_n: 64,
             stages: 3,
@@ -16516,15 +17210,19 @@ mod tests {
         let m = imp.matches(&fuf, TileId(1), &profile);
         assert!(
             m.is_some(),
-            "CutlassFusedLayerNormGemmImpl 2-tile must match (LayerNorm, Gemm) seeded \
-             on the LayerNorm — the canonical commandr lm_head shape"
+            "CutlassFusedMeanSubRmsNormGemmImpl 4-tile must match \
+             (Mean, Sub, RmsNorm, Gemm) seeded on the Mean — the post-migration \
+             commandr lm_head shape after retiring `OpKind::LayerNorm`"
         );
         let m = m.unwrap();
-        assert_eq!(m.claimed_tiles.len(), 2);
+        assert_eq!(m.claimed_tiles.len(), 4);
+        // Mean=t1, Sub=t2, RmsNorm=t3, Gemm=t4 (Embed=t0 stays upstream).
         assert!(m.claimed_tiles.contains(&TileId(1)));
         assert!(m.claimed_tiles.contains(&TileId(2)));
+        assert!(m.claimed_tiles.contains(&TileId(3)));
+        assert!(m.claimed_tiles.contains(&TileId(4)));
         assert_eq!(m.boundary_inputs, vec![TileId(0)]);
-        assert_eq!(m.boundary_outputs, vec![TileId(2)]);
+        assert_eq!(m.boundary_outputs, vec![TileId(4)]);
     }
 
     #[test]
@@ -16549,17 +17247,20 @@ mod tests {
         assert!(m.claimed_tiles.contains(&TileId(2)));
     }
 
-    /// Build a FUF that mirrors commandr's true lm_head shape:
-    /// `Embed → LayerNorm → Gemm → ScalarMul`. The ScalarMul on the
-    /// Gemm's output is what makes commandr's lm_head match
-    /// CutlassFusedLayerNormGemm + a separate ScalarMul singleton —
-    /// or, when the (d) family lands, CutlassFusedLayerNormGemmScalarMul.
-    fn fused_norm_gemm_scalarmul_test_fuf(norm_kind: OpKind) -> Fuf {
+    /// Build a FUF mirroring commandr's true lm_head shape:
+    /// `Embed → Mean → Sub → RmsNorm → Gemm → ScalarMul`. The
+    /// downstream ScalarMul (commandr's logit_scale) is what makes
+    /// the lm_head pattern claim `CutlassFusedMeanSubRmsNormGemm`
+    /// plus a separate `ScalarMul` singleton — the matcher must NOT
+    /// reject because of the trailing scalar consumer.
+    fn fused_mean_sub_rmsnorm_gemm_scalarmul_test_fuf() -> Fuf {
         use crate::shape::Dim;
         let t0 = TileId(0);
         let t1 = TileId(1);
         let t2 = TileId(2);
         let t3 = TileId(3);
+        let t4 = TileId(4);
+        let t5 = TileId(5);
         Fuf {
             nodes: vec![
                 FufNode {
@@ -16573,9 +17274,24 @@ mod tests {
                 },
                 FufNode {
                     id: t1,
-                    op: norm_kind,
+                    op: OpKind::Mean,
+                    inputs: vec![FufInput::Tile { id: t0, slot: 0 }],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t2,
+                    op: OpKind::Sub,
                     inputs: vec![
                         FufInput::Tile { id: t0, slot: 0 },
+                        FufInput::Tile { id: t1, slot: 0 },
+                    ],
+                    outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
+                },
+                FufNode {
+                    id: t3,
+                    op: OpKind::RmsNorm,
+                    inputs: vec![
+                        FufInput::Tile { id: t2, slot: 0 },
                         FufInput::Weight {
                             id: crate::classified::WeightId(0),
                             index: None,
@@ -16585,10 +17301,10 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(8192)]],
                 },
                 FufNode {
-                    id: t2,
+                    id: t4,
                     op: OpKind::Gemm,
                     inputs: vec![
-                        FufInput::Tile { id: t1, slot: 0 },
+                        FufInput::Tile { id: t3, slot: 0 },
                         FufInput::Weight {
                             id: crate::classified::WeightId(1),
                             index: None,
@@ -16598,9 +17314,9 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
                 },
                 FufNode {
-                    id: t3,
+                    id: t5,
                     op: OpKind::Mul,
-                    inputs: vec![FufInput::Tile { id: t2, slot: 0 }, FufInput::Scalar(0.0625)],
+                    inputs: vec![FufInput::Tile { id: t4, slot: 0 }, FufInput::Scalar(0.0625)],
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
                 },
             ],
@@ -16608,14 +17324,14 @@ mod tests {
     }
 
     #[test]
-    fn cutlass_fused_norm_gemm_solver_picks_2tile_with_downstream_scalarmul() {
+    fn cutlass_fused_norm_gemm_solver_picks_4tile_with_downstream_scalarmul() {
         // Production reality at commandr lm_head: the Gemm has a
-        // downstream ScalarMul consumer. The 2-tile (Norm, Gemm)
-        // matcher constrains the NORM's consumers (must be 1 = Gemm)
-        // but not the Gemm's downstream — so a downstream ScalarMul
-        // must NOT block the claim.
+        // downstream ScalarMul consumer (logit_scale). The 4-tile
+        // (Mean, Sub, RmsNorm, Gemm) matcher constrains the RmsNorm's
+        // consumers (must be 1 = Gemm) but not the Gemm's downstream —
+        // so a downstream ScalarMul must NOT block the claim.
         use crate::shape::Inferred;
-        let fuf = fused_norm_gemm_scalarmul_test_fuf(OpKind::LayerNorm);
+        let fuf = fused_mean_sub_rmsnorm_gemm_scalarmul_test_fuf();
         let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         let lib = starter_library();
         let inferred = Inferred {
@@ -16633,30 +17349,28 @@ mod tests {
             .map(|(_, a)| a)
             .expect("one workload point");
 
-        let sg = asgn.subgraph_of(TileId(1)).expect("LayerNorm covered");
+        // Mean=t1, Sub=t2, RmsNorm=t3, Gemm=t4 in the 5-node test FUF.
+        let sg = asgn.subgraph_of(TileId(1)).expect("Mean covered");
         let imp_id = asgn.impl_of(sg).expect("subgraph mapped to Impl");
         let imp = lib.get(imp_id);
         let name = imp.name();
-        // The 2-tile fused name is e.g. "cutlass_16x64_s3" (csv_name
-        // mirrors CutlassGemmImpl) — disambiguated by being part of a
-        // 2-tile claim covering both the Norm and the Gemm.
-        let sg_gemm = asgn.subgraph_of(TileId(2)).expect("Gemm covered");
+        let sg_gemm = asgn.subgraph_of(TileId(4)).expect("Gemm covered");
         assert_eq!(
             sg_gemm, sg,
-            "(LayerNorm, Gemm) must collapse into a single 2-tile fused subgraph \
-             even when the Gemm has a downstream ScalarMul; got name=`{name}`"
+            "(Mean, Sub, RmsNorm, Gemm) must collapse into a single 4-tile \
+             fused subgraph even when the Gemm has a downstream ScalarMul; \
+             got name=`{name}`"
         );
     }
 
     #[test]
-    fn cutlass_fused_norm_gemm_solver_picks_2tile_at_commandr_lm_head_shape() {
-        // Integration: run the actual solver on the (LayerNorm, Gemm)
-        // 3-node FUF and assert that the 2-tile fused Impl wins the DP
-        // pick at the seed (M=1 lm_head). This is the production
-        // scenario STATUS flagged 0-pick on; the test pins what the
-        // dump should contain after Step 1b(a).
+    fn cutlass_fused_norm_gemm_solver_picks_4tile_at_commandr_lm_head_shape() {
+        // Integration: run the actual solver on the (Mean, Sub, RmsNorm,
+        // Gemm) 5-node FUF and assert that the 4-tile fused Impl wins
+        // the DP pick at the seed (M=1 lm_head). Post-migration peer
+        // of the original (LayerNorm, Gemm) 2-tile pin.
         use crate::shape::Inferred;
-        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
+        let fuf = fused_mean_sub_rmsnorm_gemm_test_fuf();
         let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         let lib = starter_library();
         let inferred = Inferred {
@@ -16674,41 +17388,36 @@ mod tests {
             .map(|(_, a)| a)
             .expect("one workload point");
 
-        // Look up which Impl claimed the LayerNorm tile (TileId(1)).
-        let sg = asgn.subgraph_of(TileId(1)).expect("LayerNorm covered");
+        // Mean=t1, Gemm=t4 in the 5-node test FUF.
+        let sg = asgn.subgraph_of(TileId(1)).expect("Mean covered");
         let imp_id = asgn.impl_of(sg).expect("subgraph mapped to Impl");
         let imp = lib.get(imp_id);
         let name = imp.name();
         assert!(
             name.starts_with("cutlass_") && !name.contains("gemv"),
-            "DP must pick a CutlassFused*Gemm tile at the LayerNorm seed (got `{name}`); \
+            "DP must pick a CutlassFused*Gemm tile at the Mean seed (got `{name}`); \
              a `cublas`/singleton pick here is the 0-pick anomaly."
         );
-        // And the same subgraph must claim the Gemm too (2-tile fusion).
-        let sg_gemm = asgn.subgraph_of(TileId(2)).expect("Gemm covered");
+        let sg_gemm = asgn.subgraph_of(TileId(4)).expect("Gemm covered");
         assert_eq!(
             sg_gemm, sg,
-            "fused 2-tile claim must cover both (LayerNorm, Gemm) tiles in one subgraph"
+            "fused 4-tile claim must cover (Mean, Sub, RmsNorm, Gemm) in one subgraph"
         );
     }
 
     #[test]
     fn cutlass_fused_norm_gemm_norm_term_must_equal_singleton_norm_cost() {
-        // The 2-tile fused (Norm, Gemm) cost is `gemm_us + norm_us`.
-        // The unfused alternative is `norm_singleton_us + gemm_singleton_us`.
+        // The fused (Mean, Sub, RmsNorm, Gemm) cost is `gemm_us + norm_us`.
+        // The unfused alternative is `norm_trio_us + gemm_singleton_us`.
         // For the DP's claim-size-DESC tiebreak to favor fusion at
         // uncalibrated shapes (where gemm_us == gemm_singleton_us via
         // shared roofline), the FUSED `norm_us` term MUST equal the
-        // SINGLETON `LayerNormRefImpl::cost_us` byte-for-byte. Any
-        // delta hands the win to the singleton chain.
-        //
-        // Singleton uses `elementwise_cost` which sums Tile inputs +
-        // outputs ONLY (no weight). Fused must mirror this. STATUS
-        // 0-pick on 2-tile traces here: fused was charging an extra
-        // `+ hidden` weight-vector read per call.
+        // TRIO `MeanSubRmsNormImpl::cost_us` byte-for-byte. Any delta
+        // hands the win to the trio + singleton chain. Both use
+        // `elementwise_cost` keyed on the RmsNorm tile.
         use crate::shape::Inferred;
-        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
-        let imp = CutlassFusedLayerNormGemmImpl {
+        let fuf = fused_mean_sub_rmsnorm_gemm_test_fuf();
+        let imp = CutlassFusedMeanSubRmsNormGemmImpl {
             tile_m: 16,
             tile_n: 64,
             stages: 3,
@@ -16723,14 +17432,15 @@ mod tests {
             bounds: &bounds,
         };
 
-        // Singleton norm cost: LayerNormRefImpl matches the LayerNorm
-        // tile (TileId(1)) and computes elementwise_cost(input + output).
-        let norm_singleton = MatchInfo {
-            claimed_tiles: vec![TileId(1)],
+        // Trio norm cost: MeanSubRmsNormImpl claims (Mean, Sub, RmsNorm)
+        // = (t1, t2, t3) and its `cost_us` computes elementwise_cost on
+        // the RmsNorm tile (input from t0, output at t3).
+        let norm_trio = MatchInfo {
+            claimed_tiles: vec![TileId(1), TileId(2), TileId(3)],
             boundary_inputs: vec![TileId(0)],
-            boundary_outputs: vec![TileId(1)],
+            boundary_outputs: vec![TileId(3)],
         };
-        let norm_singleton_us = LayerNormRefImpl.cost_us(&norm_singleton, &ctx);
+        let norm_trio_us = MeanSubRmsNormImpl.cost_us(&norm_trio, &ctx);
 
         // Fused total cost.
         let m = imp.matches(&fuf, TileId(1), &profile).expect("matches");
@@ -16739,22 +17449,20 @@ mod tests {
         // Singleton-Gemm cost via cost_gemm (cuBLAS path: CSV row at
         // M=1 N=256000 K=8192 missing → roofline).
         let gemm_only = MatchInfo {
-            claimed_tiles: vec![TileId(2)],
-            boundary_inputs: vec![TileId(1)],
-            boundary_outputs: vec![TileId(2)],
+            claimed_tiles: vec![TileId(4)],
+            boundary_inputs: vec![TileId(3)],
+            boundary_outputs: vec![TileId(4)],
         };
         let gemm_singleton_us = cost_gemm(&gemm_only, &ctx);
 
-        // Equivalence: fused_total - gemm_singleton = norm_singleton.
-        // Allow a tiny numerical tolerance (1e-9 µs).
+        // Equivalence: fused_total - gemm_singleton = norm_trio.
         let delta = fused_total_us - gemm_singleton_us;
         assert!(
-            (delta - norm_singleton_us).abs() < 1e-9,
-            "fused norm term ({delta:.6}) must equal singleton norm cost \
-             ({norm_singleton_us:.6}); fused_total={fused_total_us:.6} \
+            (delta - norm_trio_us).abs() < 1e-9,
+            "fused norm term ({delta:.6}) must equal trio norm cost \
+             ({norm_trio_us:.6}); fused_total={fused_total_us:.6} \
              gemm_singleton={gemm_singleton_us:.6}. A delta means the DP \
-             tiebreak hands the lm_head pick to (norm + cublas) singletons \
-             — exactly the 0-pick anomaly STATUS flagged for the 2-tile."
+             tiebreak hands the lm_head pick to (trio + cublas) singletons."
         );
         let _ = Inferred {
             locals: std::collections::HashMap::new(),
@@ -16788,8 +17496,8 @@ mod tests {
         // fused form. If the fused side is even ε higher, the DP
         // picks singleton+singleton and the fused Impl captures 0
         // picks at vocab-N — exactly the 0-pick anomaly STATUS flagged.
-        let fuf = fused_norm_gemm_test_fuf(OpKind::LayerNorm);
-        let imp = CutlassFusedLayerNormGemmImpl {
+        let fuf = fused_mean_sub_rmsnorm_gemm_test_fuf();
+        let imp = CutlassFusedMeanSubRmsNormGemmImpl {
             tile_m: 16,
             tile_n: 64,
             stages: 3,
@@ -16807,14 +17515,14 @@ mod tests {
         };
 
         let fused_us = imp.cost_us(&m, &ctx);
-        // Unfused alternative: cuBLAS singleton on the Gemm via
-        // cost_gemm. Norm singleton's cost cancels (the fused Impl
-        // adds the same `bytes / bw_gb` term). So the gate is
-        // entirely on the GEMM: cutlass_roofline vs cublas_roofline.
+        // Unfused alternative: cuBLAS singleton on the Gemm (t4) via
+        // cost_gemm. Norm trio's cost cancels (the fused Impl adds
+        // the same `bytes / bw_gb` term). So the gate is entirely
+        // on the GEMM: cutlass_roofline vs cublas_roofline.
         let gemm_only = MatchInfo {
-            claimed_tiles: vec![TileId(2)],
-            boundary_inputs: vec![TileId(1)],
-            boundary_outputs: vec![TileId(2)],
+            claimed_tiles: vec![TileId(4)],
+            boundary_inputs: vec![TileId(3)],
+            boundary_outputs: vec![TileId(4)],
         };
         let unfused_gemm_us = cost_gemm(&gemm_only, &ctx);
 
@@ -16831,6 +17539,332 @@ mod tests {
             fused_us >= unfused_gemm_us,
             "fused cost ({fused_us}) includes norm BW; unfused gemm-only ({unfused_gemm_us}) \
              does not — fused must be ≥ gemm-only at the SAME shape"
+        );
+    }
+
+    // ── Encoder vs decoder attention dispatch ────────────────────
+    //
+    // The 3-arg/5-arg discrimination in `attention_has_kv_cache_extern`
+    // is the routing fulcrum for ModernBERT and any future encoder
+    // arch. These tests pin the predicate end-to-end: the same
+    // OpKind::Attention tile must reach DIFFERENT Impls depending on
+    // whether a KvCache extern is present.
+
+    fn attention_node(inputs: Vec<FufInput>) -> FufNode {
+        use crate::shape::Dim;
+        FufNode {
+            id: TileId(0),
+            op: OpKind::Attention,
+            inputs,
+            // [T, num_attention_heads*head_dim] — shape used for cost
+            // calc only; matchers don't read it.
+            outputs: vec![vec![Dim::Lit(1), Dim::Lit(128)]],
+        }
+    }
+
+    fn three_arg_encoder_inputs() -> Vec<FufInput> {
+        vec![
+            FufInput::Tile {
+                id: TileId(1),
+                slot: 0,
+            },
+            FufInput::Tile {
+                id: TileId(2),
+                slot: 0,
+            },
+            FufInput::Tile {
+                id: TileId(3),
+                slot: 0,
+            },
+        ]
+    }
+
+    fn five_arg_decoder_inputs() -> Vec<FufInput> {
+        let mut v = three_arg_encoder_inputs();
+        v.push(FufInput::Extern {
+            kind: ExternKind::KvCache,
+            index: Some(0),
+        });
+        v.push(FufInput::Extern {
+            kind: ExternKind::BlockTable,
+            index: None,
+        });
+        v
+    }
+
+    #[test]
+    fn encoder_attention_impl_matches_3arg_only() {
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+
+        // Encoder shape (3-arg): EncoderAttentionImpl claims, decoder
+        // Impls reject.
+        let fuf3 = Fuf {
+            nodes: vec![attention_node(three_arg_encoder_inputs())],
+        };
+        let seed = TileId(0);
+        let enc = EncoderAttentionImpl;
+        let dec_via = AttentionViaCacheImpl;
+        let dec_pre = AttentionPrefillContiguousImpl;
+        assert!(
+            enc.matches(&fuf3, seed, &profile).is_some(),
+            "EncoderAttentionImpl must claim 3-arg attention(q,k,v)",
+        );
+        assert!(
+            dec_via.matches(&fuf3, seed, &profile).is_none(),
+            "AttentionViaCacheImpl must NOT claim 3-arg encoder attention",
+        );
+        assert!(
+            dec_pre.matches(&fuf3, seed, &profile).is_none(),
+            "AttentionPrefillContiguousImpl must NOT claim 3-arg encoder attention",
+        );
+    }
+
+    #[test]
+    fn decoder_attention_impls_match_5arg_only() {
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+
+        // Decoder shape (5-arg): both paged decoder Impls claim,
+        // EncoderAttentionImpl rejects.
+        let fuf5 = Fuf {
+            nodes: vec![attention_node(five_arg_decoder_inputs())],
+        };
+        let seed = TileId(0);
+        let enc = EncoderAttentionImpl;
+        let dec_via = AttentionViaCacheImpl;
+        let dec_pre = AttentionPrefillContiguousImpl;
+        assert!(
+            dec_via.matches(&fuf5, seed, &profile).is_some(),
+            "AttentionViaCacheImpl must claim 5-arg decoder attention",
+        );
+        assert!(
+            dec_pre.matches(&fuf5, seed, &profile).is_some(),
+            "AttentionPrefillContiguousImpl must claim 5-arg decoder attention",
+        );
+        assert!(
+            enc.matches(&fuf5, seed, &profile).is_none(),
+            "EncoderAttentionImpl must NOT claim 5-arg decoder attention",
+        );
+    }
+
+    // ── 4-tile MeanSubRmsNormBiasAdd vs 3-tile trio dispatch ────
+    //
+    // The 4-tile fusion only fires when a `BiasAdd` is downstream of
+    // the `RmsNorm` AND the BiasAdd's second input is a Weight (the
+    // bias tensor). These tests pin the dispatch boundary so the trio
+    // stays the canonical claim everywhere else.
+
+    fn build_four_tile_layer_norm_fuf() -> Fuf {
+        use crate::quantization::StorageFormat;
+        use crate::shape::Dim;
+        // Tile 0: source x (synthetic — represents the upstream
+        // tensor; e.g. an embedding output). Singleton Embed shape
+        // works for the matcher's purposes — it just needs to be a
+        // tile that Mean/Sub can reference.
+        let x = TileId(0);
+        let mean = TileId(1);
+        let sub = TileId(2);
+        let rmsnorm = TileId(3);
+        let bias_add = TileId(4);
+        let weight = WeightId(0);
+        let bias = WeightId(1);
+        let hidden = vec![Dim::Lit(1), Dim::Lit(64)];
+
+        Fuf {
+            nodes: vec![
+                FufNode {
+                    id: x,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: mean,
+                    op: OpKind::Mean,
+                    inputs: vec![FufInput::Tile { id: x, slot: 0 }],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: sub,
+                    op: OpKind::Sub,
+                    inputs: vec![
+                        FufInput::Tile { id: x, slot: 0 },
+                        FufInput::Tile { id: mean, slot: 0 },
+                    ],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: rmsnorm,
+                    op: OpKind::RmsNorm,
+                    inputs: vec![
+                        FufInput::Tile { id: sub, slot: 0 },
+                        FufInput::Weight {
+                            id: weight,
+                            index: None,
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: bias_add,
+                    op: OpKind::BiasAdd,
+                    inputs: vec![
+                        FufInput::Tile {
+                            id: rmsnorm,
+                            slot: 0,
+                        },
+                        FufInput::Weight {
+                            id: bias,
+                            index: None,
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![hidden],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn mean_sub_rms_norm_bias_add_matches_4tile_pattern() {
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let fuf = build_four_tile_layer_norm_fuf();
+        let imp = MeanSubRmsNormBiasAddImpl;
+        // Seed on the Mean (TileId(1)) — same convention as the trio
+        // matcher.
+        let m = imp
+            .matches(&fuf, TileId(1), &profile)
+            .expect("4-tile pattern must claim");
+        assert_eq!(
+            m.claimed_tiles.len(),
+            4,
+            "must claim Mean + Sub + RmsNorm + BiasAdd",
+        );
+        // The boundary output is the BiasAdd's tile, not the RmsNorm's
+        // — downstream consumers should read the biased result.
+        assert_eq!(m.boundary_outputs, vec![TileId(4)]);
+    }
+
+    #[test]
+    fn mean_sub_rms_norm_trio_does_not_steal_4tile_pattern() {
+        // The trio matcher (`MeanSubRmsNormImpl`) still matches the
+        // 4-tile FUF because its claim doesn't reject the BiasAdd
+        // tile (BiasAdd just gets left out of the claim). The solver
+        // picks the bigger claim via claim-size-DESC. This test
+        // documents that both impls see the seed; the solver — not the
+        // matcher — does the dispatch.
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        let fuf = build_four_tile_layer_norm_fuf();
+        let trio = MeanSubRmsNormImpl;
+        let four = MeanSubRmsNormBiasAddImpl;
+        let m_trio = trio.matches(&fuf, TileId(1), &profile);
+        let m_four = four.matches(&fuf, TileId(1), &profile);
+        assert!(m_trio.is_some(), "trio still matches the seed");
+        assert!(m_four.is_some(), "4-tile fires on the seed");
+        // 4-tile claim is strictly larger — solver claim-size-DESC
+        // will prefer it.
+        assert!(
+            m_four.unwrap().claimed_tiles.len() > m_trio.unwrap().claimed_tiles.len(),
+            "4-tile must outsize the trio so the solver picks it",
+        );
+    }
+
+    #[test]
+    fn mean_sub_rms_norm_bias_add_rejects_trio_only_pattern() {
+        // Same FUF without the BiasAdd → only the trio matches.
+        use crate::quantization::StorageFormat;
+        use crate::shape::Dim;
+        let x = TileId(0);
+        let mean = TileId(1);
+        let sub = TileId(2);
+        let rmsnorm = TileId(3);
+        let weight = WeightId(0);
+        let hidden = vec![Dim::Lit(1), Dim::Lit(64)];
+        let fuf = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: x,
+                    op: OpKind::Embed,
+                    inputs: vec![FufInput::Extern {
+                        kind: ExternKind::InputIds,
+                        index: None,
+                    }],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: mean,
+                    op: OpKind::Mean,
+                    inputs: vec![FufInput::Tile { id: x, slot: 0 }],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: sub,
+                    op: OpKind::Sub,
+                    inputs: vec![
+                        FufInput::Tile { id: x, slot: 0 },
+                        FufInput::Tile { id: mean, slot: 0 },
+                    ],
+                    outputs: vec![hidden.clone()],
+                },
+                FufNode {
+                    id: rmsnorm,
+                    op: OpKind::RmsNorm,
+                    inputs: vec![
+                        FufInput::Tile { id: sub, slot: 0 },
+                        FufInput::Weight {
+                            id: weight,
+                            index: None,
+                            storage: StorageFormat::Dense,
+                        },
+                    ],
+                    outputs: vec![hidden],
+                },
+            ],
+        };
+        let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
+        assert!(
+            MeanSubRmsNormBiasAddImpl
+                .matches(&fuf, TileId(1), &profile)
+                .is_none(),
+            "no BiasAdd → 4-tile must reject",
+        );
+        assert!(
+            MeanSubRmsNormImpl
+                .matches(&fuf, TileId(1), &profile)
+                .is_some(),
+            "trio still claims",
+        );
+    }
+
+    #[test]
+    fn mean_sub_rms_norm_bias_add_registered_in_starter_library() {
+        let lib = starter_library();
+        let count = lib
+            .iter_enumerated()
+            .filter(|(_, i)| i.name() == "mean_sub_rms_norm_bias_add")
+            .count();
+        assert_eq!(
+            count, 1,
+            "starter_library must register exactly one MeanSubRmsNormBiasAddImpl",
+        );
+    }
+
+    #[test]
+    fn encoder_attention_registered_in_starter_library() {
+        // Adding/removing the registration line in `starter_library`
+        // is the only way an encoder model can find this Impl. Lock it
+        // so a future "tidy-up" can't silently drop it.
+        let lib = starter_library();
+        let count = lib
+            .iter_enumerated()
+            .filter(|(_, i)| i.name() == "encoder_attention")
+            .count();
+        assert_eq!(
+            count, 1,
+            "starter_library must register exactly one EncoderAttentionImpl"
         );
     }
 }

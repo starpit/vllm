@@ -118,13 +118,22 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::LayerNorm(in_slot, out_slot, layer, _wf) => (
-                "LayerNorm",
+            Instruction::MeanSubRmsNorm(in_slot, out_slot, layer, _wf) => (
+                "MeanSubRmsNorm",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
-                    F::LayerKind("CohereLayerNorm"),
+                    F::LayerKind("RmsNorm"),
+                ],
+            ),
+            Instruction::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer, _wf) => (
+                "MeanSubRmsNormBiasAdd",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LayerNorm"),
                 ],
             ),
             Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, ndim) => {
@@ -214,7 +223,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::CutlassFusedLayerNormGemm(
+            Instruction::CutlassFusedMeanSubRmsNormGemm(
                 in_slot,
                 out_slot,
                 layer,
@@ -226,12 +235,12 @@ impl<W> Instruction<W> {
                 n,
                 k,
             ) => (
-                "CutlassFusedLayerNormGemm",
+                "CutlassFusedMeanSubRmsNormGemm",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
-                    F::LayerKind("CohereLayerNorm"),
+                    F::LayerKind("RmsNorm"),
                     F::LayerKind("LinearLayer"),
                     F::ConstU32(tile_m),
                     F::ConstU32(tile_n),
@@ -409,6 +418,15 @@ impl<W> Instruction<W> {
                     F::Slot(v_slot),
                     F::Slot(out_slot),
                     F::ConstBool(interleaved),
+                ],
+            ),
+            Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => (
+                "EncoderAttention",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(k_slot),
+                    F::Slot(v_slot),
+                    F::Slot(out_slot),
                 ],
             ),
             Instruction::SlidingAttentionViaCache(in_slot, out_slot, layer, _cs, interleaved) => (

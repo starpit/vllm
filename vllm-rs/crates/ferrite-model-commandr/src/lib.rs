@@ -9,8 +9,10 @@
 //!
 //! 1. **CohereLayerNorm** instead of RmsNorm. Subtracts the mean
 //!    before scaling: `y = w * (x - mean(x)) / sqrt(var(x) + eps)`.
-//!    Weight only, no bias. Surfaced via the new `layer_norm` DSL
-//!    op (`OpKind::LayerNorm`).
+//!    Weight only, no bias. Expressed as the math primitive trio
+//!    `mu = mean(x); centered = sub(x, mu); rmsnorm(centered, w)` —
+//!    the DSL stays pure math, and `MeanSubRmsNormImpl` claims the
+//!    pattern and emits one `cohere_layer_norm` kernel call.
 //! 2. **Parallel attention + MLP**. Both branches read the SAME
 //!    pre-norm output and their results are summed back into the
 //!    residual: `hidden = hidden + attn(norm(x)) + mlp(norm(x))`.
@@ -38,8 +40,14 @@ use ferrite_forward::forward;
 fn commandr() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
-        // One LayerNorm per layer; both attention and MLP read it.
-        normed = layer_norm(hidden_states, input_layernorm[layer]);
+        // CohereLayerNorm expressed as plain math: subtract row mean,
+        // then RMS-normalize. The `(mean, sub, rmsnorm)` trio is
+        // claimed by `MeanSubRmsNormImpl` and emits one
+        // `cohere_layer_norm` kernel call — same runtime path as the
+        // retired `OpKind::LayerNorm` opcode.
+        mu = mean(hidden_states);
+        centered = sub(hidden_states, mu);
+        normed = rmsnorm(centered, input_layernorm[layer]);
 
         // Attention branch.
         q = gemm(normed, self_attn.q_proj[layer]);
@@ -58,7 +66,9 @@ fn commandr() {
         hidden_states = add(oproj, hidden_states);
         hidden_states = add(down, hidden_states);
     }
-    // Final norm + lm_head + logit scale.
-    normed = layer_norm(hidden_states, norm);
+    // Final norm (same factorization) + lm_head + logit scale.
+    mu = mean(hidden_states);
+    centered = sub(hidden_states, mu);
+    normed = rmsnorm(centered, norm);
     logits = gemm(normed, lm_head) * scalar(logit_scale);
 }

@@ -912,8 +912,21 @@ impl GpuWeights {
         self.gpu_allocs
             .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
 
+        // The cast destination is `self.cast_pinned`, a SHARED pinned
+        // buffer reused across calls (see `ensure_pinned_buf`). Without
+        // a sync here, the next `take` would overwrite this buffer
+        // BEFORE the GPU has actually drained the async memcpy — every
+        // queued copy then reads whichever cast we wrote last, and
+        // many distinct GPU pointers end up with the same payload.
+        // (The fast/precast path already syncs before freeing its
+        // per-tensor pinned buffer; the slow path needs the same
+        // serialization because it reuses one shared buffer.)
+        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
+            if used_shared_pinned {
+                driver::stream_synchronize(self.stream)?;
+            }
         }
 
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
@@ -1021,7 +1034,15 @@ impl GpuWeights {
         // Slow path.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
+        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
+        if used_shared_pinned {
+            // Same race as `take`'s slow path — the next `take_into`
+            // would overwrite `cast_pinned` before this async memcpy
+            // drains. Sync to make this call effectively synchronous
+            // when the cast destination is the shared buffer.
+            driver::stream_synchronize(stream)?;
+        }
 
         Ok(size_bytes)
     }
@@ -1127,8 +1148,12 @@ impl GpuWeights {
         self.gpu_allocs
             .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
 
+        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
+            if used_shared_pinned {
+                driver::stream_synchronize(self.stream).ok()?;
+            }
         }
 
         let shape = cpu_ref.shape.clone();

@@ -345,9 +345,6 @@ pub fn apply_signature(
     match op {
         OpKind::Embed => sig_embed(solver, inputs),
         OpKind::RmsNorm => sig_rmsnorm(solver, inputs),
-        // LayerNorm has identical shape constraints to RmsNorm —
-        // `(x: [..., H], w: [H]) -> [..., H]`. Same signature reused.
-        OpKind::LayerNorm => sig_rmsnorm(solver, inputs),
         OpKind::Gemm => sig_gemm(solver, inputs),
         OpKind::RopeAppend => sig_rope_append(solver, inputs),
         // Same q/k/v constraints as `rope_append`; the distinction is
@@ -363,6 +360,11 @@ pub fn apply_signature(
         OpKind::Gelu => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
+        // Same shape-preserving rule as `Add`. Used inside the
+        // LayerNorm fusion pattern `(mean, sub, rmsnorm)`.
+        OpKind::Sub => sig_binary_elementwise(solver, inputs, op),
+        // `Mean` is shape-identity — see the OpKind doc comment.
+        OpKind::Mean => sig_unary_elementwise(solver, inputs, op),
         // AllReduce is identity-shape one-input — same constraint
         // as Silu / Gelu, just with the all-reduce-sum semantics
         // tracked at the OpKind level. Never inserted by any DSL;
@@ -553,12 +555,20 @@ fn sig_rope_append(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shape
     Ok(OpSig { output: q.clone() })
 }
 
-/// `attention(q, k, v, kv_cache, block_table)` →
-/// `[.., num_attention_heads * head_dim]`. The op signature
-/// mirrors `rope_append`'s constraints on q/k/v so attention
-/// doesn't introduce fresh unknowns.
+/// `attention(q, k, v, kv_cache, block_table)` (5-arg, decoder) OR
+/// `attention(q, k, v)` (3-arg, encoder/bidirectional — no KV cache, no
+/// block table) → `[.., num_attention_heads * head_dim]`. Both forms share
+/// the same q/k/v unification constraints; the encoder form simply omits the
+/// two opaque KV-side externs. Impl matchers downstream discriminate on arity
+/// to pick decoder vs encoder kernels.
 fn sig_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::Attention, inputs, 5)?;
+    if inputs.len() != 3 && inputs.len() != 5 {
+        return Err(ShapeError::ArgCount {
+            op: OpKind::Attention,
+            expected: 5,
+            got: inputs.len(),
+        });
+    }
     let q = &inputs[0];
     let k = &inputs[1];
     let v = &inputs[2];
@@ -707,7 +717,6 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
     match op {
         OpKind::Embed => &[(1, 2)],
         OpKind::RmsNorm => &[(1, 1)],
-        OpKind::LayerNorm => &[(1, 1)],
         OpKind::Gemm => &[(1, 2)],
         OpKind::RopeAppend => &[],
         OpKind::RopeAppendInterleaved => &[],
@@ -717,6 +726,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Gelu => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::Add => &[],
+        OpKind::Sub => &[],
+        OpKind::Mean => &[],
         // AllReduce takes one activation input, no tensor weight.
         OpKind::AllReduce => &[],
         // AllGather takes one activation input, no tensor weight.
@@ -1876,6 +1887,78 @@ mod tests {
             .expect("input_layernorm present");
         let ln_shape = inf.weights.get(&ln_id).unwrap();
         assert_eq!(ln_shape, &vec![bound("hidden_size")]);
+    }
+
+    #[test]
+    fn encoder_attention_3arg_passes_shape_inference() {
+        // Bidirectional/encoder attention: `attention(q, k, v)` with no
+        // KV cache and no block table. The shape signature must accept
+        // 3 args alongside the existing 5-arg decoder form.
+        let p = classify_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                attn = attention(q, k, v);
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+            }
+            "#,
+        );
+        let inf = infer(
+            &p,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("3-arg attention must shape-infer");
+
+        // q_proj still resolves to [hidden_size, num_attention_heads*head_dim].
+        let q_proj_id = p
+            .weights
+            .path_for_test(&["self_attn", "q_proj"])
+            .expect("q_proj present");
+        let q_proj_shape = inf.weights.get(&q_proj_id).expect("q_proj inferred");
+        assert_eq!(
+            q_proj_shape,
+            &vec![bound("hidden_size"), heads_layout_attn()],
+            "q_proj shape mismatch under 3-arg attention",
+        );
+    }
+
+    #[test]
+    fn attention_arity_4_rejected() {
+        // Only 3 (encoder) and 5 (decoder) are valid; 4 must error so
+        // typos like `attention(q, k, v, kv_cache)` don't slip through.
+        let p = classify_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..num_hidden_layers {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                attn = attention(q, k, v, kv_cache[layer]);
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+            }
+            "#,
+        );
+        let err = infer(
+            &p,
+            &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect_err("4-arg attention must be rejected");
+        match err {
+            ShapeError::ArgCount {
+                op: OpKind::Attention,
+                ..
+            } => {}
+            other => panic!("expected ArgCount on Attention, got {other:?}"),
+        }
     }
 
     #[test]

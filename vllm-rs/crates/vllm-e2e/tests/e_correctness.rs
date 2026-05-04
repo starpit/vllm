@@ -58,6 +58,82 @@ async fn run_correctness_test(model: &str, golden_key: &str) {
     run_correctness_test_with_threshold(model, golden_key, 10).await
 }
 
+/// Variant for fixtures that pin a non-default `--max-model-len` —
+/// e.g. Qwen3-Next-Dev, whose `max_position_embeddings = 32` rejects
+/// the default 2048 floor. Same logprob-comparison logic, just with
+/// the server arg overridden.
+async fn run_correctness_test_with_max_len(
+    model: &str,
+    golden_key: &str,
+    max_model_len: u32,
+    late_divergence_threshold: usize,
+) {
+    let golden = load_golden_refs(golden_key);
+    let update_golden = std::env::var("VLLM_UPDATE_GOLDEN")
+        .map(|v| v == "all" || v.split(',').any(|k| k.trim() == golden_key))
+        .unwrap_or(false);
+
+    let max_len_str = max_model_len.to_string();
+    let server = TestServer::builder(model)
+        .with_args(&["--max-model-len", &max_len_str])
+        .start()
+        .await
+        .expect("server should start");
+    let client = Client::new(server.base_url());
+
+    if update_golden {
+        let mut new_results: Vec<GoldenResult> = Vec::with_capacity(golden.results.len());
+        for (i, golden_result) in golden.results.iter().enumerate() {
+            let req = completion_request(
+                &golden_result.prompt,
+                golden.max_tokens,
+                golden.num_logprobs,
+            );
+            let resp = client
+                .completion(&req)
+                .await
+                .expect("completion should succeed");
+            assert!(!resp.choices.is_empty(), "prompt {i}: no choices returned");
+            let engine_output = extract_engine_output(&resp.choices[0]);
+            new_results.push(GoldenResult {
+                prompt: golden_result.prompt.clone(),
+                output_tokens: engine_output.output_tokens,
+                output_text: engine_output.output_text,
+                logprobs: engine_output.logprobs,
+            });
+        }
+        write_golden_refs(
+            golden_key,
+            &GoldenReference {
+                model: golden.model.clone(),
+                max_tokens: golden.max_tokens,
+                num_logprobs: golden.num_logprobs,
+                results: new_results,
+            },
+        );
+    } else {
+        for (i, golden_result) in golden.results.iter().enumerate() {
+            let req = completion_request(
+                &golden_result.prompt,
+                golden.max_tokens,
+                golden.num_logprobs,
+            );
+            let resp = client
+                .completion(&req)
+                .await
+                .expect("completion should succeed");
+            assert!(!resp.choices.is_empty(), "prompt {i}: no choices returned");
+            let engine_output = extract_engine_output(&resp.choices[0]);
+            check_logprobs_close_with_threshold(
+                golden_result,
+                &engine_output,
+                i,
+                late_divergence_threshold,
+            );
+        }
+    }
+}
+
 /// BNB4 variant — the fused-dequant-GEMM in
 /// `bitsandbytes.matmul_4bit` accumulates in a different order than
 /// ferrite's dequant-to-scratch → cuBLAS-GEMM pipeline. Same
@@ -1017,6 +1093,41 @@ async fn test_cuda_correctness_qwen3_moe_3b() {
     // DeepSeek-V2-Lite / V3 goldens use for analogous reasons (FA2 vs
     // TritonMLA there; MoE-routing noise here).
     run_correctness_test_with_threshold(TestModels::QWEN3_MOE, "qwen3_moe_3b", 1).await;
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen3_next_dev() {
+    // Qwen3-Next dev fixture (`Qwen3NextForCausalLM`) — the only
+    // small `qwen3_next` checkpoint that fits an L4. Pins the hybrid
+    // dispatch end-to-end:
+    //   - GdnAttentionRefImpl claims `OpKind::GdnAttention` tiles on
+    //     the 2 linear-attention layers (gates on `linear_num_value_heads`).
+    //   - GatedAttentionRefImpl claims `OpKind::GatedAttention` tiles
+    //     on the 2 full-attention layers (same fence).
+    //   - SharedFusedMoeRefImpl claims the per-layer `OpKind::Moe`
+    //     tile via the unchanged Qwen-MoE `applies_to`.
+    //   - cuda_worker auto-builds `gdn_state_pool` for ferrite-loaded
+    //     `qwen3_next` (`init_kv_cache_pool` reads the bound from the
+    //     hf_config-derived `qwen3_next_config`) and threads
+    //     `ForwardCtx::{gdn_state, gdn_state_indices}` into the
+    //     forward via the broadened `model.is_qwen3_next()` dispatch.
+    //
+    // Golden was generated via HF transformers' trust_remote_code
+    // path (Python vLLM is currently broken on this arch — upstream
+    // RMSNormGated.forward_cuda references an undefined
+    // `self.activation`). The model is undertrained, so output is
+    // gibberish, but greedy decode is deterministic and the top-K
+    // softmax is a real signal at every position.
+    //
+    // `max-model-len=24`: fits inside the model's 32-position
+    // embedding ceiling with room for the longest prompt + 8 generated
+    // tokens. Threshold=1 — only position 0 is hard-pinned to the
+    // golden's top token; later divergences are tolerated as warnings
+    // (BF16 noise + uncalibrated routing on 4 experts is enough to
+    // flip top-K membership a few steps in).
+    run_correctness_test_with_max_len(TestModels::QWEN3_NEXT_DEV, "qwen3_next_dev", 24, 1).await;
 }
 
 /// `JacobAndersson/slimed-qwen-{1,2,3}` ship only `config.json` +

@@ -75,7 +75,20 @@ async fn run_correctness_test_with_max_len(
 
     let max_len_str = max_model_len.to_string();
     let server = TestServer::builder(model)
-        .with_args(&["--max-model-len", &max_len_str])
+        // `--gpu-memory-utilization 0.05` keeps `num_gpu_blocks` small
+        // for the auxiliary GDN per-request state pool (Qwen3-Next-Dev).
+        // The pool's slot count today is sized off `num_gpu_blocks`, so
+        // a tiny model on a 23 GB L4 would otherwise allocate millions
+        // of GDN slots × per-slot 18 KB = OOM. 5% of a 23 GB GPU
+        // (~1.1 GB) is plenty for a single-prompt golden test.
+        .with_args(&[
+            "--max-model-len",
+            &max_len_str,
+            "--gpu-memory-utilization",
+            "0.05",
+            "--max-num-seqs",
+            "4",
+        ])
         .start()
         .await
         .expect("server should start");

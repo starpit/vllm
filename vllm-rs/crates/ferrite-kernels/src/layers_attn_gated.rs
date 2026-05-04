@@ -128,14 +128,90 @@ impl Qwen3NextGatedAttentionLayer {
         };
         let kv_size = num_kv_heads * head_dim;
 
-        let qkv_w = gw.take(&format!("{prefix}.qkv_proj.weight"))?;
-        let qkv_bias_name = format!("{prefix}.qkv_proj.bias");
-        let qkv_bias = if gw.contains(&qkv_bias_name) {
-            Some(gw.take(&qkv_bias_name)?)
+        // QKV projection: prefer the fused `qkv_proj.weight` shape
+        // (Python vLLM convention). Fall back to fusing separate
+        // `q_proj` / `k_proj` / `v_proj` weights when the checkpoint
+        // ships HF transformers' split layout — Goekdeniz Qwen3Next-Dev
+        // and any model created via the trust_remote_code modeling file
+        // take this branch.
+        let fused_name = format!("{prefix}.qkv_proj.weight");
+        let qkv_proj = if gw.contains(&fused_name) {
+            let qkv_w = gw.take(&fused_name)?;
+            let qkv_bias_name = format!("{prefix}.qkv_proj.bias");
+            let qkv_bias = if gw.contains(&qkv_bias_name) {
+                Some(gw.take(&qkv_bias_name)?)
+            } else {
+                None
+            };
+            Linear::new(qkv_w, qkv_bias)
         } else {
-            None
+            // Concat `[q, k, v]` row-wise into one `[q_size + 2*kv_size, hidden]`
+            // tensor. All three sources must share dtype; we take dtype
+            // (and hidden_size) from `q_proj` which is always present.
+            let q_name = format!("{prefix}.q_proj.weight");
+            let k_name = format!("{prefix}.k_proj.weight");
+            let v_name = format!("{prefix}.v_proj.weight");
+            let (q_shape, q_dtype) = gw
+                .tensor_info(&q_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+            // The fused `qkv_proj` has shape `[q_size + 2*kv_size, hidden_size]`;
+            // recover `hidden_size` from `q_proj`'s `[q_size, hidden_size]` shape.
+            let hidden_size = q_shape[1];
+            let elem = q_dtype.size_bytes();
+            let q_bytes = q_size * hidden_size * elem;
+            let kv_bytes = kv_size * hidden_size * elem;
+            let total = q_bytes + 2 * kv_bytes;
+            let ptr = unsafe { driver::mem_alloc(total)? };
+            unsafe {
+                gw.take_into(&q_name, ptr, stream)?;
+                gw.take_into(&k_name, ptr.add(q_bytes), stream)?;
+                gw.take_into(&v_name, ptr.add(q_bytes + kv_bytes), stream)?;
+            }
+            // After-cast dtype is whatever `take_into` produced — that's
+            // the same as the loader's target dtype. Read it back via the
+            // post-load device tensor.
+            let post_dtype = gw.target_dtype().unwrap_or(q_dtype);
+            let qkv_w = unsafe {
+                GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden_size], post_dtype)
+            };
+            let q_bias_name = format!("{prefix}.q_proj.bias");
+            let qkv_bias = if gw.contains(&q_bias_name) {
+                // Fuse biases the same way; q's bias is q_size, k/v's are kv_size.
+                let q_b = gw.take(&q_bias_name)?;
+                let k_b = gw.take(&format!("{prefix}.k_proj.bias"))?;
+                let v_b = gw.take(&format!("{prefix}.v_proj.bias"))?;
+                let bias_dtype = q_b.dtype();
+                let bias_elem = bias_dtype.size_bytes();
+                let bias_total = (q_size + 2 * kv_size) * bias_elem;
+                let bias_ptr = unsafe { driver::mem_alloc(bias_total)? };
+                unsafe {
+                    driver::memcpy_dtod_async(
+                        bias_ptr,
+                        q_b.raw_ptr() as *const u8,
+                        q_size * bias_elem,
+                        stream,
+                    )?;
+                    driver::memcpy_dtod_async(
+                        bias_ptr.add(q_size * bias_elem),
+                        k_b.raw_ptr() as *const u8,
+                        kv_size * bias_elem,
+                        stream,
+                    )?;
+                    driver::memcpy_dtod_async(
+                        bias_ptr.add((q_size + kv_size) * bias_elem),
+                        v_b.raw_ptr() as *const u8,
+                        kv_size * bias_elem,
+                        stream,
+                    )?;
+                }
+                Some(unsafe {
+                    GpuTensor::new(bias_ptr, &[q_size + 2 * kv_size], bias_dtype)
+                })
+            } else {
+                None
+            };
+            Linear::new(qkv_w, qkv_bias)
         };
-        let qkv_proj = Linear::new(qkv_w, qkv_bias);
 
         let o_proj = Linear::load(gw, &format!("{prefix}.o_proj"))?;
 
@@ -229,14 +305,22 @@ impl Qwen3NextGatedAttentionLayer {
         );
         drop(qkv);
 
-        // 3. If `attn_output_gate`, separate Q from gate. The split
-        //    layout is `[T, 2 * num_q_heads, head_dim]` — first
-        //    `num_q_heads` per token is Q, next `num_q_heads` is gate.
+        // 3. If `attn_output_gate`, separate Q from gate. The
+        //    `q_with_gate` tensor has shape `[T, 2*num_q_heads, head_dim]`
+        //    where the second dim is INTERLEAVED per real head:
+        //    `[head0_Q, head0_gate, head1_Q, head1_gate, …]`. This
+        //    matches the Python reference's `view(num_heads, -1)` +
+        //    `chunk(2, dim=-1)` path, and the on-disk weight layout
+        //    of `q_proj.weight [2*num_q_heads*head_dim, hidden]`
+        //    where each head occupies a `[head_dim_Q, head_dim_gate]`
+        //    contiguous block. Split with a per-head stride.
         let (q, gate) = if self.attn_output_gate {
             let q_tensor = *q_with_gate.view();
             let elem_bytes = q_tensor.dtype().size_bytes();
-            let bytes_per_half = self.num_q_heads * self.head_dim * elem_bytes;
-            let stride = 2 * bytes_per_half;
+            let head_bytes = self.head_dim * elem_bytes;
+            let pair_bytes = 2 * head_bytes;
+            let src_token_bytes = self.num_q_heads * pair_bytes;
+            let dst_token_bytes = self.num_q_heads * head_bytes;
             let actual_q = device.caching.alloc_tensor(
                 &[num_tokens, self.num_q_heads, self.head_dim],
                 q_tensor.dtype(),
@@ -246,23 +330,26 @@ impl Qwen3NextGatedAttentionLayer {
                 q_tensor.dtype(),
             );
             for t in 0..num_tokens {
-                driver::memcpy_dtod_async(
-                    actual_q.as_gpu_tensor().raw_ptr().add(t * bytes_per_half),
-                    q_tensor.raw_ptr().add(t * stride) as *const u8,
-                    bytes_per_half,
-                    stream,
-                )
-                .expect("Q split memcpy");
-                driver::memcpy_dtod_async(
-                    gate_tensor
-                        .as_gpu_tensor()
-                        .raw_ptr()
-                        .add(t * bytes_per_half),
-                    q_tensor.raw_ptr().add(t * stride + bytes_per_half) as *const u8,
-                    bytes_per_half,
-                    stream,
-                )
-                .expect("gate split memcpy");
+                let src_off = t * src_token_bytes;
+                let dst_off = t * dst_token_bytes;
+                for h in 0..self.num_q_heads {
+                    let src_pair = src_off + h * pair_bytes;
+                    let dst_head = dst_off + h * head_bytes;
+                    driver::memcpy_dtod_async(
+                        actual_q.as_gpu_tensor().raw_ptr().add(dst_head),
+                        q_tensor.raw_ptr().add(src_pair) as *const u8,
+                        head_bytes,
+                        stream,
+                    )
+                    .expect("Q head memcpy");
+                    driver::memcpy_dtod_async(
+                        gate_tensor.as_gpu_tensor().raw_ptr().add(dst_head),
+                        q_tensor.raw_ptr().add(src_pair + head_bytes) as *const u8,
+                        head_bytes,
+                        stream,
+                    )
+                    .expect("gate head memcpy");
+                }
             }
             drop(q_with_gate);
             (actual_q, Some(gate_tensor))

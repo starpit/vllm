@@ -250,25 +250,98 @@ forward path runs, the GDN state pool fires; what's wrong is the
 numerics inside the layer-struct `forward` bodies (or weight loading
 into them).
 
-## Open follow-ups
+## 2026-05-04 — Phase 6c progress: 3 bugs fixed, golden still red
 
-- **Phase 6c — go green.** Diagnose why ferrite's GDN + gated
-  attention math diverges from the HF transformers reference. Likely
-  candidates: (a) `Qwen3NextGdnLayer::forward` — many places where
-  layout / dtype assumptions could be off, especially the QKVZ-split,
-  conv1d state addressing, and recurrent kernel calls. (b)
-  `Qwen3NextGatedAttentionLayer::forward` — the q/gate split is a
-  CPU-driven memcpy loop that's easy to get wrong on the per-head
-  layout. (c) Weight-loading transposes (HF stores `[out, in]`;
-  ferrite expects same — verify each prefix). (d) Gemma "+1"
-  RMSNorm offset on `q_norm` / `k_norm`. Start with single-prompt
-  + position 0, compare logits tensor element-wise vs HF
-  transformers, narrow down to the first divergent op.
-- **TP / quant / GGUF.** Out of scope per the plan; will need
-  per-format peer Impls and the GDN state pool's TP-aware sharding
-  (today the pool is unsharded — `feedback_ferrite_weights_unsharded`
-  applies). Document any divergence here when those land.
-- **Python vLLM unblock.** Filing or fixing the `RMSNormGated.activation`
-  bug upstream would let the standard `generate_golden_refs.py` path
-  produce this golden. For now the HF transformers path is the
-  reference of record for this fixture.
+Three concrete bugs found and patched against the Goekdeniz Dev
+fixture; test still red — at least one more bug remains.
+
+1. **Wrong arch-config variant.** The first run claimed the
+   80B-config variant (the only one whose dim-bounds didn't reject
+   it on fingerprint), so the codegen-baked `full_attn_period=4` /
+   `full_attn_remainder=3` didn't match the Dev model's alternating
+   pattern. Fix: new `configs/qwen3-next-dev.json` advertising
+   `full_attn_period=2` / `full_attn_remainder=1` and the Dev
+   model's actual dimensions (hidden=128, num_heads=4, head_dim=32,
+   num_experts=4, etc.). With this in tree the variant discovery
+   picks it correctly (`vllm ferrite info` shows three variants).
+2. **Fused-vs-separate QKV layout mismatch.** Ferrite's
+   `Qwen3NextGatedAttentionLayer::load` only handled the fused
+   `qkv_proj.weight` shape Python vLLM's `QKVParallelLinear` emits.
+   Goekdeniz Dev (and any model created via HF transformers'
+   `trust_remote_code` path) ships separate `q_proj.weight` /
+   `k_proj.weight` / `v_proj.weight`. Fix: the loader now falls
+   back to fusing the three via `take_into` into one
+   `[q_size + 2*kv_size, hidden]` tensor, mirroring
+   `vllm-cuda::model::qwen3_next::Qwen3NextFullAttention::load_fused`.
+3. **Per-head Q/gate interleaving.** The original split assumed
+   layout `[head0_Q, head1_Q, …, head0_gate, head1_gate, …]` but the
+   actual Python reference layout (matching `view(num_heads,-1)` +
+   `chunk(2,dim=-1)`) is interleaved per-head:
+   `[head0_Q, head0_gate, head1_Q, head1_gate, …]`. Fix: the q/gate
+   split now copies per `(token, head)` with the per-head pair
+   stride. Note this is a CPU-driven memcpy loop — a fused CUDA
+   kernel is a follow-up perf item but isn't the correctness bug.
+4. **GDN pool sizing.** `cuda_worker::init_kv_cache_pool` sizes the
+   GDN slot count off `num_gpu_blocks`. On a low-VRAM model + L4
+   that balloons to ~1M slots × ~18 KB → OOM. The test uses
+   `--gpu-memory-utilization 0.05` as a workaround; the real fix is
+   to size the pool by `max_num_seqs` (or expose a dedicated
+   `--num-gdn-slots`), and that's a follow-up.
+
+After all four fixes the test STILL fails:
+```
+Engine text: "近日近日近日近日近日近日近日近日"
+Golden text: "印刷issance青铜Hello直线距离 OPTION World!\n"
+```
+Position-0 logits differ enough that the engine's argmax isn't even
+in the golden's top-20 window. The output is degenerate (single
+token repeating), characteristic of a numerical / structural bug
+that produces near-uniform or near-zero deltas across positions.
+
+## Open follow-ups for Phase 6c
+
+Diagnostic plan:
+1. Use `/tmp/dump_hf_intermediates.py` (committed in spirit; recreate
+   from the script body in this handoff entry — it hooks every layer
+   + final_norm + embed and dumps `[0,0,:8]` and `[-1,-1,:8]` slices
+   to `/tmp/hf_qwen3_next_dump.json`). HF intermediates already
+   captured for prompt "hello world", token IDs `[31173, 3121]`,
+   top-3 next tokens `[("印刷", -9.84), (" moder", -9.88), ("农夫", -9.98)]`.
+2. Add a parallel ferrite dump — easiest is to print the same slices
+   from inside `Instruction::eval` (gated by an env var so it doesn't
+   leak into normal runs). Compare layer-by-layer; first divergent
+   layer points at the buggy op.
+3. Likely candidates: (a) GDN forward — QKVZ-split, conv1d state
+   addressing, recurrence kernel arg order. The CPU-roundtrip
+   adjusted-indices path is brittle. (b) Q-only RoPE — the kernel
+   reads `cos_sin_cache.dim(1)` for `rotary_dim`, but the cache the
+   codegen builds with `partial_rotary_factor=0.25` may have a
+   different layout than the kernel expects. (c) Gemma "+1" on
+   `q_norm`/`k_norm` — verify the offset is applied at load time
+   and not double-applied / not applied. (d) `attn_output_gate`
+   plumbing — the bool flow through the load path then forward path
+   is easy to flip.
+
+Reproducer (post-Phase-6c-progress):
+```
+VLLM_GPU_MEMORY_UTILIZATION=0.05 cargo test -p vllm-e2e \
+  --features e2e,cuda --release --test e_correctness \
+  test_cuda_correctness_qwen3_next_dev \
+  -- --ignored --nocapture --test-threads=1
+```
+
+## Other open follow-ups
+
+- **GDN pool sizing.** Track `max_num_seqs` instead of
+  `num_gpu_blocks` so the auxiliary pool doesn't OOM on low-VRAM
+  models. Follow-up to Phase 6c.
+- **Q/gate split kernel.** CPU-driven memcpy loop is correct but
+  slow. Add a CUDA kernel to deinterleave in one launch. Perf
+  follow-up; not on the green-test critical path.
+- **TP / quant / GGUF.** Per-format peer Impls + TP-aware GDN pool
+  sharding. Out of scope per the plan; document any divergence here
+  when they land.
+- **Python vLLM unblock.** Filing or fixing the
+  `RMSNormGated.activation` bug upstream would let the standard
+  `generate_golden_refs.py` path produce this golden. For now the
+  HF transformers path is the reference of record for this fixture.

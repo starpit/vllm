@@ -9,7 +9,7 @@
 
 **G.1 — `ferrite-vision` host-glue crate. (DONE.)** Lifted from both VL crates: `VisionConfig` (common geometric fields) with `build_rope_cos_sin_bf16` + `patches_from_normalized_chw` as methods, plus free-fn `build_cu_seqlens_i32`, `pad_linear_k_to_mult8` (Q2.5-VL cuBLAS K=3420 fix), `TraceDump`, byte-slice helpers. Both VL crates re-export `pub use ferrite_vision::VisionConfig` and now carry only their arch-specific extras (Qwen2.5-VL: `VisionExtras { intermediate_size, window_size }`). Behavior-preserving — no DSL changes.
 
-**G.2 — New OpKinds in `ferrite-forward-macro`.** Add to the `OpKind` enum (`classified.rs:67`): `VarlenAttention`, `VisionRope`, `QuickGelu`, `GeluErf`. Existing `Gelu` stays tanh-form (its current consumers are the SwiGLU-adjacent fusion patterns). Each new variant gets a shape signature in `shape.rs` and `from_name` arm. Gate behind a codegen unit test before any consumer wiring.
+**G.2 — New OpKinds in `ferrite-forward-macro`. (DONE.)** Landed `7f0dabec3`: four new variants in the `OpKind` enum (`classified.rs:67`) — `VarlenAttention`, `VisionRope`, `QuickGelu`, `GeluErf`. Existing `Gelu` stays tanh-form. Each variant has a shape signature in `shape.rs` (`sig_varlen_attention`, `sig_vision_rope`, plus arms on `sig_unary_elementwise` for the two GELUs) and a corresponding `weight_arg_ranks` row. `Stmt::AssignTuple` grew a third arm for `(q, k) = vision_rope(...)`. Six unit tests in `shape::tests` lock the sigs. **Deliberately deferred:** `from_name` arms — they land in lockstep with G.4 Impls + G.5 DSL bodies so parse ⟺ codegen stays total (no parse-then-reject). Until then the new OpKinds are produced only via direct `apply_signature` calls (i.e., from tests).
 
 **G.3 — `#[vision_forward]` attr macro.** Sibling to `#[forward]` in `ferrite-forward-macro`, sharing the FUF / solver / codegen pipeline downstream. Only differences: prelude defines vision externs (`pixels`, `cu_seqlens`, `cos`, `sin`, `grid_thw`, `max_seqlen`) instead of decoder externs (`positions`, `rotary`, `kv_cache`, `block_table`); workload-bucketing key is varlen total-L (candidate buckets `[256, 1024, 4096, 16384]`, ceil-bucketed on per-image post-merger token count) instead of decode-iter count; no AllReduce/AllGather lowering pass for v1 (vision stays replicated). Same `Forward` trait, same `LAUNCHER_TABLE` shape, no parallel codegen path.
 
@@ -37,7 +37,12 @@
 
 ## Where to start
 
-G.1 done. Next: G.2 + G.3 in parallel; G.4 follows. G.5 is the integration test for the whole stack — every preceding phase converges there.
+G.1 + G.2 done. Next: G.3 (the `#[vision_forward]` attr macro). G.4 follows. G.5 is the integration test for the whole stack — every preceding phase converges there.
+
+**G.3 entry notes** (for the next session):
+- The OpKinds exist and are total over `apply_signature` / `weight_arg_ranks` / `as_str` (G.2). What's missing on the DSL surface is `from_name` arms — those should land WITH G.3's `#[vision_forward]` body parser in lockstep, not standalone.
+- The three open questions above (workload bucketing key, Reshape DSL surface, tuple-return verification) want resolution before the macro skeleton is more than a stub. Tuple-return for `vision_rope` is already validated by the `vision_rope_arity_and_output_shape` test path — the AssignTuple machinery handles 2-target uniformly.
+- `compile()` in `lib.rs` is large; the prudent shape for G.3 is to factor a `compile_common()` and have `vision_forward` reuse most of it, with three local overrides: extern set, workload bucketing key, and the AllReduce/AllGather/MmEmbedSplice lowering passes (skipped). Avoid copy-pasting `compile()`.
 
 ## Verification at every phase
 

@@ -25,6 +25,7 @@
 #![cfg(feature = "cuda")]
 
 use crate::ForwardCtx;
+use crate::dump;
 use crate::tile_table::{TileEntry, take_owned, tile_ref, view};
 use ferrite_cuda_core::alloc::OwnedTensor;
 use ferrite_cuda_core::device::GpuDevice;
@@ -468,6 +469,12 @@ impl<W: CanonicalParams> Instruction<W> {
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
+                dump::dump_tile(
+                    "embed.out",
+                    0,
+                    &out.as_gpu_tensor(),
+                    ctx.device.compute_stream,
+                );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::SpliceMmEmbeds(slot) => unsafe {
@@ -503,11 +510,24 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                dump::dump_tile("rmsnorm.in", layer, &v, ctx.device.compute_stream);
+                dump::dump_tile(
+                    "rmsnorm.weight",
+                    layer,
+                    &w.weight,
+                    ctx.device.compute_stream,
+                );
                 let out = kernels::rms_norm(
                     *v,
                     w.weight,
                     w.eps,
                     &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                dump::dump_tile(
+                    "rmsnorm.out",
+                    layer,
+                    &out.as_gpu_tensor(),
                     ctx.device.compute_stream,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
@@ -571,6 +591,12 @@ impl<W: CanonicalParams> Instruction<W> {
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 kernels::add_inplace(*residual, *delta, ctx.device.compute_stream);
+                dump::dump_tile(
+                    "add.residual",
+                    ctx.layer_offset,
+                    &residual,
+                    ctx.device.compute_stream,
+                );
             },
             #[cfg(feature = "nccl")]
             Instruction::AllReduce(slot) => unsafe {
@@ -623,6 +649,24 @@ impl<W: CanonicalParams> Instruction<W> {
                     *residual,
                     w.weight,
                     w.eps,
+                    ctx.device.compute_stream,
+                );
+                dump::dump_tile(
+                    "fused_add_rmsnorm.weight",
+                    layer,
+                    &w.weight,
+                    ctx.device.compute_stream,
+                );
+                dump::dump_tile(
+                    "fused_add_rmsnorm.delta",
+                    layer,
+                    &delta,
+                    ctx.device.compute_stream,
+                );
+                dump::dump_tile(
+                    "fused_add_rmsnorm.residual",
+                    layer,
+                    &residual,
                     ctx.device.compute_stream,
                 );
             },
@@ -1554,14 +1598,28 @@ impl<W: CanonicalParams> Instruction<W> {
             Instruction::SharedFusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                dump::dump_tile("moe.in", layer, &v, ctx.device.compute_stream);
                 let w = (weight_fn)(ctx.wm, layer);
                 let out = w.forward(v, ctx.device);
+                dump::dump_tile(
+                    "moe.out",
+                    layer,
+                    &out.as_gpu_tensor(),
+                    ctx.device.compute_stream,
+                );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::GdnAttention(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                dump::dump_tile("gdn_attn.in", layer, &v, ctx.device.compute_stream);
                 let w = (weight_fn)(ctx.wm, layer);
+                dump::dump_tile(
+                    "gdn_attn.in_proj_ba_weight",
+                    layer,
+                    &w.in_proj_ba.weight,
+                    ctx.device.compute_stream,
+                );
                 // The pool + per-request slot table are wired in by
                 // the worker; we cannot fabricate them locally and
                 // still get correct recurrence.
@@ -1584,11 +1642,18 @@ impl<W: CanonicalParams> Instruction<W> {
                     num_seqs,
                     ctx.device,
                 );
+                dump::dump_tile(
+                    "gdn_attn.out",
+                    layer,
+                    &out.as_gpu_tensor(),
+                    ctx.device.compute_stream,
+                );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::GatedAttention(in_slot, out_slot, layer, weight_fn, cos_sin_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                dump::dump_tile("gated_attn.in", layer, &v, ctx.device.compute_stream);
                 let w = (weight_fn)(ctx.wm, layer);
                 let cos_sin = (cos_sin_fn)(ctx.wm, layer);
                 let out = w.forward(
@@ -1604,6 +1669,12 @@ impl<W: CanonicalParams> Instruction<W> {
                     layer as usize,
                     cos_sin,
                     ctx.device,
+                );
+                dump::dump_tile(
+                    "gated_attn.out",
+                    layer,
+                    &out.as_gpu_tensor(),
+                    ctx.device.compute_stream,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },

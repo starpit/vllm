@@ -10,7 +10,7 @@ default = []
 # code's type references resolve. Without this feature, only the
 # numeric pipeline observations (NUM_TILES etc) are available;
 # the emitted runtime types stay gated out.
-cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda"]
+cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:cudarc"]
 # Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
 # `ForwardCtx::tp_group` field). At tp=1 the lowering pass never
 # emits AllReduce, so this feature is a strict superset of `cuda`.
@@ -28,6 +28,8 @@ ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
+half = { workspace = true }
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
 # Optional deps used only by the `probe-weights` bin under the
 # `probe` feature. `ureq` is a blocking HTTP client we use for
 # Range-request header-only reads of safetensors (avoiding the

@@ -1995,9 +1995,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cudarc",
  "ferrite-cuda-core",
  "ferrite-forward-macro",
  "ferrite-kernels",
+ "half",
  "hf-hub",
  "inventory",
  "serde",

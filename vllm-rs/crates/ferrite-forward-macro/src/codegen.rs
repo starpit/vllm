@@ -3739,8 +3739,7 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 }
 
 fn backbone_output_for(fuf: &Fuf) -> (TileId, u8) {
-    let last_node = last_non_splice_node(fuf)
-        .expect("FUF must be non-empty to emit a forward fn");
+    let last_node = last_non_splice_node(fuf).expect("FUF must be non-empty to emit a forward fn");
     let lm_head_node = if last_node.op == crate::classified::OpKind::AllGather {
         // tp>1: skip past the AllGather to the lm_head Gemm whose
         // hidden-state input we're after. AllGather has exactly one

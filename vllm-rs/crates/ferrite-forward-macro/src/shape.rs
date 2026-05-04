@@ -359,8 +359,16 @@ pub fn apply_signature(
         // in the picked kernel (window-masked vs. dense), not in
         // the type signature.
         OpKind::SlidingAttention => sig_attention(solver, inputs),
+        // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
+        // No heads-layout anchoring — vision shapes are pinned at
+        // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
+        OpKind::VarlenAttention => sig_varlen_attention(solver, inputs),
         OpKind::Silu => sig_unary_elementwise(solver, inputs, op),
         OpKind::Gelu => sig_unary_elementwise(solver, inputs, op),
+        // QuickGelu / GeluErf are unary elementwise like Gelu; the
+        // numerical distinction lives in the picked kernel.
+        OpKind::QuickGelu => sig_unary_elementwise(solver, inputs, op),
+        OpKind::GeluErf => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
         // AllReduce is identity-shape one-input — same constraint
@@ -399,6 +407,11 @@ pub fn apply_signature(
                      Program::reshape_targets directly"
                 .into(),
         }),
+        // VisionRope is tuple-returning `(q', k') = vision_rope(q, k, cos, sin)`;
+        // `Stmt::AssignTuple` handles the 2-target binding directly. Reaching
+        // this arm via `apply_signature` (single-target) is fine — returns q's
+        // shape, same shape-preserving semantics.
+        OpKind::VisionRope => sig_vision_rope(solver, inputs),
         OpKind::MlaSplit => sig_mla_split(solver, inputs),
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
         OpKind::Moe => sig_moe(solver, inputs),
@@ -586,6 +599,39 @@ fn sig_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeEr
     Ok(OpSig { output: q.clone() })
 }
 
+/// `varlen_attention(q, k, v, cu_seqlens, max_seqlen)` →
+/// `q.shape`. Vision-encoder attention. Inputs: q/k/v all rank-2
+/// `[total_L, num_heads * head_dim]` (vision-side; the heads-layout
+/// anchoring lives at the qkv-producing gemm, not here). cu_seqlens
+/// and max_seqlen are opaque externs with empty shapes.
+fn sig_varlen_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::VarlenAttention, inputs, 5)?;
+    let q = &inputs[0];
+    if q.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::VarlenAttention,
+            reason: "q must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: q.clone() })
+}
+
+/// `vision_rope(q, k, cos, sin)` → `(q', k')`. Single-output sig
+/// returns q's shape; `Stmt::AssignTuple` binds the second target
+/// to k's shape. Shape-preserving on both q and k. cos/sin are
+/// opaque externs (built host-side from grid_thw); empty shapes.
+fn sig_vision_rope(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::VisionRope, inputs, 4)?;
+    let q = &inputs[0];
+    if q.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::VisionRope,
+            reason: "q must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: q.clone() })
+}
+
 /// `mla_split(kv_a: [T, kv_lora_rank + qk_rope_head_dim])` → (used as
 /// single-output sig by `apply_signature`; actual 2-tuple binding happens
 /// in `Stmt::AssignTuple` which calls this path first for validation).
@@ -713,8 +759,12 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::RopeAppendInterleaved => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
+        OpKind::VarlenAttention => &[],
         OpKind::Silu => &[],
         OpKind::Gelu => &[],
+        OpKind::QuickGelu => &[],
+        OpKind::GeluErf => &[],
+        OpKind::VisionRope => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::Add => &[],
         // AllReduce takes one activation input, no tensor weight.
@@ -1458,6 +1508,31 @@ impl InferCtx {
                     }
                     Ok(())
                 } else if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::VisionRope)
+                {
+                    // `(q, k) = vision_rope(q, k, cos, sin)`
+                    // Both outputs are shape-preserving on their
+                    // respective inputs. cos/sin are opaque externs.
+                    if targets.len() != 2 {
+                        return Err(ShapeError::BadArgs {
+                            op: *op,
+                            reason: format!(
+                                "vision_rope returns 2 values, got {} targets",
+                                targets.len()
+                            ),
+                        });
+                    }
+                    let q_shape = self.expr_shape(&args[0])?;
+                    let k_shape = self.expr_shape(&args[1])?;
+                    let all_input_shapes: Vec<Shape> = args
+                        .iter()
+                        .map(|a| self.expr_shape(a))
+                        .collect::<Result<_, _>>()?;
+                    apply_signature(&mut self.solver, *op, &all_input_shapes)?;
+                    self.locals.insert(targets[0], q_shape);
+                    self.locals.insert(targets[1], k_shape);
+                    Ok(())
+                } else if let Expr::Call { op, args } = value
                     && matches!(op, OpKind::MlaSplit)
                 {
                     // `(kv_latent, k_pe) = mla_split(kv_a)`
@@ -1493,7 +1568,7 @@ impl InferCtx {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append, rope_append_interleaved, and mla_split return a tuple".into(),
+                        reason: "only rope_append, rope_append_interleaved, vision_rope, and mla_split return a tuple".into(),
                     })
                 }
             }
@@ -1912,5 +1987,101 @@ mod tests {
             inf.weights.get(&down_id).unwrap(),
             &vec![bound("intermediate_size"), bound("hidden_size")],
         );
+    }
+
+    // ── Phase G.2 — vision OpKind shape signatures ──────────────
+    //
+    // These tests exercise `apply_signature` directly: the new
+    // OpKinds aren't reachable from `from_name` yet (per the
+    // parse-then-reject rule, the DSL surface lands with G.4 Impls
+    // and G.5 vision-forward bodies in lockstep). Tests pin the
+    // input arity and shape-preserving output.
+
+    #[test]
+    fn varlen_attention_arity_and_output_shape() {
+        let mut solver = Solver::new();
+        // q/k/v all rank-2 [total_L, vision_heads*head_dim]; cu_seqlens
+        // and max_seqlen are externs (empty shape).
+        let qkv_last = canonical_mul(vec![bound("vision_num_heads"), bound("vision_head_dim")]);
+        let q = vec![bound("total_L"), qkv_last.clone()];
+        let k = q.clone();
+        let v = q.clone();
+        let cu_seqlens = vec![];
+        let max_seqlen = vec![];
+        let sig = apply_signature(
+            &mut solver,
+            OpKind::VarlenAttention,
+            &[q.clone(), k, v, cu_seqlens, max_seqlen],
+        )
+        .expect("varlen_attention sig");
+        assert_eq!(sig.output, q, "output preserves q's shape");
+
+        // Wrong arity — must fail with ArgCount, not silently succeed.
+        let mut solver2 = Solver::new();
+        let err = apply_signature(
+            &mut solver2,
+            OpKind::VarlenAttention,
+            std::slice::from_ref(&q),
+        );
+        assert!(matches!(err, Err(ShapeError::ArgCount { .. })));
+    }
+
+    #[test]
+    fn vision_rope_arity_and_output_shape() {
+        let mut solver = Solver::new();
+        let q_last = canonical_mul(vec![bound("vision_num_heads"), bound("vision_head_dim")]);
+        let q = vec![bound("total_L"), q_last.clone()];
+        let k = q.clone();
+        let cos = vec![];
+        let sin = vec![];
+        let sig = apply_signature(&mut solver, OpKind::VisionRope, &[q.clone(), k, cos, sin])
+            .expect("vision_rope sig");
+        // apply_signature returns q's shape as the primary output;
+        // AssignTuple binds the second target separately.
+        assert_eq!(sig.output, q);
+
+        let mut solver2 = Solver::new();
+        let err = apply_signature(&mut solver2, OpKind::VisionRope, &[q]);
+        assert!(matches!(err, Err(ShapeError::ArgCount { .. })));
+    }
+
+    #[test]
+    fn quick_gelu_is_shape_preserving_unary() {
+        let mut solver = Solver::new();
+        let x = vec![bound("total_L"), bound("vision_intermediate_size")];
+        let sig = apply_signature(&mut solver, OpKind::QuickGelu, std::slice::from_ref(&x))
+            .expect("quick_gelu sig");
+        assert_eq!(sig.output, x);
+    }
+
+    #[test]
+    fn gelu_erf_is_shape_preserving_unary() {
+        let mut solver = Solver::new();
+        let x = vec![bound("total_L"), bound("vision_intermediate_size")];
+        let sig = apply_signature(&mut solver, OpKind::GeluErf, std::slice::from_ref(&x))
+            .expect("gelu_erf sig");
+        assert_eq!(sig.output, x);
+    }
+
+    #[test]
+    fn vision_op_names_round_trip_through_as_str() {
+        // OpKind::as_str must be total over every variant; these
+        // are the new names landed in G.2.
+        assert_eq!(OpKind::VarlenAttention.as_str(), "varlen_attention");
+        assert_eq!(OpKind::VisionRope.as_str(), "vision_rope");
+        assert_eq!(OpKind::QuickGelu.as_str(), "quick_gelu");
+        assert_eq!(OpKind::GeluErf.as_str(), "gelu_erf");
+    }
+
+    #[test]
+    fn quick_gelu_and_gelu_erf_are_distinct_from_tanh_gelu() {
+        // Numerics-bearing distinction: the three GELU OpKinds must
+        // be PartialEq-distinct so consumer Impls can match exactly
+        // one of them. (Eq is derived; this test is a structural
+        // promise that future refactors can't accidentally collapse
+        // them onto a single variant.)
+        assert_ne!(OpKind::Gelu, OpKind::QuickGelu);
+        assert_ne!(OpKind::Gelu, OpKind::GeluErf);
+        assert_ne!(OpKind::QuickGelu, OpKind::GeluErf);
     }
 }

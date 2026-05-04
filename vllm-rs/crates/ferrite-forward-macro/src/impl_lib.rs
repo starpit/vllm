@@ -15780,6 +15780,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -15852,6 +15853,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -15946,6 +15948,7 @@ mod tests {
             extra_tracked_paths: Vec::new(),
             rope_scaling: None,
             rope_scaling_hash: None,
+            mrope_section: None,
         };
 
         let imp = SharedFusedMoeRefImpl;

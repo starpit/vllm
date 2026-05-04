@@ -86,11 +86,33 @@ pub enum OpKind {
     /// through the FUF so the solver can match distinct Impls
     /// (dense flash-attn vs. window-masked flash-attn).
     SlidingAttention,
+    /// Variable-length attention used by vision encoders (Qwen2-VL,
+    /// Qwen2.5-VL, ViT-style towers). Same q/k/v shape as `Attention`
+    /// but with a `cu_seqlens` ragged-batch index instead of a paged
+    /// `kv_cache + block_table`, and a `max_seqlen` scalar that the
+    /// kernel uses to size shared-mem tiles. Inputs:
+    /// `(q, k, v, cu_seqlens, max_seqlen)`. Shape-preserving on q.
+    /// Distinct OpKind so vision-side Impls (FlashAttention varlen,
+    /// windowed varlen) match without fighting text-side Attention's
+    /// heads-layout anchoring.
+    VarlenAttention,
     Silu,
-    /// Gaussian-Error Linear Unit. Unary elementwise. Shape-preserving
-    /// like `Silu`; paired with `Mul` in the gate/up fusion of any
-    /// architecture whose MLP is `down(gelu(gate) * up)`.
+    /// Gaussian-Error Linear Unit, tanh approximation:
+    /// `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`.
+    /// Distinct from `GeluErf` and `QuickGelu` — the three differ in
+    /// numerics. Locked to tanh-form by its current consumers (the
+    /// `(Gelu, Mul)` fusion patterns in Gemma2/3 MLPs).
     Gelu,
+    /// Quick-GELU: `x * sigmoid(1.702 * x)`. Used by Qwen2-VL's vision
+    /// MLP and CLIP/ViT-style towers. Unary elementwise, shape-preserving.
+    /// Numerically distinct from `Gelu` (tanh) and `GeluErf` (erf).
+    QuickGelu,
+    /// Erf-form GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`. Used by
+    /// SigLIP, BERT, and other vision/text towers that ship their
+    /// MLP weights calibrated for the exact-erf form. Unary
+    /// elementwise, shape-preserving. Numerically distinct from
+    /// tanh-form `Gelu` and `QuickGelu`.
+    GeluErf,
     /// Tanh-based soft-cap: `y = cap * tanh(x / cap)`. Unary
     /// elementwise with an additional scalar argument; shape-
     /// preserving. Used at logit exit for architectures that cap
@@ -162,6 +184,16 @@ pub enum OpKind {
     /// `from_name` — add an entry there if a future pattern needs
     /// explicit user-written reshape.
     Reshape,
+    /// Vision RoPE pair-rotation: `(q', k') = vision_rope(q, k, cos, sin)`.
+    /// 2-target tuple-returning; both outputs are shape-preserving on
+    /// their respective inputs. Distinct from `RopeAppend` because it
+    /// has no `kv_cache` extern (vision encoders have no KV cache —
+    /// the encoder runs as one-shot prefill) and no `positions`
+    /// extern (vision RoPE indexes off `grid_thw`-derived row/col
+    /// positions baked into `cos`/`sin`). Used by Qwen2-VL and
+    /// Qwen2.5-VL vision towers; expected reuse by future ViT-RoPE
+    /// architectures.
+    VisionRope,
     /// MLA kv_a split: decomposes `[T, kv_lora_rank + qk_rope_head_dim]`
     /// into `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`.
     /// DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`. Tuple-returning;
@@ -227,8 +259,12 @@ impl OpKind {
             Self::RopeAppendInterleaved => "rope_append_interleaved",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
+            Self::VarlenAttention => "varlen_attention",
             Self::Silu => "silu",
             Self::Gelu => "gelu",
+            Self::QuickGelu => "quick_gelu",
+            Self::GeluErf => "gelu_erf",
+            Self::VisionRope => "vision_rope",
             Self::TanhSoftCap => "tanh_softcap",
             Self::Add => "add",
             Self::BiasAdd => "bias_add",

@@ -161,9 +161,15 @@ impl FusedMoELayer {
         let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
 
         let first_w1 = format!("{prefix}.experts.0.w1.weight");
-        let (_, dtype) = gw
+        let (_, disk_dtype) = gw
             .tensor_info(&first_w1)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {first_w1}"))?;
+        // `take_into` casts floating-point sources to the configured
+        // target dtype on the way in. Size + tag the stacked buffer
+        // with the post-cast width — otherwise FP32 checkpoints blow
+        // up the buffer to 2× the right size and feed the fused-MoE
+        // GEMM a wrongly-typed tensor.
+        let dtype = gw.target_dtype().unwrap_or(disk_dtype);
         let elem = dtype.size_bytes();
 
         let w1_bytes = num_experts * 2 * intermediate_size * hidden_size * elem;
@@ -212,7 +218,15 @@ impl FusedMoELayer {
             top_k,
             intermediate_size,
             hidden_size,
-            renormalize: false,
+            // Python vLLM's `MixtralMoE` constructs `FusedMoE(...,
+            // renormalize=True)` (vllm/model_executor/models/mixtral.py
+            // L136). HF transformers' `MixtralSparseMoeBlock.forward`
+            // unconditionally divides by `routing_weights.sum(dim=-1)`.
+            // The hand-written `vllm-cuda::mixtral::load_moe` path has
+            // a latent bug here (`renormalize: false`); ferrite tracks
+            // Python vLLM as the reference per
+            // `feedback_python_vllm_is_the_reference`.
+            renormalize: true,
             e_score_correction_bias: None,
             n_expert_group: 0,
             topk_group: 0,
@@ -394,9 +408,12 @@ impl SharedFusedMoELayer {
         let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
 
         let first_gate = format!("{prefix}.experts.0.gate_proj.weight");
-        let (_, dtype) = gw
+        let (_, disk_dtype) = gw
             .tensor_info(&first_gate)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
+        // Use post-cast dtype for the stacked buffer; see
+        // `FusedMoELayer::load` for the rationale.
+        let dtype = gw.target_dtype().unwrap_or(disk_dtype);
         let elem = dtype.size_bytes();
 
         let inter = moe_intermediate_size;

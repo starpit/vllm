@@ -1542,7 +1542,7 @@ async fn test_cuda_tp2_deepseek_v2_completion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_tp2_mixtral_completion() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .with_tensor_parallel_size(2)
         .start()
         .await
@@ -1875,7 +1875,7 @@ async fn test_cuda_gptq_desc_act_chat() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_mixtral_server_starts() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .start()
         .await
         .expect("CUDA Mixtral MoE server should start");
@@ -1891,7 +1891,7 @@ async fn test_cuda_mixtral_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_mixtral_completion() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .start()
         .await
         .unwrap();
@@ -1911,7 +1911,7 @@ async fn test_cuda_mixtral_completion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_mixtral_chat() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .start()
         .await
         .unwrap();
@@ -2009,7 +2009,7 @@ async fn test_cuda_qwen2_moe_chat() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_moe_graphs_mixtral_completion() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .with_enforce_eager(false)
         .start()
         .await
@@ -2030,7 +2030,7 @@ async fn test_cuda_moe_graphs_mixtral_completion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_moe_graphs_mixtral_chat() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .with_enforce_eager(false)
         .start()
         .await
@@ -2058,7 +2058,7 @@ async fn test_cuda_moe_graphs_mixtral_chat() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_moe_graphs_mixtral_multi_turn() {
-    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+    let server = TestServer::builder(TestModels::MIXTRAL_TINY_DPO_CUDA)
         .with_enforce_eager(false)
         .start()
         .await

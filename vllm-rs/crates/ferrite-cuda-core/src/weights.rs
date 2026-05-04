@@ -802,6 +802,16 @@ impl GpuWeights {
         self.target_dtype = Some(dtype);
     }
 
+    /// Read back the configured target dtype (the same value
+    /// [`Self::take_into`] casts floating-point weights to). `None` when no
+    /// target is configured — in that case the caller should treat the
+    /// on-disk dtype as authoritative. Used by stacked-tensor loaders
+    /// (fused MoE expert stacks) that pre-allocate a single buffer and
+    /// need to size it against the post-cast element width.
+    pub fn target_dtype(&self) -> Option<DType> {
+        self.target_dtype
+    }
+
     /// Start the background pre-cast pipeline.
     ///
     /// Spawns a thread that iterates through all tensors (largest first),

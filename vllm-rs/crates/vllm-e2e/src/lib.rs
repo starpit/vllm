@@ -297,9 +297,20 @@ impl TestModels {
     // equivalence test catches actual math bugs. The full 35B doesn't
     // fit on L4 and Cohere's smaller official checkpoints are gated.
     pub const COMMAND_R_1L_CUDA: &str = "Citaman/command-r-1-layer";
-    // MoE models for CUDA — safetensors BF16
-    // Mixtral: ~0.8B total params (~1.5GB BF16), MixtralForCausalLM
-    pub const MIXTRAL_SMALL_CUDA: &str = "if001/small_mixtral_ja_llm_jp_tk";
+    // MoE models for CUDA — safetensors BF16.
+    //
+    // Mixtral 8x248M DPO-tuned — `MixtralForCausalLM` (BF16, 8 experts,
+    // top-2, 12 layers, hidden=1024, intermediate=4096, ~2B total
+    // params, ~4GB BF16). Real DPO-tuned chat fine-tune (oasst2 +
+    // Intel orca DPO pairs) → produces coherent English on simple
+    // prompts. The Mixtral-arch checkpoint that fits L4 AND produces
+    // coherent output AND ships its own tokenizer. (An earlier
+    // `if001/small_mixtral_ja_llm_jp_tk` 0.8B checkpoint was used
+    // until 2026-05-04; dropped because it ships FP32 weights with no
+    // tokenizer and its near-uniform output flips argmax across
+    // independent server processes — unsuitable for golden parity.)
+    pub const MIXTRAL_TINY_DPO_CUDA: &str =
+        "NickyNicky/Mixtral-TinyMistral-8x248M-Instruct_oasst2_chatML_Intel_orca_dpo_pairs_DPO_V1";
     // Qwen2 MoE: ~14.3B total params (~29GB BF16), Qwen2MoeForCausalLM — fits on L40S (48GB)
     pub const QWEN2_MOE_A2_7B_CUDA: &str = "Qwen/Qwen1.5-MoE-A2.7B-Chat";
 

@@ -212,6 +212,15 @@ MODELS = {
     # Phi-4-mini-reasoning — GQA 24/8, partial=0.75, longrope, tied
     # (identical shape to Phi-4-mini-instruct). Fits on L4.
     "phi4_mini_reasoning": "microsoft/Phi-4-mini-reasoning",
+    # Mixtral 8x248M DPO-tuned — `MixtralForCausalLM` (BF16, 8 experts,
+    # top-2, 12 layers, ~2B params). Real DPO-tuned chat fine-tune that
+    # produces coherent English. Single-rank coherence golden for the
+    # new ferrite-model-mixtral arch.
+    "mixtral_tiny_dpo": "NickyNicky/Mixtral-TinyMistral-8x248M-Instruct_oasst2_chatML_Intel_orca_dpo_pairs_DPO_V1",
+    # Qwen3-MoE 3B — `Qwen3MoeForCausalLM` (per-head q/k norm + fused MoE
+    # block, no shared expert in the Instruct-style configs). Single-rank
+    # coherence golden for the new ferrite-model-qwen3-moe arch.
+    "qwen3_moe_3b": "TroyDoesAI/Qwen3-MoE-3B",
 }
 
 MAX_TOKENS = 32

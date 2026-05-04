@@ -12,7 +12,7 @@
 
 3. **First-20-token byte-match vs Python vLLM (Qwen2-VL).** Currently diverges at token 3 on a synthetic gradient input — both responses are coherent and correctly identify the gradient. Three-way diff an earlier session **clears the encoder** (ferrite-vs-pyvllm cosine ≥ pyvllm-vs-HF at every block; patch_embed bit-exact; merger 0.993 vs 0.971). Residual = sub-bf16-eps logit drift flipping argmax. Not a wiring bug — only chase if byte-exact is a hard requirement.
 
-4. **Phase G — Gemma3-MM / SigLIP** (own crate, `ferrite-model-gemma3-mm`). First SigLIP integration — third concrete consumer that justifies factoring shared ViT building blocks (LN/varlen-attn/MLP/projector wrappers) out of `ferrite-model-qwen2-vl` and `ferrite-model-qwen2-5-vl` into a `ferrite-vision` shared module. Plug-in surface is `MultimodalForward` + `inventory::submit!`. Non-ferrite touch budget = 0 (per Phase F's precedent).
+4. **Phase G — vision DSL + Gemma3-MM / SigLIP.** See `VISION_DSL_HANDOFF.md` for the full plan. Short version: each MM arch grows a second backbone alongside its `#[forward]` text body — a `#[vision_forward]` DSL function for the encoder — composed at runtime by the existing `MmEmbedSplice` op. Sequencing: G.1 extracts a `ferrite-vision` host-glue crate; G.2 adds `VarlenAttention` / `VisionRope` / `QuickGelu` / `GeluErf` OpKinds; G.3 adds the `#[vision_forward]` attr macro (same FUF/solver/codegen pipeline downstream); G.5/G.6 port Qwen2-VL and Qwen2.5-VL; G.7 lands SigLIP/Gemma3-MM as the ~30-line third arch that proves the cut. Non-ferrite touch budget = 0 (per Phase F's precedent). Earlier framing of Phase G as an imperative `ferrite-vision` shared module is superseded.
 
 ## How to verify nothing regressed
 

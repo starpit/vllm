@@ -34,6 +34,8 @@ pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
 #[cfg(feature = "cuda")]
+pub mod dump;
+#[cfg(feature = "cuda")]
 pub mod gguf_loader;
 #[cfg(feature = "cuda")]
 pub mod weights;

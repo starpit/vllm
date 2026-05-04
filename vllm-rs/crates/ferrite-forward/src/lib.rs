@@ -11,7 +11,7 @@ pub use ferrite_forward_macro::forward;
 pub mod attack_surface;
 pub mod cpu_golden;
 #[cfg(feature = "cuda")]
-pub mod dump;
+pub use ferrite_cuda_core::dump;
 #[cfg(feature = "cuda")]
 pub mod info;
 #[cfg(feature = "cuda")]

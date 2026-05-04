@@ -16,10 +16,10 @@
 //! See `QWEN3_NEXT_HANDOFF.md` (2026-05-04 Phase-6c entries) for the
 //! procedure and prior diagnostic state.
 
-use cudarc::driver::sys::CUstream;
-use ferrite_cuda_core::driver;
-use ferrite_cuda_core::dtype::DType;
-use ferrite_cuda_core::tensor::GpuTensor;
+use crate::CUstream;
+use crate::driver;
+use crate::dtype::DType;
+use crate::tensor::GpuTensor;
 use std::sync::OnceLock;
 
 const SAMPLE_N: usize = 8;

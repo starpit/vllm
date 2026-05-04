@@ -171,9 +171,8 @@ impl Qwen3NextGatedAttentionLayer {
             // the same as the loader's target dtype. Read it back via the
             // post-load device tensor.
             let post_dtype = gw.target_dtype().unwrap_or(q_dtype);
-            let qkv_w = unsafe {
-                GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden_size], post_dtype)
-            };
+            let qkv_w =
+                unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden_size], post_dtype) };
             let q_bias_name = format!("{prefix}.q_proj.bias");
             let qkv_bias = if gw.contains(&q_bias_name) {
                 // Fuse biases the same way; q's bias is q_size, k/v's are kv_size.
@@ -204,9 +203,7 @@ impl Qwen3NextGatedAttentionLayer {
                         stream,
                     )?;
                 }
-                Some(unsafe {
-                    GpuTensor::new(bias_ptr, &[q_size + 2 * kv_size], bias_dtype)
-                })
+                Some(unsafe { GpuTensor::new(bias_ptr, &[q_size + 2 * kv_size], bias_dtype) })
             } else {
                 None
             };

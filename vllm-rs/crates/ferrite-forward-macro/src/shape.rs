@@ -370,6 +370,7 @@ pub fn apply_signature(
         // LayerNorm has identical shape constraints to RmsNorm —
         // `(x: [..., H], w: [H]) -> [..., H]`. Same signature reused.
         OpKind::LayerNorm => sig_rmsnorm(solver, inputs),
+        OpKind::LayerNormBias => sig_layer_norm_bias(solver, inputs),
         OpKind::Gemm => sig_gemm(solver, inputs),
         OpKind::RopeAppend => sig_rope_append(solver, inputs),
         // Same q/k/v constraints as `rope_append`; the distinction is
@@ -501,6 +502,17 @@ fn sig_rmsnorm(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeErro
     }
     solver.unify(x.last().unwrap(), &w[0])?;
     Ok(OpSig { output: x.clone() })
+}
+
+/// `layer_norm_bias(x: [..., H], norm: [H])` → `[..., H]`. Standard
+/// PyTorch `nn.LayerNorm`. The `norm` arg is a single weight ref;
+/// the runtime loader (`LayerNormBias::load`) reads both
+/// `<prefix>.weight` and `<prefix>.bias` from the safetensors file
+/// into one wrapper struct (mirror of `CohereLayerNorm` / `RmsNorm`,
+/// which carry one tensor + scalar eps under one weight ref).
+fn sig_layer_norm_bias(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::LayerNormBias, inputs, 2)?;
+    sig_rmsnorm(solver, inputs)
 }
 
 /// `bias_add(x: [..., D], b: [D])` → `[..., D]`. Same shape math as
@@ -790,6 +802,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Embed => &[(1, 2)],
         OpKind::RmsNorm => &[(1, 1)],
         OpKind::LayerNorm => &[(1, 1)],
+        // Single weight ref (the `LayerNormBias` struct wraps both
+        // weight and bias internally).
+        OpKind::LayerNormBias => &[(1, 1)],
         OpKind::Gemm => &[(1, 2)],
         OpKind::RopeAppend => &[],
         OpKind::RopeAppendInterleaved => &[],

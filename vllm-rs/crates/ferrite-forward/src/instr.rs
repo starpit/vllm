@@ -34,7 +34,8 @@ use ferrite_kernels::cutlass;
 use ferrite_kernels::flashinfer;
 use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{
-    Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, LinearLayer, MarlinLinear, RmsNorm,
+    Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, LayerNormBias, LinearLayer,
+    MarlinLinear, RmsNorm,
 };
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
@@ -118,6 +119,9 @@ pub enum Instruction<W> {
     Embed(u32, WtFn<W, Embedding>),
     RmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
     LayerNorm(u32, u32, u32, WtFn<W, CohereLayerNorm>),
+    /// `LayerNormBias(in_slot, out_slot, layer, weight_fn)`. Standard
+    /// PyTorch `nn.LayerNorm` (gamma + beta + eps).
+    LayerNormBias(u32, u32, u32, WtFn<W, LayerNormBias>),
     /// `Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim)`.
     /// Output axis i is computed as
     /// `(dims_lit[i] * num_tokens^dims_nt_pow[i]) / dims_div_lit[i]`.
@@ -549,9 +553,29 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
+            Instruction::LayerNormBias(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                let w = (weight_fn)(ctx.wm, layer);
+                let out = kernels::layer_norm_bias(
+                    *v,
+                    w.weight,
+                    w.bias,
+                    w.eps,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
             Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
                 let upstream = tile_ref(ctx.tiles, in_slot).as_gpu_tensor(ctx.tiles);
-                let nt = (*ctx.fwd.input_ids).dim(0);
+                // `num_tokens` source: vision bodies set `pixels`
+                // (and the input_ids ForwardCtx field is unused); the
+                // decoder path keys off `input_ids`.
+                let nt = match ctx.fwd.pixels {
+                    Some(p) => (*p).dim(0),
+                    None => (*ctx.fwd.input_ids).dim(0),
+                };
                 let mut shape = [0usize; MAX_DIMS];
                 let nd = ndim as usize;
                 for i in 0..nd {

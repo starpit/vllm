@@ -152,6 +152,15 @@ pub enum OpKind {
     /// Distinct math from `RmsNorm` (which omits the mean subtraction).
     /// Used by Cohere's CommandR family.
     LayerNorm,
+    /// Standard PyTorch `nn.LayerNorm` with both affine weight AND
+    /// bias: `y = w * (x - mean(x)) / sqrt(var(x) + eps) + b`. Single
+    /// math primitive (one paper op, two affine params), distinct
+    /// from bias-free `LayerNorm` because the kernel signature
+    /// genuinely differs (one extra tensor argument). Used by every
+    /// CLIP/ViT-style vision tower (Qwen2-VL, Qwen2.5-VL, SigLIP,
+    /// BERT, …) where the layer-norm sites carry both gamma and
+    /// beta. Args: `(x, weight, bias)`.
+    LayerNormBias,
     Gemm,
     RopeAppend,
     /// RoPE that pairs adjacent elements `(2i, 2i+1)` for rotation
@@ -328,6 +337,7 @@ impl OpKind {
             "embed" => Some(Self::Embed),
             "rmsnorm" => Some(Self::RmsNorm),
             "layer_norm" => Some(Self::LayerNorm),
+            "layer_norm_bias" => Some(Self::LayerNormBias),
             "gemm" => Some(Self::Gemm),
             "rope_append" => Some(Self::RopeAppend),
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
@@ -366,6 +376,7 @@ impl OpKind {
             Self::Embed => "embed",
             Self::RmsNorm => "rmsnorm",
             Self::LayerNorm => "layer_norm",
+            Self::LayerNormBias => "layer_norm_bias",
             Self::Gemm => "gemm",
             Self::RopeAppend => "rope_append",
             Self::RopeAppendInterleaved => "rope_append_interleaved",
@@ -404,7 +415,7 @@ impl OpKind {
 }
 
 /// A classified DSL program.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Program {
     pub statements: Vec<Stmt>,
     /// Ident for each LocalId (for diagnostics and codegen only).
@@ -425,6 +436,12 @@ pub struct Program {
     /// records the target shape here; the second inference pass
     /// reads this map to typecheck the synthesized statement.
     pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::shape::Dim>>,
+    /// Prelude this program was classified under. `Decoder` for
+    /// text-side `#[forward]`, `Vision` for `#[vision_forward]`.
+    /// Threaded into codegen for prelude-specific decisions —
+    /// safetensors prefix conventions (`model.layers.<L>.<x>` vs
+    /// `visual.blocks.<L>.<x>`), reshape `nt` source, etc.
+    pub prelude: Prelude,
 }
 
 /// Side table: `LocalId` → debug ident.

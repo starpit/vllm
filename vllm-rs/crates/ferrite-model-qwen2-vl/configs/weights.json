@@ -1,41 +1,22 @@
 {
-  "patch_embed.proj": [
-    "vision_embed_dim",
-    "vision_in_features"
-  ],
+  "__packed_splits__": {
+    "attn.qkv": ["attn.q", "attn.k", "attn.v"]
+  },
 
-  "norm1": [
-    "vision_embed_dim"
-  ],
-  "norm2": [
-    "vision_embed_dim"
-  ],
-  "attn.qkv": [
-    "3 * vision_embed_dim",
-    "vision_embed_dim"
-  ],
-  "attn.proj": [
-    "vision_embed_dim",
-    "vision_embed_dim"
-  ],
-  "mlp.fc1": [
-    "vision_mlp_hidden",
-    "vision_embed_dim"
-  ],
-  "mlp.fc2": [
-    "vision_embed_dim",
-    "vision_mlp_hidden"
-  ],
+  "patch_embed.proj": ["vision_in_features", "vision_embed_dim"],
 
-  "merger.ln_q": [
-    "vision_embed_dim"
-  ],
-  "merger.mlp.0": [
-    "vision_merge_hidden",
-    "vision_merge_hidden"
-  ],
-  "merger.mlp.2": [
-    "d_model",
-    "vision_merge_hidden"
-  ]
+  "norm1": ["vision_embed_dim"],
+  "norm2": ["vision_embed_dim"],
+
+  "attn.q": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.k": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.v": ["vision_embed_dim", "vision_embed_dim"],
+  "attn.proj": ["vision_embed_dim", "vision_embed_dim"],
+
+  "mlp.fc1": ["vision_embed_dim", "vision_mlp_hidden"],
+  "mlp.fc2": ["vision_mlp_hidden", "vision_embed_dim"],
+
+  "merger.ln_q": ["vision_embed_dim"],
+  "merger.mlp_0": ["vision_merge_hidden", "vision_merge_hidden"],
+  "merger.mlp_2": ["vision_merge_hidden", "d_model"]
 }

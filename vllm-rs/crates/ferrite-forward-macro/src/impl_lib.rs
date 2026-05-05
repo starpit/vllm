@@ -443,6 +443,8 @@ pub fn rust_type_for_weight_consumed_by(op: OpKind) -> TokenStream {
         // Cohere-flavored full LayerNorm (weight only, no bias). The
         // `eps` rides on the wrapper struct, same shape as RmsNorm.
         OpKind::LayerNorm => quote! { ::ferrite_kernels::layers::CohereLayerNorm },
+        // Standard PyTorch nn.LayerNorm (weight + bias + eps).
+        OpKind::LayerNormBias => quote! { ::ferrite_kernels::layers::LayerNormBias },
         OpKind::Gemm => quote! { ::ferrite_kernels::layers::LinearLayer },
         // Ops that don't consume weights in the DSL's typical
         // patterns. If the DSL routes a weight into one of these
@@ -1499,6 +1501,109 @@ impl Implementation for LayerNormRefImpl {
     }
 }
 
+/// HostCallback impl for `OpKind::LayerNormBias` — standard PyTorch
+/// `nn.LayerNorm` (weight + bias). Mirror of [`LayerNormRefImpl`]
+/// with one extra weight (`LayerNormBias` carries both `weight` and
+/// `bias` internally; the accessor returns the wrapper struct).
+#[derive(Debug, Default)]
+pub struct LayerNormBiasImpl;
+
+impl Implementation for LayerNormBiasImpl {
+    fn name(&self) -> &'static str {
+        "layer_norm_bias"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::LayerNormBias)
+    }
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "LayerNormBias",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers::LayerNormBias
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "LayerNormBias: first input must be a Tile (got {other:?}); \
+                 the FUF tile shape doesn't match what fan_out expects"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("LayerNormBias: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("LayerNormBias", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
 /// Reference HostCallback impl for `OpKind::Gemm`. Hand-written
 /// (parallel to [`RmsNormRefImpl`]) to expose the host-interpreter
 /// `opcode_shape` / `fan_out` overrides. Bias
@@ -1895,6 +2000,7 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     lib.push(Box::new(LayerNormRefImpl));
+    lib.push(Box::new(LayerNormBiasImpl));
     // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
     // expansion time (i.e. when `forward!` runs during a build) drops
     // every cuBLAS-routing Impl from the library, forcing dispatch
@@ -15821,6 +15927,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
@@ -15895,6 +16002,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -15990,6 +16098,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {

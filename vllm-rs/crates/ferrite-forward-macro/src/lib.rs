@@ -842,6 +842,11 @@ fn compile_common(
                 // emits a single D2D copy that wraps `ctx.fwd.pixels`
                 // into a tile-table OwnedTensor. Not a compute kernel.
                 "load_pixels",
+                // Vision-side LayerNormBias (G.5.f) + varlen attention
+                // + vision rope. Shape-preserving non-gemm primitives.
+                "layer_norm_bias",
+                "varlen_attention",
+                "vision_rope",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =

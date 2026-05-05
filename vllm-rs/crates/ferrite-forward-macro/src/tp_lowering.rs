@@ -355,6 +355,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         }
     }
 
@@ -716,6 +717,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
         let original_count = fuf.nodes.len();
 
@@ -798,6 +800,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
         let original_count = fuf.nodes.len();
         insert_lm_head_allgather(&mut fuf, &program, 1);
@@ -837,6 +840,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
         let original_count = fuf.nodes.len();
         insert_lm_head_allgather(&mut fuf, &program, 4);
@@ -904,6 +908,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let original_count = fuf.nodes.len();
@@ -968,6 +973,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
         let original_count = fuf.nodes.len();
         insert_all_reduces(&mut fuf, &program, 4);
@@ -1044,6 +1050,7 @@ mod tests {
             locals: Default::default(),
             weights,
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let original_count = fuf.nodes.len();

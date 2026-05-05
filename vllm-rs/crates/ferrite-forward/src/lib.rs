@@ -32,9 +32,10 @@ pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_cohere_layer_norm,
     load_layered_embedding, load_layered_embedding_sharded, load_layered_fp8_block_linear,
     load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
-    load_layered_linear_dense, load_layered_linear_dense_concat,
+    load_layered_layer_norm_bias, load_layered_linear_dense, load_layered_linear_dense_concat,
     load_layered_linear_dense_concat_sharded, load_layered_linear_dense_sharded,
-    load_layered_marlin_linear, load_layered_marlin_linear_concat, load_layered_rms_norm,
+    load_layered_linear_dense_vision, load_layered_marlin_linear,
+    load_layered_marlin_linear_concat, load_layered_rms_norm,
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
@@ -131,6 +132,15 @@ pub fn trace_enabled() -> bool {
 #[inline]
 pub fn layer_weight_path(layer: u32, suffix: &str) -> String {
     format!("model.layers.{layer}.{suffix}")
+}
+
+/// Vision-tower analogue: `visual.blocks.<layer>.<suffix>`. Used by
+/// the `load_layered_*` helpers when the codegen emits a
+/// `#[vision_forward]` body — the per-block prefix differs from the
+/// decoder's `model.layers.<L>.` convention.
+#[inline]
+pub fn vision_block_weight_path(layer: u32, suffix: &str) -> String {
+    format!("visual.blocks.{layer}.{suffix}")
 }
 
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`

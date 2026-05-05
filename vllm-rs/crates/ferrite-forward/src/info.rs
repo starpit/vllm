@@ -127,6 +127,15 @@ impl<W> Instruction<W> {
                     F::LayerKind("CohereLayerNorm"),
                 ],
             ),
+            Instruction::LayerNormBias(in_slot, out_slot, layer, _wf) => (
+                "LayerNormBias",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LayerNormBias"),
+                ],
+            ),
             Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
                 let n = ndim as usize;
                 (

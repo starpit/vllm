@@ -22,11 +22,11 @@ use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, CohereLayerNorm, Embedding, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear,
-    LinearLayer, MarlinLinear, RmsNorm,
+    LayerNormBias, LinearLayer, MarlinLinear, RmsNorm,
 };
 use ferrite_kernels::layers_quant::MarlinFormat;
 
-use crate::layer_weight_path;
+use crate::{layer_weight_path, vision_block_weight_path};
 
 /// Build a `Vec<&str>` of fully-qualified weight paths for a
 /// concat-style accessor at one specific layer. The returned `paths`
@@ -94,6 +94,30 @@ pub fn load_layered_cohere_layer_norm(
 ) -> Result<Vec<CohereLayerNorm>> {
     (0..n_layers)
         .map(|layer| CohereLayerNorm::load(gw, &layer_weight_path(layer, suffix), eps))
+        .collect()
+}
+
+pub fn load_layered_layer_norm_bias(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffix: &str,
+    eps: f32,
+) -> Result<Vec<LayerNormBias>> {
+    (0..n_layers)
+        .map(|layer| LayerNormBias::load(gw, &vision_block_weight_path(layer, suffix), eps))
+        .collect()
+}
+
+/// Vision-tower analogue of [`load_layered_linear_dense`]:
+/// `visual.blocks.<L>.<suffix>` per-block prefix instead of
+/// `model.layers.<L>.<suffix>`.
+pub fn load_layered_linear_dense_vision(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffix: &str,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| LinearLayer::load_dense(gw, &vision_block_weight_path(layer, suffix)))
         .collect()
 }
 

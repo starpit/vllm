@@ -58,13 +58,41 @@ use crate::solver::WorkloadAssignments;
 /// `model.` prefix) can override via a future per-arch conventions
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(program: &Program, id: WeightId, index: Option<u64>) -> String {
-    let joined = program.weights.path(id).join(".");
-    match (index, joined.as_str()) {
-        (_, "lm_head") => "lm_head".to_string(),
+    // DSL idents can't start with a digit, so paths like
+    // `merger.mlp.0` are written `merger.mlp_0` in the body /
+    // manifest; translate `_<digit>` suffixes back to `.<digit>`
+    // for the on-disk safetensors key (which uses Python-attribute
+    // dotted form, including numeric submodule indices).
+    let joined: String = program
+        .weights
+        .path(id)
+        .iter()
+        .map(|seg| translate_digit_suffix(seg))
+        .collect::<Vec<_>>()
+        .join(".");
+    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
+    match (is_vision, index, joined.as_str()) {
+        (true, Some(l), _) => format!("visual.blocks.{l}.{joined}"),
+        (true, None, _) => format!("visual.{joined}"),
+        (false, _, "lm_head") => "lm_head".to_string(),
         // DeepSeek: the `moe` DSL name maps to `mlp` in HF safetensors.
-        (Some(l), "moe") => format!("model.layers.{l}.mlp"),
-        (Some(l), _) => format!("model.layers.{l}.{joined}"),
-        (None, _) => format!("model.{joined}"),
+        (false, Some(l), "moe") => format!("model.layers.{l}.mlp"),
+        (false, Some(l), _) => format!("model.layers.{l}.{joined}"),
+        (false, None, _) => format!("model.{joined}"),
+    }
+}
+
+/// Translate trailing `_<digits>` in a DSL path segment back to
+/// `.<digits>` so safetensors keys like `mlp.0` round-trip through
+/// the DSL's ident-only path syntax.
+fn translate_digit_suffix(seg: &str) -> String {
+    if let Some(idx) = seg.rfind('_')
+        && idx + 1 < seg.len()
+        && seg[idx + 1..].chars().all(|c| c.is_ascii_digit())
+    {
+        format!("{}.{}", &seg[..idx], &seg[idx + 1..])
+    } else {
+        seg.to_string()
     }
 }
 
@@ -82,6 +110,11 @@ enum FieldLoad {
     /// `rms_norm_eps`. Used for arches whose pre-attention norm is
     /// a full LayerNorm with weight only (Cohere's CommandR family).
     CohereLayerNorm(String, f32),
+    /// `LayerNormBias::load(gw, prefix, eps)`. Standard PyTorch
+    /// `nn.LayerNorm` — weight + bias + eps. Used by every CLIP/ViT-
+    /// style vision tower (qwen2-vl norm1 / norm2 / merger.ln_q).
+    /// Eps source is the `vision_norm_eps` config field.
+    LayerNormBias(String, f32),
     /// `LinearLayer::load_dense(gw, prefix)`.
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
@@ -384,6 +417,9 @@ fn plan_field_load(
     let is_cohere_layer_norm = ty.ends_with("::CohereLayerNorm")
         || ty == "CohereLayerNorm"
         || ty.ends_with("layers::CohereLayerNorm");
+    let is_layer_norm_bias = ty.ends_with("::LayerNormBias")
+        || ty == "LayerNormBias"
+        || ty.ends_with("layers::LayerNormBias");
     let is_linear =
         ty.ends_with("::LinearLayer") || ty == "LinearLayer" || ty.ends_with("layers::LinearLayer");
     let is_marlin = ty.ends_with("::MarlinLinear")
@@ -905,6 +941,16 @@ fn plan_field_load(
         );
         let eps = layer_norm_eps(model);
         FieldLoad::CohereLayerNorm(prefixes.into_iter().next().unwrap(), eps)
+    } else if is_layer_norm_bias {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "LayerNormBias accessor `{}` with {} sources",
+            accessor.name,
+            prefixes.len()
+        );
+        let eps = vision_norm_eps(model);
+        FieldLoad::LayerNormBias(prefixes.into_iter().next().unwrap(), eps)
     } else if is_linear {
         // Tied-embedding special case: if this accessor is the
         // `lm_head` and the model's config.json has
@@ -957,6 +1003,18 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
     v.get("rms_norm_eps")
         .and_then(|x| x.as_f64())
         .map(|x| x as f32)
+        .unwrap_or(fallback)
+}
+
+fn vision_norm_eps(model: &ModelParams) -> f32 {
+    // Vision configs (qwen2-vl, qwen2.5-vl, siglip, …) carry
+    // `vision_norm_eps` in `scalars` (auto-extracted as f64 by the
+    // config loader). Default mirrors PyTorch's `nn.LayerNorm`.
+    let fallback: f32 = 1e-5;
+    model
+        .scalars
+        .get("vision_norm_eps")
+        .map(|v| *v as f32)
         .unwrap_or(fallback)
 }
 
@@ -1776,9 +1834,10 @@ fn emit_weights_struct(
         .map(|(a, p)| (a.name.to_string(), p))
         .collect();
 
+    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     let lets: Vec<TokenStream> = groups
         .iter()
-        .map(|g| emit_group_let(g, &plan_by_name, model, tp_world_size))
+        .map(|g| emit_group_let(g, &plan_by_name, model, tp_world_size, is_vision))
         .collect();
 
     // Shared-per-model Marlin prelude: one workspace allocation
@@ -1867,13 +1926,27 @@ fn emit_weights_struct(
     // `model.bounds`. The helper is a no-op when the packed parent
     // isn't present, so models without packed checkpoints are unaffected
     // even if they share the manifest (none do today).
+    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     let packed_splits_prelude: TokenStream = if manifest.packed_splits.is_empty() {
         quote! {}
     } else {
-        let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
+        // Vision configs carry `vision_depth` instead of
+        // `num_hidden_layers`; the per-block prefix is
+        // `visual.blocks.<L>.` instead of `model.layers.<L>.`.
+        let layer_count_key = if is_vision {
+            "vision_depth"
+        } else {
+            "num_hidden_layers"
+        };
+        let block_prefix_template = if is_vision {
+            "visual.blocks"
+        } else {
+            "model.layers"
+        };
+        let num_hidden_layers = *model.bounds.get(layer_count_key).unwrap_or_else(|| {
             panic!(
-                "model `{}` has `__packed_splits__` but no `num_hidden_layers` bound",
-                model.source_stem,
+                "model `{}` has `__packed_splits__` but no `{}` bound",
+                model.source_stem, layer_count_key,
             )
         }) as usize;
         let mut calls: Vec<TokenStream> = Vec::new();
@@ -1929,7 +2002,9 @@ fn emit_weights_struct(
             let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
             calls.push(quote! {
                 for __l in 0..#num_hidden_layers {
-                    let __pp = ::std::format!("model.layers.{}.{}", __l, #packed_prefix);
+                    let __pp = ::std::format!(
+                        concat!(#block_prefix_template, ".{}.{}"), __l, #packed_prefix,
+                    );
                     // `_tp` variant handles the GGUF quantized parent at
                     // tp > 1 — fused `attn_qkv` / `ffn_up` are
                     // replicated on every rank by the GGUF loader's
@@ -2676,14 +2751,17 @@ fn layer_templated_prefix_expr(layer0_prefix: &str) -> TokenStream {
 /// mismatch surfaces a `default_required_weights` bug instead of
 /// silently emitting a malformed helper call.
 fn layered_suffix(layer0_prefix: &str) -> &str {
-    layer0_prefix
-        .strip_prefix("model.layers.0.")
-        .unwrap_or_else(|| {
-            panic!(
-                "layered accessor's L=0 prefix `{layer0_prefix}` doesn't \
-                 start with `model.layers.0.` — codegen invariant violated"
-            )
-        })
+    if let Some(s) = layer0_prefix.strip_prefix("model.layers.0.") {
+        return s;
+    }
+    if let Some(s) = layer0_prefix.strip_prefix("visual.blocks.0.") {
+        return s;
+    }
+    panic!(
+        "layered accessor's L=0 prefix `{layer0_prefix}` doesn't \
+         start with `model.layers.0.` or `visual.blocks.0.` — codegen \
+         invariant violated"
+    )
 }
 
 /// Emit the unindexed accessor's let-binding (kept as the
@@ -2719,6 +2797,11 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
         },
         FieldLoad::CohereLayerNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::CohereLayerNorm::load(
+                gw, #prefix, #eps,
+            )?;
+        },
+        FieldLoad::LayerNormBias(prefix, eps) => quote! {
+            let #name = ::ferrite_kernels::layers::LayerNormBias::load(
                 gw, #prefix, #eps,
             )?;
         },
@@ -3109,6 +3192,7 @@ fn emit_group_let(
     plans: &std::collections::BTreeMap<String, &FieldLoad>,
     model: &ModelParams,
     tp_world_size: u8,
+    is_vision: bool,
 ) -> TokenStream {
     match group.kind {
         AccessorGroupKind::Unindexed => {
@@ -3157,7 +3241,7 @@ fn emit_group_let(
             // `entries.len()`, and the static-slice rows only ever
             // index 0..n_layers, so partial coverage is fine.
             let n_layers = group.entries.len() as u32;
-            let call = emit_layered_load_body(plan, n_layers, tp_world_size);
+            let call = emit_layered_load_body(plan, n_layers, tp_world_size, is_vision);
             let _ = model;
             quote! {
                 let #base_ident = #call;
@@ -3178,7 +3262,12 @@ fn emit_group_let(
 /// `DeepSeekV2Moe` falls through to a layered-MoE helper still
 /// emitted inline (only DeepSeek arches use it; not worth a helper
 /// crossing the ferrite-forward / ferrite-kernels seam).
-fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) -> TokenStream {
+fn emit_layered_load_body(
+    plan: &FieldLoad,
+    n_layers: u32,
+    tp_world_size: u8,
+    is_vision: bool,
+) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
     let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
@@ -3216,21 +3305,30 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                 ::ferrite_forward::load_layered_cohere_layer_norm(gw, #n_lit, #suffix, #eps)?
             }
         }
+        FieldLoad::LayerNormBias(prefix, eps) => {
+            let suffix = layered_suffix(prefix);
+            quote! {
+                ::ferrite_forward::load_layered_layer_norm_bias(gw, #n_lit, #suffix, #eps)?
+            }
+        }
         FieldLoad::LinearDense(prefix) => {
             let suffix = layered_suffix(prefix);
             let kind = shard_kind_for_dotted_prefix(prefix);
-            match (sharded, kind) {
-                (true, ShardKind::ShardDim0) => quote! {
+            match (sharded, kind, is_vision) {
+                (true, ShardKind::ShardDim0, _) => quote! {
                     ::ferrite_forward::load_layered_linear_dense_sharded(
                         gw, #n_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit as usize,
                     )?
                 },
-                (true, ShardKind::ShardDim1) => quote! {
+                (true, ShardKind::ShardDim1, _) => quote! {
                     ::ferrite_forward::load_layered_linear_dense_sharded(
                         gw, #n_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit as usize,
                     )?
                 },
-                _ => quote! {
+                (_, _, true) => quote! {
+                    ::ferrite_forward::load_layered_linear_dense_vision(gw, #n_lit, #suffix)?
+                },
+                (_, _, false) => quote! {
                     ::ferrite_forward::load_layered_linear_dense(gw, #n_lit, #suffix)?
                 },
             }

@@ -60,6 +60,7 @@ pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program
         locals: cx.locals,
         weights: cx.weights,
         reshape_targets: cx.reshape_targets,
+        prelude,
     })
 }
 

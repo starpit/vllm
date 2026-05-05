@@ -16,9 +16,25 @@ use crate::classified::{
     BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
     WeightTable,
 };
-use crate::shape::Dim;
+use crate::shape::{Dim, canonical_mul};
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
+
+/// Convert a parser-produced [`ast::DimSpec`] into a [`Dim`]. `Lit` /
+/// `Bound` map directly; `Mul` flattens into [`Dim::Mul`] via
+/// `canonical_mul` (matching the form `apply_reshape_hints` produces);
+/// `Div` becomes [`Dim::Div`] — kept symbolic until codegen folds the
+/// numerator + closes the denominator against the per-model `bounds`.
+fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
+    match s {
+        ast::DimSpec::Lit(n) => Dim::Lit(*n),
+        ast::DimSpec::Bound(ident) => Dim::Bound(ident.to_string()),
+        ast::DimSpec::Mul(a, b) => canonical_mul(vec![dimspec_to_dim(a), dimspec_to_dim(b)]),
+        ast::DimSpec::Div(num, den) => {
+            Dim::Div(Box::new(dimspec_to_dim(num)), Box::new(dimspec_to_dim(den)))
+        }
+    }
+}
 
 /// Classify the AST against the decoder prelude. Convenience entry
 /// point used by unit tests in adjacent modules; production code in
@@ -90,13 +106,7 @@ impl Ctx {
                 {
                     let source = self.classify_expr(source)?;
                     let id = self.bind(target.clone());
-                    let dims: Vec<Dim> = target_shape
-                        .iter()
-                        .map(|s| match s {
-                            ast::DimSpec::Lit(n) => Dim::Lit(*n),
-                            ast::DimSpec::Bound(ident) => Dim::Bound(ident.to_string()),
-                        })
-                        .collect();
+                    let dims: Vec<Dim> = target_shape.iter().map(dimspec_to_dim).collect();
                     self.reshape_targets.insert(id, dims);
                     return Ok(Stmt::Assign {
                         target: id,
@@ -993,6 +1003,54 @@ mod tests {
         let dims = p.reshape_targets.get(&target).unwrap();
         assert!(matches!(dims[0], Dim::Bound(ref n) if n == "num_tokens"));
         assert!(matches!(dims[1], Dim::Lit(1280)));
+    }
+
+    #[test]
+    fn dsl_authored_reshape_records_arithmetic_dims() {
+        // G.5.f.a — reshape DimSpec arithmetic. The merger reshape
+        // wants `[num_tokens / vision_merge_factor, vision_merge_hidden]`;
+        // a multiplicative form `[num_tokens, vision_embed_dim *
+        // vision_merge_factor]` must round-trip too.
+        let p = classify_vision_src(
+            "y = reshape(pixels, [num_tokens / vision_merge_factor, vision_merge_hidden]);",
+        );
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p.reshape_targets.get(&target).unwrap();
+        match &dims[0] {
+            Dim::Div(num, den) => {
+                assert!(matches!(num.as_ref(), Dim::Bound(n) if n == "num_tokens"));
+                assert!(matches!(den.as_ref(), Dim::Bound(n) if n == "vision_merge_factor"));
+            }
+            other => panic!("expected Dim::Div for first dim, got {other:?}"),
+        }
+        assert!(matches!(&dims[1], Dim::Bound(n) if n == "vision_merge_hidden"));
+
+        let p = classify_vision_src(
+            "y = reshape(pixels, [num_tokens, vision_embed_dim * vision_merge_factor]);",
+        );
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p.reshape_targets.get(&target).unwrap();
+        // Second dim becomes `Dim::Mul([vision_embed_dim,
+        // vision_merge_factor])` after canonical_mul sorts by name.
+        match &dims[1] {
+            Dim::Mul(factors) => {
+                let names: Vec<_> = factors
+                    .iter()
+                    .filter_map(|d| match d {
+                        Dim::Bound(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(names, vec!["vision_embed_dim", "vision_merge_factor"]);
+            }
+            other => panic!("expected Dim::Mul for second dim, got {other:?}"),
+        }
     }
 
     #[test]

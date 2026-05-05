@@ -73,6 +73,11 @@ pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
             .iter()
             .map(|c| eval_dim_with(c, bounds))
             .try_fold(1u64, |acc, v| v.map(|x| acc.saturating_mul(x))),
+        Dim::Div(num, den) => {
+            let n = eval_dim_with(num, bounds)?;
+            let d = eval_dim_with(den, bounds)?;
+            if d == 0 { None } else { Some(n / d) }
+        }
         Dim::Var(_) => None,
     }
 }
@@ -1729,6 +1734,10 @@ impl Implementation for ReshapeRefImpl {
                     "dims_nt_pow",
                     syn::parse_quote!([u8; ::ferrite_cuda_core::tensor::MAX_DIMS]),
                 ),
+                (
+                    "dims_div_lit",
+                    syn::parse_quote!([u32; ::ferrite_cuda_core::tensor::MAX_DIMS]),
+                ),
                 ("ndim", syn::parse_quote!(u8)),
             ],
         )
@@ -1772,14 +1781,17 @@ impl Implementation for ReshapeRefImpl {
         );
         let mut dims_lit = [1u32; RESHAPE_MAX_DIMS];
         let mut dims_nt_pow = [0u8; RESHAPE_MAX_DIMS];
+        let mut dims_div_lit = [1u32; RESHAPE_MAX_DIMS];
         for (i, d) in shape.iter().enumerate() {
-            let (lit, nt_pow) = decompose_reshape_dim(d, bounds);
+            let (lit, nt_pow, div_lit) = decompose_reshape_dim(d, bounds);
             dims_lit[i] = lit;
             dims_nt_pow[i] = nt_pow;
+            dims_div_lit[i] = div_lit;
         }
         let ndim = shape.len() as u8;
         let dims_lit_toks = dims_lit.iter().map(|v| quote! { #v });
         let dims_nt_pow_toks = dims_nt_pow.iter().map(|v| quote! { #v });
+        let dims_div_lit_toks = dims_div_lit.iter().map(|v| quote! { #v });
         Some(vec![OpInstance::new(
             syn::Ident::new("Reshape", proc_macro2::Span::call_site()),
             vec![
@@ -1787,24 +1799,36 @@ impl Implementation for ReshapeRefImpl {
                 quote! { #out_slot_idx },
                 quote! { [ #( #dims_lit_toks ),* ] },
                 quote! { [ #( #dims_nt_pow_toks ),* ] },
+                quote! { [ #( #dims_div_lit_toks ),* ] },
                 quote! { #ndim },
             ],
         )])
     }
 }
 
-/// Decompose a `Dim` into `(literal_factor, num_tokens_power)` for
-/// the host-interpreter Reshape opcode. Mirrors `reshape_dim_token`'s
-/// lowering: `Lit` and non-`num_tokens` `Bound` fold into the literal
-/// factor at codegen time (via `bounds`); each occurrence of
-/// `Bound("num_tokens")` increments the `num_tokens` power. `Mul`
-/// recurses with multiplicative composition. `Var` is a compiler bug
-/// — shape inference should have closed every dim.
-fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) -> (u32, u8) {
+/// Decompose a `Dim` into `(numerator_lit, num_tokens_power,
+/// denominator_lit)` for the host-interpreter Reshape opcode. The
+/// runtime computes one output axis as
+/// `(numerator_lit * num_tokens^pow) / denominator_lit`.
+///
+/// Folding rules:
+///
+/// - `Lit(n)` → `(n, 0, 1)`.
+/// - `Bound("num_tokens")` → `(1, 1, 1)` (the only runtime factor).
+/// - other `Bound(name)` → `(bounds[name], 0, 1)` — folded at codegen.
+/// - `Mul(factors)` → multiplicative composition over numerator,
+///   power, and denominator (a Mul carrying a Div child preserves
+///   the Div's denominator).
+/// - `Div(num, den)` → numerator decomposes normally; the denominator
+///   must be num_tokens-free (`pow == 0`) or it's a compiler bug —
+///   the runtime opcode has no machinery for `nt`-in-denominator.
+/// - `Var` is a compiler bug — shape inference should have closed
+///   every dim.
+fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) -> (u32, u8, u32) {
     use crate::shape::Dim;
     match d {
-        Dim::Lit(n) => (*n as u32, 0),
-        Dim::Bound(name) if name == "num_tokens" => (1, 1),
+        Dim::Lit(n) => (*n as u32, 0, 1),
+        Dim::Bound(name) if name == "num_tokens" => (1, 1, 1),
         Dim::Bound(name) => {
             let v = *bounds.get(name).unwrap_or_else(|| {
                 panic!(
@@ -1812,17 +1836,36 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
                      the model config is incomplete"
                 )
             });
-            (v as u32, 0)
+            (v as u32, 0, 1)
         }
         Dim::Mul(factors) => {
-            let mut lit: u64 = 1;
+            let mut num_lit: u64 = 1;
             let mut nt_pow: u8 = 0;
+            let mut den_lit: u64 = 1;
             for f in factors {
-                let (l, p) = decompose_reshape_dim(f, bounds);
-                lit *= l as u64;
+                let (n, p, d) = decompose_reshape_dim(f, bounds);
+                num_lit *= n as u64;
                 nt_pow += p;
+                den_lit *= d as u64;
             }
-            (lit as u32, nt_pow)
+            (num_lit as u32, nt_pow, den_lit as u32)
+        }
+        Dim::Div(num, den) => {
+            let (num_lit, num_pow, num_den_lit) = decompose_reshape_dim(num, bounds);
+            let (den_num_lit, den_pow, den_den_lit) = decompose_reshape_dim(den, bounds);
+            assert_eq!(
+                den_pow, 0,
+                "Reshape: denominator may not contain `num_tokens` — \
+                 the runtime opcode has no `nt`-in-denominator path. \
+                 Got dim {d:?}"
+            );
+            // (num_lit * nt^p / num_den_lit) / (den_num_lit / den_den_lit)
+            //   = (num_lit * den_den_lit * nt^p) / (num_den_lit * den_num_lit)
+            (
+                (num_lit as u64 * den_den_lit as u64) as u32,
+                num_pow,
+                (num_den_lit as u64 * den_num_lit as u64) as u32,
+            )
         }
         Dim::Var(_) => {
             panic!("Reshape target dim must be closed (no Var) — compiler bug")
@@ -16397,11 +16440,12 @@ mod tests {
         let cost_other_qk = imp.cost_us(&mi, &ctx_other_qk);
         assert_eq!(cost_other_qk, 6.5);
     }
-    /// `decompose_reshape_dim` mirrors today's `reshape_dim_token`'s
-    /// folding: every config bound + literal collapses into the
-    /// `lit_part`; `num_tokens` is the only runtime factor and gets
-    /// counted in `nt_pow`. Mul recurses with multiplicative
-    /// composition; Var panics.
+    /// `decompose_reshape_dim` folds every config bound + literal at
+    /// codegen time into the numerator, counts each `num_tokens`
+    /// occurrence in `nt_pow`, and stays at `denom = 1` in the absence
+    /// of a `Div` term. `Div` (G.5.f.a, merger reshape) closes the
+    /// denominator into a literal divisor; mixed Mul-of-Div composes
+    /// the numerator/denominator multiplicatively.
     #[test]
     fn decompose_reshape_dim_folds_config_bounds_and_counts_num_tokens() {
         use crate::shape::Dim;
@@ -16409,33 +16453,71 @@ mod tests {
         bounds.insert("hidden_size".to_string(), 4096u64);
         bounds.insert("head_dim".to_string(), 64u64);
         bounds.insert("num_attention_heads".to_string(), 32u64);
+        bounds.insert("vision_merge_factor".to_string(), 4u64);
 
         // Pure literal.
-        assert_eq!(decompose_reshape_dim(&Dim::Lit(64), &bounds), (64, 0));
+        assert_eq!(decompose_reshape_dim(&Dim::Lit(64), &bounds), (64, 0, 1));
 
         // Config bound folds at codegen time.
         assert_eq!(
             decompose_reshape_dim(&Dim::Bound("hidden_size".into()), &bounds),
-            (4096, 0)
+            (4096, 0, 1)
         );
 
         // num_tokens is the only runtime factor.
         assert_eq!(
             decompose_reshape_dim(&Dim::Bound("num_tokens".into()), &bounds),
-            (1, 1)
+            (1, 1, 1)
         );
 
-        // [num_tokens * num_attention_heads, head_dim]-style
-        // Mul folds bounds + counts num_tokens occurrences.
+        // [num_tokens * num_attention_heads, head_dim]-style Mul folds
+        // bounds + counts num_tokens occurrences.
         let dim = Dim::Mul(vec![
             Dim::Bound("num_tokens".into()),
             Dim::Bound("num_attention_heads".into()),
         ]);
-        assert_eq!(decompose_reshape_dim(&dim, &bounds), (32, 1));
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (32, 1, 1));
 
         // Pure literal product.
         let dim = Dim::Mul(vec![Dim::Lit(2), Dim::Bound("head_dim".into())]);
-        assert_eq!(decompose_reshape_dim(&dim, &bounds), (128, 0));
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (128, 0, 1));
+
+        // Div(num_tokens, vision_merge_factor) — the merger's first
+        // dim. Numerator stays `(1, 1)`, denominator closes to 4.
+        let dim = Dim::Div(
+            Box::new(Dim::Bound("num_tokens".into())),
+            Box::new(Dim::Bound("vision_merge_factor".into())),
+        );
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (1, 1, 4));
+
+        // Div(num, lit) — pure literal denominator.
+        let dim = Dim::Div(
+            Box::new(Dim::Bound("hidden_size".into())),
+            Box::new(Dim::Lit(8)),
+        );
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (4096, 0, 8));
+
+        // Mul(Div(...), Lit) — denominator survives composition.
+        let dim = Dim::Mul(vec![
+            Dim::Div(
+                Box::new(Dim::Bound("num_tokens".into())),
+                Box::new(Dim::Lit(2)),
+            ),
+            Dim::Lit(3),
+        ]);
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (3, 1, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "denominator may not contain `num_tokens`")]
+    fn decompose_reshape_dim_rejects_num_tokens_in_denominator() {
+        use crate::shape::Dim;
+        let bounds = std::collections::BTreeMap::new();
+        let dim = Dim::Div(
+            Box::new(Dim::Lit(4)),
+            Box::new(Dim::Bound("num_tokens".into())),
+        );
+        let _ = decompose_reshape_dim(&dim, &bounds);
     }
     fn empty_model(name: &str) -> crate::config::ModelParams {
         crate::config::ModelParams {

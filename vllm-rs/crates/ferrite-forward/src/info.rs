@@ -127,7 +127,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("CohereLayerNorm"),
                 ],
             ),
-            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, ndim) => {
+            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
                 let n = ndim as usize;
                 (
                     "Reshape",
@@ -136,6 +136,7 @@ impl<W> Instruction<W> {
                         F::Slot(out_slot),
                         F::ConstU32Array(dims_lit[..n].to_vec()),
                         F::ConstU8Array(dims_nt_pow[..n].to_vec()),
+                        F::ConstU32Array(dims_div_lit[..n].to_vec()),
                         F::ConstU32(u32::from(ndim)),
                     ],
                 )

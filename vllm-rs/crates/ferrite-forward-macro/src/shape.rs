@@ -44,6 +44,16 @@ pub enum Dim {
     Bound(String),
     /// Product of subterms. Canonically flattened: no nested Mul.
     Mul(Vec<Dim>),
+    /// Quotient: `numerator / denominator`. Surfaced today only by
+    /// DSL-authored reshape arithmetic (`num_tokens /
+    /// vision_merge_factor`). The Solver treats it as concrete:
+    /// `unify` checks structural equality, `walk` / `close_dim`
+    /// recurse into both children. `eval_closed_dim` evaluates by
+    /// integer division (caller's responsibility to ensure the
+    /// dividend is exactly divisible at runtime — the merger
+    /// reshape's `total_l / spatial_merge_size**2` is always
+    /// exact).
+    Div(Box<Dim>, Box<Dim>),
     /// Unresolved variable. Must be resolved before inference
     /// completes or shape inference reports an error.
     Var(DimVar),
@@ -95,25 +105,6 @@ impl Solver {
         let a = self.walk(a);
         let b = self.walk(b);
         match (&a, &b) {
-            // Both resolved concrete: must structurally match.
-            (Dim::Lit(_), Dim::Lit(_))
-            | (Dim::Bound(_), Dim::Bound(_))
-            | (Dim::Mul(_), Dim::Mul(_))
-            | (Dim::Lit(_), Dim::Bound(_))
-            | (Dim::Bound(_), Dim::Lit(_))
-            | (Dim::Lit(_), Dim::Mul(_))
-            | (Dim::Mul(_), Dim::Lit(_))
-            | (Dim::Bound(_), Dim::Mul(_))
-            | (Dim::Mul(_), Dim::Bound(_)) => {
-                if dims_structurally_equal(&a, &b) {
-                    Ok(())
-                } else {
-                    Err(ShapeError::Mismatch {
-                        lhs: a.clone(),
-                        rhs: b.clone(),
-                    })
-                }
-            }
             // One var, one concrete: bind the var.
             (Dim::Var(v), other) | (other, Dim::Var(v)) => {
                 let root = self.find(*v);
@@ -130,6 +121,19 @@ impl Solver {
                 } else {
                     self.binding.insert(root, other.clone());
                     Ok(())
+                }
+            }
+            // Both resolved concrete (Lit / Bound / Mul / Div in any
+            // pairing): must structurally match. Mul/Div trees are
+            // walked recursively by `dims_structurally_equal`.
+            _ => {
+                if dims_structurally_equal(&a, &b) {
+                    Ok(())
+                } else {
+                    Err(ShapeError::Mismatch {
+                        lhs: a.clone(),
+                        rhs: b.clone(),
+                    })
                 }
             }
         }
@@ -150,6 +154,11 @@ impl Solver {
             Dim::Mul(children) => {
                 let walked: Vec<Dim> = children.iter().map(|c| self.walk(c)).collect();
                 canonical_mul(walked)
+            }
+            Dim::Div(num, den) => {
+                let n = self.walk(num);
+                let d = self.walk(den);
+                Dim::Div(Box::new(n), Box::new(d))
             }
             other => other.clone(),
         }
@@ -173,6 +182,11 @@ impl Solver {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(canonical_mul(cs))
             }
+            Dim::Div(num, den) => {
+                let n = self.close_dim(&num)?;
+                let d = self.close_dim(&den)?;
+                Ok(Dim::Div(Box::new(n), Box::new(d)))
+            }
             other => Ok(other),
         }
     }
@@ -188,6 +202,9 @@ fn dims_structurally_equal(a: &Dim, b: &Dim) -> bool {
         (Dim::Bound(x), Dim::Bound(y)) => x == y,
         (Dim::Mul(x), Dim::Mul(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| dims_structurally_equal(p, q))
+        }
+        (Dim::Div(n1, d1), Dim::Div(n2, d2)) => {
+            dims_structurally_equal(n1, n2) && dims_structurally_equal(d1, d2)
         }
         // A Lit(1) is identity for Mul — don't worry about that here,
         // canonical_mul handles it.
@@ -225,7 +242,8 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             Dim::Bound(_) => 0,
             Dim::Lit(_) => 1,
             Dim::Mul(_) => 2,
-            Dim::Var(_) => 3,
+            Dim::Div(_, _) => 3,
+            Dim::Var(_) => 4,
         }
     }
     match rank(a).cmp(&rank(b)) {
@@ -233,6 +251,9 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             (Dim::Bound(x), Dim::Bound(y)) => x.cmp(y),
             (Dim::Lit(x), Dim::Lit(y)) => x.cmp(y),
             (Dim::Mul(x), Dim::Mul(y)) => x.len().cmp(&y.len()),
+            // Div ordering is opaque (no internal order needed for
+            // canonicalization; only one Div per merger reshape today).
+            (Dim::Div(_, _), Dim::Div(_, _)) => Ordering::Equal,
             (Dim::Var(x), Dim::Var(y)) => x.0.cmp(&y.0),
             _ => unreachable!(),
         },
@@ -321,6 +342,7 @@ fn show_dim(d: &Dim) -> String {
         Dim::Lit(n) => n.to_string(),
         Dim::Bound(n) => n.clone(),
         Dim::Mul(cs) => cs.iter().map(show_dim).collect::<Vec<_>>().join(" * "),
+        Dim::Div(num, den) => format!("({} / {})", show_dim(num), show_dim(den)),
         Dim::Var(v) => format!("?{}", v.0),
     }
 }
@@ -986,6 +1008,16 @@ pub(crate) fn eval_closed_dim(
         Dim::Mul(factors) => factors
             .iter()
             .try_fold(1u64, |acc, f| eval_closed_dim(f, bounds).map(|v| acc * v)),
+        Dim::Div(num, den) => {
+            let n = eval_closed_dim(num, bounds)?;
+            let d = eval_closed_dim(den, bounds)?;
+            // Caller's responsibility to keep the dividend exactly
+            // divisible — the merger reshape's `total_l /
+            // spatial_merge_size**2` always is. Truncating divide is
+            // fine for the bounds-equivalence check (mismatched
+            // remainders are caught by the unify path, not here).
+            if d == 0 { None } else { Some(n / d) }
+        }
         Dim::Var(_) => None,
     }
 }
@@ -2199,6 +2231,66 @@ mod tests {
             &vec![bound("num_tokens"), bound("hidden_size")],
             "DSL-authored reshape output must equal the declared target shape",
         );
+    }
+
+    #[test]
+    fn dsl_authored_reshape_arithmetic_threads_through_shape_infer() {
+        // G.5.f.a checkpoint: the merger reshape's
+        // `[num_tokens / vision_merge_factor, vision_merge_hidden]`
+        // shape-infers cleanly under qwen2-vl-2b bounds. The closed
+        // form of the first dim is `Dim::Div(num_tokens,
+        // vision_merge_factor)` — kept symbolic through shape::infer
+        // (the codegen folds the divisor against `bounds` later).
+        let p = {
+            let file: syn::File = syn::parse_str(
+                "fn _carrier() {\n\
+                 merged = reshape(pixels, [num_tokens / vision_merge_factor, vision_merge_hidden]);\n\
+                 }",
+            )
+            .expect("syn parse");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            crate::classify::classify_with(&ast, crate::classified::Prelude::Vision)
+                .expect("classify (vision prelude)")
+        };
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("ferrite-model-qwen2-vl")
+            .join("configs");
+        let configs = crate::config::load_dir(&dir).expect("load qwen2-vl configs");
+        let cfg = configs
+            .iter()
+            .find(|c| c.source_stem == "qwen2-vl-2b")
+            .expect("qwen2-vl-2b config present");
+        let mut bounds: std::collections::BTreeMap<String, u64> = cfg.bounds.clone();
+        bounds.insert("num_tokens".into(), 256);
+
+        let manifest = crate::weights_manifest::WeightsManifest::empty();
+        let inferred = infer(&p, &manifest, &bounds).expect("shape::infer must succeed");
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let out = inferred.locals.get(&target).expect("inferred shape");
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            Dim::Div(num, den) => {
+                assert!(matches!(num.as_ref(), Dim::Bound(n) if n == "num_tokens"));
+                assert!(matches!(den.as_ref(), Dim::Bound(n) if n == "vision_merge_factor"));
+            }
+            other => panic!("expected Dim::Div for first dim, got {other:?}"),
+        }
+        assert!(matches!(&out[1], Dim::Bound(n) if n == "vision_merge_hidden"));
+
+        // Numerical evaluation closes via `eval_closed_dim` —
+        // 256 / 4 = 64. The codegen reads this same number out of
+        // `decompose_reshape_dim`'s denominator field.
+        assert_eq!(eval_closed_dim(&out[0], &bounds), Some(64));
+        assert_eq!(eval_closed_dim(&out[1], &bounds), Some(5120));
     }
 
     #[test]

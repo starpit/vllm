@@ -118,7 +118,22 @@ pub enum Instruction<W> {
     Embed(u32, WtFn<W, Embedding>),
     RmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
     LayerNorm(u32, u32, u32, WtFn<W, CohereLayerNorm>),
-    Reshape(u32, u32, [u32; MAX_DIMS], [u8; MAX_DIMS], u8),
+    /// `Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim)`.
+    /// Output axis i is computed as
+    /// `(dims_lit[i] * num_tokens^dims_nt_pow[i]) / dims_div_lit[i]`.
+    /// `dims_div_lit` is `1` for every dim by default (G.5.f.a opens
+    /// the divisor for DSL-authored arithmetic — the merger's
+    /// `[num_tokens / vision_merge_factor, vision_merge_hidden]`
+    /// is the first consumer, decomposing as
+    /// `dims_div_lit = [vision_merge_factor, 1]`).
+    Reshape(
+        u32,
+        u32,
+        [u32; MAX_DIMS],
+        [u8; MAX_DIMS],
+        [u32; MAX_DIMS],
+        u8,
+    ),
     Add(u32, u32),
     /// Tensor-parallel all-reduce-sum on the slot in place. Inserted
     /// by the lowering pass after every gemm whose weight is
@@ -534,7 +549,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, ndim) => {
+            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
                 let upstream = tile_ref(ctx.tiles, in_slot).as_gpu_tensor(ctx.tiles);
                 let nt = (*ctx.fwd.input_ids).dim(0);
                 let mut shape = [0usize; MAX_DIMS];
@@ -544,7 +559,13 @@ impl<W: CanonicalParams> Instruction<W> {
                     for _ in 0..(dims_nt_pow[i] as usize) {
                         d *= nt;
                     }
-                    shape[i] = d;
+                    let div = dims_div_lit[i] as usize;
+                    debug_assert!(
+                        div > 0 && d.is_multiple_of(div),
+                        "Reshape: axis {i} numerator {d} not divisible by \
+                         denominator {div} — codegen bug"
+                    );
+                    shape[i] = d / div;
                 }
                 let reshaped = upstream.reshape(&shape[..nd]);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Reshaped {

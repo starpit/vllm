@@ -689,7 +689,11 @@ mod tests {
                     // a shape-level one, and it resolves per-model
                     // at codegen time. Acceptable.
                     match dim {
-                        Dim::Lit(_) | Dim::Bound(_) | Dim::Mul(_) | Dim::Var(_) => {}
+                        Dim::Lit(_)
+                        | Dim::Bound(_)
+                        | Dim::Mul(_)
+                        | Dim::Div(_, _)
+                        | Dim::Var(_) => {}
                     }
                 }
             }

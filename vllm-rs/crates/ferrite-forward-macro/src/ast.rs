@@ -113,22 +113,35 @@ pub enum Expr {
     /// matching the synthesized-reshape shape from
     /// `shape::apply_reshape_hints`.
     ///
-    /// G.5.c surface is "literal-or-bound only" — each `DimSpec`
-    /// is an integer literal or a bare bound name. Bound-arithmetic
-    /// (`num_tokens / vision_merge_factor`) is deliberately deferred
-    /// until the merger reshape needs it.
+    /// G.5.c surface admitted literals and bare bound names. G.5.f.a
+    /// extended each [`DimSpec`] to a binary tree over `*` and `/`
+    /// — the merger reshape's `[num_tokens / vision_merge_factor,
+    /// vision_merge_hidden]` is its first consumer.
     Reshape {
         source: Box<Expr>,
         target_shape: Vec<DimSpec>,
     },
 }
 
-/// One dim of a [`Expr::Reshape`] target shape. Restricted to the
-/// minimal G.5.c surface: integer literal or a config-bound name.
+/// One dim of a [`Expr::Reshape`] target shape. Each leaf is an
+/// integer literal or a config-bound name; interior nodes are `*`
+/// or `/` over child dims. Closed under arithmetic — at codegen time
+/// the bound names + a handful of runtime axes (today: `num_tokens`)
+/// numerically evaluate every dim against the per-model `bounds`.
 #[derive(Clone, Debug)]
 pub enum DimSpec {
     /// Concrete integer dim, e.g. `4`.
     Lit(u64),
-    /// Symbolic bound name, e.g. `vision_embed_dim`.
+    /// Symbolic bound name, e.g. `vision_embed_dim` / `num_tokens`.
     Bound(Ident),
+    /// `lhs * rhs` over child dims. Used for `vision_embed_dim *
+    /// vision_merge_factor` (closed product) and for any
+    /// future bound-product the DSL surfaces.
+    Mul(Box<DimSpec>, Box<DimSpec>),
+    /// `lhs / rhs` over child dims. The merger reshape needs
+    /// `num_tokens / vision_merge_factor`. Today's codegen folds
+    /// the divisor to a literal at codegen time (it must close to
+    /// a num_tokens-free integer once `bounds` is known); a divisor
+    /// containing `num_tokens` is rejected by `decompose_reshape_dim`.
+    Div(Box<DimSpec>, Box<DimSpec>),
 }

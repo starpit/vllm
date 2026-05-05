@@ -245,6 +245,7 @@ fn dim_to_json(d: &Dim) -> Value {
         Dim::Lit(n) => json!(n),
         Dim::Bound(name) => Value::String(name.clone()),
         Dim::Mul(parts) => json!({ "mul": parts.iter().map(dim_to_json).collect::<Vec<_>>() }),
+        Dim::Div(num, den) => json!({ "div": [dim_to_json(num), dim_to_json(den)] }),
         Dim::Var(_) => Value::String("?".into()),
     }
 }

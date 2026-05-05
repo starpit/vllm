@@ -302,22 +302,39 @@ fn parse_dim_array(expr: &SynExpr) -> ParseResult<Vec<DimSpec>> {
             "reshape target shape must have at least one dim",
         ));
     }
-    arr.elems
-        .iter()
-        .map(|e| match unwrap_parens(e) {
-            SynExpr::Lit(ExprLit {
-                lit: Lit::Int(i), ..
-            }) => Ok(DimSpec::Lit(i.base10_parse()?)),
-            SynExpr::Path(p) if p.path.get_ident().is_some() => {
-                Ok(DimSpec::Bound(p.path.get_ident().unwrap().clone()))
+    arr.elems.iter().map(parse_dim_spec).collect()
+}
+
+/// Parse one dim of a `reshape(.., [..])` target shape. Each dim is
+/// a binary tree over `*` and `/` whose leaves are integer literals
+/// or bare bound identifiers. Parentheses group; nothing else is
+/// admitted (no `+` / `-`, no calls, no indexing).
+fn parse_dim_spec(expr: &SynExpr) -> ParseResult<DimSpec> {
+    match unwrap_parens(expr) {
+        SynExpr::Lit(ExprLit {
+            lit: Lit::Int(i), ..
+        }) => Ok(DimSpec::Lit(i.base10_parse()?)),
+        SynExpr::Path(p) if p.path.get_ident().is_some() => {
+            Ok(DimSpec::Bound(p.path.get_ident().unwrap().clone()))
+        }
+        SynExpr::Binary(b) => {
+            let lhs = parse_dim_spec(&b.left)?;
+            let rhs = parse_dim_spec(&b.right)?;
+            match b.op {
+                BinOp::Mul(_) => Ok(DimSpec::Mul(Box::new(lhs), Box::new(rhs))),
+                BinOp::Div(_) => Ok(DimSpec::Div(Box::new(lhs), Box::new(rhs))),
+                other => Err(syn::Error::new(
+                    other.span(),
+                    "reshape dim arithmetic admits only `*` and `/`",
+                )),
             }
-            other => Err(syn::Error::new(
-                other.span(),
-                "reshape dim must be an integer literal or a bound identifier \
-                 (bound-arithmetic is deferred — see ast::Expr::Reshape)",
-            )),
-        })
-        .collect()
+        }
+        other => Err(syn::Error::new(
+            other.span(),
+            "reshape dim must be an integer literal, a bound identifier, \
+             or a `*` / `/` arithmetic over those",
+        )),
+    }
 }
 
 pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
@@ -918,23 +935,94 @@ mod tests {
     }
 
     #[test]
-    fn reshape_with_arithmetic_dim_is_rejected() {
-        // G.5.c is "literal-or-bound only"; bound-arithmetic
-        // (`num_tokens / vision_merge_factor`) is deferred. Reject
-        // explicitly so a well-formed but unsupported body fails with
-        // the deferred-feature message rather than parsing into
-        // something the rest of the pipeline can't cope with.
-        let body = "y = reshape(x, [num_tokens / 4, hidden_size]);";
+    fn reshape_with_div_dim_parses() {
+        // G.5.f.a — bound-arithmetic admitted at parse. The merger
+        // reshape's `[num_tokens / vision_merge_factor,
+        // vision_merge_hidden]` is the first consumer.
+        let ast = parse("y = reshape(x, [num_tokens / vision_merge_factor, vision_merge_hidden]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => {
+                assert_eq!(target_shape.len(), 2);
+                match &target_shape[0] {
+                    DimSpec::Div(num, den) => {
+                        assert!(matches!(num.as_ref(), DimSpec::Bound(i) if i == "num_tokens"));
+                        assert!(
+                            matches!(den.as_ref(), DimSpec::Bound(i) if i == "vision_merge_factor")
+                        );
+                    }
+                    other => panic!("expected DimSpec::Div, got {other:?}"),
+                }
+                assert!(
+                    matches!(&target_shape[1], DimSpec::Bound(i) if i == "vision_merge_hidden")
+                );
+            }
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_mul_and_lit_arithmetic_parses() {
+        // Arithmetic admits arbitrary nesting of `*` / `/` whose
+        // leaves are literals or bound idents.
+        let ast = parse("y = reshape(x, [num_tokens, vision_embed_dim * 4]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => match &target_shape[1] {
+                DimSpec::Mul(a, b) => {
+                    assert!(matches!(a.as_ref(), DimSpec::Bound(i) if i == "vision_embed_dim"));
+                    assert!(matches!(b.as_ref(), DimSpec::Lit(4)));
+                }
+                other => panic!("expected DimSpec::Mul, got {other:?}"),
+            },
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_arithmetic_groups_with_parens() {
+        // Parens — `(a / b) * c` — produce the expected nesting.
+        let ast = parse("y = reshape(x, [(num_tokens / 2) * 3]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => match &target_shape[0] {
+                DimSpec::Mul(lhs, rhs) => {
+                    assert!(matches!(rhs.as_ref(), DimSpec::Lit(3)));
+                    match lhs.as_ref() {
+                        DimSpec::Div(num, den) => {
+                            assert!(matches!(num.as_ref(), DimSpec::Bound(i) if i == "num_tokens"));
+                            assert!(matches!(den.as_ref(), DimSpec::Lit(2)));
+                        }
+                        other => panic!("expected DimSpec::Div nested, got {other:?}"),
+                    }
+                }
+                other => panic!("expected DimSpec::Mul, got {other:?}"),
+            },
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_unsupported_binop_is_rejected() {
+        // `+` / `-` aren't admitted in a reshape dim. Surface the
+        // restriction at parse so a downstream pass doesn't have to
+        // handle the broader expression vocabulary.
+        let body = "y = reshape(x, [num_tokens + 4]);";
         let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {body} }}")).unwrap();
         let block = match &file.items[0] {
             syn::Item::Fn(f) => &*f.block,
             _ => unreachable!(),
         };
-        let err = parse_block(block).expect_err("expected deferred-feature error");
+        let err = parse_block(block).expect_err("expected unsupported-op error");
         assert!(
-            err.to_string()
-                .contains("integer literal or a bound identifier"),
-            "expected deferred-feature error, got: {err}"
+            err.to_string().contains("admits only `*` and `/`"),
+            "expected `*`/`/`-only error, got: {err}"
         );
     }
 }

@@ -76,29 +76,62 @@ impl CostTable {
     }
 }
 
-/// Hardware characteristics a cost model uses to estimate kernel
-/// timing. All units are explicit. Add fields here as the cost
-/// model learns to use more.
+/// Backend type discriminator for target profiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Cuda,
+    Metal,
+}
+
+/// CUDA-specific hardware characteristics.
 #[derive(Clone, Debug)]
-pub struct TargetProfile {
-    pub name: String,
-    pub source_path: PathBuf,
+pub struct CudaSpec {
     /// sm_XX — 89 = Ada, 90 = Hopper.
     pub compute_capability: u32,
     /// Number of streaming multiprocessors.
     pub num_sms: u32,
+    /// Shared memory per SM, kilobytes.
+    pub shared_memory_per_sm_kb: u32,
+}
+
+/// Metal-specific hardware characteristics.
+#[derive(Clone, Debug)]
+pub struct MetalSpec {
+    /// Apple Silicon generation (M1, M2, M3, M4).
+    pub generation: String,
+    /// Number of GPU cores.
+    pub gpu_cores: u32,
+    /// Threadgroup memory per threadgroup, kilobytes.
+    pub threadgroup_memory_kb: u32,
+}
+
+/// Hardware characteristics a cost model uses to estimate kernel
+/// timing. All units are explicit. Backend-agnostic to support
+/// both CUDA and Metal targets.
+#[derive(Clone, Debug)]
+pub struct TargetProfile {
+    pub name: String,
+    pub source_path: PathBuf,
+    pub backend: Backend,
     /// Peak FP16 tensor-core throughput, teraflops.
     pub peak_tflops_fp16: f64,
     /// Global memory bandwidth, gigabytes per second.
     pub memory_bandwidth_gbps: f64,
-    /// Shared memory per SM, kilobytes.
-    pub shared_memory_per_sm_kb: u32,
+    /// Backend-specific hardware details.
+    pub backend_spec: BackendSpec,
     /// Empirical cost table loaded from `cost_<name>.csv` alongside
     /// the JSON, when present. Populated with the GPU-swept
     /// measurements from prior ferrite (cublas + every cutlass tile
     /// variant across a grid of `(M, N, K)`). Empty when no CSV is
     /// present — cost impls fall back to their analytic formula.
     pub cost_table: CostTable,
+}
+
+/// Backend-specific hardware specification.
+#[derive(Clone, Debug)]
+pub enum BackendSpec {
+    Cuda(CudaSpec),
+    Metal(MetalSpec),
 }
 
 impl TargetProfile {
@@ -118,13 +151,51 @@ pub fn from_profile_def(def: &ProfileDef) -> TargetProfile {
     TargetProfile {
         name: def.name.to_string(),
         source_path: PathBuf::new(),
-        compute_capability: def.compute_capability,
-        num_sms: def.num_sms,
+        backend: Backend::Cuda,
         peak_tflops_fp16: def.peak_tflops_fp16,
         memory_bandwidth_gbps: def.memory_bandwidth_gbps,
-        shared_memory_per_sm_kb: def.shared_memory_per_sm_kb,
+        backend_spec: BackendSpec::Cuda(CudaSpec {
+            compute_capability: def.compute_capability,
+            num_sms: def.num_sms,
+            shared_memory_per_sm_kb: def.shared_memory_per_sm_kb,
+        }),
         cost_table: parse_cost_csv(def.cost_csv),
     }
+}
+
+/// Build a `TargetProfile` from a `ferrite-metal-targets` profile.
+/// Converts the Metal-specific profile into the unified TargetProfile
+/// shape that the solver and cost model consume.
+#[cfg(feature = "metal")]
+pub fn from_metal_profile(profile: &ferrite_metal_targets::MetalTargetProfile) -> TargetProfile {
+    let name = format!("{:?}_{}core", profile.generation, profile.gpu_cores).to_lowercase();
+    TargetProfile {
+        name,
+        source_path: PathBuf::new(),
+        backend: Backend::Metal,
+        peak_tflops_fp16: profile.peak_tflops_fp16,
+        memory_bandwidth_gbps: profile.memory_bandwidth_gbps,
+        backend_spec: BackendSpec::Metal(MetalSpec {
+            generation: format!("{:?}", profile.generation),
+            gpu_cores: profile.gpu_cores,
+            threadgroup_memory_kb: profile.threadgroup_memory_bytes / 1024,
+        }),
+        cost_table: parse_metal_cost_table(&profile.cost_table),
+    }
+}
+
+/// Convert Metal cost table format to unified CostTable.
+#[cfg(feature = "metal")]
+fn parse_metal_cost_table(
+    metal_table: &std::collections::BTreeMap<String, Vec<ferrite_metal_targets::CostEntry>>,
+) -> CostTable {
+    let mut table = CostTable::new();
+    for (kernel_name, entries) in metal_table {
+        for entry in entries {
+            table.insert(kernel_name.clone(), entry.m, entry.n, entry.k, entry.cost_us);
+        }
+    }
+    table
 }
 
 /// Parse the embedded `cost_<gpu>.csv` bytes into a `CostTable`.
@@ -172,12 +243,22 @@ mod tests {
     #[test]
     fn from_profile_def_carries_spec_fields() {
         let l4 = from_profile_def(&L4_SM89);
-        assert_eq!(l4.compute_capability, 89);
-        assert_eq!(l4.num_sms, 58);
+        assert_eq!(l4.backend, Backend::Cuda);
+        if let BackendSpec::Cuda(spec) = &l4.backend_spec {
+            assert_eq!(spec.compute_capability, 89);
+            assert_eq!(spec.num_sms, 58);
+        } else {
+            panic!("Expected CUDA backend spec");
+        }
         assert!(l4.peak_tflops_fp16 > 100.0);
 
         let h100 = from_profile_def(&H100_SM90);
-        assert_eq!(h100.compute_capability, 90);
+        assert_eq!(h100.backend, Backend::Cuda);
+        if let BackendSpec::Cuda(spec) = &h100.backend_spec {
+            assert_eq!(spec.compute_capability, 90);
+        } else {
+            panic!("Expected CUDA backend spec");
+        }
         assert!(h100.peak_tflops_fp16 > l4.peak_tflops_fp16);
     }
 
@@ -225,5 +306,27 @@ mod tests {
         assert_eq!(table.len(), 2);
         assert_eq!(table.get("cublas", 1, 2, 3), Some(4.5));
         assert_eq!(table.get("cutlass_128x128_s3", 8, 16, 32), Some(7.0));
+    }
+
+    #[test]
+    #[cfg(feature = "metal")]
+    fn from_metal_profile_converts_correctly() {
+        let metal = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
+        assert_eq!(metal.backend, Backend::Metal);
+        assert_eq!(metal.name, "m1_8core");
+        assert_eq!(metal.peak_tflops_fp16, 2.6);
+        assert_eq!(metal.memory_bandwidth_gbps, 68.25);
+        
+        if let BackendSpec::Metal(spec) = &metal.backend_spec {
+            assert_eq!(spec.generation, "M1");
+            assert_eq!(spec.gpu_cores, 8);
+            assert_eq!(spec.threadgroup_memory_kb, 32);
+        } else {
+            panic!("Expected Metal backend spec");
+        }
+
+        let m2 = from_metal_profile(&ferrite_metal_targets::M2_10CORE);
+        assert_eq!(m2.backend, Backend::Metal);
+        assert!(m2.peak_tflops_fp16 > metal.peak_tflops_fp16);
     }
 }

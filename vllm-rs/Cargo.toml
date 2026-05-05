@@ -50,6 +50,9 @@ members = [
     "crates/ferrite-forward-macro",
     "crates/ferrite-cost-sweep",
     "crates/ferrite-gguf",
+    "crates/ferrite-metal-targets",
+    "crates/ferrite-metal-kernels",
+    "crates/ferrite-metal-impl-lib", "crates/ferrite-metal-cost-sweep",
 ]
 exclude = []
 

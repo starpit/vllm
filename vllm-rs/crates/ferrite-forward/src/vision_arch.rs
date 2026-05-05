@@ -44,18 +44,22 @@ pub trait VisionArchWeights: Send + Sync + Sized + 'static {
     /// variant's `vision_*` bounds + `vision_norm_eps` scalar.
     fn vision_config(&self) -> &'static VisionConfig;
 
-    /// Per-arch CPU pixel pack: CHW pixels → varlen
-    /// `[T*H*W, C·T·P²]` bf16 patches + `(grid_t, grid_h, grid_w)`.
-    /// Different VL arches arrange patches differently
-    /// (Qwen2-VL spatial-merge order, SigLIP raster, …) so this
-    /// stays per-arch — the macro user passes a `pixel_pack = ...`
-    /// path, the macro emits a forwarder.
+    /// CPU pixel pack: CHW pixels → varlen `[T*H*W, C·T·P²]` bf16
+    /// patches + `(grid_t, grid_h, grid_w)`. Default delegates to
+    /// [`VisionConfig::patches_from_normalized_chw`] — the spatial-
+    /// merge order shared by Qwen2-VL / Qwen2.5-VL / any arch with
+    /// the same `patch_size · spatial_merge_size` convention. Arches
+    /// with different patch ordering (SigLIP raster, etc.) override
+    /// via the `pixel_pack = path::to::fn` attribute arg, which the
+    /// macro turns into an override of this method.
     fn pixel_pack(
         cfg: &VisionConfig,
         pixels: &[f32],
         height: u32,
         width: u32,
-    ) -> (Vec<u16>, (u32, u32, u32));
+    ) -> (Vec<u16>, (u32, u32, u32)) {
+        cfg.patches_from_normalized_chw(pixels, height, width)
+    }
 
     /// Run the encoder body. Macro emits a one-line forwarder to
     /// the variant module's free `forward(...)`.

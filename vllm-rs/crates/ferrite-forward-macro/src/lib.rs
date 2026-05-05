@@ -428,18 +428,13 @@ fn compile_common(
     let models_dir = discover_models_dir(&base, &arch_name)
         .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
 
-    // Vision macros require `pixel_pack = path::to::fn` so the
-    // emitted `VisionArchWeights` impl can forward to a per-arch
-    // CPU pixel-pack. Decoder macros ignore the arg if present.
-    if matches!(mode.prelude, classified::Prelude::Vision) && args.pixel_pack.is_none() {
-        return Err(syn::Error::new(
-            args.span,
-            "#[vision_forward] requires `pixel_pack = path::to::fn` — \
-             a host-side fn taking `(&VisionConfig, &[f32], u32, u32)` \
-             and returning `(Vec<u16>, (u32, u32, u32))` (e.g. \
-             `ferrite_vision::pack_qwen2_vl`)",
-        ));
-    }
+    // `pixel_pack = path::to::fn` is OPTIONAL under VISION mode.
+    // When unset, the trait's default `pixel_pack` (which delegates
+    // to `VisionConfig::patches_from_normalized_chw`, the spatial-
+    // merge order Qwen2-VL / Qwen2.5-VL / any arch with the same
+    // `patch_size · spatial_merge_size` convention share) is used.
+    // Override only for arches with different patch ordering
+    // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
     // ── Front end: parse + classify ───────────────────────────────
     let ast = parse::parse_block(&carrier.block)
@@ -1064,14 +1059,10 @@ fn compile_common(
         // Vision arch glue: per-variant `VisionArchWeights` impl,
         // `try_load_mm` with d_model fingerprint, inventory submits
         // for tp ∈ {1,2,4,8}. Decoder mode emits empty TokenStream.
+        // `pixel_pack` is None for arches that use the trait's
+        // default (delegating to `VisionConfig::patches_from_normalized_chw`).
         let vision_glue = if matches!(mode.prelude, classified::Prelude::Vision) {
-            // `pixel_pack` is required under VISION mode (validated
-            // at the top of compile_common), so unwrap is total.
-            let pixel_pack = args
-                .pixel_pack
-                .as_ref()
-                .expect("vision mode requires pixel_pack");
-            vision_glue::emit_per_variant(sm.model, &arch_name, pixel_pack)
+            vision_glue::emit_per_variant(sm.model, &arch_name, args.pixel_pack.as_ref())
         } else {
             proc_macro2::TokenStream::new()
         };

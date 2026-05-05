@@ -7,10 +7,7 @@
 
 use ferrite_forward::vision_forward;
 
-#[vision_forward(
-    workloads = [256, 1024, 4096, 16384],
-    pixel_pack = ferrite_vision::pack_qwen2_vl,
-)]
+#[vision_forward(workloads = [256, 1024, 4096, 16384])]
 fn qwen2_vl() {
     hidden_states = gemm(pixels, patch_embed.proj);
 

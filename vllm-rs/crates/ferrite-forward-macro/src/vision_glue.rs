@@ -54,10 +54,18 @@ fn norm_eps(model: &ModelParams) -> f64 {
 /// Emit the per-variant vision-arch glue. Returned `TokenStream` is
 /// inserted into the variant's `pub mod` body alongside the
 /// `Weights` struct + emitted `forward` fn.
+///
+/// `pixel_pack`: `None` to use the trait's default impl
+/// (delegates to [`VisionConfig::patches_from_normalized_chw`] —
+/// the spatial-merge order shared by Qwen2-VL / Qwen2.5-VL / any
+/// arch with the same `patch_size · spatial_merge_size` convention).
+/// `Some(path)` to override with `path` taking
+/// `(&VisionConfig, &[f32], u32, u32) -> (Vec<u16>, (u32, u32, u32))`
+/// — for arches with different patch ordering (SigLIP raster, etc.).
 pub fn emit_per_variant(
     model: &ModelParams,
     arch_name: &str,
-    pixel_pack: &syn::Path,
+    pixel_pack: Option<&syn::Path>,
 ) -> TokenStream {
     let embed_dim = bound(model, "vision_embed_dim") as u32;
     let depth = bound(model, "vision_depth") as u32;
@@ -87,6 +95,22 @@ pub fn emit_per_variant(
         .map(|s| syn::LitStr::new(s, proc_macro2::Span::call_site()))
         .collect();
 
+    // `pixel_pack` override: emit a method body iff the user
+    // supplied an explicit path; otherwise let the trait's default
+    // impl run (which calls `VisionConfig::patches_from_normalized_chw`).
+    let pixel_pack_method = pixel_pack.map(|path| {
+        quote! {
+            fn pixel_pack(
+                cfg: &::ferrite_vision::VisionConfig,
+                pixels: &[f32],
+                height: u32,
+                width: u32,
+            ) -> (::std::vec::Vec<u16>, (u32, u32, u32)) {
+                #path(cfg, pixels, height, width)
+            }
+        }
+    });
+
     quote! {
         impl ::ferrite_forward::VisionArchWeights for Weights {
             fn vision_config(&self) -> &'static ::ferrite_vision::VisionConfig {
@@ -104,14 +128,7 @@ pub fn emit_per_variant(
                 &C
             }
 
-            fn pixel_pack(
-                cfg: &::ferrite_vision::VisionConfig,
-                pixels: &[f32],
-                height: u32,
-                width: u32,
-            ) -> (::std::vec::Vec<u16>, (u32, u32, u32)) {
-                #pixel_pack(cfg, pixels, height, width)
-            }
+            #pixel_pack_method
 
             unsafe fn vision_forward(
                 &self,

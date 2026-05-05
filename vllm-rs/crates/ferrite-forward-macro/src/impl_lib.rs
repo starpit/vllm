@@ -1298,8 +1298,9 @@ impl Implementation for RmsNormRefImpl {
     fn name(&self) -> &'static str {
         "rmsnorm_ref"
     }
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // CUDA-only implementation - Metal targets use MetalRmsNormImpl
+        profile.backend == crate::target::Backend::Cuda
     }
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let info = single_tile_match(fuf, seed, OpKind::RmsNorm)?;
@@ -1795,6 +1796,59 @@ pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
+    // Metal Embed implementations - only match Metal targets
+    lib.push(Box::new(crate::metal::MetalEmbedImpl::fp16()));
+    lib.push(Box::new(crate::metal::MetalEmbedImpl::bf16()));
+    // Metal RMSNorm implementations - only match Metal targets
+    lib.push(Box::new(crate::metal_bridge::MetalRmsNormImpl::new_fp16()));
+    lib.push(Box::new(crate::metal_bridge::MetalRmsNormImpl::new_bf16()));
+    // Metal GEMM implementations - only match Metal targets
+    lib.push(Box::new(crate::metal_bridge::MetalGemmImpl::new_fp16()));
+    lib.push(Box::new(crate::metal_bridge::MetalGemmImpl::new_fp32()));
+    // Metal Fused Add+RMSNorm implementations - only match Metal targets
+    lib.push(Box::new(crate::metal_bridge::MetalFusedAddRmsNormImpl::new_fp16()));
+    lib.push(Box::new(crate::metal_bridge::MetalFusedAddRmsNormImpl::new_bf16()));
+    // Metal Fused Gate-Up-SiLU-Mul implementations - only match Metal targets
+    lib.push(Box::new(crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_fp16()));
+    lib.push(Box::new(crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_bf16()));
+    lib.push(Box::new(crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_gelu_fp16()));
+    // Metal Attention implementations - only match Metal targets
+    lib.push(Box::new(crate::metal::MetalAttentionImpl::new_basic_fp16()));
+    lib.push(Box::new(crate::metal::MetalAttentionImpl::new_paged_fp16()));
+    lib.push(Box::new(crate::metal::MetalAttentionImpl::new_multihead_fp16()));
+    lib.push(Box::new(crate::metal::MetalAttentionImpl::new_multihead_optimized_fp16()));
+    // Metal Activation implementations - only match Metal targets
+    lib.push(Box::new(crate::metal::MetalActivationImpl::new_silu_fp16()));
+    lib.push(Box::new(crate::metal::MetalActivationImpl::new_gelu_fp16()));
+    lib.push(Box::new(crate::metal::MetalActivationImpl::new_gelu_tanh_fp16()));
+    lib.push(Box::new(crate::metal::MetalActivationImpl::new_gelu_quick_fp16()));
+    lib.push(Box::new(crate::metal::MetalActivationImpl::new_fatrelu_fp16()));
+    // Metal AWQ implementations - only match Metal targets
+    lib.push(Box::new(crate::metal::MetalAwqImpl::new_fp16_g128()));
+    lib.push(Box::new(crate::metal::MetalAwqImpl::new_bf16_g128()));
+    // Metal core operations - only match Metal targets
+    lib.push(Box::new(crate::metal::MetalReshapeImpl::new()));
+    lib.push(Box::new(crate::metal::MetalAddImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalAddImpl::new_bf16()));
+    lib.push(Box::new(crate::metal::MetalScalarMulImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalScalarMulImpl::new_bf16()));
+    // Metal RoPE implementations - only match Metal targets
+    lib.push(Box::new(crate::metal::MetalRopeAppendImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalRopeAppendImpl::new_bf16()));
+    lib.push(Box::new(crate::metal::MetalRopeAppendInterleavedImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalRopeAppendInterleavedImpl::new_bf16()));
+    // Metal Mul implementations - elementwise multiply (gate * up)
+    lib.push(Box::new(crate::metal::MetalMulImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalMulImpl::new_bf16()));
+    // Metal BiasAdd implementations - broadcast addition
+    lib.push(Box::new(crate::metal::MetalBiasAddImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalBiasAddImpl::new_bf16()));
+    // Metal TanhSoftCap implementations - logit capping (Gemma2)
+    lib.push(Box::new(crate::metal::MetalTanhSoftCapImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalTanhSoftCapImpl::new_bf16()));
+    // Metal Sub implementations - elementwise subtraction
+    lib.push(Box::new(crate::metal::MetalSubImpl::new_fp16()));
+    lib.push(Box::new(crate::metal::MetalSubImpl::new_bf16()));
     // CohereLayerNorm-flavored norm: claims `(Mean, Sub, RmsNorm)`
     // and emits `cohere_layer_norm`. The DSL stays pure math
     // (`mu = mean(x); centered = sub(x, mu); rmsnorm(centered, w)`);
@@ -16933,11 +16987,14 @@ mod tests {
         crate::target::TargetProfile {
             name: "synthetic".to_string(),
             source_path: std::path::PathBuf::from("synthetic"),
-            compute_capability: 89,
-            num_sms: 58,
+            backend: crate::target::Backend::Cuda,
             peak_tflops_fp16: 121.0,
             memory_bandwidth_gbps: 300.0,
-            shared_memory_per_sm_kb: 100,
+            backend_spec: crate::target::BackendSpec::Cuda(crate::target::CudaSpec {
+                compute_capability: 89,
+                num_sms: 58,
+                shared_memory_per_sm_kb: 100,
+            }),
             cost_table,
         }
     }

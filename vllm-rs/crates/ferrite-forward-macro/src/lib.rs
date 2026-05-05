@@ -31,6 +31,7 @@ mod cfg;
 mod classified;
 mod classify;
 mod codegen;
+mod codegen_metal;
 mod concurrency;
 mod config;
 mod cost;
@@ -38,11 +39,14 @@ mod emit;
 mod fuf;
 mod impl_lib;
 mod interpreter_codegen;
+mod metal_bridge;
+mod metal;
 mod parse;
 mod quantization;
 mod schedule;
 mod shape;
 mod solver;
+mod solver_metal_tests;
 mod target;
 mod tp_lowering;
 mod vision_lowering;
@@ -528,9 +532,27 @@ fn compile_common(
         }
     };
 
-    let target_def =
-        ferrite_cuda_targets::detect().map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
-    let target_profile = target::from_profile_def(target_def);
+    // Backend selection via feature flags (compile-time, not runtime)
+    #[cfg(feature = "cuda")]
+    let target_profile = {
+        let target_def = ferrite_cuda_targets::detect()
+            .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
+        target::from_profile_def(target_def)
+    };
+    
+    #[cfg(feature = "metal")]
+    let target_profile = {
+        use ferrite_metal_kernels::device::detect_device;
+        let metal_device = detect_device()
+            .ok_or_else(|| syn::Error::new(
+                carrier.sig.ident.span(),
+                "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
+            ))?;
+        target::from_metal_profile(&metal_device.profile)
+    };
+    
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    compile_error!("ferrite-forward-macro requires either 'cuda' or 'metal' feature");
 
     let library = impl_lib::starter_library();
 

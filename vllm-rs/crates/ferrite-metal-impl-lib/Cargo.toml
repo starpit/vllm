@@ -1,0 +1,13 @@
+[package]
+name = "ferrite-metal-impl-lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ferrite-metal-targets = { path = "../ferrite-metal-targets" }
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels" }
+# Need ferrite-forward-macro for Implementation trait and related types
+# This creates a dependency cycle that needs to be resolved by making
+# ferrite-forward-macro export its trait definitions as a separate crate
+# For now, we'll keep implementations in ferrite-forward-macro/src/metal_bridge.rs
+# TODO: Extract trait definitions to ferrite-forward-traits crate

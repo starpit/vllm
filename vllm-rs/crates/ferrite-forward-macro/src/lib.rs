@@ -49,6 +49,8 @@ mod vision_lowering;
 mod viz_dump;
 mod weights_manifest;
 
+mod vision_glue;
+
 // ── Attribute argument parsing ────────────────────────────────────
 
 struct ForwardArgs {
@@ -62,6 +64,12 @@ struct ForwardArgs {
     /// spans — e.g. FlashInfer decode wins on long sk, FA2 wins at
     /// small prefill.
     sk_buckets: Vec<u64>,
+    /// Path to the per-arch CPU pixel-pack fn. Required for
+    /// `#[vision_forward]`, ignored by `#[forward]`. The fn signature
+    /// must match `fn(&VisionConfig, &[f32], u32, u32) -> (Vec<u16>,
+    /// (u32, u32, u32))`. The macro-emitted `VisionArchWeights` impl
+    /// forwards its `pixel_pack` associated fn to this path.
+    pixel_pack: Option<syn::Path>,
     /// Span used for error reporting when a required arg is
     /// missing.
     span: Span,
@@ -72,6 +80,7 @@ impl Parse for ForwardArgs {
         let span = input.span();
         let mut workloads: Option<Vec<u64>> = None;
         let mut sk_buckets: Option<Vec<u64>> = None;
+        let mut pixel_pack: Option<syn::Path> = None;
 
         fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
             let list;
@@ -94,6 +103,7 @@ impl Parse for ForwardArgs {
             match key.to_string().as_str() {
                 "workloads" => workloads = Some(parse_u64_list(input)?),
                 "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
+                "pixel_pack" => pixel_pack = Some(input.parse::<syn::Path>()?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -122,6 +132,7 @@ impl Parse for ForwardArgs {
         Ok(Self {
             workloads,
             sk_buckets,
+            pixel_pack,
             span,
         })
     }
@@ -416,6 +427,19 @@ fn compile_common(
     let arch_name = carrier.sig.ident.to_string();
     let models_dir = discover_models_dir(&base, &arch_name)
         .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
+
+    // Vision macros require `pixel_pack = path::to::fn` so the
+    // emitted `VisionArchWeights` impl can forward to a per-arch
+    // CPU pixel-pack. Decoder macros ignore the arg if present.
+    if matches!(mode.prelude, classified::Prelude::Vision) && args.pixel_pack.is_none() {
+        return Err(syn::Error::new(
+            args.span,
+            "#[vision_forward] requires `pixel_pack = path::to::fn` — \
+             a host-side fn taking `(&VisionConfig, &[f32], u32, u32)` \
+             and returning `(Vec<u16>, (u32, u32, u32))` (e.g. \
+             `ferrite_vision::pack_qwen2_vl`)",
+        ));
+    }
 
     // ── Front end: parse + classify ───────────────────────────────
     let ast = parse::parse_block(&carrier.block)
@@ -1037,10 +1061,25 @@ fn compile_common(
             mode.emit_arch_dispatch,
         );
         let stub_items = &sm.stub_items;
+        // Vision arch glue: per-variant `VisionArchWeights` impl,
+        // `try_load_mm` with d_model fingerprint, inventory submits
+        // for tp ∈ {1,2,4,8}. Decoder mode emits empty TokenStream.
+        let vision_glue = if matches!(mode.prelude, classified::Prelude::Vision) {
+            // `pixel_pack` is required under VISION mode (validated
+            // at the top of compile_common), so unwrap is total.
+            let pixel_pack = args
+                .pixel_pack
+                .as_ref()
+                .expect("vision mode requires pixel_pack");
+            vision_glue::emit_per_variant(sm.model, &arch_name, pixel_pack)
+        } else {
+            proc_macro2::TokenStream::new()
+        };
         per_model_ts.push(quote! {
             pub mod #model_mod {
                 #stub_items
                 #codegen_items
+                #vision_glue
             }
         });
 

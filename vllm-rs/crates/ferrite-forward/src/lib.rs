@@ -18,6 +18,8 @@ pub mod instr;
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
+#[cfg(feature = "cuda")]
+pub mod vision_arch;
 
 #[cfg(feature = "cuda")]
 pub use info::{
@@ -39,6 +41,8 @@ pub use loaders::{
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
+#[cfg(feature = "cuda")]
+pub use vision_arch::{VisionArchWeights, VisionWrapper};
 
 /// One row in a per-canonical forward dispatch table. Replaces the
 /// O(N×M) nested-match `pub fn forward()` + per-bucket

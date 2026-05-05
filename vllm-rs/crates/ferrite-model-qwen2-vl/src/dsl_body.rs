@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Qwen2-VL vision encoder body.
+//! Qwen2-VL vision encoder body. The DSL describes the GPU graph;
+//! the macro emits per-variant `Weights` + `forward` + the
+//! `VisionArchWeights` impl + `try_load_mm` + inventory rows. No
+//! hand-written `MultimodalForward` / `try_load_mm` / inventory
+//! submits — host-side glue is generic in `ferrite-forward`.
 
 use ferrite_forward::vision_forward;
 
-#[vision_forward(workloads = [256, 1024, 4096, 16384])]
+#[vision_forward(
+    workloads = [256, 1024, 4096, 16384],
+    pixel_pack = ferrite_vision::pack_qwen2_vl,
+)]
 fn qwen2_vl() {
     hidden_states = gemm(pixels, patch_embed.proj);
 

@@ -264,6 +264,24 @@ impl VisionConfig {
     }
 } // impl VisionConfig (patch flatten)
 
+/// Free-fn wrapper around [`VisionConfig::patches_from_normalized_chw`]
+/// matching the macro-emitted `pixel_pack` signature
+/// `fn(&VisionConfig, &[f32], u32, u32) -> (Vec<u16>, (u32, u32, u32))`.
+///
+/// The `#[vision_forward]` attribute takes a `pixel_pack = path::to::fn`
+/// arg; the macro emits an [`ferrite_forward::VisionArchWeights`] impl
+/// whose `pixel_pack` associated fn forwards to the provided path. This
+/// is the Qwen2-VL / Qwen2.5-VL flavor; SigLIP / Gemma3-MM will get
+/// their own free fn here when they land.
+pub fn pack_qwen2_vl(
+    cfg: &VisionConfig,
+    pixels: &[f32],
+    height: u32,
+    width: u32,
+) -> (Vec<u16>, (u32, u32, u32)) {
+    cfg.patches_from_normalized_chw(pixels, height, width)
+}
+
 // ── K-pad to multiple of 8 ─────────────────────────────────────────
 //
 // cuBLAS BF16 GEMM rejects K=3420 (Qwen2.5-VL-3B intermediate_size)

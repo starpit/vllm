@@ -29,8 +29,19 @@ pub struct LocalId(pub u32);
 pub struct WeightId(pub u32);
 
 /// The fixed enum of non-weight parameters. Every model uses the
-/// same names and shapes for these; the `#[forward]` macro knows
-/// about them by name.
+/// same names and shapes for these; the `#[forward]` /
+/// `#[vision_forward]` macros know about them by name.
+///
+/// Two prelude families share the enum:
+///   - **Decoder** (text-side `#[forward]`): `InputIds`, `Positions`,
+///     `Rotary`, `RotaryLocal`, `BlockTable`, `KvCache`.
+///   - **Vision** (image-side `#[vision_forward]`): `Pixels`,
+///     `CuSeqlens`, `Cos`, `Sin`, `GridThw`, `MaxSeqlen`.
+///
+/// The two preludes are disjoint by design — a vision body can't
+/// read `kv_cache` and a decoder body can't read `pixels`. Which
+/// names a given DSL body can name is selected by the [`Prelude`]
+/// passed into [`crate::classify::classify`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExternKind {
     InputIds,
@@ -42,18 +53,131 @@ pub enum ExternKind {
     RotaryLocal,
     BlockTable,
     KvCache,
+    /// Vision-encoder pixel/patch tensor: per-row patch of shape
+    /// `[total_l, in_chans * temporal_patch_size * patch_size²]`
+    /// produced by the host-side `patches_from_normalized_chw`
+    /// helper. Replaces the decoder's `InputIds` as the encoder's
+    /// data input.
+    Pixels,
+    /// Variable-length attention cumulative-seqlens index, shape
+    /// `[num_images + 1]` of i32. Vision encoders run varlen
+    /// flash-attn over a concatenated multi-image batch — `CuSeqlens`
+    /// is the ragged-batch boundary index, analogous to the paged
+    /// `BlockTable` for decoder attention but flat (no paging).
+    CuSeqlens,
+    /// 2D RoPE cos table, shape `[total_l, head_dim/2]`. Built
+    /// host-side from `grid_thw` and uploaded as bf16. Distinct from
+    /// decoder `Rotary` because vision RoPE has no positional
+    /// extern (positions live in `cos`/`sin` themselves) and is
+    /// applied via `vision_rope` rather than `rope_append`.
+    Cos,
+    /// 2D RoPE sin table, shape mirrors [`Cos`].
+    Sin,
+    /// Per-image grid `(t, h, w)` triples, shape `[num_images, 3]`
+    /// of u32. Drives host-side cu_seqlens / cos / sin builders
+    /// (already lifted to `ferrite-vision`); kept as an extern so
+    /// future ops like a `windowed_varlen_attention` can read it
+    /// directly when the windowed-block dispatch is DSL-visible.
+    GridThw,
+    /// Scalar i32 — the maximum per-image post-patch token count in
+    /// the current batch. Sized as a kernel input to varlen flash-
+    /// attn for shared-mem tile sizing. Shape `[]` (rank-0 / scalar).
+    MaxSeqlen,
+    /// Variable-length attention cu_seqlens for the **full image-frame**
+    /// segmentation. Qwen2.5-VL runs full-frame attention for layers
+    /// in `fullatt_block_indexes = [7, 15, 23, 31]` — each image is one
+    /// segment, so the full-frame cu_seqlens partitions the flat
+    /// `[total_L]` tensor at image boundaries (same shape as `CuSeqlens`
+    /// but materially different segmentation than the windowed variant).
+    /// Shape opaque; rank-1 i32 in practice.
+    CuSeqlensFull,
+    /// Variable-length attention cu_seqlens for the **windowed**
+    /// segmentation. Qwen2.5-VL bins post-merger cells into
+    /// 112-px-edge spatial windows (`vit_merger_window_size = 4`
+    /// merged cells per side) and emits one segment per window. Used
+    /// by the 28-of-32 layers NOT in `fullatt_block_indexes`. Shape
+    /// opaque; rank-1 i32.
+    CuSeqlensWindow,
+    /// Scalar usize — full-frame max segment length (max over image
+    /// segments, post-spatial-merge). Mirrors [`MaxSeqlen`] but for
+    /// the full-frame variant. Pairs with [`CuSeqlensFull`] in
+    /// `varlen_attention` calls at fullatt-layer indices.
+    MaxSeqlenFull,
+    /// Scalar usize — windowed max segment length. Mirrors
+    /// [`MaxSeqlenFull`] but for the windowed variant. Pairs with
+    /// [`CuSeqlensWindow`] at non-fullatt layer indices.
+    MaxSeqlenWindow,
+    /// Per-merged-cell permutation `[L / spatial_merge_size²]` of u32:
+    /// natural→window-grouped order. Drives the entry-side
+    /// `embedding_gather(x, window_index)` that re-orders tokens so
+    /// each varlen-attention window sees a contiguous segment. Built
+    /// host-side per request from `grid_thw + window_size`. Opaque
+    /// rank-1.
+    WindowIndex,
+    /// Inverse of [`WindowIndex`] — per-merged-cell permutation
+    /// `[L / spatial_merge_size²]` of u32 mapping window-grouped order
+    /// back to natural row order. Drives the post-merger-MLP
+    /// `embedding_gather(merged, reverse_indices)` that unpermutes
+    /// before the splice into the language-model embedding stream.
+    /// Opaque rank-1.
+    ReverseIndices,
+}
+
+/// Which DSL prelude (extern + op name set) is in scope when a
+/// classified body is built. Every `#[forward]` body uses
+/// [`Prelude::Decoder`]; every `#[vision_forward]` body uses
+/// [`Prelude::Vision`].
+///
+/// The two preludes are disjoint, but the downstream IR
+/// ([`Program`], [`crate::fuf::Fuf`]) shares one type and one
+/// pipeline — preludes only influence what NAMES the parser /
+/// classifier accept on input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Prelude {
+    /// Text decoder: input_ids / positions / rotary / kv_cache /
+    /// block_table externs; full text-side OpKind set.
+    #[default]
+    Decoder,
+    /// Vision encoder: pixels / cu_seqlens / cos / sin / grid_thw /
+    /// max_seqlen externs; vision-extended OpKind set
+    /// (VarlenAttention / VisionRope / QuickGelu / GeluErf
+    /// reachable in addition to the shared core).
+    Vision,
 }
 
 impl ExternKind {
-    /// Map a DSL identifier to its `ExternKind`, if any.
+    /// Map a DSL identifier to its `ExternKind`, if any. Decoder-
+    /// prelude entry point — kept for callers that pre-date the
+    /// prelude split. Equivalent to `from_name_for(name, Prelude::Decoder)`.
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "input_ids" => Some(Self::InputIds),
-            "positions" => Some(Self::Positions),
-            "rotary" => Some(Self::Rotary),
-            "rotary_local" => Some(Self::RotaryLocal),
-            "block_table" => Some(Self::BlockTable),
-            "kv_cache" => Some(Self::KvCache),
+        Self::from_name_for(name, Prelude::Decoder)
+    }
+
+    /// Prelude-aware extern lookup. Decoder bodies see the text-side
+    /// extern set; vision bodies see the vision-side set. The two
+    /// sets are disjoint — `pixels` is unrecognized in a decoder
+    /// body and `input_ids` is unrecognized in a vision body, both
+    /// raising classify-time errors per the strict-DSL rule.
+    pub fn from_name_for(name: &str, prelude: Prelude) -> Option<Self> {
+        match (prelude, name) {
+            (Prelude::Decoder, "input_ids") => Some(Self::InputIds),
+            (Prelude::Decoder, "positions") => Some(Self::Positions),
+            (Prelude::Decoder, "rotary") => Some(Self::Rotary),
+            (Prelude::Decoder, "rotary_local") => Some(Self::RotaryLocal),
+            (Prelude::Decoder, "block_table") => Some(Self::BlockTable),
+            (Prelude::Decoder, "kv_cache") => Some(Self::KvCache),
+            (Prelude::Vision, "pixels") => Some(Self::Pixels),
+            (Prelude::Vision, "cu_seqlens") => Some(Self::CuSeqlens),
+            (Prelude::Vision, "cos") => Some(Self::Cos),
+            (Prelude::Vision, "sin") => Some(Self::Sin),
+            (Prelude::Vision, "grid_thw") => Some(Self::GridThw),
+            (Prelude::Vision, "max_seqlen") => Some(Self::MaxSeqlen),
+            (Prelude::Vision, "cu_seqlens_full") => Some(Self::CuSeqlensFull),
+            (Prelude::Vision, "cu_seqlens_window") => Some(Self::CuSeqlensWindow),
+            (Prelude::Vision, "max_seqlen_full") => Some(Self::MaxSeqlenFull),
+            (Prelude::Vision, "max_seqlen_window") => Some(Self::MaxSeqlenWindow),
+            (Prelude::Vision, "window_index") => Some(Self::WindowIndex),
+            (Prelude::Vision, "reverse_indices") => Some(Self::ReverseIndices),
             _ => None,
         }
     }
@@ -81,11 +205,33 @@ pub enum OpKind {
     /// through the FUF so the solver can match distinct Impls
     /// (dense flash-attn vs. window-masked flash-attn).
     SlidingAttention,
+    /// Variable-length attention used by vision encoders (Qwen2-VL,
+    /// Qwen2.5-VL, ViT-style towers). Same q/k/v shape as `Attention`
+    /// but with a `cu_seqlens` ragged-batch index instead of a paged
+    /// `kv_cache + block_table`, and a `max_seqlen` scalar that the
+    /// kernel uses to size shared-mem tiles. Inputs:
+    /// `(q, k, v, cu_seqlens, max_seqlen)`. Shape-preserving on q.
+    /// Distinct OpKind so vision-side Impls (FlashAttention varlen,
+    /// windowed varlen) match without fighting text-side Attention's
+    /// heads-layout anchoring.
+    VarlenAttention,
     Silu,
-    /// Gaussian-Error Linear Unit. Unary elementwise. Shape-preserving
-    /// like `Silu`; paired with `Mul` in the gate/up fusion of any
-    /// architecture whose MLP is `down(gelu(gate) * up)`.
+    /// Gaussian-Error Linear Unit, tanh approximation:
+    /// `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`.
+    /// Distinct from `GeluErf` and `QuickGelu` — the three differ in
+    /// numerics. Locked to tanh-form by its current consumers (the
+    /// `(Gelu, Mul)` fusion patterns in Gemma2/3 MLPs).
     Gelu,
+    /// Quick-GELU: `x * sigmoid(1.702 * x)`. Used by Qwen2-VL's vision
+    /// MLP and CLIP/ViT-style towers. Unary elementwise, shape-preserving.
+    /// Numerically distinct from `Gelu` (tanh) and `GeluErf` (erf).
+    QuickGelu,
+    /// Erf-form GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`. Used by
+    /// SigLIP, BERT, and other vision/text towers that ship their
+    /// MLP weights calibrated for the exact-erf form. Unary
+    /// elementwise, shape-preserving. Numerically distinct from
+    /// tanh-form `Gelu` and `QuickGelu`.
+    GeluErf,
     /// Tanh-based soft-cap: `y = cap * tanh(x / cap)`. Unary
     /// elementwise with an additional scalar argument; shape-
     /// preserving. Used at logit exit for architectures that cap
@@ -175,6 +321,16 @@ pub enum OpKind {
     /// `from_name` — add an entry there if a future pattern needs
     /// explicit user-written reshape.
     Reshape,
+    /// Vision RoPE pair-rotation: `(q', k') = vision_rope(q, k, cos, sin)`.
+    /// 2-target tuple-returning; both outputs are shape-preserving on
+    /// their respective inputs. Distinct from `RopeAppend` because it
+    /// has no `kv_cache` extern (vision encoders have no KV cache —
+    /// the encoder runs as one-shot prefill) and no `positions`
+    /// extern (vision RoPE indexes off `grid_thw`-derived row/col
+    /// positions baked into `cos`/`sin`). Used by Qwen2-VL and
+    /// Qwen2.5-VL vision towers; expected reuse by future ViT-RoPE
+    /// architectures.
+    VisionRope,
     /// MLA kv_a split: decomposes `[T, kv_lora_rank + qk_rope_head_dim]`
     /// into `(kv_latent: [T, kv_lora_rank], k_pe: [T, qk_rope_head_dim])`.
     /// DSL form: `(kv_latent, k_pe) = mla_split(kv_a)`. Tuple-returning;
@@ -200,6 +356,37 @@ pub enum OpKind {
     /// keyed on the rust_type fingerprint of the `moe[layer]` weight
     /// accessor. Shape-preserving.
     Moe,
+    /// Vision-prelude pixels materialization. Synthesized by
+    /// `vision_lowering::materialize_pixels` between `fuf::unroll`
+    /// and the solver: takes zero FUF inputs and produces a single
+    /// rank-2 output `[num_tokens, vision_in_features]` whose runtime
+    /// value is `ctx.fwd.pixels` wrapped into a tile.
+    ///
+    /// Mirrors the role `EmbedRefImpl` plays for `input_ids` on the
+    /// decoder side: every downstream vision Impl
+    /// (`VarlenAttention` / `VisionRope` / `QuickGelu` / `GeluErf`)
+    /// reads its first input as `FufInput::Tile { id, slot }`, so the
+    /// extern → tile transition has to happen exactly once,
+    /// up-front, rather than being hand-unrolled into every per-Impl
+    /// `fan_out`.
+    ///
+    /// No DSL surface — `from_name` deliberately omits it. The
+    /// lowering pass writes `outputs[0]` directly (same pattern as
+    /// `AllGather` and `MmEmbedSplice`), so `apply_signature` rejects
+    /// this OpKind.
+    LoadPixels,
+    /// Row-permutation gather: `out = embedding_gather(x, indices)`.
+    /// `x` is a rank-2 tile `[L, N]` (any inner-dim factorization);
+    /// `indices` is a vision-prelude extern of `[`[`ExternKind::WindowIndex`]`
+    /// or [`ExternKind::ReverseIndices`]`]` (rank-1 u32 of length L). Output
+    /// is `[L, N]` with row `i` set to `x[indices[i]]`. Distinct OpKind
+    /// from `Embed` (which gathers off a learned embedding table) and
+    /// from `Reshape` (which is metadata-only) — this is a real
+    /// permutation kernel call. Used by Qwen2.5-VL's window-attention
+    /// dispatch: tokens + cos/sin tables are gather-permuted into
+    /// window order on encoder entry, and the merger output is
+    /// gather-permuted back to natural order at exit.
+    EmbeddingGather,
 }
 
 impl OpKind {
@@ -214,6 +401,19 @@ impl OpKind {
             "rope_append_interleaved" => Some(Self::RopeAppendInterleaved),
             "attention" => Some(Self::Attention),
             "sliding_attention" => Some(Self::SlidingAttention),
+            // Vision-tower ops. Unambiguous names: the four below are
+            // unused on the decoder side, so the lookup is shared with
+            // the decoder prelude — a `#[forward]` body that wrote
+            // `varlen_attention(...)` would parse but get rejected by
+            // the decoder-side externs (cu_seqlens / max_seqlen are
+            // only resolvable under `Prelude::Vision`). Pairs with the
+            // shape signatures in `shape::sig_varlen_attention`,
+            // `sig_vision_rope`, and `sig_unary_elementwise` (the two
+            // GELU variants).
+            "varlen_attention" => Some(Self::VarlenAttention),
+            "vision_rope" => Some(Self::VisionRope),
+            "quick_gelu" => Some(Self::QuickGelu),
+            "gelu_erf" => Some(Self::GeluErf),
             "silu" => Some(Self::Silu),
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),
@@ -227,6 +427,7 @@ impl OpKind {
             "mla_split" => Some(Self::MlaSplit),
             "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
+            "embedding_gather" => Some(Self::EmbeddingGather),
             _ => None,
         }
     }
@@ -240,8 +441,12 @@ impl OpKind {
             Self::RopeAppendInterleaved => "rope_append_interleaved",
             Self::Attention => "attention",
             Self::SlidingAttention => "sliding_attention",
+            Self::VarlenAttention => "varlen_attention",
             Self::Silu => "silu",
             Self::Gelu => "gelu",
+            Self::QuickGelu => "quick_gelu",
+            Self::GeluErf => "gelu_erf",
+            Self::VisionRope => "vision_rope",
             Self::TanhSoftCap => "tanh_softcap",
             Self::Add => "add",
             Self::Sub => "sub",
@@ -263,12 +468,16 @@ impl OpKind {
             // Lowering-pass-only op kind — see `OpKind::MmEmbedSplice`
             // doc-comment. No DSL surface.
             Self::MmEmbedSplice => "mm_embed_splice",
+            // Vision lowering-pass-only op kind — see
+            // `OpKind::LoadPixels` doc-comment. No DSL surface.
+            Self::LoadPixels => "load_pixels",
+            Self::EmbeddingGather => "embedding_gather",
         }
     }
 }
 
 /// A classified DSL program.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Program {
     pub statements: Vec<Stmt>,
     /// Ident for each LocalId (for diagnostics and codegen only).
@@ -289,6 +498,12 @@ pub struct Program {
     /// records the target shape here; the second inference pass
     /// reads this map to typecheck the synthesized statement.
     pub reshape_targets: std::collections::HashMap<LocalId, Vec<crate::shape::Dim>>,
+    /// Prelude this program was classified under. `Decoder` for
+    /// text-side `#[forward]`, `Vision` for `#[vision_forward]`.
+    /// Threaded into codegen for prelude-specific decisions —
+    /// safetensors prefix conventions (`model.layers.<L>.<x>` vs
+    /// `visual.blocks.<L>.<x>`), reshape `nt` source, etc.
+    pub prelude: Prelude,
 }
 
 /// Side table: `LocalId` → debug ident.
@@ -463,6 +678,9 @@ pub enum BoolPred {
     },
     /// `ivar < bound`.
     Less { ivar: LocalId, bound: Bound },
+    /// `members.contains(&ivar)` — set membership over a closed list
+    /// of integer literals. See [`crate::ast::BoolExpr::In`].
+    In { ivar: LocalId, members: Vec<u64> },
 }
 
 /// A value-producing expression.

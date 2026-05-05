@@ -5,7 +5,7 @@
 //! the generated code depends on: most importantly [`ForwardCtx`],
 //! the ambient-args bundle the emitted forward fn takes.
 
-pub use ferrite_forward_macro::forward;
+pub use ferrite_forward_macro::{forward, vision_forward};
 
 #[cfg(feature = "cuda")]
 pub mod attack_surface;
@@ -18,6 +18,8 @@ pub mod instr;
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
+#[cfg(feature = "cuda")]
+pub mod vision_arch;
 
 #[cfg(feature = "cuda")]
 pub use info::{
@@ -32,12 +34,16 @@ pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,
     load_layered_embedding_sharded, load_layered_fp8_block_linear,
     load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
-    load_layered_layer_norm, load_layered_linear_dense, load_layered_linear_dense_concat,
-    load_layered_linear_dense_concat_sharded, load_layered_linear_dense_sharded,
-    load_layered_marlin_linear, load_layered_marlin_linear_concat, load_layered_rms_norm,
+    load_layered_layer_norm, load_layered_layer_norm_vision, load_layered_linear_dense,
+    load_layered_linear_dense_concat, load_layered_linear_dense_concat_sharded,
+    load_layered_linear_dense_concat_vision, load_layered_linear_dense_sharded,
+    load_layered_linear_dense_vision, load_layered_marlin_linear,
+    load_layered_marlin_linear_concat, load_layered_rms_norm, load_layered_rms_norm_vision,
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
+#[cfg(feature = "cuda")]
+pub use vision_arch::{VisionArchWeights, VisionWrapper};
 
 /// One row in a per-canonical forward dispatch table. Replaces the
 /// O(N×M) nested-match `pub fn forward()` + per-bucket
@@ -131,6 +137,15 @@ pub fn trace_enabled() -> bool {
 #[inline]
 pub fn layer_weight_path(layer: u32, suffix: &str) -> String {
     format!("model.layers.{layer}.{suffix}")
+}
+
+/// Vision-tower analogue: `visual.blocks.<layer>.<suffix>`. Used by
+/// the `load_layered_*` helpers when the codegen emits a
+/// `#[vision_forward]` body — the per-block prefix differs from the
+/// decoder's `model.layers.<L>.` convention.
+#[inline]
+pub fn vision_block_weight_path(layer: u32, suffix: &str) -> String {
+    format!("visual.blocks.{layer}.{suffix}")
 }
 
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
@@ -236,6 +251,65 @@ mod ctx {
         /// `embed_patches` is empty.
         pub mm_embeds: Option<TensorView<'a>>,
         pub embed_patches: &'a [EmbedPatch],
+        /// Vision-tower 2D RoPE cos table, shape `[total_L, head_dim/2]`,
+        /// bf16. Built host-side from `grid_thw` per vision-encoder call;
+        /// the caller (`vision_forward`) uploads it and sets the field
+        /// before invoking the vision interpreter. `None` for text-side
+        /// forward calls — the `Instruction::VisionRope` arm panics on
+        /// `expect` if reached without these set, mirroring the
+        /// `tp_group` contract for `Instruction::AllReduce` at tp>1.
+        pub vision_rope_cos: Option<TensorView<'a>>,
+        /// Vision-tower 2D RoPE sin table. Same shape / population /
+        /// invariants as [`Self::vision_rope_cos`].
+        pub vision_rope_sin: Option<TensorView<'a>>,
+        /// Vision-tower input patches buffer, shape `[num_tokens,
+        /// vision_in_features]`, bf16. The vision encoder's
+        /// `vision_forward` host wrapper packs per-image CHW pixels
+        /// into this rank-2 layout (one row per patch, channels-times-
+        /// patch-area columns), uploads it, and sets the field before
+        /// invoking the vision interpreter. `None` for text-side
+        /// forward calls — `Instruction::LoadPixels` panics on
+        /// `expect` if reached without it set, mirroring the
+        /// [`Self::vision_rope_cos`] contract.
+        ///
+        /// Synthesized by `vision_lowering::materialize_pixels` after
+        /// `fuf::unroll`: every vision-prelude `pixels` extern in the
+        /// DSL classifies into a `FufInput::Extern` and is rewritten
+        /// to a `FufInput::Tile` whose producer is a single
+        /// `OpKind::LoadPixels` node; that node's runtime
+        /// counterpart copies this view into a tile-table OwnedTensor
+        /// the rest of the encoder consumes. See
+        /// [`crate::Instruction::LoadPixels`] for the eval body.
+        pub pixels: Option<TensorView<'a>>,
+        /// Qwen2.5-VL: cu_seqlens for the per-image **full-frame**
+        /// segmentation. Populated by the vision wrapper for arches
+        /// whose body calls `varlen_attention(..., cu_seqlens_full,
+        /// max_seqlen_full)` at fullatt-layer indices; `None` for
+        /// every text-side call and for vision arches that use a
+        /// single `cu_seqlens_q` (Qwen2-VL).
+        pub vision_cu_seqlens_full: Option<TensorView<'a>>,
+        /// Qwen2.5-VL: cu_seqlens for the per-window segmentation.
+        /// Populated by the vision wrapper for windowed-attention
+        /// layers; same `None` semantics as
+        /// [`Self::vision_cu_seqlens_full`].
+        pub vision_cu_seqlens_window: Option<TensorView<'a>>,
+        /// Qwen2.5-VL: max segment length under
+        /// [`Self::vision_cu_seqlens_full`]. `None` when not in use.
+        pub vision_max_seqlen_full: Option<usize>,
+        /// Qwen2.5-VL: max segment length under
+        /// [`Self::vision_cu_seqlens_window`]. `None` when not in use.
+        pub vision_max_seqlen_window: Option<usize>,
+        /// Qwen2.5-VL: per-merged-cell natural→window-grouped
+        /// permutation `[L / spatial_merge_size²]` u32. Drives the
+        /// entry-side `embedding_gather(x, window_index)` (and the
+        /// matching `embedding_gather(cos/sin, window_index)`) so
+        /// every windowed-attention layer reads contiguous segments.
+        pub vision_window_index: Option<TensorView<'a>>,
+        /// Qwen2.5-VL: inverse of [`Self::vision_window_index`] —
+        /// per-merged-cell window-grouped→natural permutation that
+        /// undoes the entry permute on the merger output before
+        /// splice into the language-model embedding stream.
+        pub vision_reverse_indices: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when

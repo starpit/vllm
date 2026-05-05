@@ -25,6 +25,7 @@ probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 ferrite-forward-macro = { path = "../ferrite-forward-macro" }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-vision = { path = "../ferrite-vision" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }

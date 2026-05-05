@@ -106,6 +106,9 @@ pub enum BoolPredResolved {
     },
     /// `ivar < bound`.
     Less { ivar: LocalId, bound: u64 },
+    /// `members.contains(&ivar)` — set membership; resolved members
+    /// are concrete u64 literals. See [`crate::classified::BoolPred::In`].
+    In { ivar: LocalId, members: Vec<u64> },
 }
 
 /// The CFG for one specialization.
@@ -399,6 +402,10 @@ impl<'a> CfgBuilder<'a> {
                 ivar: *ivar,
                 bound: self.resolve_bound(bound)?,
             }),
+            BoolPred::In { ivar, members } => Ok(BoolPredResolved::In {
+                ivar: *ivar,
+                members: members.clone(),
+            }),
         }
     }
 
@@ -598,6 +605,35 @@ mod tests {
                 _ => panic!("expected Modulo predicate"),
             },
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn if_in_literal_array_resolves_to_in_pred() {
+        let p = classify_src(
+            "for layer in 0..4 { \
+                if [0, 2].contains(&layer) { \
+                    attn = attention(q, k, v, kv_cache, block_table); \
+                } else { \
+                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
+                } \
+                hidden_states = add(attn, attn); \
+            }",
+        );
+        let cfg = build_cfg(&p, &llama_3_2_1b_params()).expect("build cfg");
+        let condjump = cfg
+            .blocks
+            .iter()
+            .find(|b| matches!(b.term, Terminator::CondJump { .. }))
+            .expect("CondJump block");
+        match &condjump.term {
+            Terminator::CondJump {
+                cond: BoolPredResolved::In { members, .. },
+                ..
+            } => {
+                assert_eq!(members, &vec![0u64, 2]);
+            }
+            _ => panic!("expected In predicate"),
         }
     }
 

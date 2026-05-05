@@ -58,6 +58,14 @@ pub enum BoolExpr {
     },
     /// `ivar < bound`.
     Less { ivar: Ident, bound: BoundExpr },
+    /// `[lit, lit, ...].contains(&ivar)` — set-membership over a
+    /// closed list of integer literals. Surface predicate for arches
+    /// like Qwen2.5-VL whose `fullatt_block_indexes = [7, 15, 23, 31]`
+    /// selects 4-of-32 transformer blocks for full attention; the
+    /// `Modulo` / `Less` shapes can't express a non-strided subset.
+    /// Members are integer literals only (no bound idents) — the
+    /// pattern is "a static, hand-listed set of layer indices."
+    In { ivar: Ident, members: Vec<u64> },
 }
 
 /// A loop bound expression. Always either an integer literal
@@ -104,4 +112,44 @@ pub enum Expr {
     /// time. `recip == true` folds to `1.0 / scalars[name]`, used
     /// for divisors like Granite's `logits_scaling`.
     ConfigScalar { name: Ident, recip: bool },
+    /// `reshape(source, [d0, d1, ...])` — DSL-authored reshape with
+    /// an explicit target shape. The target shape is preserved here
+    /// for `classify` to thread into [`Program::reshape_targets`]
+    /// keyed by the producing `LocalId`; the classified form drops
+    /// the target list and becomes
+    /// `Expr::Call { op: OpKind::Reshape, args: [source] }`,
+    /// matching the synthesized-reshape shape from
+    /// `shape::apply_reshape_hints`.
+    ///
+    /// G.5.c surface admitted literals and bare bound names. G.5.f.a
+    /// extended each [`DimSpec`] to a binary tree over `*` and `/`
+    /// — the merger reshape's `[num_tokens / vision_merge_factor,
+    /// vision_merge_hidden]` is its first consumer.
+    Reshape {
+        source: Box<Expr>,
+        target_shape: Vec<DimSpec>,
+    },
+}
+
+/// One dim of a [`Expr::Reshape`] target shape. Each leaf is an
+/// integer literal or a config-bound name; interior nodes are `*`
+/// or `/` over child dims. Closed under arithmetic — at codegen time
+/// the bound names + a handful of runtime axes (today: `num_tokens`)
+/// numerically evaluate every dim against the per-model `bounds`.
+#[derive(Clone, Debug)]
+pub enum DimSpec {
+    /// Concrete integer dim, e.g. `4`.
+    Lit(u64),
+    /// Symbolic bound name, e.g. `vision_embed_dim` / `num_tokens`.
+    Bound(Ident),
+    /// `lhs * rhs` over child dims. Used for `vision_embed_dim *
+    /// vision_merge_factor` (closed product) and for any
+    /// future bound-product the DSL surfaces.
+    Mul(Box<DimSpec>, Box<DimSpec>),
+    /// `lhs / rhs` over child dims. The merger reshape needs
+    /// `num_tokens / vision_merge_factor`. Today's codegen folds
+    /// the divisor to a literal at codegen time (it must close to
+    /// a num_tokens-free integer once `bounds` is known); a divisor
+    /// containing `num_tokens` is rejected by `decompose_reshape_dim`.
+    Div(Box<DimSpec>, Box<DimSpec>),
 }

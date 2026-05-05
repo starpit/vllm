@@ -73,6 +73,11 @@ pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
             .iter()
             .map(|c| eval_dim_with(c, bounds))
             .try_fold(1u64, |acc, v| v.map(|x| acc.saturating_mul(x))),
+        Dim::Div(num, den) => {
+            let n = eval_dim_with(num, bounds)?;
+            let d = eval_dim_with(den, bounds)?;
+            if d == 0 { None } else { Some(n / d) }
+        }
         Dim::Var(_) => None,
     }
 }
@@ -1626,6 +1631,10 @@ impl Implementation for ReshapeRefImpl {
                     "dims_nt_pow",
                     syn::parse_quote!([u8; ::ferrite_cuda_core::tensor::MAX_DIMS]),
                 ),
+                (
+                    "dims_div_lit",
+                    syn::parse_quote!([u32; ::ferrite_cuda_core::tensor::MAX_DIMS]),
+                ),
                 ("ndim", syn::parse_quote!(u8)),
             ],
         )
@@ -1669,14 +1678,17 @@ impl Implementation for ReshapeRefImpl {
         );
         let mut dims_lit = [1u32; RESHAPE_MAX_DIMS];
         let mut dims_nt_pow = [0u8; RESHAPE_MAX_DIMS];
+        let mut dims_div_lit = [1u32; RESHAPE_MAX_DIMS];
         for (i, d) in shape.iter().enumerate() {
-            let (lit, nt_pow) = decompose_reshape_dim(d, bounds);
+            let (lit, nt_pow, div_lit) = decompose_reshape_dim(d, bounds);
             dims_lit[i] = lit;
             dims_nt_pow[i] = nt_pow;
+            dims_div_lit[i] = div_lit;
         }
         let ndim = shape.len() as u8;
         let dims_lit_toks = dims_lit.iter().map(|v| quote! { #v });
         let dims_nt_pow_toks = dims_nt_pow.iter().map(|v| quote! { #v });
+        let dims_div_lit_toks = dims_div_lit.iter().map(|v| quote! { #v });
         Some(vec![OpInstance::new(
             syn::Ident::new("Reshape", proc_macro2::Span::call_site()),
             vec![
@@ -1684,24 +1696,36 @@ impl Implementation for ReshapeRefImpl {
                 quote! { #out_slot_idx },
                 quote! { [ #( #dims_lit_toks ),* ] },
                 quote! { [ #( #dims_nt_pow_toks ),* ] },
+                quote! { [ #( #dims_div_lit_toks ),* ] },
                 quote! { #ndim },
             ],
         )])
     }
 }
 
-/// Decompose a `Dim` into `(literal_factor, num_tokens_power)` for
-/// the host-interpreter Reshape opcode. Mirrors `reshape_dim_token`'s
-/// lowering: `Lit` and non-`num_tokens` `Bound` fold into the literal
-/// factor at codegen time (via `bounds`); each occurrence of
-/// `Bound("num_tokens")` increments the `num_tokens` power. `Mul`
-/// recurses with multiplicative composition. `Var` is a compiler bug
-/// — shape inference should have closed every dim.
-fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) -> (u32, u8) {
+/// Decompose a `Dim` into `(numerator_lit, num_tokens_power,
+/// denominator_lit)` for the host-interpreter Reshape opcode. The
+/// runtime computes one output axis as
+/// `(numerator_lit * num_tokens^pow) / denominator_lit`.
+///
+/// Folding rules:
+///
+/// - `Lit(n)` → `(n, 0, 1)`.
+/// - `Bound("num_tokens")` → `(1, 1, 1)` (the only runtime factor).
+/// - other `Bound(name)` → `(bounds[name], 0, 1)` — folded at codegen.
+/// - `Mul(factors)` → multiplicative composition over numerator,
+///   power, and denominator (a Mul carrying a Div child preserves
+///   the Div's denominator).
+/// - `Div(num, den)` → numerator decomposes normally; the denominator
+///   must be num_tokens-free (`pow == 0`) or it's a compiler bug —
+///   the runtime opcode has no machinery for `nt`-in-denominator.
+/// - `Var` is a compiler bug — shape inference should have closed
+///   every dim.
+fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) -> (u32, u8, u32) {
     use crate::shape::Dim;
     match d {
-        Dim::Lit(n) => (*n as u32, 0),
-        Dim::Bound(name) if name == "num_tokens" => (1, 1),
+        Dim::Lit(n) => (*n as u32, 0, 1),
+        Dim::Bound(name) if name == "num_tokens" => (1, 1, 1),
         Dim::Bound(name) => {
             let v = *bounds.get(name).unwrap_or_else(|| {
                 panic!(
@@ -1709,17 +1733,36 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
                      the model config is incomplete"
                 )
             });
-            (v as u32, 0)
+            (v as u32, 0, 1)
         }
         Dim::Mul(factors) => {
-            let mut lit: u64 = 1;
+            let mut num_lit: u64 = 1;
             let mut nt_pow: u8 = 0;
+            let mut den_lit: u64 = 1;
             for f in factors {
-                let (l, p) = decompose_reshape_dim(f, bounds);
-                lit *= l as u64;
+                let (n, p, d) = decompose_reshape_dim(f, bounds);
+                num_lit *= n as u64;
                 nt_pow += p;
+                den_lit *= d as u64;
             }
-            (lit as u32, nt_pow)
+            (num_lit as u32, nt_pow, den_lit as u32)
+        }
+        Dim::Div(num, den) => {
+            let (num_lit, num_pow, num_den_lit) = decompose_reshape_dim(num, bounds);
+            let (den_num_lit, den_pow, den_den_lit) = decompose_reshape_dim(den, bounds);
+            assert_eq!(
+                den_pow, 0,
+                "Reshape: denominator may not contain `num_tokens` — \
+                 the runtime opcode has no `nt`-in-denominator path. \
+                 Got dim {d:?}"
+            );
+            // (num_lit * nt^p / num_den_lit) / (den_num_lit / den_den_lit)
+            //   = (num_lit * den_den_lit * nt^p) / (num_den_lit * den_num_lit)
+            (
+                (num_lit as u64 * den_den_lit as u64) as u32,
+                num_pow,
+                (num_den_lit as u64 * den_num_lit as u64) as u32,
+            )
         }
         Dim::Var(_) => {
             panic!("Reshape target dim must be closed (no Var) — compiler bug")
@@ -1757,8 +1800,8 @@ pub fn starter_library() -> ImplementationLibrary {
     // `(Mean, Sub, RmsNorm, BiasAdd)` and emits `layer_norm_bias`.
     // Solver's claim-size-DESC sort lets this absorb the bias at
     // sites where the trio's RmsNorm output flows into a `bias_add`
-    // (e.g. ModernBERT). Sites without a `bias_add` consumer fall
-    // through to the trio.
+    // (e.g. ModernBERT, Qwen2-VL vision blocks). Sites without a
+    // `bias_add` consumer fall through to the trio.
     lib.push(Box::new(MeanSubRmsNormBiasAddImpl));
     // A/B hook: setting `FERRITE_DISABLE_CUBLAS_GEMM=1` at proc-macro
     // expansion time (i.e. when `forward!` runs during a build) drops
@@ -2091,6 +2134,29 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(DeepSeekGgmlMoeImpl));
     lib.push(Box::new(FusedMoeRefImpl));
     lib.push(Box::new(SharedFusedMoeRefImpl));
+
+    // ── Vision-tower ops (Phase G.4) ─────────────────────────────
+    // One Impl per vision OpKind from G.2. Pairs with the
+    // `OpKind::from_name` arms added in G.4 so `varlen_attention(...)`
+    // / `vision_rope(...)` / `quick_gelu(...)` / `gelu_erf(...)` parse
+    // ⟺ codegen stays total. Unreachable until `#[vision_forward]`
+    // bodies land in G.5+.
+    lib.push(Box::new(VarlenAttentionImpl));
+    lib.push(Box::new(VisionRopeImpl));
+    lib.push(Box::new(QuickGeluImpl));
+    lib.push(Box::new(GeluErfImpl));
+    // Pixels materialization (Phase G.5.e.1). Synthesized by
+    // `vision_lowering::materialize_pixels` after `fuf::unroll`
+    // under `Prelude::Vision`; the Impl runs only when that pass
+    // produced a tile. Decoder bodies never see this OpKind.
+    lib.push(Box::new(LoadPixelsImpl));
+    // Row-permutation gather (Phase G.6.4). Claims any DSL call to
+    // `embedding_gather(x, indices)`. The `indices` arg is one of
+    // `vision_window_index` / `vision_reverse_indices` (both vision-
+    // prelude externs); the Impl bakes which one the caller used into
+    // the emitted `Instruction::EmbeddingGather`'s discriminant so
+    // eval reads the correct `ForwardCtx` field.
+    lib.push(Box::new(EmbeddingGatherImpl));
 
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
@@ -16385,6 +16451,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
@@ -16459,6 +16526,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16554,6 +16622,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            prelude: crate::classified::Prelude::Decoder,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -17004,11 +17073,12 @@ mod tests {
         let cost_other_qk = imp.cost_us(&mi, &ctx_other_qk);
         assert_eq!(cost_other_qk, 6.5);
     }
-    /// `decompose_reshape_dim` mirrors today's `reshape_dim_token`'s
-    /// folding: every config bound + literal collapses into the
-    /// `lit_part`; `num_tokens` is the only runtime factor and gets
-    /// counted in `nt_pow`. Mul recurses with multiplicative
-    /// composition; Var panics.
+    /// `decompose_reshape_dim` folds every config bound + literal at
+    /// codegen time into the numerator, counts each `num_tokens`
+    /// occurrence in `nt_pow`, and stays at `denom = 1` in the absence
+    /// of a `Div` term. `Div` (G.5.f.a, merger reshape) closes the
+    /// denominator into a literal divisor; mixed Mul-of-Div composes
+    /// the numerator/denominator multiplicatively.
     #[test]
     fn decompose_reshape_dim_folds_config_bounds_and_counts_num_tokens() {
         use crate::shape::Dim;
@@ -17016,33 +17086,71 @@ mod tests {
         bounds.insert("hidden_size".to_string(), 4096u64);
         bounds.insert("head_dim".to_string(), 64u64);
         bounds.insert("num_attention_heads".to_string(), 32u64);
+        bounds.insert("vision_merge_factor".to_string(), 4u64);
 
         // Pure literal.
-        assert_eq!(decompose_reshape_dim(&Dim::Lit(64), &bounds), (64, 0));
+        assert_eq!(decompose_reshape_dim(&Dim::Lit(64), &bounds), (64, 0, 1));
 
         // Config bound folds at codegen time.
         assert_eq!(
             decompose_reshape_dim(&Dim::Bound("hidden_size".into()), &bounds),
-            (4096, 0)
+            (4096, 0, 1)
         );
 
         // num_tokens is the only runtime factor.
         assert_eq!(
             decompose_reshape_dim(&Dim::Bound("num_tokens".into()), &bounds),
-            (1, 1)
+            (1, 1, 1)
         );
 
-        // [num_tokens * num_attention_heads, head_dim]-style
-        // Mul folds bounds + counts num_tokens occurrences.
+        // [num_tokens * num_attention_heads, head_dim]-style Mul folds
+        // bounds + counts num_tokens occurrences.
         let dim = Dim::Mul(vec![
             Dim::Bound("num_tokens".into()),
             Dim::Bound("num_attention_heads".into()),
         ]);
-        assert_eq!(decompose_reshape_dim(&dim, &bounds), (32, 1));
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (32, 1, 1));
 
         // Pure literal product.
         let dim = Dim::Mul(vec![Dim::Lit(2), Dim::Bound("head_dim".into())]);
-        assert_eq!(decompose_reshape_dim(&dim, &bounds), (128, 0));
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (128, 0, 1));
+
+        // Div(num_tokens, vision_merge_factor) — the merger's first
+        // dim. Numerator stays `(1, 1)`, denominator closes to 4.
+        let dim = Dim::Div(
+            Box::new(Dim::Bound("num_tokens".into())),
+            Box::new(Dim::Bound("vision_merge_factor".into())),
+        );
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (1, 1, 4));
+
+        // Div(num, lit) — pure literal denominator.
+        let dim = Dim::Div(
+            Box::new(Dim::Bound("hidden_size".into())),
+            Box::new(Dim::Lit(8)),
+        );
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (4096, 0, 8));
+
+        // Mul(Div(...), Lit) — denominator survives composition.
+        let dim = Dim::Mul(vec![
+            Dim::Div(
+                Box::new(Dim::Bound("num_tokens".into())),
+                Box::new(Dim::Lit(2)),
+            ),
+            Dim::Lit(3),
+        ]);
+        assert_eq!(decompose_reshape_dim(&dim, &bounds), (3, 1, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "denominator may not contain `num_tokens`")]
+    fn decompose_reshape_dim_rejects_num_tokens_in_denominator() {
+        use crate::shape::Dim;
+        let bounds = std::collections::BTreeMap::new();
+        let dim = Dim::Div(
+            Box::new(Dim::Lit(4)),
+            Box::new(Dim::Bound("num_tokens".into())),
+        );
+        let _ = decompose_reshape_dim(&dim, &bounds);
     }
     fn empty_model(name: &str) -> crate::config::ModelParams {
         crate::config::ModelParams {
@@ -18283,6 +18391,737 @@ impl Implementation for MmEmbedSpliceImpl {
         Some(vec![OpInstance::new(
             syn::Ident::new("SpliceMmEmbeds", proc_macro2::Span::call_site()),
             vec![quote! { #slot_idx }],
+        )])
+    }
+}
+
+// ── Vision-tower Impls (Phase G.4) ───────────────────────────────
+//
+// Singleton matchers for the four vision OpKinds added in G.2
+// (`VarlenAttention`, `VisionRope`, `QuickGelu`, `GeluErf`). Each
+// claims one tile, calls one existing kernel, and emits one
+// `Instruction` row. No fusion peers yet — each is the only Impl
+// for its OpKind, so the DP solver has a deterministic claim.
+//
+// All four are unreachable until a `#[vision_forward]` body lands
+// (G.5+); registering them now keeps `OpKind::from_name`'s vision
+// arms total (parse ⟺ codegen) per the handoff bar.
+
+// ── LoadPixelsImpl (Phase G.5.e.1) ───────────────────────────────
+//
+// Singleton claiming `OpKind::LoadPixels` — synthesized by the
+// `vision_lowering::materialize_pixels` pass between `fuf::unroll`
+// and the solver. No FUF inputs, no weight inputs: the runtime tile
+// is built from `ctx.fwd.pixels` (the view the vision-side host
+// wrapper writes onto `ForwardCtx` before invoking the interpreter,
+// mirroring how text-side `Embed` reads `ctx.input_ids`). Emits a
+// single `Instruction::LoadPixels { out_slot }` row.
+//
+// This is the vision-side analog of `EmbedRefImpl`: both publish a
+// tile from an ambient `ForwardCtx` field rather than a tile
+// dataflow. The text path packs the read into `Embed` directly
+// (which also has a weight input — embed_tokens); the vision path
+// has no weight to anchor on, so the materialization needs its own
+// OpKind + Impl.
+
+#[derive(Debug, Default)]
+pub struct LoadPixelsImpl;
+
+impl Implementation for LoadPixelsImpl {
+    fn name(&self) -> &'static str {
+        "load_pixels"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::LoadPixels || !node.inputs.is_empty() {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: Vec::new(),
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        // Pure host-side metadata wrap of `ctx.fwd.pixels` — no
+        // device work and no alternative covering, so the DP
+        // tiebreaker value doesn't affect routing. Same zero-cost
+        // story as `MmEmbedSpliceImpl`.
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("LoadPixels", vec![("out_slot", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        _fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let out_slot = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("LoadPixels", proc_macro2::Span::call_site()),
+            vec![quote! { #out_slot }],
+        )])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VarlenAttentionImpl;
+
+impl Implementation for VarlenAttentionImpl {
+    fn name(&self) -> &'static str {
+        "varlen_attention"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::VarlenAttention)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same analytic shape as text-side prefill attention. The
+        // calibrated FA2 CSV is text-shape-keyed today; vision
+        // workloads need their own sweep before peer Impls compete on
+        // cost (see `feedback_calibrate_before_new_impl`). Until then
+        // the analytic estimate is the best we have.
+        cost_attention(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    // ── Host-interpreter codegen ────────────────────────────────
+    //
+    // Variant `VarlenAttention { q_slot, k_slot, v_slot, out_slot,
+    // cu_seqlens_kind }`. The `cu_seqlens_kind` discriminant is baked
+    // by `fan_out` from `node.inputs[3]`'s `ExternKind`:
+    //   - 0 = Default (`ForwardCtx::cu_seqlens_q` + `max_seqlen_q`) —
+    //         Qwen2-VL's single-cu-seqlens path.
+    //   - 1 = Full (`vision_cu_seqlens_full` + `vision_max_seqlen_full`)
+    //         — Qwen2.5-VL's fullatt-layer dispatch.
+    //   - 2 = Window (`vision_cu_seqlens_window` +
+    //         `vision_max_seqlen_window`) — Qwen2.5-VL's windowed-layer
+    //         dispatch.
+    // Eval switches on the discriminant and reads the matching pair.
+    // Scale, head count, and q_size are baked in `W::VISION_*` consts.
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "VarlenAttention",
+            vec![
+                ("q_slot", syn::parse_quote!(u32)),
+                ("k_slot", syn::parse_quote!(u32)),
+                ("v_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("cu_seqlens_kind", syn::parse_quote!(u8)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => {
+                    panic!("VarlenAttention: input {idx} must be a Tile (got {other:?})")
+                }
+            }
+        };
+        let (q_id, q_in) = resolve(0);
+        let (k_id, k_in) = resolve(1);
+        let (v_id, v_in) = resolve(2);
+        let cu_seqlens_kind: u8 = match node.inputs.get(3) {
+            Some(FufInput::Extern {
+                kind: ExternKind::CuSeqlens,
+                ..
+            }) => 0,
+            Some(FufInput::Extern {
+                kind: ExternKind::CuSeqlensFull,
+                ..
+            }) => 1,
+            Some(FufInput::Extern {
+                kind: ExternKind::CuSeqlensWindow,
+                ..
+            }) => 2,
+            other => panic!(
+                "VarlenAttention: input 3 must be a vision-prelude cu_seqlens extern \
+                 (cu_seqlens | cu_seqlens_full | cu_seqlens_window), got {other:?}"
+            ),
+        };
+        // Cross-check: input 4 must be the matching max_seqlen extern.
+        // Pairing is fixed by the body's call-site convention; the
+        // panic below catches a body that mixed `cu_seqlens_full` with
+        // `max_seqlen_window` (or any other unmatched pair) — a real
+        // bug rather than a silent misread.
+        match (cu_seqlens_kind, node.inputs.get(4)) {
+            (
+                0,
+                Some(FufInput::Extern {
+                    kind: ExternKind::MaxSeqlen,
+                    ..
+                }),
+            )
+            | (
+                1,
+                Some(FufInput::Extern {
+                    kind: ExternKind::MaxSeqlenFull,
+                    ..
+                }),
+            )
+            | (
+                2,
+                Some(FufInput::Extern {
+                    kind: ExternKind::MaxSeqlenWindow,
+                    ..
+                }),
+            ) => {}
+            (k, other) => panic!(
+                "VarlenAttention: cu_seqlens_kind={k} requires the matching max_seqlen \
+                 extern at input 4, got {other:?}"
+            ),
+        }
+        let q_slot = slots.of(q_id, q_in);
+        let k_slot = slots.of(k_id, k_in);
+        let v_slot = slots.of(v_id, v_in);
+        let out_slot = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("VarlenAttention", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #q_slot },
+                quote! { #k_slot },
+                quote! { #v_slot },
+                quote! { #out_slot },
+                quote! { #cu_seqlens_kind },
+            ],
+        )])
+    }
+}
+
+// ── VisionRopeImpl ───────────────────────────────────────────────
+//
+// Singleton on `OpKind::VisionRope`. Claims the 2-output pair-
+// rotation tile `(q', k') = vision_rope(q, k, cos, sin)` and emits
+// two `vision_rope_apply` calls (one for q, one for k) wrapped in
+// a single `Instruction::VisionRope` row. Both outputs are
+// take-owned-and-reinsert (in-place mutation pattern, same as
+// `TanhSoftCap`); the DSL's q' / k' bind to the same OwnedTensors
+// as q / k.
+
+#[derive(Debug, Default)]
+pub struct VisionRopeImpl;
+
+impl Implementation for VisionRopeImpl {
+    fn name(&self) -> &'static str {
+        "vision_rope"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::VisionRope)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: read + write q + k once each, plus cos/sin
+        // (small). Use the elementwise estimator over the q/k inputs
+        // — same shape as `Add` cost.
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        // The kernel mutates q and k in place; the eval body
+        // take_owned's both upstream tile-outputs and reinserts
+        // them at q_out_slot / k_out_slot. Codegen drop-pass must
+        // not schedule a Free for either upstream.
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut consumed = Vec::with_capacity(2);
+        for idx in 0..2 {
+            if let Some(FufInput::Tile { id, slot }) = node.inputs.get(idx) {
+                consumed.push((*id, *slot));
+            }
+        }
+        consumed
+    }
+
+    // ── Host-interpreter codegen ────────────────────────────────
+    //
+    // Variant `VisionRope { q_slot, k_slot, q_out_slot, k_out_slot }`.
+    // cos / sin flow through `ForwardCtx::vision_rope_cos` /
+    // `vision_rope_sin` (populated by `vision_forward` per call).
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "VisionRope",
+            vec![
+                ("q_slot", syn::parse_quote!(u32)),
+                ("k_slot", syn::parse_quote!(u32)),
+                ("q_out_slot", syn::parse_quote!(u32)),
+                ("k_out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => panic!("VisionRope: input {idx} must be a Tile (got {other:?})"),
+            }
+        };
+        let (q_id, q_in) = resolve(0);
+        let (k_id, k_in) = resolve(1);
+        let q_slot = slots.of(q_id, q_in);
+        let k_slot = slots.of(k_id, k_in);
+        let q_out_slot = slots.of(tile, 0);
+        let k_out_slot = slots.of(tile, 1);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("VisionRope", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #q_slot },
+                quote! { #k_slot },
+                quote! { #q_out_slot },
+                quote! { #k_out_slot },
+            ],
+        )])
+    }
+}
+
+// ── QuickGeluImpl ────────────────────────────────────────────────
+//
+// Singleton on `OpKind::QuickGelu`. Mirror of `TanhSoftCapImpl`'s
+// take-owned + in-place mutate + reinsert pattern. The kernel
+// `quick_gelu_inplace` mutates the buffer; the OwnedTensor moves
+// from `in_slot` to `out_slot`.
+
+#[derive(Debug, Default)]
+pub struct QuickGeluImpl;
+
+impl Implementation for QuickGeluImpl {
+    fn name(&self) -> &'static str {
+        "quick_gelu_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::QuickGelu)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("quick_gelu input is a tile");
+        vec![src]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "QuickGelu",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("QuickGelu: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("QuickGelu", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
+        )])
+    }
+}
+
+// ── GeluErfImpl ──────────────────────────────────────────────────
+//
+// Mirror of `QuickGeluImpl` — same shape, different kernel
+// (`gelu_erf_inplace`). Distinct OpKind because the numerics differ:
+// quick_gelu uses the 1.702-sigmoid approximation, gelu_erf uses
+// the exact erf form. Vision/CLIP-class arches calibrate weights
+// for one or the other; mismatching is silently wrong.
+
+#[derive(Debug, Default)]
+pub struct GeluErfImpl;
+
+impl Implementation for GeluErfImpl {
+    fn name(&self) -> &'static str {
+        "gelu_erf_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GeluErf)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("gelu_erf input is a tile");
+        vec![src]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GeluErf",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GeluErf: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("GeluErf", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
+        )])
+    }
+}
+
+// ── EmbeddingGatherImpl (Phase G.6.4) ────────────────────────────
+//
+// Singleton on `OpKind::EmbeddingGather`. Claims any DSL call to
+// `embedding_gather(x, indices)` and emits one
+// `Instruction::EmbeddingGather { in_slot, out_slot, indices_kind }`
+// row. The `indices` arg is a vision-prelude extern — exactly one of
+// `vision_window_index` / `vision_reverse_indices` (G.6.3). This Impl
+// reads `node.inputs[1]` to learn which extern the body referenced
+// and bakes a u8 discriminant into the opcode (0 = WindowIndex,
+// 1 = ReverseIndices) so the runtime arm reads the matching
+// `ForwardCtx` field. Unlike `QuickGelu` / `GeluErf` this is NOT an
+// in-place mutation — `kernels::embedding_gather` allocates a fresh
+// output buffer, so `consumes_input_tiles` stays empty (the source
+// tile is reused / freed by the standard drop pass).
+
+#[derive(Debug, Default)]
+pub struct EmbeddingGatherImpl;
+
+impl Implementation for EmbeddingGatherImpl {
+    fn name(&self) -> &'static str {
+        "embedding_gather"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::EmbeddingGather)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: read x + indices, write out — same shape
+        // as the elementwise estimator. The indices buffer is small
+        // (one u32 per row) so the dominant traffic is x's read.
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    // ── Host-interpreter codegen ────────────────────────────────
+    //
+    // Variant `EmbeddingGather { in_slot, out_slot, indices_kind }`.
+    // The indices buffer is read off `ForwardCtx::vision_window_index`
+    // (kind=0) or `ForwardCtx::vision_reverse_indices` (kind=1) — the
+    // runtime arm panics if the matching field is None, mirroring the
+    // `vision_rope_cos` / `vision_rope_sin` contract.
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "EmbeddingGather",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("indices_kind", syn::parse_quote!(u8)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("EmbeddingGather: input 0 must be a Tile (got {other:?})"),
+        };
+        let indices_kind: u8 = match node.inputs.get(1) {
+            Some(FufInput::Extern {
+                kind: ExternKind::WindowIndex,
+                ..
+            }) => 0,
+            Some(FufInput::Extern {
+                kind: ExternKind::ReverseIndices,
+                ..
+            }) => 1,
+            other => panic!(
+                "EmbeddingGather: input 1 must be a vision-prelude indices extern \
+                 (window_index | reverse_indices), got {other:?}"
+            ),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("EmbeddingGather", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #indices_kind },
+            ],
         )])
     }
 }

@@ -39,6 +39,29 @@ use crate::shape::{Dim, Shape, canonical_mul};
 pub struct WeightsManifest {
     pub entries: BTreeMap<String, Shape>,
     pub packed_splits: BTreeMap<String, Vec<String>>,
+    /// Optional `__pad_to_mult8__` top-level key — list of weights to
+    /// zero-pad on a specified axis to the next multiple of 8 at CPU
+    /// load time. Each entry pairs a stem (matched against the
+    /// indexed/unindexed loader convention, same as `entries`) with
+    /// the dim to pad: `[{ "weight": "mlp.down_proj", "dim": 0 }, ...]`.
+    /// Used by Qwen2.5-VL to dodge cuBLAS bf16 GEMM's K=3420 rejection
+    /// — `vision_intermediate_size` rounded to the next mult of 8 lands
+    /// every affected gemm on a supported algo (zero-fill rows/cols
+    /// preserve math because `silu(0)·0 = 0` on the activation side
+    /// and zero-row contractions are zero on the weight side).
+    pub pad_to_mult8: Vec<PadHint>,
+}
+
+/// One zero-pad-to-mult-8 entry from `__pad_to_mult8__`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadHint {
+    /// Weight stem (same naming convention as `entries`). For
+    /// indexed weights (per-block `mlp.down_proj`) the stem is
+    /// repeated under each layer index by the load-time prelude.
+    pub weight: String,
+    /// Axis to pad: 0 or 1. 0 = rows (pad N for an `[N, K]` weight);
+    /// 1 = cols (pad K for `[N, K]`, which is what `down_proj` needs).
+    pub dim: usize,
 }
 
 impl WeightsManifest {
@@ -70,6 +93,7 @@ impl WeightsManifest {
         Self {
             entries: out,
             packed_splits: BTreeMap::new(),
+            pad_to_mult8: Vec::new(),
         }
     }
 
@@ -179,7 +203,47 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
     })?;
     let mut entries: BTreeMap<String, Shape> = BTreeMap::new();
     let mut packed_splits: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut pad_to_mult8: Vec<PadHint> = Vec::new();
     for (k, v) in obj {
+        if k == "__pad_to_mult8__" {
+            let arr = v.as_array().ok_or_else(|| ManifestError::BadShape {
+                path: path.to_path_buf(),
+                weight: k.clone(),
+                reason: "`__pad_to_mult8__` must be an array of `{weight, dim}` objects".into(),
+            })?;
+            for (i, item) in arr.iter().enumerate() {
+                let obj = item.as_object().ok_or_else(|| ManifestError::BadShape {
+                    path: path.to_path_buf(),
+                    weight: k.clone(),
+                    reason: format!("entry {i} is not an object"),
+                })?;
+                let weight = obj
+                    .get("weight")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ManifestError::BadShape {
+                        path: path.to_path_buf(),
+                        weight: k.clone(),
+                        reason: format!("entry {i} missing `weight: \"<stem>\"`"),
+                    })?
+                    .to_string();
+                let dim = obj.get("dim").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    ManifestError::BadShape {
+                        path: path.to_path_buf(),
+                        weight: k.clone(),
+                        reason: format!("entry {i} (`{weight}`) missing integer `dim` field"),
+                    }
+                })? as usize;
+                if dim > 1 {
+                    return Err(ManifestError::BadShape {
+                        path: path.to_path_buf(),
+                        weight: k.clone(),
+                        reason: format!("entry {i} (`{weight}`): dim must be 0 or 1, got {dim}"),
+                    });
+                }
+                pad_to_mult8.push(PadHint { weight, dim });
+            }
+            continue;
+        }
         if k == "__packed_splits__" {
             let map = v.as_object().ok_or_else(|| ManifestError::BadShape {
                 path: path.to_path_buf(),
@@ -217,6 +281,7 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
     Ok(WeightsManifest {
         entries,
         packed_splits,
+        pad_to_mult8,
     })
 }
 
@@ -315,5 +380,64 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let m = load_or_empty(&tmp).unwrap();
         assert!(m.entries.is_empty());
+        assert!(m.pad_to_mult8.is_empty());
+    }
+
+    #[test]
+    fn parses_pad_to_mult8_top_level_array() {
+        // G.6.5 contract: `__pad_to_mult8__` is a top-level array of
+        // `{ "weight": "...", "dim": 0|1 }` objects. Order is
+        // preserved, dim is parsed as usize, and other top-level keys
+        // (regular weight stems) coexist cleanly.
+        let tmp = std::env::temp_dir().join("ferrite_pad_mult8_manifest_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("weights.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "__pad_to_mult8__": [
+                {"weight": "mlp.gate_proj", "dim": 0},
+                {"weight": "mlp.up_proj", "dim": 0},
+                {"weight": "mlp.down_proj", "dim": 1}
+              ],
+              "norm1": ["vision_embed_dim"]
+            }"#,
+        )
+        .unwrap();
+        let m = load_file(&path).expect("load_file");
+        assert_eq!(m.pad_to_mult8.len(), 3);
+        assert_eq!(
+            m.pad_to_mult8[0],
+            PadHint {
+                weight: "mlp.gate_proj".into(),
+                dim: 0
+            }
+        );
+        assert_eq!(
+            m.pad_to_mult8[2],
+            PadHint {
+                weight: "mlp.down_proj".into(),
+                dim: 1
+            }
+        );
+        // Coexists with regular entries.
+        assert!(m.entries.contains_key("norm1"));
+    }
+
+    #[test]
+    fn pad_to_mult8_rejects_dim_out_of_range() {
+        let tmp = std::env::temp_dir().join("ferrite_pad_mult8_bad_dim_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("weights.json");
+        std::fs::write(
+            &path,
+            r#"{ "__pad_to_mult8__": [{"weight": "x", "dim": 7}] }"#,
+        )
+        .unwrap();
+        let err = load_file(&path).expect_err("dim=7 is out of range");
+        let msg = format!("{err}");
+        assert!(msg.contains("dim must be 0 or 1"), "got: {msg}");
     }
 }

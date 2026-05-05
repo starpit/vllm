@@ -44,6 +44,16 @@ pub enum Dim {
     Bound(String),
     /// Product of subterms. Canonically flattened: no nested Mul.
     Mul(Vec<Dim>),
+    /// Quotient: `numerator / denominator`. Surfaced today only by
+    /// DSL-authored reshape arithmetic (`num_tokens /
+    /// vision_merge_factor`). The Solver treats it as concrete:
+    /// `unify` checks structural equality, `walk` / `close_dim`
+    /// recurse into both children. `eval_closed_dim` evaluates by
+    /// integer division (caller's responsibility to ensure the
+    /// dividend is exactly divisible at runtime — the merger
+    /// reshape's `total_l / spatial_merge_size**2` is always
+    /// exact).
+    Div(Box<Dim>, Box<Dim>),
     /// Unresolved variable. Must be resolved before inference
     /// completes or shape inference reports an error.
     Var(DimVar),
@@ -95,25 +105,6 @@ impl Solver {
         let a = self.walk(a);
         let b = self.walk(b);
         match (&a, &b) {
-            // Both resolved concrete: must structurally match.
-            (Dim::Lit(_), Dim::Lit(_))
-            | (Dim::Bound(_), Dim::Bound(_))
-            | (Dim::Mul(_), Dim::Mul(_))
-            | (Dim::Lit(_), Dim::Bound(_))
-            | (Dim::Bound(_), Dim::Lit(_))
-            | (Dim::Lit(_), Dim::Mul(_))
-            | (Dim::Mul(_), Dim::Lit(_))
-            | (Dim::Bound(_), Dim::Mul(_))
-            | (Dim::Mul(_), Dim::Bound(_)) => {
-                if dims_structurally_equal(&a, &b) {
-                    Ok(())
-                } else {
-                    Err(ShapeError::Mismatch {
-                        lhs: a.clone(),
-                        rhs: b.clone(),
-                    })
-                }
-            }
             // One var, one concrete: bind the var.
             (Dim::Var(v), other) | (other, Dim::Var(v)) => {
                 let root = self.find(*v);
@@ -130,6 +121,19 @@ impl Solver {
                 } else {
                     self.binding.insert(root, other.clone());
                     Ok(())
+                }
+            }
+            // Both resolved concrete (Lit / Bound / Mul / Div in any
+            // pairing): must structurally match. Mul/Div trees are
+            // walked recursively by `dims_structurally_equal`.
+            _ => {
+                if dims_structurally_equal(&a, &b) {
+                    Ok(())
+                } else {
+                    Err(ShapeError::Mismatch {
+                        lhs: a.clone(),
+                        rhs: b.clone(),
+                    })
                 }
             }
         }
@@ -150,6 +154,11 @@ impl Solver {
             Dim::Mul(children) => {
                 let walked: Vec<Dim> = children.iter().map(|c| self.walk(c)).collect();
                 canonical_mul(walked)
+            }
+            Dim::Div(num, den) => {
+                let n = self.walk(num);
+                let d = self.walk(den);
+                Dim::Div(Box::new(n), Box::new(d))
             }
             other => other.clone(),
         }
@@ -173,6 +182,11 @@ impl Solver {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(canonical_mul(cs))
             }
+            Dim::Div(num, den) => {
+                let n = self.close_dim(&num)?;
+                let d = self.close_dim(&den)?;
+                Ok(Dim::Div(Box::new(n), Box::new(d)))
+            }
             other => Ok(other),
         }
     }
@@ -188,6 +202,9 @@ fn dims_structurally_equal(a: &Dim, b: &Dim) -> bool {
         (Dim::Bound(x), Dim::Bound(y)) => x == y,
         (Dim::Mul(x), Dim::Mul(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| dims_structurally_equal(p, q))
+        }
+        (Dim::Div(n1, d1), Dim::Div(n2, d2)) => {
+            dims_structurally_equal(n1, n2) && dims_structurally_equal(d1, d2)
         }
         // A Lit(1) is identity for Mul — don't worry about that here,
         // canonical_mul handles it.
@@ -225,7 +242,8 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             Dim::Bound(_) => 0,
             Dim::Lit(_) => 1,
             Dim::Mul(_) => 2,
-            Dim::Var(_) => 3,
+            Dim::Div(_, _) => 3,
+            Dim::Var(_) => 4,
         }
     }
     match rank(a).cmp(&rank(b)) {
@@ -233,6 +251,9 @@ fn dim_cmp(a: &Dim, b: &Dim) -> std::cmp::Ordering {
             (Dim::Bound(x), Dim::Bound(y)) => x.cmp(y),
             (Dim::Lit(x), Dim::Lit(y)) => x.cmp(y),
             (Dim::Mul(x), Dim::Mul(y)) => x.len().cmp(&y.len()),
+            // Div ordering is opaque (no internal order needed for
+            // canonicalization; only one Div per merger reshape today).
+            (Dim::Div(_, _), Dim::Div(_, _)) => Ordering::Equal,
             (Dim::Var(x), Dim::Var(y)) => x.0.cmp(&y.0),
             _ => unreachable!(),
         },
@@ -321,6 +342,7 @@ fn show_dim(d: &Dim) -> String {
         Dim::Lit(n) => n.to_string(),
         Dim::Bound(n) => n.clone(),
         Dim::Mul(cs) => cs.iter().map(show_dim).collect::<Vec<_>>().join(" * "),
+        Dim::Div(num, den) => format!("({} / {})", show_dim(num), show_dim(den)),
         Dim::Var(v) => format!("?{}", v.0),
     }
 }
@@ -356,8 +378,16 @@ pub fn apply_signature(
         // in the picked kernel (window-masked vs. dense), not in
         // the type signature.
         OpKind::SlidingAttention => sig_attention(solver, inputs),
+        // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
+        // No heads-layout anchoring — vision shapes are pinned at
+        // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
+        OpKind::VarlenAttention => sig_varlen_attention(solver, inputs),
         OpKind::Silu => sig_unary_elementwise(solver, inputs, op),
         OpKind::Gelu => sig_unary_elementwise(solver, inputs, op),
+        // QuickGelu / GeluErf are unary elementwise like Gelu; the
+        // numerical distinction lives in the picked kernel.
+        OpKind::QuickGelu => sig_unary_elementwise(solver, inputs, op),
+        OpKind::GeluErf => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
         // Same shape-preserving rule as `Add`. Used inside the
@@ -401,6 +431,11 @@ pub fn apply_signature(
                      Program::reshape_targets directly"
                 .into(),
         }),
+        // VisionRope is tuple-returning `(q', k') = vision_rope(q, k, cos, sin)`;
+        // `Stmt::AssignTuple` handles the 2-target binding directly. Reaching
+        // this arm via `apply_signature` (single-target) is fine — returns q's
+        // shape, same shape-preserving semantics.
+        OpKind::VisionRope => sig_vision_rope(solver, inputs),
         OpKind::MlaSplit => sig_mla_split(solver, inputs),
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
         OpKind::Moe => sig_moe(solver, inputs),
@@ -412,6 +447,25 @@ pub fn apply_signature(
         // this arm via `apply_signature` is fine: sig_unary_elementwise
         // re-unifies and agrees.
         OpKind::MmEmbedSplice => sig_unary_elementwise(solver, inputs, op),
+        // LoadPixels has no FUF inputs (the runtime tile is built
+        // from `ctx.fwd.pixels`). The materialize_pixels pass writes
+        // `outputs[0] = extern_shape(ExternKind::Pixels)` directly
+        // when inserting the node; the FUF-level shape unifier never
+        // re-derives it. Reaching this arm is a compiler bug — same
+        // story as `AllGather` and `Reshape`.
+        OpKind::LoadPixels => Err(ShapeError::BadArgs {
+            op: OpKind::LoadPixels,
+            reason: "apply_signature should not be called on LoadPixels; \
+                     the vision_lowering::materialize_pixels pass sets \
+                     FufNode.outputs[0] to extern_shape(Pixels) directly \
+                     when inserting the node post-FUF-build"
+                .into(),
+        }),
+        // Row-permutation gather: shape-preserving on x. The indices
+        // arg is a vision extern with an opaque empty Shape (rank-1
+        // u32 of length L), so unification against x's leading dim
+        // would fail — we don't try.
+        OpKind::EmbeddingGather => sig_embedding_gather(solver, inputs),
     }
 }
 
@@ -596,6 +650,56 @@ fn sig_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeEr
     Ok(OpSig { output: q.clone() })
 }
 
+/// `varlen_attention(q, k, v, cu_seqlens, max_seqlen)` →
+/// `q.shape`. Vision-encoder attention. Inputs: q/k/v all rank-2
+/// `[total_L, num_heads * head_dim]` (vision-side; the heads-layout
+/// anchoring lives at the qkv-producing gemm, not here). cu_seqlens
+/// and max_seqlen are opaque externs with empty shapes.
+fn sig_varlen_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::VarlenAttention, inputs, 5)?;
+    let q = &inputs[0];
+    if q.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::VarlenAttention,
+            reason: "q must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: q.clone() })
+}
+
+/// `vision_rope(q, k, cos, sin)` → `(q', k')`. Single-output sig
+/// returns q's shape; `Stmt::AssignTuple` binds the second target
+/// to k's shape. Shape-preserving on both q and k. cos/sin are
+/// opaque externs (built host-side from grid_thw); empty shapes.
+fn sig_vision_rope(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::VisionRope, inputs, 4)?;
+    let q = &inputs[0];
+    if q.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::VisionRope,
+            reason: "q must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: q.clone() })
+}
+
+/// `embedding_gather(x: [L, N], indices: opaque)` → `[L, N]`.
+/// Row-permutation: shape-preserving on x. The indices extern is
+/// opaque (rank-1 u32 length L, but its [`crate::classified::ExternKind`]
+/// `extern_shape` arm carries an empty Shape), so we don't try to
+/// unify L against it — the runtime guarantees lengths match.
+fn sig_embedding_gather(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::EmbeddingGather, inputs, 2)?;
+    let x = &inputs[0];
+    if x.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::EmbeddingGather,
+            reason: "x must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig { output: x.clone() })
+}
+
 /// `mla_split(kv_a: [T, kv_lora_rank + qk_rope_head_dim])` → (used as
 /// single-output sig by `apply_signature`; actual 2-tuple binding happens
 /// in `Stmt::AssignTuple` which calls this path first for validation).
@@ -722,8 +826,12 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::RopeAppendInterleaved => &[],
         OpKind::Attention => &[],
         OpKind::SlidingAttention => &[],
+        OpKind::VarlenAttention => &[],
         OpKind::Silu => &[],
         OpKind::Gelu => &[],
+        OpKind::QuickGelu => &[],
+        OpKind::GeluErf => &[],
+        OpKind::VisionRope => &[],
         OpKind::TanhSoftCap => &[],
         OpKind::Add => &[],
         OpKind::Sub => &[],
@@ -744,6 +852,13 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::Moe => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
         OpKind::MmEmbedSplice => &[],
+        // LoadPixels has zero FUF inputs (the tile is materialized
+        // from `ctx.fwd.pixels` at runtime), so no weight-arg ranks.
+        OpKind::LoadPixels => &[],
+        // EmbeddingGather: arg 0 is a tile, arg 1 is a vision extern
+        // (no rank assertion via this table — extern_shape arms carry
+        // empty Shape for the indices externs).
+        OpKind::EmbeddingGather => &[],
     }
 }
 
@@ -774,6 +889,39 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         ExternKind::RotaryLocal => vec![],
         ExternKind::BlockTable => vec![],
         ExternKind::KvCache => vec![],
+        // Vision externs. `Pixels` has the per-row patch shape that
+        // shape inference needs to anchor the encoder's first GEMM
+        // (`patch_embed_proj`); `Cos`/`Sin` carry the per-row half-
+        // dim RoPE tables. The remaining vision externs are opaque
+        // (varlen index / per-image grid / scalar) — same role as
+        // the decoder's `BlockTable`/`KvCache`. Bound names anchor
+        // to vision-config fields populated by per-arch crates in
+        // G.5; until then they're symbolic placeholders that resolve
+        // only when a real vision config is loaded.
+        ExternKind::Pixels => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_in_features".into()),
+        ],
+        ExternKind::Cos => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_rope_half_dim".into()),
+        ],
+        ExternKind::Sin => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_rope_half_dim".into()),
+        ],
+        ExternKind::CuSeqlens => vec![],
+        ExternKind::GridThw => vec![],
+        ExternKind::MaxSeqlen => vec![],
+        // Qwen2.5-VL split externs — all opaque (rank-1 cu_seqlens, scalar
+        // max_seqlens, rank-1 permutations). Same role as their non-split
+        // siblings; shape inference doesn't need to model them.
+        ExternKind::CuSeqlensFull => vec![],
+        ExternKind::CuSeqlensWindow => vec![],
+        ExternKind::MaxSeqlenFull => vec![],
+        ExternKind::MaxSeqlenWindow => vec![],
+        ExternKind::WindowIndex => vec![],
+        ExternKind::ReverseIndices => vec![],
     }
 }
 
@@ -906,6 +1054,16 @@ pub(crate) fn eval_closed_dim(
         Dim::Mul(factors) => factors
             .iter()
             .try_fold(1u64, |acc, f| eval_closed_dim(f, bounds).map(|v| acc * v)),
+        Dim::Div(num, den) => {
+            let n = eval_closed_dim(num, bounds)?;
+            let d = eval_closed_dim(den, bounds)?;
+            // Caller's responsibility to keep the dividend exactly
+            // divisible — the merger reshape's `total_l /
+            // spatial_merge_size**2` always is. Truncating divide is
+            // fine for the bounds-equivalence check (mismatched
+            // remainders are caught by the unify path, not here).
+            if d == 0 { None } else { Some(n / d) }
+        }
         Dim::Var(_) => None,
     }
 }
@@ -1469,6 +1627,31 @@ impl InferCtx {
                     }
                     Ok(())
                 } else if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::VisionRope)
+                {
+                    // `(q, k) = vision_rope(q, k, cos, sin)`
+                    // Both outputs are shape-preserving on their
+                    // respective inputs. cos/sin are opaque externs.
+                    if targets.len() != 2 {
+                        return Err(ShapeError::BadArgs {
+                            op: *op,
+                            reason: format!(
+                                "vision_rope returns 2 values, got {} targets",
+                                targets.len()
+                            ),
+                        });
+                    }
+                    let q_shape = self.expr_shape(&args[0])?;
+                    let k_shape = self.expr_shape(&args[1])?;
+                    let all_input_shapes: Vec<Shape> = args
+                        .iter()
+                        .map(|a| self.expr_shape(a))
+                        .collect::<Result<_, _>>()?;
+                    apply_signature(&mut self.solver, *op, &all_input_shapes)?;
+                    self.locals.insert(targets[0], q_shape);
+                    self.locals.insert(targets[1], k_shape);
+                    Ok(())
+                } else if let Expr::Call { op, args } = value
                     && matches!(op, OpKind::MlaSplit)
                 {
                     // `(kv_latent, k_pe) = mla_split(kv_a)`
@@ -1504,7 +1687,7 @@ impl InferCtx {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append, rope_append_interleaved, and mla_split return a tuple".into(),
+                        reason: "only rope_append, rope_append_interleaved, vision_rope, and mla_split return a tuple".into(),
                     })
                 }
             }
@@ -1995,5 +2178,421 @@ mod tests {
             inf.weights.get(&down_id).unwrap(),
             &vec![bound("intermediate_size"), bound("hidden_size")],
         );
+    }
+
+    // ── Phase G.2 — vision OpKind shape signatures ──────────────
+    //
+    // These tests exercise `apply_signature` directly: the new
+    // OpKinds aren't reachable from `from_name` yet (per the
+    // parse-then-reject rule, the DSL surface lands with G.4 Impls
+    // and G.5 vision-forward bodies in lockstep). Tests pin the
+    // input arity and shape-preserving output.
+
+    #[test]
+    fn varlen_attention_arity_and_output_shape() {
+        let mut solver = Solver::new();
+        // q/k/v all rank-2 [total_L, vision_heads*head_dim]; cu_seqlens
+        // and max_seqlen are externs (empty shape).
+        let qkv_last = canonical_mul(vec![bound("vision_num_heads"), bound("vision_head_dim")]);
+        let q = vec![bound("total_L"), qkv_last.clone()];
+        let k = q.clone();
+        let v = q.clone();
+        let cu_seqlens = vec![];
+        let max_seqlen = vec![];
+        let sig = apply_signature(
+            &mut solver,
+            OpKind::VarlenAttention,
+            &[q.clone(), k, v, cu_seqlens, max_seqlen],
+        )
+        .expect("varlen_attention sig");
+        assert_eq!(sig.output, q, "output preserves q's shape");
+
+        // Wrong arity — must fail with ArgCount, not silently succeed.
+        let mut solver2 = Solver::new();
+        let err = apply_signature(
+            &mut solver2,
+            OpKind::VarlenAttention,
+            std::slice::from_ref(&q),
+        );
+        assert!(matches!(err, Err(ShapeError::ArgCount { .. })));
+    }
+
+    #[test]
+    fn vision_rope_arity_and_output_shape() {
+        let mut solver = Solver::new();
+        let q_last = canonical_mul(vec![bound("vision_num_heads"), bound("vision_head_dim")]);
+        let q = vec![bound("total_L"), q_last.clone()];
+        let k = q.clone();
+        let cos = vec![];
+        let sin = vec![];
+        let sig = apply_signature(&mut solver, OpKind::VisionRope, &[q.clone(), k, cos, sin])
+            .expect("vision_rope sig");
+        // apply_signature returns q's shape as the primary output;
+        // AssignTuple binds the second target separately.
+        assert_eq!(sig.output, q);
+
+        let mut solver2 = Solver::new();
+        let err = apply_signature(&mut solver2, OpKind::VisionRope, &[q]);
+        assert!(matches!(err, Err(ShapeError::ArgCount { .. })));
+    }
+
+    #[test]
+    fn quick_gelu_is_shape_preserving_unary() {
+        let mut solver = Solver::new();
+        let x = vec![bound("total_L"), bound("vision_intermediate_size")];
+        let sig = apply_signature(&mut solver, OpKind::QuickGelu, std::slice::from_ref(&x))
+            .expect("quick_gelu sig");
+        assert_eq!(sig.output, x);
+    }
+
+    #[test]
+    fn gelu_erf_is_shape_preserving_unary() {
+        let mut solver = Solver::new();
+        let x = vec![bound("total_L"), bound("vision_intermediate_size")];
+        let sig = apply_signature(&mut solver, OpKind::GeluErf, std::slice::from_ref(&x))
+            .expect("gelu_erf sig");
+        assert_eq!(sig.output, x);
+    }
+
+    #[test]
+    fn vision_op_names_round_trip_through_as_str() {
+        // OpKind::as_str must be total over every variant; these
+        // are the new names landed in G.2.
+        assert_eq!(OpKind::VarlenAttention.as_str(), "varlen_attention");
+        assert_eq!(OpKind::VisionRope.as_str(), "vision_rope");
+        assert_eq!(OpKind::QuickGelu.as_str(), "quick_gelu");
+        assert_eq!(OpKind::GeluErf.as_str(), "gelu_erf");
+        // G.6.4: row-permutation gather added for Qwen2.5-VL window
+        // attention dispatch. Round-trip required so DSL bodies that
+        // write `embedding_gather(...)` parse cleanly.
+        assert_eq!(OpKind::EmbeddingGather.as_str(), "embedding_gather");
+        assert_eq!(
+            OpKind::from_name("embedding_gather"),
+            Some(OpKind::EmbeddingGather)
+        );
+    }
+
+    #[test]
+    fn embedding_gather_is_shape_preserving_on_first_arg() {
+        // G.6.4 contract: `embedding_gather(x, indices)` returns x's
+        // shape unchanged. The indices arg is opaque (rank-0 / empty
+        // Shape, matching the `WindowIndex` / `ReverseIndices` extern
+        // arms), so the signature only inspects x.
+        let mut solver = Solver::new();
+        let x = vec![bound("num_tokens"), bound("vision_merge_hidden")];
+        let indices: Shape = vec![];
+        let sig = apply_signature(&mut solver, OpKind::EmbeddingGather, &[x.clone(), indices])
+            .expect("embedding_gather sig");
+        assert_eq!(sig.output, x);
+    }
+
+    #[test]
+    fn embedding_gather_rejects_arg_count_mismatch() {
+        let mut solver = Solver::new();
+        let x = vec![bound("num_tokens"), bound("vision_embed_dim")];
+        let err = apply_signature(&mut solver, OpKind::EmbeddingGather, &[x]);
+        assert!(matches!(err, Err(ShapeError::ArgCount { .. })));
+    }
+
+    #[test]
+    fn quick_gelu_and_gelu_erf_are_distinct_from_tanh_gelu() {
+        // Numerics-bearing distinction: the three GELU OpKinds must
+        // be PartialEq-distinct so consumer Impls can match exactly
+        // one of them. (Eq is derived; this test is a structural
+        // promise that future refactors can't accidentally collapse
+        // them onto a single variant.)
+        assert_ne!(OpKind::Gelu, OpKind::QuickGelu);
+        assert_ne!(OpKind::Gelu, OpKind::GeluErf);
+        assert_ne!(OpKind::QuickGelu, OpKind::GeluErf);
+    }
+
+    #[test]
+    fn vision_op_names_resolve_via_from_name() {
+        // G.4 gate: every name `OpKind::as_str` returns must round-
+        // trip through `from_name`, otherwise classify rejects DSL
+        // bodies that wrote the op (parse-then-reject violation).
+        // Locks in the four arms added in G.4 lockstep with the
+        // existing matchers in `impl_lib::starter_library`.
+        assert_eq!(
+            OpKind::from_name("varlen_attention"),
+            Some(OpKind::VarlenAttention)
+        );
+        assert_eq!(OpKind::from_name("vision_rope"), Some(OpKind::VisionRope));
+        assert_eq!(OpKind::from_name("quick_gelu"), Some(OpKind::QuickGelu));
+        assert_eq!(OpKind::from_name("gelu_erf"), Some(OpKind::GeluErf));
+    }
+
+    #[test]
+    fn dsl_authored_reshape_threads_through_shape_infer() {
+        // End-to-end gate for G.5.c: a DSL body that writes
+        // `out = reshape(x, [a, b])` must classify and shape-infer
+        // without recovery, with the output local picking up the
+        // declared dims from `Program::reshape_targets` exactly the
+        // way a synthesized reshape would.
+        //
+        // The body is intentionally minimal — just enough to prove
+        // the wiring chain:
+        //   parse → classify → shape::infer → Inferred.locals[out]
+        // is the dims we wrote in the DSL.
+        let p = {
+            let file: syn::File = syn::parse_str(
+                "fn _carrier() { y = reshape(input_layernorm, [num_tokens, hidden_size]); }",
+            )
+            .expect("syn parse");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            crate::classify::classify(&ast).expect("classify")
+        };
+
+        // Sanity: classify recorded the target shape.
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p
+            .reshape_targets
+            .get(&target)
+            .expect("reshape_targets entry");
+        assert_eq!(dims, &vec![bound("num_tokens"), bound("hidden_size")]);
+
+        // shape::infer must pick those dims up directly (no
+        // ReshapeRecovery, no Mismatch). The empty manifest path is
+        // the simplest cell since this body never references a
+        // weight that needs anchoring.
+        let manifest = crate::weights_manifest::WeightsManifest::empty();
+        let bounds = std::collections::BTreeMap::from([
+            ("num_tokens".to_string(), 256_u64),
+            ("hidden_size".to_string(), 1280_u64),
+        ]);
+        let inferred = infer(&p, &manifest, &bounds).expect("shape::infer must succeed");
+
+        // The reshape's output local carries the exact dims we wrote.
+        let out_shape = inferred
+            .locals
+            .get(&target)
+            .expect("inferred shape for `y`");
+        assert_eq!(
+            out_shape,
+            &vec![bound("num_tokens"), bound("hidden_size")],
+            "DSL-authored reshape output must equal the declared target shape",
+        );
+    }
+
+    #[test]
+    fn dsl_authored_reshape_arithmetic_threads_through_shape_infer() {
+        // G.5.f.a checkpoint: the merger reshape's
+        // `[num_tokens / vision_merge_factor, vision_merge_hidden]`
+        // shape-infers cleanly under qwen2-vl-2b bounds. The closed
+        // form of the first dim is `Dim::Div(num_tokens,
+        // vision_merge_factor)` — kept symbolic through shape::infer
+        // (the codegen folds the divisor against `bounds` later).
+        let p = {
+            let file: syn::File = syn::parse_str(
+                "fn _carrier() {\n\
+                 merged = reshape(pixels, [num_tokens / vision_merge_factor, vision_merge_hidden]);\n\
+                 }",
+            )
+            .expect("syn parse");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            crate::classify::classify_with(&ast, crate::classified::Prelude::Vision)
+                .expect("classify (vision prelude)")
+        };
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("ferrite-model-qwen2-vl")
+            .join("configs");
+        let configs = crate::config::load_dir(&dir).expect("load qwen2-vl configs");
+        let cfg = configs
+            .iter()
+            .find(|c| c.source_stem == "qwen2-vl-2b")
+            .expect("qwen2-vl-2b config present");
+        let mut bounds: std::collections::BTreeMap<String, u64> = cfg.bounds.clone();
+        bounds.insert("num_tokens".into(), 256);
+
+        let manifest = crate::weights_manifest::WeightsManifest::empty();
+        let inferred = infer(&p, &manifest, &bounds).expect("shape::infer must succeed");
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let out = inferred.locals.get(&target).expect("inferred shape");
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            Dim::Div(num, den) => {
+                assert!(matches!(num.as_ref(), Dim::Bound(n) if n == "num_tokens"));
+                assert!(matches!(den.as_ref(), Dim::Bound(n) if n == "vision_merge_factor"));
+            }
+            other => panic!("expected Dim::Div for first dim, got {other:?}"),
+        }
+        assert!(matches!(&out[1], Dim::Bound(n) if n == "vision_merge_hidden"));
+
+        // Numerical evaluation closes via `eval_closed_dim` —
+        // 256 / 4 = 64. The codegen reads this same number out of
+        // `decompose_reshape_dim`'s denominator field.
+        assert_eq!(eval_closed_dim(&out[0], &bounds), Some(64));
+        assert_eq!(eval_closed_dim(&out[1], &bounds), Some(5120));
+    }
+
+    #[test]
+    fn vision_prelude_externs_shape_infer_under_qwen2_vl_2b_bounds() {
+        // G.5.d checkpoint: a vision-prelude DSL body referencing
+        // `pixels` / `cos` / `sin` must shape-infer cleanly under the
+        // qwen2-vl-2b config, with each extern's shape resolving to
+        // the bound names declared in `extern_shape`. No production
+        // change at G.5.d — the test pins the already-wired chain
+        // (`extern_shape` arms ← G.5.b vision-config bounds) so a
+        // future edit that desyncs the two trips here, before it
+        // reaches a `#[vision_forward]` expansion.
+        let p = {
+            let file: syn::File = syn::parse_str(
+                "fn _carrier() {\n\
+                 pixels_out = pixels;\n\
+                 cos_out = cos;\n\
+                 sin_out = sin;\n\
+                 }",
+            )
+            .expect("syn parse");
+            let block = match &file.items[0] {
+                syn::Item::Fn(f) => &*f.block,
+                _ => unreachable!(),
+            };
+            let ast = crate::parse::parse_block(block).expect("DSL parse");
+            crate::classify::classify_with(&ast, crate::classified::Prelude::Vision)
+                .expect("classify (vision prelude)")
+        };
+
+        // Bounds come from the real qwen2-vl-2b config (G.5.b).
+        // `extern_shape` for `Pixels` anchors on `vision_in_features`;
+        // for `Cos`/`Sin` on `vision_rope_half_dim`. `num_tokens` is
+        // the workload axis the vision encoder reuses (batched-total
+        // flat L per the handoff §"Open question 1" resolution).
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("ferrite-model-qwen2-vl")
+            .join("configs");
+        let configs = crate::config::load_dir(&dir).expect("load qwen2-vl configs");
+        let cfg = configs
+            .iter()
+            .find(|c| c.source_stem == "qwen2-vl-2b")
+            .expect("qwen2-vl-2b config present");
+        let mut bounds: std::collections::BTreeMap<String, u64> = cfg.bounds.clone();
+        bounds.insert("num_tokens".into(), 256);
+
+        let manifest = crate::weights_manifest::WeightsManifest::empty();
+        let inferred = infer(&p, &manifest, &bounds).expect("shape::infer must succeed");
+
+        // Each statement's target carries the shape from its extern's
+        // arm in `extern_shape`. Bound names — not Lit ints — close
+        // through `Solver::close_shape`; this mirrors how the FUF
+        // consumes shapes (numerical evaluation lives at codegen).
+        let target_named = |name: &str| -> LocalId {
+            for s in &p.statements {
+                if let Stmt::Assign { target, .. } = s
+                    && *p.locals.name(*target) == name
+                {
+                    return *target;
+                }
+            }
+            panic!("missing target {name}");
+        };
+        assert_eq!(
+            inferred.locals.get(&target_named("pixels_out")).unwrap(),
+            &vec![bound("num_tokens"), bound("vision_in_features")],
+            "`pixels` extern must resolve to [num_tokens, vision_in_features]",
+        );
+        assert_eq!(
+            inferred.locals.get(&target_named("cos_out")).unwrap(),
+            &vec![bound("num_tokens"), bound("vision_rope_half_dim")],
+            "`cos` extern must resolve to [num_tokens, vision_rope_half_dim]",
+        );
+        assert_eq!(
+            inferred.locals.get(&target_named("sin_out")).unwrap(),
+            &vec![bound("num_tokens"), bound("vision_rope_half_dim")],
+            "`sin` extern must resolve to [num_tokens, vision_rope_half_dim]",
+        );
+
+        // Closing the loop: those bound names exist in qwen2-vl-2b's
+        // config bounds, so a downstream consumer (e.g. a real
+        // `#[vision_forward]` expansion at G.5.e) will be able to
+        // numerically evaluate the inferred shapes.
+        assert_eq!(bounds.get("vision_in_features"), Some(&1176));
+        assert_eq!(bounds.get("vision_rope_half_dim"), Some(&40));
+    }
+
+    #[test]
+    fn qwen2_5_vl_split_externs_classify_under_vision_prelude() {
+        // G.6.3: the four cu_seqlens/max_seqlen split externs and the
+        // window_index / reverse_indices permutation externs must
+        // classify under the vision prelude. Decoder prelude must
+        // continue to NOT see them — pin both directions so a future
+        // edit that leaks them into the decoder set trips here.
+        use crate::classified::{ExternKind, Prelude};
+        let names = [
+            ("cu_seqlens_full", ExternKind::CuSeqlensFull),
+            ("cu_seqlens_window", ExternKind::CuSeqlensWindow),
+            ("max_seqlen_full", ExternKind::MaxSeqlenFull),
+            ("max_seqlen_window", ExternKind::MaxSeqlenWindow),
+            ("window_index", ExternKind::WindowIndex),
+            ("reverse_indices", ExternKind::ReverseIndices),
+        ];
+        for (name, kind) in names {
+            assert_eq!(
+                ExternKind::from_name_for(name, Prelude::Vision),
+                Some(kind),
+                "vision prelude must resolve {name}",
+            );
+            assert_eq!(
+                ExternKind::from_name_for(name, Prelude::Decoder),
+                None,
+                "decoder prelude must NOT resolve {name}",
+            );
+            // All six new externs are opaque (rank-0); shape::infer
+            // for any vision body that names them shouldn't synthesize
+            // dimensions for them.
+            assert!(
+                extern_shape(kind).is_empty(),
+                "{name} extern must be opaque (rank-0)",
+            );
+        }
+    }
+
+    #[test]
+    fn load_pixels_is_lowering_only_op_kind() {
+        // G.5.e.1 contract: `LoadPixels` is produced exclusively by
+        // the `vision_lowering::materialize_pixels` pass between
+        // `fuf::unroll` and the solver. It must NOT be reachable via
+        // `from_name` (no parse-then-reject — a user that wrote
+        // `load_pixels(...)` in a `#[vision_forward]` body classifies
+        // as an unknown op rather than an OpKind that any consumer is
+        // unprepared for), and `apply_signature` must error out on it
+        // (mirrors `AllGather` / `Reshape` — the materialize pass
+        // writes `outputs[0]` directly when constructing the node).
+        assert_eq!(OpKind::LoadPixels.as_str(), "load_pixels");
+        assert_eq!(OpKind::from_name("load_pixels"), None);
+        assert_eq!(weight_arg_ranks(OpKind::LoadPixels), &[]);
+
+        let mut solver = Solver::new();
+        let err = apply_signature(&mut solver, OpKind::LoadPixels, &[]);
+        match err {
+            Err(ShapeError::BadArgs { op, reason }) => {
+                assert_eq!(op, OpKind::LoadPixels);
+                assert!(
+                    reason.contains("materialize_pixels"),
+                    "reason must point at the lowering pass, got: {reason}",
+                );
+            }
+            Err(other) => {
+                panic!("LoadPixels apply_signature must return BadArgs, got error: {other:?}")
+            }
+            Ok(_) => panic!("LoadPixels apply_signature must error, not succeed"),
+        }
     }
 }

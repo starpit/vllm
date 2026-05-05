@@ -20,7 +20,7 @@
 use syn::spanned::Spanned;
 use syn::{BinOp, Block, Expr as SynExpr, ExprLit, Lit, Pat, Stmt as SynStmt};
 
-use crate::ast::{Ast, BoolExpr, BoundExpr, Expr, Stmt};
+use crate::ast::{Ast, BoolExpr, BoundExpr, DimSpec, Expr, Stmt};
 
 pub type ParseResult<T> = Result<T, syn::Error>;
 
@@ -157,14 +157,73 @@ fn parse_if(i: &syn::ExprIf) -> ParseResult<Stmt> {
     })
 }
 
-/// Parse a boolean predicate for an `if` condition. Accepts only
-/// two shapes: `ivar % <bound> == <bound>` or `ivar < <bound>`,
-/// where `ivar` is a plain identifier (must refer to an enclosing
-/// loop induction variable; classify enforces this) and `<bound>`
-/// is an integer literal or a bare identifier naming a per-model
-/// bound (e.g. `sliding_window_pattern`).
+/// Parse a boolean predicate for an `if` condition. Accepts four
+/// shapes:
+///   - `ivar % <bound> == <bound>`
+///   - `ivar % <bound> != <bound>`
+///   - `ivar < <bound>`
+///   - `[lit, lit, ...].contains(&ivar)`
+///
+/// `ivar` is a plain identifier (must refer to an enclosing loop
+/// induction variable; classify enforces this) and `<bound>` is an
+/// integer literal or a bare identifier naming a per-model bound
+/// (e.g. `sliding_window_pattern`). The `.contains` form takes only
+/// integer literals on the array side — symbolic bounds aren't
+/// useful for the "static, hand-listed set of layer indices" use
+/// case (e.g. Qwen2.5-VL's `fullatt_block_indexes`).
 fn parse_bool_expr(expr: &SynExpr) -> ParseResult<BoolExpr> {
     let expr = unwrap_parens(expr);
+    // `[lit, lit, ...].contains(&ivar)` — set membership.
+    if let SynExpr::MethodCall(mc) = expr
+        && mc.method == "contains"
+    {
+        let arr = match unwrap_parens(&mc.receiver) {
+            SynExpr::Array(a) => a,
+            other => {
+                return Err(syn::Error::new(
+                    other.span(),
+                    "`.contains(&ivar)` predicate requires an array literal `[lit, lit, ...]` \
+                     as receiver",
+                ));
+            }
+        };
+        if arr.elems.is_empty() {
+            return Err(syn::Error::new(
+                arr.span(),
+                "`.contains(&ivar)` predicate array must have at least one element",
+            ));
+        }
+        let members: Vec<u64> = arr
+            .elems
+            .iter()
+            .map(|e| match unwrap_parens(e) {
+                SynExpr::Lit(ExprLit {
+                    lit: Lit::Int(i), ..
+                }) => i.base10_parse(),
+                other => Err(syn::Error::new(
+                    other.span(),
+                    "`.contains(&ivar)` predicate array elements must be integer literals",
+                )),
+            })
+            .collect::<ParseResult<_>>()?;
+        if mc.args.len() != 1 {
+            return Err(syn::Error::new(
+                mc.span(),
+                "`.contains(&ivar)` predicate takes exactly one argument: `&ivar`",
+            ));
+        }
+        let arg = unwrap_parens(&mc.args[0]);
+        let ivar = match arg {
+            SynExpr::Reference(r) => parse_ivar(&r.expr)?,
+            other => {
+                return Err(syn::Error::new(
+                    other.span(),
+                    "`.contains` argument must be `&ivar` (a reference to the loop variable)",
+                ));
+            }
+        };
+        return Ok(BoolExpr::In { ivar, members });
+    }
     match expr {
         SynExpr::Binary(b) => match b.op {
             BinOp::Eq(_) => {
@@ -224,7 +283,8 @@ fn parse_bool_expr(expr: &SynExpr) -> ParseResult<BoolExpr> {
         other => Err(syn::Error::new(
             other.span(),
             "`if` condition must be `ivar % <bound> == <bound>`, \
-             `ivar % <bound> != <bound>`, or `ivar < <bound>`",
+             `ivar % <bound> != <bound>`, `ivar < <bound>`, \
+             or `[lit, lit, ...].contains(&ivar)`",
         )),
     }
 }
@@ -279,6 +339,60 @@ fn parse_bound(expr: &SynExpr) -> ParseResult<BoundExpr> {
         other => Err(syn::Error::new(
             other.span(),
             "loop bound must be an integer literal or a bare identifier",
+        )),
+    }
+}
+
+/// Parse the second argument of `reshape(source, [..])` — an array
+/// literal of integer literals and bound identifiers. Each element
+/// is one output dimension.
+fn parse_dim_array(expr: &SynExpr) -> ParseResult<Vec<DimSpec>> {
+    let arr = match unwrap_parens(expr) {
+        SynExpr::Array(a) => a,
+        other => {
+            return Err(syn::Error::new(
+                other.span(),
+                "reshape target shape must be an array literal `[dim0, dim1, ...]`",
+            ));
+        }
+    };
+    if arr.elems.is_empty() {
+        return Err(syn::Error::new(
+            arr.span(),
+            "reshape target shape must have at least one dim",
+        ));
+    }
+    arr.elems.iter().map(parse_dim_spec).collect()
+}
+
+/// Parse one dim of a `reshape(.., [..])` target shape. Each dim is
+/// a binary tree over `*` and `/` whose leaves are integer literals
+/// or bare bound identifiers. Parentheses group; nothing else is
+/// admitted (no `+` / `-`, no calls, no indexing).
+fn parse_dim_spec(expr: &SynExpr) -> ParseResult<DimSpec> {
+    match unwrap_parens(expr) {
+        SynExpr::Lit(ExprLit {
+            lit: Lit::Int(i), ..
+        }) => Ok(DimSpec::Lit(i.base10_parse()?)),
+        SynExpr::Path(p) if p.path.get_ident().is_some() => {
+            Ok(DimSpec::Bound(p.path.get_ident().unwrap().clone()))
+        }
+        SynExpr::Binary(b) => {
+            let lhs = parse_dim_spec(&b.left)?;
+            let rhs = parse_dim_spec(&b.right)?;
+            match b.op {
+                BinOp::Mul(_) => Ok(DimSpec::Mul(Box::new(lhs), Box::new(rhs))),
+                BinOp::Div(_) => Ok(DimSpec::Div(Box::new(lhs), Box::new(rhs))),
+                other => Err(syn::Error::new(
+                    other.span(),
+                    "reshape dim arithmetic admits only `*` and `/`",
+                )),
+            }
+        }
+        other => Err(syn::Error::new(
+            other.span(),
+            "reshape dim must be an integer literal, a bound identifier, \
+             or a `*` / `/` arithmetic over those",
         )),
     }
 }
@@ -346,6 +460,26 @@ pub fn parse_expr(expr: &SynExpr) -> ParseResult<Expr> {
                     }
                 };
                 return Ok(Expr::SqrtBound(ident));
+            }
+            if op == "reshape" {
+                // `reshape(source, [dim0, dim1, ...])` — DSL-authored
+                // reshape with explicit target shape. The second arg
+                // is an array literal whose elements are each either
+                // an integer literal or a bound identifier. See
+                // `ast::Expr::Reshape` for the deferral note on
+                // bound-arithmetic dims.
+                if c.args.len() != 2 {
+                    return Err(syn::Error::new(
+                        op.span(),
+                        "`reshape(source, [dim0, dim1, ...])` takes exactly two arguments",
+                    ));
+                }
+                let source = parse_expr(&c.args[0])?;
+                let target_shape = parse_dim_array(&c.args[1])?;
+                return Ok(Expr::Reshape {
+                    source: Box::new(source),
+                    target_shape,
+                });
             }
             if op == "scalar" || op == "recip_scalar" {
                 if c.args.len() != 1 {
@@ -690,6 +824,88 @@ mod tests {
     }
 
     #[test]
+    fn if_in_literal_array_parses() {
+        let ast = parse(
+            "for layer in 0..32 { \
+                if [7, 15, 23, 31].contains(&layer) { x = gemm(a, b); } \
+                else { x = gemm(a, b); } \
+            }",
+        );
+        match &ast.statements[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::If { cond, .. } => match cond {
+                    BoolExpr::In { ivar, members } => {
+                        assert_eq!(ivar.to_string(), "layer");
+                        assert_eq!(members, &vec![7u64, 15, 23, 31]);
+                    }
+                    other => panic!("expected In, got {other:?}"),
+                },
+                _ => panic!("expected If"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn if_in_with_symbolic_bound_in_array_is_rejected() {
+        let src = "for layer in 0..32 { \
+            if [7, foo, 23].contains(&layer) { x = gemm(a, b); } \
+            else { x = gemm(a, b); } \
+        }";
+        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("should reject symbolic bound in array");
+        assert!(
+            err.to_string().contains("integer literals"),
+            "error mentions integer-literals requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn if_in_empty_array_is_rejected() {
+        let src = "for layer in 0..32 { \
+            if [].contains(&layer) { x = gemm(a, b); } \
+            else { x = gemm(a, b); } \
+        }";
+        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("should reject empty membership array");
+        assert!(
+            err.to_string().contains("at least one element"),
+            "error mentions empty array: {err}"
+        );
+    }
+
+    #[test]
+    fn if_in_without_reference_is_rejected() {
+        // `.contains(layer)` without `&` — Rust would still type-check
+        // (slice `contains` takes a value reference, but stable Rust
+        // also has `[T]::contains` that takes `&T`); the DSL wants the
+        // explicit `&ivar` form so the predicate reads cleanly as
+        // "layer is in this set."
+        let src = "for layer in 0..32 { \
+            if [7].contains(layer) { x = gemm(a, b); } \
+            else { x = gemm(a, b); } \
+        }";
+        let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("should reject value `&ivar` form");
+        assert!(
+            err.to_string().contains("&ivar"),
+            "error names the &ivar form: {err}"
+        );
+    }
+
+    #[test]
     fn if_without_else_is_rejected() {
         let src = "for layer in 0..4 { if layer < 2 { x = gemm(a, b); } }";
         let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).unwrap();
@@ -790,5 +1006,165 @@ mod tests {
             }
             _ => panic!("expected for-loop"),
         }
+    }
+
+    #[test]
+    fn reshape_with_bound_dims_parses() {
+        let ast = parse("y = reshape(x, [num_tokens, vision_embed_dim]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                target,
+                value:
+                    Expr::Reshape {
+                        source: _,
+                        target_shape,
+                    },
+            } => {
+                assert_eq!(target.to_string(), "y");
+                assert_eq!(target_shape.len(), 2);
+                assert!(matches!(&target_shape[0], DimSpec::Bound(i) if i == "num_tokens"));
+                assert!(matches!(&target_shape[1], DimSpec::Bound(i) if i == "vision_embed_dim"));
+            }
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_literal_dims_parses() {
+        let ast = parse("y = reshape(x, [256, 1280]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => {
+                assert!(matches!(target_shape[0], DimSpec::Lit(256)));
+                assert!(matches!(target_shape[1], DimSpec::Lit(1280)));
+            }
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_wrong_arity_is_rejected() {
+        // 1 arg / 3 args — both rejected with the arity message.
+        let body = "y = reshape(x);";
+        let file: syn::File =
+            syn::parse_str(&format!("fn _carrier() {{ {body} }}")).expect("syntactic parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("expected arity error");
+        assert!(
+            err.to_string().contains("exactly two arguments"),
+            "expected arity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reshape_with_non_array_second_arg_is_rejected() {
+        let body = "y = reshape(x, hidden_size);";
+        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {body} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("expected non-array error");
+        assert!(
+            err.to_string().contains("array literal"),
+            "expected array-literal error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reshape_with_div_dim_parses() {
+        // G.5.f.a — bound-arithmetic admitted at parse. The merger
+        // reshape's `[num_tokens / vision_merge_factor,
+        // vision_merge_hidden]` is the first consumer.
+        let ast = parse("y = reshape(x, [num_tokens / vision_merge_factor, vision_merge_hidden]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => {
+                assert_eq!(target_shape.len(), 2);
+                match &target_shape[0] {
+                    DimSpec::Div(num, den) => {
+                        assert!(matches!(num.as_ref(), DimSpec::Bound(i) if i == "num_tokens"));
+                        assert!(
+                            matches!(den.as_ref(), DimSpec::Bound(i) if i == "vision_merge_factor")
+                        );
+                    }
+                    other => panic!("expected DimSpec::Div, got {other:?}"),
+                }
+                assert!(
+                    matches!(&target_shape[1], DimSpec::Bound(i) if i == "vision_merge_hidden")
+                );
+            }
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_mul_and_lit_arithmetic_parses() {
+        // Arithmetic admits arbitrary nesting of `*` / `/` whose
+        // leaves are literals or bound idents.
+        let ast = parse("y = reshape(x, [num_tokens, vision_embed_dim * 4]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => match &target_shape[1] {
+                DimSpec::Mul(a, b) => {
+                    assert!(matches!(a.as_ref(), DimSpec::Bound(i) if i == "vision_embed_dim"));
+                    assert!(matches!(b.as_ref(), DimSpec::Lit(4)));
+                }
+                other => panic!("expected DimSpec::Mul, got {other:?}"),
+            },
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_arithmetic_groups_with_parens() {
+        // Parens — `(a / b) * c` — produce the expected nesting.
+        let ast = parse("y = reshape(x, [(num_tokens / 2) * 3]);");
+        match &ast.statements[0] {
+            Stmt::Assign {
+                value: Expr::Reshape { target_shape, .. },
+                ..
+            } => match &target_shape[0] {
+                DimSpec::Mul(lhs, rhs) => {
+                    assert!(matches!(rhs.as_ref(), DimSpec::Lit(3)));
+                    match lhs.as_ref() {
+                        DimSpec::Div(num, den) => {
+                            assert!(matches!(num.as_ref(), DimSpec::Bound(i) if i == "num_tokens"));
+                            assert!(matches!(den.as_ref(), DimSpec::Lit(2)));
+                        }
+                        other => panic!("expected DimSpec::Div nested, got {other:?}"),
+                    }
+                }
+                other => panic!("expected DimSpec::Mul, got {other:?}"),
+            },
+            other => panic!("expected reshape Assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_with_unsupported_binop_is_rejected() {
+        // `+` / `-` aren't admitted in a reshape dim. Surface the
+        // restriction at parse so a downstream pass doesn't have to
+        // handle the broader expression vocabulary.
+        let body = "y = reshape(x, [num_tokens + 4]);";
+        let file: syn::File = syn::parse_str(&format!("fn _carrier() {{ {body} }}")).unwrap();
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let err = parse_block(block).expect_err("expected unsupported-op error");
+        assert!(
+            err.to_string().contains("admits only `*` and `/`"),
+            "expected `*`/`/`-only error, got: {err}"
+        );
     }
 }

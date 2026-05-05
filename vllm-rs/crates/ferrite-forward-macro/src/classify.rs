@@ -13,20 +13,54 @@ use syn::Ident;
 
 use crate::ast::{self, BoundExpr};
 use crate::classified::{
-    BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Program, Stmt, WeightTable,
+    BoolPred, Bound, Expr, ExternKind, LocalId, LocalTable, OpKind, Prelude, Program, Stmt,
+    WeightTable,
 };
+use crate::shape::{Dim, canonical_mul};
 
 pub type ClassifyResult<T> = Result<T, syn::Error>;
 
-/// Classify the AST.
+/// Convert a parser-produced [`ast::DimSpec`] into a [`Dim`]. `Lit` /
+/// `Bound` map directly; `Mul` flattens into [`Dim::Mul`] via
+/// `canonical_mul` (matching the form `apply_reshape_hints` produces);
+/// `Div` becomes [`Dim::Div`] — kept symbolic until codegen folds the
+/// numerator + closes the denominator against the per-model `bounds`.
+fn dimspec_to_dim(s: &ast::DimSpec) -> Dim {
+    match s {
+        ast::DimSpec::Lit(n) => Dim::Lit(*n),
+        ast::DimSpec::Bound(ident) => Dim::Bound(ident.to_string()),
+        ast::DimSpec::Mul(a, b) => canonical_mul(vec![dimspec_to_dim(a), dimspec_to_dim(b)]),
+        ast::DimSpec::Div(num, den) => {
+            Dim::Div(Box::new(dimspec_to_dim(num)), Box::new(dimspec_to_dim(den)))
+        }
+    }
+}
+
+/// Classify the AST against the decoder prelude. Convenience entry
+/// point used by unit tests in adjacent modules; production code in
+/// `compile_common` calls [`classify_with`] with an explicit prelude.
+#[allow(dead_code)]
 pub fn classify(ast: &ast::Ast) -> ClassifyResult<Program> {
-    let mut cx = Ctx::default();
+    classify_with(ast, Prelude::Decoder)
+}
+
+/// Classify the AST against a specific prelude. The prelude selects
+/// which extern names are recognized — decoder bodies use
+/// `input_ids`/`positions`/etc., vision bodies use
+/// `pixels`/`cu_seqlens`/etc. — and is otherwise inert: every
+/// downstream pass operates on the same `Program` shape.
+pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program> {
+    let mut cx = Ctx {
+        prelude,
+        ..Ctx::default()
+    };
     let statements = cx.classify_stmts(&ast.statements)?;
     Ok(Program {
         statements,
         locals: cx.locals,
         weights: cx.weights,
-        reshape_targets: std::collections::HashMap::new(),
+        reshape_targets: cx.reshape_targets,
+        prelude,
     })
 }
 
@@ -38,6 +72,13 @@ struct Ctx {
     /// line SSA: a new assignment shadows the previous binding.
     /// For-loops push their induction variable and pop it on exit.
     scope: HashMap<String, Vec<LocalId>>,
+    prelude: Prelude,
+    /// DSL-authored reshape targets accumulated during classify.
+    /// Identical surface to `shape::apply_reshape_hints`'s synthesized
+    /// reshapes — both flow into `Program::reshape_targets` keyed by
+    /// the producing `LocalId`. See [`Ctx::classify_stmt`] for the
+    /// `ast::Expr::Reshape` Assign-arm intercept.
+    reshape_targets: HashMap<LocalId, Vec<Dim>>,
 }
 
 impl Ctx {
@@ -48,6 +89,34 @@ impl Ctx {
     fn classify_stmt(&mut self, stmt: &ast::Stmt) -> ClassifyResult<Stmt> {
         match stmt {
             ast::Stmt::Assign { target, value } => {
+                // `out = reshape(source, [d0, d1, ...])` is the only
+                // place an `ast::Expr::Reshape` is admitted. We
+                // intercept here (before `classify_expr`) so the
+                // target shape can be threaded into
+                // `program.reshape_targets` keyed by the freshly
+                // bound `LocalId`. The classified Stmt drops the
+                // explicit shape and becomes a Reshape OpKind call —
+                // identical surface to the synthesized form from
+                // `shape::apply_reshape_hints`, so every downstream
+                // pass (CFG / FUF / shape::infer / solver / codegen)
+                // already knows how to handle it.
+                if let ast::Expr::Reshape {
+                    source,
+                    target_shape,
+                } = value
+                {
+                    let source = self.classify_expr(source)?;
+                    let id = self.bind(target.clone());
+                    let dims: Vec<Dim> = target_shape.iter().map(dimspec_to_dim).collect();
+                    self.reshape_targets.insert(id, dims);
+                    return Ok(Stmt::Assign {
+                        target: id,
+                        value: Expr::Call {
+                            op: OpKind::Reshape,
+                            args: vec![source],
+                        },
+                    });
+                }
                 // Classify RHS first so that `x = f(x)` reads the
                 // previous binding of `x`, not the new one.
                 let value = self.classify_expr(value)?;
@@ -259,6 +328,21 @@ impl Ctx {
                     bound: self.classify_bound(bound),
                 })
             }
+            ast::BoolExpr::In { ivar, members } => {
+                let ivar_id = self.lookup_local(ivar).ok_or_else(|| {
+                    syn::Error::new(
+                        ivar.span(),
+                        format!(
+                            "`if` condition must reference an enclosing loop variable; \
+                             `{ivar}` is not in scope",
+                        ),
+                    )
+                })?;
+                Ok(BoolPred::In {
+                    ivar: ivar_id,
+                    members: members.clone(),
+                })
+            }
         }
     }
 
@@ -334,6 +418,16 @@ impl Ctx {
                 name: name.clone(),
                 recip: *recip,
             }),
+            // `reshape(...)` is only admitted as the top-level RHS of
+            // an `Assign`, where `classify_stmt` intercepts it to
+            // record the target shape on `Program::reshape_targets`.
+            // Reaching here means the user nested it inside another
+            // expression (e.g. `y = relu(reshape(x, [..]))`) — that
+            // would silently lose the target shape, so reject early.
+            ast::Expr::Reshape { .. } => Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`reshape(source, [..])` may only appear as the top-level RHS of an assignment",
+            )),
         }
     }
 
@@ -365,7 +459,7 @@ impl Ctx {
         if let Some(id) = self.lookup_local(ident) {
             return Ok(Expr::Local(id));
         }
-        if let Some(kind) = ExternKind::from_name(&name) {
+        if let Some(kind) = ExternKind::from_name_for(&name, self.prelude) {
             return Ok(Expr::Extern { kind, index });
         }
         // Weight ref by bare ident (e.g. `embed_tokens`, `lm_head`,
@@ -477,7 +571,7 @@ mod tests {
             _ => unreachable!(),
         };
         let ast = parse_block(block).expect("DSL parse");
-        classify(&ast).expect("classification")
+        classify_with(&ast, Prelude::Decoder).expect("classification")
     }
 
     fn classify_err(src: &str) -> syn::Error {
@@ -487,7 +581,18 @@ mod tests {
             _ => unreachable!(),
         };
         let ast = parse_block(block).expect("DSL parse");
-        classify(&ast).expect_err("expected classification error")
+        classify_with(&ast, Prelude::Decoder).expect_err("expected classification error")
+    }
+
+    fn classify_vision_src(src: &str) -> Program {
+        let file: syn::File =
+            syn::parse_str(&format!("fn _carrier() {{ {src} }}")).expect("syntactic parse");
+        let block = match &file.items[0] {
+            syn::Item::Fn(f) => &*f.block,
+            _ => unreachable!(),
+        };
+        let ast = parse_block(block).expect("DSL parse");
+        classify_with(&ast, Prelude::Vision).expect("classification")
     }
 
     #[test]
@@ -711,6 +816,51 @@ mod tests {
     }
 
     #[test]
+    fn if_in_literal_array_classifies_to_in_pred() {
+        let p = classify_src(
+            "for layer in 0..32 { \
+                if [7, 15, 23, 31].contains(&layer) { \
+                    attn = attention(q, k, v, kv_cache, block_table); \
+                } else { \
+                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
+                } \
+                hidden_states = add(attn, attn); \
+            }",
+        );
+        match &p.statements[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::If { cond, .. } => match cond {
+                    BoolPred::In { ivar, members } => {
+                        assert_eq!(p.locals.name(*ivar).to_string(), "layer");
+                        assert_eq!(members, &vec![7u64, 15, 23, 31]);
+                    }
+                    other => panic!("expected In, got {other:?}"),
+                },
+                _ => panic!("expected If"),
+            },
+            _ => panic!("expected for-loop"),
+        }
+    }
+
+    #[test]
+    fn if_in_with_unbound_ivar_is_rejected() {
+        let err = classify_err(
+            "for layer in 0..32 { \
+                if [7, 15].contains(&ghost) { \
+                    attn = attention(q, k, v, kv_cache, block_table); \
+                } else { \
+                    attn = sliding_attention(q, k, v, kv_cache, block_table); \
+                } \
+            }",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not in scope") || msg.contains("loop variable"),
+            "error mentions scope/loop-var requirement: {msg}"
+        );
+    }
+
+    #[test]
     fn if_arms_binding_different_names_is_rejected() {
         let err = classify_err(
             "for layer in 0..4 { \
@@ -776,5 +926,223 @@ mod tests {
         //   embed_tokens, norm, lm_head = 3
         //   TOTAL = 12.
         assert_eq!(p.weights.len(), 12, "unique weights interned");
+    }
+
+    // ── Vision prelude routing (G.3) ─────────────────────────────
+
+    #[test]
+    fn vision_prelude_recognizes_pixels_extern() {
+        // Under the vision prelude, `pixels` is the encoder's data
+        // input — analogous to `input_ids` under the decoder prelude.
+        // Classify must tag it as `ExternKind::Pixels`, not as a
+        // weight ref.
+        let p = classify_vision_src("x = layer_norm(pixels, ln_q);");
+        match &p.statements[0] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Call { args, .. } => assert!(
+                    matches!(
+                        args[0],
+                        Expr::Extern {
+                            kind: ExternKind::Pixels,
+                            index: None
+                        }
+                    ),
+                    "pixels resolves to ExternKind::Pixels under vision prelude, got {:?}",
+                    args[0],
+                ),
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_prelude_recognizes_full_vision_extern_set() {
+        // All six vision externs map: pixels, cu_seqlens, cos, sin,
+        // grid_thw, max_seqlen. Pin the routing in one place so a
+        // future shape-signature edit doesn't silently relabel any
+        // of them as weights.
+        let cases: &[(&str, ExternKind)] = &[
+            ("pixels", ExternKind::Pixels),
+            ("cu_seqlens", ExternKind::CuSeqlens),
+            ("cos", ExternKind::Cos),
+            ("sin", ExternKind::Sin),
+            ("grid_thw", ExternKind::GridThw),
+            ("max_seqlen", ExternKind::MaxSeqlen),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                ExternKind::from_name_for(name, Prelude::Vision),
+                Some(*expected),
+                "vision extern `{name}` routes",
+            );
+            assert_eq!(
+                ExternKind::from_name_for(name, Prelude::Decoder),
+                None,
+                "vision extern `{name}` is invisible under decoder prelude",
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_externs_invisible_under_vision_prelude() {
+        // Disjoint preludes: `input_ids` is unrecognized in a vision
+        // body. With no extern match, classify falls through to the
+        // weight-ref path and interns it as a single-segment weight
+        // — observable as a non-zero weight count for a body that
+        // only writes the would-be extern.
+        let p = classify_vision_src("x = layer_norm(input_ids, ln);");
+        match &p.statements[0] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Call { args, .. } => match &args[0] {
+                    Expr::Weight { .. } => { /* expected: weight ref, not extern */ }
+                    other => panic!(
+                        "input_ids must NOT resolve to an extern under vision prelude, got {other:?}",
+                    ),
+                },
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected assign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsl_authored_reshape_records_target_shape() {
+        // `reshape(x, [num_tokens, vision_embed_dim])` — the G.5.c
+        // "literal-or-bound" surface. The classified Stmt must match
+        // the shape of `apply_reshape_hints`'s synthesized form: a
+        // Reshape OpKind call with the source as its only arg, plus
+        // an entry in `program.reshape_targets` keyed by the new
+        // local. Bound names round-trip as `Dim::Bound(name)`,
+        // literals as `Dim::Lit(n)`.
+        let p = classify_vision_src("y = reshape(pixels, [num_tokens, vision_embed_dim]);");
+        let (target, call_args) = match &p.statements[0] {
+            Stmt::Assign {
+                target,
+                value: Expr::Call { op, args },
+            } => {
+                assert_eq!(*op, OpKind::Reshape, "must lower to OpKind::Reshape");
+                (*target, args.clone())
+            }
+            other => panic!("expected Stmt::Assign with reshape call, got {other:?}"),
+        };
+        assert_eq!(p.locals.name(target).to_string(), "y");
+        // Source arg preserved verbatim — `pixels` resolves to the
+        // vision-prelude extern.
+        assert_eq!(call_args.len(), 1);
+        assert!(matches!(
+            call_args[0],
+            Expr::Extern {
+                kind: ExternKind::Pixels,
+                index: None,
+            }
+        ));
+        // Target shape recorded.
+        let dims = p
+            .reshape_targets
+            .get(&target)
+            .expect("reshape_targets entry");
+        assert_eq!(dims.len(), 2);
+        match &dims[0] {
+            Dim::Bound(name) => assert_eq!(name, "num_tokens"),
+            other => panic!("expected Bound, got {other:?}"),
+        }
+        match &dims[1] {
+            Dim::Bound(name) => assert_eq!(name, "vision_embed_dim"),
+            other => panic!("expected Bound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsl_authored_reshape_with_literal_dim() {
+        // Literal dims survive as `Dim::Lit(n)`.
+        let p = classify_vision_src("y = reshape(pixels, [num_tokens, 1280]);");
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p.reshape_targets.get(&target).unwrap();
+        assert!(matches!(dims[0], Dim::Bound(ref n) if n == "num_tokens"));
+        assert!(matches!(dims[1], Dim::Lit(1280)));
+    }
+
+    #[test]
+    fn dsl_authored_reshape_records_arithmetic_dims() {
+        // G.5.f.a — reshape DimSpec arithmetic. The merger reshape
+        // wants `[num_tokens / vision_merge_factor, vision_merge_hidden]`;
+        // a multiplicative form `[num_tokens, vision_embed_dim *
+        // vision_merge_factor]` must round-trip too.
+        let p = classify_vision_src(
+            "y = reshape(pixels, [num_tokens / vision_merge_factor, vision_merge_hidden]);",
+        );
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p.reshape_targets.get(&target).unwrap();
+        match &dims[0] {
+            Dim::Div(num, den) => {
+                assert!(matches!(num.as_ref(), Dim::Bound(n) if n == "num_tokens"));
+                assert!(matches!(den.as_ref(), Dim::Bound(n) if n == "vision_merge_factor"));
+            }
+            other => panic!("expected Dim::Div for first dim, got {other:?}"),
+        }
+        assert!(matches!(&dims[1], Dim::Bound(n) if n == "vision_merge_hidden"));
+
+        let p = classify_vision_src(
+            "y = reshape(pixels, [num_tokens, vision_embed_dim * vision_merge_factor]);",
+        );
+        let target = match &p.statements[0] {
+            Stmt::Assign { target, .. } => *target,
+            _ => panic!(),
+        };
+        let dims = p.reshape_targets.get(&target).unwrap();
+        // Second dim becomes `Dim::Mul([vision_embed_dim,
+        // vision_merge_factor])` after canonical_mul sorts by name.
+        match &dims[1] {
+            Dim::Mul(factors) => {
+                let names: Vec<_> = factors
+                    .iter()
+                    .filter_map(|d| match d {
+                        Dim::Bound(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(names, vec!["vision_embed_dim", "vision_merge_factor"]);
+            }
+            other => panic!("expected Dim::Mul for second dim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_reshape_is_rejected() {
+        // Nesting would silently lose the target shape (no LocalId
+        // to key reshape_targets on), so it must error at classify
+        // time, not produce wrong code at codegen.
+        let err =
+            classify_err("y = layer_norm(reshape(hidden_states, [num_tokens, hidden_size]), ln);");
+        assert!(
+            err.to_string().contains("top-level RHS of an assignment"),
+            "expected top-level-RHS error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn vision_externs_invisible_under_decoder_prelude() {
+        // Mirror of the above: `pixels` does not exist under the
+        // decoder prelude — it lands as a weight ref, not an extern.
+        let p = classify_src("x = layer_norm(pixels, ln);");
+        match &p.statements[0] {
+            Stmt::Assign { value, .. } => match value {
+                Expr::Call { args, .. } => match &args[0] {
+                    Expr::Weight { .. } => { /* expected */ }
+                    other => panic!(
+                        "pixels must NOT resolve to an extern under decoder prelude, got {other:?}",
+                    ),
+                },
+                other => panic!("expected call, got {other:?}"),
+            },
+            other => panic!("expected assign, got {other:?}"),
+        }
     }
 }

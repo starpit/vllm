@@ -136,7 +136,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("LayerNorm"),
                 ],
             ),
-            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, ndim) => {
+            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
                 let n = ndim as usize;
                 (
                     "Reshape",
@@ -145,6 +145,7 @@ impl<W> Instruction<W> {
                         F::Slot(out_slot),
                         F::ConstU32Array(dims_lit[..n].to_vec()),
                         F::ConstU8Array(dims_nt_pow[..n].to_vec()),
+                        F::ConstU32Array(dims_div_lit[..n].to_vec()),
                         F::ConstU32(u32::from(ndim)),
                     ],
                 )
@@ -453,6 +454,40 @@ impl<W> Instruction<W> {
                     F::Slot(v_slot),
                     F::Slot(out_slot),
                     F::ConstBool(interleaved),
+                ],
+            ),
+            Instruction::VarlenAttention(q_slot, k_slot, v_slot, out_slot, cu_seqlens_kind) => (
+                "VarlenAttention",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(k_slot),
+                    F::Slot(v_slot),
+                    F::Slot(out_slot),
+                    F::ConstU32(u32::from(cu_seqlens_kind)),
+                ],
+            ),
+            Instruction::VisionRope(q_slot, k_slot, q_out_slot, k_out_slot) => (
+                "VisionRope",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(k_slot),
+                    F::Slot(q_out_slot),
+                    F::Slot(k_out_slot),
+                ],
+            ),
+            Instruction::QuickGelu(in_slot, out_slot) => {
+                ("QuickGelu", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
+            Instruction::GeluErf(in_slot, out_slot) => {
+                ("GeluErf", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
+            Instruction::LoadPixels(out_slot) => ("LoadPixels", vec![F::Slot(out_slot)]),
+            Instruction::EmbeddingGather(in_slot, out_slot, indices_kind) => (
+                "EmbeddingGather",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::ConstU32(u32::from(indices_kind)),
                 ],
             ),
             Instruction::FlashInferAttentionDecode(

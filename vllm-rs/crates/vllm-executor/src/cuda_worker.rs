@@ -424,6 +424,15 @@ impl CudaModel {
                     kv_cache,
                     mm_embeds,
                     embed_patches,
+                    vision_rope_cos: None,
+                    vision_rope_sin: None,
+                    pixels: None,
+                    vision_cu_seqlens_full: None,
+                    vision_cu_seqlens_window: None,
+                    vision_max_seqlen_full: None,
+                    vision_max_seqlen_window: None,
+                    vision_window_index: None,
+                    vision_reverse_indices: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -624,6 +633,15 @@ impl CudaModel {
                     kv_cache,
                     mm_embeds,
                     embed_patches,
+                    vision_rope_cos: None,
+                    vision_rope_sin: None,
+                    pixels: None,
+                    vision_cu_seqlens_full: None,
+                    vision_cu_seqlens_window: None,
+                    vision_max_seqlen_full: None,
+                    vision_max_seqlen_window: None,
+                    vision_window_index: None,
+                    vision_reverse_indices: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };

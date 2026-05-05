@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite vision-tower host glue (rope tables, varlen cu_seqlens, patch flatten, K-pad, trace dump)."
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+anyhow = { workspace = true }
+half = { workspace = true }

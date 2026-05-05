@@ -2016,6 +2016,40 @@ impl CohereLayerNorm {
 }
 
 // ---------------------------------------------------------------------------
+// LayerNormBias — standard PyTorch nn.LayerNorm
+// ---------------------------------------------------------------------------
+
+/// Standard `nn.LayerNorm` with both affine weight AND bias.
+///
+/// `y = weight * (x - mean(x)) / sqrt(var(x) + eps) + bias`
+///
+/// Used by every CLIP/ViT-style vision tower (Qwen2-VL, Qwen2.5-VL,
+/// SigLIP, BERT, …) where the layer-norm sites carry both gamma and
+/// beta. Sibling of [`CohereLayerNorm`] (which is bias-free).
+pub struct LayerNormBias {
+    pub weight: GpuTensor, // [hidden]
+    pub bias: GpuTensor,   // [hidden]
+    pub eps: f32,
+}
+
+impl LayerNormBias {
+    pub fn new(weight: GpuTensor, bias: GpuTensor, eps: f32) -> Self {
+        debug_assert_eq!(weight.ndim(), 1);
+        debug_assert_eq!(bias.ndim(), 1);
+        debug_assert_eq!(weight.dim(0), bias.dim(0));
+        Self { weight, bias, eps }
+    }
+
+    /// Load from `GpuWeights` by prefix — looks up `<prefix>.weight`
+    /// and `<prefix>.bias` as 1D tensors.
+    pub fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+        let bias = weights.take(&format!("{prefix}.bias"))?;
+        Ok(Self::new(weight, bias, eps))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GGML quantized-storage dual-path probe (FERRITE_PROBE_MMVQ=1)
 //
 // Runs the broken MMVQ/DMMV path AND a cuBLAS-on-dequant reference on every

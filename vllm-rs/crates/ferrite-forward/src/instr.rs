@@ -74,6 +74,24 @@ pub trait CanonicalParams {
     /// existing arches need no override; Qwen2-VL sets it via the
     /// proc-macro emit path. Plan: `~/.claude/plans/distributed-mapping-map.md`.
     const MROPE_SECTION: Option<[u32; 3]> = None;
+    /// Vision-tower attention head count. Vision encoders run plain
+    /// MHA (`num_kv_heads == num_heads`); only one head dim is needed.
+    /// Default 0 for text-only arches that never produce
+    /// `OpKind::VarlenAttention` / `OpKind::VisionRope` tiles, so the
+    /// matching `Instruction` variants stay registered but unreachable.
+    /// Set by `#[vision_forward]` from the vision config.
+    const VISION_NUM_HEADS: u32 = 0;
+    /// Vision-tower attention head dimension. Same defaults / set-by
+    /// rule as [`Self::VISION_NUM_HEADS`].
+    const VISION_HEAD_DIM: u32 = 0;
+    /// `vision_num_heads * vision_head_dim` — the rank-2 last-dim of
+    /// q/k/v at the FUF level (the kernel internally reshapes to
+    /// rank-3). Same defaults / set-by rule as
+    /// [`Self::VISION_NUM_HEADS`].
+    const VISION_Q_SIZE: usize = 0;
+    /// Vision-tower softmax scale: `1 / sqrt(vision_head_dim)`. Same
+    /// defaults / set-by rule as [`Self::VISION_NUM_HEADS`].
+    const VISION_ATTN_SCALE: f32 = 0.0;
 }
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
@@ -115,9 +133,25 @@ pub enum Instruction<W> {
     /// rmsnorm's weight ref. The DSL bias-weight ref (e.g.
     /// `attn_norm.bias[layer]`) is structural-only — same trick the
     /// dense `(Gemm, BiasAdd)` fusion plays via `LinearLayer`.
-    /// Used by encoder models like ModernBERT.
+    /// Used by encoder models like ModernBERT and vision towers like
+    /// Qwen2-VL.
     MeanSubRmsNormBiasAdd(u32, u32, u32, WtFn<W, LayerNorm>),
-    Reshape(u32, u32, [u32; MAX_DIMS], [u8; MAX_DIMS], u8),
+    /// `Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim)`.
+    /// Output axis i is computed as
+    /// `(dims_lit[i] * num_tokens^dims_nt_pow[i]) / dims_div_lit[i]`.
+    /// `dims_div_lit` is `1` for every dim by default (G.5.f.a opens
+    /// the divisor for DSL-authored arithmetic — the merger's
+    /// `[num_tokens / vision_merge_factor, vision_merge_hidden]`
+    /// is the first consumer, decomposing as
+    /// `dims_div_lit = [vision_merge_factor, 1]`).
+    Reshape(
+        u32,
+        u32,
+        [u32; MAX_DIMS],
+        [u8; MAX_DIMS],
+        [u32; MAX_DIMS],
+        u8,
+    ),
     Add(u32, u32),
     /// Tensor-parallel all-reduce-sum on the slot in place. Inserted
     /// by the lowering pass after every gemm whose weight is
@@ -244,6 +278,69 @@ pub enum Instruction<W> {
     EncoderAttention(u32, u32, u32, u32),
     SlidingAttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
     SlidingAttentionPrefillContiguous(u32, u32, u32, u32, bool),
+    /// Vision-tower variable-length attention: `(q_slot, k_slot,
+    /// v_slot, out_slot, cu_seqlens_kind)`. The `cu_seqlens_kind`
+    /// u8 discriminant selects which `(cu_seqlens, max_seqlen)` pair
+    /// the kernel reads:
+    ///
+    /// - `0` (Default): `ForwardCtx::cu_seqlens_q` + `max_seqlen_q`.
+    ///   Qwen2-VL's single-cu-seqlens path; the host wrapper
+    ///   populates these from the per-batch concatenated boundaries.
+    /// - `1` (Full): `ForwardCtx::vision_cu_seqlens_full` +
+    ///   `vision_max_seqlen_full`. Qwen2.5-VL's full-frame layers
+    ///   (`fullatt_block_indexes = [7, 15, 23, 31]`).
+    /// - `2` (Window): `ForwardCtx::vision_cu_seqlens_window` +
+    ///   `vision_max_seqlen_window`. Qwen2.5-VL's windowed-attn
+    ///   layers (the other 28 of 32).
+    ///
+    /// Bidirectional (no causal mask), no softcap, no fused rope —
+    /// rope is applied upstream by `Instruction::VisionRope`. Output
+    /// reshaped to rank-2 `[L, vision_num_heads * vision_head_dim]`
+    /// to match the FUF's q-shape contract.
+    VarlenAttention(u32, u32, u32, u32, u8),
+    /// Vision 2D RoPE pair-rotation: `(q_in, k_in, q_out, k_out)`.
+    /// Reads cos / sin from `ForwardCtx::vision_rope_cos` /
+    /// `vision_rope_sin`. In-place on q / k buffers; the output slots
+    /// reinsert the same `OwnedTensor`s after mutation. Handles the
+    /// rank-2 → rank-3 reshape internally; the kernel
+    /// `vision_rope_apply` requires rank-3 `[L, H, D]`.
+    VisionRope(u32, u32, u32, u32),
+    /// Quick-GELU activation: `(in_slot, out_slot)`. In-place
+    /// elementwise mutation, take-owned + kernel + reinsert. Same
+    /// shape as `TanhSoftCap` / `ScalarMul` consume-pattern.
+    QuickGelu(u32, u32),
+    /// Materialize the vision-prelude `pixels` extern as a tile:
+    /// `(out_slot)`. Reads `ctx.fwd.pixels` (the rank-2
+    /// `[num_tokens, vision_in_features]` view the
+    /// `vision_forward` host wrapper writes onto `ForwardCtx`
+    /// before invoking the vision interpreter), allocates a fresh
+    /// `OwnedTensor` of the same shape/dtype, D2D-copies the
+    /// pixels view into it, and publishes the result at `out_slot`.
+    ///
+    /// The copy is what lets the consume-pattern vision Impls
+    /// (`QuickGelu` / `GeluErf` / `VisionRope`) downstream of
+    /// `pixels` read it as a tile-table `Owned` entry — `take_owned`
+    /// requires `Owned`, and a borrowed `External` wrapper around
+    /// `ctx.fwd.pixels` would panic on the first such consumer.
+    /// In G.5.f's real encoder body the first op on pixels is a
+    /// non-consuming `gemm` (`patch_embed`), so the copy is paid
+    /// once per encoder invocation regardless. Synthesized
+    /// exclusively by `vision_lowering::materialize_pixels` —
+    /// never appears in any DSL.
+    LoadPixels(u32),
+    /// Erf-form GELU activation: same shape as `QuickGelu`. Distinct
+    /// numerics (`0.5 * x * (1 + erf(x / sqrt(2)))`).
+    GeluErf(u32, u32),
+    /// Row-permutation gather: `(in_slot, out_slot, indices_kind)`.
+    /// Reads the source rank-2 tile from `in_slot`, the rank-1 u32
+    /// indices buffer from `ForwardCtx::vision_window_index` (kind=0)
+    /// or `ForwardCtx::vision_reverse_indices` (kind=1), and writes a
+    /// fresh `OwnedTensor` of the same shape as the source to
+    /// `out_slot`. Output row `i` = source row `indices[i]`. Used by
+    /// Qwen2.5-VL's window-attention dispatch — tokens, cos, sin are
+    /// gather-permuted into window order on encoder entry, and the
+    /// merger output is permuted back to natural order at exit.
+    EmbeddingGather(u32, u32, u8),
     FlashInferAttentionDecode(u32, u32, u32, CosSinFn<W>, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, CosSinFn<W>, bool),
@@ -525,9 +622,15 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, ndim) => {
+            Instruction::Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
                 let upstream = tile_ref(ctx.tiles, in_slot).as_gpu_tensor(ctx.tiles);
-                let nt = (*ctx.fwd.input_ids).dim(0);
+                // `num_tokens` source: vision bodies set `pixels`
+                // (and the input_ids ForwardCtx field is unused); the
+                // decoder path keys off `input_ids`.
+                let nt = match ctx.fwd.pixels {
+                    Some(p) => (*p).dim(0),
+                    None => (*ctx.fwd.input_ids).dim(0),
+                };
                 let mut shape = [0usize; MAX_DIMS];
                 let nd = ndim as usize;
                 for i in 0..nd {
@@ -535,7 +638,13 @@ impl<W: CanonicalParams> Instruction<W> {
                     for _ in 0..(dims_nt_pow[i] as usize) {
                         d *= nt;
                     }
-                    shape[i] = d;
+                    let div = dims_div_lit[i] as usize;
+                    debug_assert!(
+                        div > 0 && d.is_multiple_of(div),
+                        "Reshape: axis {i} numerator {d} not divisible by \
+                         denominator {div} — codegen bug"
+                    );
+                    shape[i] = d / div;
                 }
                 let reshaped = upstream.reshape(&shape[..nd]);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Reshaped {
@@ -1264,6 +1373,161 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             }
+            Instruction::VarlenAttention(q_slot, k_slot, v_slot, out_slot, cu_seqlens_kind) => {
+                let (cu_view, max_seqlen) = match cu_seqlens_kind {
+                    0 => (ctx.fwd.cu_seqlens_q, ctx.fwd.max_seqlen_q),
+                    1 => {
+                        let cu = ctx.fwd.vision_cu_seqlens_full.expect(
+                            "Instruction::VarlenAttention(kind=1) reached eval but \
+                             ForwardCtx::vision_cu_seqlens_full is None — caller must \
+                             populate it before invoking the vision interpreter",
+                        );
+                        let m = ctx.fwd.vision_max_seqlen_full.expect(
+                            "Instruction::VarlenAttention(kind=1) reached eval but \
+                             ForwardCtx::vision_max_seqlen_full is None",
+                        );
+                        (cu, m)
+                    }
+                    2 => {
+                        let cu = ctx.fwd.vision_cu_seqlens_window.expect(
+                            "Instruction::VarlenAttention(kind=2) reached eval but \
+                             ForwardCtx::vision_cu_seqlens_window is None — caller must \
+                             populate it before invoking the vision interpreter",
+                        );
+                        let m = ctx.fwd.vision_max_seqlen_window.expect(
+                            "Instruction::VarlenAttention(kind=2) reached eval but \
+                             ForwardCtx::vision_max_seqlen_window is None",
+                        );
+                        (cu, m)
+                    }
+                    other => panic!(
+                        "Instruction::VarlenAttention: cu_seqlens_kind must be 0 \
+                         (default) | 1 (full) | 2 (window); got {other}"
+                    ),
+                };
+                let mut out = unsafe {
+                    let q_view = tile_ref(ctx.tiles, q_slot).as_view(ctx.tiles);
+                    let k_view = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
+                    let v_view = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
+                    let total_l = (*q_view).dim(0);
+                    let nh = W::VISION_NUM_HEADS as usize;
+                    let hd = W::VISION_HEAD_DIM as usize;
+                    let q3 = q_view.reshape(&[total_l, nh, hd]);
+                    let k3 = k_view.reshape(&[total_l, nh, hd]);
+                    let v3 = v_view.reshape(&[total_l, nh, hd]);
+                    kernels::flash_attn_contiguous(
+                        *q3,
+                        *k3,
+                        *v3,
+                        *cu_view,
+                        *cu_view,
+                        max_seqlen,
+                        max_seqlen,
+                        W::VISION_ATTN_SCALE,
+                        false,
+                        0.0,
+                        -1,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                        ::std::ptr::null::<u8>(),
+                        0,
+                        false,
+                    )
+                };
+                unsafe {
+                    let nt = (*out).dim(0);
+                    let dt = (*out).dtype();
+                    out.reshape(&[nt, W::VISION_Q_SIZE], dt);
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            }
+            Instruction::VisionRope(q_slot, k_slot, q_out_slot, k_out_slot) => {
+                let cos = ctx.fwd.vision_rope_cos.expect(
+                    "Instruction::VisionRope reached eval but \
+                     ForwardCtx::vision_rope_cos is None — caller must \
+                     populate it before invoking the vision interpreter",
+                );
+                let sin = ctx.fwd.vision_rope_sin.expect(
+                    "Instruction::VisionRope reached eval but \
+                     ForwardCtx::vision_rope_sin is None — caller must \
+                     populate it before invoking the vision interpreter",
+                );
+                let q_owned = take_owned(ctx.tiles, q_slot);
+                let k_owned = take_owned(ctx.tiles, k_slot);
+                let total_l = (*q_owned).dim(0);
+                let nh = W::VISION_NUM_HEADS as usize;
+                let hd = W::VISION_HEAD_DIM as usize;
+                let q3 = (*q_owned).reshape(&[total_l, nh, hd]);
+                let k3 = (*k_owned).reshape(&[total_l, nh, hd]);
+                unsafe {
+                    kernels::vision_rope_apply(q3, *cos, *sin, ctx.device.compute_stream);
+                    kernels::vision_rope_apply(k3, *cos, *sin, ctx.device.compute_stream);
+                }
+                ctx.tiles[q_out_slot as usize] = Some(TileEntry::Owned(q_owned));
+                ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k_owned));
+            }
+            Instruction::QuickGelu(in_slot, out_slot) => {
+                let owned = take_owned(ctx.tiles, in_slot);
+                unsafe {
+                    kernels::quick_gelu_inplace(*owned, ctx.device.compute_stream);
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            }
+            Instruction::GeluErf(in_slot, out_slot) => {
+                let owned = take_owned(ctx.tiles, in_slot);
+                unsafe {
+                    kernels::gelu_erf_inplace(*owned, ctx.device.compute_stream);
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            }
+            Instruction::EmbeddingGather(in_slot, out_slot, indices_kind) => {
+                let indices_view = match indices_kind {
+                    0 => ctx.fwd.vision_window_index.expect(
+                        "Instruction::EmbeddingGather(kind=0) reached eval but \
+                         ForwardCtx::vision_window_index is None — caller must \
+                         populate it before invoking the vision interpreter",
+                    ),
+                    1 => ctx.fwd.vision_reverse_indices.expect(
+                        "Instruction::EmbeddingGather(kind=1) reached eval but \
+                         ForwardCtx::vision_reverse_indices is None — caller must \
+                         populate it before invoking the vision interpreter",
+                    ),
+                    other => panic!(
+                        "Instruction::EmbeddingGather: indices_kind must be 0 \
+                         (window_index) or 1 (reverse_indices); got {other}"
+                    ),
+                };
+                let owned = unsafe {
+                    let in_view = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                    kernels::embedding_gather(
+                        *in_view,
+                        *indices_view,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                };
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            }
+            Instruction::LoadPixels(out_slot) => unsafe {
+                let view = ctx.fwd.pixels.expect(
+                    "Instruction::LoadPixels invoked without ForwardCtx::pixels — \
+                     caller (vision_forward host wrapper) must populate this view \
+                     before driving the vision interpreter, mirroring the \
+                     vision_rope_cos / vision_rope_sin contract",
+                );
+                let raw = view.as_raw();
+                let shape: Vec<usize> = raw.shape().iter().map(|&d| d as usize).collect();
+                let owned = ctx.device.caching.alloc_tensor(&shape, raw.dtype());
+                let bytes = raw.size_bytes();
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*owned).raw_ptr(),
+                    raw.raw_ptr(),
+                    bytes,
+                    ctx.device.compute_stream,
+                )
+                .expect("LoadPixels D2D copy");
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            },
             Instruction::FlashInferAttentionDecode(
                 in_slot,
                 out_slot,

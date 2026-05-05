@@ -58,13 +58,41 @@ use crate::solver::WorkloadAssignments;
 /// `model.` prefix) can override via a future per-arch conventions
 /// mechanism; this covers Llama, Qwen2, Mistral, Gemma2.
 fn safetensors_prefix(program: &Program, id: WeightId, index: Option<u64>) -> String {
-    let joined = program.weights.path(id).join(".");
-    match (index, joined.as_str()) {
-        (_, "lm_head") => "lm_head".to_string(),
+    // DSL idents can't start with a digit, so paths like
+    // `merger.mlp.0` are written `merger.mlp_0` in the body /
+    // manifest; translate `_<digit>` suffixes back to `.<digit>`
+    // for the on-disk safetensors key (which uses Python-attribute
+    // dotted form, including numeric submodule indices).
+    let joined: String = program
+        .weights
+        .path(id)
+        .iter()
+        .map(|seg| translate_digit_suffix(seg))
+        .collect::<Vec<_>>()
+        .join(".");
+    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
+    match (is_vision, index, joined.as_str()) {
+        (true, Some(l), _) => format!("visual.blocks.{l}.{joined}"),
+        (true, None, _) => format!("visual.{joined}"),
+        (false, _, "lm_head") => "lm_head".to_string(),
         // DeepSeek: the `moe` DSL name maps to `mlp` in HF safetensors.
-        (Some(l), "moe") => format!("model.layers.{l}.mlp"),
-        (Some(l), _) => format!("model.layers.{l}.{joined}"),
-        (None, _) => format!("model.{joined}"),
+        (false, Some(l), "moe") => format!("model.layers.{l}.mlp"),
+        (false, Some(l), _) => format!("model.layers.{l}.{joined}"),
+        (false, None, _) => format!("model.{joined}"),
+    }
+}
+
+/// Translate trailing `_<digits>` in a DSL path segment back to
+/// `.<digits>` so safetensors keys like `mlp.0` round-trip through
+/// the DSL's ident-only path syntax.
+fn translate_digit_suffix(seg: &str) -> String {
+    if let Some(idx) = seg.rfind('_')
+        && idx + 1 < seg.len()
+        && seg[idx + 1..].chars().all(|c| c.is_ascii_digit())
+    {
+        format!("{}.{}", &seg[..idx], &seg[idx + 1..])
+    } else {
+        seg.to_string()
     }
 }
 
@@ -78,7 +106,7 @@ enum FieldLoad {
     RmsNorm(String, f32),
     /// `LayerNorm::load(gw, prefix, eps)` — pulls `<prefix>.weight` AND
     /// optional `<prefix>.bias`. Used by `MeanSubRmsNormBiasAddImpl`
-    /// (encoder models like ModernBERT).
+    /// (encoder models like ModernBERT, vision towers like Qwen2-VL).
     LayerNorm(String, f32),
     /// `LinearLayer::load_dense(gw, prefix)`.
     LinearDense(String),
@@ -903,7 +931,12 @@ fn plan_field_load(
         // Same eps source as RmsNorm — `rms_norm_eps` already accepts
         // the `layer_norm_eps` JSON key (CommandR convention) as a
         // fallback. ModernBERT writes `norm_eps` / `layer_norm_eps`,
-        // both already in the fallback chain (see `rms_norm_eps`).
+        // both already in the fallback chain. Vision configs (Qwen2-VL
+        // / Qwen2.5-VL / SigLIP) carry `vision_norm_eps` as a scalar;
+        // `rms_norm_eps`'s JSON-only fallback chain misses that, so
+        // vision-prefixed accessors override eps via the
+        // `vision_norm_eps` scalar lookup once routed to a vision
+        // loader at codegen time.
         let eps = rms_norm_eps(model);
         FieldLoad::LayerNorm(prefixes.into_iter().next().unwrap(), eps)
     } else if is_linear {
@@ -960,6 +993,7 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
     let read = |key| v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32);
     read("rms_norm_eps")
         .or_else(|| read("layer_norm_eps"))
+        .or_else(|| read("vision_norm_eps"))
         .unwrap_or(fallback)
 }
 
@@ -1600,6 +1634,7 @@ fn emit_weights_struct(
     manifest: &crate::weights_manifest::WeightsManifest,
     mode: WeightsEmitMode<'_>,
     tp_world_size: u8,
+    emit_fingerprint: bool,
 ) -> TokenStream {
     let accessors = match collect_accessors(program, fuf, sfufs, lib, model) {
         Ok(a) => a,
@@ -1794,9 +1829,10 @@ fn emit_weights_struct(
         .map(|(a, p)| (a.name.to_string(), p))
         .collect();
 
+    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     let lets: Vec<TokenStream> = groups
         .iter()
-        .map(|g| emit_group_let(g, &plan_by_name, model, tp_world_size))
+        .map(|g| emit_group_let(g, &plan_by_name, model, tp_world_size, is_vision))
         .collect();
 
     // Shared-per-model Marlin prelude: one workspace allocation
@@ -1885,13 +1921,27 @@ fn emit_weights_struct(
     // `model.bounds`. The helper is a no-op when the packed parent
     // isn't present, so models without packed checkpoints are unaffected
     // even if they share the manifest (none do today).
+    let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     let packed_splits_prelude: TokenStream = if manifest.packed_splits.is_empty() {
         quote! {}
     } else {
-        let num_hidden_layers = *model.bounds.get("num_hidden_layers").unwrap_or_else(|| {
+        // Vision configs carry `vision_depth` instead of
+        // `num_hidden_layers`; the per-block prefix is
+        // `visual.blocks.<L>.` instead of `model.layers.<L>.`.
+        let layer_count_key = if is_vision {
+            "vision_depth"
+        } else {
+            "num_hidden_layers"
+        };
+        let block_prefix_template = if is_vision {
+            "visual.blocks"
+        } else {
+            "model.layers"
+        };
+        let num_hidden_layers = *model.bounds.get(layer_count_key).unwrap_or_else(|| {
             panic!(
-                "model `{}` has `__packed_splits__` but no `num_hidden_layers` bound",
-                model.source_stem,
+                "model `{}` has `__packed_splits__` but no `{}` bound",
+                model.source_stem, layer_count_key,
             )
         }) as usize;
         let mut calls: Vec<TokenStream> = Vec::new();
@@ -1947,7 +1997,9 @@ fn emit_weights_struct(
             let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
             calls.push(quote! {
                 for __l in 0..#num_hidden_layers {
-                    let __pp = ::std::format!("model.layers.{}.{}", __l, #packed_prefix);
+                    let __pp = ::std::format!(
+                        concat!(#block_prefix_template, ".{}.{}"), __l, #packed_prefix,
+                    );
                     // `_tp` variant handles the GGUF quantized parent at
                     // tp > 1 — fused `attn_qkv` / `ffn_up` are
                     // replicated on every rank by the GGUF loader's
@@ -1986,7 +2038,17 @@ fn emit_weights_struct(
             }
         })
         .collect();
-    let fingerprint_method = emit_fingerprint_check(model, manifest, tp_world_size);
+    // Vision encoders skip the fingerprint emission entirely — they
+    // route through the hand-written `FerriteMmRegistration` instead
+    // of the inventory-based arch dispatcher, so `fingerprint_matches`
+    // is unreachable. Skipping also avoids the `num_hidden_layers` /
+    // `hidden_size` / `vocab_size` panics in `emit_fingerprint_check`
+    // — vision configs (`vision_*` + `d_model` only) lack those keys.
+    let fingerprint_method = if emit_fingerprint {
+        emit_fingerprint_check(model, manifest, tp_world_size)
+    } else {
+        TokenStream::new()
+    };
 
     // Detect whether this arch uses `rotary_local` (dual-rotary,
     // e.g. Gemma3). If so, emit a `rotary_local: RotaryCache` field
@@ -2684,14 +2746,17 @@ fn layer_templated_prefix_expr(layer0_prefix: &str) -> TokenStream {
 /// mismatch surfaces a `default_required_weights` bug instead of
 /// silently emitting a malformed helper call.
 fn layered_suffix(layer0_prefix: &str) -> &str {
-    layer0_prefix
-        .strip_prefix("model.layers.0.")
-        .unwrap_or_else(|| {
-            panic!(
-                "layered accessor's L=0 prefix `{layer0_prefix}` doesn't \
-                 start with `model.layers.0.` — codegen invariant violated"
-            )
-        })
+    if let Some(s) = layer0_prefix.strip_prefix("model.layers.0.") {
+        return s;
+    }
+    if let Some(s) = layer0_prefix.strip_prefix("visual.blocks.0.") {
+        return s;
+    }
+    panic!(
+        "layered accessor's L=0 prefix `{layer0_prefix}` doesn't \
+         start with `model.layers.0.` or `visual.blocks.0.` — codegen \
+         invariant violated"
+    )
 }
 
 /// Emit the unindexed accessor's let-binding (kept as the
@@ -3115,6 +3180,7 @@ fn emit_group_let(
     plans: &std::collections::BTreeMap<String, &FieldLoad>,
     model: &ModelParams,
     tp_world_size: u8,
+    is_vision: bool,
 ) -> TokenStream {
     match group.kind {
         AccessorGroupKind::Unindexed => {
@@ -3163,7 +3229,7 @@ fn emit_group_let(
             // `entries.len()`, and the static-slice rows only ever
             // index 0..n_layers, so partial coverage is fine.
             let n_layers = group.entries.len() as u32;
-            let call = emit_layered_load_body(plan, n_layers, tp_world_size);
+            let call = emit_layered_load_body(plan, n_layers, tp_world_size, is_vision);
             let _ = model;
             quote! {
                 let #base_ident = #call;
@@ -3184,7 +3250,12 @@ fn emit_group_let(
 /// `DeepSeekV2Moe` falls through to a layered-MoE helper still
 /// emitted inline (only DeepSeek arches use it; not worth a helper
 /// crossing the ferrite-forward / ferrite-kernels seam).
-fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) -> TokenStream {
+fn emit_layered_load_body(
+    plan: &FieldLoad,
+    n_layers: u32,
+    tp_world_size: u8,
+    is_vision: bool,
+) -> TokenStream {
     use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
     let n_lit = proc_macro2::Literal::u32_unsuffixed(n_layers);
     let tp_world_lit = proc_macro2::Literal::u8_unsuffixed(tp_world_size);
@@ -3212,31 +3283,46 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
         }
         FieldLoad::RmsNorm(prefix, eps) => {
             let suffix = layered_suffix(prefix);
-            quote! {
-                ::ferrite_forward::load_layered_rms_norm(gw, #n_lit, #suffix, #eps)?
+            if is_vision {
+                quote! {
+                    ::ferrite_forward::load_layered_rms_norm_vision(gw, #n_lit, #suffix, #eps)?
+                }
+            } else {
+                quote! {
+                    ::ferrite_forward::load_layered_rms_norm(gw, #n_lit, #suffix, #eps)?
+                }
             }
         }
         FieldLoad::LayerNorm(prefix, eps) => {
             let suffix = layered_suffix(prefix);
-            quote! {
-                ::ferrite_forward::load_layered_layer_norm(gw, #n_lit, #suffix, #eps)?
+            if is_vision {
+                quote! {
+                    ::ferrite_forward::load_layered_layer_norm_vision(gw, #n_lit, #suffix, #eps)?
+                }
+            } else {
+                quote! {
+                    ::ferrite_forward::load_layered_layer_norm(gw, #n_lit, #suffix, #eps)?
+                }
             }
         }
         FieldLoad::LinearDense(prefix) => {
             let suffix = layered_suffix(prefix);
             let kind = shard_kind_for_dotted_prefix(prefix);
-            match (sharded, kind) {
-                (true, ShardKind::ShardDim0) => quote! {
+            match (sharded, kind, is_vision) {
+                (true, ShardKind::ShardDim0, _) => quote! {
                     ::ferrite_forward::load_layered_linear_dense_sharded(
                         gw, #n_lit, #suffix, 0usize, tp_rank as usize, #tp_world_lit as usize,
                     )?
                 },
-                (true, ShardKind::ShardDim1) => quote! {
+                (true, ShardKind::ShardDim1, _) => quote! {
                     ::ferrite_forward::load_layered_linear_dense_sharded(
                         gw, #n_lit, #suffix, 1usize, tp_rank as usize, #tp_world_lit as usize,
                     )?
                 },
-                _ => quote! {
+                (_, _, true) => quote! {
+                    ::ferrite_forward::load_layered_linear_dense_vision(gw, #n_lit, #suffix)?
+                },
+                (_, _, false) => quote! {
                     ::ferrite_forward::load_layered_linear_dense(gw, #n_lit, #suffix)?
                 },
             }
@@ -3253,6 +3339,18 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                         stream,
                         tp_rank as usize,
                         #tp_world_lit as usize,
+                    )?
+                }
+            } else if is_vision {
+                // Vision-prelude per-block prefix is `visual.blocks.<L>.`,
+                // not `model.layers.<L>.` — mirrors the LinearDense arm
+                // above which forks via `load_layered_linear_dense_vision`.
+                quote! {
+                    ::ferrite_forward::load_layered_linear_dense_concat_vision(
+                        gw,
+                        #n_lit,
+                        &[ #(#suffixes),* ],
+                        stream,
                     )?
                 }
             } else {
@@ -3731,18 +3829,28 @@ struct CanonicalLowered {
     lm_head: crate::interpreter_codegen::LoweredBucket,
 }
 
-/// Walk the FUF from the end, skipping any `OpKind::MmEmbedSplice`
-/// nodes that `tp_lowering::insert_mm_splices` appended after
-/// `insert_all_reduces` / `insert_lm_head_allgather`. The "last node"
-/// for backbone-output / terminal-subgraph identification must be
-/// the lm_head Gemm (tp=1) or its AllGather wrapper (tp>1); the
-/// splice nodes live at array-tail for ease of `push`-based insertion
-/// but are semantically adjacent to the Embed they hang off of.
+/// Walk the FUF from the end, skipping nodes appended by lowering
+/// passes that aren't the body's terminal output:
+///
+/// - `OpKind::MmEmbedSplice` — `tp_lowering::insert_mm_splices`
+///   pushes one per image-bearing batch; semantically adjacent to
+///   the Embed, lives at array tail for `push`-based insertion.
+/// - `OpKind::LoadPixels` — `vision_lowering::materialize_pixels`
+///   pushes one to materialize the `pixels` extern as a tile;
+///   semantically the FIRST op (everything reads from it), but
+///   lives at array tail for the same `push`-based reason.
+///
+/// The "last node" for backbone-output / terminal-subgraph
+/// identification must be the body's actual terminal — the lm_head
+/// Gemm (tp=1) or its AllGather wrapper (tp>1) for decoders, the
+/// merger MLP's bias_add for vision encoders.
 fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
-    fuf.nodes
-        .iter()
-        .rev()
-        .find(|n| n.op != crate::classified::OpKind::MmEmbedSplice)
+    fuf.nodes.iter().rev().find(|n| {
+        !matches!(
+            n.op,
+            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadPixels
+        )
+    })
 }
 
 /// How the FUF's terminal node maps onto the backbone/lm_head split.
@@ -3754,10 +3862,12 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
 ///   input — the slot `forward_backbone` returns and the slot the
 ///   lm_head slice reads.
 /// - [`BackboneLayout::Encoder`] — the FUF's terminal is NOT
-///   `gemm(_, lm_head)` (e.g. ModernBERT, where the encoder output
-///   IS the final hidden state — there's no LM head to split off).
-///   The whole pipeline is the backbone, the lm_head slice is empty,
-///   and `forward` returns the FUF's last-node output directly.
+///   `gemm(_, lm_head)`. Covers text-side encoders (ModernBERT)
+///   AND every `#[vision_forward]` body (Qwen2-VL / Qwen2.5-VL /
+///   SigLIP / …) since vision bodies don't have a trainable
+///   lm_head. The whole pipeline is the backbone, the lm_head slice
+///   is empty, and `forward` returns the FUF's last-node output
+///   directly.
 #[derive(Clone, Copy, Debug)]
 enum BackboneLayout {
     Decoder { backbone_out: (TileId, u8) },
@@ -3767,14 +3877,13 @@ enum BackboneLayout {
 /// Classify the FUF's terminal as decoder vs encoder. A decoder
 /// terminal is `gemm(<tile>, <lm_head_weight>)`, optionally followed
 /// by an `AllGather` (inserted by tp>1 lowering on the vocab-parallel
-/// lm_head Gemm). Walks past trailing `MmEmbedSplice` nodes via
-/// [`last_non_splice_node`] — those hang off the embedding and are
-/// not the terminal.
+/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadPixels`
+/// nodes via [`last_non_splice_node`] — those are appended by
+/// lowering passes but aren't the body's actual terminal.
 fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
     const LM_HEAD_PREFIX: &str = "lm_head";
 
-    let last_node = last_non_splice_node(fuf)
-        .expect("FUF must be non-empty to emit a forward fn");
+    let last_node = last_non_splice_node(fuf).expect("FUF must be non-empty to emit a forward fn");
     let lm_head_node = if last_node.op == crate::classified::OpKind::AllGather {
         // tp>1: walk past the AllGather to the underlying Gemm.
         // AllGather has exactly one tile input by construction.
@@ -3923,7 +4032,19 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
     let num_q_heads = (*model.bounds.get("num_attention_heads").unwrap_or(&0) as u32) / tp;
     let num_kv_heads = (*model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32) / tp;
-    let intermediate_size = (*model.bounds.get("intermediate_size").unwrap_or(&0) as usize) / tp_us;
+    // For text bodies this comes straight off `intermediate_size`. For
+    // vision-only bodies (like Qwen2.5-VL) the bound is absent, but
+    // `vision_intermediate_size_padded` carries the SwiGLU intermediate
+    // width that `silu_and_mul_fused`'s split-point reads out of
+    // `W::INTERMEDIATE_SIZE` at runtime — so fall back to that. Vision
+    // is replicated per-rank, so don't divide by tp.
+    let intermediate_size = if let Some(v) = model.bounds.get("intermediate_size") {
+        (*v as usize) / tp_us
+    } else if let Some(v) = model.bounds.get("vision_intermediate_size_padded") {
+        *v as usize
+    } else {
+        0
+    };
     let q_size = (num_q_heads as usize) * (head_dim as usize);
     let kv_size = (num_kv_heads as usize) * (head_dim as usize);
     let kv_lora_rank = *model.bounds.get("kv_lora_rank").unwrap_or(&0) as usize;
@@ -3931,6 +4052,21 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     let qk_rope_head_dim = *model.bounds.get("qk_rope_head_dim").unwrap_or(&0) as usize;
     let v_head_dim = *model.bounds.get("v_head_dim").unwrap_or(&0) as usize;
     let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+
+    // Vision-tower constants. Set in `#[vision_forward]` configs via
+    // `vision_num_heads` / `vision_head_dim` bounds; absent in text
+    // configs so the defaults (0 / 0.0) match the trait defaults
+    // declared in `ferrite_forward::CanonicalParams`. Q_SIZE is the
+    // rank-2 last-dim (`H*D`) the FUF carries; VISION_ATTN_SCALE is
+    // `1/sqrt(head_dim)`.
+    let vision_num_heads = *model.bounds.get("vision_num_heads").unwrap_or(&0) as u32;
+    let vision_head_dim = *model.bounds.get("vision_head_dim").unwrap_or(&0) as u32;
+    let vision_q_size = (vision_num_heads as usize) * (vision_head_dim as usize);
+    let vision_attn_scale: f32 = if vision_head_dim > 0 {
+        1.0_f32 / (vision_head_dim as f32).sqrt()
+    } else {
+        0.0
+    };
 
     // attention_multiplier (Granite override) → query_pre_attn_scalar
     // (Gemma2) → 1/sqrt(head_dim). Default 0.0 if no attention path.
@@ -3997,6 +4133,10 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
     let final_logit_softcapping_lit = proc_macro2::Literal::f32_unsuffixed(final_logit_softcapping);
     let mla_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(mla_attn_scale);
+    let vision_num_heads_lit = proc_macro2::Literal::u32_unsuffixed(vision_num_heads);
+    let vision_head_dim_lit = proc_macro2::Literal::u32_unsuffixed(vision_head_dim);
+    let vision_q_size_lit = proc_macro2::Literal::usize_unsuffixed(vision_q_size);
+    let vision_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(vision_attn_scale);
 
     // MRoPE section override. `Some([t, h, w])` only when the
     // config carries `rope_scaling.mrope_section` (Qwen2-VL /
@@ -4047,6 +4187,10 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
             const FINAL_LOGIT_SOFTCAPPING: f32 = #final_logit_softcapping_lit;
             const QK_HEAD_DIM: usize = #qk_head_dim_lit;
             const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+            const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
+            const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
+            const VISION_Q_SIZE: usize = #vision_q_size_lit;
+            const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
             #mrope_section_tokens
         }
     }
@@ -4063,7 +4207,14 @@ pub fn emit_model(
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
+    emit_fingerprint: bool,
 ) -> TokenStream {
+    // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
+    // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
+    // (which already covers text-side encoders like ModernBERT)
+    // handles this naturally because `backbone_layout` reports
+    // Encoder when the terminal isn't `gemm(_, lm_head)`. No
+    // separate vision flag needed.
     if let Some(canonical) = canonical_override {
         return emit_shim_model(
             program,
@@ -4074,6 +4225,7 @@ pub fn emit_model(
             manifest,
             canonical,
             tp_world_size,
+            emit_fingerprint,
         );
     }
     let weights = emit_weights_struct(
@@ -4085,6 +4237,7 @@ pub fn emit_model(
         manifest,
         WeightsEmitMode::Canonical,
         tp_world_size,
+        emit_fingerprint,
     );
 
     // Group workload points by SFUF signature (sorted subgraph → impl).
@@ -4135,8 +4288,9 @@ pub fn emit_model(
         .expect("non-empty FUF expected")
         .id;
     let layout = backbone_layout(fuf, program);
-    // For encoder layouts the FUF's terminal IS the backbone output
-    // (no lm_head split); decoder layouts carry the lm_head Gemm's
+    // For encoder layouts (text-side encoders like ModernBERT AND
+    // every `#[vision_forward]` body) the FUF's terminal IS the
+    // backbone output; decoder layouts carry the lm_head Gemm's
     // hidden-state input as the backbone output.
     let backbone_out = match layout {
         BackboneLayout::Decoder { backbone_out } => backbone_out,
@@ -4192,6 +4346,9 @@ pub fn emit_model(
         };
         let num_slots = slots.total();
 
+        // Decoder: skip the terminal subgraph so it emits as a
+        // separate lm_head slice. Encoder (text encoders OR vision
+        // bodies): pass `None` so the whole FUF lowers as backbone.
         let lowered_bb = lower_bucket(
             fuf,
             sfuf,
@@ -4209,8 +4366,9 @@ pub fn emit_model(
 
         // LM_HEAD — only emitted in decoder mode. One row, computed
         // by directly invoking the terminal subgraph's `fan_out`
-        // against the same slot map. Encoder mode emits an empty
-        // slice (the whole pipeline already ran in the backbone).
+        // against the same slot map. Encoder mode (text encoders OR
+        // vision bodies) emits an empty slice — the whole pipeline
+        // already ran in the backbone.
         let lowered_lm = match layout {
             BackboneLayout::Decoder { .. } => {
                 let terminal_sg =
@@ -4581,6 +4739,7 @@ fn emit_shim_model(
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical: &Ident,
     tp_world_size: u8,
+    emit_fingerprint: bool,
 ) -> TokenStream {
     let weights = emit_weights_struct(
         program,
@@ -4591,6 +4750,7 @@ fn emit_shim_model(
         manifest,
         WeightsEmitMode::Shim { canonical },
         tp_world_size,
+        emit_fingerprint,
     );
 
     // Per-bucket fn surfaces are gone — dispatch lives on the
@@ -5075,7 +5235,7 @@ mod tests {
     #[test]
     fn emit_layered_load_body_uses_layer_template_for_rmsnorm() {
         let plan = FieldLoad::RmsNorm("model.layers.0.input_layernorm".to_string(), 1e-5);
-        let ts = emit_layered_load_body(&plan, 32, 1).to_string();
+        let ts = emit_layered_load_body(&plan, 32, 1, false).to_string();
         // Delegates to the load_layered_rms_norm helper in
         // ferrite-forward. The closure / collect / Vec annotation
         // the loop used to emit per accessor are now owned by the
@@ -5107,7 +5267,7 @@ mod tests {
             "model.layers.0.self_attn.k_proj".to_string(),
             "model.layers.0.self_attn.v_proj".to_string(),
         ]);
-        let ts = emit_layered_load_body(&plan, 32, 1).to_string();
+        let ts = emit_layered_load_body(&plan, 32, 1, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_concat"),
             "expected helper call, got: {ts}"
@@ -5142,7 +5302,7 @@ mod tests {
             FieldLoad::Embedding("model.layers.0.embed_tokens".to_string()),
         ];
         for plan in plans {
-            let ts = emit_layered_load_body(plan, 32, 1).to_string();
+            let ts = emit_layered_load_body(plan, 32, 1, false).to_string();
             assert!(
                 !ts.contains("_sharded"),
                 "tp=1 must never emit a `_sharded` helper call (got: {ts})",
@@ -5166,7 +5326,7 @@ mod tests {
     fn emit_layered_load_body_at_tp_gt_1_dispatches_by_shard_kind() {
         // Column-parallel (ShardDim0): q_proj. Expect `dim = 0` lit.
         let q = FieldLoad::LinearDense("model.layers.0.self_attn.q_proj".to_string());
-        let ts = emit_layered_load_body(&q, 32, 2).to_string();
+        let ts = emit_layered_load_body(&q, 32, 2, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_sharded"),
             "tp=2 q_proj must route to sharded helper (got: {ts})",
@@ -5179,7 +5339,7 @@ mod tests {
 
         // Row-parallel (ShardDim1): o_proj. Expect `dim = 1` lit.
         let o = FieldLoad::LinearDense("model.layers.0.self_attn.o_proj".to_string());
-        let ts = emit_layered_load_body(&o, 32, 2).to_string();
+        let ts = emit_layered_load_body(&o, 32, 2, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_sharded"),
             "tp=2 o_proj must route to sharded helper (got: {ts})",
@@ -5191,7 +5351,7 @@ mod tests {
 
         // Replicate (norm, etc.): NO sharded helper, even at tp>1.
         let n = FieldLoad::LinearDense("model.layers.0.input_layernorm".to_string());
-        let ts = emit_layered_load_body(&n, 32, 2).to_string();
+        let ts = emit_layered_load_body(&n, 32, 2, false).to_string();
         assert!(
             !ts.contains("_sharded"),
             "Replicate path must not route to sharded helper at tp>1 (got: {ts})",
@@ -5204,7 +5364,7 @@ mod tests {
             "model.layers.0.mlp.gate_proj".to_string(),
             "model.layers.0.mlp.up_proj".to_string(),
         ]);
-        let ts = emit_layered_load_body(&c, 32, 4).to_string();
+        let ts = emit_layered_load_body(&c, 32, 4, false).to_string();
         assert!(
             ts.contains("load_layered_linear_dense_concat_sharded"),
             "tp=4 gate_up concat must route to concat_sharded (got: {ts})",

@@ -245,6 +245,7 @@ fn dim_to_json(d: &Dim) -> Value {
         Dim::Lit(n) => json!(n),
         Dim::Bound(name) => Value::String(name.clone()),
         Dim::Mul(parts) => json!({ "mul": parts.iter().map(dim_to_json).collect::<Vec<_>>() }),
+        Dim::Div(num, den) => json!({ "div": [dim_to_json(num), dim_to_json(den)] }),
         Dim::Var(_) => Value::String("?".into()),
     }
 }
@@ -481,6 +482,14 @@ fn pred_label(p: &BoolPred, program: &Program) -> String {
         ),
         BoolPred::Less { ivar, bound } => {
             format!("{} < {}", local_name(program, *ivar), bound_label(bound))
+        }
+        BoolPred::In { ivar, members } => {
+            let elems = members
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{} in [{}]", local_name(program, *ivar), elems)
         }
     }
 }

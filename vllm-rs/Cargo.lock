@@ -1998,6 +1998,7 @@ dependencies = [
  "ferrite-cuda-core",
  "ferrite-forward-macro",
  "ferrite-kernels",
+ "ferrite-vision",
  "hf-hub",
  "inventory",
  "serde",
@@ -2212,6 +2213,7 @@ dependencies = [
  "ferrite-cuda-core",
  "ferrite-forward",
  "ferrite-kernels",
+ "ferrite-vision",
  "half",
  "tracing",
 ]
@@ -2236,6 +2238,7 @@ dependencies = [
  "ferrite-cuda-core",
  "ferrite-forward",
  "ferrite-kernels",
+ "ferrite-vision",
  "half",
  "tracing",
 ]
@@ -2291,6 +2294,16 @@ dependencies = [
 [[package]]
 name = "ferrite-quantizations"
 version = "0.1.0"
+
+[[package]]
+name = "ferrite-vision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-kernels",
+ "half",
+]
 
 [[package]]
 name = "ff"

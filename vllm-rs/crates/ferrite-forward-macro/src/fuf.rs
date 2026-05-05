@@ -338,6 +338,10 @@ impl<'a> Unroller<'a> {
                 let v = self.loop_var_value(*ivar)?;
                 Ok(v < *bound)
             }
+            BoolPredResolved::In { ivar, members } => {
+                let v = self.loop_var_value(*ivar)?;
+                Ok(members.contains(&v))
+            }
         }
     }
 
@@ -689,7 +693,11 @@ mod tests {
                     // a shape-level one, and it resolves per-model
                     // at codegen time. Acceptable.
                     match dim {
-                        Dim::Lit(_) | Dim::Bound(_) | Dim::Mul(_) | Dim::Var(_) => {}
+                        Dim::Lit(_)
+                        | Dim::Bound(_)
+                        | Dim::Mul(_)
+                        | Dim::Div(_, _)
+                        | Dim::Var(_) => {}
                     }
                 }
             }
@@ -893,6 +901,58 @@ mod tests {
                 OpKind::SlidingAttention,
             ],
             "first 2 dense, remaining 3 sliding"
+        );
+    }
+
+    #[test]
+    fn if_in_literal_array_alternates_per_iteration() {
+        // Mirrors Qwen2.5-VL's `fullatt_block_indexes = [7, 15, 23, 31]`
+        // dispatch — at the unroll-time literal predicate level, only
+        // layers in the set take the `then` arm. Stand it in here
+        // with `[1, 3]` over an 8-iteration loop and check the
+        // attention-family ordering matches the membership pattern.
+        let params = llama_3_2_1b_params();
+        let fuf = unroll_src(
+            r#"
+            hidden_states = embed(input_ids, embed_tokens);
+            for layer in 0..8 {
+                normed = rmsnorm(hidden_states, input_layernorm[layer]);
+                q = gemm(normed, self_attn.q_proj[layer]);
+                k = gemm(normed, self_attn.k_proj[layer]);
+                v = gemm(normed, self_attn.v_proj[layer]);
+                (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+                if [1, 3].contains(&layer) {
+                    attn = attention(q, k, v, kv_cache[layer], block_table);
+                } else {
+                    attn = sliding_attention(q, k, v, kv_cache[layer], block_table);
+                }
+                oproj = gemm(attn, self_attn.o_proj[layer]);
+                hidden_states = add(oproj, hidden_states);
+            }
+            "#,
+            &params,
+        );
+        let attn_family: Vec<OpKind> = fuf
+            .nodes
+            .iter()
+            .filter_map(|n| match n.op {
+                OpKind::Attention | OpKind::SlidingAttention => Some(n.op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            attn_family,
+            vec![
+                OpKind::SlidingAttention, // layer 0
+                OpKind::Attention,        // layer 1 ∈ {1, 3}
+                OpKind::SlidingAttention, // layer 2
+                OpKind::Attention,        // layer 3 ∈ {1, 3}
+                OpKind::SlidingAttention, // layer 4
+                OpKind::SlidingAttention, // layer 5
+                OpKind::SlidingAttention, // layer 6
+                OpKind::SlidingAttention, // layer 7
+            ],
+            "in-set picks `then` arm; outside picks `else`"
         );
     }
 

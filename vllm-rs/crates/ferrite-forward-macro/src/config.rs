@@ -1115,6 +1115,132 @@ mod tests {
     }
 
     #[test]
+    fn load_real_qwen2_vl_vision_configs() {
+        // Vision configs (G.5.b) carry only `d_model` + `vision_*`
+        // bounds — no decoder-only keys (`hidden_size`,
+        // `num_attention_heads`, etc.). This test pins three things:
+        //
+        //   1. `load_dir` parses each variant cleanly without
+        //      requiring the decoder fields,
+        //   2. `derive_implicit_bounds` does NOT spuriously synthesize
+        //      `head_dim` / `num_key_value_heads` (its source keys are
+        //      absent → every branch short-circuits),
+        //   3. every `vision_*` bound the codegen reads
+        //      (`vision_num_heads`, `vision_head_dim`, plus the shape-
+        //      anchoring `vision_in_features` / `vision_rope_half_dim`)
+        //      lands in `bounds`.
+        let dir = repo_model_archs("qwen2-vl");
+        let configs = load_dir(&dir).expect("load qwen2-vl vision configs");
+        assert_eq!(
+            configs.len(),
+            3,
+            "expected 3 Qwen2-VL vision variants (2b/7b/72b)"
+        );
+
+        // Per-variant `d_model` (= text-decoder hidden), vision tower
+        // is shape-identical otherwise.
+        let d_model_for = |stem: &str| -> u64 {
+            *configs
+                .iter()
+                .find(|c| c.source_stem == stem)
+                .unwrap_or_else(|| panic!("{stem} present"))
+                .bounds
+                .get("d_model")
+                .expect("d_model")
+        };
+        assert_eq!(d_model_for("qwen2-vl-2b"), 1536);
+        assert_eq!(d_model_for("qwen2-vl-7b"), 3584);
+        assert_eq!(d_model_for("qwen2-vl-72b"), 8192);
+
+        let cfg = configs
+            .iter()
+            .find(|c| c.source_stem == "qwen2-vl-2b")
+            .expect("qwen2-vl-2b present");
+
+        // Bounds the codegen reads via `emit_canonical_params_impl`
+        // and `extern_shape`.
+        assert_eq!(cfg.bounds.get("vision_num_heads"), Some(&16));
+        assert_eq!(cfg.bounds.get("vision_head_dim"), Some(&80));
+        assert_eq!(cfg.bounds.get("vision_in_features"), Some(&1176));
+        assert_eq!(cfg.bounds.get("vision_rope_half_dim"), Some(&40));
+        // Bounds the manifest formulas anchor on.
+        assert_eq!(cfg.bounds.get("vision_embed_dim"), Some(&1280));
+        assert_eq!(cfg.bounds.get("vision_mlp_hidden"), Some(&5120));
+        assert_eq!(cfg.bounds.get("vision_merge_hidden"), Some(&5120));
+        assert_eq!(cfg.bounds.get("vision_depth"), Some(&32));
+        assert_eq!(cfg.bounds.get("vision_spatial_merge_size"), Some(&2));
+        assert_eq!(cfg.bounds.get("vision_merge_factor"), Some(&4));
+        assert_eq!(cfg.bounds.get("vision_patch_size"), Some(&14));
+        assert_eq!(cfg.bounds.get("vision_temporal_patch_size"), Some(&2));
+        assert_eq!(cfg.bounds.get("vision_in_chans"), Some(&3));
+
+        // Decoder-only keys are absent — `derive_implicit_bounds`
+        // must not have synthesized them.
+        assert!(!cfg.bounds.contains_key("hidden_size"));
+        assert!(!cfg.bounds.contains_key("num_attention_heads"));
+        assert!(!cfg.bounds.contains_key("num_key_value_heads"));
+        assert!(!cfg.bounds.contains_key("head_dim"));
+        assert!(!cfg.bounds.contains_key("num_hidden_layers"));
+        assert!(!cfg.bounds.contains_key("vocab_size"));
+
+        // Float scalars land in `scalars`. Vision norm eps for the
+        // pre/post-attn LayerNorms; auto-extracted by
+        // `extract_scalars` from any f64 field.
+        assert_eq!(cfg.scalars.get("vision_norm_eps"), Some(&1e-6));
+
+        // HF arch claim string + tie flag (per handoff, false for VL).
+        assert_eq!(
+            cfg.architectures,
+            vec!["Qwen2VLForConditionalGeneration".to_string()]
+        );
+        assert!(!cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn qwen2_vl_vision_weights_manifest_anchors_on_vision_bounds() {
+        // The vision weights.json declares per-tensor shapes anchored
+        // on `vision_*` bounds (and `d_model` on `merger.mlp.2`).
+        // Pin a few representative shapes so a future edit that
+        // accidentally swaps in decoder-side bounds (e.g.
+        // `hidden_size`) trips this guard at unit-test time, before
+        // it reaches a #[vision_forward] expansion.
+        use crate::weights_manifest::load_or_empty;
+        let dir = repo_model_archs("qwen2-vl");
+        let manifest = load_or_empty(&dir).expect("load qwen2-vl weights.json");
+
+        // G.5.f flipped `attn.qkv` from a top-level shape entry to a
+        // `__packed_splits__` mapping → `[attn.q, attn.k, attn.v]`. The
+        // body writes three separate gemms (text-side qwen2 pattern),
+        // so the post-split keys are what land in `entries`.
+        let splits = manifest
+            .packed_splits
+            .get("attn.qkv")
+            .expect("attn.qkv in __packed_splits__");
+        assert_eq!(
+            splits,
+            &vec!["attn.q".to_string(), "attn.k".into(), "attn.v".into()]
+        );
+        let q = manifest.lookup(&["attn", "q"]).expect("attn.q in manifest");
+        // `[vision_embed_dim, vision_embed_dim]` — K, N order.
+        assert_eq!(q.len(), 2);
+
+        let merger_proj = manifest
+            .lookup(&["merger", "mlp_2"])
+            .expect("merger.mlp_2 in manifest");
+        // `[vision_merge_hidden, d_model]` in K, N order.
+        assert_eq!(merger_proj.len(), 2);
+
+        let patch_embed = manifest
+            .lookup(&["patch_embed", "proj"])
+            .expect("patch_embed.proj in manifest");
+        // `[vision_in_features, vision_embed_dim]` in K, N order.
+        assert_eq!(patch_embed.len(), 2);
+
+        let norm1 = manifest.lookup(&["norm1"]).expect("norm1 in manifest");
+        assert_eq!(norm1.len(), 1);
+    }
+
+    #[test]
     fn bounds_are_sorted_by_stem_for_determinism() {
         let dir = repo_model_archs("llama");
         let configs = load_dir(&dir).unwrap();

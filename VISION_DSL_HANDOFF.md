@@ -1,7 +1,23 @@
 # Vision DSL — Phase G handoff
 
+**Status:** LANDED on `ff-interpreter` as `209b81fc9` (cherry-pick-ff from worktree-multimodal). Single commit covering G.1–G.6.10. All 16 e2e tests (8 qwen2-vl + 8 qwen2.5-vl) green on a clean build. Below is the historical narrative for future readers; the current code follows the design described under "Compositional norms" below, NOT the explicit `OpKind::LayerNormBias` framing some of the older G.5.f / G.6 entries describe.
+
 **Branch:** `feat/rust`, worktree `.claude/worktrees/multimodal`.
 **Goal:** lift the vision tower into a `#[vision_forward]` DSL body, mirroring how text decoders are described. Each MM arch ends up with two backbones — text (`#[forward]`) and vision (`#[vision_forward]`) — composed at runtime via the existing `MmEmbedSplice` op. Supersedes the MULTIMODAL_HANDOFF.md "Phase G — Gemma3-MM / SigLIP" framing, which assumed a non-DSL `ferrite-vision` shared module.
+
+## Compositional norms (post-rebase reconciliation)
+
+ff-interpreter retired the explicit `OpKind::LayerNorm` / `OpKind::LayerNormBias` DSL surface in favor of a compositional design: the DSL writes the math primitives (`mean(x); sub(x, m); rmsnorm(centered, w); bias_add(normed, w.bias)`) and an Impl matcher (`MeanSubRmsNormImpl` / `MeanSubRmsNormBiasAddImpl`) claims the trio/quad and lowers it to one fused kernel call. Per-arch LayerNorm minor-math variants live at the Impl level instead of proliferating OpKind variants.
+
+This handoff's older G.5.f and G.6 entries describe an `OpKind::LayerNormBias` + `Instruction::LayerNormBias` + `LayerNormBiasImpl` + `load_layered_layer_norm_bias` chain that was the original design before the rebase onto ff-interpreter. The landed `209b81fc9` adapts to ff-interpreter's compositional model:
+
+- **No `OpKind::LayerNorm` / `OpKind::LayerNormBias`.** Qwen2-VL writes its norms (norm1 / norm2 / merger.ln_q) as `(mean, sub, rmsnorm, bias_add)` in the DSL body. The bias-side weight ref (e.g. `norm1.bias[layer]`) is structural-only — the matcher's `required_weights` returns ONE `LayerNorm`-typed accessor sourced from the rmsnorm's weight ref, and `load_layered_layer_norm` (or its vision-prefix sibling `load_layered_layer_norm_vision`) pulls both `<prefix>.weight` and `<prefix>.bias` from disk.
+- **No singleton `LayerNormBiasImpl` / `Instruction::LayerNormBias`.** Both retired in favor of `MeanSubRmsNormBiasAddImpl` → `Instruction::MeanSubRmsNormBiasAdd` → `kernels::layer_norm_bias`.
+- **No `load_layered_layer_norm_bias` loader.** Replaced by `load_layered_layer_norm_vision` (vision-prefix variant of the existing `load_layered_layer_norm`); codegen routes by `Prelude::Vision`.
+- **No `BackboneLayout::Vision` flag.** Vision falls into the existing `BackboneLayout::Encoder` arm naturally — vision terminals aren't `gemm(_, lm_head)`, so `backbone_layout()` reports `Encoder` for vision the same way it does for ModernBERT.
+- **Kernel-class summary.** The norm path now reports as `mean_sub_rms_norm_bias_add` (HEAD's name), not `layer_norm_bias`.
+
+Qwen2.5-VL is unaffected by this reconciliation — its vision blocks use plain RMSNorm (no mean subtraction, no bias) so the body's `rmsnorm(x, w)` already matches HEAD's `RmsNormRefImpl` with no decomposition needed.
 
 **Why now:** with 3+ VL/MM arches imminent (Qwen2-VL + Qwen2.5-VL + Gemma3-MM/SigLIP, internvl/llava/pixtral on the horizon), the imperative ~1k-line per-arch `vision.rs` (931 + 989 lines today) is the wrong cut. Hybrid DSL gives per-block fusion, const-prop, and reduces each new tower to ~30 lines of math. The first port is the expensive one; each subsequent arch is the payoff.
 
@@ -33,11 +49,11 @@
 - **G.5.f — Real body port. (DONE — body compiles; runtime hookup pending.)** `ferrite-model-qwen2-vl/src/dsl_body.rs` rewritten to the full encoder math (~30 lines): patch_embed gemm + 32-block transformer loop (norm + 3×qkv gemm/bias + vision_rope + varlen_attention + proj/bias + add + norm + fc1/bias + quick_gelu + fc2/bias + add) + ln_q + reshape + 2-stage merger MLP. Per-variant compile-time summary `qwen2-vl-{2b,7b,72b} · 617 tiles · 359 waves · tp=1 · cublas non-gemm` (vision tower is shape-identical across the family — only `d_model` differs at the merger output). Infra landed in the same commit (d1bc34000):
     - **Program prelude threading.** `Program` now carries the `Prelude` it was classified under so codegen can dispatch on prelude rather than re-detecting from extern sets.
     - **Vision safetensors prefix.** `safetensors_prefix` emits `visual.blocks.<L>.{x}` for indexed vision weights and `visual.{x}` for unindexed (`patch_embed`, `merger.*`); decoder path unchanged. Numeric submodule indices (`mlp.0` / `mlp.2`) map to ident form (`mlp_0` / `mlp_2`) in the DSL/manifest and back to dotted form at the safetensors key (`translate_digit_suffix`).
-    - **`OpKind::LayerNormBias`.** Standard PyTorch `nn.LayerNorm` (one paper op with both gamma + beta). Distinct math from bias-free CommandR `LayerNorm`. Singleton `LayerNormBiasImpl` → `Instruction::LayerNormBias` → `kernels::layer_norm_bias`. New `ferrite-kernels::layers::LayerNormBias` wrapper struct loads weight + bias under one prefix (sibling of `CohereLayerNorm`). DSL writes `layer_norm_bias(x, norm[layer])` — single weight ref; loader fetches both `<prefix>.weight` and `<prefix>.bias`.
+    - **`OpKind::LayerNormBias`** (RETIRED post-rebase — see "Compositional norms" header). Original framing: standard PyTorch `nn.LayerNorm` (gamma + beta) as a singleton OpKind. Landed implementation uses HEAD's `(mean, sub, rmsnorm, bias_add)` decomposition + `MeanSubRmsNormBiasAddImpl` matcher instead.
     - **Vision manifest in `[K, N]` order + packed splits.** `weights.json` flipped from on-disk `[out, in]` to DSL `[K, N]` order (matches every text-side manifest entry, e.g. `mlp.gate_proj: [hidden_size, intermediate_size]`). Added `__packed_splits__` mapping `attn.qkv` → `attn.q/k/v` so the body writes three separate gemms (text-side qwen2 pattern). Packed-splits prelude generalized: under vision mode it reads `vision_depth` + emits `visual.blocks.{L}` template instead of `num_hidden_layers` + `model.layers.{L}`.
     - **Vision-aware Reshape eval.** `Instruction::Reshape::eval` reads `nt` from `ForwardCtx::pixels` when present, else `input_ids` (decoder unchanged).
-    - **Vision-aware layered loaders.** `load_layered_linear_dense_vision` + `vision_block_weight_path` helpers route vision LinearDense loads through the right per-block prefix. `load_layered_layer_norm_bias` is vision-only (no decoder consumer today). `layered_suffix` accepts both decoder and vision L=0 prefixes.
-    - **Kernel-class summary.** Recognizes `layer_norm_bias` / `varlen_attention` / `vision_rope` as non-gemm.
+    - **Vision-aware layered loaders.** `load_layered_linear_dense_vision` + `vision_block_weight_path` helpers route vision LinearDense loads through the right per-block prefix. `load_layered_layer_norm_vision` is the vision-prefix sibling of HEAD's `load_layered_layer_norm` (both return `Vec<LayerNorm>` with optional bias). `load_layered_rms_norm_vision` covers the Qwen2.5-VL RMSNorm sites. `layered_suffix` accepts both decoder and vision L=0 prefixes.
+    - **Kernel-class summary.** Recognizes `mean_sub_rms_norm_bias_add` / `varlen_attention` / `vision_rope` / `embedding_gather` / `load_pixels` / `quick_gelu_inplace` / `gelu_erf_inplace` as non-gemm.
     - `(Gemm, BiasAdd)` fusion claims every gemm-followed-by-bias_add in the body via the existing FusedGemmBias paths (cuBLAS / CUTLASS) — no new fusion work needed for the body's GEMM-side biases.
     - Validated: commandr text decoder still 19 tiles · 10 waves byte-equivalent at tp=1; qwen2-vl-{2b,7b,72b} all emit 617/359.
     - **What's NOT yet wired:** the host wrapper `VisionWeights::vision_forward` in `vision.rs:216` still runs the imperative kernel loop. The macro emits a `qwen2_vl_vision::forward(...)` entry point, but nothing calls it. See G.5.g.
@@ -111,7 +127,7 @@ G.1–G.5.h done — Qwen2-VL is pure DSL (~30 lines body in a single `lib.rs`, 
 
 ## G.6.10 — Image-path coherent + e2e green
 
-`ebfa490ba`. Two fixes turned the qwen2.5-vl image inference from "no image attached" to coherent captions:
+`ebfa490ba` (pre-rebase) → folded into `209b81fc9` (landed on ff-interpreter). Two fixes turned the qwen2.5-vl image inference from "no image attached" to coherent captions:
 
 1. **`W::INTERMEDIATE_SIZE` fallback to `vision_intermediate_size_padded`** (`codegen.rs::emit_canonical_params_impl`). Vision-only crates lack the `intermediate_size` bound, so the bake produced `INTERMEDIATE_SIZE = 0` — `silu_and_mul_fused`'s split-point ran at 0, the kernel emitted a `[L, 0]` empty activation, and the down gemm contracted to zero. (`FusedGateUpSiluMul` *was* claiming the vision body's `(gate, up, silu, mul)` quad — Silu and Mul have no singletons, the matcher's the only path.)
 2. **Explicit `bias_add(down, mlp.down_proj.bias[layer])`** in the body. The unfused `Instruction::Gemm` calls `cublas.gemm(weight, ...)` and skips bias entirely; without the bias_add tile, `down_proj.bias` was silently dropped on every block. `FusedGemmBias` now claims the down gemm + its bias_add via the existing `(Gemm, BiasAdd)` matcher.

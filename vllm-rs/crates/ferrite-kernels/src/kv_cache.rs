@@ -152,6 +152,33 @@ impl KvCachePool {
         })
     }
 
+    /// Placeholder pool with zero layers and no GPU allocations. Used
+    /// to satisfy the `&KvCachePool` field on `ForwardCtx` for vision
+    /// encoder forwards, which never reach a kv_cache-touching
+    /// instruction (vision body uses `VarlenAttention`, not the paged
+    /// `Attention` op). Reading any layer index from this pool would
+    /// panic — by contract, vision-mode codegen never emits such reads.
+    pub fn empty_for_vision() -> Self {
+        Self {
+            k_caches: Vec::new(),
+            v_caches: Vec::new(),
+            _k_ptrs: Vec::new(),
+            _v_ptrs: Vec::new(),
+            num_blocks: 0,
+            block_size: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            num_layers: 0,
+            cache_dtype: DType::BF16,
+            k_scale_ptrs: Vec::new(),
+            v_scale_ptrs: Vec::new(),
+            block_is_unrotated: Vec::new(),
+            block_is_span: Vec::new(),
+            block_unrotated_gpu_ptr: None,
+            block_span_gpu_ptr: None,
+        }
+    }
+
     /// Get K cache tensor for a layer as a lifetime-checked view.
     pub fn k_cache(&self, layer: usize) -> TensorView<'_> {
         // Safety: KvCachePool owns the memory via _k_ptrs; view borrows &self.

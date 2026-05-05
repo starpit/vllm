@@ -1114,6 +1114,30 @@ impl GpuWeights {
         None
     }
 
+    /// Rewrite a safetensors entry's shape in place. Element count
+    /// must match the on-disk size. Used to flatten conv-style 5D
+    /// tensors (e.g. Qwen2-VL `visual.patch_embed.proj.weight`
+    /// `[E, C, T, P, P]`) to the 2D form a downstream `take`-style
+    /// loader expects, when that loader doesn't have a shape-override
+    /// entry point. No data is moved; only the shape metadata
+    /// changes.
+    pub fn reshape_in_place(&mut self, name: &str, new_shape: &[usize]) -> Result<()> {
+        let cpu_ref = self
+            .tensors
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("reshape_in_place: weight not found: {name}"))?;
+        let old_numel: usize = cpu_ref.shape.iter().product();
+        let new_numel: usize = new_shape.iter().product();
+        anyhow::ensure!(
+            old_numel == new_numel,
+            "reshape_in_place: {name} on-disk shape {:?} (numel {old_numel}) != new shape {:?} (numel {new_numel})",
+            cpu_ref.shape,
+            new_shape,
+        );
+        cpu_ref.shape = new_shape.to_vec();
+        Ok(())
+    }
+
     /// Get a tensor by name (copies to GPU). For read-only access.
     ///
     /// WARNING: The returned GPU tensor is leaked — caller must arrange cleanup.

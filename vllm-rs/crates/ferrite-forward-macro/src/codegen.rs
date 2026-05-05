@@ -3833,18 +3833,28 @@ struct CanonicalLowered {
 /// first arg, since `forward_backbone` has no defined behavior for
 /// architectures whose terminal is anything other than `gemm(<tile>,
 /// lm_head)`.
-/// Walk the FUF from the end, skipping any `OpKind::MmEmbedSplice`
-/// nodes that `tp_lowering::insert_mm_splices` appended after
-/// `insert_all_reduces` / `insert_lm_head_allgather`. The "last node"
-/// for backbone-output / terminal-subgraph identification must be
-/// the lm_head Gemm (tp=1) or its AllGather wrapper (tp>1); the
-/// splice nodes live at array-tail for ease of `push`-based insertion
-/// but are semantically adjacent to the Embed they hang off of.
+/// Walk the FUF from the end, skipping nodes appended by lowering
+/// passes that aren't the body's terminal output:
+///
+/// - `OpKind::MmEmbedSplice` — `tp_lowering::insert_mm_splices`
+///   pushes one per image-bearing batch; semantically adjacent to
+///   the Embed, lives at array tail for `push`-based insertion.
+/// - `OpKind::LoadPixels` — `vision_lowering::materialize_pixels`
+///   pushes one to materialize the `pixels` extern as a tile;
+///   semantically the FIRST op (everything reads from it), but
+///   lives at array tail for the same `push`-based reason.
+///
+/// The "last node" for backbone-output / terminal-subgraph
+/// identification must be the body's actual terminal — the lm_head
+/// Gemm (tp=1) or its AllGather wrapper (tp>1) for decoders, the
+/// merger MLP's bias_add for vision encoders.
 fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
-    fuf.nodes
-        .iter()
-        .rev()
-        .find(|n| n.op != crate::classified::OpKind::MmEmbedSplice)
+    fuf.nodes.iter().rev().find(|n| {
+        !matches!(
+            n.op,
+            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadPixels
+        )
+    })
 }
 
 fn backbone_output_for(fuf: &Fuf) -> (TileId, u8) {

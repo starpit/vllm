@@ -265,7 +265,16 @@ Two device-bound tests added:
 
 `half = { workspace = true }` added to `ferrite-forward/Cargo.toml` as dev-dep (used for f32↔f16 conversion at the test boundary). 47/47 ferrite-forward Metal lib tests pass.
 
-**5.G.4 (next) — Per-bucket CPU-vs-Metal diff harness.** Now unblocked. Walk one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena; assert elementwise difference under tolerance. Pattern is established (see `rope_append_matches_cpu_golden`); the harness generalizes it across the lowered tape's full op set.
+**5.G.4a + 5.G.4b — Attention numerical-correctness tests. ✅ COMPLETE (2026-05-06)**
+
+Two device-bound tests landed in `pipelines.rs` mirroring the `rope_append_matches_cpu_golden` pattern (allocate StorageModeShared buffers, set the specialized pipeline directly, dispatch with `(grid, threadgroup)` matching the lowering's plan, read back f16, diff against `cpu_golden`):
+
+- `attention_via_cache_matches_cpu_golden` — 2-sequence decode (`batch = bucket_m = 2`, mixed cache lengths spanning one and two logical blocks), block_table maps logical → physical with seq 0 → physical 0 and seq 1 → physicals 2, 3. Live-only fill of physical blocks 0/2/3 doubles as a defensive check that the shader reads only the slots `block_table` points at. Round-trips Q + K/V through f16 before invoking `cpu_golden::attention_via_cache` to match shader input precision; max-abs error < 5e-3.
+- `attention_prefill_contiguous_matches_cpu_golden` — 2 sequences × 8 tokens (total = 16 = exactly one `PREFILL_TILE_Q` tile, single-tile dispatch on x-axis). Round-trips Q/K/V through f16 before invoking `cpu_golden::attention_prefill`. Tolerance 5e-3 absorbs both f16 round-tripping and the shader's `inv_sum = 1/(sum_exp + 1e-6)` epsilon vs the ref's plain `/ sum_exp` (drift ≲ 1e-6 / sum_exp).
+
+Both tests pass first run on the M1 device-bound suite; total ferrite-forward Metal lib tests now 49/49.
+
+**5.G.4c (next) — Per-bucket CPU-vs-Metal diff harness.** Now unblocked. Walk one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena; assert elementwise difference under tolerance. Pattern is established (per-op tests above); the harness generalizes it across the lowered tape's full op set.
 
 **5.G.5 (after 5.G.4) — TinyLlama-1.1B end-to-end via vllm-e2e.** Blocked on real `MetalModelMeta` impl backed by safetensors (current 5.F.5 emission is panic-stub accessors).
 
@@ -307,6 +316,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.G.1 Complete:** 2026-05-06 ✅ (`cpu_golden::{embed, add, scalar_mul, fused_add_rmsnorm, fused_gate_up_silu_mul}` per-op refs + 5 unit tests; matches `fused_add_rmsnorm_f16_specialized` shader semantics)
 - **Phase 5.G.2 Complete:** 2026-05-06 ✅ (`cpu_golden::{rope_append, attention_via_cache}` paged-cache refs + 4 unit tests; matches metal shader's `inv_sum = 1/(sum_exp + 1e-6)` guard; surfaces missing `rope_append_f16_specialized` shader)
 - **Phase 5.G.3 Complete:** 2026-05-06 ✅ (`rope_append_f16_specialized` MSL kernel + `BLOCK_SIZE` function constant + 2 device-bound tests; numerical match against `cpu_golden::rope_append` within 5e-3 f16 tolerance)
+- **Phase 5.G.4a + 5.G.4b Complete:** 2026-05-06 ✅ (device-bound numerical tests for `attention_via_cache_f16_specialized` (2-seq paged decode) + `attention_prefill_contiguous_f16_specialized` (2-seq×8 prefill, one full PREFILL_TILE_Q tile); both within 5e-3 f16 tolerance vs `cpu_golden::attention_via_cache` / `cpu_golden::attention_prefill`)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

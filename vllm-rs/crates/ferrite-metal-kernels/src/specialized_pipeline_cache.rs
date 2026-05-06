@@ -225,9 +225,21 @@ impl SpecializedPipelineCache {
                 ))
             })?;
 
+        // Build via descriptor so we can flag
+        // `supportIndirectCommandBuffers=true`. ICB execution under
+        // `inheritPipelineState=true` requires every encoder-bound
+        // pipeline to advertise ICB support; pipelines built via the
+        // shorter `new_compute_pipeline_state_with_function` path
+        // default to NO and trip the validation layer with
+        // "compute pipeline set on this encoder does not support
+        // indirect command buffers". This is the only deviation from
+        // the legacy `ShaderCache` builder.
+        let descriptor = metal::ComputePipelineDescriptor::new();
+        descriptor.set_compute_function(Some(&function));
+        descriptor.set_support_indirect_command_buffers(true);
         let pipeline = self
             .device
-            .new_compute_pipeline_state_with_function(&function)
+            .new_compute_pipeline_state(&descriptor)
             .map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!(
                     "build pipeline `{}`: {e}",

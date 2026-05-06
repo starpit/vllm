@@ -45,7 +45,7 @@ use ferrite_metal_kernels::instruction_executor::RecordingContext;
 use ferrite_metal_kernels::metal::foreign_types::ForeignType;
 use ferrite_metal_kernels::metal::{
     Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLResourceOptions, MTLSize,
+    MTLResourceOptions, MTLResourceUsage, MTLSize, ResourceRef,
 };
 
 use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape};
@@ -110,10 +110,19 @@ pub struct BoundBuffer {
 /// into the ICB (MPS doesn't fit ICBs). The `steps` vector is the
 /// authoritative ordering; ICB ranges in `BucketStep::Icb` index into
 /// `icb`, while `BucketStep::Gemm` stands alone.
+///
+/// `baked_resources` is the set of unique buffers referenced by ICB
+/// commands. The descriptor is built with `inheritBuffers=false` so
+/// the GPU needs every ICB-referenced buffer marked resident on the
+/// firing encoder via `useResources:count:usage:` — otherwise the
+/// command buffer fails with status `Error`. Collected once at bake
+/// time so the per-forward residency call is a single Objective-C
+/// message with the cached slice.
 pub struct BucketBaking {
     pub bucket_m: u32,
     pub icb: RecordingContext,
     pub steps: Vec<BucketStep>,
+    pub baked_resources: Vec<Buffer>,
 }
 
 #[derive(Debug)]
@@ -294,6 +303,23 @@ impl<W: CanonicalParams> MetalWorker<W> {
         cmdbuf: &CommandBufferRef,
     ) -> Result<(), WorkerError> {
         let baking = &self.bucket_bakings[bucket];
+        // ICB descriptor uses `inheritBuffers=false`; the firing
+        // encoder must declare every ICB-referenced buffer resident
+        // before the dispatch. Pre-build the `&[&ResourceRef]` slice
+        // once per call (no allocation amortized — pointer-sized refs
+        // into an existing `Vec<Buffer>`).
+        let resource_refs: Vec<&ResourceRef> = baking
+            .baked_resources
+            .iter()
+            .map(|b| {
+                // `&Buffer → &BufferRef → &ResourceRef` via the
+                // foreign_types deref chain. Spelled out here because
+                // the closure return type isn't pinned by `Vec::iter()`
+                // alone.
+                let r: &ResourceRef = b;
+                r
+            })
+            .collect();
         // We open compute encoders lazily so a leading-GEMM bucket
         // doesn't open an empty one. `current` is `Some` only while
         // an encoder is live — every Gemm step ends it, every Icb
@@ -307,7 +333,21 @@ impl<W: CanonicalParams> MetalWorker<W> {
         for step in &baking.steps {
             match step {
                 BucketStep::Icb { pipeline, range } => {
-                    let enc = current.unwrap_or_else(|| cmdbuf.new_compute_command_encoder());
+                    let enc = match current {
+                        Some(e) => e,
+                        None => {
+                            let e = cmdbuf.new_compute_command_encoder();
+                            // Residency call must precede every
+                            // dispatch on a fresh encoder.
+                            if !resource_refs.is_empty() {
+                                e.use_resources(
+                                    &resource_refs,
+                                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                                );
+                            }
+                            e
+                        }
+                    };
                     enc.set_compute_pipeline_state(pipeline);
                     baking.icb.execute_on_encoder(enc, range.clone());
                     current = Some(enc);
@@ -366,6 +406,19 @@ fn bake_bucket<W: CanonicalParams>(
     let mut ctx = RecordingContext::new(device, tape.commands.len().max(1))
         .map_err(WorkerError::Recording)?;
     let mut steps: Vec<BucketStep> = Vec::new();
+    // Unique buffers referenced by ICB commands. Used at firing time
+    // to satisfy the `inheritBuffers=false` residency contract via
+    // `useResources`. Identity is by raw `metal::Buffer` pointer —
+    // the ICB doesn't care about Rust ownership, only the GPU handle.
+    let mut baked_resources: Vec<Buffer> = Vec::new();
+    let mut baked_seen: Vec<*const _> = Vec::new();
+    let record_resource = |buf: &Buffer, seen: &mut Vec<*const _>, out: &mut Vec<Buffer>| {
+        let ptr = buf.as_ptr() as *const _;
+        if !seen.contains(&ptr) {
+            seen.push(ptr);
+            out.push(buf.clone());
+        }
+    };
 
     for (cmd_idx, cmd) in tape.commands.iter().enumerate() {
         if matches!(cmd.kernel, KernelId::Gemm) {
@@ -402,6 +455,9 @@ fn bake_bucket<W: CanonicalParams>(
         let bound = resolve_bindings(bucket_index, cmd_idx, cmd, arena, model_meta, runtime)?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|&(b, off, idx)| (b, off, idx)).collect();
+        for &(b, _, _) in &bound_refs {
+            record_resource(b, &mut baked_seen, &mut baked_resources);
+        }
         let (tg, tpt) = mtl_size_pair(cmd);
         ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
 
@@ -430,6 +486,7 @@ fn bake_bucket<W: CanonicalParams>(
         bucket_m: tape.bucket_m,
         icb: ctx,
         steps,
+        baked_resources,
     })
 }
 

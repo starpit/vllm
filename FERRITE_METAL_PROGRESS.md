@@ -72,9 +72,9 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E + 5.F.1–5.F.3 done)
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E + 5.F.1–5.F.4 done)
 **Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
-**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene), 5.F.2 (cfg-gate impl pushes), and 5.F.3 (Metal impls' fan_out / opcode_shape wiring) all complete. 5.F (residual: macro-emitted constructor) + 5.G + 5.6 still pending.
+**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene), 5.F.2 (cfg-gate impl pushes), 5.F.3 (Metal impls' fan_out / opcode_shape wiring), and 5.F.4 (`MetalWorkerPool::for_buckets` + `lower_pair`) all complete. 5.F.5 (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` static + `metal_pool()` constructor) + 5.G + 5.6 still pending.
 
 **Architecture pivot (2026-05-06).** The earlier 5.1–5.5 plan (`MetalExecutor` walks the tape and calls `record_to_icb()` methods on `Instruction<W>`) was replaced. Reasons:
 - A single `MetalExecutor` per model has no concurrency story (spec-decode draft+verify, prefill/decode overlap, multi-stream serving need bounded concurrency without N-fold weight duplication).
@@ -159,6 +159,20 @@ Also gated `tp_lowering::insert_mm_splices` call site (`lib.rs:765`) behind `#[c
 
 Three new metal kernel names added to the classifier: `metal_embed_f16`, `metal_reshape`, `metal_bias_add_f16` (all gated `cfg(feature = "metal")`).
 
+**5.F.4 — `MetalWorkerPool::for_buckets` + `lower_pair`. ✅ COMPLETE (2026-05-06)**
+
+Runtime-side prerequisites for the macro-emitted constructor (5.F.5). The macro will eventually emit a per-canonical `pub fn metal_pool(...)` whose body delegates to `MetalWorkerPool::for_buckets(...)`; landing the helper first lets that emission be a thin wrapper rather than reproducing pipeline-cache + lowering + pool-spawn glue.
+
+New types in `crates/ferrite-forward/src/interpreter/metal/`:
+- `pool::MetalBucketSpec<W>` (`Copy`) — one row per solved bucket: `{ bucket_m, num_arena_slots, backbone: &'static [Instruction<W>], lm_head: &'static [Instruction<W>] }`. Mirrors what the cuda macro already emits as `BACKBONE_M_<wp>` / `LM_HEAD_M_<wp>` static slices, packaged for the metal pool's constructor.
+- `pool::PoolBuildError` — `{ PipelineCacheBuild(String), BucketLower { bucket_m, error: String }, Worker(WorkerError), NoBuckets }`. Discriminates the failure surface a downstream `metal_pool()` caller would forward.
+- `lowering::lower_pair` — concatenating lower over `(backbone ++ lm_head)`. Delegates to the existing `lower` once per half and chains the `LoweredCommand` vecs. Avoids requiring `Instruction<W>: Clone` (every variant is structurally `Copy` but the enum doesn't derive it; the per-half lower reads slices in place). Loop bodies that span the boundary aren't supported; no model emits one.
+- `pool::MetalWorkerPool::for_buckets(device, model_meta, &[MetalBucketSpec<W>], arena_layout, runtime_factory, max_workers) -> Result<Self, PoolBuildError>` — builds `SpecializedPipelineCache::with_standard_shaders(...)`, wraps in `SpecializedPipelines`, lowers each spec via `lower_pair`, packages the per-bucket tapes into `Arc<[…]>`, and hands off to `MetalWorkerPool::new(...)` (which eagerly spawns the first worker — surfaces alloc / recording / pipeline-lookup failures at construction time).
+
+3 new device-bound pool tests (silent-skip on non-Apple): `for_buckets_rejects_empty_specs`, `for_buckets_builds_pool_for_single_empty_bucket`, `for_buckets_preserves_bucket_order`. Use `EMPTY_BACKBONE: &[Instruction<TinyLlamaProbe>] = &[]` slices — exercises the constructor's lowering→pool-spawn pipeline without requiring real `Instruction<W>` values constructible at the test site (the macro emits those at codegen time; pool tests stay structural). 36/36 ferrite-forward Metal lib tests pass total.
+
+**5.F.5 (next) — macro emission of per-canonical `Weights` ZST + accessor stubs + `METAL_BUCKETS` static + `metal_pool()` constructor.** Substantial — the macro currently emits the per-model module entirely under `#[cfg(feature = "cuda")]` (Weights struct, accessor methods, CanonicalParams impl, instruction_alias, static slices, FORWARD_TABLE, forward / forward_backbone / dump fns), so under `--features metal` each `pub mod <model>` is empty. 5.F.5 needs to add a parallel path under `#[cfg(feature = "metal")]`: a `pub struct Weights;` ZST, panic-stub accessor methods (one per `WeightAccessor` — preserve fn-pointer identity for `WtFn`-keyed `MetalModelMeta` lookup, prevent ICF folding via `#[inline(never)]` + unique `concat!("metal stub: ", stringify!(name))` panic message), `impl CanonicalParams for Weights` (mirror cuda values), `BACKBONE_M_<wp>` / `LM_HEAD_M_<wp>` static slices over `Instruction<Weights>`, a `pub static METAL_BUCKETS: &[MetalBucketSpec<Weights>]`, and a `pub fn metal_pool(...)` that delegates to `MetalWorkerPool::for_buckets(METAL_BUCKETS, ...)`. Shim variants get `pub use super::canonical::{Weights, METAL_BUCKETS, metal_pool}`.
+
 **5.F.3 (commit `eff0b2ed6`) — Wire `fan_out` / `opcode_shape` on Metal impls. ✅ COMPLETE**
 Each Metal impl now emits a structurally identical `Instruction<W>` variant to its CUDA counterpart by delegating `opcode_shape` / `fan_out` (and where relevant `output_alias` / `consumes_input_tiles` / `required_weights`) to the corresponding CUDA `RefImpl`. The codegen panic `Impl <metal_*> has no fan_out` no longer fires.
 
@@ -222,6 +236,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.F.1 Complete:** 2026-05-06 ✅ (build hygiene — ferrite-vision gate, macro feature plumbing, classifier symmetry)
 - **Phase 5.F.2 Complete:** 2026-05-06 ✅ (cfg-gate impl pushes in starter_library; MmEmbedSplice cuda-only)
 - **Phase 5.F.3 Complete:** 2026-05-06 ✅ (Metal impls' fan_out / opcode_shape wiring via CUDA RefImpl delegation; sliding-attention; matches() neuter on no-variant impls)
+- **Phase 5.F.4 Complete:** 2026-05-06 ✅ (`MetalWorkerPool::for_buckets` + `lower_pair` + `MetalBucketSpec` + `PoolBuildError`; 3 new device-bound pool tests)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

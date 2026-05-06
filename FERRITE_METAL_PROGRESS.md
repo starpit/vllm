@@ -72,9 +72,9 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A done)
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.C done)
 **Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
-**Status:** 5.A complete; 5.B–5.G + 5.6 remaining.
+**Status:** 5.A, 5.B, 5.C complete; 5.D–5.G + 5.6 remaining.
 
 **Architecture pivot (2026-05-06).** The earlier 5.1–5.5 plan (`MetalExecutor` walks the tape and calls `record_to_icb()` methods on `Instruction<W>`) was replaced. Reasons:
 - A single `MetalExecutor` per model has no concurrency story (spec-decode draft+verify, prefill/decode overlap, multi-stream serving need bounded concurrency without N-fold weight duplication).
@@ -105,19 +105,25 @@ This gating is acknowledged technical debt — when parallel Metal weight types 
 
 **Verification:** `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin without CUDA toolkit.
 
-#### Phase 5.B: Function-constant pipeline cache 🔄 IN PROGRESS
-Rewrite hand-rolled MSL shaders (`rmsnorm.metal`, `attention.metal`, `fused_*.metal`) to declare layer-independent params (`hidden_size`, `eps`, `num_heads`, `head_dim`, `rope_theta`, `intermediate_size`, …) as `[[function_constant(N)]]`. Build `SpecializedPipelineCache` keyed on `(library, kernel, function-constant bag)` that constructs `MTLComputePipelineState`s via `MTLFunctionConstantValues`. Removes the runtime `constants` buffer and saves a binding slot.
+#### Phase 5.B: Function-constant pipeline cache ✅ COMPLETE (2026-05-06)
+Rewrote hand-rolled MSL shaders to declare layer-independent params (`hidden_size`, `eps`, `num_heads`, `head_dim`, `intermediate_size`, …) as `[[function_constant(N)]]`. Built `SpecializedPipelineCache` keyed on `(library, kernel, function-constant bag)`; pipelines constructed via `MTLFunctionConstantValues`. Removes the runtime `constants` buffer and saves a binding slot.
 
-**Sub-status (2026-05-06):**
+**Sub-status:**
 - ✅ 5.B.1 — Audited every MSL shader for runtime-constant uses; mapped each to a `CanonicalParams` field, bucket-derived value, or per-instruction extra (eps / scale).
-- ✅ 5.B.2 — `SpecializedPipelineCache` (in `ferrite-metal-kernels::specialized_pipeline_cache`) + glue layer (`ferrite-forward::interpreter::metal::pipelines::SpecializedPipelines`). The cache builds pipelines via `MTLFunctionConstantValues`, deduplicates on `(library, kernel, constants bag)`. Glue layer codifies the function-constant index assignments per `KernelId` (see `pipelines.rs` doc comment). 3 device-bound + 5 CPU-only tests pass.
-- 🔜 5.B.3 — Rewrite `rmsnorm.metal` + `fused_add_rmsnorm.metal` to use the function constants the glue layer expects. Add new specialized symbols (`rmsnorm_f16_specialized`, …) alongside the existing ones so legacy Phase 4.6 ICB recorders keep compiling until 5.C lands.
-- ✅ 5.B.3 — `rmsnorm_f16_specialized` + `fused_add_rmsnorm_f16_specialized` written into the existing .metal files; symbols compile under `with_standard_shaders` and dedup correctly via `SpecializedPipelineCache`. Legacy non-specialized symbols left in place.
-- 🔄 5.B.4 — `fused_gate_up_silu_mul_f16_specialized` added (concatenated gate-up form; matches `Instruction::FusedGateUpSiluMul` lowering). **Attention kernels deferred to 5.C**: existing `attention_multihead_paged` only handles a single Q token per dispatch, while the lowering pass dispatches per-(token, head) for `bucket_m` Q tokens at once. Replacing runtime constants without first redesigning the kernel layout would bake the wrong shape into the function-constant pipeline. The attention rewrite happens alongside the worker's recording loop in 5.C.
-- ✅ 5.B.5 — Device-bound smoke test (`rmsnorm_pipeline_builds_and_caches`) builds 6 pipelines at buckets {1, 8} for {RmsNorm, FusedAddRmsNorm, FusedGateUpSiluMul} on TinyLlama-1.1B params; asserts cache hit on repeat. Five CPU-only `constants_for` tests also pass on any host.
+- ✅ 5.B.2 — `SpecializedPipelineCache` + `SpecializedPipelines` glue layer (function-constant index assignments per `KernelId`). 3 device-bound + 5 CPU-only tests pass.
+- ✅ 5.B.3 — `rmsnorm_f16_specialized` + `fused_add_rmsnorm_f16_specialized` symbols added; legacy non-specialized symbols kept in place so Phase 4.6 ICB recorders keep compiling.
+- ✅ 5.B.4 — `fused_gate_up_silu_mul_f16_specialized` added. Attention kernels deferred to 5.C (single-Q-token kernel shape was wrong for the lowering's multi-Q-token dispatch).
+- ✅ 5.B.5 — Device-bound smoke test `rmsnorm_pipeline_builds_and_caches` builds 6 pipelines at buckets {1, 8} for {RmsNorm, FusedAddRmsNorm, FusedGateUpSiluMul} on TinyLlama-1.1B params; asserts cache hit on repeat.
 
-#### Phase 5.C: `MetalWorker` 🔜 PLANNED
-Allocates the per-worker arena (one buffer per colored slot, sized for the max bucket). Walks the lowered tape, resolves `Binding::ArenaSlot` against `arena[slot]` and `Binding::Weight` against `MetalModelMeta`, records one ICB per bucket using the specialized pipelines from 5.B.
+#### Phase 5.C: `MetalWorker` ✅ COMPLETE (2026-05-06)
+Allocates the per-worker arena (one buffer per colored slot, sized for the max bucket). Walks the lowered tape, resolves `Binding::ArenaSlot` against `arena[slot]` and `Binding::Weight` against `MetalModelMeta`, records one ICB per bucket using the specialized pipelines from 5.B. Bucket plan is a `Vec<BucketStep>` where each step is either a same-pipeline ICB run or an MPS GEMM dispatch.
+
+**Sub-status:**
+- ✅ 5.C scaffolding (commit `ed2862483`) — `MetalModelMeta<W>`, `RuntimeBindings`, `MetalWorker<W>`, `BucketBaking`. Per-bucket ICB recording with `inheritPipelineState=true`; segment partitioning so a single `executeCommandsInBuffer` call only runs commands sharing one pipeline.
+- ✅ 5.C.4 (commit `1beee7599`) — `attention_via_cache_f16_specialized` (paged decode) and `attention_prefill_contiguous_f16_specialized` (causal multi-Q-token, contiguous Q/K/V) MSL kernels. Function-constant indices: `0..3` shared (`HEAD_DIM`/`NUM_Q_HEADS`/`NUM_KV_HEADS`/`ATTN_SCALE`), `4..5` decode-only (`BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`), `6` prefill-only (`PREFILL_TILE_Q`); disjoint to avoid an MSL same-index/different-name collision in one compilation unit. `KernelExtras` extended with `block_size`, `max_blocks_per_seq`, `prefill_tile_q`. Reference logic is correct but unoptimized — FlashAttention-style blocking deferred to 5.6; capped at `MAX_SHARED_LOGITS = 4096` floats per threadgroup.
+- ✅ 5.C.5 (commit `6209efbaa`) — `KernelId::Gemm` routed via MPS, interleaved with ICB segments. Lowering carries M/N/K through `LoweredCommand::gemm_dims: Option<GemmDims>`. Worker plan changed from `Vec<ExecSegment>` to `Vec<BucketStep>` (`Icb { pipeline, range }` | `Gemm { a, b, c, m, n, k }`). `run_bucket(&CommandBufferRef)` manages compute encoder lifecycle: adjacent ICB steps reuse the encoder, a GEMM step ends it and the next ICB step opens a fresh one. New low-level helper `gemm::encode_gemm_into_command_buffer` (no `MetalStream`, caller owns commit). `WorkerError::OpaqueGemmNotYetRouted` removed.
+
+**Tests at 5.C close:** 18 `ferrite-forward` unit tests + 3 `specialized_pipeline_cache` tests pass. Includes `worker_builds_and_segments_coalesce`, `worker_records_attention_via_cache`, `attention_pipelines_build_and_cache`, `worker_routes_gemm_step`, `worker_interleaves_gemm_with_icb`.
 
 #### Phase 5.D: `MetalWorkerPool` 🔜 PLANNED
 Growable, capped, semaphore-bounded checkout/checkin. RAII guard. `max_workers` derived from device memory at construction time.
@@ -157,7 +163,8 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 4 Complete:** 2026-05-06 ✅ (including 4.6 ICB infrastructure)
 - **Phase 5 Started:** 2026-05-06 (initial skeleton; superseded by architecture pivot same day)
 - **Phase 5.A Complete:** 2026-05-06 ✅ (lowering pass + feature-flag refactor)
-- **Phase 5.B.1+5.B.2 Complete:** 2026-05-06 ✅ (`SpecializedPipelineCache` + `KernelId`-aware glue layer)
+- **Phase 5.B Complete:** 2026-05-06 ✅ (function-constant pipelines for rmsnorm/fused_add_rmsnorm/silu)
+- **Phase 5.C Complete:** 2026-05-06 ✅ (worker scaffolding + attention rewrite + MPS GEMM routing)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary
@@ -226,19 +233,25 @@ The earlier 5.1–5.2 `MetalExecutor` skeleton was deleted as part of the pivot.
 
 Architecture decisions captured in `FERRITE_METAL_ARCHITECTURE.md` (now the source of truth). `FERRITE_METAL_ICB_INHERIT_BUFFERS.md` superseded; `FERRITE_METAL_PHASE5_PLAN.md` 5.1–5.5 superseded but 5.6+ steps still valid.
 
+### Phase 5.B + 5.C landed - ✅ (2026-05-06)
+
+Specialized pipelines for the hand-rolled-kernel set (rmsnorm / fused-add-rmsnorm / fused gate-up SiLU) shipped as 5.B; the worker, multi-Q-token attention rewrite, and MPS GEMM routing shipped as 5.C in three commits the same day:
+- `ed2862483` — 5.C scaffolding (`MetalWorker`, `MetalModelMeta`, `RuntimeBindings`, segmented exec plan).
+- `1beee7599` — 5.C.4 (`attention_via_cache_f16_specialized` + `attention_prefill_contiguous_f16_specialized`, function-constant specialized; `KernelExtras` extended with `block_size`/`max_blocks_per_seq`/`prefill_tile_q`).
+- `6209efbaa` — 5.C.5 (MPS GEMM interleaved with ICB segments; `BucketBaking::steps: Vec<BucketStep>` (Icb | Gemm); `run_bucket(&CommandBufferRef)` manages compute encoder lifecycle across GEMM boundaries; new `gemm::encode_gemm_into_command_buffer` helper; `WorkerError::OpaqueGemmNotYetRouted` removed).
+
 **Next Steps:**
-1. Phase 5.B: Function-constant pipeline cache (rewrite hand-rolled MSL to declare layer-independent params as `function_constant`s)
-2. Phase 5.C: `MetalWorker` (arena + per-bucket ICB recording against the lowered tape)
-3. Phase 5.D: `MetalWorkerPool` (growable, capped, semaphore-bounded)
-4. Phase 5.E: `forward()` (bucket pick → checkout → bind inputs → executeCommandsInBuffer → checkin)
-5. Phase 5.F: `#[forward]` macro emits `MetalWorkerPool::for_<model>()` alongside CUDA's `try_load`
-6. Phase 5.G: Wire `cpu_golden` per-op + `vllm-e2e` end-to-end (no bespoke Metal-only test scaffolding)
-7. Phase 5.6: TinyLlama-1.1B golden under `--features metal`
+1. Phase 5.D: `MetalWorkerPool` (growable, capped, semaphore-bounded checkout/checkin; `max_workers = floor((device_total - weights - misc) / per_worker_arena)`)
+2. Phase 5.E: `forward()` (bucket pick → checkout → bind inputs → `run_bucket` → checkin → commit cmdbuf)
+3. Phase 5.F: `#[forward]` macro emits `MetalWorkerPool::for_<model>()` alongside CUDA's `try_load`
+4. Phase 5.G: Wire `cpu_golden` per-op + `vllm-e2e` end-to-end (no bespoke Metal-only test scaffolding)
+5. Phase 5.6: TinyLlama-1.1B golden under `--features metal` on M1+; profile function-constant specialization win
 
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
-- Phase 5.A: ✅ COMPLETE - Lowering pass + feature-flag refactor
-- Phase 5.B–G + 5.6: 🔄 PLANNED - Specialized pipelines, worker, pool, forward, macro, e2e wiring
-- 78 Phase 1-4 tests passing
+- Phase 5.A–5.C: ✅ COMPLETE - Lowering, function-constant cache, worker (incl. attention + GEMM)
+- Phase 5.D–G + 5.6: 🔜 PLANNED - Pool, forward, macro emission, e2e wiring, golden
+- 78 Phase 1-4 tests + 18 ferrite-forward unit tests + 3 cache tests passing
 - `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land
+- Multi-Q-token attention kernels are correctness-first reference impls; FlashAttention-style blocking + perf tuning is Phase 5.6 work

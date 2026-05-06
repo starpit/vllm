@@ -24,8 +24,7 @@
 
 use ferrite_metal_kernels::metal::Buffer;
 
-use super::lowered::{LoweredCommand, WeightBundleKind, WeightTensor};
-use super::pipelines::KernelExtras;
+use super::lowered::{WeightBundleKind, WeightTensor};
 use crate::CanonicalParams;
 
 /// Where a weight tensor's bytes live, plus the offset into that
@@ -63,17 +62,4 @@ pub trait MetalModelMeta<W: CanonicalParams>: Send + Sync {
         layer: u32,
         which: WeightTensor,
     ) -> BufferRef<'_>;
-
-    /// Return the per-kernel extras (eps, scale, …) that the
-    /// `SpecializedPipelineCache` needs to bake function constants
-    /// for `cmd`.
-    ///
-    /// Default implementation returns [`KernelExtras::NONE`] — fine
-    /// for kernels with no per-layer scalars (`Embed`,
-    /// `FusedGateUpSiluMul`, `Add`, `ScalarMul`). Overrides supply
-    /// `eps` for RmsNorm-shaped kernels and `attn_scale`/`rot_dim`
-    /// where the model deviates from `W::ATTN_SCALE` / `W::HEAD_DIM`.
-    fn kernel_extras_for(&self, _cmd: &LoweredCommand<W>) -> KernelExtras {
-        KernelExtras::NONE
-    }
 }

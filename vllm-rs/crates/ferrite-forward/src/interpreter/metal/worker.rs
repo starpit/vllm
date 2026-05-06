@@ -447,9 +447,11 @@ fn bake_bucket<W: CanonicalParams>(
             continue;
         }
 
-        let extras = model_meta.kernel_extras_for(cmd);
+        // Every per-layer scalar (eps, attn_scale, paging strides)
+        // is a `CanonicalParams` constant the macro emitted from the
+        // model config — no runtime extras to thread.
         let pipeline = pipelines
-            .pipeline_for::<W>(cmd.kernel, tape.bucket_m, extras)
+            .pipeline_for::<W>(cmd.kernel, tape.bucket_m)
             .map_err(WorkerError::PipelineLookup)?;
 
         let bound = resolve_bindings(bucket_index, cmd_idx, cmd, arena, model_meta, runtime)?;
@@ -606,7 +608,6 @@ mod tests {
         Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, WeightBundleKind, WeightTensor,
     };
     use crate::interpreter::metal::model_meta::BufferRef;
-    use crate::interpreter::metal::pipelines::KernelExtras;
     use crate::CanonicalParams;
     use ferrite_kernels::layers::{Embedding, LinearLayer, RmsNorm};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
@@ -682,23 +683,6 @@ mod tests {
             }
         }
 
-        fn kernel_extras_for(&self, cmd: &LoweredCommand<TinyLlamaProbe>) -> KernelExtras {
-            // Per-`KernelId` defaults so the smoke tests can mix
-            // RmsNorm (needs `eps`) and AttentionViaCache (needs
-            // `block_size` + `max_blocks_per_seq`) in the same
-            // synthetic tape.
-            match cmd.kernel {
-                KernelId::AttentionViaCache => KernelExtras {
-                    block_size: 16,
-                    max_blocks_per_seq: 128,
-                    ..KernelExtras::NONE
-                },
-                _ => KernelExtras {
-                    eps: 1e-5,
-                    ..KernelExtras::NONE
-                },
-            }
-        }
     }
 
     fn alloc_buffer(device: &Device, bytes: u64) -> Buffer {

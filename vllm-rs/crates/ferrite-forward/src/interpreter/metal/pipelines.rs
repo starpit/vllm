@@ -70,57 +70,13 @@ use ferrite_metal_kernels::stream::MetalStreamError;
 
 use super::lowered::KernelId;
 
-/// Per-kernel scalars the lowering pass cannot infer from
-/// `CanonicalParams` alone (per-layer `eps`, dynamic scales, etc.).
-/// Carried into [`SpecializedPipelines::pipeline_for`] alongside the
-/// `KernelId` and bucket M.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct KernelExtras {
-    /// RmsNorm / FusedAddRmsNorm: the per-layer `RmsNorm.eps`. Worker
-    /// resolves the weight bundle and reads this at pipeline-build
-    /// time. `0.0` if the kernel does not consume `eps`.
-    pub eps: f32,
-    /// Override for `W::ATTN_SCALE` if the kernel needs a different
-    /// scale (MlaAttention uses `MLA_ATTN_SCALE`). `0.0` selects
-    /// `W::ATTN_SCALE`.
-    pub attn_scale: f32,
-    /// Partial-rope rotation dim. `0` selects `W::HEAD_DIM`.
-    pub rot_dim: u32,
-    /// Paged-KV-cache block stride for `AttentionViaCache`. The cache
-    /// layout this targets is `[num_blocks, num_kv_heads, block_size,
-    /// head_dim]`; reading a token's K/V vector is one contiguous
-    /// `head_dim` slice. `0` is invalid for cache-reading kernels;
-    /// the model meta supplies `16` (vLLM's default) or whatever the
-    /// allocator chose.
-    pub block_size: u32,
-    /// Row stride of the `block_table` runtime buffer (in u32s),
-    /// equal to `ceil(MAX_SEQ_LEN / block_size)`. Baked per-bucket so
-    /// the kernel can index `block_table[seq * MAX_BLOCKS_PER_SEQ +
-    /// logical_block]` without a runtime divide. `0` is invalid for
-    /// `AttentionViaCache`.
-    pub max_blocks_per_seq: u32,
-    /// Q-axis tile size for `AttentionPrefillContiguous`. The kernel
-    /// processes `prefill_tile_q` query tokens per threadgroup. Must
-    /// match the lowering pass's `PREFILL_TILE_Q` constant. `0`
-    /// selects the default (16); the model meta usually leaves this
-    /// at the default.
-    pub prefill_tile_q: u32,
-}
-
-impl KernelExtras {
-    pub const NONE: Self = Self {
-        eps: 0.0,
-        attn_scale: 0.0,
-        rot_dim: 0,
-        block_size: 0,
-        max_blocks_per_seq: 0,
-        prefill_tile_q: 0,
-    };
-}
-
-/// Default Q-axis tile size for `AttentionPrefillContiguous` — must
-/// match the lowering pass's `PREFILL_TILE_Q`.
-pub(crate) const DEFAULT_PREFILL_TILE_Q: u32 = 16;
+// `KernelExtras` and friends used to live here. Every field has been
+// promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
+// `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`)
+// because the macro reads them from the model JSON at compile time
+// and emits the per-canonical impl. `constants_for::<W>` reads
+// directly from `W::*`; no runtime extras struct, no
+// `MetalModelMeta::kernel_extras_for` callback, no plumbing.
 
 /// Library-and-function name pair for a [`KernelId`].
 ///
@@ -163,77 +119,46 @@ fn kernel_msl_names(kernel: KernelId) -> Result<(&'static str, &'static str), Pi
 }
 
 /// Build the function-constant bag for `kernel` from `W` and the
-/// supplied extras. Kept as a free function so unit tests can call it
-/// without standing up the full cache.
+/// bucket M. Every per-layer scalar (eps, attn_scale, paging
+/// strides) is a `CanonicalParams` constant the macro emitted from
+/// the model config — there are no runtime "extras" to thread.
 pub fn constants_for<W: CanonicalParams>(
     kernel: KernelId,
     bucket_m: u32,
-    extras: KernelExtras,
 ) -> Result<Vec<ConstantValue>, PipelineLookupError> {
     let cv = match kernel {
         KernelId::RmsNorm | KernelId::FusedAddRmsNorm => vec![
             ConstantValue::uint(0, bucket_m),
             ConstantValue::uint(1, W::Q_SIZE as u32),
-            ConstantValue::float(2, extras.eps),
+            ConstantValue::float(2, W::RMS_NORM_EPS),
         ],
         KernelId::FusedGateUpSiluMul => vec![
             ConstantValue::uint(0, bucket_m),
             ConstantValue::uint(1, W::INTERMEDIATE_SIZE as u32),
         ],
         KernelId::Embed => vec![ConstantValue::uint(0, W::Q_SIZE as u32)],
-        KernelId::RopeAppend => {
-            let rot_dim = if extras.rot_dim == 0 {
-                W::HEAD_DIM
-            } else {
-                extras.rot_dim
-            };
-            // `block_size` reaches the kernel as a function constant
-            // (index 4) so the paged-write index math folds at
-            // pipeline-build time. The same value plumbs into
-            // `AttentionViaCache` (index 4) — the model_meta supplies
-            // it once per layer via `KernelExtras::block_size`.
-            vec![
-                ConstantValue::uint(0, W::HEAD_DIM),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::uint(3, rot_dim),
-                ConstantValue::uint(4, extras.block_size),
-            ]
-        }
-        KernelId::AttentionViaCache => {
-            let scale = if extras.attn_scale == 0.0 {
-                W::ATTN_SCALE
-            } else {
-                extras.attn_scale
-            };
-            vec![
-                ConstantValue::uint(0, W::HEAD_DIM),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::float(3, scale),
-                ConstantValue::uint(4, extras.block_size),
-                ConstantValue::uint(5, extras.max_blocks_per_seq),
-            ]
-        }
-        KernelId::AttentionPrefillContiguous => {
-            let scale = if extras.attn_scale == 0.0 {
-                W::ATTN_SCALE
-            } else {
-                extras.attn_scale
-            };
-            let tile_q = if extras.prefill_tile_q == 0 {
-                DEFAULT_PREFILL_TILE_Q
-            } else {
-                extras.prefill_tile_q
-            };
-            vec![
-                ConstantValue::uint(0, W::HEAD_DIM),
-                ConstantValue::uint(1, W::NUM_Q_HEADS),
-                ConstantValue::uint(2, W::NUM_KV_HEADS),
-                ConstantValue::float(3, scale),
-                ConstantValue::uint(6, tile_q),
-            ]
-        }
+        KernelId::RopeAppend => vec![
+            ConstantValue::uint(0, W::HEAD_DIM),
+            ConstantValue::uint(1, W::NUM_Q_HEADS),
+            ConstantValue::uint(2, W::NUM_KV_HEADS),
+            ConstantValue::uint(3, W::ROT_DIM),
+            ConstantValue::uint(4, W::BLOCK_SIZE),
+        ],
+        KernelId::AttentionViaCache => vec![
+            ConstantValue::uint(0, W::HEAD_DIM),
+            ConstantValue::uint(1, W::NUM_Q_HEADS),
+            ConstantValue::uint(2, W::NUM_KV_HEADS),
+            ConstantValue::float(3, W::ATTN_SCALE),
+            ConstantValue::uint(4, W::BLOCK_SIZE),
+            ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
+        ],
+        KernelId::AttentionPrefillContiguous => vec![
+            ConstantValue::uint(0, W::HEAD_DIM),
+            ConstantValue::uint(1, W::NUM_Q_HEADS),
+            ConstantValue::uint(2, W::NUM_KV_HEADS),
+            ConstantValue::float(3, W::ATTN_SCALE),
+            ConstantValue::uint(6, W::PREFILL_TILE_Q),
+        ],
         KernelId::Add | KernelId::ScalarMul => Vec::new(),
         KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
         KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
@@ -258,16 +183,18 @@ impl SpecializedPipelines {
         Self { cache }
     }
 
-    /// Return the specialized pipeline for `(kernel, bucket_m, W, extras)`.
-    /// First call builds; subsequent calls hit the cache.
+    /// Return the specialized pipeline for `(kernel, bucket_m, W)`.
+    /// First call builds; subsequent calls hit the cache. Every
+    /// function constant the kernel consumes is read from `W::*`
+    /// (the macro-emitted `CanonicalParams` impl) so there is no
+    /// runtime extras struct to thread.
     pub fn pipeline_for<W: CanonicalParams>(
         &self,
         kernel: KernelId,
         bucket_m: u32,
-        extras: KernelExtras,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
         let (library, function) = kernel_msl_names(kernel)?;
-        let constants = constants_for::<W>(kernel, bucket_m, extras)?;
+        let constants = constants_for::<W>(kernel, bucket_m)?;
         let key = PipelineKey::new(library, function, constants);
         self.cache
             .get_or_build(&key)
@@ -343,12 +270,9 @@ mod tests {
 
     #[test]
     fn rmsnorm_constants_are_well_formed() {
-        let extras = KernelExtras {
-            eps: 1e-5,
-            ..KernelExtras::NONE
-        };
+        // `RMS_NORM_EPS` defaults to 1e-5 on `CanonicalParams`.
         let bag =
-            constants_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8, extras).expect("rmsnorm bag");
+            constants_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8).expect("rmsnorm bag");
         assert_eq!(bag.len(), 3);
         assert_eq!(bag[0], ConstantValue::uint(0, 8));
         assert_eq!(bag[1], ConstantValue::uint(1, 2048));
@@ -356,42 +280,29 @@ mod tests {
     }
 
     #[test]
-    fn attention_via_cache_uses_canonical_scale_when_extras_is_zero() {
-        let extras = KernelExtras {
-            block_size: 16,
-            max_blocks_per_seq: 128,
-            ..KernelExtras::NONE
-        };
+    fn attention_via_cache_pulls_consts_from_canonical_params() {
         let bag =
-            constants_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1, extras).expect("attn bag");
+            constants_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1).expect("attn bag");
         assert_eq!(bag.len(), 6);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[3], ConstantValue::float(3, 0.125));
-        assert_eq!(bag[4], ConstantValue::uint(4, 16));
-        assert_eq!(bag[5], ConstantValue::uint(5, 128));
+        assert_eq!(bag[4], ConstantValue::uint(4, 16));    // BLOCK_SIZE default
+        assert_eq!(bag[5], ConstantValue::uint(5, 128));   // MAX_BLOCKS_PER_SEQ default
     }
 
     #[test]
-    fn attention_prefill_falls_back_to_default_tile_q() {
-        let bag = constants_for::<TinyLlamaProbe>(
-            KernelId::AttentionPrefillContiguous,
-            16,
-            KernelExtras::NONE,
-        )
-        .expect("prefill bag");
+    fn attention_prefill_pulls_tile_q_from_canonical_params() {
+        let bag = constants_for::<TinyLlamaProbe>(KernelId::AttentionPrefillContiguous, 16)
+            .expect("prefill bag");
         assert_eq!(bag.len(), 5);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
-        assert_eq!(bag[4], ConstantValue::uint(6, DEFAULT_PREFILL_TILE_Q));
+        assert_eq!(bag[4], ConstantValue::uint(6, 16));    // PREFILL_TILE_Q default
     }
 
     #[test]
     fn fused_silu_bag_has_no_eps() {
-        let bag = constants_for::<TinyLlamaProbe>(
-            KernelId::FusedGateUpSiluMul,
-            64,
-            KernelExtras::NONE,
-        )
-        .expect("silu bag");
+        let bag = constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 64)
+            .expect("silu bag");
         assert_eq!(bag.len(), 2);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[1], ConstantValue::uint(1, 5632));
@@ -399,15 +310,13 @@ mod tests {
 
     #[test]
     fn gemm_is_rejected_as_opaque() {
-        let err =
-            constants_for::<TinyLlamaProbe>(KernelId::Gemm, 1, KernelExtras::NONE).unwrap_err();
+        let err = constants_for::<TinyLlamaProbe>(KernelId::Gemm, 1).unwrap_err();
         assert!(matches!(err, PipelineLookupError::OpaqueKernel(_)));
     }
 
     #[test]
     fn reshape_is_rejected_as_metadata_only() {
-        let err = constants_for::<TinyLlamaProbe>(KernelId::Reshape, 1, KernelExtras::NONE)
-            .unwrap_err();
+        let err = constants_for::<TinyLlamaProbe>(KernelId::Reshape, 1).unwrap_err();
         assert!(matches!(err, PipelineLookupError::MetadataOnly(_)));
     }
 
@@ -429,39 +338,36 @@ mod tests {
         let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
 
         // RmsNorm at bucket=1 (decode) and bucket=8 (small prefill).
-        let extras = KernelExtras {
-            eps: 1e-5,
-            ..KernelExtras::NONE
-        };
+        // `RMS_NORM_EPS` baked from `TinyLlamaProbe::RMS_NORM_EPS`
+        // (defaults to 1e-5).
         let _p1 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 1, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 1)
             .expect("rmsnorm bucket=1");
         let _p8 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8)
             .expect("rmsnorm bucket=8");
         let _p1_again = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 1, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 1)
             .expect("rmsnorm bucket=1 cache hit");
         // Two pipelines (one per bucket); third call hits the cache.
         assert_eq!(pipelines.cached_count(), 2);
 
-        // FusedAddRmsNorm at the same buckets, same eps. Adds two
-        // more entries; full cache count should be 4.
+        // FusedAddRmsNorm at the same buckets. Adds two more entries.
         let _f1 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, 1, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, 1)
             .expect("fused_add_rmsnorm bucket=1");
         let _f8 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, 8, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, 8)
             .expect("fused_add_rmsnorm bucket=8");
         assert_eq!(pipelines.cached_count(), 4);
 
         // FusedGateUpSiluMul (Phase 5.B.4 scope — silu only; gemm is
         // opaque/MPS). Two buckets → six pipelines total.
         let _g1 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 1, KernelExtras::NONE)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 1)
             .expect("silu bucket=1");
         let _g8 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 8, KernelExtras::NONE)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 8)
             .expect("silu bucket=8");
         assert_eq!(pipelines.cached_count(), 6);
     }
@@ -486,36 +392,25 @@ mod tests {
             .expect("compile standard shaders");
         let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
 
-        // AttentionViaCache: bucket=1 (decode), block_size=16,
-        // max_blocks_per_seq=128 (room for ~2k KV tokens).
-        let decode_extras = KernelExtras {
-            block_size: 16,
-            max_blocks_per_seq: 128,
-            ..KernelExtras::NONE
-        };
+        // AttentionViaCache: bucket=1 (decode). block_size=16,
+        // max_blocks_per_seq=128 baked from
+        // `TinyLlamaProbe::BLOCK_SIZE` / `MAX_BLOCKS_PER_SEQ`
+        // (defaults).
         let _d1 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1, decode_extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1)
             .expect("attention_via_cache bucket=1");
         let _d1_again = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1, decode_extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1)
             .expect("attention_via_cache bucket=1 cache hit");
         assert_eq!(pipelines.cached_count(), 1);
 
         // AttentionPrefillContiguous at bucket=16 (one full
         // PREFILL_TILE_Q tile) and bucket=64.
         let _p16 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(
-                KernelId::AttentionPrefillContiguous,
-                16,
-                KernelExtras::NONE,
-            )
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionPrefillContiguous, 16)
             .expect("attention_prefill bucket=16");
         let _p64 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(
-                KernelId::AttentionPrefillContiguous,
-                64,
-                KernelExtras::NONE,
-            )
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionPrefillContiguous, 64)
             .expect("attention_prefill bucket=64");
         // PREFILL_TILE_Q is the only `M`-derived constant baked, so
         // the bucket axis is collapsed for prefill — both 16 and 64
@@ -548,18 +443,15 @@ mod tests {
             .expect("compile standard shaders");
         let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
 
-        let extras = KernelExtras {
-            block_size: 16,
-            ..KernelExtras::NONE
-        };
+        // BLOCK_SIZE baked from `TinyLlamaProbe::BLOCK_SIZE` (default 16).
         let _r1 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 1, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 1)
             .expect("rope_append bucket=1");
         let _r8 = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 8, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 8)
             .expect("rope_append bucket=8");
         let _r1_again = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 1, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 1)
             .expect("rope_append bucket=1 cache hit");
         // Bucket axis collapsed (no `M`-derived constant); both 1 and
         // 8 share one entry. Repeat at bucket=1 hits cache.
@@ -604,16 +496,12 @@ mod tests {
         let half_dim = head_dim / 2;
         let num_q = TinyLlamaProbe::NUM_Q_HEADS as usize;
         let num_kv = TinyLlamaProbe::NUM_KV_HEADS as usize;
-        let block_size: usize = 16;
+        let block_size: usize = TinyLlamaProbe::BLOCK_SIZE as usize;
         let num_blocks: usize = 4;
         let max_pos: usize = 32;
 
-        let extras = KernelExtras {
-            block_size: block_size as u32,
-            ..KernelExtras::NONE
-        };
         let pipeline = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, bucket_m as u32, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, bucket_m as u32)
             .expect("rope_append pipeline");
 
         // Synthetic deterministic inputs.
@@ -815,22 +703,19 @@ mod tests {
         let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
 
         // TinyLlamaProbe params: HEAD_DIM=64, NUM_Q_HEADS=32,
-        // NUM_KV_HEADS=4, ATTN_SCALE=0.125. Decode: bucket_m == batch.
+        // NUM_KV_HEADS=4, ATTN_SCALE=0.125, BLOCK_SIZE=16,
+        // MAX_BLOCKS_PER_SEQ=128 (defaults from `CanonicalParams`).
+        // Decode: bucket_m == batch.
         let batch: usize = 2;
         let head_dim = TinyLlamaProbe::HEAD_DIM as usize;
         let num_q = TinyLlamaProbe::NUM_Q_HEADS as usize;
         let num_kv = TinyLlamaProbe::NUM_KV_HEADS as usize;
-        let block_size: usize = 16;
-        let max_blocks_per_seq: usize = 4;
+        let block_size: usize = TinyLlamaProbe::BLOCK_SIZE as usize;
+        let max_blocks_per_seq: usize = TinyLlamaProbe::MAX_BLOCKS_PER_SEQ as usize;
         let num_blocks: usize = 4;
 
-        let extras = KernelExtras {
-            block_size: block_size as u32,
-            max_blocks_per_seq: max_blocks_per_seq as u32,
-            ..KernelExtras::NONE
-        };
         let pipeline = pipelines
-            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, batch as u32, extras)
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, batch as u32)
             .expect("attention_via_cache pipeline");
 
         // Per-seq cache lengths: seq 0 fits in one logical block, seq
@@ -1021,7 +906,7 @@ mod tests {
         let head_dim = TinyLlamaProbe::HEAD_DIM as usize;
         let num_q = TinyLlamaProbe::NUM_Q_HEADS as usize;
         let num_kv = TinyLlamaProbe::NUM_KV_HEADS as usize;
-        let tile_q: usize = DEFAULT_PREFILL_TILE_Q as usize;
+        let tile_q: usize = TinyLlamaProbe::PREFILL_TILE_Q as usize;
 
         // 2 sequences, each 8 tokens — total = 16 = exactly one
         // PREFILL_TILE_Q tile, so the dispatch grid has a single
@@ -1031,11 +916,7 @@ mod tests {
 
         let bucket_m = total as u32;
         let pipeline = pipelines
-            .pipeline_for::<TinyLlamaProbe>(
-                KernelId::AttentionPrefillContiguous,
-                bucket_m,
-                KernelExtras::NONE,
-            )
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionPrefillContiguous, bucket_m)
             .expect("attention_prefill pipeline");
 
         // Synthetic deterministic Q/K/V — small magnitudes so f16

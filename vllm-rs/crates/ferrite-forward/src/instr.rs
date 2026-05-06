@@ -120,6 +120,40 @@ pub trait CanonicalParams {
     /// projector: k=4 over a 64×64 patch grid → 16×16 = 256 tokens). The
     /// pool is non-overlapping, so stride == kernel. Defaults to 0.
     const VISION_POOL_KERNEL: u32 = 0;
+
+    /// RmsNorm epsilon — read from `rms_norm_eps` in the model
+    /// config at macro-expand time. The metal `rmsnorm_*_specialized`
+    /// kernels consume this via `[[function_constant]]` baked into
+    /// the compiled pipeline; cuda's interpreter still reads it
+    /// from `RmsNorm.eps` on the loaded layer struct (same value,
+    /// same source). Default is the value Llama / Qwen / Phi
+    /// canonically use; per-canonical macro impls override.
+    const RMS_NORM_EPS: f32 = 1e-5;
+
+    /// Paged-KV-cache block stride (the `block_size` function
+    /// constant `attention_via_cache_*_specialized` and
+    /// `rope_append_*_specialized` consume). Backend-fixed at 16
+    /// (vLLM's default); per-canonical override only if a model
+    /// chooses a different paging size.
+    const BLOCK_SIZE: u32 = 16;
+
+    /// Block-table row stride (in u32s), equal to
+    /// `ceil(MAX_SEQ_LEN / BLOCK_SIZE)`. Baked into
+    /// `attention_via_cache_*_specialized` so the kernel can index
+    /// `block_table[seq * MAX_BLOCKS_PER_SEQ + logical_block]`
+    /// without a runtime divide. Default sized for ~2k tokens; per-
+    /// canonical macro impls override for longer-context models.
+    const MAX_BLOCKS_PER_SEQ: u32 = 128;
+
+    /// Q-axis tile size for `attention_prefill_contiguous_*_specialized`
+    /// — the kernel processes this many query tokens per threadgroup.
+    /// Backend-fixed; tuning requires kernel co-evolution.
+    const PREFILL_TILE_Q: u32 = 16;
+
+    /// Partial-rope rotation dim — for models where only the first
+    /// `ROT_DIM` of `HEAD_DIM` get rotary applied (Qwen2-VL, GPT-J).
+    /// Default equals `HEAD_DIM` (full rope, the common case).
+    const ROT_DIM: u32 = Self::HEAD_DIM;
 }
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.

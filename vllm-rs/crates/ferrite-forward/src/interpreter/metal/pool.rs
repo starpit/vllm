@@ -588,7 +588,6 @@ mod tests {
         WeightTensor,
     };
     use crate::interpreter::metal::model_meta::BufferRef;
-    use crate::interpreter::metal::pipelines::KernelExtras;
     use ferrite_kernels::layers::RmsNorm;
     use ferrite_metal_kernels::metal::{Buffer, MTLResourceOptions};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
@@ -639,13 +638,6 @@ mod tests {
             BufferRef {
                 buffer: &self.rmsnorm_weight,
                 offset: 0,
-            }
-        }
-
-        fn kernel_extras_for(&self, _cmd: &LoweredCommand<TinyLlamaProbe>) -> KernelExtras {
-            KernelExtras {
-                eps: 1e-5,
-                ..KernelExtras::NONE
             }
         }
     }

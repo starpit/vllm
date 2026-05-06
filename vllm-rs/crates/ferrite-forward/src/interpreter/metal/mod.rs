@@ -9,9 +9,13 @@
 
 pub mod lowered;
 pub mod lowering;
+pub mod pipelines;
 
 pub use lowered::{
     Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 pub use lowering::lower;
+pub use pipelines::{
+    constants_for, KernelExtras, PipelineLookupError, SpecializedPipelines,
+};

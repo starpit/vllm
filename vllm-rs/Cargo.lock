@@ -2090,6 +2090,7 @@ dependencies = [
  "ferrite-cuda-core",
  "ferrite-forward-macro",
  "ferrite-kernels",
+ "ferrite-metal-kernels",
  "ferrite-vision",
  "hf-hub",
  "inventory",

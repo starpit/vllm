@@ -18,11 +18,14 @@ nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forwa
 # Metal backend on Apple Silicon. Surfaces the `Instruction<W>` enum +
 # `CanonicalParams` trait + `WtFn`/`CosSinFn` aliases so the Metal
 # interpreter (`interpreter::metal`) can lower a per-bucket tape into
-# `LoweredMetalTape` for ICB recording. Pulls in NO Metal SDK at this
-# layer (the lowering pass is pure CPU); the Metal device dependency
-# lives in `ferrite-metal-kernels`, which the Metal interpreter wires
-# up itself.
-metal = []
+# `LoweredMetalTape` for ICB recording. Phase 5.A's lowering pass is
+# pure CPU — but Phase 5.B's `pipelines.rs` (specialized pipeline
+# cache) and the upcoming worker/pool pieces (5.C/5.D/5.E) wrap
+# metal-rs types, so this feature pulls in `ferrite-metal-kernels` to
+# bring those in. The cfg gate inside `interpreter::metal::pipelines`
+# also requires `target_os = "macos"` so non-Apple builds with the
+# `metal` feature still compile (lowering only).
+metal = ["dep:ferrite-metal-kernels"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -36,6 +39,12 @@ ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 # `ferrite-vision` is gated on `cuda` because its lib.rs uses
 # `cudarc::CUstream` unconditionally; the Metal path doesn't touch it.
 ferrite-vision = { path = "../ferrite-vision", optional = true }
+# Optional Metal backend; only depended on under `feature = "metal"`.
+# The dep itself only compiles on macOS — its `metal-rs` transitive
+# dep is gated there. Don't add a `cfg(target_os = "macos")` here in
+# the workspace; let cargo handle it via the feature flag and let
+# downstream callers gate their consuming code.
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }

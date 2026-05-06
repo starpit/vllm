@@ -105,8 +105,15 @@ This gating is acknowledged technical debt — when parallel Metal weight types 
 
 **Verification:** `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin without CUDA toolkit.
 
-#### Phase 5.B: Function-constant pipeline cache 🔜 NEXT
-Rewrite hand-rolled MSL shaders (`rmsnorm.metal`, `attention.metal`, `fused_*.metal`) to declare layer-independent params (`hidden_size`, `eps`, `num_heads`, `head_dim`, `rope_theta`, `intermediate_size`, …) as `[[function_constant(N)]]`. Build `SpecializedPipelineCache` keyed on `(model_variant_id, bucket_id, kernel_name)` that constructs `MTLComputePipelineState`s via `MTLFunctionConstantValues`. Removes the runtime `constants` buffer and saves a binding slot.
+#### Phase 5.B: Function-constant pipeline cache 🔄 IN PROGRESS
+Rewrite hand-rolled MSL shaders (`rmsnorm.metal`, `attention.metal`, `fused_*.metal`) to declare layer-independent params (`hidden_size`, `eps`, `num_heads`, `head_dim`, `rope_theta`, `intermediate_size`, …) as `[[function_constant(N)]]`. Build `SpecializedPipelineCache` keyed on `(library, kernel, function-constant bag)` that constructs `MTLComputePipelineState`s via `MTLFunctionConstantValues`. Removes the runtime `constants` buffer and saves a binding slot.
+
+**Sub-status (2026-05-06):**
+- ✅ 5.B.1 — Audited every MSL shader for runtime-constant uses; mapped each to a `CanonicalParams` field, bucket-derived value, or per-instruction extra (eps / scale).
+- ✅ 5.B.2 — `SpecializedPipelineCache` (in `ferrite-metal-kernels::specialized_pipeline_cache`) + glue layer (`ferrite-forward::interpreter::metal::pipelines::SpecializedPipelines`). The cache builds pipelines via `MTLFunctionConstantValues`, deduplicates on `(library, kernel, constants bag)`. Glue layer codifies the function-constant index assignments per `KernelId` (see `pipelines.rs` doc comment). 3 device-bound + 5 CPU-only tests pass.
+- 🔜 5.B.3 — Rewrite `rmsnorm.metal` + `fused_add_rmsnorm.metal` to use the function constants the glue layer expects. Add new specialized symbols (`rmsnorm_f16_specialized`, …) alongside the existing ones so legacy Phase 4.6 ICB recorders keep compiling until 5.C lands.
+- 🔜 5.B.4 — Same treatment for `attention.metal` and `fused_gate_up_silu_mul.metal`.
+- 🔜 5.B.5 — Smoke test: build the cache for TinyLlama-1.1B params at `bucket_m ∈ {1, 8, 64, 256, 2048}` for every rewritten kernel; assert each pipeline builds and the cache deduplicates.
 
 #### Phase 5.C: `MetalWorker` 🔜 PLANNED
 Allocates the per-worker arena (one buffer per colored slot, sized for the max bucket). Walks the lowered tape, resolves `Binding::ArenaSlot` against `arena[slot]` and `Binding::Weight` against `MetalModelMeta`, records one ICB per bucket using the specialized pipelines from 5.B.
@@ -149,6 +156,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 4 Complete:** 2026-05-06 ✅ (including 4.6 ICB infrastructure)
 - **Phase 5 Started:** 2026-05-06 (initial skeleton; superseded by architecture pivot same day)
 - **Phase 5.A Complete:** 2026-05-06 ✅ (lowering pass + feature-flag refactor)
+- **Phase 5.B.1+5.B.2 Complete:** 2026-05-06 ✅ (`SpecializedPipelineCache` + `KernelId`-aware glue layer)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

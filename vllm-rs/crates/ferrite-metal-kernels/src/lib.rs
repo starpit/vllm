@@ -14,7 +14,14 @@ pub mod fused_kernels;
 pub mod gemm;
 pub mod rope;
 pub mod shader_cache;
+pub mod specialized_pipeline_cache;
 pub mod stream;
+
+/// Re-export of the upstream `metal` crate so downstream callers
+/// (notably `ferrite-forward::interpreter::metal::pipelines`) can
+/// reach Metal types without taking their own `metal` dependency
+/// — the version stays pinned here.
+pub use metal;
 
 // Instruction recording for ICB execution
 pub mod instruction_executor;

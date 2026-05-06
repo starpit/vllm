@@ -187,11 +187,17 @@ pub fn constants_for<W: CanonicalParams>(
             } else {
                 extras.rot_dim
             };
+            // `block_size` reaches the kernel as a function constant
+            // (index 4) so the paged-write index math folds at
+            // pipeline-build time. The same value plumbs into
+            // `AttentionViaCache` (index 4) — the model_meta supplies
+            // it once per layer via `KernelExtras::block_size`.
             vec![
                 ConstantValue::uint(0, W::HEAD_DIM),
                 ConstantValue::uint(1, W::NUM_Q_HEADS),
                 ConstantValue::uint(2, W::NUM_KV_HEADS),
                 ConstantValue::uint(3, rot_dim),
+                ConstantValue::uint(4, extras.block_size),
             ]
         }
         KernelId::AttentionViaCache => {
@@ -515,5 +521,266 @@ mod tests {
         // the bucket axis is collapsed for prefill — both 16 and 64
         // share the same cache entry. Total now = 2.
         assert_eq!(pipelines.cached_count(), 2);
+    }
+
+    /// Device-bound smoke test for the Phase 5.G.3 specialized
+    /// `rope_append_f16_specialized` shader. Verifies the kernel
+    /// compiles against the five-element `MTLFunctionConstantValues`
+    /// bag (`HEAD_DIM`, `NUM_Q_HEADS`, `NUM_KV_HEADS`, `ROT_DIM`,
+    /// `BLOCK_SIZE`) the lowering pass emits, and that the cache
+    /// returns the same handle on a repeat lookup.
+    ///
+    /// `bucket_m` is not part of RopeAppend's constant bag (the
+    /// kernel reads `tg_pos.x` over the dispatch range), so different
+    /// buckets share one pipeline entry — same collapse pattern as
+    /// `AttentionPrefillContiguous`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rope_append_pipeline_builds_and_caches() {
+        let Some(device) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let extras = KernelExtras {
+            block_size: 16,
+            ..KernelExtras::NONE
+        };
+        let _r1 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 1, extras)
+            .expect("rope_append bucket=1");
+        let _r8 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 8, extras)
+            .expect("rope_append bucket=8");
+        let _r1_again = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, 1, extras)
+            .expect("rope_append bucket=1 cache hit");
+        // Bucket axis collapsed (no `M`-derived constant); both 1 and
+        // 8 share one entry. Repeat at bucket=1 hits cache.
+        assert_eq!(pipelines.cached_count(), 1);
+    }
+
+    /// Device-bound numerical-correctness check for the Phase 5.G.3
+    /// `rope_append_f16_specialized` kernel against
+    /// `cpu_golden::rope_append`. Allocates synthetic Q/K/V/cos_sin/
+    /// positions/slot_mapping/kv_cache buffers, dispatches the
+    /// specialized kernel directly (no ICB/worker — just the pipeline
+    /// + a fresh compute encoder), reads back the f16 outputs, and
+    /// asserts max-abs error < 5e-3 vs the cpu_golden ref.
+    ///
+    /// 5e-3 tolerance covers f16 round-tripping (3 ULP at typical
+    /// Q magnitudes) plus the MSL `half(...)` rounding mode, which
+    /// is round-to-nearest-even on Apple Silicon — same as `f16::from_f32`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rope_append_matches_cpu_golden() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        // Shape: TinyLlama-1.1B params, bucket_m = 2 (small for test),
+        // BLOCK_SIZE = 16. The kernel is bucket-axis-independent.
+        let bucket_m: usize = 2;
+        let head_dim = TinyLlamaProbe::HEAD_DIM as usize;
+        let half_dim = head_dim / 2;
+        let num_q = TinyLlamaProbe::NUM_Q_HEADS as usize;
+        let num_kv = TinyLlamaProbe::NUM_KV_HEADS as usize;
+        let block_size: usize = 16;
+        let num_blocks: usize = 4;
+        let max_pos: usize = 32;
+
+        let extras = KernelExtras {
+            block_size: block_size as u32,
+            ..KernelExtras::NONE
+        };
+        let pipeline = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RopeAppend, bucket_m as u32, extras)
+            .expect("rope_append pipeline");
+
+        // Synthetic deterministic inputs.
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.001).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.002).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| (i as f32) * 0.003)
+            .collect();
+
+        // cos_sin layout: [max_pos, head_dim] = [cos[half] | sin[half]].
+        let mut cos_sin_data = vec![0.0f32; max_pos * head_dim];
+        for pos in 0..max_pos {
+            for d in 0..half_dim {
+                let theta =
+                    (pos as f32) / 10000.0_f32.powf((d as f32) / (half_dim as f32));
+                cos_sin_data[pos * head_dim + d] = theta.cos();
+                cos_sin_data[pos * head_dim + half_dim + d] = theta.sin();
+            }
+        }
+
+        let positions = vec![5u32, 7];
+        // Two distinct slots — one in block 0 (offset 3), one in block 1 (offset 3).
+        let slot_mapping = vec![3u32, (block_size as u32) + 3];
+
+        // Buffer helpers.
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> =
+                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf = device
+                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device
+                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_f16(&device, &q_data);
+        let k_buf = alloc_f16(&device, &k_data);
+        let v_buf = alloc_f16(&device, &v_data);
+        let cos_sin_buf = alloc_f16(&device, &cos_sin_data);
+        let positions_buf = alloc_u32(&device, &positions);
+        let slot_buf = alloc_u32(&device, &slot_mapping);
+        let kv_k_buf = alloc_zero_f16(&device, num_blocks * num_kv * block_size * head_dim);
+        let kv_v_buf = alloc_zero_f16(&device, num_blocks * num_kv * block_size * head_dim);
+
+        // Encode + dispatch.
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&cos_sin_buf), 0);
+        enc.set_buffer(4, Some(&positions_buf), 0);
+        enc.set_buffer(5, Some(&slot_buf), 0);
+        enc.set_buffer(6, Some(&kv_k_buf), 0);
+        enc.set_buffer(7, Some(&kv_v_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(bucket_m as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Build separated cos/sin tables for cpu_golden::rope_append.
+        let mut cos_table = vec![0.0_f32; max_pos * head_dim];
+        let mut sin_table = vec![0.0_f32; max_pos * head_dim];
+        for pos in 0..max_pos {
+            for d in 0..half_dim {
+                cos_table[pos * head_dim + d] = cos_sin_data[pos * head_dim + d];
+                sin_table[pos * head_dim + d] = cos_sin_data[pos * head_dim + half_dim + d];
+            }
+        }
+
+        let mut q_out_cpu = vec![0.0_f32; q_data.len()];
+        let mut kv_k_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
+        let mut kv_v_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
+        cpu_golden::rope_append(
+            &q_data,
+            &k_data,
+            &v_data,
+            &positions,
+            &slot_mapping,
+            &cos_table,
+            &sin_table,
+            &mut q_out_cpu,
+            &mut kv_k_cpu,
+            &mut kv_v_cpu,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+        );
+
+        // Read back f16 buffers and convert to f32 for comparison.
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let q_metal = read_f16(&q_buf, q_data.len());
+        let kv_k_metal = read_f16(&kv_k_buf, kv_k_cpu.len());
+        let kv_v_metal = read_f16(&kv_v_buf, kv_v_cpu.len());
+
+        let tol: f32 = 5e-3;
+        for i in 0..q_data.len() {
+            let diff = (q_metal[i] - q_out_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "q[{i}] metal={} cpu={} diff={}",
+                q_metal[i],
+                q_out_cpu[i],
+                diff
+            );
+        }
+        for i in 0..kv_k_cpu.len() {
+            let diff = (kv_k_metal[i] - kv_k_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "kv_k[{i}] metal={} cpu={} diff={}",
+                kv_k_metal[i],
+                kv_k_cpu[i],
+                diff
+            );
+        }
+        for i in 0..kv_v_cpu.len() {
+            let diff = (kv_v_metal[i] - kv_v_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "kv_v[{i}] metal={} cpu={} diff={}",
+                kv_v_metal[i],
+                kv_v_cpu[i],
+                diff
+            );
+        }
     }
 }

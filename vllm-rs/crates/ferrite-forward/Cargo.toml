@@ -58,6 +58,12 @@ ureq = { version = "2", optional = true, features = ["tls"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# Used by metal interpreter tests for f32 ↔ f16 conversion when
+# allocating + reading back Metal buffers in numerical-correctness
+# checks (Phase 5.G.3 onward).
+half = { workspace = true }
+
 [[bin]]
 name = "probe-weights"
 path = "src/bin/probe_weights.rs"

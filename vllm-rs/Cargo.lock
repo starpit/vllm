@@ -2092,6 +2092,7 @@ dependencies = [
  "ferrite-kernels",
  "ferrite-metal-kernels",
  "ferrite-vision",
+ "half",
  "hf-hub",
  "inventory",
  "serde",

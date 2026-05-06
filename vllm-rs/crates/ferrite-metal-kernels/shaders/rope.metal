@@ -209,6 +209,145 @@ kernel void rope_interleaved_f16(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5.G.3: rope_append_f16_specialized — paged-cache RoPE writer
+//
+// In-place NeoX-style RoPE on Q and K, plus paged write of (rotated K,
+// un-rotated V) into the per-layer KV cache. Mirrors
+// `Instruction::RopeAppend` (CUDA) / `KernelId::RopeAppend` (Metal).
+//
+// Function constants (must match
+// `ferrite_forward::interpreter::metal::pipelines::constants_for`):
+//   0 = HEAD_DIM
+//   1 = NUM_Q_HEADS
+//   2 = NUM_KV_HEADS
+//   3 = ROT_DIM     (typically == HEAD_DIM; partial-rope models pass < HEAD_DIM)
+//   4 = BLOCK_SIZE  (paged KV cache page size)
+//
+// Bindings (must match `interpreter::metal::lowering::lower_one` for
+// `Instruction::RopeAppend`):
+//   buffer(0) = q_inout       [bucket_m, NUM_Q_HEADS  * HEAD_DIM]   in/out
+//   buffer(1) = k_inout       [bucket_m, NUM_KV_HEADS * HEAD_DIM]   in/out
+//   buffer(2) = v_inout       [bucket_m, NUM_KV_HEADS * HEAD_DIM]   in/out (un-rotated; cache copy only)
+//   buffer(3) = cos_sin       [max_pos, ROT_DIM] — row = [cos[half] | sin[half]]
+//   buffer(4) = positions     [bucket_m]
+//   buffer(5) = slot_mapping  [bucket_m] — global cache slot per token
+//   buffer(6) = kv_cache_k    [num_blocks, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM]
+//   buffer(7) = kv_cache_v    same shape as kv_cache_k
+//
+// Dispatch (set by `interpreter::metal::lowering::lower_one`):
+//   threadgroups: (bucket_m, NUM_Q_HEADS, 1)
+//   threads_per_threadgroup: (HEAD_DIM, 1, 1)
+//
+// Per (token, q_head) threadgroup:
+//   - Threads with `d < ROT_DIM/2` rotate the (d, d+half) pair of
+//     `q_inout[token, q_head, :]`.
+//   - Threadgroups whose q_head owns a kv_head (i.e. `q_head %
+//     group_ratio == 0` where `group_ratio = NUM_Q_HEADS / NUM_KV_HEADS`)
+//     additionally:
+//       a. Rotate `k_inout[token, kv_head, :]` (same pair shape).
+//       b. Copy the rotated K and un-rotated V into the cache slot.
+//   - Other q_heads do Q only.
+//
+// No threadgroup_barrier needed: each thread reads-then-writes its own
+// (d, d+half) pair before any other thread touches the same indices,
+// and the K/V paged write happens after the K rotation in the same
+// thread (sequential dependency).
+// ---------------------------------------------------------------------------
+
+constant uint ROPE_HEAD_DIM     [[function_constant(0)]];
+constant uint ROPE_NUM_Q_HEADS  [[function_constant(1)]];
+constant uint ROPE_NUM_KV_HEADS [[function_constant(2)]];
+constant uint ROPE_ROT_DIM      [[function_constant(3)]];
+constant uint ROPE_BLOCK_SIZE   [[function_constant(4)]];
+
+kernel void rope_append_f16_specialized(
+    device       half* q_inout      [[buffer(0)]],
+    device       half* k_inout      [[buffer(1)]],
+    device       half* v_inout      [[buffer(2)]],
+    device const half* cos_sin      [[buffer(3)]],
+    device const uint* positions    [[buffer(4)]],
+    device const uint* slot_mapping [[buffer(5)]],
+    device       half* kv_cache_k   [[buffer(6)]],
+    device       half* kv_cache_v   [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid    [[thread_position_in_threadgroup]])
+{
+    const uint t        = tg_pos.x;
+    const uint q_head   = tg_pos.y;
+    const uint d        = tid.x;
+    const uint head_dim = ROPE_HEAD_DIM;
+    const uint rot_dim  = ROPE_ROT_DIM;
+    const uint half_dim = rot_dim / 2;
+    const uint num_q    = ROPE_NUM_Q_HEADS;
+    const uint num_kv   = ROPE_NUM_KV_HEADS;
+    const uint block_sz = ROPE_BLOCK_SIZE;
+    const uint group_r  = num_q / num_kv;
+
+    if (q_head >= num_q || d >= head_dim) return;
+
+    const uint pos = positions[t];
+    device const half* cos_row = cos_sin + pos * rot_dim;
+    device const half* sin_row = cos_sin + pos * rot_dim + half_dim;
+
+    // ── Q rotation (in-place) ────────────────────────────────────────
+    const uint q_dim = num_q * head_dim;
+    device half* q_row = q_inout + t * q_dim + q_head * head_dim;
+    if (d < half_dim) {
+        const float c  = float(cos_row[d]);
+        const float s  = float(sin_row[d]);
+        const float x0 = float(q_row[d]);
+        const float x1 = float(q_row[half_dim + d]);
+        q_row[d]            = half(x0 * c - x1 * s);
+        q_row[half_dim + d] = half(x1 * c + x0 * s);
+    }
+
+    // ── K/V rotation + paged write (only owning q_head per kv_head) ─
+    if (q_head % group_r != 0) return;
+    const uint kv_head = q_head / group_r;
+    const uint kv_dim  = num_kv * head_dim;
+    device half* k_row = k_inout + t * kv_dim + kv_head * head_dim;
+    device half* v_row = v_inout + t * kv_dim + kv_head * head_dim;
+
+    // K rotation (in-place).
+    if (d < half_dim) {
+        const float c  = float(cos_row[d]);
+        const float s  = float(sin_row[d]);
+        const float x0 = float(k_row[d]);
+        const float x1 = float(k_row[half_dim + d]);
+        k_row[d]            = half(x0 * c - x1 * s);
+        k_row[half_dim + d] = half(x1 * c + x0 * s);
+    }
+    // Fence the K writes — the paged write below has thread `d` read
+    // `k_row[d]`, which (for d ≥ half_dim) was written by thread
+    // `d - half_dim`. Without the barrier the paged write may see the
+    // pre-rotation half.
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Paged write: kv_cache layout [num_blocks, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM].
+    const uint slot         = slot_mapping[t];
+    const uint block_id     = slot / block_sz;
+    const uint block_offset = slot % block_sz;
+    const uint kv_blk_stride  = num_kv * block_sz * head_dim;
+    const uint kv_head_stride = block_sz * head_dim;
+    const uint kv_tok_stride  = head_dim;
+    device half* k_dst = kv_cache_k
+        + block_id     * kv_blk_stride
+        + kv_head      * kv_head_stride
+        + block_offset * kv_tok_stride;
+    device half* v_dst = kv_cache_v
+        + block_id     * kv_blk_stride
+        + kv_head      * kv_head_stride
+        + block_offset * kv_tok_stride;
+
+    // Each thread copies one element of K (rotated, post-write above)
+    // and V (un-rotated). For partial-rope models (rot_dim < head_dim),
+    // the tail [rot_dim, head_dim) of k_row is unrotated and copied
+    // through unchanged.
+    k_dst[d] = k_row[d];
+    v_dst[d] = v_row[d];
+}
+
 /// BFloat16 variant of interleaved RoPE
 kernel void rope_interleaved_bf16(
     device bfloat* query [[buffer(0)]],

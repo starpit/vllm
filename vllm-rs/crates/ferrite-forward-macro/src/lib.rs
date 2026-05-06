@@ -908,6 +908,33 @@ fn compile_common(
                 "quick_gelu_inplace",
                 "gelu_erf_inplace",
                 "gelu_tanh_inplace",
+                // Metal kernels (Phase 5.F: the proc-macro now runs
+                // under `--features metal`, so the classifier sees
+                // these names alongside the CUDA ones). Hand-rolled
+                // norm / elementwise / fused-MLP / RoPE — same shape
+                // class as the CUDA `*_ref` siblings, just emitting
+                // MSL instead of CUDA. `metal_attention_*` and
+                // `metal_gemm_*` get their own prefix arms below
+                // (fa2 / cutlass-equivalent). Gated on `metal` so the
+                // CUDA build doesn't carry dead names in its classifier.
+                #[cfg(feature = "metal")]
+                "metal_add_f16",
+                #[cfg(feature = "metal")]
+                "metal_rmsnorm_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_add_rmsnorm_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_gate_up_silu_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_gate_up_gelu_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_rope_append_f16",
+                // CommandR and other models use the interleaved rope
+                // variant; same shape class as the regular rope_append.
+                #[cfg(feature = "metal")]
+                "metal_rope_append_interleaved_f16",
+                #[cfg(feature = "metal")]
+                "metal_fatrelu_f16",
                 // Vision-prelude pixels materialization (G.5.e.1).
                 // Synthesized by `vision_lowering::materialize_pixels`;
                 // emits a single D2D copy that wraps `ctx.fwd.pixels`
@@ -937,36 +964,56 @@ fn compile_common(
             for assignment in sfufs.per_workload.values() {
                 for impl_id in assignment.impls.values() {
                     let name = library.get(*impl_id).name();
-                    let bucket = if name.starts_with("flashinfer") {
+                    // Most kernel-name prefixes here are CUDA-specific
+                    // (flashinfer/mla/cutlass/marlin/fp8/bnb4/ggml/cublas-via-fused_/
+                    // NCCL collectives + the multimodal D2D splice).
+                    // Gating each behind `cfg!(feature = "cuda")` keeps
+                    // the metal-only build's classifier from carrying
+                    // dead arms and prevents a hypothetical
+                    // metal-emitted impl that happens to start with
+                    // `cutlass` etc. from being silently mis-classed.
+                    let bucket = if cfg!(feature = "cuda") && name.starts_with("flashinfer") {
                         Some(1) // fi
-                    } else if name.starts_with("mla_") {
+                    } else if cfg!(feature = "cuda") && name.starts_with("mla_") {
                         Some(2) // mla
                     } else if name.starts_with("attention_")
                         || name.starts_with("sliding_attention_")
                         || name.starts_with("fa2_")
                         || name == "encoder_attention"
+                        || (cfg!(feature = "metal") && name.starts_with("metal_attention_"))
                     {
                         Some(0) // fa2
-                    } else if name.starts_with("marlin") {
+                    } else if cfg!(feature = "cuda") && name.starts_with("marlin") {
                         Some(5) // marlin
-                    } else if name.starts_with("fp8") {
+                    } else if cfg!(feature = "cuda") && name.starts_with("fp8") {
                         Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
-                    } else if name.starts_with("bnb4") || name.starts_with("ggml") {
+                    } else if cfg!(feature = "cuda")
+                        && (name.starts_with("bnb4") || name.starts_with("ggml"))
+                    {
                         // cublas: bnb4 dequant + cuBLAS matmul; ggml
                         // dequant_mul_mat_vec at decode + cuBLAS at prefill.
                         Some(3)
-                    } else if name.starts_with("cutlass") {
+                    } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
+                    {
+                        // Metal GEMM is currently routed through MPS
+                        // matmul2d (see ferrite-metal-kernels::gemm).
+                        // Treated as a cutlass-equivalent for class
+                        // accounting — same "specialized matmul tile"
+                        // shape from the cost-model's perspective.
                         Some(4) // cutlass
                     } else if NON_GEMM_NAMES.contains(&name) {
                         Some(6) // non-gemm
-                    } else if name == "all_reduce" || name == "all_gather" {
+                    } else if cfg!(feature = "cuda")
+                        && (name == "all_reduce" || name == "all_gather")
+                    {
                         // Tensor-parallel collectives inserted by
                         // `tp_lowering` at tp>1 (AllReduce after
                         // row-parallel gemms + vocab-parallel embed;
                         // AllGather after lm_head). Maps to NCCL —
                         // semantically distinct from compute kernels.
                         Some(7) // comm
-                    } else if name == "mm_embed_splice" {
+                    } else if cfg!(feature = "cuda") && name == "mm_embed_splice" {
                         // Multimodal post-Embed D2D splice inserted by
                         // `tp_lowering::insert_mm_splices`. Not a
                         // compute kernel — runs a sequence of
@@ -975,7 +1022,9 @@ fn compile_common(
                         // they share the "not a GEMM / not a normal
                         // per-token kernel" shape.
                         Some(7) // comm
-                    } else if name.starts_with("fused_") || name == "gemm_ref" {
+                    } else if cfg!(feature = "cuda")
+                        && (name.starts_with("fused_") || name == "gemm_ref")
+                    {
                         Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
                     } else {
                         None

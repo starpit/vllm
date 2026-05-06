@@ -10,7 +10,7 @@ default = []
 # code's type references resolve. Without this feature, only the
 # numeric pipeline observations (NUM_TILES etc) are available;
 # the emitted runtime types stay gated out.
-cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:ferrite-vision"]
+cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:ferrite-vision", "ferrite-forward-macro/cuda"]
 # Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
 # `ForwardCtx::tp_group` field). At tp=1 the lowering pass never
 # emits AllReduce, so this feature is a strict superset of `cuda`.
@@ -25,7 +25,7 @@ nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forwa
 # bring those in. The cfg gate inside `interpreter::metal::pipelines`
 # also requires `target_os = "macos"` so non-Apple builds with the
 # `metal` feature still compile (lowering only).
-metal = ["dep:ferrite-metal-kernels"]
+metal = ["dep:ferrite-metal-kernels", "ferrite-forward-macro/metal"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -33,7 +33,7 @@ metal = ["dep:ferrite-metal-kernels"]
 probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 
 [dependencies]
-ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-forward-macro = { path = "../ferrite-forward-macro", default-features = false }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 # `ferrite-vision` is gated on `cuda` because its lib.rs uses

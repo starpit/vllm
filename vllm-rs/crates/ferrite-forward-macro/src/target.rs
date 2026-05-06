@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+#[cfg(feature = "cuda")]
 use ferrite_cuda_targets::ProfileDef;
 
 /// Empirical GPU cost table: `(kernel_name, M, N, K) -> cost_us`.
@@ -147,6 +148,7 @@ impl TargetProfile {
 /// const, parsing the embedded CSV bytes into a `CostTable`. The
 /// proc-macro calls this once per `#[forward]` invocation after
 /// resolving the active GPU (`ferrite_cuda_targets::detect()`).
+#[cfg(feature = "cuda")]
 pub fn from_profile_def(def: &ProfileDef) -> TargetProfile {
     TargetProfile {
         name: def.name.to_string(),

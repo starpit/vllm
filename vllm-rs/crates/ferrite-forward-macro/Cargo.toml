@@ -8,7 +8,14 @@ license.workspace = true
 proc-macro = true
 
 [features]
-default = ["cuda"]
+# No default backend. Consumer must opt into exactly one of `cuda`
+# or `metal` via their own feature graph (see `ferrite-forward`'s
+# Cargo.toml — its `cuda` and `metal` features explicitly enable the
+# matching macro feature). Picking a default here was previously
+# convenient but made it impossible to build the macro under a pure
+# `--features metal` graph: cargo would unify `default` ∪ `metal`,
+# and the macro's `compile_error!` rejected having both at once.
+default = []
 # Backend selection: exactly one must be enabled
 cuda = ["dep:ferrite-cuda-targets"]
 metal = ["dep:ferrite-metal-targets", "dep:ferrite-metal-kernels"]

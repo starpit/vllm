@@ -341,6 +341,7 @@ pub unsafe fn pad_linear_k_to_mult8(
 /// `dump_tensor` between encoder stages to write `.bin` + jsonl metadata.
 #[cfg(feature = "cuda")]
 pub struct TraceDump {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     dir: Option<std::path::PathBuf>,
 }
 
@@ -365,6 +366,7 @@ impl TraceDump {
     /// # Safety
     /// `t` must be a live device tensor produced on `stream`'s context;
     /// this routine D2Hs synchronously around the copy.
+    #[cfg(feature = "cuda")]
     pub unsafe fn dump_tensor(&self, name: &str, t: GpuTensor, stream: CUstream) {
         let Some(dir) = self.dir.as_ref() else {
             return;

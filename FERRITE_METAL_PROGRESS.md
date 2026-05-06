@@ -274,9 +274,33 @@ Two device-bound tests landed in `pipelines.rs` mirroring the `rope_append_match
 
 Both tests pass first run on the M1 device-bound suite; total ferrite-forward Metal lib tests now 49/49.
 
-**5.G.4c (next) — Per-bucket CPU-vs-Metal diff harness.** Now unblocked. Walk one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena; assert elementwise difference under tolerance. Pattern is established (per-op tests above); the harness generalizes it across the lowered tape's full op set.
+**5.G.4c — Per-bucket CPU-vs-Metal diff harness.** ❌ **DROPPED** (2026-05-06). The per-op tests + structural worker tests already cover the value-add; a synthetic chained-op harness with stub weights mostly re-exercises the same machinery. Skip in favor of going straight to the real e2e path.
 
-**5.G.5 (after 5.G.4) — TinyLlama-1.1B end-to-end via vllm-e2e.** Blocked on real `MetalModelMeta` impl backed by safetensors (current 5.F.5 emission is panic-stub accessors).
+### Backend-unification refactor (2026-05-06)
+
+Sub-thread interrupted Phase 5.G to fix an architectural problem the user surfaced: weight loading was needlessly platform-coupled. CUDA-feature-gated impl blocks on `RmsNorm`, `LinearLayer`, `Embedding` etc. forced an entirely parallel Metal weight-lookup trait (`MetalModelMeta`) when the only platform-specific bit is the disk → device byte transfer. Four staged commits unwind this:
+
+**Stage A — `DeviceAllocator` trait + CUDA impl. ✅ COMPLETE (commit `67fd7bd08`)**
+
+`crates/ferrite-cuda-core/src/device_allocator.rs` defines `pub trait DeviceAllocator { unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8>; }` — synchronous from the caller's POV (impl syncs before returning). `crates/ferrite-cuda-core/src/cuda_allocator.rs` implements it with `mem_alloc` + `memcpy_htod_async` + `RawGpuMem` tracker. CUDA-specific accessors (`take_allocations` returning `Vec<RawGpuMem>`, `push_alloc`, `unrecord_alloc`, `stream`) live on the concrete `CudaAllocator` type — not the trait — because backend-specific code holds `&mut CudaAllocator` directly (no `Any` downcasts, no generics). `GpuWeights` now holds `allocator: BackendAllocator` via a feature-gated type alias (`#[cfg(cuda)] pub type BackendAllocator = CudaAllocator`); the `stream`/`cast_pinned`/`gpu_allocs` triple is gone, `take()`/`take_with_shape()`/`get()`/`take_shard()` collapse to one allocator call. Cast destination is a plain `Vec<u8>` (slow path syncs anyway; precast still uses pinned host memory internally).
+
+**Stage B — Metal `DeviceAllocator` impl + `GpuWeights` compiles under metal. ✅ COMPLETE (commit `4573f13e2`)**
+
+`crates/ferrite-cuda-core/src/metal_allocator.rs` implements `DeviceAllocator` with one or more `MTLBuffer` arenas in `StorageModeShared` (Apple silicon unified memory; `buffer.contents()` is host-writable AND device-visible). Bump-allocates within a 256 MB chunk; pushes a new arena when full or oversized. `MetalAllocator::buffer_for(ptr) -> Option<(&Buffer, u64)>` does linear lookup over arenas — used by the worker to map a `GpuTensor`'s raw pointer back to `(&MTLBuffer, offset)` for encoder bindings. `BackendAllocator` gets its `#[cfg(metal)]` arm. `pub mod weights` + `pub use GpuWeights` come out of the cuda gate. Inside `weights.rs`, the precast pipeline + `take_into` + `take_shard*` + `from_path` + `from_gguf_file` + `record_alloc`/`unrecord_alloc`/`take_gpu_allocs`/`stream`/etc. are individually `#[cfg(feature = "cuda")]`-gated. 5 new device-bound tests (`metal_allocator::tests::*`). 49/49 ferrite-forward Metal lib tests still pass.
+
+**Stage C — Unwind cuda gates on Layer impl blocks. ✅ COMPLETE (commit `dbb8bb6db` + cleanup `e022c93b0`)**
+
+`#[cfg(feature = "cuda")]` comes off the impl blocks of `Linear`, `MarlinLinear`, `Bnb4bitLinear`, `GgmlLinear`, `Fp8Linear`, `Fp8BlockLinear`, `Fp8AnyLinear`, `Embedding`, `RmsNorm`, `LayerNorm` and is moved per-method only on the genuinely cuda-specific bits — `forward` (uses cuBLAS / kernel launches), `load_sharded` (uses `take_shard*`), `load_dense_concat*` (use `CUstream`-typed signatures), and the GGML-specific concat helpers. Platform-neutral methods (`new`, `load`, `out_features`, `in_features`, `vocab_size`, `hidden_size`, `dense_weight`, `dense_bias`, `shallow_clone`) become reachable under metal. `LinearLayer::out_features`/`in_features` carries per-arm cfg gates: `Self::Dense` reachable everywhere; quant variant arms cuda-only with a `_ => panic!(...)` fall-through under non-cuda. `try_synthesize_packed_slice` ungated (Phi-3 packed-source helper — pure metadata). New `metal = ["ferrite-cuda-core/metal"]` feature on `ferrite-kernels`, propagated into `ferrite-forward/metal`.
+
+**Stage D (in progress) — Unify macro `Weights` emission, kill `MetalModelMeta`.**
+
+Replace the macro's parallel metal-only `Weights;` ZST + panic-stub accessors + `MetalModelMeta`-based pool constructor with the same `Weights` struct cuda emits — real loader, real `try_load(&mut GpuWeights)`, layer structs holding `GpuTensor`s. The worker resolves a `Binding::Weight { kind, layer, which }` by calling the WtFn thunk on the loaded `&Weights` (same code CUDA's interpreter uses), pulling out the GpuTensor, and calling `MetalAllocator::buffer_for(tensor.raw_ptr())` for the `(&MTLBuffer, offset)`. `KernelExtras` (per-layer eps etc.) comes from the same WtFn lookup (read `RmsNorm.eps` directly off the layer struct) instead of a separate `MetalModelMeta::kernel_extras_for` method. `MetalModelMeta` trait + `BufferRef` + `model_meta.rs` deleted. `metal_pool` constructor takes `Arc<Weights>` + `Arc<MetalAllocator>` instead of `Arc<dyn MetalModelMeta<Weights>>`.
+
+D.1 (commit `e022c93b0`): pre-cleanup — ungated `LinearLayer::dense_weight`/`dense_bias`/`shallow_clone` (purely platform-neutral pattern-matchers; quant variants panic, but the panic itself is platform-neutral). Worker's WtFn-based resolver needs these reachable under metal.
+
+D.2-D.6 remaining: worker-side WtFn-based weight resolver, KernelExtras-via-WtFn helper, replace `MetalModelMeta` references in worker.rs / pool.rs, update macro emission, delete `model_meta.rs`.
+
+**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** Unblocked once Stage D lands (the macro will emit a real `Weights::try_load` + a `metal_pool` ctor that takes the real loader struct + the metal allocator's buffer registry).
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
 Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
@@ -317,6 +341,10 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.G.2 Complete:** 2026-05-06 ✅ (`cpu_golden::{rope_append, attention_via_cache}` paged-cache refs + 4 unit tests; matches metal shader's `inv_sum = 1/(sum_exp + 1e-6)` guard; surfaces missing `rope_append_f16_specialized` shader)
 - **Phase 5.G.3 Complete:** 2026-05-06 ✅ (`rope_append_f16_specialized` MSL kernel + `BLOCK_SIZE` function constant + 2 device-bound tests; numerical match against `cpu_golden::rope_append` within 5e-3 f16 tolerance)
 - **Phase 5.G.4a + 5.G.4b Complete:** 2026-05-06 ✅ (device-bound numerical tests for `attention_via_cache_f16_specialized` (2-seq paged decode) + `attention_prefill_contiguous_f16_specialized` (2-seq×8 prefill, one full PREFILL_TILE_Q tile); both within 5e-3 f16 tolerance vs `cpu_golden::attention_via_cache` / `cpu_golden::attention_prefill`)
+- **Backend-unification Stage A Complete:** 2026-05-06 ✅ (`DeviceAllocator` trait + `CudaAllocator` impl; `GpuWeights` allocator-driven; commit `67fd7bd08`)
+- **Backend-unification Stage B Complete:** 2026-05-06 ✅ (`MetalAllocator` impl + `GpuWeights` compiles under metal; commit `4573f13e2`)
+- **Backend-unification Stage C Complete:** 2026-05-06 ✅ (Layer impl gates moved per-method; load methods reachable under metal; commit `dbb8bb6db`)
+- **Backend-unification Stage D.1 Complete:** 2026-05-06 ✅ (LinearLayer accessors ungated; commit `e022c93b0`)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

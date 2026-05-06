@@ -1,6 +1,6 @@
 # Ferrite Metal Architecture
 
-**Status**: Initial skeleton implementation (Week 1 of 8-12 week roadmap)
+**Status**: Phase 5 implementation (runtime interpreter with ICB recording)
 
 ## Overview
 
@@ -10,7 +10,7 @@ This document describes the architecture for porting ferrite's compile-time DSL 
 
 ### 1. Backend-Agnostic Solver + Backend-Specific Execution
 
-**Decision**: Solver emits backend-agnostic `Instruction<W>` lists; Metal execution records these to ICB.
+**Decision**: Solver emits backend-agnostic `Instruction<W>` lists; Metal execution records these to ICB at init time.
 
 **Architecture**:
 ```
@@ -18,8 +18,10 @@ DSL → Solver (backend-agnostic) → Instruction<W> list
                                          ↓
                     ┌────────────────────┴────────────────────┐
                     ↓                                         ↓
-            CUDA: eval() each instruction          Metal: record_to_icb() each instruction
-                  (direct kernel launch)                 (ICB pre-recording at init)
+            CUDA: eval() each instruction          Metal: MetalExecutor walks tape at init
+                  (runtime kernel launch)                calls record_*() methods
+                                                          ↓
+                                                    ICB pre-recorded at init
                                                           ↓
                                                     execute_icb() at runtime
                                                     (single GPU call per forward)
@@ -29,8 +31,8 @@ DSL → Solver (backend-agnostic) → Instruction<W> list
 - Solver picks `Implementation`s based on `target_compatible()` check
 - Metal impls implement `Implementation` trait directly (no wrapper)
 - Same `Instruction<W>` enum for both backends
-- CUDA: `Instruction::eval()` launches kernels directly
-- Metal: `Instruction::record_to_icb()` pre-records to ICB at init time
+- CUDA: `Instruction::eval()` launches kernels at runtime
+- Metal: `MetalExecutor` walks tape at init, calls `record_*()` to populate ICB
 
 ### 2. Reuse 100% of Frontend Pipeline
 
@@ -42,7 +44,8 @@ DSL → Solver (backend-agnostic) → Instruction<W> list
 
 **Backend-Specific Components** (Metal-only):
 - `Implementation` trait impls in `ferrite-metal-impl-lib`
-- ICB recording in `ferrite-metal-kernels/src/instruction_executor.rs`
+- ICB recording infrastructure in `ferrite-metal-kernels/src/instruction_executor/`
+- `MetalExecutor` runtime interpreter in `ferrite-forward/src/interpreter/metal.rs`
 - Metal kernel wrappers (RMSNorm, GEMM, Attention, etc.)
 - MSL shaders in `ferrite-metal-kernels/shaders/`
 
@@ -76,6 +79,11 @@ BTreeMap<String, Vec<CostEntry>>
 
 ```
 vllm-rs/crates/
+├── ferrite-forward/             # Frontend + runtime interpreter
+│   └── src/
+│       └── interpreter/
+│           ├── metal.rs        # MetalExecutor (walks tape, calls record_*())
+│           └── metal_tests.rs  # MetalExecutor tests
 ├── ferrite-metal-targets/       # Device profiles (M1/M2/M3/M4)
 │   ├── src/lib.rs              # MetalTargetProfile, cost tables
 │   └── profiles/cost_*.csv     # Measured kernel costs
@@ -85,7 +93,12 @@ vllm-rs/crates/
 │   │   ├── device.rs           # Device detection & capabilities
 │   │   ├── stream.rs           # Command buffer management
 │   │   ├── allocator.rs        # Buffer pooling
-│   │   ├── instruction_executor.rs  # ICB recording for Instruction<W>
+│   │   ├── instruction_executor/  # ICB recording infrastructure
+│   │   │   ├── mod.rs          # RecordingContext, dispatch helpers
+│   │   │   ├── rmsnorm.rs      # record_rmsnorm()
+│   │   │   ├── gemm.rs         # record_gemm()
+│   │   │   ├── attention.rs    # record_attention()
+│   │   │   └── fused.rs        # record_fused_*()
 │   │   ├── rmsnorm.rs          # RMSNorm kernel wrapper
 │   │   ├── gemm.rs             # MPS GEMM wrapper
 │   │   ├── attention.rs        # Attention kernel wrapper
@@ -97,10 +110,15 @@ vllm-rs/crates/
 ├── ferrite-metal-impl-lib/      # Metal Implementation trait impls
 │   └── src/
 │       ├── lib.rs              # Re-exports
-│       ├── rmsnorm.rs          # MetalRmsNormF16Impl: Implementation
-│       ├── gemm.rs             # MetalGemmImpl: Implementation
-│       ├── attention.rs        # MetalAttentionImpl: Implementation
-│       └── fused_kernels.rs    # MetalFused*Impl: Implementation
+│       ├── metal/              # Modular implementation structure
+│       │   ├── mod.rs          # Module organization
+│       │   ├── rmsnorm.rs      # MetalRmsNormImpl
+│       │   ├── gemm.rs         # MetalGemmImpl
+│       │   ├── attention.rs    # MetalAttentionImpl (4 variants)
+│       │   ├── activation.rs   # MetalActivationImpl (5 variants)
+│       │   ├── awq.rs          # MetalAwqImpl (2 variants)
+│       │   └── fused_kernels.rs # MetalFused*Impl
+│       └── metal_bridge.rs     # Deprecated compatibility shim
 └── ferrite-forward-macro/       # Proc-macro (unchanged for Metal)
     └── src/
         ├── solver.rs           # Backend-agnostic solver
@@ -111,27 +129,28 @@ vllm-rs/crates/
 **Key Architectural Points**:
 1. **No Metal-specific codegen**: Solver already emits `Instruction<W>` lists
 2. **No wrapper traits**: Metal impls implement `Implementation` directly
-3. **ICB execution**: `instruction_executor.rs` records each `Instruction` variant to ICB
-4. **Solver integration**: `starter_library()` registers Metal impls alongside CUDA impls
+3. **ICB recording**: `instruction_executor/` provides `record_*()` methods
+4. **Runtime interpreter**: `MetalExecutor` walks tape at init, calls `record_*()`
+5. **Solver integration**: `starter_library()` registers Metal impls alongside CUDA impls
 
 ## Implementation Phases
 
-### Phase 1: Foundation (Weeks 1-2) ✅ CURRENT
+### Phase 1: Foundation ✅ COMPLETE
 - [x] Create `ferrite-metal-targets` with M1/M2/M3/M4 profiles
 - [x] Create `ferrite-metal-kernels` with Metal-rs bindings
 - [x] Create `ferrite-metal-impl-lib` with `MetalImplementation` trait
 - [x] Implement `MetalRmsNormF16Impl` as first example
 - [x] Add Metal shaders directory with `rmsnorm.metal`
-- [ ] Verify basic Metal device detection and buffer allocation
+- [x] Verify basic Metal device detection and buffer allocation
 
-### Phase 2: Solver Integration (Weeks 3-4) ✅ COMPLETE
+### Phase 2: Solver Integration ✅ COMPLETE
 - [x] Extend `TargetProfile` to support Metal backend via `Backend` enum
 - [x] Metal implementations registered in `starter_library()` (MetalRmsNormImpl)
 - [x] Cost lookup works for Metal targets via `MetalTargetProfile::cost_us_for()`
 - [x] Microbenchmark harness created (`ferrite-metal-cost-sweep`)
 - [x] Initial cost tables populated for M1 Max from real hardware measurements
 
-### Phase 3: Runtime & ICB Execution (Weeks 5-6) ✅ COMPLETE
+### Phase 3: Runtime & ICB Infrastructure ✅ COMPLETE
 - [x] MetalStream for command buffer management
 - [x] MetalAllocator for buffer pooling
 - [x] Integration tests passing (21 tests total)
@@ -140,37 +159,48 @@ vllm-rs/crates/
 
 **Note**: No Metal-specific codegen needed - solver already emits backend-agnostic `Instruction<W>` lists
 
-### Phase 4: Kernel Library & Implementation Registration (Weeks 7-10) 🔄 IN PROGRESS
-**Current Status**: ~15% complete (1 of ~50 instruction types)
+### Phase 4: Kernel Library & Implementation Registration ✅ COMPLETE
+**Status**: All 18 critical path operations implemented
 
 **Completed**:
 - [x] 4.1: Attention kernels (basic, paged, multi-head, GQA, optimized)
 - [x] 4.2: Fused kernels (Add+RMSNorm, Gate-Up-SiLU-Mul, GEMM via MPS)
 - [x] 4.3: Activation functions (SiLU, GELU, FatReLU)
 - [x] 4.4: Quantization (AWQ dequantization + GEMM integration)
+- [x] 4.5: Implementation trait impls (18 critical path operations)
+  - Modular structure in `src/metal/` directory
+  - All registered in `starter_library()`
+  - 78 tests passing
+- [x] 4.6: ICB recording infrastructure
+  - `RecordingContext` with ICB management
+  - `record_compute_dispatch()` for recording commands
+  - `inheritPipelineState=true` for Apple Silicon compatibility
+  - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-**In Progress**:
-- [ ] 4.5: Create `Implementation` trait impls for each Metal kernel
-  - [x] MetalRmsNormImpl (fp16, bf16) - registered in `starter_library()`
-  - [ ] MetalGemmImpl (wraps Phase 4.2.5 MPS GEMM)
-  - [ ] MetalFusedAddRmsNormImpl (wraps Phase 4.2.1)
-  - [ ] MetalFusedGateUpSiluMulImpl (wraps Phase 4.2.2)
-  - [ ] MetalAttentionImpl (wraps Phase 4.1 attention kernels)
-  - [ ] ~45 more instruction variants...
-- [ ] 4.6: Implement `Instruction<W>::record_to_icb()` for Metal
-  - [ ] Create `ferrite-metal-kernels/src/instruction_executor.rs`
-  - [ ] One match arm per `Instruction` variant (~50 total)
-  - [ ] Record pipeline state, buffer bindings, dispatch size to ICB
+### Phase 5: Runtime Interpreter 🔄 IN PROGRESS
+**Goal**: Runtime interpreter that walks instruction tape and records to ICB  
+**Status**: Skeleton created, recording loop TODO
 
-**Estimated Remaining**: 2-3 weeks
+**Architecture**:
+- `MetalExecutor` walks instruction tape at init time
+- Calls Phase 4.6's `record_*()` methods to populate ICB
+- Executes ICB on each forward pass
 
-### Phase 5: End-to-End Integration (Weeks 11-12) 🔜 PLANNED
-- [ ] Wire up Metal execution path in vllm-executor
-- [ ] Test full forward pass: DSL → Solver → ICB → Metal kernels
-- [ ] Verify numerical correctness against CUDA reference
-- [ ] Profile and optimize hot paths
+**Implementation**:
+- [x] 5.1: Create `MetalExecutor` struct (skeleton with instruction matching)
+- [x] 5.2: Create `RecordingContext` (from Phase 4.6)
+- [ ] 5.3: Implement instruction recording loop
+- [ ] 5.4: Implement `forward()` execution (tile table + ICB execution)
+- [ ] 5.5: Add MetalExecutor tests
 
-### Phase 6: Production Readiness (Weeks 13-14) 🔜 PLANNED
+### Phase 5.6: Test with Real Model 🔜 NEXT
+- [ ] Complete Phase 5.3-5.5 (recording loop + forward execution)
+- [ ] Wire `#[forward]` macro to emit Metal code
+- [ ] Implement `MetalWeights::load_safetensors()`
+- [ ] Add Metal backend to `vllm-e2e` tests
+- [ ] Debug and validate with TinyLlama-1.1B
+
+### Phase 6: Production Readiness 🔜 PLANNED
 - [ ] Add comprehensive error handling
 - [ ] Document all public APIs
 - [ ] Create migration guide for CUDA users
@@ -215,7 +245,6 @@ vllm-rs/crates/
 
 **Strategy**: Leverage ferrite's superior fusion and cost modeling, adopt MLX's tuned Metal kernel implementations.
 
-
 ## Future Architectural Improvements
 
 ### Metal Tensor Abstraction (RAII Pattern)
@@ -254,19 +283,18 @@ pub struct OwnedMetalTensor {
 - Prevents manual `release` calls and double-free bugs
 - Enables zero-copy views and slicing operations
 
-**Implementation Priority**: Post-Phase 4 (after core kernel functionality complete)
+**Implementation Priority**: Post-Phase 5 (after runtime interpreter complete)
 
 **Related Issues**:
 - Fixed in Phase 4.4: Manual MPS object release causing SIGSEGV
 - Fixed in Phase 4.4: Wrong MPSDataType enum values (268435472 vs 16)
 
-
 ## Next Steps
 
-1. **Verify skeleton compiles**: `cd vllm-rs && cargo check -p ferrite-metal-targets -p ferrite-metal-kernels -p ferrite-metal-impl-lib`
-2. **Run basic tests**: `cargo test -p ferrite-metal-targets -p ferrite-metal-impl-lib`
-3. **Start Phase 2**: Integrate Metal backend into solver
-4. **Microbenchmark harness**: Port `ferrite-cost-sweep` to Metal
+1. **Complete Phase 5.3-5.5**: Implement instruction recording loop in `MetalExecutor`
+2. **Test with real model**: Wire into `vllm-e2e` golden test framework
+3. **Profile and optimize**: Identify hot paths and optimize Metal kernels
+4. **Production readiness**: Error handling, documentation, CI/CD
 
 ## References
 

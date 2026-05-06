@@ -9,9 +9,13 @@ description = "Core GPU types for the ferrite inference framework"
 default = []
 cuda = ["dep:cudarc"]
 nccl = ["cuda", "cudarc/nccl"]
+# Metal backend: pulls in metal-rs for the `MetalAllocator` impl of
+# `DeviceAllocator`. Mutually exclusive with `cuda` at build time.
+metal = ["dep:metal"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+metal = { version = "0.29", optional = true }
 half = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }

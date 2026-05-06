@@ -2071,6 +2071,7 @@ dependencies = [
  "inventory",
  "libc",
  "memmap2",
+ "metal 0.29.0",
  "safetensors 0.7.0",
  "serde_json",
  "tracing",

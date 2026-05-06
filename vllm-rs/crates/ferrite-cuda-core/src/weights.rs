@@ -14,13 +14,18 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
 
 use anyhow::{Result, bail};
+#[cfg(feature = "cuda")]
 use cudarc::driver::sys::CUstream;
 
 use crate::DeviceAllocator;
+#[cfg(feature = "cuda")]
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
@@ -218,6 +223,11 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 
 /// Background worker: iterates through tensors, pre-faults mmap pages, casts
 /// float data into per-tensor pinned buffers, and stores results in `state.ready`.
+///
+/// CUDA-only: uses `mem_alloc_host` for pinned-host destinations. The
+/// Metal path (unified memory) doesn't need pinning and skips this
+/// pipeline entirely.
+#[cfg(feature = "cuda")]
 fn precast_worker(
     state: Arc<PrecastState>,
     target_dtype: Option<DType>,
@@ -271,6 +281,8 @@ fn precast_worker(
 
 /// Pre-fault mmap pages by reading through the data at page-stride intervals.
 /// This triggers page faults now so take() doesn't block on disk I/O later.
+/// CUDA-only — invoked from the precast pipeline.
+#[cfg(feature = "cuda")]
 fn prefault_pages(data: &[u8]) {
     // Read one byte per page (4KB) to fault each page into the page cache.
     // The volatile read prevents the compiler from optimizing this away.
@@ -284,7 +296,8 @@ fn prefault_pages(data: &[u8]) {
     }
 }
 
-/// Cast tensor data into a new pinned host buffer.
+/// Cast tensor data into a new pinned host buffer. CUDA-only.
+#[cfg(feature = "cuda")]
 fn cast_into_pinned(data: &[u8], src_dtype: DType, target: DType) -> Result<PrecastEntry> {
     let numel = data.len() / src_dtype.size_bytes();
     let cast_size = numel * target.size_bytes();
@@ -352,6 +365,8 @@ fn cast_into_pinned(data: &[u8], src_dtype: DType, target: DType) -> Result<Prec
 }
 
 /// A pre-cast tensor ready for H2D DMA. Data lives in a pinned host buffer.
+/// CUDA-only.
+#[cfg(feature = "cuda")]
 struct PrecastEntry {
     /// Pinned host buffer containing the (possibly cast) tensor data.
     pinned_ptr: *mut u8,
@@ -362,9 +377,11 @@ struct PrecastEntry {
 }
 
 // Safety: pinned host memory is accessible from any thread.
+#[cfg(feature = "cuda")]
 unsafe impl Send for PrecastEntry {}
 
-/// Shared state for the pre-cast pipeline.
+/// Shared state for the pre-cast pipeline. CUDA-only.
+#[cfg(feature = "cuda")]
 struct PrecastState {
     /// Pre-cast tensors ready for take(). Protected by mutex — contention is
     /// low because the producer adds entries one at a time and the consumer
@@ -448,14 +465,16 @@ impl GpuWeights {
     /// `gguf_dense` directly via `quantized_map_mut` /
     /// `gguf_dense_map_mut`. Safetensors callers should use
     /// `from_dir` / `from_index` / `from_single_file` instead.
-    pub fn empty(stream: CUstream) -> Self {
+    pub fn empty(allocator: crate::BackendAllocator) -> Self {
         Self {
             tensors: HashMap::new(),
             target_dtype: None,
             cast_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
             precast: None,
+            #[cfg(feature = "cuda")]
             precast_handle: None,
-            allocator: crate::CudaAllocator::new(stream),
+            allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -465,6 +484,7 @@ impl GpuWeights {
     /// Push a `RawGpuMem` allocation onto the lifetime tracker. Used
     /// by the GGUF loader so quantized-weight GPU memory is freed
     /// alongside the rest of the `GpuWeights` allocations.
+    #[cfg(feature = "cuda")]
     pub fn push_gpu_alloc(&mut self, alloc: crate::alloc::RawGpuMem) {
         self.allocator.push_alloc(alloc);
     }
@@ -473,17 +493,20 @@ impl GpuWeights {
     ///
     /// Handles both single-file (`model.safetensors`) and sharded
     /// (`model.safetensors.index.json`) models.
-    pub fn from_dir(dir: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
+    pub fn from_dir(
+        dir: impl AsRef<Path>,
+        allocator: crate::BackendAllocator,
+    ) -> Result<Self> {
         let dir = dir.as_ref();
         let index_path = dir.join("model.safetensors.index.json");
         let single_path = dir.join("model.safetensors");
 
         if index_path.exists() {
-            Self::from_index(&index_path, stream)
+            Self::from_index(&index_path, allocator)
         } else if single_path.exists() {
-            Self::from_single_file(&single_path, stream)
+            Self::from_single_file(&single_path, allocator)
         } else {
-            bail!("No safetensors files found in {}", dir.display());
+            anyhow::bail!("No safetensors files found in {}", dir.display());
         }
     }
 
@@ -499,6 +522,7 @@ impl GpuWeights {
     ///
     /// # Safety
     /// Caller must hold a valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn from_path(
         path: impl AsRef<Path>,
         stream: CUstream,
@@ -544,7 +568,7 @@ impl GpuWeights {
                 )
             };
         }
-        let mut gw = Self::from_dir(path, stream)?;
+        let mut gw = Self::from_dir(path, crate::CudaAllocator::new(stream))?;
         gw.set_target_dtype(target_dtype);
         Ok(gw)
     }
@@ -562,6 +586,7 @@ impl GpuWeights {
     /// Caller must hold a valid CUDA context and stream. The
     /// returned `GpuWeights` retains GGUF tensor pointers for the
     /// lifetime of the model.
+    #[cfg(feature = "cuda")]
     pub unsafe fn from_gguf_file(
         path: impl AsRef<Path>,
         model_dtype: DType,
@@ -581,15 +606,20 @@ impl GpuWeights {
     }
 
     /// Load from a single safetensors file (CPU-only).
-    pub fn from_single_file(path: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
+    pub fn from_single_file(
+        path: impl AsRef<Path>,
+        allocator: crate::BackendAllocator,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let mut gw = Self {
             tensors: HashMap::new(),
             target_dtype: None,
             cast_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
             precast: None,
+            #[cfg(feature = "cuda")]
             precast_handle: None,
-            allocator: crate::CudaAllocator::new(stream),
+            allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -603,7 +633,10 @@ impl GpuWeights {
     /// Multiple shards are loaded in parallel — each thread mmaps a shard,
     /// issues madvise(WILLNEED) to start readahead, and parses the header.
     /// This overlaps disk I/O across shards.
-    pub fn from_index(index_path: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
+    pub fn from_index(
+        index_path: impl AsRef<Path>,
+        allocator: crate::BackendAllocator,
+    ) -> Result<Self> {
         let index_path = index_path.as_ref();
         let dir = index_path
             .parent()
@@ -632,9 +665,11 @@ impl GpuWeights {
                 tensors: HashMap::new(),
                 target_dtype: None,
                 cast_scratch: Vec::new(),
+                #[cfg(feature = "cuda")]
                 precast: None,
+                #[cfg(feature = "cuda")]
                 precast_handle: None,
-                allocator: crate::CudaAllocator::new(stream),
+                allocator,
                 _mmaps: Vec::new(),
                 quantized: HashMap::new(),
                 gguf_dense: HashMap::new(),
@@ -676,9 +711,11 @@ impl GpuWeights {
             tensors,
             target_dtype: None,
             cast_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
             precast: None,
+            #[cfg(feature = "cuda")]
             precast_handle: None,
-            allocator: crate::CudaAllocator::new(stream),
+            allocator,
             _mmaps: mmaps,
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -819,6 +856,11 @@ impl GpuWeights {
     ///
     /// Must be called after `set_target_dtype()`. Safe to call multiple times
     /// (subsequent calls are no-ops if already running).
+    ///
+    /// CUDA-only: pre-casts into pinned host buffers for async DMA. The
+    /// Metal path uses unified-memory `MTLBuffer`s — no DMA, no
+    /// pinning, no precast pipeline.
+    #[cfg(feature = "cuda")]
     pub fn start_precast(&mut self) {
         if self.precast.is_some() {
             return; // Already running.
@@ -876,7 +918,9 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        // Fast path: check if precast pipeline has this tensor ready.
+        // Fast path: check if precast pipeline has this tensor
+        // ready. Cuda-only — Metal has no precast.
+        #[cfg(feature = "cuda")]
         if let Some(entry) = self.take_precast(name) {
             // The allocator's `alloc_and_copy_host` synchronizes
             // before returning, so the entry's pinned buffer is safe
@@ -933,6 +977,7 @@ impl GpuWeights {
             shape,
         );
 
+        #[cfg(feature = "cuda")]
         if let Some(entry) = self.take_precast(name) {
             let gpu_ptr = unsafe {
                 self.allocator
@@ -951,6 +996,7 @@ impl GpuWeights {
     ///
     /// Used for fused weight loading (QKV, gate_up) — pre-allocate the fused
     /// tensor, then copy each component directly from CPU to the right offset.
+    #[cfg(feature = "cuda")]
     pub unsafe fn take_into(
         &mut self,
         name: &str,
@@ -993,7 +1039,8 @@ impl GpuWeights {
         Ok(size_bytes)
     }
 
-    /// Try to take a pre-cast entry for the given tensor name.
+    /// Try to take a pre-cast entry for the given tensor name. CUDA-only.
+    #[cfg(feature = "cuda")]
     fn take_precast(&self, name: &str) -> Option<PrecastEntry> {
         let state = self.precast.as_ref()?;
         let mut ready = state.ready.lock().ok()?;
@@ -1681,6 +1728,7 @@ impl GpuWeights {
     ///
     /// Called by quantized weight loaders (AWQ, GPTQ, Marlin, etc.) that
     /// allocate GPU memory via `driver::mem_alloc` outside of `take()`.
+    #[cfg(feature = "cuda")]
     pub fn record_alloc(&mut self, ptr: *mut u8, size_bytes: usize) {
         self.allocator
             .push_alloc(unsafe { crate::alloc::RawGpuMem::new(ptr, size_bytes) });
@@ -1689,12 +1737,14 @@ impl GpuWeights {
     /// Remove a previously-recorded allocation from tracking (e.g. after repack
     /// frees it separately). The removed `RawGpuMem` is leaked — caller is
     /// responsible for freeing the GPU memory.
+    #[cfg(feature = "cuda")]
     pub fn unrecord_alloc(&mut self, ptr: *mut u8) {
         self.allocator.unrecord_alloc(ptr);
     }
 
     /// Drain all tracked GPU allocations. The caller takes ownership of the
     /// `RawGpuMem` wrappers — dropping them frees the GPU memory.
+    #[cfg(feature = "cuda")]
     pub fn take_gpu_allocs(&mut self) -> Vec<crate::alloc::RawGpuMem> {
         self.allocator.take_allocations()
     }
@@ -1717,7 +1767,8 @@ impl GpuWeights {
         self.tensors = stripped;
     }
 
-    /// Get the stream used for H2D copies.
+    /// Get the stream used for H2D copies. CUDA-only.
+    #[cfg(feature = "cuda")]
     pub fn stream(&self) -> CUstream {
         self.allocator.stream()
     }
@@ -1932,6 +1983,7 @@ impl GpuWeights {
     ///
     /// Used for fused TP weight loading (e.g. QKV shards concatenated into one buffer).
     /// Returns the number of bytes written.
+    #[cfg(feature = "cuda")]
     pub unsafe fn take_shard_into(
         &mut self,
         name: &str,
@@ -2116,25 +2168,29 @@ fn dump_shard_head(
 
 impl Drop for GpuWeights {
     fn drop(&mut self) {
-        // Signal precast thread to stop and wait for it.
-        if let Some(state) = &self.precast {
-            state.shutdown.store(true, Ordering::Relaxed);
-        }
-        if let Some(handle) = self.precast_handle.take() {
-            handle.join().ok();
-        }
-        // Free any unconsumed precast pinned buffers.
-        if let Some(state) = &self.precast
-            && let Ok(mut ready) = state.ready.lock()
+        // Signal precast thread to stop and wait for it (cuda only).
+        #[cfg(feature = "cuda")]
         {
-            for (_name, entry) in ready.drain() {
-                unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
+            if let Some(state) = &self.precast {
+                state.shutdown.store(true, Ordering::Relaxed);
+            }
+            if let Some(handle) = self.precast_handle.take() {
+                handle.join().ok();
+            }
+            // Free any unconsumed precast pinned buffers.
+            if let Some(state) = &self.precast
+                && let Ok(mut ready) = state.ready.lock()
+            {
+                for (_name, entry) in ready.drain() {
+                    unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
+                }
             }
         }
         // `cast_scratch: Vec<u8>` drops itself.
-        // `allocator` (RAII over GPU + pinned host scratch) drops itself.
+        // `allocator` drops itself (CUDA: frees GPU mem; Metal: frees MTLBuffers).
         // GPU memory allocated by take()/take_into() is owned by model layers
-        //   (transferred via take_gpu_allocs); the rest is freed by allocator's Drop.
+        //   on the cuda path (transferred via take_gpu_allocs); on metal it's
+        //   held by the allocator's MetalBuffer arenas.
         // CPU mmaps are dropped automatically when Arc<Mmap> refcounts reach zero.
     }
 }

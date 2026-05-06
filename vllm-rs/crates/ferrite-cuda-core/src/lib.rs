@@ -17,9 +17,14 @@ pub mod dtype;
 pub mod ggml_quant;
 pub mod tensor;
 
+#[cfg(feature = "metal")]
+pub mod metal_allocator;
+
 pub use device_allocator::DeviceAllocator;
 pub use dtype::DType;
 pub use ggml_quant::{GgmlDType, GgmlStorage};
+#[cfg(feature = "metal")]
+pub use metal_allocator::MetalAllocator;
 pub use tensor::{GpuTensor, TensorView};
 
 // CUDA runtime (requires CUDA toolkit).
@@ -39,7 +44,6 @@ pub mod device;
 pub mod driver;
 #[cfg(feature = "cuda")]
 pub mod gguf_loader;
-#[cfg(feature = "cuda")]
 pub mod weights;
 
 #[cfg(feature = "cuda")]
@@ -55,13 +59,14 @@ pub use cuda_allocator::CudaAllocator;
 /// matching feature.
 #[cfg(feature = "cuda")]
 pub type BackendAllocator = CudaAllocator;
+#[cfg(feature = "metal")]
+pub type BackendAllocator = MetalAllocator;
 #[cfg(feature = "cuda")]
 pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 #[cfg(feature = "cuda")]
 pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 pub use device::GpuDevice;
-#[cfg(feature = "cuda")]
 pub use weights::GpuWeights;
 
 /// Re-export `cudarc::driver::sys::CUstream` at a stable path so

@@ -18,7 +18,11 @@ pub mod info;
 // `#[cfg(feature = "cuda")]`-gated.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod instr;
-#[cfg(feature = "cuda")]
+// Layered-load helpers are dual-mode like `layers` / `rotary`: stream-free
+// helpers (Embedding, RmsNorm, LinearDense, plus the new `_concat_packed`
+// variant) compile under metal too; cuda-stream-using and quant variants are
+// individually `#[cfg(feature = "cuda")]`-gated inside the file.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
@@ -42,16 +46,22 @@ pub use instr::{CanonicalParams, CosSinFn, Instruction, WtFn};
 // CUDA-only runtime entry points.
 #[cfg(feature = "cuda")]
 pub use instr::{InterpreterCtx, run, run_backbone};
+// Stream-free / quant-free helpers — reachable under either backend.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use loaders::{
+    load_layered_embedding, load_layered_layer_norm, load_layered_layer_norm_vision,
+    load_layered_linear_dense, load_layered_linear_dense_concat_packed,
+    load_layered_linear_dense_vision, load_layered_rms_norm, load_layered_rms_norm_vision,
+};
+// Stream-using and quant helpers — cuda-only.
 #[cfg(feature = "cuda")]
 pub use loaders::{
-    load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,
-    load_layered_embedding_sharded, load_layered_fp8_block_linear,
-    load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
-    load_layered_layer_norm, load_layered_layer_norm_vision, load_layered_linear_dense,
-    load_layered_linear_dense_concat, load_layered_linear_dense_concat_sharded,
-    load_layered_linear_dense_concat_vision, load_layered_linear_dense_sharded,
-    load_layered_linear_dense_vision, load_layered_marlin_linear,
-    load_layered_marlin_linear_concat, load_layered_rms_norm, load_layered_rms_norm_vision,
+    load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding_sharded,
+    load_layered_fp8_block_linear, load_layered_fp8_block_linear_concat, load_layered_fp8_linear,
+    load_layered_fp8_linear_concat, load_layered_linear_dense_concat,
+    load_layered_linear_dense_concat_sharded, load_layered_linear_dense_concat_vision,
+    load_layered_linear_dense_sharded, load_layered_marlin_linear,
+    load_layered_marlin_linear_concat,
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};

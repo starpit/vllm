@@ -40,10 +40,11 @@ fn llama() {
 #[cfg(all(test, feature = "metal"))]
 mod metal_emission_tests {
     /// Sanity-check that the macro emits the per-canonical metal
-    /// surface (Weights ZST + METAL_BUCKETS static + metal_pool fn)
-    /// for at least one model in this arch. The check is structural
-    /// — it doesn't run the pool, just asserts the symbols exist
-    /// and resolve to the expected types.
+    /// surface (real Weights struct + accessor methods + load fn +
+    /// METAL_BUCKETS static + metal_pool fn) for at least one model
+    /// in this arch. The check is structural — it doesn't run the
+    /// loader, just asserts the symbols exist and resolve to the
+    /// expected types.
     #[test]
     fn tinyllama_metal_symbols_resolve() {
         // METAL_BUCKETS is a non-empty `&[MetalBucketSpec<Weights>]`.
@@ -68,5 +69,13 @@ mod metal_emission_tests {
             ::ferrite_forward::interpreter::metal::MetalWorkerPool<crate::tinyllama_1_1b::Weights>,
             ::ferrite_forward::interpreter::metal::PoolBuildError,
         > = crate::tinyllama_1_1b::metal_pool;
+        // load() resolves as a stream-free fn returning `Result<Weights>`.
+        // Same fn-pointer-only check; no GpuWeights instance available in
+        // unit-test ctx.
+        let _loader: fn(
+            &mut ::ferrite_cuda_core::weights::GpuWeights,
+            usize,
+            u8,
+        ) -> ::anyhow::Result<crate::tinyllama_1_1b::Weights> = crate::tinyllama_1_1b::load;
     }
 }

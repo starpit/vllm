@@ -2199,6 +2199,38 @@ fn emit_weights_struct(
         quote! {}
     };
 
+    let rotary_local_load_metal: TokenStream = if uses_rotary_local {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for RotaryLocal") as usize;
+        let max_pos = *model
+            .bounds
+            .get("max_position_embeddings")
+            .expect("model must have max_position_embeddings for RotaryLocal")
+            as usize;
+        let local_theta = model
+            .scalars
+            .get("rope_local_base_freq")
+            .copied()
+            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
+            .or_else(|| model.scalars.get("rope_theta").copied())
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .expect("model must have rope_local_base_freq for RotaryLocal");
+        quote! {
+            let rotary_local = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                gw,
+                #head_dim,
+                #max_pos,
+                #local_theta,
+                None,
+                ::ferrite_cuda_core::dtype::DType::BF16,
+            )?;
+        }
+    } else {
+        quote! {}
+    };
+
     let rotary_local_init: TokenStream = if uses_rotary_local {
         quote! { rotary_local, }
     } else {
@@ -2451,6 +2483,85 @@ fn emit_weights_struct(
         quote! {}
     };
 
+    // Stream-free metal counterpart to `rotary_load`. `new_from_gpuweights`
+    // currently covers basic + Llama3 scaling; LongRoPE / Yarn /
+    // partial-rotary models hit a compile_error so the failure mode is
+    // an explicit "unsupported under metal" rather than a hidden
+    // runtime panic. Same scope decision as the per-arch metal feature
+    // gates landed in 5.F.5.
+    let rotary_load_metal: TokenStream = if uses_rotary {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for Rotary") as usize;
+        let max_pos = *model
+            .bounds
+            .get("max_position_embeddings")
+            .expect("model must have max_position_embeddings for Rotary")
+            as usize;
+        let rope_theta = model
+            .scalars
+            .get("rope_theta")
+            .copied()
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .unwrap_or(10000.0);
+        let partial = model
+            .scalars
+            .get("partial_rotary_factor")
+            .copied()
+            .filter(|&f| (f - 1.0).abs() > 1e-9);
+        let scaling = model.rope_scaling.clone();
+        match (partial, scaling) {
+            (None, None) => quote! {
+                let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                    gw,
+                    #head_dim,
+                    #max_pos,
+                    #rope_theta,
+                    None,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
+                )?;
+            },
+            (
+                None,
+                Some(crate::config::RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position_embeddings,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                        gw,
+                        #head_dim,
+                        #max_pos,
+                        #rope_theta,
+                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                            factor: #factor,
+                            low_freq_factor: #low_freq_factor,
+                            high_freq_factor: #high_freq_factor,
+                            original_max_position_embeddings: #orig,
+                        }),
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                    )?;
+                }
+            }
+            _ => quote! {
+                ::core::compile_error!(
+                    "metal: rotary scaling variant not yet supported \
+                     (LongRoPE / Yarn / partial-rotary). Land a metal \
+                     counterpart to RotaryCache::new_from_gpuweights for \
+                     this scaling family before enabling this model under \
+                     --features metal."
+                );
+            },
+        }
+    } else {
+        quote! {}
+    };
+
     let rotary_init: TokenStream = if uses_rotary {
         quote! { rotary, }
     } else {
@@ -2468,7 +2579,6 @@ fn emit_weights_struct(
     // same signature for uniformity; their body is `&self.<field>`
     // and ignores the layer arg.
     let accessor_methods = emit_weights_accessor_methods(&accessors);
-    let accessor_methods_metal = emit_weights_accessor_methods_metal(&accessors);
 
     // Rotary cos_sin accessors for the host-interpreter path. Both
     // `wm.rotary` and `wm.rotary_local` are conditionally-emitted
@@ -2484,7 +2594,6 @@ fn emit_weights_struct(
         WeightsEmitMode::Canonical => {
             let main = if uses_rotary {
                 quote! {
-                    #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
                     pub fn rotary_cos_sin(&self, _layer: u32)
@@ -2498,7 +2607,6 @@ fn emit_weights_struct(
             };
             let local = if uses_rotary_local {
                 quote! {
-                    #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
                     pub fn rotary_local_cos_sin(&self, _layer: u32)
@@ -2512,7 +2620,6 @@ fn emit_weights_struct(
             };
             if uses_rotary || uses_rotary_local {
                 quote! {
-                    #[cfg(feature = "cuda")]
                     impl Weights {
                         #main
                         #local
@@ -2527,89 +2634,27 @@ fn emit_weights_struct(
         WeightsEmitMode::Shim { .. } => quote! {},
     };
 
-    // Metal-side rotary cos_sin stubs. Same fn-pointer-identity rule
-    // as `emit_weights_accessor_methods_metal`: each stub gets
-    // `#[inline(never)]` and a unique panic body so ICF can't merge
-    // them. `Instruction<Weights>` variants like `RopeAppend` carry a
-    // `CosSinFn<Weights>` field whose value is `Weights::rotary_cos_sin`
-    // (or `..._local`); `MetalModelMeta` looks up the cos_sin cache
-    // buffer keyed on that fn-pointer at recording time.
-    let rotary_cos_sin_methods_metal: TokenStream = match &mode {
-        WeightsEmitMode::Canonical => {
-            let main = if uses_rotary {
-                quote! {
-                    #[inline(never)]
-                    pub fn rotary_cos_sin(&self, _layer: u32)
-                        -> ::ferrite_cuda_core::tensor::GpuTensor
-                    {
-                        panic!(concat!("metal stub: ", "rotary_cos_sin"))
-                    }
-                }
-            } else {
-                quote! {}
-            };
-            let local = if uses_rotary_local {
-                quote! {
-                    #[inline(never)]
-                    pub fn rotary_local_cos_sin(&self, _layer: u32)
-                        -> ::ferrite_cuda_core::tensor::GpuTensor
-                    {
-                        panic!(concat!("metal stub: ", "rotary_local_cos_sin"))
-                    }
-                }
-            } else {
-                quote! {}
-            };
-            if uses_rotary || uses_rotary_local {
-                quote! {
-                    #[cfg(feature = "metal")]
-                    #[allow(dead_code)]
-                    impl Weights {
-                        #main
-                        #local
-                    }
-                }
-            } else {
-                quote! {}
-            }
-        }
-        WeightsEmitMode::Shim { .. } => quote! {},
-    };
-
     // Struct definition vs type alias per emit mode.
     //
-    // Two parallel emissions are produced — one cfg-gated on `cuda`,
-    // one cfg-gated on `metal`. The macro's top-level
-    // `compile_error!` enforces "exactly one of cuda/metal", so the
-    // two definitions never collide. Under `metal`, `Weights` is a
-    // ZST: per-bucket static slices reference accessor methods only
-    // for their fn-pointer identity (the Metal worker resolves them
-    // against `MetalModelMeta` at runtime), so the metal `Weights`
-    // carries no weight tensors. Loader / fingerprint live entirely
-    // on the cuda side.
+    // Single emission used under either backend. After Stage E (the
+    // `MetalModelMeta` removal + WtFn-based weight resolution against
+    // a real `&Weights`), the metal worker resolves
+    // `Binding::Weight` by calling the same accessor fns the cuda
+    // path uses, then maps the resulting `GpuTensor.raw_ptr()` back
+    // to a `(&MTLBuffer, offset)` via `MetalAllocator::buffer_for`.
+    // Real fields are required under both backends.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
             /// Every weight the forward needs, packed for the
             /// solver-picked Impls. Construct via `load`.
-            #[cfg(feature = "cuda")]
             pub struct Weights {
                 #(#fields)*
                 #rotary_field
                 #rotary_local_field
             }
-
-            /// Metal-side `Weights` is a ZST. Per-bucket static
-            /// slices reference accessor methods (below) only as
-            /// fn-pointers; the runtime `MetalModelMeta` translates
-            /// each pointer to a Metal `Buffer` at recording time.
-            #[cfg(feature = "metal")]
-            pub struct Weights;
         },
         WeightsEmitMode::Shim { canonical } => quote! {
             /// Shim — shares canonical sibling's `Weights`.
-            #[cfg(feature = "cuda")]
-            pub type Weights = super::#canonical::Weights;
-            #[cfg(feature = "metal")]
             pub type Weights = super::#canonical::Weights;
         },
     };
@@ -2634,11 +2679,7 @@ fn emit_weights_struct(
 
             #accessor_methods
 
-            #accessor_methods_metal
-
             #rotary_cos_sin_methods
-
-            #rotary_cos_sin_methods_metal
 
             #fingerprint_method
 
@@ -2684,6 +2725,30 @@ fn emit_weights_struct(
             ) -> ::anyhow::Result<Weights> {
                 load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
             }
+
+            /// Metal entry — stream-free, no marlin_storage thread
+            /// (quant variants are filtered out at config-load time
+            /// under metal). The body shares the canonical's `lets`
+            /// and `field_shorthand` — `LinearConcat` arms route
+            /// through `LinearLayer::load_dense_concat_packed` and
+            /// the rotary load uses `RotaryCache::new_from_gpuweights`.
+            #[cfg(feature = "metal")]
+            #[allow(clippy::too_many_lines, unused_variables)]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                max_model_len: usize,
+                tp_rank: u8,
+            ) -> ::anyhow::Result<Weights> {
+                #packed_splits_prelude
+                #(#lets)*
+                #rotary_load_metal
+                #rotary_local_load_metal
+                Ok(#weights_ctor {
+                    #(#field_shorthand,)*
+                    #rotary_init
+                    #rotary_local_init
+                })
+            }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
             #weights_def
@@ -2701,6 +2766,20 @@ fn emit_weights_struct(
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
                 super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
+            }
+
+            /// Metal shim — delegates to canonical's metal `load`.
+            /// Quant variants are filtered out at config-load time
+            /// under metal, so the variant's MarlinFormat is irrelevant
+            /// here (it's a load-time-only sniff for AWQ/GPTQ/CT).
+            #[cfg(feature = "metal")]
+            #[inline]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                max_model_len: usize,
+                tp_rank: u8,
+            ) -> ::anyhow::Result<Weights> {
+                super::#canonical::load(gw, max_model_len, tp_rank)
             }
         },
     }
@@ -3035,11 +3114,20 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
         }
         FieldLoad::LinearConcat(prefixes) => {
             // Fused QKV / gate_up are always column-parallel — no
-            // row-parallel concat exists in any current arch. The
-            // sharded helper packs each source's per-rank slice into
-            // one contiguous buffer; biases follow column-parallel
-            // rule (sliced along dim 0 too).
-            if sharded {
+            // row-parallel concat exists in any current arch. Under
+            // metal the macro emits a stream-free `_concat_packed`
+            // path (CPU-concat then one allocator call); cuda keeps
+            // the GGUF/safetensors `_or_ggml` path with stream-based
+            // async DMA. Sharded variants stay cuda-only — single-
+            // GPU is the only metal target initially.
+            if cfg!(feature = "metal") {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat_packed(
+                        gw,
+                        &[ #(#prefixes),* ],
+                    )?;
+                }
+            } else if sharded {
                 quote! {
                     let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat_sharded(
                         gw,
@@ -3622,7 +3710,18 @@ fn emit_layered_load_body(
                 .map(|p| layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref))
                 .collect();
             // Always column-parallel — no row-parallel concat exists.
-            if sharded {
+            // Under metal the layered helper routes to the stream-free
+            // `_concat_packed` path; cuda keeps the existing stream-
+            // based GGUF / vision / sharded variants.
+            if cfg!(feature = "metal") {
+                quote! {
+                    ::ferrite_forward::load_layered_linear_dense_concat_packed(
+                        gw,
+                        #n_lit,
+                        &[ #(#suffixes),* ],
+                    )?
+                }
+            } else if sharded {
                 quote! {
                     ::ferrite_forward::load_layered_linear_dense_concat_sharded(
                         gw,
@@ -4082,55 +4181,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         })
         .collect();
     quote! {
-        #[cfg(feature = "cuda")]
-        #[allow(dead_code)]
-        impl Weights {
-            #(#methods)*
-        }
-    }
-}
-
-/// Emit metal-side panic-stub accessor methods on the per-arch `Weights`.
-///
-/// Under `cfg(feature = "metal")`, `Weights` is a ZST — it carries no
-/// tensors. Per-bucket static slices reference these methods only as
-/// fn-pointers; the runtime `MetalModelMeta` translates each pointer
-/// to a Metal `Buffer` at recording time. The methods themselves
-/// would never run in a well-formed metal forward, so each body just
-/// panics.
-///
-/// Two non-obvious choices:
-/// - `#[inline(never)]` keeps each stub a distinct function. Without
-///   this rustc is free to inline the panic at the call site, leaving
-///   the fn-pointer with no stable address.
-/// - The panic body uses `concat!("metal stub: ", stringify!(<base>))`
-///   so each stub's body bytes differ. LLVM's identical-code-folding
-///   pass otherwise merges all "trivially diverging" stubs into one
-///   fn-pointer address, breaking the per-accessor lookup contract.
-///
-/// Returns an `impl Weights { ... }` block. Empty (zero accessors)
-/// is fine — the impl block is then elided entirely.
-fn emit_weights_accessor_methods_metal(accessors: &[WeightAccessor]) -> TokenStream {
-    let groups = group_accessors_by_base(accessors);
-    if groups.is_empty() {
-        return quote! {};
-    }
-    let methods: Vec<TokenStream> = groups
-        .iter()
-        .map(|g| {
-            let base_ident = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
-            let base_lit = &g.base;
-            let ty = &g.rust_type;
-            quote! {
-                #[inline(never)]
-                pub fn #base_ident(&self, _layer: u32) -> &#ty {
-                    panic!(concat!("metal stub: ", #base_lit))
-                }
-            }
-        })
-        .collect();
-    quote! {
-        #[cfg(feature = "metal")]
         #[allow(dead_code)]
         impl Weights {
             #(#methods)*

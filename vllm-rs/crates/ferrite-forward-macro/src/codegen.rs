@@ -4215,12 +4215,12 @@ pub fn emit_model(
     // handles this naturally because `backbone_layout` reports
     // Encoder when the terminal isn't `gemm(_, lm_head)`. No
     // separate vision flag needed.
-    
+
     // Backend dispatch: route to Metal codegen if target is Metal
     // Note: target_profile is not passed to emit_model, so we infer from lib
     // For now, emit CUDA code (Metal codegen integration is Phase 3.2+)
     // TODO: Add target_profile parameter and dispatch based on backend
-    
+
     if let Some(canonical) = canonical_override {
         return emit_shim_model(
             program,

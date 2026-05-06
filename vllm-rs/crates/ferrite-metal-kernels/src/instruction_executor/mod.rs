@@ -6,16 +6,11 @@
 //! This module provides the core infrastructure for recording ferrite-forward
 //! instructions into Metal ICBs for efficient GPU execution.
 
-pub mod activation;
-pub mod attention;
-pub mod elementwise;
-pub mod embed;
-pub mod fused;
-pub mod gemm;
 pub mod icb_ffi;
-pub mod reshape;
 pub mod rmsnorm;
-pub mod rope;
+pub mod gemm;
+pub mod attention;
+pub mod fused;
 
 #[cfg(test)]
 mod test_minimal_recording;
@@ -26,12 +21,9 @@ mod test_icb_execution;
 #[cfg(test)]
 mod test_direct_vs_icb;
 
-#[cfg(test)]
-mod test_full_sequence;
-
-use foreign_types::ForeignType;
 use icb_ffi::{IndirectCommandBuffer, IndirectCommandBufferDescriptor, MTLIndirectCommandType};
 use metal::{ComputePipelineState, Device, MTLSize};
+use foreign_types::ForeignType;
 use std::sync::Arc;
 
 /// Context for recording instructions into an ICB.
@@ -46,7 +38,7 @@ pub struct RecordingContext {
 
 impl RecordingContext {
     /// Create a new recording context with an ICB of the given capacity.
-    ///
+    /// 
     /// CRITICAL: Uses `inheritPipelineState = true` to avoid crashes on Apple Silicon.
     /// This means:
     /// - Pipeline state is set on the compute encoder, NOT on ICB commands
@@ -56,9 +48,9 @@ impl RecordingContext {
         let descriptor = IndirectCommandBufferDescriptor::new();
         descriptor.set_command_types(MTLIndirectCommandType::ConcurrentDispatch as u64);
         descriptor.set_max_kernel_buffer_bind_count(31); // Max buffer bindings per kernel
-        descriptor.set_inherit_pipeline_state(true); // CRITICAL: Must be true on Apple Silicon
+        descriptor.set_inherit_pipeline_state(true);  // CRITICAL: Must be true on Apple Silicon
         descriptor.set_inherit_buffers(false);
-
+        
         let icb = IndirectCommandBuffer::new(&device, &descriptor, max_commands as u64, 0)?;
 
         Ok(Self {
@@ -86,26 +78,24 @@ impl RecordingContext {
     /// * `threads_per_threadgroup` - Threads per threadgroup
     pub fn record_compute_dispatch(
         &mut self,
-        _pipeline: &ComputePipelineState, // Ignored - pipeline inherited from encoder
+        _pipeline: &ComputePipelineState,  // Ignored - pipeline inherited from encoder
         buffers: &[(&metal::Buffer, u64, u64)],
         threadgroups: MTLSize,
         threads_per_threadgroup: MTLSize,
     ) {
-        let command = self
-            .icb
-            .indirect_compute_command_at(self.command_index as u64);
-
+        let command = self.icb.indirect_compute_command_at(self.command_index as u64);
+        
         // Reset command before encoding
         command.reset();
-
+        
         // Bind buffers
         for &(buffer, offset, index) in buffers {
             command.set_kernel_buffer(buffer.as_ptr() as *mut _, offset, index);
         }
-
+        
         // Set dispatch size
         command.concurrent_dispatch_threadgroups(threadgroups, threads_per_threadgroup);
-
+        
         self.command_index += 1;
     }
 
@@ -113,24 +103,17 @@ impl RecordingContext {
     pub fn icb(&self) -> &IndirectCommandBuffer {
         &self.icb
     }
-
-    /// Reset the ICB commands in the given range and reset command counter to start
-    pub fn reset_range(&mut self, range: std::ops::Range<usize>) {
-        self.icb
-            .reset_with_range(range.start as u64..range.end as u64);
-        // Reset command index to the start of the range so re-recording works correctly
-        self.command_index = range.start;
+    
+    /// Reset the ICB commands in the given range
+    pub fn reset_range(&self, range: std::ops::Range<usize>) {
+        self.icb.reset_with_range(range.start as u64..range.end as u64);
     }
-
+    
     /// Execute the recorded commands on a compute encoder
-    ///
+    /// 
     /// CRITICAL: The pipeline state must be set on the encoder BEFORE calling this,
     /// as ICB commands inherit the pipeline state from the encoder.
-    pub fn execute_on_encoder(
-        &self,
-        encoder: &metal::ComputeCommandEncoderRef,
-        range: std::ops::Range<usize>,
-    ) {
+    pub fn execute_on_encoder(&self, encoder: &metal::ComputeCommandEncoderRef, range: std::ops::Range<usize>) {
         unsafe {
             use objc::{msg_send, sel, sel_impl};
             let ns_range = metal::NSRange {
@@ -156,7 +139,7 @@ impl RecordingContext {
 /// # Returns
 /// (threadgroups, threads_per_threadgroup) as MTLSize
 pub fn dispatch_1d(total_threads: usize, threads_per_group: usize) -> (MTLSize, MTLSize) {
-    let num_groups = total_threads.div_ceil(threads_per_group);
+    let num_groups = (total_threads + threads_per_group - 1) / threads_per_group;
     (
         MTLSize {
             width: num_groups as u64,
@@ -187,8 +170,8 @@ pub fn dispatch_2d(
     tile_width: usize,
     tile_height: usize,
 ) -> (MTLSize, MTLSize) {
-    let groups_x = width.div_ceil(tile_width);
-    let groups_y = height.div_ceil(tile_height);
+    let groups_x = (width + tile_width - 1) / tile_width;
+    let groups_y = (height + tile_height - 1) / tile_height;
     (
         MTLSize {
             width: groups_x as u64,
@@ -229,7 +212,7 @@ mod tests {
     #[test]
     fn test_dispatch_2d_calculation() {
         let (tg, tpt) = dispatch_2d(1024, 768, 16, 16);
-        assert_eq!(tg.width, 64); // ceil(1024 / 16) = 64
+        assert_eq!(tg.width, 64);  // ceil(1024 / 16) = 64
         assert_eq!(tg.height, 48); // ceil(768 / 16) = 48
         assert_eq!(tg.depth, 1);
         assert_eq!(tpt.width, 16);

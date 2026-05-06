@@ -79,10 +79,10 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Test error handling
   - **ALL 21 TESTS PASSING** (14 unit + 7 integration)
 
-### Phase 4: Kernel Library & Implementation Registration ✅ COMPLETE
+### Phase 4: Kernel Library & Implementation Registration 🔄 IN PROGRESS
 **Goal:** Create Metal kernels + Implementation trait impls + ICB recording  
 **Duration:** 3-4 weeks  
-**Status:** ✅ ALL COMPLETE - Kernels ~75%, Implementation impls 100% (18/18 ops), ICB recording 100% (18/18 ops)
+**Status:** Kernels ~75% complete, Implementation impls ~20% complete (7 of ~50)
 
 **Architecture Clarification**:
 - Phase 4A: Metal kernel wrappers (RMSNorm, GEMM, Attention, etc.) - ~75% done
@@ -294,41 +294,13 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
     - RopeAppendInterleaved (fp16, bf16)
     - Same cost model as standard RoPE (only pairing differs)
     - Registered in `starter_library()`
-- [x] MetalMulImpl (2 variants: fp16, bf16) - Elementwise multiply ✅
-- [x] MetalBiasAddImpl (2 variants: fp16, bf16) - Broadcast addition ✅
-- [x] MetalTanhSoftCapImpl (2 variants: fp16, bf16) - Logit capping ✅
-- [x] MetalSubImpl (2 variants: fp16, bf16) - Elementwise subtraction ✅
-- [x] MetalScalarMulImpl (2 variants: fp16, bf16) - Broadcast scalar multiply ✅
-- [x] MetalEmbedImpl (2 variants: fp16, bf16) - Lookup table operation ✅
-- [x] MetalReshapeImpl (1 variant) - Metadata-only view operation ✅
-- [ ] ~29 more instruction variants (MoE, advanced fusions, etc.)
+  - [ ] ~36 more instruction variants (Mul, BiasAdd, TanhSoftCap, Sub, MoE, etc.)
   
-- [x] 4.6: ICB instruction recording infrastructure ✅ COMPLETE (18 of 18 critical path ops)
-  - [x] Discovered root cause: pipelines need `supportIndirectCommandBuffers=YES`
-  - [x] Verified working configuration on M1 Max
-  - [x] Created test suite demonstrating correct ICB usage
-  - [x] Documented complete solution in PHASE4_ICB_BREAKTHROUGH.md
-  - [x] Updated Rust implementation with ICB-aware pipeline creation
-    - Note: metal-rs doesn't expose MTLComputePipelineDescriptor API
-    - Documented workaround: supportIndirectCommandBuffers must be set via Objective-C
-    - ShaderCache updated with documentation of the requirement
-  - [x] Implemented instruction recording modules for critical path ops (18 operations total)
-    - `instruction_executor/rmsnorm.rs` - RMSNorm recording (fp16, bf16)
-    - `instruction_executor/activation.rs` - Activation recording (5 variants)
-    - `instruction_executor/rope.rs` - RoPE recording (NeoX & interleaved)
-    - `instruction_executor/elementwise.rs` - Elementwise operations (Add, Mul, Sub, ScalarMul, BiasAdd, TanhSoftCap)
-    - `instruction_executor/embed.rs` - Embedding lookup recorder
-    - `instruction_executor/reshape.rs` - Metadata-only reshape recorder
-    - `shaders/elementwise.metal` - 12 Metal kernels (6 ops × 2 dtypes)
-    - `shaders/embed.metal` - 2 Metal kernels (fp16, bf16)
-    - All use proper type conversions (u32/u64) and dispatch_1d helper
-  - [x] Created comprehensive integration tests
-    - `test_full_sequence.rs` - Multi-instruction recording (RMSNorm → SiLU → RoPE)
-    - `test_icb_reset_and_rerecord` - ICB reset and re-recording validation
-    - Both tests passing on M1 Max
-  - [x] Fixed ICB reset behavior
-    - `reset_range()` now properly resets command_index for re-recording
-  - [ ] Verify on M4 hardware (deferred - M1 Max validation sufficient)
+- [ ] 4.6: Implement `Instruction<W>::record_to_icb()` for ICB execution
+  - [ ] Create `ferrite-metal-kernels/src/instruction_executor.rs`
+  - [ ] Implement recording logic for each `Instruction` variant (~50 total)
+  - [ ] Each variant records: pipeline state, buffer bindings, dispatch size
+  - [ ] Test ICB recording and execution with simple instruction sequences
 
 - [ ] 4.7: Verify numerical accuracy against CUDA reference
 
@@ -383,11 +355,8 @@ Mul Tests:                                   4 passed
 BiasAdd Tests:                               4 passed
 TanhSoftCap Tests:                           4 passed
 Sub Tests:                                   4 passed
-ScalarMul Tests:                             4 passed
-Add Tests:                                   4 passed
-ICB Recording Tests:                         8 passed
 Metal Codegen Tests:                         4 passed
-Total:                                      90 passed, 1 ignored
+Total:                                      78 passed, 1 ignored
 ```
 
 ## Key Decisions
@@ -406,68 +375,7 @@ Total:                                      90 passed, 1 ignored
 
 ## Recent Progress (2026-05-05)
 
-### ✅ Phase 4.6 COMPLETE: ICB Instruction Recording Infrastructure (May 2026)
-
-**All 18 critical path operations now have ICB instruction recorders!**
-
-Completed in this session:
-- ✅ Created `instruction_executor/elementwise.rs` with 6 operation recorders
-  - Add, Mul, Sub, ScalarMul, BiasAdd, TanhSoftCap (fp16, bf16)
-- ✅ Created `instruction_executor/embed.rs` with embedding lookup recorder
-- ✅ Created `instruction_executor/reshape.rs` with metadata-only reshape recorder
-- ✅ Created `shaders/elementwise.metal` with 12 Metal kernels
-- ✅ Created `shaders/embed.metal` with 2 Metal kernels
-- ✅ Updated `shader_cache.rs` to compile and route new shader libraries
-- ✅ All 8 new tests passing (44/49 total, 3 pre-existing GEMM failures, 2 ignored)
-- ✅ Fixed clippy warnings (div_ceil, unnecessary casts, or_default)
-- ✅ Committed and rebased onto ff-interpreter branch
-
-**Phase 4 Status: ✅ COMPLETE**
-- Kernels: ~75% complete (all critical path ops done)
-- Implementation impls: 100% complete (18/18 critical path ops)
-- ICB recording: 100% complete (18/18 critical path ops)
-
-Ready for Phase 4.7 (numerical accuracy verification) and Phase 5 (end-to-end integration).
-
-### 🎉 MAJOR BREAKTHROUGH: Compute ICBs Work on Apple Silicon! (May 2026)
-
-**The missing piece was `supportIndirectCommandBuffers=YES` on the pipeline.**
-
-Metal debug layer revealed the issue - pipelines must explicitly enable ICB support:
-```objective-c
-MTLComputePipelineDescriptor* desc = [[MTLComputePipelineDescriptor alloc] init];
-desc.computeFunction = function;
-desc.supportIndirectCommandBuffers = YES;  // <-- THE KEY!
-```
-
-**Complete Working Configuration (Verified on M1 Max):**
-
-1. **Pipeline with ICB support** - `supportIndirectCommandBuffers=YES`
-2. **ICB with inheritance** - `inheritPipelineState=YES`, `StorageMode=SHARED`
-3. **No pipeline in ICB command** - Only set buffers and dispatch
-4. **Pipeline on encoder** - Set before `executeCommandsInBuffer`
-
-**Test Results:**
-```
-✅ Pipeline created with supportIndirectCommandBuffers=YES
-✅ ICB created (inheritPipelineState=YES, StorageMode=SHARED)
-✅ ICB command encoded (buffer + dispatch, no pipeline)
-✅ ICB execution command encoded
-✅ Command buffer completed successfully
-Output: [42, 42, 42, 42]
-
-🎉 SUCCESS! Compute ICBs work on Apple Silicon!
-```
-
-**Investigation Files:**
-- `PHASE4_ICB_BREAKTHROUGH.md` - Complete solution documentation
-- `test_icb_with_icb_support.m` - Working test with correct configuration
-- `test_icb_pipeline_support.m` - Alternative working test
-- Multiple investigation tests documenting the journey
-
-**Impact:** Phase 4.6 can now proceed with ICBs as originally planned. The multi-launch ICB architecture is viable on Apple Silicon.
-
-### Phase 4.5: Implementation Trait Adapters - ✅ COMPLETE (18 of 18 critical path ops)
+### Phase 4.5: Implementation Trait Adapters - 🔄 IN PROGRESS (20% complete - 7 of ~50)
 
 **Major Achievement: Modular Implementation Structure** ✅
 

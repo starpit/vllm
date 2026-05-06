@@ -100,7 +100,7 @@ impl MetalTargetProfile {
             let entry = CostEntry { m, n, k, cost_us };
             self.cost_table
                 .entry(kernel)
-                .or_default()
+                .or_insert_with(Vec::new)
                 .push(entry);
         }
         

@@ -33,11 +33,24 @@
 //! - `2`: `NUM_KV_HEADS` (uint)
 //! - `3`: `ROT_DIM` (uint) — for partial-rope models; equals `HEAD_DIM` by default
 //!
-//! ## AttentionViaCache / AttentionPrefillContiguous
+//! ## AttentionViaCache
 //! - `0`: `HEAD_DIM` (uint)
 //! - `1`: `NUM_Q_HEADS` (uint)
 //! - `2`: `NUM_KV_HEADS` (uint)
 //! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE` (1/sqrt(head_dim) by default)
+//! - `4`: `BLOCK_SIZE` (uint) — paged-cache block stride (e.g. 16); from `KernelExtras`
+//! - `5`: `MAX_BLOCKS_PER_SEQ` (uint) — `block_table` row stride; from `KernelExtras`
+//!
+//! ## AttentionPrefillContiguous
+//! - `0`: `HEAD_DIM` (uint)
+//! - `1`: `NUM_Q_HEADS` (uint)
+//! - `2`: `NUM_KV_HEADS` (uint)
+//! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE` (1/sqrt(head_dim) by default)
+//! - `6`: `PREFILL_TILE_Q` (uint) — Q-axis tile from the lowering pass
+//!         (currently 16, baked from `KernelExtras::prefill_tile_q`).
+//!         Index `6` (not `4`) so AttentionViaCache and
+//!         AttentionPrefillContiguous can coexist in the same `.metal`
+//!         file without a function-constant index collision.
 //!
 //! ## Add / ScalarMul
 //! - No function constants in 5.B (kernels are token-parallel and
@@ -73,6 +86,25 @@ pub struct KernelExtras {
     pub attn_scale: f32,
     /// Partial-rope rotation dim. `0` selects `W::HEAD_DIM`.
     pub rot_dim: u32,
+    /// Paged-KV-cache block stride for `AttentionViaCache`. The cache
+    /// layout this targets is `[num_blocks, num_kv_heads, block_size,
+    /// head_dim]`; reading a token's K/V vector is one contiguous
+    /// `head_dim` slice. `0` is invalid for cache-reading kernels;
+    /// the model meta supplies `16` (vLLM's default) or whatever the
+    /// allocator chose.
+    pub block_size: u32,
+    /// Row stride of the `block_table` runtime buffer (in u32s),
+    /// equal to `ceil(MAX_SEQ_LEN / block_size)`. Baked per-bucket so
+    /// the kernel can index `block_table[seq * MAX_BLOCKS_PER_SEQ +
+    /// logical_block]` without a runtime divide. `0` is invalid for
+    /// `AttentionViaCache`.
+    pub max_blocks_per_seq: u32,
+    /// Q-axis tile size for `AttentionPrefillContiguous`. The kernel
+    /// processes `prefill_tile_q` query tokens per threadgroup. Must
+    /// match the lowering pass's `PREFILL_TILE_Q` constant. `0`
+    /// selects the default (16); the model meta usually leaves this
+    /// at the default.
+    pub prefill_tile_q: u32,
 }
 
 impl KernelExtras {
@@ -80,8 +112,15 @@ impl KernelExtras {
         eps: 0.0,
         attn_scale: 0.0,
         rot_dim: 0,
+        block_size: 0,
+        max_blocks_per_seq: 0,
+        prefill_tile_q: 0,
     };
 }
+
+/// Default Q-axis tile size for `AttentionPrefillContiguous` — must
+/// match the lowering pass's `PREFILL_TILE_Q`.
+pub(crate) const DEFAULT_PREFILL_TILE_Q: u32 = 16;
 
 /// Library-and-function name pair for a [`KernelId`].
 ///
@@ -155,7 +194,7 @@ pub fn constants_for<W: CanonicalParams>(
                 ConstantValue::uint(3, rot_dim),
             ]
         }
-        KernelId::AttentionViaCache | KernelId::AttentionPrefillContiguous => {
+        KernelId::AttentionViaCache => {
             let scale = if extras.attn_scale == 0.0 {
                 W::ATTN_SCALE
             } else {
@@ -166,6 +205,27 @@ pub fn constants_for<W: CanonicalParams>(
                 ConstantValue::uint(1, W::NUM_Q_HEADS),
                 ConstantValue::uint(2, W::NUM_KV_HEADS),
                 ConstantValue::float(3, scale),
+                ConstantValue::uint(4, extras.block_size),
+                ConstantValue::uint(5, extras.max_blocks_per_seq),
+            ]
+        }
+        KernelId::AttentionPrefillContiguous => {
+            let scale = if extras.attn_scale == 0.0 {
+                W::ATTN_SCALE
+            } else {
+                extras.attn_scale
+            };
+            let tile_q = if extras.prefill_tile_q == 0 {
+                DEFAULT_PREFILL_TILE_Q
+            } else {
+                extras.prefill_tile_q
+            };
+            vec![
+                ConstantValue::uint(0, W::HEAD_DIM),
+                ConstantValue::uint(1, W::NUM_Q_HEADS),
+                ConstantValue::uint(2, W::NUM_KV_HEADS),
+                ConstantValue::float(3, scale),
+                ConstantValue::uint(6, tile_q),
             ]
         }
         KernelId::Add | KernelId::ScalarMul => Vec::new(),
@@ -290,16 +350,32 @@ mod tests {
     }
 
     #[test]
-    fn attention_uses_canonical_scale_when_extras_is_zero() {
-        let bag = constants_for::<TinyLlamaProbe>(
-            KernelId::AttentionViaCache,
-            1,
-            KernelExtras::NONE,
-        )
-        .expect("attn bag");
-        assert_eq!(bag.len(), 4);
+    fn attention_via_cache_uses_canonical_scale_when_extras_is_zero() {
+        let extras = KernelExtras {
+            block_size: 16,
+            max_blocks_per_seq: 128,
+            ..KernelExtras::NONE
+        };
+        let bag =
+            constants_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1, extras).expect("attn bag");
+        assert_eq!(bag.len(), 6);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[3], ConstantValue::float(3, 0.125));
+        assert_eq!(bag[4], ConstantValue::uint(4, 16));
+        assert_eq!(bag[5], ConstantValue::uint(5, 128));
+    }
+
+    #[test]
+    fn attention_prefill_falls_back_to_default_tile_q() {
+        let bag = constants_for::<TinyLlamaProbe>(
+            KernelId::AttentionPrefillContiguous,
+            16,
+            KernelExtras::NONE,
+        )
+        .expect("prefill bag");
+        assert_eq!(bag.len(), 5);
+        assert_eq!(bag[0], ConstantValue::uint(0, 64));
+        assert_eq!(bag[4], ConstantValue::uint(6, DEFAULT_PREFILL_TILE_Q));
     }
 
     #[test]
@@ -382,5 +458,62 @@ mod tests {
             .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 8, KernelExtras::NONE)
             .expect("silu bucket=8");
         assert_eq!(pipelines.cached_count(), 6);
+    }
+
+    /// Device-bound smoke test for the Phase 5.C.4 specialized
+    /// attention shader rewrite. Verifies both
+    /// `attention_via_cache_f16_specialized` and
+    /// `attention_prefill_contiguous_f16_specialized` compile against
+    /// `MTLFunctionConstantValues` carrying their respective bag, and
+    /// that the cache returns the same handle on a repeat lookup.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_pipelines_build_and_cache() {
+        let Some(device) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        // AttentionViaCache: bucket=1 (decode), block_size=16,
+        // max_blocks_per_seq=128 (room for ~2k KV tokens).
+        let decode_extras = KernelExtras {
+            block_size: 16,
+            max_blocks_per_seq: 128,
+            ..KernelExtras::NONE
+        };
+        let _d1 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1, decode_extras)
+            .expect("attention_via_cache bucket=1");
+        let _d1_again = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionViaCache, 1, decode_extras)
+            .expect("attention_via_cache bucket=1 cache hit");
+        assert_eq!(pipelines.cached_count(), 1);
+
+        // AttentionPrefillContiguous at bucket=16 (one full
+        // PREFILL_TILE_Q tile) and bucket=64.
+        let _p16 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(
+                KernelId::AttentionPrefillContiguous,
+                16,
+                KernelExtras::NONE,
+            )
+            .expect("attention_prefill bucket=16");
+        let _p64 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(
+                KernelId::AttentionPrefillContiguous,
+                64,
+                KernelExtras::NONE,
+            )
+            .expect("attention_prefill bucket=64");
+        // PREFILL_TILE_Q is the only `M`-derived constant baked, so
+        // the bucket axis is collapsed for prefill — both 16 and 64
+        // share the same cache entry. Total now = 2.
+        assert_eq!(pipelines.cached_count(), 2);
     }
 }

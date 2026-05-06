@@ -349,7 +349,7 @@ fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
 mod tests {
     use super::*;
     use crate::interpreter::metal::lowered::{
-        Binding, DispatchShape, LoweredCommand, WeightBundleKind, WeightTensor,
+        Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, WeightBundleKind, WeightTensor,
     };
     use crate::interpreter::metal::model_meta::BufferRef;
     use crate::interpreter::metal::pipelines::KernelExtras;
@@ -418,10 +418,21 @@ mod tests {
             }
         }
 
-        fn kernel_extras_for(&self, _cmd: &LoweredCommand<TinyLlamaProbe>) -> KernelExtras {
-            KernelExtras {
-                eps: 1e-5,
-                ..KernelExtras::NONE
+        fn kernel_extras_for(&self, cmd: &LoweredCommand<TinyLlamaProbe>) -> KernelExtras {
+            // Per-`KernelId` defaults so the smoke tests can mix
+            // RmsNorm (needs `eps`) and AttentionViaCache (needs
+            // `block_size` + `max_blocks_per_seq`) in the same
+            // synthetic tape.
+            match cmd.kernel {
+                KernelId::AttentionViaCache => KernelExtras {
+                    block_size: 16,
+                    max_blocks_per_seq: 128,
+                    ..KernelExtras::NONE
+                },
+                _ => KernelExtras {
+                    eps: 1e-5,
+                    ..KernelExtras::NONE
+                },
             }
         }
     }
@@ -637,6 +648,89 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    /// Phase 5.C.4 smoke test: the worker bakes an AttentionViaCache
+    /// command into a one-segment ICB. Verifies that the new
+    /// `attention_via_cache_f16_specialized` kernel resolves through
+    /// the specialized-pipeline cache and that the worker accepts the
+    /// runtime bindings the lowering pass produces (Q + seq_used_k +
+    /// block_table + per-layer kv_cache_k/v).
+    #[test]
+    fn worker_records_attention_via_cache() {
+        let Some(device) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+
+        let cache = Arc::new(
+            SpecializedPipelineCache::with_standard_shaders((*device).clone())
+                .expect("compile standard shaders"),
+        );
+        let pipelines = SpecializedPipelines::new(cache);
+
+        let meta = StubMeta {
+            rmsnorm_weight: alloc_buffer(&device, 4096),
+        };
+        let runtime = empty_runtime(&device, 1);
+
+        // Single AttentionViaCache command at decode bucket=1
+        // (batch=1, num_q_heads heads).
+        let attn = LoweredCommand {
+            kernel: KernelId::AttentionViaCache,
+            dispatch: DispatchShape {
+                threadgroups: (1, TinyLlamaProbe::NUM_Q_HEADS, 1),
+                threads_per_threadgroup: (TinyLlamaProbe::HEAD_DIM, 1, 1),
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: 0,
+                    binding_index: 0,
+                },
+                Binding::ArenaSlot {
+                    slot: 1,
+                    binding_index: 1,
+                },
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::SeqUsedK,
+                    binding_index: 2,
+                },
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::BlockTable,
+                    binding_index: 3,
+                },
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::KvCacheK { layer: 0 },
+                    binding_index: 4,
+                },
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::KvCacheV { layer: 0 },
+                    binding_index: 5,
+                },
+            ],
+        };
+        let tape = LoweredMetalTape {
+            bucket_m: 1,
+            num_arena_slots: 2,
+            commands: vec![attn],
+        };
+
+        let worker = MetalWorker::<TinyLlamaProbe>::new(
+            device,
+            &vec![1024, 1024],
+            &[tape],
+            &pipelines,
+            &meta,
+            &runtime,
+        )
+        .expect("worker bakes attention command");
+
+        assert_eq!(worker.bucket_bakings.len(), 1);
+        let baking = &worker.bucket_bakings[0];
+        // One command → one segment.
+        assert_eq!(baking.segments.len(), 1);
+        assert_eq!(baking.segments[0].range, 0..1);
     }
 
     #[test]

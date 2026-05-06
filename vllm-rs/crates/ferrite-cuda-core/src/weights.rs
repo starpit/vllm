@@ -1038,6 +1038,37 @@ impl GpuWeights {
         Ok(size_bytes)
     }
 
+    /// Allocate a single GPU buffer and copy `data` into it via the
+    /// active [`DeviceAllocator`]. Returns a fresh `GpuTensor` of the
+    /// given `shape` and `dtype` over that buffer.
+    ///
+    /// Backend-neutral: under cuda this does `mem_alloc` + sync H2D;
+    /// under metal it allocates a `StorageModeShared` arena slice and
+    /// memcpys into it. Used by stream-free fused loaders (e.g.
+    /// `LinearLayer::load_dense_concat_packed`) that pre-concatenate
+    /// CPU bytes and need a single packed device buffer.
+    pub fn alloc_packed_from_host(
+        &mut self,
+        data: &[u8],
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<GpuTensor> {
+        let elem = dtype.size_bytes();
+        let expected = shape.iter().product::<usize>() * elem;
+        anyhow::ensure!(
+            data.len() == expected,
+            "alloc_packed_from_host: bytes {} != shape {:?} × {}",
+            data.len(),
+            shape,
+            elem,
+        );
+        let gpu_ptr = unsafe {
+            self.allocator
+                .alloc_and_copy_host(data.as_ptr(), data.len())?
+        };
+        Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
+    }
+
     /// Try to take a pre-cast entry for the given tensor name. CUDA-only.
     #[cfg(feature = "cuda")]
     fn take_precast(&self, name: &str) -> Option<PrecastEntry> {

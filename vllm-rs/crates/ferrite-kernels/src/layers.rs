@@ -1206,6 +1206,119 @@ impl LinearLayer {
         )?))
     }
 
+    /// Backend-neutral, stream-free counterpart to [`load_dense_concat`].
+    ///
+    /// Reads each source's CPU bytes via `take_cpu`, concatenates them
+    /// along dim 0 into a single packed buffer, and uploads via the
+    /// active [`DeviceAllocator`]. No precast pipeline / async DMA —
+    /// callers pay one CPU memcpy per prefix in exchange for not
+    /// needing a `CUstream`. Acceptable on the load-once path; metal
+    /// has no DMA either way (`StorageModeShared` is unified memory).
+    ///
+    /// All sources must share `in_features` (dim 1) and dtype. If any
+    /// source has a bias, every source must — biases concat in the
+    /// same order. Refuses any source with quantized storage (callers
+    /// route GGUF through `load_dense_concat_or_ggml` under cuda; metal
+    /// never sees quantized variants per the macro's quant-skip).
+    ///
+    /// [`load_dense_concat`]: Self::load_dense_concat
+    pub fn load_dense_concat_packed(weights: &mut GpuWeights, prefixes: &[&str]) -> Result<Self> {
+        if prefixes.is_empty() {
+            anyhow::bail!("load_dense_concat_packed: empty prefix list");
+        }
+
+        for p in prefixes {
+            if !weights.contains(&format!("{p}.weight")) {
+                try_synthesize_packed_slice(weights, p)?;
+            }
+        }
+
+        let mut shapes_dtypes: Vec<(Vec<usize>, ferrite_cuda_core::dtype::DType)> =
+            Vec::with_capacity(prefixes.len());
+        for p in prefixes {
+            let weight_name = format!("{p}.weight");
+            let (shape, dtype) = weights
+                .tensor_info(&weight_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {weight_name}"))?;
+            anyhow::ensure!(
+                shape.len() == 2,
+                "load_dense_concat_packed: `{weight_name}` has rank {}, expected 2",
+                shape.len(),
+            );
+            shapes_dtypes.push((shape.to_vec(), dtype));
+        }
+
+        let hidden = shapes_dtypes[0].0[1];
+        let dtype = shapes_dtypes[0].1;
+        for (i, (shape, dt)) in shapes_dtypes.iter().enumerate() {
+            anyhow::ensure!(
+                shape[1] == hidden,
+                "load_dense_concat_packed: `{}` has in_features {}, expected {}",
+                prefixes[i],
+                shape[1],
+                hidden,
+            );
+            anyhow::ensure!(
+                *dt == dtype,
+                "load_dense_concat_packed: `{}` has dtype {:?}, expected {:?}",
+                prefixes[i],
+                dt,
+                dtype,
+            );
+        }
+
+        let total_out: usize = shapes_dtypes.iter().map(|(s, _)| s[0]).sum();
+        let elem = dtype.size_bytes();
+
+        // Pull each prefix's CPU bytes (consumes from `tensors` map),
+        // concat in order. `take_cpu` returns the on-disk dtype — we
+        // already validated uniformity above, so no per-source cast.
+        let mut packed: Vec<u8> = Vec::with_capacity(total_out * hidden * elem);
+        for p in prefixes {
+            let weight_name = format!("{p}.weight");
+            let (data, _shape, dt) = weights.take_cpu(&weight_name)?;
+            anyhow::ensure!(
+                dt == dtype,
+                "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
+                weight_name,
+                dt,
+                dtype,
+            );
+            packed.extend_from_slice(&data);
+        }
+        let packed_weight = weights.alloc_packed_from_host(&packed, &[total_out, hidden], dtype)?;
+
+        // Biases: either all-or-none across the source set.
+        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+        let any_bias = bias_names.iter().any(|n| weights.contains(n));
+        let all_bias = bias_names.iter().all(|n| weights.contains(n));
+        anyhow::ensure!(
+            !any_bias || all_bias,
+            "load_dense_concat_packed: inconsistent biases across prefixes {:?}",
+            prefixes,
+        );
+        let packed_bias = if all_bias {
+            let mut bias_bytes: Vec<u8> = Vec::new();
+            let mut total_bias_elems: usize = 0;
+            for bn in &bias_names {
+                let (data, shape, bdt) = weights.take_cpu(bn)?;
+                anyhow::ensure!(
+                    bdt == dtype,
+                    "load_dense_concat_packed: bias `{bn}` dtype {:?} != weight dtype {:?}",
+                    bdt,
+                    dtype,
+                );
+                total_bias_elems += shape.iter().product::<usize>();
+                bias_bytes.extend_from_slice(&data);
+            }
+            Some(weights.alloc_packed_from_host(&bias_bytes, &[total_bias_elems], dtype)?)
+        } else {
+            None
+        };
+
+        Ok(Self::Dense(Linear::new(packed_weight, packed_bias)))
+    }
+
     /// Load several dense linear layers and concatenate along the
     /// out-feature dim (dim 0 of the weight matrix), returning one
     /// packed `LinearLayer::Dense`.

@@ -37,7 +37,13 @@ pub mod layers;
 pub mod layers_moe;
 #[cfg(feature = "cuda")]
 pub mod layers_quant;
-#[cfg(feature = "cuda")]
+// `rotary` is dual-mode like `layers`: the struct *definitions* and CPU-side
+// math helpers compile without `cuda`; the cudarc-using stream constructors
+// are individually `#[cfg(feature = "cuda")]`-gated inside the file. Under
+// metal the [`new_from_gpuweights`] constructor builds the same cache via
+// the active `DeviceAllocator`.
+//
+// [`new_from_gpuweights`]: rotary::RotaryCache::new_from_gpuweights
 pub mod rotary;
 
 #[cfg(feature = "cuda")]
@@ -53,5 +59,4 @@ pub use layers::{
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
 pub use layers_moe::{DeepSeekV2MoELayer, MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
-#[cfg(feature = "cuda")]
 pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling};

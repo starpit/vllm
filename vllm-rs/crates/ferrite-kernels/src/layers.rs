@@ -852,7 +852,9 @@ impl LinearLayer {
 
     /// Access the raw dense weight tensor. Panics if quantized —
     /// CUTLASS standalone GEMM only works with dense bf16 weights.
-    #[cfg(feature = "cuda")]
+    /// Quant variants are unreachable under metal (the macro only
+    /// emits Dense `LinearLayer`s on that path), so the panic arms
+    /// matter only on cuda.
     pub fn dense_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
         match self {
             Self::Dense(l) => l.weight,
@@ -890,7 +892,6 @@ impl LinearLayer {
     /// Access the bias tensor from a dense layer. Returns the bias
     /// `GpuTensor` or `None` if the layer has no bias. Panics on
     /// quantized variants — solver only supports dense bf16.
-    #[cfg(feature = "cuda")]
     pub fn dense_bias(&self) -> Option<ferrite_cuda_core::tensor::GpuTensor> {
         match self {
             Self::Dense(l) => l.bias,
@@ -900,7 +901,6 @@ impl LinearLayer {
 
     /// Cheap copy for dense layers (GpuTensor metadata only, no weight copy).
     /// Panics on quantized variants — solver only supports dense bf16.
-    #[cfg(feature = "cuda")]
     pub fn shallow_clone(&self) -> Self {
         match self {
             Self::Dense(l) => Self::Dense(Linear::new(l.weight, l.bias)),

@@ -11,6 +11,13 @@ pub mod lowered;
 pub mod lowering;
 pub mod pipelines;
 
+#[cfg(feature = "metal")]
+pub mod model_meta;
+#[cfg(feature = "metal")]
+pub mod runtime;
+#[cfg(feature = "metal")]
+pub mod worker;
+
 pub use lowered::{
     Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
@@ -19,3 +26,10 @@ pub use lowering::lower;
 pub use pipelines::{
     constants_for, KernelExtras, PipelineLookupError, SpecializedPipelines,
 };
+
+#[cfg(feature = "metal")]
+pub use model_meta::{BufferRef, MetalModelMeta};
+#[cfg(feature = "metal")]
+pub use runtime::RuntimeBindings;
+#[cfg(feature = "metal")]
+pub use worker::{ArenaLayout, BucketBaking, ExecSegment, MetalWorker, WorkerError};

@@ -25,7 +25,7 @@ pub use lowered::{
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 pub use lowering::{lower, lower_pair};
-pub use pipelines::{constants_for, PipelineLookupError, SpecializedPipelines};
+pub use pipelines::{PipelineLookupError, SpecializedPipelines, constants_for};
 
 #[cfg(feature = "metal")]
 pub use forward::{ForwardError, ForwardInputs};

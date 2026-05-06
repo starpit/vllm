@@ -35,15 +35,16 @@ pub mod arena;
 #[cfg(feature = "cuda")]
 pub mod cpu_gpu_buf;
 #[cfg(feature = "cuda")]
-pub mod cuda_allocator;
-#[cfg(feature = "cuda")]
 pub mod cublas;
+#[cfg(feature = "cuda")]
+pub mod cuda_allocator;
 #[cfg(feature = "cuda")]
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
 #[cfg(feature = "cuda")]
 pub mod gguf_loader;
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod weights;
 
 #[cfg(feature = "cuda")]
@@ -67,6 +68,7 @@ pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 pub use device::GpuDevice;
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use weights::GpuWeights;
 
 /// Re-export `cudarc::driver::sys::CUstream` at a stable path so

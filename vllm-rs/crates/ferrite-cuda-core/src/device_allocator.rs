@@ -46,9 +46,5 @@ pub trait DeviceAllocator: Send + Sync {
     /// `memcpy_htod_async` against `src_host`; passing pageable
     /// memory works but blocks the CPU. Metal implementations
     /// `memcpy` from `src_host`, so any host memory is fine.
-    unsafe fn alloc_and_copy_host(
-        &mut self,
-        src_host: *const u8,
-        bytes: usize,
-    ) -> Result<*mut u8>;
+    unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8>;
 }

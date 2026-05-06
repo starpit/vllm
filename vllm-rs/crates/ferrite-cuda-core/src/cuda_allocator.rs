@@ -69,11 +69,7 @@ impl CudaAllocator {
 }
 
 impl DeviceAllocator for CudaAllocator {
-    unsafe fn alloc_and_copy_host(
-        &mut self,
-        src_host: *const u8,
-        bytes: usize,
-    ) -> Result<*mut u8> {
+    unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
         let gpu_ptr = unsafe { driver::mem_alloc(bytes)? };
         self.gpu_allocs
             .push(unsafe { RawGpuMem::new(gpu_ptr, bytes) });
@@ -86,5 +82,4 @@ impl DeviceAllocator for CudaAllocator {
         }
         Ok(gpu_ptr)
     }
-
 }

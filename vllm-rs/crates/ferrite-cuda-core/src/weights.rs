@@ -14,11 +14,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-#[cfg(feature = "cuda")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
+#[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
 #[cfg(feature = "cuda")]
@@ -493,10 +493,7 @@ impl GpuWeights {
     ///
     /// Handles both single-file (`model.safetensors`) and sharded
     /// (`model.safetensors.index.json`) models.
-    pub fn from_dir(
-        dir: impl AsRef<Path>,
-        allocator: crate::BackendAllocator,
-    ) -> Result<Self> {
+    pub fn from_dir(dir: impl AsRef<Path>, allocator: crate::BackendAllocator) -> Result<Self> {
         let dir = dir.as_ref();
         let index_path = dir.join("model.safetensors.index.json");
         let single_path = dir.join("model.safetensors");
@@ -983,7 +980,9 @@ impl GpuWeights {
                 self.allocator
                     .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
             };
-            unsafe { driver::mem_free_host(entry.pinned_ptr).ok(); }
+            unsafe {
+                driver::mem_free_host(entry.pinned_ptr).ok();
+            }
             return Ok(unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) });
         }
 

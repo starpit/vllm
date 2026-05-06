@@ -20,11 +20,11 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 use crate::classified::Program;
+use crate::config::ModelParams;
 use crate::fuf::Fuf;
 use crate::impl_lib::ImplementationLibrary;
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
-use crate::config::ModelParams;
 
 /// Emit Metal ICB (Indirect Command Buffer) construction code for a decoder block.
 ///
@@ -47,7 +47,7 @@ use crate::config::ModelParams;
 /// icb_desc.set_max_kernel_buffer_bind_count(32);
 /// icb_desc.set_inherit_buffers(false);
 /// let icb = device.new_indirect_command_buffer(&icb_desc, 10, MTLResourceOptions::empty());
-/// 
+///
 /// // Record RMSNorm dispatch at index 0
 /// let cmd = icb.indirect_compute_command_at_index(0);
 /// cmd.set_compute_pipeline_state(&self.rmsnorm_pipeline);
@@ -61,7 +61,7 @@ pub fn emit_metal_icb_construction(
     kernel_count: usize,
 ) -> TokenStream {
     let kernel_count_lit = proc_macro2::Literal::usize_unsuffixed(kernel_count);
-    
+
     // Generate ICB descriptor setup
     let icb_setup = quote! {
         // Create ICB descriptor with compute command support
@@ -70,7 +70,7 @@ pub fn emit_metal_icb_construction(
         icb_desc.set_max_kernel_buffer_bind_count(32); // Max buffers per kernel
         icb_desc.set_inherit_buffers(false); // Each command sets its own buffers
         icb_desc.set_inherit_pipeline_state(false);
-        
+
         // Allocate ICB with capacity for all kernels in this decoder block
         let icb = device.new_indirect_command_buffer(
             &icb_desc,
@@ -78,19 +78,19 @@ pub fn emit_metal_icb_construction(
             metal::MTLResourceOptions::StorageModeShared,
         )?;
     };
-    
+
     // Generate kernel recording code for each wave
     let mut kernel_index = 0usize;
     let mut wave_recordings = Vec::new();
-    
+
     for (wave_idx, subgraph_ids) in wave_schedule.iter().enumerate() {
         let wave_idx_lit = proc_macro2::Literal::usize_unsuffixed(wave_idx);
         let mut subgraph_recordings = Vec::new();
-        
+
         for &subgraph_id in subgraph_ids {
             let kernel_idx_lit = proc_macro2::Literal::usize_unsuffixed(kernel_index);
             let subgraph_id_lit = proc_macro2::Literal::u32_unsuffixed(subgraph_id);
-            
+
             // Each subgraph gets recorded as an indirect compute command
             // The actual implementation will be filled in by the subgraph's
             // Implementation::emit_icb_recording() method
@@ -100,23 +100,23 @@ pub fn emit_metal_icb_construction(
                 // TODO: Call subgraph's Implementation::emit_icb_recording()
                 // This will set pipeline state, buffer bindings, and dispatch size
             });
-            
+
             kernel_index += 1;
         }
-        
+
         wave_recordings.push(quote! {
             // Wave #wave_idx_lit: #(subgraph_ids),*
             #(#subgraph_recordings)*
         });
     }
-    
+
     quote! {
         {
             #icb_setup
-            
+
             // Record all kernel dispatches into the ICB
             #(#wave_recordings)*
-            
+
             Ok(icb)
         }
     }
@@ -140,22 +140,20 @@ pub fn emit_metal_icb_construction(
 /// The ICB was pre-recorded at init time with buffer binding INDICES.
 /// The actual buffer pointers come from the scratch/tile table that the
 /// runtime updates per-request.
-pub fn emit_metal_icb_execution(
-    kernel_count: usize,
-) -> TokenStream {
+pub fn emit_metal_icb_execution(kernel_count: usize) -> TokenStream {
     let kernel_count_lit = proc_macro2::Literal::usize_unsuffixed(kernel_count);
-    
+
     quote! {
         {
             // HOT PATH: Single Metal API call to execute entire pre-recorded ICB
             // This replaces hundreds of individual kernel dispatches with one GPU call
-            
+
             // Create command buffer from the command queue
             let command_buffer = self.command_queue.new_command_buffer();
-            
+
             // Create compute encoder
             let encoder = command_buffer.new_compute_command_encoder();
-            
+
             // Execute all pre-recorded commands in the ICB
             // Range is 0..kernel_count (all kernels in this decoder block)
             encoder.execute_commands_in_buffer(
@@ -165,16 +163,16 @@ pub fn emit_metal_icb_execution(
                     length: #kernel_count_lit,
                 },
             );
-            
+
             // End encoding
             encoder.end_encoding();
-            
+
             // Commit the command buffer to the GPU
             command_buffer.commit();
-            
+
             // Wait for completion (synchronous for now; async version later)
             command_buffer.wait_until_completed();
-            
+
             // Check for errors
             if command_buffer.status() == metal::MTLCommandBufferStatus::Error {
                 return Err(format!(
@@ -182,7 +180,7 @@ pub fn emit_metal_icb_execution(
                     command_buffer.error()
                 ).into());
             }
-            
+
             Ok(())
         }
     }
@@ -264,14 +262,20 @@ mod tests {
         let wave_schedule = vec![vec![0, 1, 2], vec![3, 4]];
         let tokens = emit_metal_icb_construction(&wave_schedule, 5);
         let code = tokens.to_string();
-        assert!(!code.is_empty(), "Metal ICB construction should emit non-empty tokens");
+        assert!(
+            !code.is_empty(),
+            "Metal ICB construction should emit non-empty tokens"
+        );
     }
 
     #[test]
     fn metal_icb_execution_emits_tokens() {
         let tokens = emit_metal_icb_execution(10);
         let code = tokens.to_string();
-        assert!(!code.is_empty(), "Metal ICB execution should emit non-empty tokens");
+        assert!(
+            !code.is_empty(),
+            "Metal ICB execution should emit non-empty tokens"
+        );
     }
 
     #[test]

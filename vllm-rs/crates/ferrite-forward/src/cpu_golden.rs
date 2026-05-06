@@ -115,12 +115,7 @@ pub fn mul(a: &[f32], b: &[f32], output: &mut [f32]) {
 ///
 /// Mirrors `Instruction::Embed` (CUDA) and the Metal `KernelId::Embed`
 /// dispatch.
-pub fn embed(
-    input_ids: &[u32],
-    embed_weight: &[f32],
-    output: &mut [f32],
-    hidden_size: usize,
-) {
+pub fn embed(input_ids: &[u32], embed_weight: &[f32], output: &mut [f32], hidden_size: usize) {
     assert_eq!(output.len(), input_ids.len() * hidden_size);
     assert_eq!(embed_weight.len() % hidden_size, 0);
     let vocab = embed_weight.len() / hidden_size;
@@ -350,9 +345,8 @@ pub fn rope_append(
         let block_offset = slot % block_size;
         for h in 0..num_kv_heads {
             let kv_base = t * kv_dim + h * head_dim;
-            let cache_base = block_id * kv_cache_stride
-                + h * block_size * head_dim
-                + block_offset * head_dim;
+            let cache_base =
+                block_id * kv_cache_stride + h * block_size * head_dim + block_offset * head_dim;
             // K: rotate.
             for d in 0..half_dim {
                 let x0 = k_in[kv_base + d];
@@ -696,7 +690,10 @@ mod tests {
             for i in 0..4 {
                 let want = weight[i];
                 let got = delta[row * 4 + i];
-                assert!((got - want).abs() < 1e-3, "row {row} idx {i}: want {want}, got {got}");
+                assert!(
+                    (got - want).abs() < 1e-3,
+                    "row {row} idx {i}: want {want}, got {got}"
+                );
             }
         }
     }
@@ -854,8 +851,10 @@ mod tests {
             let logical = t / block_size;
             let off = t % block_size;
             let dst = logical * block_stride + 0 * block_size * head_dim + off * head_dim;
-            kv_cache_k[dst..dst + head_dim].copy_from_slice(&k_contig[t * head_dim..(t + 1) * head_dim]);
-            kv_cache_v[dst..dst + head_dim].copy_from_slice(&v_contig[t * head_dim..(t + 1) * head_dim]);
+            kv_cache_k[dst..dst + head_dim]
+                .copy_from_slice(&k_contig[t * head_dim..(t + 1) * head_dim]);
+            kv_cache_v[dst..dst + head_dim]
+                .copy_from_slice(&v_contig[t * head_dim..(t + 1) * head_dim]);
         }
         let block_table = vec![0u32, 1];
         let seq_used_k = vec![kv_len as u32];

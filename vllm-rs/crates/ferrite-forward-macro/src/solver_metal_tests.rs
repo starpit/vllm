@@ -23,16 +23,16 @@ mod tests {
             hidden_states = embed(input_ids, embed_tokens);
             normed = rmsnorm(hidden_states, input_layernorm);
         "#;
-        
+
         let file: syn::File = syn::parse_str(&format!("fn _c() {{ {src} }}")).expect("parse");
         let block = match &file.items[0] {
             syn::Item::Fn(f) => &*f.block,
             _ => unreachable!(),
         };
-        
+
         let ast = parse_block(block).unwrap();
         let program = crate::classify::classify(&ast).unwrap();
-        
+
         let mut params = ModelParams {
             name: "test_model".to_string(),
             source_stem: "test_model".to_string(),
@@ -50,17 +50,17 @@ mod tests {
         params.bounds.insert("num_hidden_layers".into(), 1);
         params.bounds.insert("hidden_size".into(), 4096);
         params.bounds.insert("vocab_size".into(), 32000);
-        
+
         let inferred = infer(
             &program,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
             &BTreeMap::new(),
         )
         .unwrap();
-        
+
         let cfg = crate::cfg::build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
-        
+
         (fuf, inferred, params)
     }
 
@@ -68,10 +68,10 @@ mod tests {
     fn solver_picks_metal_rmsnorm_for_metal_target() {
         let (fuf, inferred, params) = build_simple_rmsnorm_fuf();
         let lib = starter_library();
-        
+
         // Use Metal M1 target
         let metal_target = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
-        
+
         let workloads = solve(
             &fuf,
             &lib,
@@ -82,10 +82,10 @@ mod tests {
             &[],
         )
         .expect("solve should succeed with Metal target");
-        
+
         // Verify we got assignments for both workload points
         assert_eq!(workloads.per_workload.len(), 2);
-        
+
         // Check that RMSNorm tiles are covered
         for (wp, sfuf) in workloads.per_workload.iter() {
             assert!(
@@ -93,16 +93,16 @@ mod tests {
                 "cover incomplete at num_tokens={}",
                 wp.num_tokens
             );
-            
+
             // Find RMSNorm subgraphs and verify they use Metal implementations
             for sg in sfuf.subgraphs() {
                 let tiles = sfuf.tiles_in_subgraph(sg);
                 let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
-                
+
                 if ops.contains(&OpKind::RmsNorm) {
                     let impl_id = sfuf.impl_of(sg).unwrap();
                     let impl_name = lib.get(impl_id).name();
-                    
+
                     // Should be one of the Metal implementations
                     assert!(
                         impl_name.starts_with("metal_rmsnorm"),
@@ -119,10 +119,10 @@ mod tests {
     fn solver_rejects_metal_rmsnorm_for_cuda_target() {
         let (fuf, inferred, params) = build_simple_rmsnorm_fuf();
         let lib = starter_library();
-        
+
         // Use CUDA L4 target
         let cuda_target = from_profile_def(&ferrite_cuda_targets::L4_SM89);
-        
+
         let workloads = solve(
             &fuf,
             &lib,
@@ -133,20 +133,20 @@ mod tests {
             &[],
         )
         .expect("solve should succeed with CUDA target");
-        
+
         // Verify we got assignments
         assert_eq!(workloads.per_workload.len(), 2);
-        
+
         // Check that RMSNorm tiles use CUDA implementations, NOT Metal
         for (wp, sfuf) in workloads.per_workload.iter() {
             for sg in sfuf.subgraphs() {
                 let tiles = sfuf.tiles_in_subgraph(sg);
                 let ops: Vec<OpKind> = tiles.iter().map(|t| fuf.get(*t).op).collect();
-                
+
                 if ops.contains(&OpKind::RmsNorm) {
                     let impl_id = sfuf.impl_of(sg).unwrap();
                     let impl_name = lib.get(impl_id).name();
-                    
+
                     // Should NOT be Metal implementation
                     assert!(
                         !impl_name.starts_with("metal_"),
@@ -154,13 +154,12 @@ mod tests {
                         impl_name,
                         wp.num_tokens
                     );
-                    
+
                     // Should be the CUDA reference implementation
                     assert_eq!(
                         impl_name, "rmsnorm_ref",
                         "Expected CUDA rmsnorm_ref, got {} at num_tokens={}",
-                        impl_name,
-                        wp.num_tokens
+                        impl_name, wp.num_tokens
                     );
                 }
             }
@@ -171,7 +170,7 @@ mod tests {
     fn metal_rmsnorm_cost_varies_by_device() {
         let (fuf, inferred, params) = build_simple_rmsnorm_fuf();
         let lib = starter_library();
-        
+
         // Solve for M1 (68.25 GB/s)
         let m1_target = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         let m1_workloads = solve(
@@ -185,7 +184,7 @@ mod tests {
         )
         .unwrap();
         let m1_cost = m1_workloads.get_nt(512).unwrap().predicted_us;
-        
+
         // Solve for M2 (100 GB/s - 1.46× faster)
         let m2_target = from_metal_profile(&ferrite_metal_targets::M2_10CORE);
         let m2_workloads = solve(
@@ -199,7 +198,7 @@ mod tests {
         )
         .unwrap();
         let m2_cost = m2_workloads.get_nt(512).unwrap().predicted_us;
-        
+
         // M1 should be slower than M2 (lower bandwidth)
         assert!(
             m1_cost > m2_cost,
@@ -207,7 +206,7 @@ mod tests {
             m1_cost,
             m2_cost
         );
-        
+
         // Cost ratio should roughly match bandwidth ratio (within 20% tolerance)
         let cost_ratio = m1_cost / m2_cost;
         let bandwidth_ratio = 100.0 / 68.25; // M2 / M1
@@ -224,20 +223,20 @@ mod tests {
     #[test]
     fn metal_implementations_registered_in_library() {
         let lib = starter_library();
-        
+
         // Count Metal implementations
         let metal_impls: Vec<_> = lib
             .iter_enumerated()
             .filter(|(_, imp)| imp.name().starts_with("metal_"))
             .collect();
-        
+
         // Should have at least 2 Metal RMSNorm implementations (fp16 + bf16)
         assert!(
             metal_impls.len() >= 2,
             "Expected at least 2 Metal implementations, found {}",
             metal_impls.len()
         );
-        
+
         // Verify specific implementations are present
         let names: Vec<&str> = metal_impls.iter().map(|(_, imp)| imp.name()).collect();
         assert!(

@@ -12,9 +12,9 @@ use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     AttentionPrefillContiguousImpl, AttentionViaCacheImpl, CostCtx, Handoff, Implementation,
-    LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlidingAttentionPrefillContiguousImpl,
-    SlidingAttentionViaCacheImpl, SlotMap, WeightAccessor, WorkloadConstraint,
-    default_required_weights,
+    LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources,
+    SlidingAttentionPrefillContiguousImpl, SlidingAttentionViaCacheImpl, SlotMap, WeightAccessor,
+    WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -141,12 +141,12 @@ impl MetalAttentionImpl {
         compute_tflops: f64,
     ) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
-        
+
         // Phase 1: Q·K^T compute cost
         // FLOPs = num_heads * seq_len * head_size * 2 (multiply-add)
         let qk_flops = (num_heads as f64) * (seq_len as f64) * (head_size as f64) * 2.0;
         let compute_cost_us = (qk_flops / (compute_tflops * 1e12)) * 1e6;
-        
+
         // Phase 2: Memory cost (read Q, K, V, write output)
         // Reads: Q [num_heads, head_size] + K [seq_len, head_size] + V [seq_len, head_size]
         // Writes: output [num_heads, head_size]
@@ -155,7 +155,7 @@ impl MetalAttentionImpl {
         let output_bytes = (num_heads as f64) * (head_size as f64) * bytes_per_element;
         let total_bytes = q_bytes + kv_bytes + output_bytes;
         let memory_cost_us = (total_bytes / 1e9 / bandwidth_gbps) * 1e6;
-        
+
         // Return max since phases overlap
         compute_cost_us.max(memory_cost_us)
     }
@@ -163,7 +163,12 @@ impl MetalAttentionImpl {
 
 impl Implementation for MetalAttentionImpl {
     fn name(&self) -> &'static str {
-        match (self.is_sliding, self.is_optimized, self.is_multihead, self.is_paged) {
+        match (
+            self.is_sliding,
+            self.is_optimized,
+            self.is_multihead,
+            self.is_paged,
+        ) {
             (true, true, _, _) => "metal_sliding_attention_multihead_optimized_f16",
             (true, _, _, _) => "metal_sliding_attention_paged_f16",
             (false, true, _, _) => "metal_attention_multihead_optimized_f16",
@@ -213,27 +218,32 @@ impl Implementation for MetalAttentionImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: Attention output is [num_heads, head_size]
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             if dims.len() >= 2 {
                 let num_heads = dims[0] as u32;
                 let head_size = dims[1] as u32;
-                
+
                 // Get sequence length from bounds (context_len or similar)
-                let seq_len = ctx.bounds.get("context_len")
+                let seq_len = ctx
+                    .bounds
+                    .get("context_len")
                     .or_else(|| ctx.bounds.get("max_seq_len"))
                     .copied()
                     .unwrap_or(2048) as u32;
-                
+
                 // Try empirical cost first
-                if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, num_heads, head_size, seq_len) {
+                if let Some(cost) =
+                    ctx.profile
+                        .cost_us_for(self.kernel_name, num_heads, head_size, seq_len)
+                {
                     return cost;
                 }
-                
+
                 // Fall back to analytical model
                 return self.analytical_cost_us(
                     num_heads,
@@ -244,7 +254,7 @@ impl Implementation for MetalAttentionImpl {
                 );
             }
         }
-        
+
         // Fallback: conservative estimate (attention is expensive)
         1000.0
     }
@@ -321,11 +331,11 @@ mod tests {
     #[test]
     fn metal_attention_only_compatible_with_metal_targets() {
         let metal_impl = MetalAttentionImpl::new_multihead_optimized_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -334,30 +344,38 @@ mod tests {
     #[test]
     fn metal_attention_analytical_cost_scales_with_seq_len() {
         let impl_fp16 = MetalAttentionImpl::new_multihead_optimized_fp16();
-        
+
         // Short sequence
         let cost_short = impl_fp16.analytical_cost_us(32, 128, 256, 400.0, 10.4);
-        
+
         // Long sequence (4× longer)
         let cost_long = impl_fp16.analytical_cost_us(32, 128, 1024, 400.0, 10.4);
-        
+
         // Cost should scale roughly linearly with seq_len
         let ratio = cost_long / cost_short;
-        assert!((ratio - 4.0).abs() < 1.0, "Expected ratio ~4.0, got {}", ratio);
+        assert!(
+            (ratio - 4.0).abs() < 1.0,
+            "Expected ratio ~4.0, got {}",
+            ratio
+        );
     }
 
     #[test]
     fn metal_attention_analytical_cost_scales_with_num_heads() {
         let impl_fp16 = MetalAttentionImpl::new_multihead_optimized_fp16();
-        
+
         // Few heads
         let cost_few = impl_fp16.analytical_cost_us(8, 128, 512, 400.0, 10.4);
-        
+
         // Many heads (4× more)
         let cost_many = impl_fp16.analytical_cost_us(32, 128, 512, 400.0, 10.4);
-        
+
         // Cost should scale roughly linearly with num_heads
         let ratio = cost_many / cost_few;
-        assert!((ratio - 4.0).abs() < 1.0, "Expected ratio ~4.0, got {}", ratio);
+        assert!(
+            (ratio - 4.0).abs() < 1.0,
+            "Expected ratio ~4.0, got {}",
+            ratio
+        );
     }
 }

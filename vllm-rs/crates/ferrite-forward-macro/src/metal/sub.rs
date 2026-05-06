@@ -8,8 +8,8 @@
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,
+    WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -80,30 +80,30 @@ impl Implementation for MetalSubImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: Sub operates on tensors of any shape
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             // Calculate total number of elements
             let num_elements: u32 = dims.iter().copied().product::<u64>() as u32;
-            
+
             // Try empirical cost first (if we have benchmarks for this size)
             let kernel_name = match self.dtype {
                 "fp16" => "sub_f16",
                 "bf16" => "sub_bf16",
                 _ => "sub_f16",
             };
-            
+
             if let Some(cost) = ctx.profile.cost_us_for(kernel_name, num_elements, 1, 0) {
                 return cost;
             }
-            
+
             // Fall back to analytical model
             return self.analytical_cost_us(num_elements, ctx.profile.memory_bandwidth_gbps);
         }
-        
+
         // Fallback: conservative estimate
         10.0
     }
@@ -154,11 +154,11 @@ mod tests {
     #[test]
     fn metal_sub_only_compatible_with_metal_targets() {
         let metal_impl = MetalSubImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -167,45 +167,54 @@ mod tests {
     #[test]
     fn metal_sub_analytical_cost_scales_with_size() {
         let impl_fp16 = MetalSubImpl::new_fp16();
-        
+
         // Small: 1K elements
         let small_cost = impl_fp16.analytical_cost_us(1_000, 68.25);
-        
+
         // Large: 1M elements (1000× larger)
         let large_cost = impl_fp16.analytical_cost_us(1_000_000, 68.25);
-        
+
         // Cost should scale linearly with size
         let ratio = large_cost / small_cost;
-        assert!((ratio - 1000.0).abs() < 50.0, "Expected ratio ~1000, got {}", ratio);
+        assert!(
+            (ratio - 1000.0).abs() < 50.0,
+            "Expected ratio ~1000, got {}",
+            ratio
+        );
     }
 
     #[test]
     fn metal_sub_cost_same_as_add() {
         let sub_impl = MetalSubImpl::new_fp16();
-        
+
         // Sub and Add have identical memory traffic patterns
         // Both read 2 inputs + write 1 output
         let num_elements = 1_000_000;
         let bandwidth = 100.0; // GB/s
-        
+
         let cost = sub_impl.analytical_cost_us(num_elements, bandwidth);
-        
+
         // Expected: (2*1M*2 + 1M*2) bytes / 100 GB/s = 6 MB / 100 GB/s = 60 µs
         let expected = 60.0;
-        assert!((cost - expected).abs() < 1.0, "Expected ~{}µs, got {}µs", expected, cost);
+        assert!(
+            (cost - expected).abs() < 1.0,
+            "Expected ~{}µs, got {}µs",
+            expected,
+            cost
+        );
     }
 
     #[test]
     fn metal_sub_bf16_same_cost_as_fp16() {
         let impl_fp16 = MetalSubImpl::new_fp16();
         let impl_bf16 = MetalSubImpl::new_bf16();
-        
+
         let num_elements = 1_000_000;
         let bandwidth = 68.25;
-        
+
         let cost_fp16 = impl_fp16.analytical_cost_us(num_elements, bandwidth);
         let cost_bf16 = impl_bf16.analytical_cost_us(num_elements, bandwidth);
-        
+
         // Both are 2 bytes per element, so costs should be identical
         assert!((cost_fp16 - cost_bf16).abs() < 0.01);
     }

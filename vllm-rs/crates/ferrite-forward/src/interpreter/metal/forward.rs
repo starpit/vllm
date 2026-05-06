@@ -73,10 +73,7 @@ pub enum ForwardError {
     /// `num_tokens` exceeded every bucket's `bucket_m`. The engine
     /// either needs to chunk the step or the model loader needs to
     /// add a wider bucket.
-    NoBucketFits {
-        num_tokens: u32,
-        max_bucket: u32,
-    },
+    NoBucketFits { num_tokens: u32, max_bucket: u32 },
     /// One of the input slices was bigger than its runtime buffer.
     /// The runtime buffer was sized at `RuntimeFactory` invocation —
     /// either the factory under-sized it for this bucket or the

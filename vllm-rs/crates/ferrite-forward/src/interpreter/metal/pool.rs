@@ -24,9 +24,7 @@
 use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Condvar, Mutex};
 
-use ferrite_metal_kernels::metal::{
-    Buffer, CommandQueue, Device, MTLCommandBufferStatus,
-};
+use ferrite_metal_kernels::metal::{Buffer, CommandQueue, Device, MTLCommandBufferStatus};
 
 use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
 
@@ -36,8 +34,8 @@ use super::lowering::lower_pair;
 use super::pipelines::SpecializedPipelines;
 use super::runtime::RuntimeBindings;
 use super::worker::{ArenaLayout, MetalWorker, WorkerError};
-use ferrite_cuda_core::MetalAllocator;
 use crate::{CanonicalParams, Instruction};
+use ferrite_cuda_core::MetalAllocator;
 
 /// One bucket's compile-time data, ready to be lowered + handed to a
 /// [`MetalWorkerPool`].
@@ -96,10 +94,7 @@ pub enum PoolBuildError {
     /// One bucket's [`lower`] failed. `bucket_m` identifies the row
     /// for the model author; `error` is the `Display` of the
     /// underlying [`LoweringError`].
-    BucketLower {
-        bucket_m: u32,
-        error: String,
-    },
+    BucketLower { bucket_m: u32, error: String },
     /// The eager-spawn first worker (or any structural pool prereq)
     /// reported a [`WorkerError`].
     Worker(WorkerError),
@@ -141,8 +136,7 @@ impl From<WorkerError> for PoolBuildError {
 /// can stay non-generic over the closure type — there's exactly one
 /// runtime layout per (model, max bucket) and the factory captures
 /// it once at pool construction.
-pub type RuntimeFactory =
-    Arc<dyn Fn(&Device) -> RuntimeBindings + Send + Sync>;
+pub type RuntimeFactory = Arc<dyn Fn(&Device) -> RuntimeBindings + Send + Sync>;
 
 /// One unit the pool hands out: a worker plus its private
 /// [`RuntimeBindings`].
@@ -226,6 +220,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// Eager creation surfaces allocation/recording/pipeline-lookup
     /// failures at construction time and warms the first-forward
     /// path (no creation cost on the first checkout).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
         weights: Arc<W>,
@@ -545,11 +540,7 @@ fn write_runtime_inputs(
     Ok(())
 }
 
-fn write_slice(
-    kind: &'static str,
-    buffer: &Buffer,
-    src: &[u32],
-) -> Result<(), ForwardError> {
+fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> {
     let bytes_needed = std::mem::size_of_val(src);
     let bytes_available = buffer.length() as usize;
     if bytes_needed > bytes_available {
@@ -708,8 +699,7 @@ mod tests {
 
         let tapes: Arc<[_]> = Arc::from(vec![synthetic_tape(1)]);
         let arena_layout: ArenaLayout = vec![4096, 4096];
-        let runtime_factory: RuntimeFactory =
-            Arc::new(|d| empty_runtime(d, 1));
+        let runtime_factory: RuntimeFactory = Arc::new(|d| empty_runtime(d, 1));
 
         Some(
             MetalWorkerPool::<TestWeights>::new(
@@ -991,8 +981,16 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        assert_eq!(pool.pick_bucket(1).unwrap(), 1, "smallest bucket at index 1");
-        assert_eq!(pool.pick_bucket(8).unwrap(), 2, "8 fits index 2 (bucket_m=8)");
+        assert_eq!(
+            pool.pick_bucket(1).unwrap(),
+            1,
+            "smallest bucket at index 1"
+        );
+        assert_eq!(
+            pool.pick_bucket(8).unwrap(),
+            2,
+            "8 fits index 2 (bucket_m=8)"
+        );
         assert_eq!(pool.pick_bucket(9).unwrap(), 0, "9 only fits the 32 bucket");
     }
 

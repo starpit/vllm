@@ -8,8 +8,8 @@
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,
+    WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -40,12 +40,12 @@ impl MetalBiasAddImpl {
     fn analytical_cost_us(&self, num_elements: u32, bandwidth_gbps: f64) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let total_elements = num_elements as f64;
-        
+
         // Input read + output write (bias is small and often cached)
         let bytes_read = total_elements * bytes_per_element; // input
         let bytes_written = total_elements * bytes_per_element; // output
         let total_bytes = bytes_read + bytes_written;
-        
+
         let total_gb = total_bytes / 1e9;
         let time_seconds = total_gb / bandwidth_gbps;
         time_seconds * 1e6 // convert to microseconds
@@ -83,30 +83,30 @@ impl Implementation for MetalBiasAddImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: BiasAdd operates on tensors of any shape
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             // Calculate total number of elements
             let num_elements: u32 = dims.iter().copied().product::<u64>() as u32;
-            
+
             // Try empirical cost first (if we have benchmarks for this size)
             let kernel_name = match self.dtype {
                 "fp16" => "bias_add_f16",
                 "bf16" => "bias_add_bf16",
                 _ => "bias_add_f16",
             };
-            
+
             if let Some(cost) = ctx.profile.cost_us_for(kernel_name, num_elements, 1, 0) {
                 return cost;
             }
-            
+
             // Fall back to analytical model
             return self.analytical_cost_us(num_elements, ctx.profile.memory_bandwidth_gbps);
         }
-        
+
         // Fallback: conservative estimate
         10.0
     }
@@ -157,11 +157,11 @@ mod tests {
     #[test]
     fn metal_bias_add_only_compatible_with_metal_targets() {
         let metal_impl = MetalBiasAddImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -170,46 +170,55 @@ mod tests {
     #[test]
     fn metal_bias_add_analytical_cost_scales_with_size() {
         let impl_fp16 = MetalBiasAddImpl::new_fp16();
-        
+
         // Small: 1K elements
         let small_cost = impl_fp16.analytical_cost_us(1_000, 68.25);
-        
+
         // Large: 1M elements (1000× larger)
         let large_cost = impl_fp16.analytical_cost_us(1_000_000, 68.25);
-        
+
         // Cost should scale linearly with size
         let ratio = large_cost / small_cost;
-        assert!((ratio - 1000.0).abs() < 50.0, "Expected ratio ~1000, got {}", ratio);
+        assert!(
+            (ratio - 1000.0).abs() < 50.0,
+            "Expected ratio ~1000, got {}",
+            ratio
+        );
     }
 
     #[test]
     fn metal_bias_add_cost_lower_than_add() {
         let bias_add_impl = MetalBiasAddImpl::new_fp16();
-        
+
         // BiasAdd has less memory traffic than Add
         // BiasAdd: 1 read (input) + 1 write (output) = 2× traffic (bias is small/cached)
         // Add: 2 reads + 1 write = 3× traffic
         let num_elements = 1_000_000;
         let bandwidth = 100.0; // GB/s
-        
+
         let cost = bias_add_impl.analytical_cost_us(num_elements, bandwidth);
-        
+
         // Expected: (1M*2 + 1M*2) bytes / 100 GB/s = 4 MB / 100 GB/s = 40 µs
         let expected = 40.0;
-        assert!((cost - expected).abs() < 1.0, "Expected ~{}µs, got {}µs", expected, cost);
+        assert!(
+            (cost - expected).abs() < 1.0,
+            "Expected ~{}µs, got {}µs",
+            expected,
+            cost
+        );
     }
 
     #[test]
     fn metal_bias_add_bf16_same_cost_as_fp16() {
         let impl_fp16 = MetalBiasAddImpl::new_fp16();
         let impl_bf16 = MetalBiasAddImpl::new_bf16();
-        
+
         let num_elements = 1_000_000;
         let bandwidth = 68.25;
-        
+
         let cost_fp16 = impl_fp16.analytical_cost_us(num_elements, bandwidth);
         let cost_bf16 = impl_bf16.analytical_cost_us(num_elements, bandwidth);
-        
+
         // Both are 2 bytes per element, so costs should be identical
         assert!((cost_fp16 - cost_bf16).abs() < 0.01);
     }

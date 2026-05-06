@@ -47,17 +47,23 @@ impl MetalFusedAddRmsNormImpl {
     /// Cost = (bytes_read + bytes_written) / bandwidth
     /// Reads: input + residual + weight
     /// Writes: output (+ optional residual_out)
-    fn analytical_cost_us(&self, m: u32, n: u32, bandwidth_gbps: f64, has_residual_out: bool) -> f64 {
+    fn analytical_cost_us(
+        &self,
+        m: u32,
+        n: u32,
+        bandwidth_gbps: f64,
+        has_residual_out: bool,
+    ) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let total_elements = (m as f64) * (n as f64);
-        
+
         // Reads: input [M,N] + residual [M,N] + weight [N]
         let bytes_read = total_elements * bytes_per_element * 2.0 + (n as f64) * bytes_per_element;
-        
+
         // Writes: output [M,N] + optional residual_out [M,N]
         let write_multiplier = if has_residual_out { 2.0 } else { 1.0 };
         let bytes_written = total_elements * bytes_per_element * write_multiplier;
-        
+
         let total_bytes = bytes_read + bytes_written;
         let total_gb = total_bytes / 1e9;
         let time_seconds = total_gb / bandwidth_gbps;
@@ -96,19 +102,22 @@ impl Implementation for MetalFusedAddRmsNormImpl {
         // Get the RMSNorm tile (second in claimed_tiles)
         let rmsnorm_tile = match_info.claimed_tiles[1];
         let node = ctx.fuf.get(rmsnorm_tile);
-        
+
         // Get shape: RMSNorm operates on [M, N]
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             if dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
-                
+
                 // Check if Add has multiple consumers (indicates residual_out needed)
                 let add_tile = match_info.claimed_tiles[0];
-                let has_residual_out = ctx.fuf.nodes.iter()
+                let has_residual_out = ctx
+                    .fuf
+                    .nodes
+                    .iter()
                     .filter(|node| {
                         node.inputs.iter().any(|input| {
                             if let crate::fuf::FufInput::Tile { id, slot: _ } = input {
@@ -118,19 +127,25 @@ impl Implementation for MetalFusedAddRmsNormImpl {
                             }
                         })
                     })
-                    .count() > 1;
-                
+                    .count()
+                    > 1;
+
                 // Try empirical cost first
                 let k = if has_residual_out { 1 } else { 0 };
                 if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, k) {
                     return cost;
                 }
-                
+
                 // Fall back to analytical model
-                return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps, has_residual_out);
+                return self.analytical_cost_us(
+                    m,
+                    n,
+                    ctx.profile.memory_bandwidth_gbps,
+                    has_residual_out,
+                );
             }
         }
-        
+
         // Fallback: conservative estimate
         150.0
     }
@@ -248,13 +263,13 @@ impl MetalFusedGateUpSiluMulImpl {
     fn analytical_cost_us(&self, m: u32, n: u32, bandwidth_gbps: f64) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let total_elements = (m as f64) * (n as f64);
-        
+
         // Reads: gate [M,N] + up [M,N]
         let bytes_read = total_elements * bytes_per_element * 2.0;
-        
+
         // Writes: output [M,N]
         let bytes_written = total_elements * bytes_per_element;
-        
+
         let total_bytes = bytes_read + bytes_written;
         let total_gb = total_bytes / 1e9;
         let time_seconds = total_gb / bandwidth_gbps;
@@ -305,26 +320,26 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         // Get the Mul tile (last in claimed_tiles)
         let mul_tile = *match_info.claimed_tiles.last().unwrap();
         let node = ctx.fuf.get(mul_tile);
-        
+
         // Get shape: Mul operates on [M, N]
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             if dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
-                
+
                 // Try empirical cost first
                 if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
                     return cost;
                 }
-                
+
                 // Fall back to analytical model
                 return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
             }
         }
-        
+
         // Fallback: conservative estimate
         120.0
     }
@@ -407,11 +422,11 @@ mod tests {
     #[test]
     fn metal_fused_add_rmsnorm_only_compatible_with_metal_targets() {
         let metal_impl = MetalFusedAddRmsNormImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -420,31 +435,38 @@ mod tests {
     #[test]
     fn metal_fused_add_rmsnorm_cost_accounts_for_residual_out() {
         let impl_fp16 = MetalFusedAddRmsNormImpl::new_fp16();
-        
+
         // Without residual_out
         let cost_no_res = impl_fp16.analytical_cost_us(1024, 4096, 68.25, false);
-        
+
         // With residual_out (extra write)
         let cost_with_res = impl_fp16.analytical_cost_us(1024, 4096, 68.25, true);
-        
+
         // Cost with residual_out should be higher
-        assert!(cost_with_res > cost_no_res, 
-            "Expected cost_with_res ({}) > cost_no_res ({})", 
-            cost_with_res, cost_no_res);
-        
+        assert!(
+            cost_with_res > cost_no_res,
+            "Expected cost_with_res ({}) > cost_no_res ({})",
+            cost_with_res,
+            cost_no_res
+        );
+
         // Should be roughly 1.33× (4 reads + 2 writes vs 4 reads + 1 write)
         let ratio = cost_with_res / cost_no_res;
-        assert!((ratio - 1.2).abs() < 0.2, "Expected ratio ~1.2-1.4, got {}", ratio);
+        assert!(
+            (ratio - 1.2).abs() < 0.2,
+            "Expected ratio ~1.2-1.4, got {}",
+            ratio
+        );
     }
 
     #[test]
     fn metal_fused_gate_up_silu_mul_only_compatible_with_metal_targets() {
         let metal_impl = MetalFusedGateUpSiluMulImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -453,13 +475,17 @@ mod tests {
     #[test]
     fn metal_fused_gate_up_silu_mul_analytical_cost() {
         let impl_fp16 = MetalFusedGateUpSiluMulImpl::new_fp16();
-        
+
         // Cost should scale with M*N (memory-bound)
         let cost_small = impl_fp16.analytical_cost_us(512, 2048, 68.25);
         let cost_large = impl_fp16.analytical_cost_us(1024, 4096, 68.25);
-        
+
         // Large should be ~8× more expensive (2× M, 2× N = 4× elements, 2× for gate+up)
         let ratio = cost_large / cost_small;
-        assert!((ratio - 8.0).abs() < 1.0, "Expected ratio ~8.0, got {}", ratio);
+        assert!(
+            (ratio - 8.0).abs() < 1.0,
+            "Expected ratio ~8.0, got {}",
+            ratio
+        );
     }
 }

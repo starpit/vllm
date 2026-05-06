@@ -292,15 +292,21 @@ Sub-thread interrupted Phase 5.G to fix an architectural problem the user surfac
 
 `#[cfg(feature = "cuda")]` comes off the impl blocks of `Linear`, `MarlinLinear`, `Bnb4bitLinear`, `GgmlLinear`, `Fp8Linear`, `Fp8BlockLinear`, `Fp8AnyLinear`, `Embedding`, `RmsNorm`, `LayerNorm` and is moved per-method only on the genuinely cuda-specific bits — `forward` (uses cuBLAS / kernel launches), `load_sharded` (uses `take_shard*`), `load_dense_concat*` (use `CUstream`-typed signatures), and the GGML-specific concat helpers. Platform-neutral methods (`new`, `load`, `out_features`, `in_features`, `vocab_size`, `hidden_size`, `dense_weight`, `dense_bias`, `shallow_clone`) become reachable under metal. `LinearLayer::out_features`/`in_features` carries per-arm cfg gates: `Self::Dense` reachable everywhere; quant variant arms cuda-only with a `_ => panic!(...)` fall-through under non-cuda. `try_synthesize_packed_slice` ungated (Phi-3 packed-source helper — pure metadata). New `metal = ["ferrite-cuda-core/metal"]` feature on `ferrite-kernels`, propagated into `ferrite-forward/metal`.
 
-**Stage D (in progress) — Unify macro `Weights` emission, kill `MetalModelMeta`.**
+**Stage D — Unify macro `Weights` emission, kill `MetalModelMeta`. ✅ COMPLETE (2026-05-06)**
 
-Replace the macro's parallel metal-only `Weights;` ZST + panic-stub accessors + `MetalModelMeta`-based pool constructor with the same `Weights` struct cuda emits — real loader, real `try_load(&mut GpuWeights)`, layer structs holding `GpuTensor`s. The worker resolves a `Binding::Weight { kind, layer, which }` by calling the WtFn thunk on the loaded `&Weights` (same code CUDA's interpreter uses), pulling out the GpuTensor, and calling `MetalAllocator::buffer_for(tensor.raw_ptr())` for the `(&MTLBuffer, offset)`. `KernelExtras` (per-layer eps etc.) comes from the same WtFn lookup (read `RmsNorm.eps` directly off the layer struct) instead of a separate `MetalModelMeta::kernel_extras_for` method. `MetalModelMeta` trait + `BufferRef` + `model_meta.rs` deleted. `metal_pool` constructor takes `Arc<Weights>` + `Arc<MetalAllocator>` instead of `Arc<dyn MetalModelMeta<Weights>>`.
+The user surfaced that `MetalModelMeta` was unnecessary architectural drift — the trait abstracted two things that didn't need abstracting:
+
+1. **Per-kernel scalars (eps, paging strides, etc.)**: every field on the old `KernelExtras` struct was a model-config literal that the macro reads at compile time. Promoted to `CanonicalParams` constants (`RMS_NORM_EPS`, `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`); `pipelines::constants_for::<W>` reads them directly from `W::*`. `KernelExtras` struct deleted, `extras` parameter dropped from `pipeline_for`. (D.2, commit `e492b17b1`.)
+
+2. **Weight buffer lookup**: the worker now calls the `WtFn` thunk inside the `WeightBundleKind` directly against the loaded `&Weights`, pulls out the requested `GpuTensor` (`.weight` / `.dense_weight()` / `.dense_bias()` / `(cosfn)(..)`), and asks `MetalAllocator::buffer_for(tensor.raw_ptr())` which arena buffer + offset to bind. Same WtFn-based lookup CUDA's interpreter uses; the metal-side delta is just the final pointer → `(&Buffer, offset)` reverse lookup against the allocator's arena registry. `MetalModelMeta` trait + `BufferRef` + `model_meta.rs` deleted. `metal_pool` macro emission takes `Arc<Weights>` + `Arc<MetalAllocator>` instead of `Arc<dyn MetalModelMeta<Weights>>`. New `WorkerError::WeightLookupFailed` for the bias-absent / pointer-not-in-arena cases. (D.3, commit `da9f5ec7f`.)
 
 D.1 (commit `e022c93b0`): pre-cleanup — ungated `LinearLayer::dense_weight`/`dense_bias`/`shallow_clone` (purely platform-neutral pattern-matchers; quant variants panic, but the panic itself is platform-neutral). Worker's WtFn-based resolver needs these reachable under metal.
 
-D.2-D.6 remaining: worker-side WtFn-based weight resolver, KernelExtras-via-WtFn helper, replace `MetalModelMeta` references in worker.rs / pool.rs, update macro emission, delete `model_meta.rs`.
+Test fixtures rebuilt: `TestWeights` carries real layer instances; `build_test_weights(&device)` allocates dummy `MTLBuffer`-backed `GpuTensor`s through a real `MetalAllocator`. Stub `_stub` thunks that previously panicked with `unreachable!("test meta resolves by discriminant")` are replaced by real thunks that index `&w.rmsnorm_layer` / `&w.linear_layer` etc. — the new resolver actually invokes them. 49/49 ferrite-forward Metal lib tests pass.
 
-**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** Unblocked once Stage D lands (the macro will emit a real `Weights::try_load` + a `metal_pool` ctor that takes the real loader struct + the metal allocator's buffer registry).
+Loose end (next chunk, not part of Stage D): the macro under metal still emits a `Weights;` ZST + panic-stub accessor methods (5.F.5 emission). The new `metal_pool` resolves symbols correctly but actually calling it would WtFn into the panic stubs at bake time. The macro needs to emit the same real `Weights` struct cuda emits (real loader, real `try_load(&mut GpuWeights)`) so the panics go away and 5.G.5 (TinyLlama-1.1B end-to-end) becomes runnable.
+
+**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** Unblocked once the macro emits the cuda-shape `Weights` under metal too.
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
 Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
@@ -345,6 +351,8 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Backend-unification Stage B Complete:** 2026-05-06 ✅ (`MetalAllocator` impl + `GpuWeights` compiles under metal; commit `4573f13e2`)
 - **Backend-unification Stage C Complete:** 2026-05-06 ✅ (Layer impl gates moved per-method; load methods reachable under metal; commit `dbb8bb6db`)
 - **Backend-unification Stage D.1 Complete:** 2026-05-06 ✅ (LinearLayer accessors ungated; commit `e022c93b0`)
+- **Backend-unification Stage D.2 Complete:** 2026-05-06 ✅ (KernelExtras killed; CanonicalParams gains RMS_NORM_EPS / BLOCK_SIZE / MAX_BLOCKS_PER_SEQ / PREFILL_TILE_Q / ROT_DIM; commit `e492b17b1`)
+- **Backend-unification Stage D Complete:** 2026-05-06 ✅ (MetalModelMeta + BufferRef + model_meta.rs deleted; worker resolves Binding::Weight via WtFn + MetalAllocator::buffer_for; metal_pool ctor signature updated; commit `da9f5ec7f`)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

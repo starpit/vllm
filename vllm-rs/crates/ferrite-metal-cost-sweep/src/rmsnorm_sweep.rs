@@ -20,7 +20,9 @@ pub fn run(launch_overhead_us: f64) {
     let hidden_sizes = vec![2048, 3072, 4096, 5120, 6144, 7168, 8192];
 
     // Sequence lengths: powers of 2 from 1 to 8192
-    let seq_lens = vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+    let seq_lens = vec![
+        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
+    ];
 
     // Sweep F16 variant
     for &hidden_size in &hidden_sizes {
@@ -111,13 +113,9 @@ fn benchmark_rmsnorm_f16(seq_len: usize, hidden_size: usize, launch_overhead_us:
         encoder.set_buffer(0, Some(&input_buf), 0);
         encoder.set_buffer(1, Some(&weight_buf), 0);
         encoder.set_buffer(2, Some(&output_buf), 0);
-        
+
         let threadgroup_size = MTLSize::new(256, 1, 1);
-        let grid_size = MTLSize::new(
-            (((seq_len + 255) / 256) * 256) as u64,
-            1,
-            1,
-        );
+        let grid_size = MTLSize::new((((seq_len + 255) / 256) * 256) as u64, 1, 1);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
         cmd_buffer.commit();
@@ -134,13 +132,9 @@ fn benchmark_rmsnorm_f16(seq_len: usize, hidden_size: usize, launch_overhead_us:
         encoder.set_buffer(0, Some(&input_buf), 0);
         encoder.set_buffer(1, Some(&weight_buf), 0);
         encoder.set_buffer(2, Some(&output_buf), 0);
-        
+
         let threadgroup_size = MTLSize::new(256, 1, 1);
-        let grid_size = MTLSize::new(
-            (((seq_len + 255) / 256) * 256) as u64,
-            1,
-            1,
-        );
+        let grid_size = MTLSize::new((((seq_len + 255) / 256) * 256) as u64, 1, 1);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         encoder.end_encoding();
         cmd_buffer.commit();

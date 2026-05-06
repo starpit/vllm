@@ -151,7 +151,11 @@ impl MetalAllocator {
     /// the arena index and the offset within that arena where
     /// `bytes` will be placed (post-bump, the destination).
     fn reserve(&mut self, bytes: usize) -> Result<(usize, usize)> {
-        if let Some(idx) = self.arenas.iter().rposition(|a| a.capacity - a.used >= bytes) {
+        if let Some(idx) = self
+            .arenas
+            .iter()
+            .rposition(|a| a.capacity - a.used >= bytes)
+        {
             let offset = self.arenas[idx].used;
             return Ok((idx, offset));
         }
@@ -161,11 +165,7 @@ impl MetalAllocator {
 }
 
 impl DeviceAllocator for MetalAllocator {
-    unsafe fn alloc_and_copy_host(
-        &mut self,
-        src_host: *const u8,
-        bytes: usize,
-    ) -> Result<*mut u8> {
+    unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
         // Zero-byte tensors are legal (e.g. an unused bias slot);
         // pick any non-null sentinel so the GpuTensor isn't `is_null()`.
         if bytes == 0 {
@@ -277,11 +277,7 @@ mod tests {
         // Request bigger than chunk_bytes — should push an arena
         // sized to the request.
         let big = vec![0x42u8; 16 * 1024];
-        let p = unsafe {
-            alloc
-                .alloc_and_copy_host(big.as_ptr(), big.len())
-                .unwrap()
-        };
+        let p = unsafe { alloc.alloc_and_copy_host(big.as_ptr(), big.len()).unwrap() };
         let (buf, off) = alloc.buffer_for(p).unwrap();
         assert_eq!(off, 0);
         assert!(buf.length() as usize >= big.len());

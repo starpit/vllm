@@ -41,12 +41,12 @@ impl MetalEmbedImpl {
     fn analytical_cost_us(&self, num_tokens: u32, hidden_size: u32, bandwidth_gbps: f64) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let output_elements = (num_tokens * hidden_size) as f64;
-        
+
         // Read from embedding table + write output
         let bytes_read = output_elements * bytes_per_element;
         let bytes_written = output_elements * bytes_per_element;
         let total_bytes = bytes_read + bytes_written;
-        
+
         let total_gb = total_bytes / 1e9;
         let time_seconds = total_gb / bandwidth_gbps;
         time_seconds * 1e6 // convert to microseconds
@@ -87,32 +87,39 @@ impl Implementation for MetalEmbedImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Output shape: [num_tokens, hidden_size]
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             if dims.len() == 2 {
                 let num_tokens = dims[0] as u32;
                 let hidden_size = dims[1] as u32;
-                
+
                 // Try empirical cost first
                 let kernel_name = match self.dtype {
                     "fp16" => "embed_f16",
                     "bf16" => "embed_bf16",
                     _ => "embed_f16",
                 };
-                
-                if let Some(cost) = ctx.profile.cost_us_for(kernel_name, num_tokens, hidden_size, 0) {
+
+                if let Some(cost) = ctx
+                    .profile
+                    .cost_us_for(kernel_name, num_tokens, hidden_size, 0)
+                {
                     return cost;
                 }
-                
+
                 // Fall back to analytical model
-                return self.analytical_cost_us(num_tokens, hidden_size, ctx.profile.memory_bandwidth_gbps);
+                return self.analytical_cost_us(
+                    num_tokens,
+                    hidden_size,
+                    ctx.profile.memory_bandwidth_gbps,
+                );
             }
         }
-        
+
         // Fallback: conservative estimate
         10.0
     }

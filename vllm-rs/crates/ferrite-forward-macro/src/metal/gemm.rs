@@ -87,34 +87,34 @@ impl Implementation for MetalGemmImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: GEMM output is [M, N], weight is [K, N] or [N, K]
         let output_shape = &node.outputs[0];
         let output_dims = ctx.eval_shape(output_shape);
-        
+
         if let Some(output_dims) = output_dims {
             if output_dims.len() >= 2 {
                 let m = output_dims[0] as u32;
                 let n = output_dims[1] as u32;
-                
+
                 // Get K from weight shape
                 // Weight input is typically the second input (after activation)
                 if node.inputs.len() >= 2 {
                     // For GEMM, the weight input provides K dimension
                     // We'll use a conservative estimate if we can't determine K
                     let k = 2048u32; // Conservative default for typical transformer dimensions
-                    
+
                     // Try empirical cost first
                     if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, k) {
                         return cost;
                     }
-                    
+
                     // Fall back to analytical model
                     return self.analytical_cost_us(m, n, k, ctx.profile.peak_tflops_fp16);
                 }
             }
         }
-        
+
         // Fallback: conservative estimate (assume medium-sized GEMM)
         500.0
     }
@@ -182,11 +182,11 @@ mod tests {
     #[test]
     fn metal_gemm_only_compatible_with_metal_targets() {
         let metal_impl = MetalGemmImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -195,15 +195,19 @@ mod tests {
     #[test]
     fn metal_gemm_analytical_cost_scales_with_compute() {
         let impl_fp16 = MetalGemmImpl::new_fp16();
-        
+
         // M1 Max: 10.4 TFLOPS FP16
         let cost_m1 = impl_fp16.analytical_cost_us(1024, 4096, 2048, 10.4);
-        
+
         // M2 Max: 13.6 TFLOPS FP16 (1.31× faster)
         let cost_m2 = impl_fp16.analytical_cost_us(1024, 4096, 2048, 13.6);
-        
+
         // Cost should be inversely proportional to compute
         let ratio = cost_m1 / cost_m2;
-        assert!((ratio - 1.31).abs() < 0.01, "Expected ratio ~1.31, got {}", ratio);
+        assert!(
+            (ratio - 1.31).abs() < 0.01,
+            "Expected ratio ~1.31, got {}",
+            ratio
+        );
     }
 }

@@ -40,7 +40,7 @@
 
 use std::sync::Arc;
 
-use ferrite_metal_kernels::gemm::{encode_gemm_into_command_buffer, GemmError};
+use ferrite_metal_kernels::gemm::{GemmError, encode_gemm_into_command_buffer};
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
 use ferrite_metal_kernels::metal::foreign_types::ForeignType;
 use ferrite_metal_kernels::metal::{
@@ -48,7 +48,9 @@ use ferrite_metal_kernels::metal::{
     MTLResourceOptions, MTLResourceUsage, MTLSize, ResourceRef,
 };
 
-use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind, WeightTensor};
+use super::lowered::{
+    Binding, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind, WeightTensor,
+};
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::CanonicalParams;
@@ -135,10 +137,7 @@ pub enum WorkerError {
     /// `arena_layout.len()` did not match the lowered tape's
     /// `num_arena_slots`. Indicates a mismatched lowering and arena
     /// computation upstream — the macro should keep these in sync.
-    ArenaShapeMismatch {
-        expected: u32,
-        actual: usize,
-    },
+    ArenaShapeMismatch { expected: u32, actual: usize },
     /// A `Binding::ArenaSlot { slot, .. }` referenced a slot id
     /// outside `[0, arena_layout.len())`.
     ArenaSlotOutOfRange {
@@ -169,9 +168,7 @@ pub enum WorkerError {
     /// failed. Either the layer struct didn't carry the requested
     /// tensor (e.g. bias absent on a no-bias linear) or the tensor's
     /// raw pointer didn't fall inside any of the allocator's arenas.
-    WeightLookupFailed {
-        reason: &'static str,
-    },
+    WeightLookupFailed { reason: &'static str },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -239,6 +236,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// `bucket_tapes` is the per-bucket lowered tape set, in the
     /// caller's bucket order. The worker bakes one ICB + execution
     /// plan per tape.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: Arc<Device>,
         arena_layout: &ArenaLayout,
@@ -251,13 +249,13 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // Arena slot count comes from the lowered tape (post-FUF
         // coloring). Every bucket of a given model shares the same
         // colored slot map, so checking the first bucket is enough.
-        if let Some(first) = bucket_tapes.first() {
-            if first.num_arena_slots as usize != arena_layout.len() {
-                return Err(WorkerError::ArenaShapeMismatch {
-                    expected: first.num_arena_slots,
-                    actual: arena_layout.len(),
-                });
-            }
+        if let Some(first) = bucket_tapes.first()
+            && first.num_arena_slots as usize != arena_layout.len()
+        {
+            return Err(WorkerError::ArenaShapeMismatch {
+                expected: first.num_arena_slots,
+                actual: arena_layout.len(),
+            });
         }
 
         let arena: Vec<Buffer> = arena_layout
@@ -369,19 +367,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         enc.end_encoding();
                     }
                     encode_gemm_into_command_buffer(
-                        device,
-                        cmdbuf,
-                        &a.buffer,
-                        &b.buffer,
-                        &c.buffer,
-                        *m,
-                        *n,
-                        *k,
-                        1.0,
-                        0.0,
-                        false,
-                        true,
-                        true,
+                        device, cmdbuf, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0,
+                        false, true, true,
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }
@@ -395,6 +382,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
 }
 
 /// Bake one bucket's ICB + execution plan.
+#[allow(clippy::too_many_arguments)]
 fn bake_bucket<W: CanonicalParams>(
     bucket_index: usize,
     tape: &LoweredMetalTape<W>,
@@ -435,12 +423,10 @@ fn bake_bucket<W: CanonicalParams>(
 
     for (cmd_idx, cmd) in tape.commands.iter().enumerate() {
         if matches!(cmd.kernel, KernelId::Gemm) {
-            let dims = cmd
-                .gemm_dims
-                .ok_or(WorkerError::MissingGemmDims {
-                    bucket_index,
-                    command_index: cmd_idx,
-                })?;
+            let dims = cmd.gemm_dims.ok_or(WorkerError::MissingGemmDims {
+                bucket_index,
+                command_index: cmd_idx,
+            })?;
             let (a, b, c) = resolve_gemm_buffers(
                 bucket_index,
                 cmd_idx,
@@ -468,8 +454,15 @@ fn bake_bucket<W: CanonicalParams>(
             .pipeline_for::<W>(cmd.kernel, tape.bucket_m)
             .map_err(WorkerError::PipelineLookup)?;
 
-        let bound =
-            resolve_bindings(bucket_index, cmd_idx, cmd, arena, weights, allocator, runtime)?;
+        let bound = resolve_bindings(
+            bucket_index,
+            cmd_idx,
+            cmd,
+            arena,
+            weights,
+            allocator,
+            runtime,
+        )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|&(b, off, idx)| (b, off, idx)).collect();
         for &(b, _, _) in &bound_refs {
@@ -485,9 +478,10 @@ fn bake_bucket<W: CanonicalParams>(
         // from the cache).
         let recorded_at = cmd_idx;
         match steps.last_mut() {
-            Some(BucketStep::Icb { pipeline: prev, range })
-                if same_pipeline(prev, &pipeline) =>
-            {
+            Some(BucketStep::Icb {
+                pipeline: prev,
+                range,
+            }) if same_pipeline(prev, &pipeline) => {
                 range.end = recorded_at + 1;
             }
             _ => {
@@ -586,11 +580,9 @@ fn resolve_weight<'a, W: CanonicalParams>(
             let l = (wtfn)(weights, layer);
             match which {
                 WeightTensor::Weight => l.dense_weight(),
-                WeightTensor::Bias => l
-                    .dense_bias()
-                    .ok_or(WorkerError::WeightLookupFailed {
-                        reason: "LinearLayer bias requested but not present",
-                    })?,
+                WeightTensor::Bias => l.dense_bias().ok_or(WorkerError::WeightLookupFailed {
+                    reason: "LinearLayer bias requested but not present",
+                })?,
             }
         }
         WeightBundleKind::CosSin(cosfn) => (cosfn)(weights, layer),
@@ -616,7 +608,10 @@ fn resolve_bindings<'a, W: CanonicalParams>(
     let mut out: Vec<(&'a Buffer, u64, u64)> = Vec::with_capacity(cmd.bindings.len());
     for binding in &cmd.bindings {
         let (buf, off, idx) = match binding {
-            Binding::ArenaSlot { slot, binding_index } => {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
                 let s = *slot as usize;
                 if s >= arena.len() {
                     return Err(WorkerError::ArenaSlotOutOfRange {
@@ -671,10 +666,10 @@ fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::CanonicalParams;
     use crate::interpreter::metal::lowered::{
         Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, WeightBundleKind, WeightTensor,
     };
-    use crate::CanonicalParams;
     use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
     use ferrite_kernels::layers::{Embedding, Linear, LinearLayer, RmsNorm};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
@@ -965,7 +960,11 @@ mod tests {
         // boundary forces a new segment. So: 2 ICB steps per bucket,
         // no GEMM steps.
         for baking in &worker.bucket_bakings {
-            assert_eq!(baking.steps.len(), 2, "expected RmsNorm + FusedAddRmsNorm coalesced");
+            assert_eq!(
+                baking.steps.len(),
+                2,
+                "expected RmsNorm + FusedAddRmsNorm coalesced"
+            );
             assert_eq!(icb_range(&baking.steps[0]), 0..2);
             assert_eq!(icb_range(&baking.steps[1]), 2..4);
         }
@@ -992,7 +991,13 @@ mod tests {
         // Layout has only 1 slot — should error.
         let bad_layout: ArenaLayout = vec![4 * 1024];
         let err = MetalWorker::<TestWeights>::new(
-            device, &bad_layout, &tapes, &pipelines, &weights, &allocator, &runtime,
+            device,
+            &bad_layout,
+            &tapes,
+            &pipelines,
+            &weights,
+            &allocator,
+            &runtime,
         )
         .err()
         .expect("expected arena shape mismatch error");
@@ -1114,11 +1119,7 @@ mod tests {
                     binding_index: 2,
                 },
             ],
-            gemm_dims: Some(crate::interpreter::metal::lowered::GemmDims {
-                m: bucket_m,
-                n,
-                k,
-            }),
+            gemm_dims: Some(crate::interpreter::metal::lowered::GemmDims { m: bucket_m, n, k }),
         }
     }
 
@@ -1250,11 +1251,7 @@ mod tests {
         let tape = LoweredMetalTape {
             bucket_m: 1,
             num_arena_slots: 2,
-            commands: vec![
-                rmsnorm_pre,
-                build_gemm_command(1, 2048, 2048),
-                rmsnorm_post,
-            ],
+            commands: vec![rmsnorm_pre, build_gemm_command(1, 2048, 2048), rmsnorm_post],
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -1275,7 +1272,15 @@ mod tests {
             "Icb (rmsnorm_pre) | Gemm | Icb (rmsnorm_post)"
         );
         assert!(matches!(&baking.steps[0], BucketStep::Icb { range, .. } if *range == (0..1)));
-        assert!(matches!(&baking.steps[1], BucketStep::Gemm { m: 1, n: 2048, k: 2048, .. }));
+        assert!(matches!(
+            &baking.steps[1],
+            BucketStep::Gemm {
+                m: 1,
+                n: 2048,
+                k: 2048,
+                ..
+            }
+        ));
         // Post-GEMM RmsNorm is at command index 2, not coalesced with
         // the pre-GEMM RmsNorm despite the identical pipeline.
         assert!(matches!(&baking.steps[2], BucketStep::Icb { range, .. } if *range == (2..3)));

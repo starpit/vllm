@@ -50,7 +50,10 @@ mod metal_emission_tests {
         let buckets: &[::ferrite_forward::interpreter::metal::MetalBucketSpec<
             crate::tinyllama_1_1b::Weights,
         >] = crate::tinyllama_1_1b::METAL_BUCKETS;
-        assert!(!buckets.is_empty(), "TinyLlama-1.1B emits at least one bucket");
+        assert!(
+            !buckets.is_empty(),
+            "TinyLlama-1.1B emits at least one bucket"
+        );
         // metal_pool resolves as an `fn(...) -> Result<MetalWorkerPool, PoolBuildError>`.
         // We don't call it (no Device available in unit-test ctx); just
         // taking the fn-pointer proves the symbol + signature compiled.

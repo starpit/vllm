@@ -16,8 +16,7 @@
 //! reach the un-specialized cache; the new worker uses this one).
 
 use metal::{
-    ComputePipelineState, Device, FunctionConstantValues, Library, MTLDataType,
-    NSUInteger,
+    ComputePipelineState, Device, FunctionConstantValues, Library, MTLDataType, NSUInteger,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -114,20 +113,15 @@ impl SpecializedPipelineCache {
     /// argument list is `(library_name, source)`; library names are
     /// the same `&'static str` callers pass in `PipelineKey` so the
     /// hashmap lookup is identity-cheap.
-    pub fn new(
-        device: Device,
-        sources: &[(&'static str, &str)],
-    ) -> Result<Self, MetalStreamError> {
+    pub fn new(device: Device, sources: &[(&'static str, &str)]) -> Result<Self, MetalStreamError> {
         let mut libraries = HashMap::with_capacity(sources.len());
         for (name, source) in sources {
             let opts = metal::CompileOptions::new();
-            let lib = device
-                .new_library_with_source(source, &opts)
-                .map_err(|e| {
-                    MetalStreamError::ShaderCompilationFailed(format!(
-                        "compile library `{name}`: {e:?}"
-                    ))
-                })?;
+            let lib = device.new_library_with_source(source, &opts).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "compile library `{name}`: {e:?}"
+                ))
+            })?;
             libraries.insert(*name, lib);
         }
         Ok(Self {
@@ -293,16 +287,8 @@ kernel void probe_const(
             .expect("compile probe library");
 
         // Two distinct constant bags → two distinct pipelines.
-        let k1 = PipelineKey::new(
-            "probe",
-            "probe_const",
-            vec![ConstantValue::uint(0, 32)],
-        );
-        let k2 = PipelineKey::new(
-            "probe",
-            "probe_const",
-            vec![ConstantValue::uint(0, 64)],
-        );
+        let k1 = PipelineKey::new("probe", "probe_const", vec![ConstantValue::uint(0, 32)]);
+        let k2 = PipelineKey::new("probe", "probe_const", vec![ConstantValue::uint(0, 64)]);
 
         let p1 = cache.get_or_build(&k1).unwrap();
         let p2 = cache.get_or_build(&k2).unwrap();

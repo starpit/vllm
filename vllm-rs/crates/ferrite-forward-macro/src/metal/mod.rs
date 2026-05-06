@@ -6,35 +6,35 @@
 //! This module provides a modular structure for Metal `Implementation` trait adapters,
 //! replacing the monolithic `metal_bridge.rs` with separate files per kernel category.
 
-pub mod attention;
 pub mod activation;
-pub mod awq;
-pub mod rmsnorm;
-pub mod gemm;
-pub mod fused_kernels;
-pub mod reshape;
 pub mod add;
-pub mod scalar_mul;
-pub mod embed;
-pub mod rope;
-pub mod mul;
+pub mod attention;
+pub mod awq;
 pub mod bias_add;
+pub mod embed;
+pub mod fused_kernels;
+pub mod gemm;
+pub mod mul;
+pub mod reshape;
+pub mod rmsnorm;
+pub mod rope;
+pub mod scalar_mul;
 pub mod softcap;
 pub mod sub;
 
 // Re-export the main implementation types
-pub use attention::MetalAttentionImpl;
 pub use activation::MetalActivationImpl;
-pub use awq::MetalAwqImpl;
-pub use rmsnorm::MetalRmsNormImpl;
-pub use gemm::MetalGemmImpl;
-pub use fused_kernels::{MetalFusedAddRmsNormImpl, MetalFusedGateUpSiluMulImpl};
-pub use reshape::MetalReshapeImpl;
 pub use add::MetalAddImpl;
-pub use scalar_mul::MetalScalarMulImpl;
-pub use embed::MetalEmbedImpl;
-pub use rope::{MetalRopeAppendImpl, MetalRopeAppendInterleavedImpl};
-pub use mul::MetalMulImpl;
+pub use attention::MetalAttentionImpl;
+pub use awq::MetalAwqImpl;
 pub use bias_add::MetalBiasAddImpl;
+pub use embed::MetalEmbedImpl;
+pub use fused_kernels::{MetalFusedAddRmsNormImpl, MetalFusedGateUpSiluMulImpl};
+pub use gemm::MetalGemmImpl;
+pub use mul::MetalMulImpl;
+pub use reshape::MetalReshapeImpl;
+pub use rmsnorm::MetalRmsNormImpl;
+pub use rope::{MetalRopeAppendImpl, MetalRopeAppendInterleavedImpl};
+pub use scalar_mul::MetalScalarMulImpl;
 pub use softcap::MetalTanhSoftCapImpl;
 pub use sub::MetalSubImpl;

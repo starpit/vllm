@@ -194,7 +194,13 @@ fn parse_metal_cost_table(
     let mut table = CostTable::new();
     for (kernel_name, entries) in metal_table {
         for entry in entries {
-            table.insert(kernel_name.clone(), entry.m, entry.n, entry.k, entry.cost_us);
+            table.insert(
+                kernel_name.clone(),
+                entry.m,
+                entry.n,
+                entry.k,
+                entry.cost_us,
+            );
         }
     }
     table
@@ -318,7 +324,7 @@ mod tests {
         assert_eq!(metal.name, "m1_8core");
         assert_eq!(metal.peak_tflops_fp16, 2.6);
         assert_eq!(metal.memory_bandwidth_gbps, 68.25);
-        
+
         if let BackendSpec::Metal(spec) = &metal.backend_spec {
             assert_eq!(spec.generation, "M1");
             assert_eq!(spec.gpu_cores, 8);

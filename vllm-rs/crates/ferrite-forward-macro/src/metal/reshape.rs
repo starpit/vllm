@@ -12,7 +12,7 @@ use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, ReshapeRefImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    ReshapeRefImpl, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
     default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
@@ -142,11 +142,11 @@ mod tests {
     #[test]
     fn metal_reshape_only_compatible_with_metal_targets() {
         let metal_impl = MetalReshapeImpl::new();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -155,13 +155,13 @@ mod tests {
     #[test]
     fn metal_reshape_has_fixed_negligible_cost() {
         let metal_impl = MetalReshapeImpl::new();
-        
+
         // Reshape is metadata-only (no data movement), so cost is fixed
         let cost = metal_impl.analytical_cost_us();
-        
+
         // Verify cost is negligible (< 1µs)
         assert!(cost < 1.0, "Reshape cost should be < 1µs, got {}µs", cost);
-        
+
         // Verify it's the expected fixed value
         assert_eq!(cost, 0.1, "Reshape should have fixed 0.1µs cost");
     }

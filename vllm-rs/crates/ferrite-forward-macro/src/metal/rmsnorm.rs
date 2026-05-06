@@ -93,26 +93,26 @@ impl Implementation for MetalRmsNormImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: RMSNorm operates on [M, N] where M=num_tokens, N=hidden_size
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             if dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
-                
+
                 // Try empirical cost first
                 if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
                     return cost;
                 }
-                
+
                 // Fall back to analytical model
                 return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
             }
         }
-        
+
         // Fallback: conservative estimate
         100.0
     }
@@ -181,11 +181,11 @@ mod tests {
     #[test]
     fn metal_rmsnorm_only_compatible_with_metal_targets() {
         let metal_impl = MetalRmsNormImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -194,15 +194,19 @@ mod tests {
     #[test]
     fn metal_rmsnorm_analytical_cost_scales_with_bandwidth() {
         let impl_fp16 = MetalRmsNormImpl::new_fp16();
-        
+
         // M1: 68.25 GB/s
         let cost_m1 = impl_fp16.analytical_cost_us(1024, 4096, 68.25);
-        
+
         // M2: 100 GB/s (1.46× faster)
         let cost_m2 = impl_fp16.analytical_cost_us(1024, 4096, 100.0);
-        
+
         // Cost should be inversely proportional to bandwidth
         let ratio = cost_m1 / cost_m2;
-        assert!((ratio - 1.46).abs() < 0.01, "Expected ratio ~1.46, got {}", ratio);
+        assert!(
+            (ratio - 1.46).abs() < 0.01,
+            "Expected ratio ~1.46, got {}",
+            ratio
+        );
     }
 }

@@ -41,9 +41,9 @@ mod fuf;
 mod impl_lib;
 mod interpreter_codegen;
 #[cfg(feature = "metal")]
-mod metal_bridge;
-#[cfg(feature = "metal")]
 mod metal;
+#[cfg(feature = "metal")]
+mod metal_bridge;
 mod parse;
 mod quantization;
 mod schedule;
@@ -542,18 +542,19 @@ fn compile_common(
             .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
         target::from_profile_def(target_def)
     };
-    
+
     #[cfg(feature = "metal")]
     let target_profile = {
         use ferrite_metal_kernels::device::detect_device;
-        let metal_device = detect_device()
-            .ok_or_else(|| syn::Error::new(
+        let metal_device = detect_device().ok_or_else(|| {
+            syn::Error::new(
                 carrier.sig.ident.span(),
                 "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
-            ))?;
+            )
+        })?;
         target::from_metal_profile(&metal_device.profile)
     };
-    
+
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     compile_error!("ferrite-forward-macro requires either 'cuda' or 'metal' feature");
 
@@ -1012,8 +1013,7 @@ fn compile_common(
                         || name.starts_with("fa2_")
                         || name == "encoder_attention"
                         || (cfg!(feature = "metal") && name.starts_with("metal_attention_"))
-                        || (cfg!(feature = "metal")
-                            && name.starts_with("metal_sliding_attention_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_sliding_attention_"))
                     {
                         Some(0) // fa2
                     } else if cfg!(feature = "cuda") && name.starts_with("marlin") {

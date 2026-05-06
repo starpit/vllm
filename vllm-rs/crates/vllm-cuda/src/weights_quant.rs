@@ -2910,9 +2910,11 @@ mod tests {
 
         // Load weights (no GPU needed — merge is CPU-only).
         // LoRA merge is CPU-only; null stream is fine.
-        let mut gw =
-            GpuWeights::from_single_file(dir.path().join("model.safetensors"), std::ptr::null_mut())
-                .unwrap();
+        let mut gw = GpuWeights::from_single_file(
+            dir.path().join("model.safetensors"),
+            std::ptr::null_mut(),
+        )
+        .unwrap();
 
         // Strip "model." prefix to match what CudaWorker does.
         // Actually, merge_lora looks for "{prefix}.weight" keys, so let's check
@@ -3010,9 +3012,11 @@ mod tests {
         .unwrap();
 
         // LoRA merge is CPU-only; null stream is fine.
-        let mut gw =
-            GpuWeights::from_single_file(dir.path().join("model.safetensors"), std::ptr::null_mut())
-                .unwrap();
+        let mut gw = GpuWeights::from_single_file(
+            dir.path().join("model.safetensors"),
+            std::ptr::null_mut(),
+        )
+        .unwrap();
 
         let merged = gw.merge_lora(adapter_dir.path()).unwrap();
         assert_eq!(merged, 1);

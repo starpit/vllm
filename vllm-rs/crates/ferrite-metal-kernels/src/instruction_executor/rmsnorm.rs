@@ -3,9 +3,9 @@
 
 //! RMSNorm instruction recording for Metal ICB.
 
-use super::{RecordingContext, dispatch_1d};
+use super::{dispatch_1d, RecordingContext};
 use crate::shader_cache::ShaderCache;
-use metal::{MTLSize, MTLResourceOptions};
+use metal::{MTLResourceOptions, MTLSize};
 use std::sync::Arc;
 
 /// Record an RMSNorm kernel dispatch into the ICB.
@@ -40,7 +40,7 @@ pub fn record_rmsnorm(
         "bf16" => "rmsnorm_bf16",
         _ => return Err(format!("Unsupported dtype: {}", dtype)),
     };
-    
+
     let pipeline = shader_cache
         .get_pipeline(kernel_name)
         .map_err(|e| format!("Failed to compile RMSNorm shader: {:?}", e))?;
@@ -100,13 +100,9 @@ mod tests {
 
         // Record RMSNorm dispatch
         let result = record_rmsnorm(
-            &mut ctx,
-            &input,
-            &output,
-            &weight,
-            1024,  // num_tokens
-            4096,  // hidden_size
-            1e-6,  // eps
+            &mut ctx, &input, &output, &weight, 1024, // num_tokens
+            4096, // hidden_size
+            1e-6, // eps
             "fp16",
         );
 

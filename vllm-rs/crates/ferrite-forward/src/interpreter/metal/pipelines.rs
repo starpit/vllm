@@ -2,23 +2,24 @@
 //! Glue between the Metal interpreter's [`KernelId`] taxonomy and
 //! `ferrite-metal-kernels`'s [`SpecializedPipelineCache`].
 //!
-//! Phase 5.B's deliverable: turn `(KernelId, bucket M, CanonicalParams,
-//! per-kernel extras)` into a `MTLComputePipelineState` whose
-//! `[[function_constant(N)]]` slots are pre-baked. The `MetalWorker`
-//! (Phase 5.C) consults this layer once per `(model variant, bucket,
-//! kernel)` at init time; recording into the ICB happens against the
-//! resulting pipeline.
+//! Turns `(KernelId, bucket M, W: CanonicalParams)` into a
+//! `MTLComputePipelineState` whose `[[function_constant(N)]]` slots
+//! are pre-baked. The `MetalWorker` consults this layer once per
+//! `(model variant, bucket, kernel)` at init time; recording into the
+//! ICB happens against the resulting pipeline. Every per-layer scalar
+//! (eps, attn_scale, paging strides) is a `CanonicalParams` constant
+//! the macro emitted from the model JSON — no runtime extras struct.
 //!
 //! # Function-constant index assignments
 //!
 //! These are the contract between the MSL shader files and this glue
-//! layer. The Phase 5.B.3 / 5.B.4 shader rewrites declare each
-//! `[[function_constant(N)]]` at the index spelled here.
+//! layer. The shader rewrites declare each `[[function_constant(N)]]`
+//! at the index spelled here.
 //!
 //! ## RmsNorm / FusedAddRmsNorm
-//! - `0`: `M` (uint)              — bucket token count
+//! - `0`: `M` (uint) — bucket token count
 //! - `1`: `N`/`HIDDEN_SIZE` (uint) — `W::Q_SIZE`
-//! - `2`: `EPS` (float)            — per-layer `RmsNorm.eps` (caller-supplied)
+//! - `2`: `EPS` (float) — `W::RMS_NORM_EPS` (from model config)
 //!
 //! ## FusedGateUpSiluMul
 //! - `0`: `M` (uint)
@@ -31,31 +32,30 @@
 //! - `0`: `HEAD_DIM` (uint)
 //! - `1`: `NUM_Q_HEADS` (uint)
 //! - `2`: `NUM_KV_HEADS` (uint)
-//! - `3`: `ROT_DIM` (uint) — for partial-rope models; equals `HEAD_DIM` by default
+//! - `3`: `ROT_DIM` (uint) — `W::ROT_DIM`; equals `HEAD_DIM` for full rope
+//! - `4`: `BLOCK_SIZE` (uint) — `W::BLOCK_SIZE`
 //!
 //! ## AttentionViaCache
 //! - `0`: `HEAD_DIM` (uint)
 //! - `1`: `NUM_Q_HEADS` (uint)
 //! - `2`: `NUM_KV_HEADS` (uint)
-//! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE` (1/sqrt(head_dim) by default)
-//! - `4`: `BLOCK_SIZE` (uint) — paged-cache block stride (e.g. 16); from `KernelExtras`
-//! - `5`: `MAX_BLOCKS_PER_SEQ` (uint) — `block_table` row stride; from `KernelExtras`
+//! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE`
+//! - `4`: `BLOCK_SIZE` (uint) — `W::BLOCK_SIZE`
+//! - `5`: `MAX_BLOCKS_PER_SEQ` (uint) — `W::MAX_BLOCKS_PER_SEQ`
 //!
 //! ## AttentionPrefillContiguous
 //! - `0`: `HEAD_DIM` (uint)
 //! - `1`: `NUM_Q_HEADS` (uint)
 //! - `2`: `NUM_KV_HEADS` (uint)
-//! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE` (1/sqrt(head_dim) by default)
-//! - `6`: `PREFILL_TILE_Q` (uint) — Q-axis tile from the lowering pass
-//!         (currently 16, baked from `KernelExtras::prefill_tile_q`).
-//!         Index `6` (not `4`) so AttentionViaCache and
-//!         AttentionPrefillContiguous can coexist in the same `.metal`
-//!         file without a function-constant index collision.
+//! - `3`: `ATTN_SCALE` (float) — `W::ATTN_SCALE`
+//! - `6`: `PREFILL_TILE_Q` (uint) — `W::PREFILL_TILE_Q`. Index `6`
+//!   (not `4`) so AttentionViaCache and AttentionPrefillContiguous
+//!   can coexist in the same `.metal` file without a function-
+//!   constant index collision.
 //!
 //! ## Add / ScalarMul
-//! - No function constants in 5.B (kernels are token-parallel and
-//!   read total-element count from dispatch shape). Reserved for
-//!   future per-bucket fast paths.
+//! - No function constants — kernels are token-parallel and read
+//!   total-element count from dispatch shape.
 
 #![cfg(feature = "metal")]
 
@@ -92,9 +92,7 @@ fn kernel_msl_names(kernel: KernelId) -> Result<(&'static str, &'static str), Pi
     Ok(match kernel {
         KernelId::Embed => ("embed", "embed_f16_specialized"),
         KernelId::RmsNorm => ("rmsnorm", "rmsnorm_f16_specialized"),
-        KernelId::FusedAddRmsNorm => {
-            ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized")
-        }
+        KernelId::FusedAddRmsNorm => ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized"),
         KernelId::FusedGateUpSiluMul => (
             "fused_gate_up_silu_mul",
             "fused_gate_up_silu_mul_f16_specialized",
@@ -271,8 +269,7 @@ mod tests {
     #[test]
     fn rmsnorm_constants_are_well_formed() {
         // `RMS_NORM_EPS` defaults to 1e-5 on `CanonicalParams`.
-        let bag =
-            constants_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8).expect("rmsnorm bag");
+        let bag = constants_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8).expect("rmsnorm bag");
         assert_eq!(bag.len(), 3);
         assert_eq!(bag[0], ConstantValue::uint(0, 8));
         assert_eq!(bag[1], ConstantValue::uint(1, 2048));
@@ -286,8 +283,8 @@ mod tests {
         assert_eq!(bag.len(), 6);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[3], ConstantValue::float(3, 0.125));
-        assert_eq!(bag[4], ConstantValue::uint(4, 16));    // BLOCK_SIZE default
-        assert_eq!(bag[5], ConstantValue::uint(5, 128));   // MAX_BLOCKS_PER_SEQ default
+        assert_eq!(bag[4], ConstantValue::uint(4, 16)); // BLOCK_SIZE default
+        assert_eq!(bag[5], ConstantValue::uint(5, 128)); // MAX_BLOCKS_PER_SEQ default
     }
 
     #[test]
@@ -296,13 +293,13 @@ mod tests {
             .expect("prefill bag");
         assert_eq!(bag.len(), 5);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
-        assert_eq!(bag[4], ConstantValue::uint(6, 16));    // PREFILL_TILE_Q default
+        assert_eq!(bag[4], ConstantValue::uint(6, 16)); // PREFILL_TILE_Q default
     }
 
     #[test]
     fn fused_silu_bag_has_no_eps() {
-        let bag = constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 64)
-            .expect("silu bag");
+        let bag =
+            constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 64).expect("silu bag");
         assert_eq!(bag.len(), 2);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[1], ConstantValue::uint(1, 5632));
@@ -519,8 +516,7 @@ mod tests {
         let mut cos_sin_data = vec![0.0f32; max_pos * head_dim];
         for pos in 0..max_pos {
             for d in 0..half_dim {
-                let theta =
-                    (pos as f32) / 10000.0_f32.powf((d as f32) / (half_dim as f32));
+                let theta = (pos as f32) / 10000.0_f32.powf((d as f32) / (half_dim as f32));
                 cos_sin_data[pos * head_dim + d] = theta.cos();
                 cos_sin_data[pos * head_dim + half_dim + d] = theta.sin();
             }
@@ -533,11 +529,9 @@ mod tests {
         // Buffer helpers.
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device
-                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -549,8 +543,7 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device
-                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -760,11 +753,9 @@ mod tests {
         // Buffer helpers (mirror rope_append_matches_cpu_golden).
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device
-                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -776,8 +767,7 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device
-                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -934,11 +924,9 @@ mod tests {
         // Buffer helpers.
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device
-                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -950,8 +938,7 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device
-                .new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,

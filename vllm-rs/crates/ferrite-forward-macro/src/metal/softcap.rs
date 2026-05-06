@@ -44,18 +44,18 @@ impl MetalTanhSoftCapImpl {
     fn analytical_cost_us(&self, num_elements: u32, bandwidth_gbps: f64, peak_tflops: f64) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let total_elements = num_elements as f64;
-        
+
         // Memory traffic: 1 read + 1 write
         let bytes_read = total_elements * bytes_per_element;
         let bytes_written = total_elements * bytes_per_element;
         let total_bytes = bytes_read + bytes_written;
         let total_gb = total_bytes / 1e9;
         let memory_time_seconds = total_gb / bandwidth_gbps;
-        
+
         // Compute: ~25 FLOPs per element for tanh + scaling
         let flops = total_elements * 25.0;
         let compute_time_seconds = flops / (peak_tflops * 1e12);
-        
+
         // Take max of memory and compute time (compute-bound)
         let time_seconds = memory_time_seconds.max(compute_time_seconds);
         time_seconds * 1e6 // convert to microseconds
@@ -97,26 +97,26 @@ impl Implementation for MetalTanhSoftCapImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: TanhSoftCap operates on tensors of any shape
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             // Calculate total number of elements
             let num_elements: u32 = dims.iter().copied().product::<u64>() as u32;
-            
+
             // Try empirical cost first (if we have benchmarks for this size)
             let kernel_name = match self.dtype {
                 "fp16" => "tanh_softcap_f16",
                 "bf16" => "tanh_softcap_bf16",
                 _ => "tanh_softcap_f16",
             };
-            
+
             if let Some(cost) = ctx.profile.cost_us_for(kernel_name, num_elements, 1, 0) {
                 return cost;
             }
-            
+
             // Fall back to analytical model
             return self.analytical_cost_us(
                 num_elements,
@@ -124,7 +124,7 @@ impl Implementation for MetalTanhSoftCapImpl {
                 ctx.profile.peak_tflops_fp16,
             );
         }
-        
+
         // Fallback: conservative estimate
         10.0
     }
@@ -173,11 +173,7 @@ impl Implementation for MetalTanhSoftCapImpl {
     // `tanh_softcap_inplace` is consume-style — `take_owned → mutate
     // → reinsert`. Mirror the CUDA contract so the codegen drop pass
     // doesn't double-free the upstream buffer.
-    fn consumes_input_tiles(
-        &self,
-        claimed_tiles: &[TileId],
-        fuf: &Fuf,
-    ) -> Vec<(TileId, u8)> {
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
         TanhSoftCapImpl.consumes_input_tiles(claimed_tiles, fuf)
     }
     fn opcode_shape(&self) -> OpcodeShape {
@@ -203,11 +199,11 @@ mod tests {
     #[test]
     fn metal_tanh_softcap_only_compatible_with_metal_targets() {
         let metal_impl = MetalTanhSoftCapImpl::new_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -222,41 +218,49 @@ mod tests {
     #[test]
     fn metal_tanh_softcap_cost_higher_than_simple_ops() {
         let impl_fp16 = MetalTanhSoftCapImpl::new_fp16();
-        
+
         let num_elements = 1_000_000;
         let bandwidth = 100.0; // GB/s
         let peak_tflops = 10.0; // TFLOPS
-        
+
         let cost = impl_fp16.analytical_cost_us(num_elements, bandwidth, peak_tflops);
-        
+
         // TanhSoftCap should be more expensive than simple elementwise ops
         // due to tanh computation (25 FLOPs vs 1 FLOP for add/mul)
         // Expected: max(memory_time, compute_time)
         // Memory: 4 MB / 100 GB/s = 40 µs
         // Compute: 25M FLOPs / 10 TFLOPS = 2.5 µs
         // Result: max(40, 2.5) = 40 µs (memory-bound on fast hardware)
-        assert!(cost > 30.0 && cost < 100.0, "Expected 30-100µs, got {}µs", cost);
+        assert!(
+            cost > 30.0 && cost < 100.0,
+            "Expected 30-100µs, got {}µs",
+            cost
+        );
     }
 
     #[test]
     fn metal_tanh_softcap_compute_bound_on_slow_compute() {
         let impl_fp16 = MetalTanhSoftCapImpl::new_fp16();
-        
+
         let num_elements = 1_000_000;
         let bandwidth = 100.0; // GB/s (fast memory)
         let peak_tflops = 1.0; // TFLOPS (slow compute)
-        
+
         let cost = impl_fp16.analytical_cost_us(num_elements, bandwidth, peak_tflops);
-        
+
         // With slow compute, should be compute-bound
         // Memory: 4 MB / 100 GB/s = 40 µs
         // Compute: 25M FLOPs / 1 TFLOPS = 25 µs
         // Result: max(40, 25) = 40 µs (still memory-bound, but closer)
-        
+
         // Now with even slower compute
         let slow_cost = impl_fp16.analytical_cost_us(num_elements, bandwidth, 0.1);
         // Compute: 25M FLOPs / 0.1 TFLOPS = 250 µs
         // Result: max(40, 250) = 250 µs (compute-bound)
-        assert!(slow_cost > 200.0, "Expected >200µs on slow compute, got {}µs", slow_cost);
+        assert!(
+            slow_cost > 200.0,
+            "Expected >200µs on slow compute, got {}µs",
+            slow_cost
+        );
     }
 }

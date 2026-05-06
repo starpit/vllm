@@ -17,16 +17,10 @@
 //! new locations. It will be removed in a future version once all references are updated.
 
 // Re-export all implementations from the modular structure
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `crate::metal::MetalRmsNormImpl` instead"
-)]
+#[deprecated(since = "0.1.0", note = "Use `crate::metal::MetalRmsNormImpl` instead")]
 pub use crate::metal::rmsnorm::MetalRmsNormImpl;
 
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `crate::metal::MetalGemmImpl` instead"
-)]
+#[deprecated(since = "0.1.0", note = "Use `crate::metal::MetalGemmImpl` instead")]
 pub use crate::metal::gemm::MetalGemmImpl;
 
 #[deprecated(
@@ -53,8 +47,5 @@ pub use crate::metal::attention::MetalAttentionImpl;
 )]
 pub use crate::metal::activation::MetalActivationImpl;
 
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `crate::metal::MetalAwqImpl` instead"
-)]
+#[deprecated(since = "0.1.0", note = "Use `crate::metal::MetalAwqImpl` instead")]
 pub use crate::metal::awq::MetalAwqImpl;

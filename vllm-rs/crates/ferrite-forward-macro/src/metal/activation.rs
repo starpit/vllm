@@ -9,8 +9,8 @@
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,
+    WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -103,7 +103,9 @@ impl MetalActivationImpl {
     fn matches_op_kind(&self) -> OpKind {
         match self.activation_type {
             ActivationType::Silu => OpKind::Silu,
-            ActivationType::Gelu | ActivationType::GeluTanh | ActivationType::GeluQuick => OpKind::Gelu,
+            ActivationType::Gelu | ActivationType::GeluTanh | ActivationType::GeluQuick => {
+                OpKind::Gelu
+            }
             ActivationType::FatRelu => OpKind::TanhSoftCap, // FatReLU uses TanhSoftCap opcode
         }
     }
@@ -147,15 +149,15 @@ impl Implementation for MetalActivationImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: Activation is shape-preserving
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             // Calculate total number of elements
             let num_elements: u64 = dims.iter().product();
-            
+
             // Try empirical cost first (using first two dims as M, N)
             if dims.len() >= 2 {
                 let m = dims[0] as u32;
@@ -164,11 +166,11 @@ impl Implementation for MetalActivationImpl {
                     return cost;
                 }
             }
-            
+
             // Fall back to analytical model
             return self.analytical_cost_us(num_elements, ctx.profile.memory_bandwidth_gbps);
         }
-        
+
         // Fallback: conservative estimate
         50.0
     }
@@ -219,11 +221,11 @@ mod tests {
     #[test]
     fn metal_activation_only_compatible_with_metal_targets() {
         let metal_impl = MetalActivationImpl::new_silu_fp16();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -232,26 +234,30 @@ mod tests {
     #[test]
     fn metal_activation_analytical_cost_scales_with_size() {
         let impl_fp16 = MetalActivationImpl::new_silu_fp16();
-        
+
         // Small tensor
         let cost_small = impl_fp16.analytical_cost_us(1024 * 1024, 400.0);
-        
+
         // Large tensor (4× bigger)
         let cost_large = impl_fp16.analytical_cost_us(4 * 1024 * 1024, 400.0);
-        
+
         // Cost should scale linearly with size
         let ratio = cost_large / cost_small;
-        assert!((ratio - 4.0).abs() < 0.1, "Expected ratio ~4.0, got {}", ratio);
+        assert!(
+            (ratio - 4.0).abs() < 0.1,
+            "Expected ratio ~4.0, got {}",
+            ratio
+        );
     }
 
     #[test]
     fn metal_activation_matches_correct_op_kind() {
         let silu_impl = MetalActivationImpl::new_silu_fp16();
         assert_eq!(silu_impl.matches_op_kind(), OpKind::Silu);
-        
+
         let gelu_impl = MetalActivationImpl::new_gelu_fp16();
         assert_eq!(gelu_impl.matches_op_kind(), OpKind::Gelu);
-        
+
         let fatrelu_impl = MetalActivationImpl::new_fatrelu_fp16();
         assert_eq!(fatrelu_impl.matches_op_kind(), OpKind::TanhSoftCap);
     }

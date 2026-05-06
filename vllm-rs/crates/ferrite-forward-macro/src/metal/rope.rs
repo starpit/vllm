@@ -39,21 +39,21 @@ impl MetalRopeAppendImpl {
     fn analytical_cost_us(&self, num_elements: u32, bandwidth_gbps: f64) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let total_elements = num_elements as f64;
-        
+
         // RoPE reads Q, K, cos_sin_cache and writes Q', K'
         // Assuming Q and K have same size
         let bytes_read = 3.0 * total_elements * bytes_per_element; // Q, K, cache
         let bytes_written = 2.0 * total_elements * bytes_per_element; // Q', K'
         let total_bytes = bytes_read + bytes_written;
-        
+
         let total_gb = total_bytes / 1e9;
         let time_seconds = total_gb / bandwidth_gbps;
-        
+
         // Add small compute overhead for rotation math (2 muls + 2 adds per pair)
         let num_pairs = num_elements / 2;
         let flops = (num_pairs * 4) as f64;
         let compute_overhead = flops / (400.0 * 1e12) * 0.1; // 10% of compute time
-        
+
         (time_seconds + compute_overhead) * 1e6 // convert to microseconds
     }
 }
@@ -92,26 +92,26 @@ impl Implementation for MetalRopeAppendImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             let num_elements: u32 = dims.iter().copied().product::<u64>() as u32;
-            
+
             let kernel_name = match self.dtype {
                 "fp16" => "rope_append_f16",
                 "bf16" => "rope_append_bf16",
                 _ => "rope_append_f16",
             };
-            
+
             if let Some(cost) = ctx.profile.cost_us_for(kernel_name, num_elements, 1, 0) {
                 return cost;
             }
-            
+
             return self.analytical_cost_us(num_elements, ctx.profile.memory_bandwidth_gbps);
         }
-        
+
         10.0 // conservative fallback
     }
 
@@ -249,7 +249,7 @@ impl Implementation for MetalRopeAppendInterleavedImpl {
         let node = ctx.fuf.get(tile);
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             let num_elements: u32 = dims.iter().copied().product::<u64>() as u32;
             let kernel_name = match self.dtype {
@@ -257,14 +257,14 @@ impl Implementation for MetalRopeAppendInterleavedImpl {
                 "bf16" => "rope_append_interleaved_bf16",
                 _ => "rope_append_interleaved_f16",
             };
-            
+
             if let Some(cost) = ctx.profile.cost_us_for(kernel_name, num_elements, 1, 0) {
                 return cost;
             }
-            
+
             return self.analytical_cost_us(num_elements, ctx.profile.memory_bandwidth_gbps);
         }
-        
+
         10.0
     }
 
@@ -341,7 +341,7 @@ mod tests {
         let metal_impl = MetalRopeAppendImpl::new_fp16();
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
     }
@@ -356,35 +356,48 @@ mod tests {
     #[test]
     fn metal_rope_analytical_cost_scales_with_size() {
         let impl_fp16 = MetalRopeAppendImpl::new_fp16();
-        
+
         // Small: 4096 elements
         let small_cost = impl_fp16.analytical_cost_us(4096, 68.25);
-        
+
         // Large: 262144 elements (64x larger)
         let large_cost = impl_fp16.analytical_cost_us(262144, 68.25);
-        
+
         // Cost should scale roughly linearly with size
         let ratio = large_cost / small_cost;
         assert!(ratio > 50.0 && ratio < 80.0, "Cost ratio: {}", ratio);
-        
+
         // Costs should be in reasonable microsecond range
-        assert!(small_cost > 0.1 && small_cost < 100.0, "Small cost: {}", small_cost);
-        assert!(large_cost > 1.0 && large_cost < 10000.0, "Large cost: {}", large_cost);
+        assert!(
+            small_cost > 0.1 && small_cost < 100.0,
+            "Small cost: {}",
+            small_cost
+        );
+        assert!(
+            large_cost > 1.0 && large_cost < 10000.0,
+            "Large cost: {}",
+            large_cost
+        );
     }
 
     #[test]
     fn metal_rope_cost_accounts_for_memory_traffic() {
         let impl_fp16 = MetalRopeAppendImpl::new_fp16();
-        
+
         // RoPE reads 3 buffers (Q, K, cache) + writes 2 (Q', K') = 5× traffic
         // vs Add which reads 2 + writes 1 = 3× traffic
         let num_elements = 1_000_000;
         let bandwidth = 100.0; // GB/s
-        
+
         let cost = impl_fp16.analytical_cost_us(num_elements, bandwidth);
-        
+
         // Expected: (3*1M*2 + 2*1M*2) bytes / 100 GB/s = 10 MB / 100 GB/s = 100 µs
         let expected = 100.0;
-        assert!((cost - expected).abs() < 10.0, "Expected ~{}µs, got {}µs", expected, cost);
+        assert!(
+            (cost - expected).abs() < 10.0,
+            "Expected ~{}µs, got {}µs",
+            expected,
+            cost
+        );
     }
 }

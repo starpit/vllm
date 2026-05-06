@@ -8,8 +8,8 @@
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,
+    WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -54,7 +54,7 @@ impl MetalAwqImpl {
     fn analytical_cost_us(&self, m: u32, n: u32, bandwidth_gbps: f64) -> f64 {
         let bytes_per_element = 2.0; // fp16/bf16
         let total_elements = (m as f64) * (n as f64);
-        
+
         // Reads:
         // - Quantized weights: 4 bits per element = 0.5 bytes
         // - Scales: 1 per group = (total_elements / group_size) * 2 bytes
@@ -64,10 +64,10 @@ impl MetalAwqImpl {
         let scales_bytes = num_groups * bytes_per_element;
         let zeros_bytes = num_groups * bytes_per_element;
         let bytes_read = quantized_bytes + scales_bytes + zeros_bytes;
-        
+
         // Writes: dequantized weights (fp16/bf16)
         let bytes_written = total_elements * bytes_per_element;
-        
+
         let total_bytes = bytes_read + bytes_written;
         let total_gb = total_bytes / 1e9;
         let time_seconds = total_gb / bandwidth_gbps;
@@ -95,7 +95,7 @@ impl Implementation for MetalAwqImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let node = fuf.get(seed);
-        
+
         // AWQ dequantization is typically part of a GEMM operation
         // For now, we don't match standalone dequantization tiles
         // This will be integrated with MetalGemmImpl for quantized weights
@@ -111,26 +111,26 @@ impl Implementation for MetalAwqImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        
+
         // Get shape: GEMM output is [M, N]
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
-        
+
         if let Some(dims) = dims {
             if dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
-                
+
                 // Try empirical cost first
                 if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
                     return cost;
                 }
-                
+
                 // Fall back to analytical model
                 return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
             }
         }
-        
+
         // Fallback: conservative estimate
         200.0
     }
@@ -181,11 +181,11 @@ mod tests {
     #[test]
     fn metal_awq_only_compatible_with_metal_targets() {
         let metal_impl = MetalAwqImpl::new_fp16_g128();
-        
+
         // Metal target - should be compatible
         let metal_profile = from_metal_profile(&ferrite_metal_targets::M1_8CORE);
         assert!(metal_impl.target_compatible(&metal_profile));
-        
+
         // CUDA target - should NOT be compatible
         let cuda_profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(!metal_impl.target_compatible(&cuda_profile));
@@ -194,33 +194,40 @@ mod tests {
     #[test]
     fn metal_awq_analytical_cost_accounts_for_compression() {
         let impl_fp16 = MetalAwqImpl::new_fp16_g128();
-        
+
         // AWQ dequantization should be cheaper than full FP16 read
         // because quantized weights are 4-bit (8× smaller)
         let cost_awq = impl_fp16.analytical_cost_us(1024, 4096, 400.0);
-        
+
         // Equivalent FP16 read would be: (1024*4096*2 read + 1024*4096*2 write) / 400e9 * 1e6
         let fp16_bytes = (1024.0 * 4096.0 * 2.0 * 2.0) / 1e9;
         let cost_fp16 = (fp16_bytes / 400.0) * 1e6;
-        
+
         // AWQ should be significantly cheaper (quantized weights are 8× smaller)
-        assert!(cost_awq < cost_fp16 * 0.7, 
-            "Expected AWQ cost ({}) < 70% of FP16 cost ({})", 
-            cost_awq, cost_fp16);
+        assert!(
+            cost_awq < cost_fp16 * 0.7,
+            "Expected AWQ cost ({}) < 70% of FP16 cost ({})",
+            cost_awq,
+            cost_fp16
+        );
     }
 
     #[test]
     fn metal_awq_analytical_cost_scales_with_size() {
         let impl_fp16 = MetalAwqImpl::new_fp16_g128();
-        
+
         // Small matrix
         let cost_small = impl_fp16.analytical_cost_us(512, 2048, 400.0);
-        
+
         // Large matrix (4× bigger)
         let cost_large = impl_fp16.analytical_cost_us(1024, 4096, 400.0);
-        
+
         // Cost should scale roughly linearly with size
         let ratio = cost_large / cost_small;
-        assert!((ratio - 4.0).abs() < 0.5, "Expected ratio ~4.0, got {}", ratio);
+        assert!(
+            (ratio - 4.0).abs() < 0.5,
+            "Expected ratio ~4.0, got {}",
+            ratio
+        );
     }
 }

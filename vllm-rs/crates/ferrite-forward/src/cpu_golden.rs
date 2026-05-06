@@ -106,6 +106,127 @@ pub fn mul(a: &[f32], b: &[f32], output: &mut [f32]) {
     }
 }
 
+/// Token-id → embedding table lookup.
+///
+/// - `input_ids`: `[num_tokens]` u32 — vocab indices to gather.
+/// - `embed_weight`: `[vocab_size, hidden_size]` row-major.
+/// - `output`: `[num_tokens, hidden_size]` row-major; row `i` is
+///   `embed_weight[input_ids[i]]`.
+///
+/// Mirrors `Instruction::Embed` (CUDA) and the Metal `KernelId::Embed`
+/// dispatch.
+pub fn embed(
+    input_ids: &[u32],
+    embed_weight: &[f32],
+    output: &mut [f32],
+    hidden_size: usize,
+) {
+    assert_eq!(output.len(), input_ids.len() * hidden_size);
+    assert_eq!(embed_weight.len() % hidden_size, 0);
+    let vocab = embed_weight.len() / hidden_size;
+    for (i, &tok) in input_ids.iter().enumerate() {
+        let row = tok as usize;
+        assert!(row < vocab, "token id {row} out of range vocab={vocab}");
+        let src = &embed_weight[row * hidden_size..(row + 1) * hidden_size];
+        output[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(src);
+    }
+}
+
+/// Elementwise add: `output = a + b`.
+///
+/// Mirrors `Instruction::Add(delta_slot, residual_slot)` — the CUDA
+/// path adds in place into the residual buffer; this golden writes the
+/// sum to a fresh `output` so call sites can supply a copy of the
+/// residual when an in-place model isn't convenient.
+pub fn add(a: &[f32], b: &[f32], output: &mut [f32]) {
+    assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), output.len());
+    for i in 0..a.len() {
+        output[i] = a[i] + b[i];
+    }
+}
+
+/// Elementwise scalar multiply: `output = input * scale`.
+///
+/// Mirrors `Instruction::ScalarMul(in_slot, out_slot, scale)`. The
+/// CUDA path is in-place (`scale_inplace`); this golden writes a
+/// separate output for cleanliness.
+pub fn scalar_mul(input: &[f32], output: &mut [f32], scale: f32) {
+    assert_eq!(input.len(), output.len());
+    for i in 0..input.len() {
+        output[i] = input[i] * scale;
+    }
+}
+
+/// Fused add + RMSNorm with the same semantics as the Metal
+/// `fused_add_rmsnorm_f16_specialized` kernel and CUDA's
+/// `fused_add_rms_norm_inplace`:
+///
+/// - Pass 1: `residual += delta` (in place).
+/// - Pass 2: `delta = rmsnorm(residual_after_add, weight, eps)`.
+///
+/// Both buffers are `[M, hidden_size]` row-major; `weight` is
+/// `[hidden_size]`. After the call:
+/// - `residual[i]` holds the post-add value (consumed downstream as
+///   the next layer's residual);
+/// - `delta[i]` holds the normalized result (consumed downstream as
+///   the next sublayer's input).
+///
+/// Mirrors `Instruction::FusedAddRmsNorm` (CUDA) and Metal
+/// `KernelId::FusedAddRmsNorm`. See `shaders/fused_add_rmsnorm.metal`
+/// for the device-side reference; this CPU path is bit-identical at
+/// f32 (the kernel is f16, so end-to-end goldens compare with a
+/// tolerance — see the per-bucket diff harness in 5.G.2).
+pub fn fused_add_rmsnorm(
+    residual: &mut [f32],
+    delta: &mut [f32],
+    weight: &[f32],
+    eps: f32,
+    hidden_size: usize,
+) {
+    assert_eq!(residual.len(), delta.len());
+    assert_eq!(weight.len(), hidden_size);
+    assert_eq!(residual.len() % hidden_size, 0);
+
+    let m = residual.len() / hidden_size;
+    for row in 0..m {
+        let base = row * hidden_size;
+        // Pass 1: residual += delta in place; accumulate sum-of-squares
+        // off the post-add residual.
+        let mut sum_sq = 0.0_f32;
+        for i in 0..hidden_size {
+            let s = residual[base + i] + delta[base + i];
+            residual[base + i] = s;
+            sum_sq += s * s;
+        }
+        let rms = (sum_sq / hidden_size as f32 + eps).sqrt();
+        let inv_rms = 1.0 / rms;
+        // Pass 2: write rmsnorm(residual_after_add, weight) into delta.
+        for i in 0..hidden_size {
+            delta[base + i] = residual[base + i] * inv_rms * weight[i];
+        }
+    }
+}
+
+/// Fused gate/up SwiGLU MLP: `output = silu(gate) * up`.
+///
+/// Both inputs are `[M, intermediate_size]`; the output has the same
+/// shape. Mirrors `Instruction::FusedGateUpSiluMul` (CUDA) and Metal
+/// `KernelId::FusedGateUpSiluMul`.
+///
+/// The Metal lowering folds the two gate/up Gemms (and the SiLU + Mul)
+/// into one kernel call; this CPU golden takes the post-Gemm activations
+/// as inputs and only models the SiLU + elementwise multiply.
+pub fn fused_gate_up_silu_mul(gate: &[f32], up: &[f32], output: &mut [f32]) {
+    assert_eq!(gate.len(), up.len());
+    assert_eq!(gate.len(), output.len());
+    for i in 0..gate.len() {
+        let g = gate[i];
+        let silu_g = g / (1.0 + (-g).exp());
+        output[i] = silu_g * up[i];
+    }
+}
+
 /// Rotary position embedding (RoPE).
 ///
 /// Applies rotation to query/key vectors using cos/sin tables.
@@ -324,6 +445,77 @@ mod tests {
         assert!((output[0] - 0.0).abs() < 1e-5); // silu(0) = 0
         assert!((output[1] - 0.7310586).abs() < 1e-4); // silu(1) ≈ 0.731
         assert!((output[2] - (-0.2689414)).abs() < 1e-4); // silu(-1) ≈ -0.269
+    }
+
+    #[test]
+    fn test_embed_gather() {
+        // 4-token vocab, hidden=3. Gather rows 2, 0, 3 in that order.
+        #[rustfmt::skip]
+        let weight = vec![
+            0.1, 0.2, 0.3,   // row 0
+            1.1, 1.2, 1.3,   // row 1
+            2.1, 2.2, 2.3,   // row 2
+            3.1, 3.2, 3.3,   // row 3
+        ];
+        let ids = vec![2u32, 0, 3];
+        let mut out = vec![0.0_f32; 3 * 3];
+        embed(&ids, &weight, &mut out, 3);
+        assert_eq!(&out[0..3], &[2.1, 2.2, 2.3]);
+        assert_eq!(&out[3..6], &[0.1, 0.2, 0.3]);
+        assert_eq!(&out[6..9], &[3.1, 3.2, 3.3]);
+    }
+
+    #[test]
+    fn test_add_elementwise() {
+        let a = vec![1.0, -2.0, 3.5];
+        let b = vec![0.5, 2.0, -1.5];
+        let mut out = vec![0.0; 3];
+        add(&a, &b, &mut out);
+        assert_eq!(out, vec![1.5, 0.0, 2.0]);
+    }
+
+    #[test]
+    fn test_scalar_mul_basic() {
+        let input = vec![1.0, -2.0, 0.5];
+        let mut out = vec![0.0; 3];
+        scalar_mul(&input, &mut out, 4.0);
+        assert_eq!(out, vec![4.0, -8.0, 2.0]);
+    }
+
+    #[test]
+    fn test_fused_add_rmsnorm_two_rows() {
+        // M=2 rows, hidden=4. residual starts zero; delta=[2,2,2,2]
+        // gives post-add residual = [2,2,2,2] with rms=2 → normed = 1
+        // before scaling by weight.
+        let mut residual = vec![0.0_f32; 2 * 4];
+        let mut delta = vec![2.0_f32; 2 * 4];
+        let weight = vec![1.0, 0.5, 0.5, 1.0];
+        fused_add_rmsnorm(&mut residual, &mut delta, &weight, 1e-5, 4);
+        // Post-add residual should hold the sum.
+        for v in &residual {
+            assert!((v - 2.0).abs() < 1e-5, "expected 2.0, got {v}");
+        }
+        // delta should hold weight (since normed≈1).
+        for row in 0..2 {
+            for i in 0..4 {
+                let want = weight[i];
+                let got = delta[row * 4 + i];
+                assert!((got - want).abs() < 1e-3, "row {row} idx {i}: want {want}, got {got}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fused_gate_up_silu_mul_signs() {
+        // silu(0)=0 → product 0; silu(1)≈0.731 → 0.731 * 2 = 1.462;
+        // silu(-1)≈-0.269 → -0.269 * -1 = 0.269.
+        let gate = vec![0.0, 1.0, -1.0];
+        let up = vec![5.0, 2.0, -1.0];
+        let mut out = vec![0.0; 3];
+        fused_gate_up_silu_mul(&gate, &up, &mut out);
+        assert!((out[0] - 0.0).abs() < 1e-5);
+        assert!((out[1] - 1.4621172).abs() < 1e-4);
+        assert!((out[2] - 0.26894143).abs() < 1e-4);
     }
 
     #[test]

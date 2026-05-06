@@ -36,3 +36,37 @@ fn llama() {
     normed = rmsnorm(hidden_states, norm);
     logits = gemm(normed, lm_head);
 }
+
+#[cfg(all(test, feature = "metal"))]
+mod metal_emission_tests {
+    /// Sanity-check that the macro emits the per-canonical metal
+    /// surface (Weights ZST + METAL_BUCKETS static + metal_pool fn)
+    /// for at least one model in this arch. The check is structural
+    /// — it doesn't run the pool, just asserts the symbols exist
+    /// and resolve to the expected types.
+    #[test]
+    fn tinyllama_metal_symbols_resolve() {
+        // METAL_BUCKETS is a non-empty `&[MetalBucketSpec<Weights>]`.
+        let buckets: &[::ferrite_forward::interpreter::metal::MetalBucketSpec<
+            crate::tinyllama_1_1b::Weights,
+        >] = crate::tinyllama_1_1b::METAL_BUCKETS;
+        assert!(!buckets.is_empty(), "TinyLlama-1.1B emits at least one bucket");
+        // metal_pool resolves as an `fn(...) -> Result<MetalWorkerPool, PoolBuildError>`.
+        // We don't call it (no Device available in unit-test ctx); just
+        // taking the fn-pointer proves the symbol + signature compiled.
+        let _ctor: fn(
+            ::std::sync::Arc<::ferrite_forward::interpreter::metal::__re::Device>,
+            ::std::sync::Arc<
+                dyn ::ferrite_forward::interpreter::metal::MetalModelMeta<
+                    crate::tinyllama_1_1b::Weights,
+                >,
+            >,
+            ::ferrite_forward::interpreter::metal::ArenaLayout,
+            ::ferrite_forward::interpreter::metal::RuntimeFactory,
+            usize,
+        ) -> ::core::result::Result<
+            ::ferrite_forward::interpreter::metal::MetalWorkerPool<crate::tinyllama_1_1b::Weights>,
+            ::ferrite_forward::interpreter::metal::PoolBuildError,
+        > = crate::tinyllama_1_1b::metal_pool;
+    }
+}

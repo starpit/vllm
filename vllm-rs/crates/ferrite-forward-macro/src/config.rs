@@ -384,8 +384,18 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     // identical Impl-set signatures share one emitted body. Without
     // that dedup, N sizes × M presets quickly blow up release-build
     // LLVM work.
+    // Under `--features metal` we skip quant-variant synthesis
+    // entirely. Every preset (awq-gemm, gptq-sym, bnb-nf4-dq, fp8-*,
+    // ct-int4-sym, ggml, …) is CUDA-only at the impl-library level —
+    // the metal impl pool has no `MarlinFusedGateUpSiluMul` /
+    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` claimants, so the
+    // solver explodes with `UnclaimedTile` on the first quant variant
+    // it touches. The Dense base variants still flow through
+    // unchanged. Re-enable once the corresponding metal-quant impls
+    // land. (Tracked alongside the moe / mla-split / mean / bias-add
+    // gaps in `project_ferrite_metal_port_handoff.md`.)
     let quantizations_path = dir.join("quantizations.json");
-    if quantizations_path.exists() {
+    if !cfg!(feature = "metal") && quantizations_path.exists() {
         let (_, qjson) = read_json_file(&quantizations_path)?;
         // Each entry is either a bare preset name (`"fp8-..."`,
         // `"ggml"`) or a single-key object carrying registration data
@@ -465,6 +475,20 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
                 out.push(variant);
             }
         }
+    }
+
+    // Drop any explicitly-quantized base configs under
+    // `--features metal`. The macro-side preset overlay was already
+    // skipped above, but a few arches ship checked-in
+    // `<size>-<preset>.json` base configs (e.g.
+    // `qwen3-0.6b-bnb-4bit.json`). Those land in `base_raw` directly
+    // and reach the solver as if they were dense bases. The metal
+    // impl pool has no quantized claimants (Marlin / Bnb4 / Fp8 /
+    // GGML are CUDA-only), so the solver explodes on the first
+    // quantized tile. Same rationale as the synthesized-variant
+    // skip above; same future-fix path (land metal-quant impls).
+    if cfg!(feature = "metal") {
+        out.retain(|m| m.quantization.is_none());
     }
 
     // Keep the final list sorted by stem so emitted

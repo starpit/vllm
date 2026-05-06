@@ -2468,6 +2468,7 @@ fn emit_weights_struct(
     // same signature for uniformity; their body is `&self.<field>`
     // and ignores the layer arg.
     let accessor_methods = emit_weights_accessor_methods(&accessors);
+    let accessor_methods_metal = emit_weights_accessor_methods_metal(&accessors);
 
     // Rotary cos_sin accessors for the host-interpreter path. Both
     // `wm.rotary` and `wm.rotary_local` are conditionally-emitted
@@ -2526,7 +2527,66 @@ fn emit_weights_struct(
         WeightsEmitMode::Shim { .. } => quote! {},
     };
 
+    // Metal-side rotary cos_sin stubs. Same fn-pointer-identity rule
+    // as `emit_weights_accessor_methods_metal`: each stub gets
+    // `#[inline(never)]` and a unique panic body so ICF can't merge
+    // them. `Instruction<Weights>` variants like `RopeAppend` carry a
+    // `CosSinFn<Weights>` field whose value is `Weights::rotary_cos_sin`
+    // (or `..._local`); `MetalModelMeta` looks up the cos_sin cache
+    // buffer keyed on that fn-pointer at recording time.
+    let rotary_cos_sin_methods_metal: TokenStream = match &mode {
+        WeightsEmitMode::Canonical => {
+            let main = if uses_rotary {
+                quote! {
+                    #[inline(never)]
+                    pub fn rotary_cos_sin(&self, _layer: u32)
+                        -> ::ferrite_cuda_core::tensor::GpuTensor
+                    {
+                        panic!(concat!("metal stub: ", "rotary_cos_sin"))
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            let local = if uses_rotary_local {
+                quote! {
+                    #[inline(never)]
+                    pub fn rotary_local_cos_sin(&self, _layer: u32)
+                        -> ::ferrite_cuda_core::tensor::GpuTensor
+                    {
+                        panic!(concat!("metal stub: ", "rotary_local_cos_sin"))
+                    }
+                }
+            } else {
+                quote! {}
+            };
+            if uses_rotary || uses_rotary_local {
+                quote! {
+                    #[cfg(feature = "metal")]
+                    #[allow(dead_code)]
+                    impl Weights {
+                        #main
+                        #local
+                    }
+                }
+            } else {
+                quote! {}
+            }
+        }
+        WeightsEmitMode::Shim { .. } => quote! {},
+    };
+
     // Struct definition vs type alias per emit mode.
+    //
+    // Two parallel emissions are produced — one cfg-gated on `cuda`,
+    // one cfg-gated on `metal`. The macro's top-level
+    // `compile_error!` enforces "exactly one of cuda/metal", so the
+    // two definitions never collide. Under `metal`, `Weights` is a
+    // ZST: per-bucket static slices reference accessor methods only
+    // for their fn-pointer identity (the Metal worker resolves them
+    // against `MetalModelMeta` at runtime), so the metal `Weights`
+    // carries no weight tensors. Loader / fingerprint live entirely
+    // on the cuda side.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
             /// Every weight the forward needs, packed for the
@@ -2537,10 +2597,19 @@ fn emit_weights_struct(
                 #rotary_field
                 #rotary_local_field
             }
+
+            /// Metal-side `Weights` is a ZST. Per-bucket static
+            /// slices reference accessor methods (below) only as
+            /// fn-pointers; the runtime `MetalModelMeta` translates
+            /// each pointer to a Metal `Buffer` at recording time.
+            #[cfg(feature = "metal")]
+            pub struct Weights;
         },
         WeightsEmitMode::Shim { canonical } => quote! {
             /// Shim — shares canonical sibling's `Weights`.
             #[cfg(feature = "cuda")]
+            pub type Weights = super::#canonical::Weights;
+            #[cfg(feature = "metal")]
             pub type Weights = super::#canonical::Weights;
         },
     };
@@ -2565,7 +2634,11 @@ fn emit_weights_struct(
 
             #accessor_methods
 
+            #accessor_methods_metal
+
             #rotary_cos_sin_methods
+
+            #rotary_cos_sin_methods_metal
 
             #fingerprint_method
 
@@ -4017,6 +4090,54 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
     }
 }
 
+/// Emit metal-side panic-stub accessor methods on the per-arch `Weights`.
+///
+/// Under `cfg(feature = "metal")`, `Weights` is a ZST — it carries no
+/// tensors. Per-bucket static slices reference these methods only as
+/// fn-pointers; the runtime `MetalModelMeta` translates each pointer
+/// to a Metal `Buffer` at recording time. The methods themselves
+/// would never run in a well-formed metal forward, so each body just
+/// panics.
+///
+/// Two non-obvious choices:
+/// - `#[inline(never)]` keeps each stub a distinct function. Without
+///   this rustc is free to inline the panic at the call site, leaving
+///   the fn-pointer with no stable address.
+/// - The panic body uses `concat!("metal stub: ", stringify!(<base>))`
+///   so each stub's body bytes differ. LLVM's identical-code-folding
+///   pass otherwise merges all "trivially diverging" stubs into one
+///   fn-pointer address, breaking the per-accessor lookup contract.
+///
+/// Returns an `impl Weights { ... }` block. Empty (zero accessors)
+/// is fine — the impl block is then elided entirely.
+fn emit_weights_accessor_methods_metal(accessors: &[WeightAccessor]) -> TokenStream {
+    let groups = group_accessors_by_base(accessors);
+    if groups.is_empty() {
+        return quote! {};
+    }
+    let methods: Vec<TokenStream> = groups
+        .iter()
+        .map(|g| {
+            let base_ident = syn::Ident::new(&g.base, proc_macro2::Span::call_site());
+            let base_lit = &g.base;
+            let ty = &g.rust_type;
+            quote! {
+                #[inline(never)]
+                pub fn #base_ident(&self, _layer: u32) -> &#ty {
+                    panic!(concat!("metal stub: ", #base_lit))
+                }
+            }
+        })
+        .collect();
+    quote! {
+        #[cfg(feature = "metal")]
+        #[allow(dead_code)]
+        impl Weights {
+            #(#methods)*
+        }
+    }
+}
+
 /// Emit the `MarlinFormat` const this variant's `load` passes into
 /// the (canonical or shared) `load_with` body. For non-Marlin
 /// variants (dense / BNB4 / FP8 later) the value is still a valid
@@ -4457,7 +4578,13 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     };
 
     quote! {
-        #[cfg(feature = "cuda")]
+        // `CanonicalParams` is backend-agnostic — the trait, its
+        // associated `const`s, and every callsite (`<W as
+        // CanonicalParams>::HEAD_DIM`) live in `ferrite-forward` with
+        // no cuda gating. So this impl applies under either
+        // `cfg(feature = "cuda")` (where `Weights` is the loader
+        // struct) or `cfg(feature = "metal")` (where `Weights` is
+        // the ZST emitted in `emit_weights_struct`).
         impl ::ferrite_forward::CanonicalParams for Weights {
             const HEAD_DIM: u32 = #head_dim_lit;
             const NUM_Q_HEADS: u32 = #num_q_heads_lit;
@@ -4746,11 +4873,15 @@ pub fn emit_model(
     // `RmsNorm(...)` instead of
     // `::ferrite_forward::Instruction::<Weights>::Embed(...)`
     // (which prettyplease wraps over 3-4 lines per row).
+    // The `__I` alias and the variant glob-import are backend-agnostic
+    // — `Instruction<W>` is defined in `ferrite-forward` without a
+    // backend gate. The per-bucket static slices reference both, so
+    // they compile under either `cfg(feature = "cuda")` (linking the
+    // cuda `Weights` struct) or `cfg(feature = "metal")` (linking the
+    // metal `Weights` ZST emitted in `emit_weights_struct`).
     let instruction_alias = quote! {
-        #[cfg(feature = "cuda")]
         #[allow(non_camel_case_types, dead_code)]
         type __I = ::ferrite_forward::Instruction<Weights>;
-        #[cfg(feature = "cuda")]
         use ::ferrite_forward::Instruction::*;
     };
     let shapes_by_name = arch_opcodes.shapes_by_name();
@@ -4901,6 +5032,94 @@ pub fn emit_model(
         };
     };
 
+    // METAL_BUCKETS — one row per distinct `num_tokens` point. The
+    // metal pool dispatches on `num_tokens` only (no sk axis); for
+    // models that declared `sk_buckets` we pick the `sk_bucket == 0`
+    // canonical at each `m`, falling back to whichever wp exists for
+    // that `m` if the model elided the sk=0 entry. TinyLlama-class
+    // models have no sk axis, so this is a 1:1 enumeration of
+    // `num_tokens_points`.
+    //
+    // Each row's `backbone` / `lm_head` ride on the per-canonical
+    // static slices the cuda emission already produced — under both
+    // backends the slices are unconditionally emitted (the
+    // `instruction_alias` and `Weights` definitions are now
+    // mutually-exclusive cfg-gated, but the slice statics
+    // themselves are backend-agnostic).
+    let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
+    for &m in &num_tokens_points {
+        // Prefer the sk=0 canonical for this `m`; fall back to any wp
+        // at `m` if the model never declared sk=0 explicitly.
+        let wp = bucket_points
+            .iter()
+            .find(|wp| wp.num_tokens == m && wp.sk_bucket == 0)
+            .copied()
+            .or_else(|| bucket_points.iter().find(|wp| wp.num_tokens == m).copied())
+            .expect("every num_tokens point has at least one wp");
+        let i = bucket_points
+            .iter()
+            .position(|w| *w == wp)
+            .expect("wp came from bucket_points");
+        let canonical = bucket_canonical[i];
+        let bb_static = bucket_static_ident("BACKBONE_M", canonical);
+        let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
+        let (_, num_slots_b, _, _) = &canonical_lowered[&canonical];
+        let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
+        let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
+        metal_bucket_entries.push(quote! {
+            ::ferrite_forward::interpreter::metal::MetalBucketSpec {
+                bucket_m: #bucket_m_lit,
+                num_arena_slots: #num_slots_lit,
+                backbone: #bb_static,
+                lm_head: #lm_static,
+            },
+        });
+    }
+
+    let metal_emission = quote! {
+        /// Per-canonical bucket plan for the Metal pool. One row per
+        /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`
+        /// is a linear smallest-fit scan, so order matters.
+        #[cfg(feature = "metal")]
+        pub static METAL_BUCKETS:
+            &[::ferrite_forward::interpreter::metal::MetalBucketSpec<Weights>]
+            = &[
+                #(#metal_bucket_entries)*
+            ];
+
+        /// Build a [`MetalWorkerPool`] for this canonical. Thin
+        /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
+        /// the per-canonical [`METAL_BUCKETS`] static so callers don't
+        /// have to construct the bucket plan by hand.
+        ///
+        /// [`MetalWorkerPool`]: ::ferrite_forward::interpreter::metal::MetalWorkerPool
+        /// [`MetalWorkerPool::for_buckets`]: ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets
+        #[cfg(feature = "metal")]
+        pub fn metal_pool(
+            device: ::std::sync::Arc<
+                ::ferrite_forward::interpreter::metal::__re::Device,
+            >,
+            model_meta: ::std::sync::Arc<
+                dyn ::ferrite_forward::interpreter::metal::MetalModelMeta<Weights>,
+            >,
+            arena_layout: ::ferrite_forward::interpreter::metal::ArenaLayout,
+            runtime_factory: ::ferrite_forward::interpreter::metal::RuntimeFactory,
+            max_workers: usize,
+        ) -> ::core::result::Result<
+            ::ferrite_forward::interpreter::metal::MetalWorkerPool<Weights>,
+            ::ferrite_forward::interpreter::metal::PoolBuildError,
+        > {
+            ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
+                device,
+                model_meta,
+                METAL_BUCKETS,
+                arena_layout,
+                runtime_factory,
+                max_workers,
+            )
+        }
+    };
+
     // Encoder layouts have no lm_head split — `forward_backbone` is
     // semantically identical to `forward`. Decoder layouts return the
     // pre-lm_head activation via a DtoD memcpy of the protected
@@ -4953,6 +5172,8 @@ pub fn emit_model(
         #(#static_slices)*
 
         #forward_table
+
+        #metal_emission
 
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
         /// run the universal interpreter.
@@ -5051,13 +5272,19 @@ fn emit_shim_model(
 
     // Per-bucket fn surfaces are gone — dispatch lives on the
     // canonical's `FORWARD_TABLE` + `find_bucket`. Re-export the
-    // arch-level dispatchers only.
+    // arch-level dispatchers only. Under `metal` the shim shares the
+    // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
+    // — variant-specific differences (quant format, fingerprint) are
+    // load-time only; static bucket plans are byte-identical.
     let _ = sfufs;
     quote! {
         #weights
 
         #[cfg(feature = "cuda")]
         pub use super::#canonical::{dump, forward, forward_backbone};
+
+        #[cfg(feature = "metal")]
+        pub use super::#canonical::{METAL_BUCKETS, metal_pool};
     }
 }
 

@@ -36,8 +36,21 @@ pub use forward::{ForwardError, ForwardInputs};
 #[cfg(feature = "metal")]
 pub use model_meta::{BufferRef, MetalModelMeta};
 #[cfg(feature = "metal")]
-pub use pool::{MetalWorkerPool, PooledWorker, RuntimeFactory, WorkerGuard};
+pub use pool::{
+    MetalBucketSpec, MetalWorkerPool, PoolBuildError, PooledWorker, RuntimeFactory, WorkerGuard,
+};
 #[cfg(feature = "metal")]
 pub use runtime::RuntimeBindings;
 #[cfg(feature = "metal")]
 pub use worker::{ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, WorkerError};
+
+// Re-export `metal::Device` so per-model crates whose macro expansion
+// emits a `metal_pool(...)` constructor signature can name the type
+// without taking a direct `ferrite-metal-kernels` dep. Per-arch crates
+// already depend on `ferrite-forward`, so all macro-emitted paths
+// route through this crate.
+#[cfg(feature = "metal")]
+#[doc(hidden)]
+pub mod __re {
+    pub use ::ferrite_metal_kernels::metal::Device;
+}

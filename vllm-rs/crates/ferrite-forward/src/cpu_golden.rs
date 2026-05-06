@@ -269,6 +269,202 @@ pub fn rope(
     }
 }
 
+/// RoPE + paged KV-cache append.
+///
+/// Mirrors `Instruction::RopeAppend` (CUDA) and Metal
+/// `KernelId::RopeAppend`. Two effects per token:
+/// 1. Rotate Q (and K) using `cos_table[positions[t]]` /
+///    `sin_table[positions[t]]`. NeoX-style pairing: element `d`
+///    pairs with `d + half_dim`.
+/// 2. Write the rotated K and unrotated V into the paged KV cache
+///    at `slot_mapping[t]`. Slot id is global: `block_id =
+///    slot / block_size`, `block_offset = slot % block_size`.
+///
+/// Layout conventions (must match the Metal shader):
+/// - `q_in`, `q_out`: `[num_tokens, num_q_heads * head_dim]` row-major.
+/// - `k_in`, `v_in`: `[num_tokens, num_kv_heads * head_dim]` row-major.
+/// - `cos_table`, `sin_table`: `[max_pos, head_dim]` row-major; only
+///   the first `head_dim/2` columns of each row are read (matches the
+///   existing `cpu_golden::rope` convention).
+/// - `kv_cache_k`, `kv_cache_v`: `[num_blocks, num_kv_heads,
+///   block_size, head_dim]` row-major. The shader's KV cache is the
+///   same shape.
+/// - `slot_mapping`: `[num_tokens]` u32 — global cache slot id per
+///   token; the caller picks free slots before the call.
+///
+/// V is written un-rotated; only Q and K are rotated. This matches
+/// `Instruction::RopeAppend` semantics in `instr.rs` and the
+/// (currently unwritten) `rope_append_f16_specialized` shader.
+pub fn rope_append(
+    q_in: &[f32],
+    k_in: &[f32],
+    v_in: &[f32],
+    positions: &[u32],
+    slot_mapping: &[u32],
+    cos_table: &[f32],
+    sin_table: &[f32],
+    q_out: &mut [f32],
+    kv_cache_k: &mut [f32],
+    kv_cache_v: &mut [f32],
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+) {
+    let num_tokens = positions.len();
+    assert_eq!(slot_mapping.len(), num_tokens);
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    assert_eq!(q_in.len(), num_tokens * q_dim);
+    assert_eq!(q_out.len(), num_tokens * q_dim);
+    assert_eq!(k_in.len(), num_tokens * kv_dim);
+    assert_eq!(v_in.len(), num_tokens * kv_dim);
+    assert_eq!(cos_table.len(), sin_table.len());
+    assert_eq!(cos_table.len() % head_dim, 0);
+    let kv_cache_stride = num_kv_heads * block_size * head_dim;
+    assert_eq!(kv_cache_k.len() % kv_cache_stride, 0);
+    assert_eq!(kv_cache_v.len(), kv_cache_k.len());
+    let half_dim = head_dim / 2;
+
+    for t in 0..num_tokens {
+        let pos = positions[t] as usize;
+        let cos_row = &cos_table[pos * head_dim..pos * head_dim + head_dim];
+        let sin_row = &sin_table[pos * head_dim..pos * head_dim + head_dim];
+
+        // Rotate Q in place into q_out.
+        for h in 0..num_q_heads {
+            let base = t * q_dim + h * head_dim;
+            for d in 0..half_dim {
+                let x0 = q_in[base + d];
+                let x1 = q_in[base + half_dim + d];
+                let c = cos_row[d];
+                let s = sin_row[d];
+                q_out[base + d] = x0 * c - x1 * s;
+                q_out[base + half_dim + d] = x1 * c + x0 * s;
+            }
+        }
+
+        // Rotate K and write rotated K + unrotated V to the cache slot.
+        let slot = slot_mapping[t] as usize;
+        let block_id = slot / block_size;
+        let block_offset = slot % block_size;
+        for h in 0..num_kv_heads {
+            let kv_base = t * kv_dim + h * head_dim;
+            let cache_base = block_id * kv_cache_stride
+                + h * block_size * head_dim
+                + block_offset * head_dim;
+            // K: rotate.
+            for d in 0..half_dim {
+                let x0 = k_in[kv_base + d];
+                let x1 = k_in[kv_base + half_dim + d];
+                let c = cos_row[d];
+                let s = sin_row[d];
+                kv_cache_k[cache_base + d] = x0 * c - x1 * s;
+                kv_cache_k[cache_base + half_dim + d] = x1 * c + x0 * s;
+            }
+            // V: copy un-rotated.
+            for d in 0..head_dim {
+                kv_cache_v[cache_base + d] = v_in[kv_base + d];
+            }
+        }
+    }
+}
+
+/// Paged-cache decode attention.
+///
+/// Mirrors `Instruction::AttentionViaCache` (CUDA) and Metal
+/// `attention_via_cache_f16_specialized` (`shaders/attention.metal`).
+/// One Q token per sequence (`bucket_m == batch` for decode); reads K
+/// and V from the paged cache via the per-sequence `block_table` and
+/// `seq_used_k` length.
+///
+/// Layout conventions (must match the Metal shader):
+/// - `q`: `[batch, num_q_heads * head_dim]` row-major.
+/// - `kv_cache_k`, `kv_cache_v`: `[num_blocks, num_kv_heads,
+///   block_size, head_dim]` row-major.
+/// - `block_table`: `[batch, max_blocks_per_seq]` row-major u32 —
+///   logical-to-physical block map per sequence.
+/// - `seq_used_k`: `[batch]` u32 — kv-axis used length per sequence.
+/// - `output`: `[batch, num_q_heads * head_dim]` row-major.
+///
+/// Matches the metal shader's `inv_sum = 1 / (sum_exp + 1e-6)`
+/// epsilon — the CPU ref drifts from `cpu_golden::attention_decode`
+/// (which uses exact 1/sum_exp) only on this term, ensuring the
+/// per-bucket diff harness in 5.G.3 sees no spurious mismatch from
+/// numerical-guard differences.
+pub fn attention_via_cache(
+    q: &[f32],
+    kv_cache_k: &[f32],
+    kv_cache_v: &[f32],
+    block_table: &[u32],
+    seq_used_k: &[u32],
+    output: &mut [f32],
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    attn_scale: f32,
+) {
+    let batch = seq_used_k.len();
+    let q_dim = num_q_heads * head_dim;
+    assert_eq!(q.len(), batch * q_dim);
+    assert_eq!(output.len(), batch * q_dim);
+    assert_eq!(block_table.len(), batch * max_blocks_per_seq);
+    let kv_block_stride = num_kv_heads * block_size * head_dim;
+    assert_eq!(kv_cache_k.len() % kv_block_stride, 0);
+    assert_eq!(kv_cache_v.len(), kv_cache_k.len());
+    let group_ratio = num_q_heads / num_kv_heads;
+
+    for seq in 0..batch {
+        let kv_len = seq_used_k[seq] as usize;
+        let row_blocks = &block_table[seq * max_blocks_per_seq..(seq + 1) * max_blocks_per_seq];
+
+        for h in 0..num_q_heads {
+            let kv_h = h / group_ratio;
+            let q_off = seq * q_dim + h * head_dim;
+
+            let mut scores = vec![0.0_f32; kv_len];
+            for t in 0..kv_len {
+                let logical_block = t / block_size;
+                let block_offset = t % block_size;
+                let physical_block = row_blocks[logical_block] as usize;
+                let k_base = physical_block * kv_block_stride
+                    + kv_h * block_size * head_dim
+                    + block_offset * head_dim;
+                let mut dot = 0.0_f32;
+                for d in 0..head_dim {
+                    dot += q[q_off + d] * kv_cache_k[k_base + d];
+                }
+                scores[t] = dot * attn_scale;
+            }
+
+            let max_logit = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum_exp = 0.0_f32;
+            for s in &mut scores {
+                *s = (*s - max_logit).exp();
+                sum_exp += *s;
+            }
+            // +1e-6 epsilon matches the metal shader's inv_sum guard.
+            let inv_sum = 1.0 / (sum_exp + 1e-6);
+
+            for d in 0..head_dim {
+                let mut acc = 0.0_f32;
+                for t in 0..kv_len {
+                    let logical_block = t / block_size;
+                    let block_offset = t % block_size;
+                    let physical_block = row_blocks[logical_block] as usize;
+                    let v_base = physical_block * kv_block_stride
+                        + kv_h * block_size * head_dim
+                        + block_offset * head_dim;
+                    acc += scores[t] * inv_sum * kv_cache_v[v_base + d];
+                }
+                output[q_off + d] = acc;
+            }
+        }
+    }
+}
+
 /// Scaled dot-product attention (decode, single query token).
 ///
 /// - `q`: [1, num_heads * head_dim]
@@ -516,6 +712,219 @@ mod tests {
         assert!((out[0] - 0.0).abs() < 1e-5);
         assert!((out[1] - 1.4621172).abs() < 1e-4);
         assert!((out[2] - 0.26894143).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_rope_append_writes_paged_cache() {
+        // 1 token, num_q_heads = num_kv_heads = 1, head_dim = 4, block_size = 2.
+        // cos_table = identity-like (cos=1, sin=0) at pos=0 → no rotation.
+        // V is copied unrotated; K is rotated (which equals input since sin=0).
+        let head_dim = 4;
+        let half = head_dim / 2;
+        let block_size = 2;
+        let num_blocks = 3;
+        let num_q_heads = 1;
+        let num_kv_heads = 1;
+
+        let q_in = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let k_in = vec![5.0_f32, 6.0, 7.0, 8.0];
+        let v_in = vec![9.0_f32, 10.0, 11.0, 12.0];
+        let positions = vec![0u32];
+        // Pick slot 3 → block_id = 1, block_offset = 1 (block 1, second token).
+        let slot_mapping = vec![3u32];
+        // cos[0,d] = 1 for d in [0,half); sin[0,d] = 0.
+        let mut cos_table = vec![0.0_f32; head_dim];
+        for d in 0..half {
+            cos_table[d] = 1.0;
+        }
+        let sin_table = vec![0.0_f32; head_dim];
+
+        let mut q_out = vec![0.0_f32; q_in.len()];
+        let cache_elems = num_blocks * num_kv_heads * block_size * head_dim;
+        let mut kv_cache_k = vec![0.0_f32; cache_elems];
+        let mut kv_cache_v = vec![0.0_f32; cache_elems];
+
+        rope_append(
+            &q_in,
+            &k_in,
+            &v_in,
+            &positions,
+            &slot_mapping,
+            &cos_table,
+            &sin_table,
+            &mut q_out,
+            &mut kv_cache_k,
+            &mut kv_cache_v,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+        );
+
+        // No rotation → q_out equals q_in.
+        assert_eq!(q_out, q_in);
+        // Slot 3 = block_id 1, block_offset 1. Cache stride per block:
+        // num_kv_heads * block_size * head_dim = 1 * 2 * 4 = 8.
+        // Per-block layout: head 0, offset 0 [0..4], offset 1 [4..8].
+        // So slot 3 occupies kv_cache[1 * 8 + 0 * 8 + 1 * 4 + d] = idx 12..16.
+        assert_eq!(&kv_cache_k[12..16], &k_in[..]);
+        assert_eq!(&kv_cache_v[12..16], &v_in[..]);
+        // Other slots untouched.
+        for (i, &v) in kv_cache_k.iter().enumerate() {
+            if !(12..16).contains(&i) {
+                assert_eq!(v, 0.0, "kv_cache_k[{i}] should be untouched");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rope_append_actually_rotates() {
+        // 1 token, head_dim = 2, half = 1. cos = 0, sin = 1 → 90° rotation:
+        // (x0, x1) → (x0*cos - x1*sin, x1*cos + x0*sin) = (-x1, x0).
+        let head_dim = 2;
+        let q_in = vec![3.0_f32, 4.0]; // (x0, x1) = (3, 4)
+        let k_in = vec![5.0_f32, 6.0];
+        let v_in = vec![7.0_f32, 8.0];
+        let positions = vec![0u32];
+        let slot_mapping = vec![0u32];
+        // cos[0, 0] = 0; sin[0, 0] = 1.
+        let cos_table = vec![0.0_f32, 0.0]; // [max_pos=1, head_dim=2]
+        let sin_table = vec![1.0_f32, 0.0];
+
+        let mut q_out = vec![0.0; 2];
+        let mut kv_cache_k = vec![0.0; 1 * 1 * 1 * 2]; // 1 block, 1 kv_head, block_size=1, head_dim=2
+        let mut kv_cache_v = vec![0.0; 2];
+
+        rope_append(
+            &q_in,
+            &k_in,
+            &v_in,
+            &positions,
+            &slot_mapping,
+            &cos_table,
+            &sin_table,
+            &mut q_out,
+            &mut kv_cache_k,
+            &mut kv_cache_v,
+            1,
+            1,
+            head_dim,
+            1,
+        );
+        // q_out = (3*0 - 4*1, 4*0 + 3*1) = (-4, 3)
+        assert_eq!(q_out, vec![-4.0, 3.0]);
+        // K rotated similarly: (5, 6) → (-6, 5).
+        assert_eq!(kv_cache_k, vec![-6.0, 5.0]);
+        // V un-rotated.
+        assert_eq!(kv_cache_v, vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_attention_via_cache_matches_decode_ref() {
+        // 1 sequence, single head, head_dim=4, block_size=2,
+        // max_blocks_per_seq=2. Build a contiguous KV cache (block_table
+        // = [0, 1]) and verify attention_via_cache matches
+        // attention_decode for the same K/V data.
+        let head_dim = 4;
+        let block_size = 2;
+        let max_blocks = 2;
+        let num_q_heads = 1;
+        let num_kv_heads = 1;
+        let kv_len = 3; // tokens 0,1 in block 0; token 2 in block 1.
+
+        // q
+        let q = vec![1.0_f32, 0.0, 0.0, 0.0];
+        // contiguous K/V: [kv_len, head_dim]
+        let k_contig = vec![
+            1.0, 0.0, 0.0, 0.0, // t=0
+            0.0, 1.0, 0.0, 0.0, // t=1
+            1.0, 1.0, 0.0, 0.0, // t=2
+        ];
+        let v_contig = vec![
+            1.0, 2.0, 3.0, 4.0, // t=0
+            5.0, 6.0, 7.0, 8.0, // t=1
+            9.0, 10.0, 11.0, 12.0, // t=2
+        ];
+
+        // Pack into paged cache: 2 blocks × 1 kv_head × block_size × head_dim
+        let block_stride = num_kv_heads * block_size * head_dim;
+        let mut kv_cache_k = vec![0.0_f32; 2 * block_stride];
+        let mut kv_cache_v = vec![0.0_f32; 2 * block_stride];
+        for t in 0..kv_len {
+            let logical = t / block_size;
+            let off = t % block_size;
+            let dst = logical * block_stride + 0 * block_size * head_dim + off * head_dim;
+            kv_cache_k[dst..dst + head_dim].copy_from_slice(&k_contig[t * head_dim..(t + 1) * head_dim]);
+            kv_cache_v[dst..dst + head_dim].copy_from_slice(&v_contig[t * head_dim..(t + 1) * head_dim]);
+        }
+        let block_table = vec![0u32, 1];
+        let seq_used_k = vec![kv_len as u32];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut paged_out = vec![0.0_f32; head_dim];
+        attention_via_cache(
+            &q,
+            &kv_cache_k,
+            &kv_cache_v,
+            &block_table,
+            &seq_used_k,
+            &mut paged_out,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            max_blocks,
+            scale,
+        );
+
+        // Compare against contiguous attention_decode (which has no
+        // +1e-6 guard) — at well-conditioned softmax sums the
+        // difference is negligible (sum_exp >> 1e-6 here).
+        let mut ref_out = vec![0.0_f32; head_dim];
+        attention_decode(
+            &q,
+            &k_contig,
+            &v_contig,
+            &mut ref_out,
+            kv_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+        );
+        for (i, (&p, &r)) in paged_out.iter().zip(ref_out.iter()).enumerate() {
+            assert!(
+                (p - r).abs() < 1e-4,
+                "paged vs contig mismatch at d={i}: paged={p} contig={r}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_attention_via_cache_zero_kv_len() {
+        // seq_used_k = 0 → no KV tokens. Output is all-zeros after
+        // the weighted-sum loop runs zero iterations.
+        let mut output = vec![123.0_f32; 4];
+        let q = vec![1.0_f32; 4];
+        let kv_cache_k = vec![0.0_f32; 8]; // 1 block × 1 head × bs=2 × hd=4
+        let kv_cache_v = vec![0.0_f32; 8];
+        attention_via_cache(
+            &q,
+            &kv_cache_k,
+            &kv_cache_v,
+            &[0u32, 0],
+            &[0u32],
+            &mut output,
+            1,
+            1,
+            4,
+            2,
+            2,
+            0.5,
+        );
+        for v in &output {
+            assert_eq!(*v, 0.0);
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@ extern crate ferrite_model_deepseek_v3_flat as _keep_deepseek_v3_flat;
 extern crate ferrite_model_gemma2 as _keep_gemma2;
 #[cfg(feature = "arch-gemma3")]
 extern crate ferrite_model_gemma3 as _keep_gemma3;
+#[cfg(feature = "arch-gemma3-mm")]
+extern crate ferrite_model_gemma3_mm as _keep_gemma3_mm;
 #[cfg(feature = "arch-granite")]
 extern crate ferrite_model_granite as _keep_granite;
 #[cfg(feature = "arch-llama")]
@@ -36,12 +38,12 @@ extern crate ferrite_model_modernbert as _keep_modernbert;
 extern crate ferrite_model_phi3 as _keep_phi3;
 #[cfg(feature = "arch-qwen2")]
 extern crate ferrite_model_qwen2 as _keep_qwen2;
+#[cfg(feature = "arch-qwen2-5-vl")]
+extern crate ferrite_model_qwen2_5_vl as _keep_qwen2_5_vl;
 #[cfg(feature = "arch-qwen2-moe")]
 extern crate ferrite_model_qwen2_moe as _keep_qwen2_moe;
 #[cfg(feature = "arch-qwen2-vl")]
 extern crate ferrite_model_qwen2_vl as _keep_qwen2_vl;
-#[cfg(feature = "arch-qwen2-5-vl")]
-extern crate ferrite_model_qwen2_5_vl as _keep_qwen2_5_vl;
 #[cfg(feature = "arch-qwen3")]
 extern crate ferrite_model_qwen3 as _keep_qwen3;
 #[cfg(feature = "arch-qwen3-moe")]
@@ -59,6 +61,8 @@ pub use ferrite_model_deepseek_v3_flat as deepseek_v3_flat;
 pub use ferrite_model_gemma2 as gemma2;
 #[cfg(feature = "arch-gemma3")]
 pub use ferrite_model_gemma3 as gemma3;
+#[cfg(feature = "arch-gemma3-mm")]
+pub use ferrite_model_gemma3_mm as gemma3_mm;
 #[cfg(feature = "arch-granite")]
 pub use ferrite_model_granite as granite;
 #[cfg(feature = "arch-llama")]
@@ -73,12 +77,12 @@ pub use ferrite_model_modernbert as modernbert;
 pub use ferrite_model_phi3 as phi3;
 #[cfg(feature = "arch-qwen2")]
 pub use ferrite_model_qwen2 as qwen2;
+#[cfg(feature = "arch-qwen2-5-vl")]
+pub use ferrite_model_qwen2_5_vl as qwen2_5_vl;
 #[cfg(feature = "arch-qwen2-moe")]
 pub use ferrite_model_qwen2_moe as qwen2_moe;
 #[cfg(feature = "arch-qwen2-vl")]
 pub use ferrite_model_qwen2_vl as qwen2_vl;
-#[cfg(feature = "arch-qwen2-5-vl")]
-pub use ferrite_model_qwen2_5_vl as qwen2_5_vl;
 #[cfg(feature = "arch-qwen3")]
 pub use ferrite_model_qwen3 as qwen3;
 #[cfg(feature = "arch-qwen3-moe")]

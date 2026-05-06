@@ -17,8 +17,6 @@ pub mod embedding;
 pub mod gptq_config;
 #[cfg(feature = "guided-decoding")]
 pub mod grammar;
-#[cfg(feature = "multimodal")]
-pub mod image;
 pub mod layers;
 pub mod lora;
 pub mod process_group;

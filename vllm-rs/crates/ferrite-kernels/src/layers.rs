@@ -918,6 +918,26 @@ impl LinearLayer {
         Ok(Self::Dense(Linear::load(weights, prefix)?))
     }
 
+    /// Load an `nn.Parameter`-style weight by its verbatim safetensors
+    /// key (no `.weight` / `.bias` suffix). Used for matmul-natural
+    /// `[K, N]` parameters that ship outside the `nn.Linear`
+    /// convention — Gemma3 MM projector's
+    /// `multi_modal_projector.mm_input_projection_weight` is the
+    /// motivating example. No bias.
+    ///
+    /// HF stores such params as `[K, N]` (the matmul-natural shape, since
+    /// they're consumed via `act @ param`). ferrite's gemm expects
+    /// `[N, K]` (PyTorch nn.Linear convention). We transpose at CPU side
+    /// before upload so the runtime weight matches the gemm convention.
+    /// Shape inference declares the matmul-natural `[K, N]` shape (same
+    /// way nn.Linear weights are declared), keeping the DSL surface
+    /// uniform.
+    pub fn load_raw(weights: &mut GpuWeights, key: &str) -> Result<Self> {
+        weights.transpose_2d_in_place(key)?;
+        let weight = weights.take(key)?;
+        Ok(Self::Dense(Linear::new(weight, None)))
+    }
+
     /// Load a linear layer that may be either dense (safetensors) or
     /// GGUF-quantized. Tries `take_quantized_linear` first; falls back
     /// to `load_dense` when the prefix isn't quantized in the

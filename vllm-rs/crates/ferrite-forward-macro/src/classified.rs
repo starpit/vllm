@@ -121,6 +121,19 @@ pub enum ExternKind {
     /// before the splice into the language-model embedding stream.
     /// Opaque rank-1.
     ReverseIndices,
+    /// Per-row position index for the SigLIP-style learned position
+    /// embedding lookup, shape `[num_tokens]` u32. Built host-side as
+    /// `[0..num_pos, 0..num_pos, ...]` (num_pos = `vision_num_positions`)
+    /// repeated for each image in the batch — fixed-size SigLIP at
+    /// 896² always has `num_tokens % num_pos == 0`. Drives the
+    /// vision-prelude `pos_embed(position_ids, embeddings.position_embedding)`
+    /// that gathers positional rows from a learned table the same way
+    /// `embed(input_ids, embed_tokens)` does on the decoder side. Used
+    /// by Gemma3-MM (SigLIP) and any future tower with a learned
+    /// positional embedding (LLaVA / InternVL); bypasses the
+    /// `Embed` OpKind because that one anchors on `vocab_size` /
+    /// `hidden_size` bounds that don't apply to a vision tower.
+    PositionIds,
 }
 
 /// Which DSL prelude (extern + op name set) is in scope when a
@@ -178,6 +191,7 @@ impl ExternKind {
             (Prelude::Vision, "max_seqlen_window") => Some(Self::MaxSeqlenWindow),
             (Prelude::Vision, "window_index") => Some(Self::WindowIndex),
             (Prelude::Vision, "reverse_indices") => Some(Self::ReverseIndices),
+            (Prelude::Vision, "position_ids") => Some(Self::PositionIds),
             _ => None,
         }
     }
@@ -387,6 +401,36 @@ pub enum OpKind {
     /// window order on encoder entry, and the merger output is
     /// gather-permuted back to natural order at exit.
     EmbeddingGather,
+    /// 2-D non-overlapping average-pool over the patch grid:
+    /// `out = avg_pool_2d(x: [L, e]) -> [L / vision_pool_factor, e]`.
+    ///
+    /// Models the Gemma3-MM SigLIP→text projector, which reshapes the
+    /// flat patch grid `[ph², e]` to `[ph, ph, e]`, applies a stride-k
+    /// k×k AvgPool2d (k = `vision_pool_kernel`), and flattens back to
+    /// `[(ph/k)², e]`. The k² spatial cells contributing to each output
+    /// row are NOT contiguous in row-major `[ph², e]` — they're spread
+    /// across k different rows separated by `ph` row-strides — so the
+    /// pool can't be expressed as `reshape + mean + gather` over
+    /// existing ops; it needs its own kernel that walks the 2-D grid.
+    ///
+    /// Shape: leading dim divides by `vision_pool_factor = k * k`
+    /// (`Dim::Div`); trailing dim is preserved. The kernel reads
+    /// `vision_patch_grid_side` and `vision_pool_kernel` off
+    /// `CanonicalParams` so it can convert flat-row index → (row, col)
+    /// and walk the k² source cells per output row.
+    AvgPool2d,
+    /// Vision-tower learned positional embedding lookup:
+    /// `pos_embed(position_ids, weight) -> [num_tokens, vision_embed_dim]`.
+    /// Mirror of [`Self::Embed`] but anchored on
+    /// `vision_num_positions` / `vision_embed_dim` instead of
+    /// `vocab_size` / `hidden_size`. Used by SigLIP-style encoders
+    /// (Gemma3-MM today, LLaVA / InternVL on the horizon) where the
+    /// patch-embed Conv2d output gets a learned per-position bias
+    /// added before the encoder blocks. The `position_ids` arg is the
+    /// vision-prelude [`ExternKind::PositionIds`] extern; the runtime
+    /// reuses `kernels::embedding_gather_masked` (the same kernel
+    /// `Instruction::Embed` calls) reading `ctx.fwd.position_ids`.
+    PosEmbed,
 }
 
 impl OpKind {
@@ -428,6 +472,8 @@ impl OpKind {
             "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
             "embedding_gather" => Some(Self::EmbeddingGather),
+            "avg_pool_2d" => Some(Self::AvgPool2d),
+            "pos_embed" => Some(Self::PosEmbed),
             _ => None,
         }
     }
@@ -472,6 +518,8 @@ impl OpKind {
             // `OpKind::LoadPixels` doc-comment. No DSL surface.
             Self::LoadPixels => "load_pixels",
             Self::EmbeddingGather => "embedding_gather",
+            Self::AvgPool2d => "avg_pool_2d",
+            Self::PosEmbed => "pos_embed",
         }
     }
 }
@@ -504,6 +552,20 @@ pub struct Program {
     /// safetensors prefix conventions (`model.layers.<L>.<x>` vs
     /// `visual.blocks.<L>.<x>`), reshape `nt` source, etc.
     pub prelude: Prelude,
+    /// On-disk safetensors layout for vision-prelude programs.
+    /// Populated by `compile_common` from the arch's representative
+    /// config (`vision_safetensors_layout` JSON field). `None` for
+    /// decoder programs and for vision configs that omit the field —
+    /// codegen falls back to
+    /// [`crate::config::VisionSafetensorsLayout::qwen_default`].
+    pub vision_layout: Option<crate::config::VisionSafetensorsLayout>,
+    /// Decoder-side safetensors prefix to prepend to every text-decoder
+    /// safetensors key. Populated by `compile_common` from the arch's
+    /// representative config (`decoder_safetensors_prefix` JSON field).
+    /// `None` for text-only and Qwen-style VL arches; `Some("language_model")`
+    /// for Gemma3-MM-style multimodal where HF nests the text decoder
+    /// under `language_model.<...>`.
+    pub decoder_safetensors_prefix: Option<String>,
 }
 
 /// Side table: `LocalId` → debug ident.

@@ -433,6 +433,7 @@ impl CudaModel {
                     vision_max_seqlen_window: None,
                     vision_window_index: None,
                     vision_reverse_indices: None,
+                    vision_position_ids: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -642,6 +643,7 @@ impl CudaModel {
                     vision_max_seqlen_window: None,
                     vision_window_index: None,
                     vision_reverse_indices: None,
+                    vision_position_ids: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -8769,7 +8771,23 @@ impl CudaWorker {
                     // the pre-built 1D `gpu_positions` (broadcast path).
                     let per_req_mm =
                         Self::build_per_req_mm_seq_info(model, &self.mm_data_buffers, &prepared);
-                    let gpu_positions_2d = if !per_req_mm.is_empty() {
+                    // MRoPE override is per-arch — Qwen2-VL family
+                    // packs (T, H, W) per token so MM tokens carry grid
+                    // coords; Gemma3-MM / LLaVA-class use standard 1D
+                    // RoPE in the text decoder and must keep the
+                    // prebuilt sequence positions. The flag rides on
+                    // `MultimodalForward::mm_metadata().mrope_positions`,
+                    // declared per-arch on `pub const PROCESSOR:
+                    // ferrite_vision::MmMetadata`.
+                    let mrope = if let CudaModel::Ferrite(fm) = model {
+                        fm.mm
+                            .as_ref()
+                            .map(|m| m.mm_metadata().mrope_positions)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    let gpu_positions_2d = if mrope && !per_req_mm.is_empty() {
                         let pos_2d = Self::build_mrope_positions_2d(&prepared, &per_req_mm);
                         let mut t = Self::h2d_u32(&pos_2d, device)?;
                         unsafe { t.reshape(&[3, total_tokens], GpuDType::U32) };

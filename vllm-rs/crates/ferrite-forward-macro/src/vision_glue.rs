@@ -68,6 +68,7 @@ pub fn emit_per_variant(
     arch_name: &str,
     pixel_pack: Option<&syn::Path>,
     pad_to_mult8: &[PadHint],
+    processor: &syn::Path,
 ) -> TokenStream {
     let embed_dim = bound(model, "vision_embed_dim") as u32;
     let depth = bound(model, "vision_depth") as u32;
@@ -78,6 +79,28 @@ pub fn emit_per_variant(
     let in_chans = bound(model, "vision_in_chans") as u32;
     let d_model = bound(model, "d_model") as u32;
     let eps = norm_eps(model) as f32;
+
+    // d_model fingerprint: per-arch on-disk weight + dim that
+    // `try_load_mm` reads to discriminate among variants. Default
+    // is Qwen's `visual.merger.mlp.2.weight` dim 0 — every existing
+    // Qwen2-VL / Qwen2.5-VL config keeps that path byte-identically.
+    let fingerprint = model
+        .vision_d_model_fingerprint
+        .clone()
+        .unwrap_or_else(crate::config::VisionDModelFingerprint::qwen_default);
+    let fp_key_lit = syn::LitStr::new(&fingerprint.key, proc_macro2::Span::call_site());
+    let fp_dim_lit = proc_macro2::Literal::usize_unsuffixed(fingerprint.dim);
+
+    // Patch-embed flatten target: per-arch on-disk conv weight that
+    // ships in 4D (SigLIP `[E, C, P, P]`) or 5D (Qwen `[E, C, T, P, P]`)
+    // form. We multiply every dim after `leading_dim` to land at a
+    // dense 2D `[d_lead, prod_after]`. Default is Qwen's 5D path.
+    let flatten = model
+        .vision_patch_embed_flatten
+        .clone()
+        .unwrap_or_else(crate::config::VisionPatchEmbedFlatten::qwen_default);
+    let flatten_key_lit = syn::LitStr::new(&flatten.key, proc_macro2::Span::call_site());
+    let flatten_lead_lit = proc_macro2::Literal::usize_unsuffixed(flatten.leading_dim);
 
     let embed_dim_lit = proc_macro2::Literal::u32_unsuffixed(embed_dim);
     let depth_lit = proc_macro2::Literal::u32_unsuffixed(depth);
@@ -98,12 +121,19 @@ pub fn emit_per_variant(
     // side before any `Weights::load` runs. Top-level (non-per-block)
     // pads aren't needed today; add a `top_level: bool` PadHint field
     // when a future arch requires it.
+    let layered_prefix = {
+        let layout = model
+            .vision_layout
+            .clone()
+            .unwrap_or_else(crate::config::VisionSafetensorsLayout::qwen_default);
+        format!("{}.{}", layout.default_root, layout.layered_subpath)
+    };
     let pad_calls: Vec<TokenStream> = pad_to_mult8
         .iter()
         .map(|hint| {
             let stem = &hint.weight;
             let dim_lit = proc_macro2::Literal::usize_unsuffixed(hint.dim);
-            let template = format!("visual.blocks.{{l}}.{stem}.weight");
+            let template = format!("{layered_prefix}.{{l}}.{stem}.weight");
             let template_lit = syn::LitStr::new(&template, proc_macro2::Span::call_site());
             quote! {
                 for __l in 0..#depth_lit {
@@ -165,6 +195,21 @@ pub fn emit_per_variant(
         }
     });
 
+    // Learned positional embedding override (G.7(c.1)): arches with a
+    // `vision_num_positions` bound (SigLIP / Gemma3-MM family) override
+    // the trait default `None` to return `Some(num_pos)`. The
+    // VisionWrapper reads this at request time and uploads
+    // `[0..N, 0..N, ...]` as `vision_position_ids` so the body's
+    // `pos_embed(...)` call has its index buffer.
+    let pos_embed_method = model.bounds.get("vision_num_positions").map(|num_pos| {
+        let lit = proc_macro2::Literal::u32_unsuffixed(*num_pos as u32);
+        quote! {
+            fn vision_num_positions() -> ::std::option::Option<u32> {
+                ::std::option::Option::Some(#lit)
+            }
+        }
+    });
+
     quote! {
         impl ::ferrite_forward::VisionArchWeights for Weights {
             fn vision_config(&self) -> &'static ::ferrite_vision::VisionConfig {
@@ -182,9 +227,15 @@ pub fn emit_per_variant(
                 &C
             }
 
+            fn mm_metadata() -> &'static ::ferrite_vision::MmMetadata {
+                &#processor
+            }
+
             #pixel_pack_method
 
             #windowed_attn_method
+
+            #pos_embed_method
 
             unsafe fn vision_forward(
                 &self,
@@ -211,27 +262,29 @@ pub fn emit_per_variant(
         ) -> ::anyhow::Result<::std::option::Option<
             ::std::boxed::Box<dyn ::ferrite_forward::MultimodalForward>,
         >> {
-            // Sniff the merger's output dim — that's d_model.
-            let merger2 = match gw.tensor_shape_any("visual.merger.mlp.2.weight") {
+            // Sniff the per-arch d_model fingerprint key + dim —
+            // discriminates among variants of one vision arch.
+            // Default (Qwen): `visual.merger.mlp.2.weight` dim 0.
+            let fp_shape = match gw.tensor_shape_any(#fp_key_lit) {
                 ::std::option::Option::Some(s) => s,
                 ::std::option::Option::None => return ::std::result::Result::Ok(::std::option::Option::None),
             };
-            if merger2.first().copied() != ::std::option::Option::Some(#d_model_usize_lit) {
+            if fp_shape.get(#fp_dim_lit).copied() != ::std::option::Option::Some(#d_model_usize_lit) {
                 return ::std::result::Result::Ok(::std::option::Option::None);
             }
-            // patch_embed.proj.weight ships as 5D `[E, C, T, P, P]`
-            // on disk; flatten to `[E, C*T*P*P]` so the macro's
-            // `LinearLayer::load_dense_or_ggml` reads a dense 2D
-            // weight (it has no shape-override entry point).
+            // Patch-embed conv weight ships as 4D (SigLIP) or 5D
+            // (Qwen) on disk; flatten dims after `leading_dim` into
+            // one row so the macro's `LinearLayer::load_dense_or_ggml`
+            // reads a dense 2D `[d_lead, prod_rest]` (no shape-
+            // override entry point on the loader). No-op if the
+            // tensor is already 2D.
             if let ::std::option::Option::Some(pe) =
-                gw.tensor_shape_any("visual.patch_embed.proj.weight")
+                gw.tensor_shape_any(#flatten_key_lit)
             {
-                if pe.len() == 5 {
-                    let flat = pe[1] * pe[2] * pe[3] * pe[4];
-                    gw.reshape_in_place(
-                        "visual.patch_embed.proj.weight",
-                        &[pe[0], flat],
-                    )?;
+                if pe.len() > 2 {
+                    let lead = pe[#flatten_lead_lit];
+                    let rest: usize = pe.iter().skip(#flatten_lead_lit + 1).product();
+                    gw.reshape_in_place(#flatten_key_lit, &[lead, rest])?;
                 }
             }
             #pad_prelude
@@ -256,6 +309,7 @@ pub fn emit_per_variant(
                 gguf_archs: &[],
                 tp_world_size: 1,
                 try_load_mm,
+                mm_metadata: #processor,
             }
         }
         #[cfg(feature = "nccl")]
@@ -266,6 +320,7 @@ pub fn emit_per_variant(
                 gguf_archs: &[],
                 tp_world_size: 2,
                 try_load_mm,
+                mm_metadata: #processor,
             }
         }
         #[cfg(feature = "nccl")]
@@ -276,6 +331,7 @@ pub fn emit_per_variant(
                 gguf_archs: &[],
                 tp_world_size: 4,
                 try_load_mm,
+                mm_metadata: #processor,
             }
         }
         #[cfg(feature = "nccl")]
@@ -286,6 +342,7 @@ pub fn emit_per_variant(
                 gguf_archs: &[],
                 tp_world_size: 8,
                 try_load_mm,
+                mm_metadata: #processor,
             }
         }
     }

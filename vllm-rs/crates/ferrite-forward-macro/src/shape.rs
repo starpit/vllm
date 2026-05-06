@@ -466,6 +466,13 @@ pub fn apply_signature(
         // u32 of length L), so unification against x's leading dim
         // would fail — we don't try.
         OpKind::EmbeddingGather => sig_embedding_gather(solver, inputs),
+        // AvgPool2d divides the leading dim by `vision_pool_factor`
+        // (= `vision_pool_kernel`²). Trailing dim preserved.
+        OpKind::AvgPool2d => sig_avg_pool_2d(solver, inputs),
+        // Vision learned positional embedding lookup. Mirror of
+        // `Embed` but anchored on `vision_num_positions` /
+        // `vision_embed_dim`.
+        OpKind::PosEmbed => sig_pos_embed(solver, inputs),
     }
 }
 
@@ -486,6 +493,28 @@ fn sig_embed(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError>
     solver.unify(&table[1], &Dim::Bound("hidden_size".into()))?;
     let mut output = ids.clone();
     output.push(Dim::Bound("hidden_size".into()));
+    Ok(OpSig { output })
+}
+
+/// `pos_embed(position_ids: [num_tokens], table: [vision_num_positions,
+/// vision_embed_dim])` → `[num_tokens, vision_embed_dim]`. Mirror of
+/// [`sig_embed`] but anchored on the vision-side bound names so the
+/// SigLIP positional table doesn't try to unify with `vocab_size` /
+/// `hidden_size`.
+fn sig_pos_embed(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::PosEmbed, inputs, 2)?;
+    let ids = &inputs[0];
+    let table = &inputs[1];
+    if table.len() != 2 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::PosEmbed,
+            reason: format!("pos_embed weight must have rank 2, got {}", table.len()),
+        });
+    }
+    solver.unify(&table[0], &Dim::Bound("vision_num_positions".into()))?;
+    solver.unify(&table[1], &Dim::Bound("vision_embed_dim".into()))?;
+    let mut output = ids.clone();
+    output.push(Dim::Bound("vision_embed_dim".into()));
     Ok(OpSig { output })
 }
 
@@ -700,6 +729,30 @@ fn sig_embedding_gather(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig,
     Ok(OpSig { output: x.clone() })
 }
 
+/// `avg_pool_2d(x: [L, e])` → `[L / vision_pool_factor, e]`. The
+/// leading dim is divided by the bake-time `vision_pool_factor`
+/// (`= vision_pool_kernel * vision_pool_kernel`); the trailing dim is
+/// preserved. The Div is kept symbolic — `eval_closed_dim` reduces it
+/// to a concrete integer at codegen time once the bound is bound to
+/// its config value.
+fn sig_avg_pool_2d(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::AvgPool2d, inputs, 1)?;
+    let x = &inputs[0];
+    if x.len() != 2 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::AvgPool2d,
+            reason: format!("input must have rank 2 ([L, e]), got rank {}", x.len()),
+        });
+    }
+    let pooled_l = Dim::Div(
+        Box::new(x[0].clone()),
+        Box::new(Dim::Bound("vision_pool_factor".into())),
+    );
+    Ok(OpSig {
+        output: vec![pooled_l, x[1].clone()],
+    })
+}
+
 /// `mla_split(kv_a: [T, kv_lora_rank + qk_rope_head_dim])` → (used as
 /// single-output sig by `apply_signature`; actual 2-tuple binding happens
 /// in `Stmt::AssignTuple` which calls this path first for validation).
@@ -859,6 +912,13 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // (no rank assertion via this table — extern_shape arms carry
         // empty Shape for the indices externs).
         OpKind::EmbeddingGather => &[],
+        // AvgPool2d takes one activation input ([L, e]); no tensor
+        // weight args.
+        OpKind::AvgPool2d => &[],
+        // PosEmbed: arg 0 is the position_ids extern (rank-1, no
+        // assertion via this table — the extern_shape arm handles it),
+        // arg 1 is the rank-2 weight table.
+        OpKind::PosEmbed => &[(1, 2)],
     }
 }
 
@@ -922,6 +982,11 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         ExternKind::MaxSeqlenWindow => vec![],
         ExternKind::WindowIndex => vec![],
         ExternKind::ReverseIndices => vec![],
+        // SigLIP-style positional-embedding indices, shape
+        // `[num_tokens]`. Built host-side as `[0..N, 0..N, ...]`
+        // (N = `vision_num_positions`) per image; consumed by
+        // `OpKind::PosEmbed` via `kernels::embedding_gather_masked`.
+        ExternKind::PositionIds => vec![Dim::Bound("num_tokens".into())],
     }
 }
 
@@ -2292,6 +2357,39 @@ mod tests {
         let x = vec![bound("num_tokens"), bound("vision_embed_dim")];
         let err = apply_signature(&mut solver, OpKind::EmbeddingGather, &[x]);
         assert!(matches!(err, Err(ShapeError::ArgCount { .. })));
+    }
+
+    #[test]
+    fn avg_pool_2d_divides_leading_dim_by_pool_factor() {
+        // G.7(b) contract: `avg_pool_2d([L, e]) -> [L /
+        // vision_pool_factor, e]`. The Div is symbolic; codegen
+        // resolves it via `eval_closed_dim` once the bound is concrete.
+        let mut solver = Solver::new();
+        let x = vec![bound("num_tokens"), bound("vision_embed_dim")];
+        let sig = apply_signature(&mut solver, OpKind::AvgPool2d, &[x]).expect("avg_pool_2d sig");
+        assert_eq!(sig.output.len(), 2);
+        assert_eq!(
+            sig.output[0],
+            Dim::Div(
+                Box::new(bound("num_tokens")),
+                Box::new(bound("vision_pool_factor"))
+            )
+        );
+        assert_eq!(sig.output[1], bound("vision_embed_dim"));
+    }
+
+    #[test]
+    fn avg_pool_2d_requires_rank_2_input() {
+        let mut solver = Solver::new();
+        let x = vec![bound("num_tokens")];
+        let err = apply_signature(&mut solver, OpKind::AvgPool2d, &[x]);
+        assert!(matches!(err, Err(ShapeError::BadArgs { .. })));
+    }
+
+    #[test]
+    fn avg_pool_2d_round_trips_through_op_name() {
+        assert_eq!(OpKind::AvgPool2d.as_str(), "avg_pool_2d");
+        assert_eq!(OpKind::from_name("avg_pool_2d"), Some(OpKind::AvgPool2d));
     }
 
     #[test]

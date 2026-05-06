@@ -280,6 +280,23 @@ pub fn insert_lm_head_allgather(fuf: &mut Fuf, program: &Program, tp_world_size:
 /// `Instruction::Embed::eval`, which was wrong at tp>1 (every
 /// rank's D2D overwrite got summed by the post-Embed AllReduce,
 /// multiplying mm_embeds by `tp_world_size`).
+///
+/// **Embed-scale handling (Gemma2/Gemma3 family).** The DSL `embed(ids,
+/// embed_tokens) * sqrt(hidden_size)` lowers to `Embed → Mul(scalar)`.
+/// HF semantics (`Gemma3TextScaledWordEmbedding` + `masked_scatter` at
+/// `transformers/models/gemma3/modeling_gemma3.py:907-913`): the scale
+/// applies ONLY to text positions; image-feature replacement happens
+/// AFTER scaling. To match, walk past any single-consumer scalar `Mul`
+/// (`x * scalar` — claimed by `ScalarMulImpl`) before injecting the
+/// splice, so the splice writes UN-scaled image features into the
+/// already-scaled text-embedding buffer. Without this, image features
+/// get multiplied by ~50× through the residual stream — RMSNorm at the
+/// next layer divides the scale out for attention input, but every
+/// block's residual add re-introduces the over-scaled `hidden_states`,
+/// drowning out attention's contribution at image positions. End
+/// effect: image content is functionally invisible to the LM, so
+/// outputs are independent of which image was sent (R1 red and R2 blue
+/// produce byte-identical first-token logits when the bug is live).
 pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
     let mut insertions: Vec<TileId> = Vec::new();
     for node in &fuf.nodes {
@@ -296,7 +313,12 @@ pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
                 _ => None,
             }
         });
-        insertions.push(reduce_id.unwrap_or(embed_id));
+        let after_reduce = reduce_id.unwrap_or(embed_id);
+        // Skip past an embedding-scale Mul (`x * scalar`) so the
+        // splice writes after scaling, matching HF's masked_scatter
+        // ordering. See doc comment above for why this matters.
+        let after_scale = scalar_mul_consumer(fuf, after_reduce).unwrap_or(after_reduce);
+        insertions.push(after_scale);
     }
 
     for src_id in insertions {
@@ -313,6 +335,32 @@ pub fn insert_mm_splices(fuf: &mut Fuf, _program: &Program) {
         });
         rewire_consumers(fuf, src_id, new_id);
     }
+}
+
+/// Find a downstream `OpKind::Mul` whose inputs are exactly one Tile
+/// from `src_id` and one Scalar — i.e. the `x * scalar` pattern that
+/// `ScalarMulImpl` claims. Returns the Mul's TileId so the caller can
+/// place a splice after it. Returns `None` if no such consumer exists.
+fn scalar_mul_consumer(fuf: &Fuf, src_id: TileId) -> Option<TileId> {
+    fuf.nodes.iter().find_map(|n| {
+        if n.op != OpKind::Mul || n.inputs.len() != 2 {
+            return None;
+        }
+        let mut tile_from_src = false;
+        let mut has_scalar = false;
+        for inp in &n.inputs {
+            match inp {
+                FufInput::Tile { id, .. } if *id == src_id => tile_from_src = true,
+                FufInput::Scalar(_) => has_scalar = true,
+                _ => return None,
+            }
+        }
+        if tile_from_src && has_scalar {
+            Some(n.id)
+        } else {
+            None
+        }
+    })
 }
 
 /// Rewire every consumer of `(old_id, slot 0)` to read `(new_id,
@@ -356,6 +404,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         }
     }
 
@@ -718,6 +768,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
         let original_count = fuf.nodes.len();
 
@@ -801,6 +853,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
         let original_count = fuf.nodes.len();
         insert_lm_head_allgather(&mut fuf, &program, 1);
@@ -841,6 +895,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
         let original_count = fuf.nodes.len();
         insert_lm_head_allgather(&mut fuf, &program, 4);
@@ -909,6 +965,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let original_count = fuf.nodes.len();
@@ -974,6 +1032,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
         let original_count = fuf.nodes.len();
         insert_all_reduces(&mut fuf, &program, 4);
@@ -1051,6 +1111,8 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let original_count = fuf.nodes.len();

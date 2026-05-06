@@ -94,6 +94,107 @@ pub struct ModelParams {
     /// arch (the rope kernel takes the legacy 1D-positions path).
     /// See `~/.claude/plans/distributed-mapping-map.md` Phase A/B.
     pub mrope_section: Option<[u32; 3]>,
+    /// On-disk safetensors prefix layout for a vision tower. `None`
+    /// for text-only configs and for vision configs that omit the
+    /// `vision_safetensors_layout` JSON field — codegen falls back to
+    /// the Qwen-default layout (`visual` / `blocks` / no subtrees).
+    /// Per-arch fields: `default_root` is the unindexed-weight root,
+    /// `layered_subpath` is appended for indexed weights, and
+    /// `subtrees` overrides the prefix for DSL paths whose first
+    /// segment matches a key (e.g. Gemma3's `mm.*` → on-disk
+    /// `multi_modal_projector.*`, sibling of `vision_tower`).
+    pub vision_layout: Option<VisionSafetensorsLayout>,
+    /// Vision d_model fingerprint: which on-disk weight name + dim
+    /// the per-variant `try_load_mm` reads to discriminate among
+    /// variants of the same arch. `None` falls back to Qwen's
+    /// `visual.merger.mlp.2.weight` dim 0. Required only for
+    /// non-Qwen-default MM arches.
+    pub vision_d_model_fingerprint: Option<VisionDModelFingerprint>,
+    /// Vision patch-embed flatten target: which on-disk weight to
+    /// flatten in-place on the CPU side before `LinearLayer::load`
+    /// reads it. `key` is the on-disk safetensors name; `leading_dim`
+    /// is the axis count to keep — every dim after it gets multiplied
+    /// into one flat row (handles 4D `[E, C, P, P]` SigLIP and 5D
+    /// `[E, C, T, P, P]` Qwen uniformly). `None` falls back to Qwen's
+    /// `visual.patch_embed.proj.weight` leading_dim 0 (today's
+    /// hardcoded 5D behavior).
+    pub vision_patch_embed_flatten: Option<VisionPatchEmbedFlatten>,
+    /// Decoder-side safetensors prefix to prepend to every text-decoder
+    /// safetensors key. `None` for text-only and Qwen-style VL arches
+    /// where the text decoder ships at top-level (`model.layers.<L>.<...>`,
+    /// `lm_head.weight`, `model.embed_tokens.weight`). `Some("language_model")`
+    /// for Gemma3-MM-style multimodal arches where HF nests the text
+    /// decoder under `language_model.<...>` alongside `vision_tower.<...>`
+    /// and `multi_modal_projector.<...>`. Read from the per-variant
+    /// `decoder_safetensors_prefix` JSON field; threaded through
+    /// `Program::decoder_safetensors_prefix` and consumed by
+    /// [`crate::codegen::safetensors_prefix`] under `Prelude::Decoder`.
+    pub decoder_safetensors_prefix: Option<String>,
+}
+
+/// On-disk safetensors layout for a vision tower. Drives
+/// [`crate::codegen::safetensors_prefix`] for `Prelude::Vision`
+/// programs. Field semantics in [`ModelParams::vision_layout`].
+#[derive(Clone, Debug)]
+pub struct VisionSafetensorsLayout {
+    /// Disk root for unindexed weights (e.g. `visual` for Qwen2-VL,
+    /// `vision_tower.vision_model` for Gemma3-MM SigLIP).
+    pub default_root: String,
+    /// Suffix appended after `default_root` for indexed (per-block)
+    /// weights — e.g. `blocks` (Qwen2-VL: `visual.blocks.{l}.*`),
+    /// `encoder.layers` (Gemma3-MM: `vision_tower.vision_model.encoder.layers.{l}.*`).
+    pub layered_subpath: String,
+    /// First-DSL-segment → disk-prefix overrides for sibling
+    /// subtrees. Lookups treat the matching subtree as unindexed —
+    /// the override fully replaces the `<default_root>(.<layered_subpath>.{l})?`
+    /// prefix. Example: `{"mm" → "multi_modal_projector"}` routes
+    /// Gemma3-MM's `mm.mm_soft_emb_norm` to disk
+    /// `multi_modal_projector.mm_soft_emb_norm`.
+    pub subtrees: BTreeMap<String, String>,
+}
+
+impl VisionSafetensorsLayout {
+    /// Today's hardcoded Qwen2-VL / Qwen2.5-VL convention. Used
+    /// when a vision config omits `vision_safetensors_layout`.
+    pub fn qwen_default() -> Self {
+        Self {
+            default_root: "visual".to_string(),
+            layered_subpath: "blocks".to_string(),
+            subtrees: BTreeMap::new(),
+        }
+    }
+}
+
+/// d_model fingerprint key + dim — see [`ModelParams::vision_d_model_fingerprint`].
+#[derive(Clone, Debug)]
+pub struct VisionDModelFingerprint {
+    pub key: String,
+    pub dim: usize,
+}
+
+impl VisionDModelFingerprint {
+    pub fn qwen_default() -> Self {
+        Self {
+            key: "visual.merger.mlp.2.weight".to_string(),
+            dim: 0,
+        }
+    }
+}
+
+/// Patch-embed flatten target — see [`ModelParams::vision_patch_embed_flatten`].
+#[derive(Clone, Debug)]
+pub struct VisionPatchEmbedFlatten {
+    pub key: String,
+    pub leading_dim: usize,
+}
+
+impl VisionPatchEmbedFlatten {
+    pub fn qwen_default() -> Self {
+        Self {
+            key: "visual.patch_embed.proj.weight".to_string(),
+            leading_dim: 0,
+        }
+    }
 }
 
 /// Arch-agnostic rope-scaling flavor parsed from `config.json`.
@@ -687,6 +788,13 @@ fn model_params_from_json(
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
     let mrope_section = extract_mrope_section(json);
+    let vision_layout = extract_vision_layout(json);
+    let vision_d_model_fingerprint = extract_vision_d_model_fingerprint(json);
+    let vision_patch_embed_flatten = extract_vision_patch_embed_flatten(json);
+    let decoder_safetensors_prefix = json
+        .get("decoder_safetensors_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     Ok(ModelParams {
         name,
@@ -701,7 +809,47 @@ fn model_params_from_json(
         rope_scaling,
         rope_scaling_hash,
         mrope_section,
+        vision_layout,
+        vision_d_model_fingerprint,
+        vision_patch_embed_flatten,
+        decoder_safetensors_prefix,
     })
+}
+
+/// Parse `vision_safetensors_layout`, if present. Missing or
+/// malformed → `None`; codegen falls back to
+/// [`VisionSafetensorsLayout::qwen_default`] in that case.
+fn extract_vision_layout(json: &serde_json::Value) -> Option<VisionSafetensorsLayout> {
+    let obj = json.get("vision_safetensors_layout")?.as_object()?;
+    let default_root = obj.get("default_root")?.as_str()?.to_string();
+    let layered_subpath = obj.get("layered_subpath")?.as_str()?.to_string();
+    let mut subtrees = BTreeMap::new();
+    if let Some(s) = obj.get("subtrees").and_then(|v| v.as_object()) {
+        for (k, v) in s {
+            if let Some(disk) = v.as_str() {
+                subtrees.insert(k.clone(), disk.to_string());
+            }
+        }
+    }
+    Some(VisionSafetensorsLayout {
+        default_root,
+        layered_subpath,
+        subtrees,
+    })
+}
+
+fn extract_vision_d_model_fingerprint(json: &serde_json::Value) -> Option<VisionDModelFingerprint> {
+    let obj = json.get("vision_d_model_fingerprint")?.as_object()?;
+    let key = obj.get("key")?.as_str()?.to_string();
+    let dim = obj.get("dim")?.as_u64()? as usize;
+    Some(VisionDModelFingerprint { key, dim })
+}
+
+fn extract_vision_patch_embed_flatten(json: &serde_json::Value) -> Option<VisionPatchEmbedFlatten> {
+    let obj = json.get("vision_patch_embed_flatten")?.as_object()?;
+    let key = obj.get("key")?.as_str()?.to_string();
+    let leading_dim = obj.get("leading_dim")?.as_u64()? as usize;
+    Some(VisionPatchEmbedFlatten { key, leading_dim })
 }
 
 /// Extract `rope_scaling.mrope_section` as a fixed `[u32; 3]`. Returns

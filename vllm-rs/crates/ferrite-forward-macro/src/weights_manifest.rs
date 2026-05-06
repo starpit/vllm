@@ -50,6 +50,32 @@ pub struct WeightsManifest {
     /// preserve math because `silu(0)·0 = 0` on the activation side
     /// and zero-row contractions are zero on the weight side).
     pub pad_to_mult8: Vec<PadHint>,
+    /// Per-entry kind override. Absent ⇒ default
+    /// [`ManifestEntryKind::LinearLayer`] (the standard PyTorch
+    /// `nn.Linear` convention with `<prefix>.weight` / optional
+    /// `<prefix>.bias` on disk). Present ⇒ the codegen routes
+    /// the matching `LinearLayer` accessor to the alternate loader.
+    /// See [`ManifestEntryKind`] for the variants.
+    pub kinds: BTreeMap<String, ManifestEntryKind>,
+}
+
+/// Per-entry storage convention. The default
+/// ([`ManifestEntryKind::LinearLayer`]) is the standard PyTorch
+/// `nn.Linear` layout — the macro reads `<prefix>.weight` and
+/// optional `<prefix>.bias` off disk. [`ManifestEntryKind::RawLinear`]
+/// names an `nn.Parameter` weight (e.g. Gemma3's
+/// `multi_modal_projector.mm_input_projection_weight`) that ships
+/// without the `.weight` / `.bias` suffix; the codegen reads
+/// `<prefix>` verbatim and the loaded layer carries no bias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManifestEntryKind {
+    /// PyTorch `nn.Linear` convention: `<prefix>.weight` (+ optional
+    /// `<prefix>.bias`).
+    #[default]
+    LinearLayer,
+    /// PyTorch `nn.Parameter` convention: the on-disk key is
+    /// `<prefix>` verbatim with no `.weight` suffix; no bias.
+    RawLinear,
 }
 
 /// One zero-pad-to-mult-8 entry from `__pad_to_mult8__`.
@@ -73,6 +99,17 @@ impl WeightsManifest {
         self.entries.get(&dotted.join("."))
     }
 
+    /// Storage convention for a weight path. Returns the manifest's
+    /// declared `kind` if present; otherwise falls back to the
+    /// default ([`ManifestEntryKind::LinearLayer`]).
+    pub fn kind<S: AsRef<str>>(&self, path_segments: &[S]) -> ManifestEntryKind {
+        let dotted: Vec<&str> = path_segments.iter().map(|s| s.as_ref()).collect();
+        self.kinds
+            .get(&dotted.join("."))
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Empty manifest — used when an arch directory has no
     /// `weights.json` yet (arches predating the probe workflow).
     /// Shape inference falls back to its dataflow-only behavior.
@@ -94,6 +131,7 @@ impl WeightsManifest {
             entries: out,
             packed_splits: BTreeMap::new(),
             pad_to_mult8: Vec::new(),
+            kinds: BTreeMap::new(),
         }
     }
 
@@ -204,6 +242,7 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
     let mut entries: BTreeMap<String, Shape> = BTreeMap::new();
     let mut packed_splits: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pad_to_mult8: Vec<PadHint> = Vec::new();
+    let mut kinds: BTreeMap<String, ManifestEntryKind> = BTreeMap::new();
     for (k, v) in obj {
         if k == "__pad_to_mult8__" {
             let arr = v.as_array().ok_or_else(|| ManifestError::BadShape {
@@ -271,18 +310,49 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
             }
             continue;
         }
-        let shape = parse_shape(v).map_err(|reason| ManifestError::BadShape {
+        let (shape, kind) = parse_entry(v).map_err(|reason| ManifestError::BadShape {
             path: path.to_path_buf(),
             weight: k.clone(),
             reason,
         })?;
         entries.insert(k.clone(), shape);
+        if let Some(kind) = kind {
+            kinds.insert(k.clone(), kind);
+        }
     }
     Ok(WeightsManifest {
         entries,
         packed_splits,
         pad_to_mult8,
+        kinds,
     })
+}
+
+/// Parse one weight entry value. Two accepted shapes:
+///   - Array of dim strings (`["hidden_size", "num_heads * head_dim"]`)
+///     — the legacy default; entry kind defaults to `LinearLayer`.
+///   - Object `{ "shape": [...], "kind": "raw_linear" }` — opt-in
+///     storage convention override. Today the only non-default
+///     kind is `raw_linear` (Gemma3 MM projector's
+///     `mm_input_projection_weight` is an `nn.Parameter`, not a
+///     `nn.Linear`).
+fn parse_entry(v: &serde_json::Value) -> Result<(Shape, Option<ManifestEntryKind>), String> {
+    if v.is_array() {
+        return Ok((parse_shape(v)?, None));
+    }
+    let obj = v.as_object().ok_or_else(|| {
+        "expected an array of shape strings or `{shape, kind}` object".to_string()
+    })?;
+    let shape_v = obj
+        .get("shape")
+        .ok_or_else(|| "object form requires a `shape` field".to_string())?;
+    let shape = parse_shape(shape_v)?;
+    let kind = match obj.get("kind").and_then(|k| k.as_str()) {
+        Some("raw_linear") => Some(ManifestEntryKind::RawLinear),
+        Some(other) => return Err(format!("unknown manifest entry kind `{other}`")),
+        None => None,
+    };
+    Ok((shape, kind))
 }
 
 /// Parse a JSON shape value — must be an array of strings, each
@@ -423,6 +493,64 @@ mod tests {
         );
         // Coexists with regular entries.
         assert!(m.entries.contains_key("norm1"));
+    }
+
+    #[test]
+    fn parses_raw_linear_object_form() {
+        // G.7(a) contract: a manifest value of the form
+        // `{ "shape": [...], "kind": "raw_linear" }` parses cleanly,
+        // populates `entries` with the shape AND `kinds` with the
+        // override. Array-form entries leave `kinds` absent (default
+        // is `LinearLayer`, exposed via `WeightsManifest::kind`).
+        let tmp = std::env::temp_dir().join("ferrite_raw_linear_manifest_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("weights.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "self_attn.q_proj": ["hidden_size", "hidden_size"],
+              "mm.mm_input_projection_weight": {
+                "shape": ["vision_embed_dim", "d_model"],
+                "kind": "raw_linear"
+              }
+            }"#,
+        )
+        .unwrap();
+        let m = load_file(&path).expect("load_file");
+        // Both entries land in `entries`.
+        assert!(m.entries.contains_key("self_attn.q_proj"));
+        assert!(m.entries.contains_key("mm.mm_input_projection_weight"));
+        // Kind override only on the object-form entry.
+        assert_eq!(
+            m.kind(&["mm", "mm_input_projection_weight"]),
+            ManifestEntryKind::RawLinear
+        );
+        assert_eq!(
+            m.kind(&["self_attn", "q_proj"]),
+            ManifestEntryKind::LinearLayer
+        );
+        // Absent path → default kind.
+        assert_eq!(
+            m.kind(&["does", "not", "exist"]),
+            ManifestEntryKind::LinearLayer
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_manifest_entry_kind() {
+        let tmp = std::env::temp_dir().join("ferrite_bad_kind_manifest_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("weights.json");
+        std::fs::write(
+            &path,
+            r#"{ "x": { "shape": ["d"], "kind": "totally_made_up" } }"#,
+        )
+        .unwrap();
+        let err = load_file(&path).expect_err("unknown kind must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown manifest entry kind"), "got: {msg}");
     }
 
     #[test]

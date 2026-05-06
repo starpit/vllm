@@ -92,6 +92,15 @@ pub trait CanonicalParams {
     /// Vision-tower softmax scale: `1 / sqrt(vision_head_dim)`. Same
     /// defaults / set-by rule as [`Self::VISION_NUM_HEADS`].
     const VISION_ATTN_SCALE: f32 = 0.0;
+    /// Patch-grid side length (square): `vision_image_size / vision_patch_size`.
+    /// Used by `Instruction::AvgPool2d` to convert flat row index
+    /// `[L = ph * ph]` → `(row, col)` and walk the k² source cells per
+    /// output. Defaults to 0 for arches that never emit `OpKind::AvgPool2d`.
+    const VISION_PATCH_GRID_SIDE: u32 = 0;
+    /// Stride / kernel size of the post-encoder average pool (Gemma3-MM
+    /// projector: k=4 over a 64×64 patch grid → 16×16 = 256 tokens). The
+    /// pool is non-overlapping, so stride == kernel. Defaults to 0.
+    const VISION_POOL_KERNEL: u32 = 0;
 }
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
@@ -103,6 +112,29 @@ pub struct InterpreterCtx<'a, W> {
     pub device: &'a mut GpuDevice,
     /// Iter index of the enclosing `Op::Loop`, else 0.
     pub layer_offset: u32,
+    /// `OwnedTensor`s removed from `tiles` to make room for a
+    /// `Reshaped` at the same slot index. Keeping them here pins
+    /// the underlying GPU memory for the rest of the run, so any
+    /// `Reshaped { ref_slot, tensor }` that aliases this storage
+    /// continues to point at live memory.
+    ///
+    /// **Why this exists.** When `Instruction::Reshape(in_slot,
+    /// out_slot, ...)` is emitted with `out_slot == in_slot`, the
+    /// previous `TileEntry::Owned(OwnedTensor)` at that slot would
+    /// be dropped on overwrite — freeing its block back to the
+    /// caching allocator. The new `TileEntry::Reshaped` still holds
+    /// the original GPU pointer in its `tensor` field, but that
+    /// memory is now in the free pool; subsequent `alloc_tensor`
+    /// calls in the same forward (e.g., a downstream attention
+    /// kernel's output) hand the same address back, the kernel
+    /// writes there while still reading the Reshaped, and the
+    /// supposedly-still-live "input" tile sees torn writes (NaN /
+    /// extreme magnitudes). Pinning here is the minimum-invasive
+    /// fix: the codegen contract that `Reshaped::ref_slot` "pins
+    /// the slot whose `OwnedTensor` actually owns the storage" only
+    /// works when the OwnedTensor still lives at `ref_slot`; in the
+    /// in-place case it has already been overwritten. Stash it.
+    pub pinned_owned: Vec<OwnedTensor>,
 }
 
 // Type aliases for variant fields.
@@ -309,6 +341,23 @@ pub enum Instruction<W> {
     /// elementwise mutation, take-owned + kernel + reinsert. Same
     /// shape as `TanhSoftCap` / `ScalarMul` consume-pattern.
     QuickGelu(u32, u32),
+    /// GELU tanh-approximation activation: `(in_slot, out_slot)`.
+    /// In-place mutation. Mirrors `QuickGelu` / `GeluErf`; matches
+    /// PyTorch `nn.GELU(approximate="tanh")`. Used by SigLIP /
+    /// Gemma3-MM vision MLP.
+    Gelu(u32, u32),
+    /// Vision learned positional embedding lookup: `(out_slot,
+    /// weight_fn)`. Reads `ctx.fwd.vision_position_ids` (rank-1 u32
+    /// view of length `num_tokens`) and gathers rows from the
+    /// per-arch positional table via the same
+    /// `kernels::embedding_gather_masked` kernel
+    /// `Instruction::Embed` calls (with `vocab_offset = 0` /
+    /// `vocab_per_rank = num_positions` so the mask never trips).
+    /// Used by SigLIP / Gemma3-MM. Distinct from `Embed` because the
+    /// table dim 0 is `vision_num_positions` (not `vocab_size`); the
+    /// `OpKind::PosEmbed` shape sig anchors on the vision bound names
+    /// so the macro emits a `Weights` field of the right type.
+    PosEmbed(u32, WtFn<W, Embedding>),
     /// Materialize the vision-prelude `pixels` extern as a tile:
     /// `(out_slot)`. Reads `ctx.fwd.pixels` (the rank-2
     /// `[num_tokens, vision_in_features]` view the
@@ -341,6 +390,14 @@ pub enum Instruction<W> {
     /// gather-permuted into window order on encoder entry, and the
     /// merger output is permuted back to natural order at exit.
     EmbeddingGather(u32, u32, u8),
+    /// 2-D non-overlapping average pool: `(in_slot, out_slot)`. Reads
+    /// the source rank-2 tile `[L = ph², e]` from `in_slot`, walks the
+    /// flat row index as a `(row, col)` pair on a `ph × ph` grid (with
+    /// `ph = W::VISION_PATCH_GRID_SIDE`), and averages each k×k cell
+    /// (`k = W::VISION_POOL_KERNEL`) into one output row. Output is a
+    /// fresh `OwnedTensor` of shape `[(ph/k)², e]`. Used by Gemma3-MM's
+    /// SigLIP→text projector. Stride == kernel (non-overlapping).
+    AvgPool2d(u32, u32),
     FlashInferAttentionDecode(u32, u32, u32, CosSinFn<W>, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, CosSinFn<W>, bool),
@@ -647,6 +704,16 @@ impl<W: CanonicalParams> Instruction<W> {
                     shape[i] = d / div;
                 }
                 let reshaped = upstream.reshape(&shape[..nd]);
+                // Pin overwritten Owned: if `out_slot == in_slot`, the
+                // existing `TileEntry::Owned` would otherwise drop here,
+                // freeing the very memory the new `Reshaped` aliases.
+                // See `pinned_owned` doc on `InterpreterCtx`. Take the
+                // old entry out first so we can stash any Owned without
+                // double-borrowing `ctx.tiles`.
+                let prev = std::mem::take(&mut ctx.tiles[out_slot as usize]);
+                if let Some(TileEntry::Owned(t)) = prev {
+                    ctx.pinned_owned.push(t);
+                }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Reshaped {
                     ref_slot: in_slot,
                     tensor: reshaped,
@@ -1473,6 +1540,38 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
+            Instruction::Gelu(in_slot, out_slot) => {
+                let owned = take_owned(ctx.tiles, in_slot);
+                unsafe {
+                    kernels::gelu_tanh_inplace(*owned, ctx.device.compute_stream);
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            }
+            Instruction::PosEmbed(out_slot, weight_fn) => unsafe {
+                let weight = (weight_fn)(ctx.wm, 0u32).weight;
+                let position_ids = ctx.fwd.vision_position_ids.expect(
+                    "Instruction::PosEmbed reached eval but \
+                     ForwardCtx::vision_position_ids is None — caller \
+                     (vision_forward host wrapper) must populate this \
+                     view before driving the vision interpreter, \
+                     mirroring the pixels / cu_seqlens / cos / sin \
+                     contract",
+                );
+                let num_positions = weight.dim(0) as u32;
+                // No tp sharding on the vision positional table —
+                // vision is replicated per-rank; vocab_offset = 0 and
+                // vocab_per_rank covers the full table so the mask
+                // arm in `embedding_gather_masked` never trips.
+                let out = kernels::embedding_gather_masked(
+                    weight,
+                    *position_ids,
+                    0u32,
+                    num_positions,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
             Instruction::GeluErf(in_slot, out_slot) => {
                 let owned = take_owned(ctx.tiles, in_slot);
                 unsafe {
@@ -1502,6 +1601,30 @@ impl<W: CanonicalParams> Instruction<W> {
                     kernels::embedding_gather(
                         *in_view,
                         *indices_view,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
+                };
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            }
+            Instruction::AvgPool2d(in_slot, out_slot) => {
+                let ph = W::VISION_PATCH_GRID_SIDE;
+                let k = W::VISION_POOL_KERNEL;
+                if ph == 0 || k == 0 {
+                    panic!(
+                        "Instruction::AvgPool2d reached eval with \
+                         VISION_PATCH_GRID_SIDE={ph} VISION_POOL_KERNEL={k} — \
+                         the per-arch CanonicalParams bake must populate both \
+                         (vision_patch_grid_side / vision_pool_kernel bounds in \
+                         configs/<variant>.json)",
+                    );
+                }
+                let owned = unsafe {
+                    let in_view = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                    kernels::avg_pool_2d(
+                        *in_view,
+                        ph,
+                        k,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
@@ -1716,6 +1839,14 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 let nt_q = (*q_view).dim(0);
                 let q_3d = q_view.reshape(&[nt_q, W::NUM_Q_HEADS as usize, W::HEAD_DIM as usize]);
+                // Pin any Owned overwritten by these three Reshaped
+                // writes. See InterpreterCtx::pinned_owned for the why.
+                for slot in [q_out_slot, k_out_slot, v_out_slot] {
+                    let prev = std::mem::take(&mut ctx.tiles[slot as usize]);
+                    if let Some(TileEntry::Owned(t)) = prev {
+                        ctx.pinned_owned.push(t);
+                    }
+                }
                 ctx.tiles[q_out_slot as usize] = Some(TileEntry::Reshaped {
                     ref_slot: q_slot,
                     tensor: *q_3d,
@@ -3068,6 +3199,7 @@ pub unsafe fn run<W: CanonicalParams>(
         fwd,
         device,
         layer_offset: 0,
+        pinned_owned: Vec::new(),
     };
     unsafe {
         run_slice(backbone, &mut ctx);
@@ -3096,6 +3228,7 @@ pub unsafe fn run_backbone<W: CanonicalParams>(
         fwd,
         device,
         layer_offset: 0,
+        pinned_owned: Vec::new(),
     };
     unsafe {
         run_slice(backbone, &mut ctx);

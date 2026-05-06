@@ -987,86 +987,25 @@ pub fn initialize_stack(
         info!("Runner: pooling mode (embedding requests go through scheduler)");
     }
 
-    // Configure multimodal support if the model has a vision_config.
+    // Configure multimodal support — the per-arch declaration lives in
+    // ferrite-vision::MmMetadata (collected via ferrite-forward's
+    // inventory). vllm-serve names no arch; if no MM arch claims the
+    // current HF architectures, the engine stays text-only.
     let hf_config = &core.hf_config;
-    if let Some(vision_config) = hf_config.extra.get("vision_config") {
-        let is_qwen2_vl = hf_config.architectures.iter().any(|a| {
-            a == "Qwen2VLForConditionalGeneration" || a == "Qwen2_5_VLForConditionalGeneration"
-        });
-
-        let image_size = vision_config
-            .get("image_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(if is_qwen2_vl { 392 } else { 224 }) as usize;
-        let patch_size = vision_config
-            .get("patch_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(14) as usize;
-        let num_patches = image_size
-            .checked_div(patch_size)
-            .map(|v| v.pow(2))
-            .unwrap_or(256);
-
-        // Qwen2-VL uses <|image_pad|> token (151655) instead of image_token_index.
-        let image_token_index = if is_qwen2_vl {
-            hf_config
-                .extra
-                .get("image_token_id")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(151655) as u32
-        } else {
-            hf_config
-                .extra
-                .get("image_token_index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(255999) as u32
-        };
-
-        // For Qwen2-VL, compute tokens per image from spatial_merge_size.
-        let mm_tokens_per_image = if is_qwen2_vl {
-            let spatial_merge = vision_config
-                .get("spatial_merge_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(2) as usize;
-            let grid = image_size / patch_size;
-            let merged_grid = grid / spatial_merge;
-            merged_grid * merged_grid
-        } else {
-            hf_config
-                .extra
-                .get("mm_tokens_per_image")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .unwrap_or(num_patches)
-        };
-
+    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    if let Some(processor) = crate::multimodal::resolve(
+        &hf_config.architectures,
+        &hf_config.extra,
+        core.model_dir.as_deref(),
+    ) {
         info!(
-            "Multimodal config: image_token_id={}, tokens_per_image={}, image_size={}",
-            image_token_index, mm_tokens_per_image, image_size,
+            "Multimodal config: arch={:?}, image_token_id={}, image_size={}, tokens_per_image={}",
+            hf_config.architectures,
+            processor.image_token_id,
+            processor.image_size,
+            processor.mm_tokens_per_image,
         );
-        engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
-        if is_qwen2_vl {
-            engine.set_mm_model_type("qwen2_vl");
-            // Read `preprocessor_config.json::{min_pixels,max_pixels}` so
-            // `smart_resize` matches HF's `Qwen2VLImageProcessor` exactly.
-            // Qwen2-VL-2B ships 3136 / 12_845_056; the previous hard-coded
-            // 256·28² / 1280·28² were ~64× too large at the floor and were
-            // forcing 224×224 inputs up to 448×448 patches.
-            if let Some(dir) = core.model_dir.as_ref()
-                && let Ok(s) = std::fs::read_to_string(dir.join("preprocessor_config.json"))
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
-                && let (Some(mn), Some(mx)) = (
-                    v.get("min_pixels").and_then(|x| x.as_u64()),
-                    v.get("max_pixels").and_then(|x| x.as_u64()),
-                )
-            {
-                engine.set_mm_image_processor_pixel_limits(mn as usize, mx as usize);
-                info!(
-                    "Qwen2-VL preprocessor: min_pixels={}, max_pixels={}",
-                    mn, mx
-                );
-            }
-        }
+        engine.set_mm_processor(Some(processor));
     }
 
     info!(
@@ -2196,84 +2135,24 @@ fn initialize_stack_tp(
             engine.set_is_pooling(true);
         }
 
-        // Multimodal config — mirrors the single-rank `initialize_stack`
-        // path (same `hf_config.extra.vision_config` probe, same Qwen2-VL
-        // detection, same preprocessor-pixel-limits read). Without this
-        // block, the engine has no image_token_id / tokens_per_image /
-        // mm_model_type, so image placeholders never expand, the vision
-        // pipeline never engages, and image-bearing requests decode as
-        // text-only with the image content silently dropped.
-        if let Some(vision_config) = hf_config.extra.get("vision_config") {
-            let is_qwen2_vl = hf_config.architectures.iter().any(|a| {
-                a == "Qwen2VLForConditionalGeneration" || a == "Qwen2_5_VLForConditionalGeneration"
-            });
-
-            let image_size = vision_config
-                .get("image_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(if is_qwen2_vl { 392 } else { 224 }) as usize;
-            let patch_size = vision_config
-                .get("patch_size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(14) as usize;
-            let num_patches = image_size
-                .checked_div(patch_size)
-                .map(|v| v.pow(2))
-                .unwrap_or(256);
-
-            let image_token_index = if is_qwen2_vl {
-                hf_config
-                    .extra
-                    .get("image_token_id")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(151655) as u32
-            } else {
-                hf_config
-                    .extra
-                    .get("image_token_index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(255999) as u32
-            };
-
-            let mm_tokens_per_image = if is_qwen2_vl {
-                let spatial_merge = vision_config
-                    .get("spatial_merge_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(2) as usize;
-                let grid = image_size / patch_size;
-                let merged_grid = grid / spatial_merge;
-                merged_grid * merged_grid
-            } else {
-                hf_config
-                    .extra
-                    .get("mm_tokens_per_image")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(num_patches)
-            };
-
+        // Multimodal config — generic ferrite-vision inventory lookup.
+        // See the single-rank `initialize_stack` path for the rationale;
+        // this is the same call shape, threaded through the TP-init
+        // engine instead.
+        #[cfg(all(feature = "multimodal", feature = "cuda"))]
+        if let Some(processor) = crate::multimodal::resolve(
+            &hf_config.architectures,
+            &hf_config.extra,
+            model_dir.as_deref(),
+        ) {
             info!(
-                "Multimodal config: image_token_id={}, tokens_per_image={}, image_size={}",
-                image_token_index, mm_tokens_per_image, image_size,
+                "Multimodal config: arch={:?}, image_token_id={}, image_size={}, tokens_per_image={}",
+                hf_config.architectures,
+                processor.image_token_id,
+                processor.image_size,
+                processor.mm_tokens_per_image,
             );
-            engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
-            if is_qwen2_vl {
-                engine.set_mm_model_type("qwen2_vl");
-                if let Some(dir) = model_dir.as_ref()
-                    && let Ok(s) = std::fs::read_to_string(dir.join("preprocessor_config.json"))
-                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&s)
-                    && let (Some(mn), Some(mx)) = (
-                        v.get("min_pixels").and_then(|x| x.as_u64()),
-                        v.get("max_pixels").and_then(|x| x.as_u64()),
-                    )
-                {
-                    engine.set_mm_image_processor_pixel_limits(mn as usize, mx as usize);
-                    info!(
-                        "Qwen2-VL preprocessor: min_pixels={}, max_pixels={}",
-                        mn, mx
-                    );
-                }
-            }
+            engine.set_mm_processor(Some(processor));
         }
 
         let engine = Arc::new(engine);

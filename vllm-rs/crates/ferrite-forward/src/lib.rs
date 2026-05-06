@@ -139,13 +139,27 @@ pub fn layer_weight_path(layer: u32, suffix: &str) -> String {
     format!("model.layers.{layer}.{suffix}")
 }
 
-/// Vision-tower analogue: `visual.blocks.<layer>.<suffix>`. Used by
-/// the `load_layered_*` helpers when the codegen emits a
+/// Multimodal-aware decoder layered key. `root` is the per-arch
+/// `<prefix>.layers` template (e.g. `"model.layers"` for text-only and
+/// Qwen-style VL, `"language_model.model.layers"` for Gemma3-MM-style
+/// arches that nest the text decoder under `language_model.<...>`).
+/// Mirrors [`vision_block_weight_path`] for the decoder side.
+#[inline]
+pub fn layer_weight_path_with_root(root: &str, layer: u32, suffix: &str) -> String {
+    format!("{root}.{layer}.{suffix}")
+}
+
+/// Vision-tower analogue: `<root>.<layer>.<suffix>` where `root` is
+/// the per-arch concatenation `<default_root>.<layered_subpath>`
+/// derived from `vision_safetensors_layout` (e.g. `visual.blocks` for
+/// Qwen2-VL / Qwen2.5-VL or `vision_tower.vision_model.encoder.layers`
+/// for SigLIP-style encoders like Gemma3-MM). Used by the
+/// `load_layered_*_vision` helpers when the codegen emits a
 /// `#[vision_forward]` body — the per-block prefix differs from the
 /// decoder's `model.layers.<L>.` convention.
 #[inline]
-pub fn vision_block_weight_path(layer: u32, suffix: &str) -> String {
-    format!("visual.blocks.{layer}.{suffix}")
+pub fn vision_block_weight_path(root: &str, layer: u32, suffix: &str) -> String {
+    format!("{root}.{layer}.{suffix}")
 }
 
 /// Deterministic hash of a `serde_json::Value` for `HfFingerprint`
@@ -310,6 +324,15 @@ mod ctx {
         /// undoes the entry permute on the merger output before
         /// splice into the language-model embedding stream.
         pub vision_reverse_indices: Option<TensorView<'a>>,
+        /// SigLIP-style learned positional embedding indices, shape
+        /// `[num_tokens]` u32. Built host-side as `[0..num_pos,
+        /// 0..num_pos, ...]` per image. Consumed by
+        /// `Instruction::PosEmbed` via `kernels::embedding_gather_masked`
+        /// (the same kernel `Instruction::Embed` calls). `None` for
+        /// text-side forward calls and for vision arches that don't
+        /// need a positional embedding (Qwen2-VL / Qwen2.5-VL use
+        /// 2D RoPE via `vision_rope` instead).
+        pub vision_position_ids: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when
@@ -581,6 +604,14 @@ mod dispatcher {
         /// 3D MRoPE positions used to encode the cached KV → attention
         /// goes haywire and the model emits `<|im_end|>` immediately.
         fn embed_patch_grids(&self, pixel_batches: &[PixelInput<'_>]) -> Vec<(u32, u32, u32)>;
+
+        /// Per-arch CPU-side preprocessing metadata. Lets the executor
+        /// read declarative flags (e.g. `mrope_positions`) the
+        /// per-arch `pub const PROCESSOR: ferrite_vision::MmMetadata`
+        /// declared. Default impl panics so every arch must surface its
+        /// declaration; the macro-emitted `VisionWrapper<W>` impl
+        /// returns the per-variant baked const.
+        fn mm_metadata(&self) -> &'static ferrite_vision::MmMetadata;
     }
 
     /// Sibling MM-load fn. Same dispatch shape as [`ArchTryLoadFn`]
@@ -604,15 +635,42 @@ mod dispatcher {
     /// list the multimodal-conditional-generation variants
     /// (e.g. `Qwen2VLForConditionalGeneration`, NOT plain
     /// `Qwen2ForCausalLM`).
+    ///
+    /// `mm_metadata` is the per-arch CPU-side preprocessing
+    /// declaration baked from a `pub const PROCESSOR: MmMetadata` in
+    /// the arch crate, threaded through `#[vision_forward(processor =
+    /// path::PROCESSOR, ...)]`. ferrite stays arch-agnostic: every
+    /// arch-specific knob (placeholder token id key, size policy,
+    /// tokens-per-image policy, preprocess fn) is data on this row,
+    /// not a switch in ferrite or the macro.
     pub struct FerriteMmRegistration {
         pub arch_name: &'static str,
         pub hf_arches: &'static [&'static str],
         pub gguf_archs: &'static [&'static str],
         pub tp_world_size: u8,
         pub try_load_mm: MmTryLoadFn,
+        pub mm_metadata: ferrite_vision::MmMetadata,
     }
 
     inventory::collect!(FerriteMmRegistration);
+
+    /// Walk the [`FerriteMmRegistration`] inventory and return the
+    /// first registration whose `hf_arches` claims any of the
+    /// supplied HF architecture strings. Returns `None` for text-
+    /// only models. Used by serve at startup to pick MM metadata
+    /// without knowing any arch names itself.
+    ///
+    /// `tp_world_size` filter is intentionally not applied here —
+    /// MM metadata is identical across the tp variants of an arch
+    /// (preprocessing is host-side and replicated), so the first
+    /// hit is sufficient.
+    pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static FerriteMmRegistration> {
+        inventory::iter::<FerriteMmRegistration>().find(|reg| {
+            hf_arches
+                .iter()
+                .any(|a| reg.hf_arches.contains(&a.as_str()))
+        })
+    }
 
     /// Top-level ferrite loader. Walks every `#[forward]`-registered
     /// arch; the first whose `hf_arches` list contains `arch_hint`
@@ -689,7 +747,7 @@ mod dispatcher {
 #[cfg(feature = "cuda")]
 pub use dispatcher::{
     EmbedPatch, FerriteArchRegistration, FerriteMmRegistration, FerriteWeights, HfFingerprint,
-    MmTryLoadFn, MultimodalForward, PixelInput, try_load, try_load_mm,
+    MmTryLoadFn, MultimodalForward, PixelInput, resolve_mm_metadata, try_load, try_load_mm,
 };
 
 /// Re-export `inventory` so the `#[forward]`-macro-emitted

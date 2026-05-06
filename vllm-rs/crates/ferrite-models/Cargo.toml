@@ -16,6 +16,7 @@ arch-deepseek-v3   = ["dep:ferrite-model-deepseek-v3"]
 arch-deepseek-v3-flat = ["dep:ferrite-model-deepseek-v3-flat"]
 arch-gemma2        = ["dep:ferrite-model-gemma2"]
 arch-gemma3        = ["dep:ferrite-model-gemma3"]
+arch-gemma3-mm     = ["arch-gemma3", "dep:ferrite-model-gemma3-mm"]
 arch-granite       = ["dep:ferrite-model-granite"]
 arch-llama         = ["dep:ferrite-model-llama"]
 arch-mistral       = ["dep:ferrite-model-mistral"]
@@ -36,6 +37,7 @@ all-arches = [
     "arch-deepseek-v3-flat",
     "arch-gemma2",
     "arch-gemma3",
+    "arch-gemma3-mm",
     "arch-granite",
     "arch-llama",
     "arch-mistral",
@@ -54,6 +56,7 @@ cuda = [
     "ferrite-model-commandr?/cuda",
     "ferrite-model-gemma2?/cuda",
     "ferrite-model-gemma3?/cuda",
+    "ferrite-model-gemma3-mm?/cuda",
     "ferrite-model-granite?/cuda",
     "ferrite-model-llama?/cuda",
     "ferrite-model-mistral?/cuda",
@@ -81,6 +84,7 @@ nccl = [
     "ferrite-model-commandr?/nccl",
     "ferrite-model-gemma2?/nccl",
     "ferrite-model-gemma3?/nccl",
+    "ferrite-model-gemma3-mm?/nccl",
     "ferrite-model-granite?/nccl",
     "ferrite-model-llama?/nccl",
     "ferrite-model-mistral?/nccl",
@@ -104,6 +108,7 @@ ferrite-model-deepseek-v3  = { path = "../ferrite-model-deepseek-v3",  optional 
 ferrite-model-deepseek-v3-flat = { path = "../ferrite-model-deepseek-v3-flat", optional = true }
 ferrite-model-gemma2       = { path = "../ferrite-model-gemma2",       optional = true }
 ferrite-model-gemma3       = { path = "../ferrite-model-gemma3",       optional = true }
+ferrite-model-gemma3-mm    = { path = "../ferrite-model-gemma3-mm",    optional = true }
 ferrite-model-granite      = { path = "../ferrite-model-granite",      optional = true }
 ferrite-model-llama        = { path = "../ferrite-model-llama",        optional = true }
 ferrite-model-mistral      = { path = "../ferrite-model-mistral",      optional = true }

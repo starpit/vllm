@@ -21,6 +21,8 @@ pub mod init;
 pub mod llm;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(all(feature = "multimodal", feature = "cuda"))]
+pub mod multimodal;
 #[cfg(feature = "metrics")]
 pub mod orca;
 pub mod progress;

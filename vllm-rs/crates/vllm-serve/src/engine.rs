@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use vllm_common::engine_io::EmbeddingData;
-#[cfg(feature = "multimodal")]
+#[cfg(all(feature = "multimodal", feature = "cuda"))]
 use vllm_common::multimodal::{ImageData, MultimodalData};
 use vllm_common::sampling::GuidedGrammar;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
@@ -239,21 +239,15 @@ pub struct AsyncEngine {
     /// Set to `true` when the step loop is running; cleared on exit.
     /// Checked by `poll_until_done` to detect a dead step loop.
     step_loop_alive: Arc<AtomicBool>,
-    /// Multimodal config: image token ID for placeholder expansion.
-    /// `None` for text-only models.
-    image_token_id: Option<u32>,
-    /// Number of image tokens per image (vision encoder output patches).
-    mm_tokens_per_image: usize,
-    /// Image preprocessing size (pixels). 0 if not a VLM.
-    mm_image_size: usize,
-    /// Multimodal model type for preprocessing dispatch.
-    /// "siglip" (Gemma3), "qwen2_vl" (Qwen2-VL/Qwen2.5-VL), or empty.
-    mm_model_type: String,
-    /// Qwen2-VL `smart_resize` clamp from `preprocessor_config.json`.
-    /// Defaults match Qwen2-VL-2B's shipped config (3136 / 12_845_056); the
-    /// init layer overrides them when the file is present.
-    mm_min_pixels: usize,
-    mm_max_pixels: usize,
+    /// Resolved multimodal processor handle. `None` for text-only.
+    /// Built at startup from `ferrite_vision::MmMetadata` declared by
+    /// the per-arch crate; carries the placeholder token id, size
+    /// policy, tokens-per-image policy, preprocess fn pointer, and
+    /// runtime-resolved knobs (smart-resize bounds, image_size,
+    /// patch_size). The engine dispatches generically through this
+    /// handle — no arch names appear here.
+    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    mm_processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
     /// Maximum time the step loop can have pending requests with no output
@@ -291,12 +285,8 @@ impl AsyncEngine {
             default_chat_template_kwargs: None,
             async_scheduling: false,
             step_loop_alive: Arc::new(AtomicBool::new(false)),
-            image_token_id: None,
-            mm_tokens_per_image: 0,
-            mm_image_size: 0,
-            mm_model_type: String::new(),
-            mm_min_pixels: 3136,
-            mm_max_pixels: 12_845_056,
+            #[cfg(all(feature = "multimodal", feature = "cuda"))]
+            mm_processor: None,
             is_pooling: false,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
@@ -418,37 +408,17 @@ impl AsyncEngine {
         self.async_scheduling = enabled;
     }
 
-    /// Configure multimodal (VLM) support.
-    ///
-    /// * `image_token_id` — the token ID used as image placeholder (e.g. 255999 for Gemma 3)
-    /// * `mm_tokens_per_image` — number of tokens per image (vision encoder patches)
-    /// * `mm_image_size` — pixel size for image preprocessing (e.g. 224 for SigLIP)
-    pub fn set_multimodal_config(
+    /// Set the resolved multimodal processor (built from a ferrite
+    /// inventory lookup at init). `None` clears it (text-only). All
+    /// per-arch knobs (placeholder token id, image_size, smart-resize
+    /// bounds, tokens-per-image, preprocess fn pointer) are carried by
+    /// the resolved handle — the engine never names an arch.
+    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    pub fn set_mm_processor(
         &mut self,
-        image_token_id: u32,
-        mm_tokens_per_image: usize,
-        mm_image_size: usize,
+        processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
     ) {
-        self.image_token_id = Some(image_token_id);
-        self.mm_tokens_per_image = mm_tokens_per_image;
-        self.mm_image_size = mm_image_size;
-    }
-
-    /// Set the multimodal model type for preprocessing dispatch.
-    /// e.g., "qwen2_vl" for Qwen2-VL/Qwen2.5-VL.
-    pub fn set_mm_model_type(&mut self, model_type: &str) {
-        self.mm_model_type = model_type.to_string();
-    }
-
-    /// Override the Qwen2-VL `smart_resize` clamp. Driven by
-    /// `preprocessor_config.json`'s `min_pixels` / `max_pixels` so the
-    /// preprocessor matches HF's `Qwen2VLImageProcessor` byte-for-byte —
-    /// the shipped Qwen2-VL-2B values (3136 / 12_845_056) are *much*
-    /// smaller than `256*28*28 / 1280*28*28` and the mismatch was forcing
-    /// 224×224 inputs up to 448×448, garbling downstream encoder output.
-    pub fn set_mm_image_processor_pixel_limits(&mut self, min_pixels: usize, max_pixels: usize) {
-        self.mm_min_pixels = min_pixels;
-        self.mm_max_pixels = max_pixels;
+        self.mm_processor = processor;
     }
 
     /// Get the model name.
@@ -2833,6 +2803,28 @@ impl AsyncEngine {
                             }
                         }
                     }
+                    // Normalize content-array image parts to `type: "image"`
+                    // before applying the chat template. The OpenAI-style
+                    // wire format uses `type: "image_url"` with a nested
+                    // `image_url.url`; some templates (Gemma3) only check
+                    // `type == "image"`, others (Qwen2-VL) accept either.
+                    // Universally renaming to `image` is safe for both and
+                    // keeps the per-arch chat-template plumbing arch-
+                    // agnostic — vllm-serve never names an arch.
+                    if let Some(content) = val.get_mut("content")
+                        && let Some(parts) = content.as_array_mut()
+                    {
+                        for part in parts.iter_mut() {
+                            if let Some(obj) = part.as_object_mut()
+                                && obj.get("type").and_then(|t| t.as_str()) == Some("image_url")
+                            {
+                                obj.insert(
+                                    "type".to_string(),
+                                    serde_json::Value::String("image".to_string()),
+                                );
+                            }
+                        }
+                    }
                     val
                 })
                 .collect();
@@ -2888,13 +2880,13 @@ impl AsyncEngine {
         };
 
         // Extract images from message content arrays and build multimodal data.
-        #[cfg(feature = "multimodal")]
-        let mm_data = if self.image_token_id.is_some() {
+        #[cfg(all(feature = "multimodal", feature = "cuda"))]
+        let mm_data = if self.mm_processor.is_some() {
             self.extract_images_from_messages(&request.messages, &mut token_ids)?
         } else {
             None
         };
-        #[cfg(not(feature = "multimodal"))]
+        #[cfg(not(all(feature = "multimodal", feature = "cuda")))]
         let mm_data = None;
 
         Ok(EngineCoreRequest {
@@ -3007,20 +2999,17 @@ impl AsyncEngine {
     /// images, expand image placeholder tokens, and build `MultimodalData`.
     ///
     /// Returns `None` if no images are present.
-    #[cfg(feature = "multimodal")]
+    #[cfg(all(feature = "multimodal", feature = "cuda"))]
     fn extract_images_from_messages(
         &self,
         messages: &[protocol::ChatCompletionMessageParam],
         token_ids: &mut Vec<u32>,
     ) -> ServeResult<Option<MultimodalData>> {
-        let image_token_id = match self.image_token_id {
-            Some(id) => id,
+        let processor = match &self.mm_processor {
+            Some(p) => p.clone(),
             None => return Ok(None),
         };
-        let image_size = self.mm_image_size;
-        if image_size == 0 {
-            return Ok(None);
-        }
+        let image_token_id = processor.image_token_id;
 
         let mut images: Vec<ImageData> = Vec::new();
 
@@ -3043,7 +3032,7 @@ impl AsyncEngine {
 
                         // Decode the image.
                         let img_bytes = if url.starts_with("data:") {
-                            vllm_model::image::decode_data_uri(url).map_err(|e| {
+                            ferrite_vision::preprocess::decode_data_uri(url).map_err(|e| {
                                 ServeError::Validation(format!("failed to decode data URI: {e}"))
                             })?
                         } else {
@@ -3054,26 +3043,12 @@ impl AsyncEngine {
                             ));
                         };
 
-                        let dyn_image =
-                            vllm_model::image::decode_image(&img_bytes).map_err(|e| {
+                        let dyn_image = ferrite_vision::preprocess::decode_image(&img_bytes)
+                            .map_err(|e| {
                                 ServeError::Validation(format!("failed to decode image: {e}"))
                             })?;
 
-                        let image_data = if self.mm_model_type == "qwen2_vl" {
-                            // Qwen2-VL: smart_resize to target dimensions, CLIP normalization.
-                            // Factor = patch_size(14) * spatial_merge_size(2) = 28.
-                            let factor = 28;
-                            let (target_h, target_w) = vllm_model::image::smart_resize(
-                                dyn_image.height() as usize,
-                                dyn_image.width() as usize,
-                                factor,
-                                self.mm_min_pixels,
-                                self.mm_max_pixels,
-                            );
-                            vllm_model::image::preprocess_qwen2_vl(&dyn_image, target_h, target_w)
-                        } else {
-                            vllm_model::image::preprocess_siglip(&dyn_image, image_size)
-                        };
+                        let image_data = processor.preprocess(&dyn_image);
                         images.push(image_data);
                     }
                 }
@@ -3084,29 +3059,25 @@ impl AsyncEngine {
             return Ok(None);
         }
 
-        // Per-image expanded placeholder count: for Qwen2-VL, the
-        // smart_resize output is variable per image (e.g. 1344×728 or
-        // 448×448 depending on aspect ratio + the min/max-pixels
-        // bracket), so the post-merger token count `(h/28)·(w/28)`
-        // varies. Fall back to the static `self.mm_tokens_per_image`
-        // for arches whose vision encoder produces a fixed count
-        // (SigLIP-class).
+        // Per-image expanded placeholder count. The processor's
+        // `tokens_for_image` honors per-arch policy: `FromConfig`
+        // returns the static count (Gemma3-MM, SigLIP-class),
+        // `PerImageGrid` returns the per-image grid product
+        // (Qwen2-VL family — varies per aspect ratio).
         let per_image_counts: Vec<usize> = images
             .iter()
-            .map(|img| {
-                if self.mm_model_type == "qwen2_vl" {
-                    (img.height / 28) * (img.width / 28)
-                } else {
-                    self.mm_tokens_per_image
-                }
-            })
+            .map(|img| processor.tokens_for_image(img.height, img.width))
             .collect();
 
-        // Expand image placeholders in token IDs.
-        let placeholders = vllm_model::image::expand_image_placeholders_per_image(
+        // Expand image placeholders in token IDs per the arch's
+        // declared placeholder policy. Returned ranges cover only the
+        // positions the vision splice writes into (RepeatMarker: all
+        // expanded copies; BoiSoftEoiWrap: just the middle soft tokens).
+        let placeholders = ferrite_vision::preprocess::expand_placeholders_by_policy(
             token_ids,
             image_token_id,
             &per_image_counts,
+            &processor.metadata.placeholder_policy,
         );
 
         if placeholders.len() != images.len() {

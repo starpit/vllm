@@ -7,7 +7,7 @@ description = "Model loading, weight management, and tensor abstractions for vLL
 
 [features]
 default = []
-multimodal = ["image"]
+multimodal = []
 guided-decoding = ["llguidance", "toktrie", "toktrie_hf_tokenizers"]
 
 [dependencies]
@@ -19,7 +19,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
 rand = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 llguidance = { workspace = true, optional = true }
 toktrie = { workspace = true, optional = true }
 toktrie_hf_tokenizers = { workspace = true, optional = true }

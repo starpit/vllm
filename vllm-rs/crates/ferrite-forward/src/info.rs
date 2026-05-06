@@ -481,6 +481,13 @@ impl<W> Instruction<W> {
             Instruction::GeluErf(in_slot, out_slot) => {
                 ("GeluErf", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
+            Instruction::Gelu(in_slot, out_slot) => {
+                ("Gelu", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
+            Instruction::PosEmbed(out_slot, _wf) => (
+                "PosEmbed",
+                vec![F::Slot(out_slot), F::LayerKind("Embedding")],
+            ),
             Instruction::LoadPixels(out_slot) => ("LoadPixels", vec![F::Slot(out_slot)]),
             Instruction::EmbeddingGather(in_slot, out_slot, indices_kind) => (
                 "EmbeddingGather",
@@ -490,6 +497,9 @@ impl<W> Instruction<W> {
                     F::ConstU32(u32::from(indices_kind)),
                 ],
             ),
+            Instruction::AvgPool2d(in_slot, out_slot) => {
+                ("AvgPool2d", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
             Instruction::FlashInferAttentionDecode(
                 in_slot,
                 out_slot,

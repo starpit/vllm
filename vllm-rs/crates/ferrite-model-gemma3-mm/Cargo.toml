@@ -1,0 +1,20 @@
+[package]
+name = "ferrite-model-gemma3-mm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite Gemma3 multimodal vision tower (text decoder shared via ferrite-model-gemma3)"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-vision/cuda"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-vision/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward = { path = "../ferrite-forward" }
+ferrite-vision = { path = "../ferrite-vision" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+half = { workspace = true }

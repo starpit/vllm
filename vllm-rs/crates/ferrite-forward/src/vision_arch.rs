@@ -90,6 +90,25 @@ pub trait VisionArchWeights: Send + Sync + Sized + 'static {
     fn windowed_attn_window_size() -> Option<u32> {
         None
     }
+
+    /// Per-arch CPU-side preprocessing metadata declaration. The macro
+    /// emits this as `&<crate>::PROCESSOR` so the executor can read
+    /// declarative flags (e.g. `mrope_positions`) without naming any
+    /// arch.
+    fn mm_metadata() -> &'static ferrite_vision::MmMetadata;
+
+    /// Number of learned positional embedding rows the body looks up
+    /// via `pos_embed(position_ids, embeddings.position_embedding)`.
+    /// `Some(N)` → the wrapper builds `[0..N, 0..N, ...]` u32 per
+    /// image and uploads it into [`ForwardCtx::vision_position_ids`];
+    /// `None` → no positional embedding (Qwen2-VL / Qwen2.5-VL use 2D
+    /// RoPE via `vision_rope` instead). Used by SigLIP / Gemma3-MM.
+    /// `N` matches the per-image patch count (image_size/patch_size)²,
+    /// fixed at compile time for SigLIP-class arches with a fixed
+    /// resize step.
+    fn vision_num_positions() -> Option<u32> {
+        None
+    }
 }
 
 /// Generic [`MultimodalForward`] impl over any [`VisionArchWeights`].
@@ -202,6 +221,30 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             bf16_slice_as_bytes(sin_to_upload),
         );
 
+        // ── Learned positional embeddings (SigLIP / Gemma3-MM) ──────
+        //
+        // For arches that override `vision_num_positions()` to
+        // `Some(N)`, build `[0..N, 0..N, ...]` u32 (one chunk per
+        // image) and upload as `vision_position_ids`. The DSL body's
+        // `pos_embed(position_ids, weight)` reads this view via
+        // `kernels::embedding_gather_masked`. Default `None` arches
+        // (Qwen2-VL family) skip the upload — `position_ids_buf`
+        // stays None so the GpuTensor isn't allocated.
+        //
+        // The owned GpuTensor lives in this function's stack frame so
+        // the view inside `ctx` doesn't dangle.
+        let position_ids_buf = W::vision_num_positions().map(|num_pos| {
+            let n = num_pos as usize;
+            let mut ids: Vec<u32> = Vec::with_capacity(total_l);
+            for _ in 0..pixel_batches.len() {
+                ids.extend(0..num_pos);
+            }
+            debug_assert_eq!(ids.len(), total_l);
+            debug_assert_eq!(total_l, pixel_batches.len() * n);
+            device.alloc_gpu_tensor_from_host(&[total_l], DType::U32, u32_slice_as_bytes(&ids))
+        });
+        let position_ids_view = position_ids_buf.as_ref().map(|t| unsafe { t.as_view() });
+
         let (cu_window_view, window_index_view, reverse_indices_view, max_seqlen_window_opt) =
             if let Some(ref wd) = window_dispatch {
                 let l_merged = total_l / (cfg.spatial_merge_size as usize).pow(2);
@@ -262,6 +305,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_max_seqlen_window: max_seqlen_window_opt,
             vision_window_index: window_index_view,
             vision_reverse_indices: reverse_indices_view,
+            vision_position_ids: position_ids_view,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };
@@ -287,6 +331,10 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             })
             .collect();
         (projected, patches)
+    }
+
+    fn mm_metadata(&self) -> &'static ferrite_vision::MmMetadata {
+        W::mm_metadata()
     }
 
     fn embed_patch_grids(&self, pixel_batches: &[PixelInput<'_>]) -> Vec<(u32, u32, u32)> {

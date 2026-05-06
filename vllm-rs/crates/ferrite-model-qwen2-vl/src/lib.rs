@@ -20,8 +20,36 @@
 #[cfg(feature = "cuda")]
 use ferrite_forward::vision_forward;
 
+/// Per-arch CPU preprocessing declaration baked into every emitted
+/// `FerriteMmRegistration` row by the `#[vision_forward(processor = ...)]`
+/// arg. Qwen2-VL uses smart-resize (post-resize dims vary per image)
+/// with CLIP-mean/std normalization; placeholder token id is the
+/// `<|image_pad|>` token id from `hf_config.image_token_id` (defaults
+/// to 151655). Tokens-per-image is per-image grid divided by spatial
+/// merge size (= 2 for every Qwen2-VL variant).
+pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
+    hf_token_id_key: "image_token_id",
+    hf_token_id_default: 151655,
+    size_policy: ferrite_vision::SizePolicy::SmartResize {
+        // patch_size(14) · spatial_merge_size(2)
+        factor: 28,
+        // HF Qwen2VLImageProcessor defaults; per-checkpoint
+        // `preprocessor_config.json` overrides at init time.
+        default_min_pixels: 3136,
+        default_max_pixels: 12_845_056,
+    },
+    tokens_per_image: ferrite_vision::TokensPerImage::PerImageGrid {
+        spatial_merge_default: 2,
+    },
+    preprocess: ferrite_vision::preprocess::preprocess_clip_normalized,
+    default_image_size: 392,
+    chat_template_image_part_type: "image",
+    placeholder_policy: ferrite_vision::PlaceholderPolicy::RepeatMarker,
+    mrope_positions: true,
+};
+
 #[cfg(feature = "cuda")]
-#[vision_forward(workloads = [256, 1024, 4096, 16384])]
+#[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
 fn qwen2_vl() {
     hidden_states = gemm(pixels, patch_embed.proj);
 

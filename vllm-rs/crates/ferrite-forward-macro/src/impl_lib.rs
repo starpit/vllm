@@ -441,6 +441,10 @@ pub fn rust_type_for_weight_consumed_by(op: OpKind) -> TokenStream {
         OpKind::Embed => quote! { ::ferrite_kernels::layers::Embedding },
         OpKind::RmsNorm => quote! { ::ferrite_kernels::layers::RmsNorm },
         OpKind::Gemm => quote! { ::ferrite_kernels::layers::LinearLayer },
+        // Vision learned positional embedding (G.7(c.1)). Same wrapper
+        // as `Embed` — the kernel call is the same and the loader
+        // pulls a single `<prefix>.weight` 2D tensor.
+        OpKind::PosEmbed => quote! { ::ferrite_kernels::layers::Embedding },
         // Ops that don't consume weights in the DSL's typical
         // patterns. If the DSL routes a weight into one of these
         // unexpectedly, the user must provide a raw `GpuTensor`.
@@ -2145,6 +2149,20 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(VisionRopeImpl));
     lib.push(Box::new(QuickGeluImpl));
     lib.push(Box::new(GeluErfImpl));
+    // GELU-tanh singleton (Phase G.7(c)). Mirrors `QuickGeluImpl` /
+    // `GeluErfImpl`; claims a standalone `gelu(x)` tile. SigLIP /
+    // Gemma3-MM use tanh-form GELU in their MLP. The
+    // `FusedGateUpGeluMul*` family still claims `(gemm, gemm, gelu, mul)`
+    // SwiGLU-style chains (Gemma2/3 text decoder); the singleton only
+    // fires when no Mul follows.
+    lib.push(Box::new(GeluImpl));
+    // Vision learned positional embedding (Phase G.7(c.1)). Mirror of
+    // `EmbedRefImpl` — same kernel (`embedding_gather_masked`), but
+    // anchored on `vision_num_positions` / `vision_embed_dim` and
+    // reading `ctx.fwd.vision_position_ids` instead of
+    // `ctx.fwd.input_ids`. Used by SigLIP / Gemma3-MM and any future
+    // tower with a learned positional table.
+    lib.push(Box::new(PosEmbedRefImpl));
     // Pixels materialization (Phase G.5.e.1). Synthesized by
     // `vision_lowering::materialize_pixels` after `fuf::unroll`
     // under `Prelude::Vision`; the Impl runs only when that pass
@@ -2157,6 +2175,10 @@ pub fn starter_library() -> ImplementationLibrary {
     // the emitted `Instruction::EmbeddingGather`'s discriminant so
     // eval reads the correct `ForwardCtx` field.
     lib.push(Box::new(EmbeddingGatherImpl));
+    // 2-D non-overlapping average pool (Phase G.7(b)). Claims any
+    // `avg_pool_2d(x)` call; reduces the leading dim by the bake-time
+    // `vision_pool_factor`. Used by Gemma3-MM's SigLIP→text projector.
+    lib.push(Box::new(AvgPool2dImpl));
 
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
@@ -16428,6 +16450,9 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
+            vision_layout: None,
+            vision_d_model_fingerprint: None,
+            vision_patch_embed_flatten: None,
         };
 
         let scale = attention_scale_for(&model);
@@ -16452,6 +16477,7 @@ mod tests {
             weights: Default::default(),
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
         };
 
         let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
@@ -16471,6 +16497,9 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
+            vision_layout: None,
+            vision_d_model_fingerprint: None,
+            vision_patch_embed_flatten: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16527,6 +16556,7 @@ mod tests {
             weights: Default::default(),
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16545,6 +16575,9 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
+            vision_layout: None,
+            vision_d_model_fingerprint: None,
+            vision_patch_embed_flatten: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16623,6 +16656,7 @@ mod tests {
             weights: Default::default(),
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
+            vision_layout: None,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16641,6 +16675,9 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
+            vision_layout: None,
+            vision_d_model_fingerprint: None,
+            vision_patch_embed_flatten: None,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17166,6 +17203,9 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
+            vision_layout: None,
+            vision_d_model_fingerprint: None,
+            vision_patch_embed_flatten: None,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {
@@ -19002,6 +19042,217 @@ impl Implementation for GeluErfImpl {
     }
 }
 
+// ── GeluImpl (Phase G.7(c)) ──────────────────────────────────────
+//
+// Singleton on `OpKind::Gelu` (tanh approximation, PyTorch
+// `nn.GELU(approximate="tanh")` / HuggingFace `gelu_pytorch_tanh`).
+// Mirror of `QuickGeluImpl` / `GeluErfImpl` — same take-owned + in-place
+// kernel + reinsert pattern, distinct kernel (`gelu_tanh_inplace`). The
+// `FusedGateUpGeluMul*` family still claims `(gemm, gemm, gelu, mul)`
+// SwiGLU chains; this singleton only fires when no Mul follows.
+
+#[derive(Debug, Default)]
+pub struct GeluImpl;
+
+impl Implementation for GeluImpl {
+    fn name(&self) -> &'static str {
+        "gelu_tanh_inplace"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::Gelu)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let src = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("gelu input is a tile");
+        vec![src]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Gelu",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("Gelu: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Gelu", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
+        )])
+    }
+}
+
+// ── PosEmbedRefImpl (Phase G.7(c.1)) ─────────────────────────────
+//
+// Singleton on `OpKind::PosEmbed`. Mirror of `EmbedRefImpl` — same
+// HostCallback + Embedding-typed weight + identical
+// `embedding_gather_masked` kernel call — but the eval body reads
+// `ctx.fwd.vision_position_ids` instead of `ctx.fwd.input_ids`, and
+// the shape signature anchors on `vision_num_positions` /
+// `vision_embed_dim`. The DSL surface
+// `pos_embed(position_ids, embeddings.position_embedding)` mirrors
+// the decoder's `embed(input_ids, embed_tokens)` exactly; the
+// distinct OpKind is necessary because `Embed`'s shape sig
+// hard-codes `vocab_size` / `hidden_size` (decoder-only bounds).
+
+#[derive(Debug, Default)]
+pub struct PosEmbedRefImpl;
+
+impl Implementation for PosEmbedRefImpl {
+    fn name(&self) -> &'static str {
+        "pos_embed_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let info = single_tile_match(fuf, seed, OpKind::PosEmbed)?;
+        if let Some(s) = weight_storage_of(fuf.get(seed))
+            && !matches!(s, StorageFormat::Dense)
+        {
+            return None;
+        }
+        Some(info)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Same bandwidth profile as the embed lookup — read num_tokens
+        // rows of [vision_embed_dim] from the table, write same.
+        cost_embed(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "PosEmbed",
+            vec![
+                ("out_slot", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Embedding
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let out_slot = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("PosEmbed: required_weights returned empty");
+        let (base, _layer) = split_base_layer(&acc.name.to_string());
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("PosEmbed", proc_macro2::Span::call_site()),
+            vec![quote! { #out_slot }, quote! { Weights::#base_ident }],
+        )])
+    }
+}
+
 // ── EmbeddingGatherImpl (Phase G.6.4) ────────────────────────────
 //
 // Singleton on `OpKind::EmbeddingGather`. Claims any DSL call to
@@ -19122,6 +19373,103 @@ impl Implementation for EmbeddingGatherImpl {
                 quote! { #out_slot_idx },
                 quote! { #indices_kind },
             ],
+        )])
+    }
+}
+
+// ── AvgPool2dImpl (Phase G.7(b)) ─────────────────────────────────
+//
+// Singleton on `OpKind::AvgPool2d`. Claims any DSL call to
+// `avg_pool_2d(x)` and emits one `Instruction::AvgPool2d { in_slot,
+// out_slot }` row. The kernel reads `vision_patch_grid_side` and
+// `vision_pool_kernel` off `CanonicalParams` to compute the output
+// shape and walk the k² source cells per output row, so no per-call
+// discriminant is needed on the opcode.
+//
+// Unlike the in-place GELU variants, this allocates a fresh smaller
+// output buffer (`[L / k², e]`) — the output shape differs from the
+// input shape, so we can't reuse the input's allocation. Same
+// allocation pattern as `EmbeddingGather`. `consumes_input_tiles`
+// stays empty: the source tile is reused / freed by the standard
+// drop pass.
+
+#[derive(Debug, Default)]
+pub struct AvgPool2dImpl;
+
+impl Implementation for AvgPool2dImpl {
+    fn name(&self) -> &'static str {
+        "avg_pool_2d"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::AvgPool2d)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: read x, write out (k² smaller). Same
+        // estimator as the elementwise / gather Impls.
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "AvgPool2d",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("AvgPool2d: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("AvgPool2d", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
         )])
     }
 }

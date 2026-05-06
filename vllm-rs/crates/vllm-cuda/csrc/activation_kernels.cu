@@ -497,3 +497,141 @@ void gelu_erf_inplace_bf16(void* x, int n_elements, cudaStream_t stream)
 { LAUNCH_GELU_ERF(__nv_bfloat16); }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// GELU (tanh form) — in-place pointwise
+//
+// PyTorch `nn.GELU(approximate="tanh")` (HuggingFace activation key
+// `gelu_pytorch_tanh`):
+//   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// Used by SigLIP / Gemma3-MM vision MLP and other towers calibrated for
+// tanh-GELU. Mirrors `quick_gelu_inplace` / `gelu_erf_inplace`; same
+// vector-load/store + scalar-tail pattern.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void gelu_tanh_inplace_kernel(T* __restrict__ x, int n_elements) {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const int total_vecs = n_elements / VEC_SIZE;
+    const int tail_start = total_vecs * VEC_SIZE;
+
+    for (int vi = blockIdx.x * blockDim.x + threadIdx.x;
+         vi < total_vecs;
+         vi += blockDim.x * gridDim.x)
+    {
+        T* slot = x + vi * VEC_SIZE;
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(slot), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            buf[j] = gelu_tanh(buf[j]);
+        }
+        vec_store(slot, pack_vec<T>(buf));
+    }
+
+    if (blockIdx.x == 0) {
+        for (int i = tail_start + threadIdx.x; i < n_elements; i += blockDim.x) {
+            x[i] = static_cast<T>(gelu_tanh(static_cast<float>(x[i])));
+        }
+    }
+}
+
+extern "C" {
+
+#define LAUNCH_GELU_TANH(T)                                                    \
+    do {                                                                       \
+        if (n_elements <= 0) return;                                           \
+        const int VEC = VecType<T>::SIZE;                                      \
+        const int total_vecs = n_elements / VEC;                               \
+        const int threads = 256;                                               \
+        const int blocks = (total_vecs > 0) ? min(1024, (total_vecs + threads - 1) / threads) : 1; \
+        gelu_tanh_inplace_kernel<T><<<blocks, threads, 0, stream>>>(           \
+            reinterpret_cast<T*>(x), n_elements);                              \
+    } while (0)
+
+void gelu_tanh_inplace_f32(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_GELU_TANH(float); }
+
+void gelu_tanh_inplace_f16(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_GELU_TANH(__half); }
+
+void gelu_tanh_inplace_bf16(void* x, int n_elements, cudaStream_t stream)
+{ LAUNCH_GELU_TANH(__nv_bfloat16); }
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
+// AvgPool2d (non-overlapping) on a flat patch grid
+//
+// Models the Gemma3-MM SigLIP→text projector's average-pool stage. The
+// flat input `[L = ph * ph, e]` is treated as a `ph × ph × e` grid; we
+// fold each `k × k` cell (stride == kernel) into one output row of an
+// `[(ph/k) * (ph/k), e]` output. ph and k come from the per-arch
+// `CanonicalParams` bake (`vision_patch_grid_side` and
+// `vision_pool_kernel`), so the kernel sees them as plain ints.
+//
+// One thread per `(output_row, embed_dim)` cell — total ≈ 295k threads
+// for SigLIP @ 896² (ph=64, k=4, e=1152, → 256 × 1152). Each thread
+// reads k² source elements from non-contiguous rows (separated by
+// `ph * e`) and writes one bf16 — bandwidth-bound. No vectorization
+// (pool side is too small to make 128-bit loads worthwhile).
+
+template <typename T>
+__global__ void avg_pool_2d_kernel(
+    T* __restrict__ out,         // [(ph/k) * (ph/k), e]
+    const T* __restrict__ in,    // [ph * ph, e]
+    int ph,
+    int k,
+    int e
+) {
+    const int ph_out = ph / k;
+    const int total_out = ph_out * ph_out * e;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_out) return;
+
+    int dim = idx % e;
+    int out_row = idx / e;
+    int out_r = out_row / ph_out;
+    int out_c = out_row % ph_out;
+    int in_r0 = out_r * k;
+    int in_c0 = out_c * k;
+
+    float acc = 0.0f;
+    const float inv = 1.0f / static_cast<float>(k * k);
+    for (int dr = 0; dr < k; dr++) {
+        int in_r = in_r0 + dr;
+        const T* row = in + (in_r * ph + in_c0) * e + dim;
+        for (int dc = 0; dc < k; dc++) {
+            acc += static_cast<float>(row[dc * e]);
+        }
+    }
+    out[idx] = static_cast<T>(acc * inv);
+}
+
+extern "C" {
+
+#define LAUNCH_AVG_POOL_2D(T)                                                  \
+    do {                                                                       \
+        const int ph_out = ph / k;                                             \
+        const int total = ph_out * ph_out * e;                                 \
+        if (total <= 0) return;                                                \
+        const int threads = 256;                                               \
+        const int blocks = (total + threads - 1) / threads;                    \
+        avg_pool_2d_kernel<T><<<blocks, threads, 0, stream>>>(                 \
+            reinterpret_cast<T*>(out),                                         \
+            reinterpret_cast<const T*>(in),                                    \
+            ph, k, e);                                                         \
+    } while (0)
+
+void avg_pool_2d_f32(void* out, const void* in, int ph, int k, int e, cudaStream_t stream)
+{ LAUNCH_AVG_POOL_2D(float); }
+
+void avg_pool_2d_f16(void* out, const void* in, int ph, int k, int e, cudaStream_t stream)
+{ LAUNCH_AVG_POOL_2D(__half); }
+
+void avg_pool_2d_bf16(void* out, const void* in, int ph, int k, int e, cudaStream_t stream)
+{ LAUNCH_AVG_POOL_2D(__nv_bfloat16); }
+
+} // extern "C"

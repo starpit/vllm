@@ -1,0 +1,52 @@
+{
+  "architectures": [
+    "Gemma3ForConditionalGeneration"
+  ],
+  "model_type": "gemma3_mm_vision",
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+
+  "d_model": 3840,
+
+  "vision_embed_dim": 1152,
+  "vision_depth": 27,
+  "vision_num_heads": 16,
+  "vision_head_dim": 72,
+  "vision_mlp_hidden": 4304,
+  "vision_in_chans": 3,
+  "vision_patch_size": 14,
+  "vision_image_size": 896,
+  "vision_in_features": 588,
+  "vision_num_positions": 4096,
+  "vision_patch_grid_side": 64,
+
+  "vision_temporal_patch_size": 1,
+  "vision_spatial_merge_size": 1,
+  "vision_rope_half_dim": 0,
+  "vision_merge_factor": 1,
+  "vision_merge_hidden": 1152,
+
+  "vision_pool_kernel": 4,
+  "vision_pool_factor": 16,
+  "vision_pooled_tokens": 256,
+
+  "vision_norm_eps": 1e-6,
+
+  "vision_safetensors_layout": {
+    "default_root": "vision_tower.vision_model",
+    "layered_subpath": "encoder.layers",
+    "subtrees": {
+      "mm": "multi_modal_projector"
+    }
+  },
+
+  "vision_d_model_fingerprint": {
+    "key": "multi_modal_projector.mm_input_projection_weight",
+    "dim": 1
+  },
+
+  "vision_patch_embed_flatten": {
+    "key": "vision_tower.vision_model.embeddings.patch_embedding.weight",
+    "leading_dim": 0
+  }
+}

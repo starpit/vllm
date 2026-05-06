@@ -38,6 +38,7 @@ members = [
     "crates/ferrite-vision",
     "crates/ferrite-model-qwen2-vl",
     "crates/ferrite-model-qwen2-5-vl",
+    "crates/ferrite-model-gemma3-mm",
     "crates/ferrite-model-qwen3",
     "crates/ferrite-model-qwen3-moe",
     "crates/ferrite-model-deepseek-v2",
@@ -187,6 +188,8 @@ vllm-serve = { path = "crates/vllm-serve" }
 vllm-executor = { path = "crates/vllm-executor" }
 vllm-model = { path = "crates/vllm-model" }
 ferrite-gguf = { path = "crates/ferrite-gguf" }
+ferrite-vision = { path = "crates/ferrite-vision" }
+ferrite-forward = { path = "crates/ferrite-forward" }
 vllm-protocol = { path = "crates/vllm-protocol" }
 vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }

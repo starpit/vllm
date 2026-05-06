@@ -1,6 +1,6 @@
 //! Layered-load helper subroutines that fold each per-accessor
 //! `let <base>: Vec<T> = (0..N).map(|layer| Type::load(gw,
-//! &layer_weight_path(layer, suffix), …)).collect::<Result<Vec<_>>>()?;`
+//! &layer_weight_path_with_root(root, layer, suffix), …)).collect::<Result<Vec<_>>>()?;`
 //! block emitted by `emit_layered_load_body` into a single fn-call
 //! at the call site.
 //!
@@ -26,17 +26,17 @@ use ferrite_kernels::layers::{
 };
 use ferrite_kernels::layers_quant::MarlinFormat;
 
-use crate::{layer_weight_path, vision_block_weight_path};
+use crate::{layer_weight_path_with_root, vision_block_weight_path};
 
 /// Build a `Vec<&str>` of fully-qualified weight paths for a
 /// concat-style accessor at one specific layer. The returned `paths`
 /// owns the `String`s the `&str` borrows point into; the caller
 /// must keep `paths` alive for the duration of the borrow.
 #[inline]
-fn concat_paths_for_layer(layer: u32, suffixes: &[&str]) -> Vec<String> {
+fn concat_paths_for_layer(root: &str, layer: u32, suffixes: &[&str]) -> Vec<String> {
     suffixes
         .iter()
-        .map(|s| layer_weight_path(layer, s))
+        .map(|s| layer_weight_path_with_root(root, layer, s))
         .collect()
 }
 
@@ -48,10 +48,11 @@ fn as_str_refs(paths: &[String]) -> Vec<&str> {
 pub fn load_layered_embedding(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
 ) -> Result<Vec<Embedding>> {
     (0..n_layers)
-        .map(|layer| Embedding::load(gw, &layer_weight_path(layer, suffix)))
+        .map(|layer| Embedding::load(gw, &layer_weight_path_with_root(root, layer, suffix)))
         .collect()
 }
 
@@ -66,23 +67,32 @@ pub fn load_layered_embedding(
 pub fn load_layered_embedding_sharded(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     rank: usize,
     world: usize,
 ) -> Result<Vec<Embedding>> {
     (0..n_layers)
-        .map(|layer| Embedding::load_sharded(gw, &layer_weight_path(layer, suffix), rank, world))
+        .map(|layer| {
+            Embedding::load_sharded(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                rank,
+                world,
+            )
+        })
         .collect()
 }
 
 pub fn load_layered_rms_norm(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     eps: f32,
 ) -> Result<Vec<RmsNorm>> {
     (0..n_layers)
-        .map(|layer| RmsNorm::load(gw, &layer_weight_path(layer, suffix), eps))
+        .map(|layer| RmsNorm::load(gw, &layer_weight_path_with_root(root, layer, suffix), eps))
         .collect()
 }
 
@@ -96,11 +106,12 @@ pub fn load_layered_rms_norm(
 pub fn load_layered_layer_norm(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     eps: f32,
 ) -> Result<Vec<LayerNorm>> {
     (0..n_layers)
-        .map(|layer| LayerNorm::load(gw, &layer_weight_path(layer, suffix), eps))
+        .map(|layer| LayerNorm::load(gw, &layer_weight_path_with_root(root, layer, suffix), eps))
         .collect()
 }
 
@@ -112,11 +123,12 @@ pub fn load_layered_layer_norm(
 pub fn load_layered_rms_norm_vision(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     eps: f32,
 ) -> Result<Vec<RmsNorm>> {
     (0..n_layers)
-        .map(|layer| RmsNorm::load(gw, &vision_block_weight_path(layer, suffix), eps))
+        .map(|layer| RmsNorm::load(gw, &vision_block_weight_path(root, layer, suffix), eps))
         .collect()
 }
 
@@ -130,11 +142,12 @@ pub fn load_layered_rms_norm_vision(
 pub fn load_layered_layer_norm_vision(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     eps: f32,
 ) -> Result<Vec<LayerNorm>> {
     (0..n_layers)
-        .map(|layer| LayerNorm::load(gw, &vision_block_weight_path(layer, suffix), eps))
+        .map(|layer| LayerNorm::load(gw, &vision_block_weight_path(root, layer, suffix), eps))
         .collect()
 }
 
@@ -144,23 +157,27 @@ pub fn load_layered_layer_norm_vision(
 pub fn load_layered_linear_dense_vision(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
 ) -> Result<Vec<LinearLayer>> {
     (0..n_layers)
-        .map(|layer| LinearLayer::load_dense(gw, &vision_block_weight_path(layer, suffix)))
+        .map(|layer| LinearLayer::load_dense(gw, &vision_block_weight_path(root, layer, suffix)))
         .collect()
 }
 
 pub fn load_layered_linear_dense(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
 ) -> Result<Vec<LinearLayer>> {
     // `load_dense_or_ggml`: tries `take_quantized_linear` first
     // (for `StorageFormat::Ggml` weights), falls back to dense.
     // Transparent on safetensors models since the GGUF map is empty.
     (0..n_layers)
-        .map(|layer| LinearLayer::load_dense_or_ggml(gw, &layer_weight_path(layer, suffix)))
+        .map(|layer| {
+            LinearLayer::load_dense_or_ggml(gw, &layer_weight_path_with_root(root, layer, suffix))
+        })
         .collect()
 }
 
@@ -171,6 +188,7 @@ pub fn load_layered_linear_dense(
 pub fn load_layered_linear_dense_sharded(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     dim: usize,
     rank: usize,
@@ -178,7 +196,13 @@ pub fn load_layered_linear_dense_sharded(
 ) -> Result<Vec<LinearLayer>> {
     (0..n_layers)
         .map(|layer| {
-            LinearLayer::load_dense_sharded(gw, &layer_weight_path(layer, suffix), dim, rank, world)
+            LinearLayer::load_dense_sharded(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                dim,
+                rank,
+                world,
+            )
         })
         .collect()
 }
@@ -186,6 +210,7 @@ pub fn load_layered_linear_dense_sharded(
 pub fn load_layered_linear_dense_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     stream: CUstream,
 ) -> Result<Vec<LinearLayer>> {
@@ -196,7 +221,7 @@ pub fn load_layered_linear_dense_concat(
     }
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             LinearLayer::load_dense_concat_or_ggml(gw, &refs, stream)
         })
@@ -213,6 +238,7 @@ pub fn load_layered_linear_dense_concat(
 pub fn load_layered_linear_dense_concat_vision(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     stream: CUstream,
 ) -> Result<Vec<LinearLayer>> {
@@ -220,7 +246,7 @@ pub fn load_layered_linear_dense_concat_vision(
         .map(|layer| {
             let paths: Vec<String> = suffixes
                 .iter()
-                .map(|s| crate::vision_block_weight_path(layer, s))
+                .map(|s| crate::vision_block_weight_path(root, layer, s))
                 .collect();
             let refs = as_str_refs(&paths);
             LinearLayer::load_dense_concat_or_ggml(gw, &refs, stream)
@@ -234,6 +260,7 @@ pub fn load_layered_linear_dense_concat_vision(
 pub fn load_layered_linear_dense_concat_sharded(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     stream: CUstream,
     rank: usize,
@@ -241,7 +268,7 @@ pub fn load_layered_linear_dense_concat_sharded(
 ) -> Result<Vec<LinearLayer>> {
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             LinearLayer::load_dense_concat_sharded(gw, &refs, stream, rank, world)
         })
@@ -252,6 +279,7 @@ pub fn load_layered_linear_dense_concat_sharded(
 pub fn load_layered_marlin_linear(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     storage: MarlinFormat,
     workspace: GpuTensor,
@@ -261,7 +289,7 @@ pub fn load_layered_marlin_linear(
         .map(|layer| {
             MarlinLinear::load(
                 gw,
-                &layer_weight_path(layer, suffix),
+                &layer_weight_path_with_root(root, layer, suffix),
                 storage,
                 workspace,
                 device_id,
@@ -274,6 +302,7 @@ pub fn load_layered_marlin_linear(
 pub fn load_layered_marlin_linear_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     storage: MarlinFormat,
     workspace: GpuTensor,
@@ -281,7 +310,7 @@ pub fn load_layered_marlin_linear_concat(
 ) -> Result<Vec<MarlinLinear>> {
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             MarlinLinear::load_concat(gw, &refs, storage, workspace, device_id)
         })
@@ -291,13 +320,18 @@ pub fn load_layered_marlin_linear_concat(
 pub fn load_layered_fp8_linear(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     output_dtype: DType,
 ) -> Result<Vec<Fp8AnyLinear>> {
     (0..n_layers)
         .map(|layer| {
-            Fp8Linear::load(gw, &layer_weight_path(layer, suffix), output_dtype)
-                .map(Fp8AnyLinear::Std)
+            Fp8Linear::load(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                output_dtype,
+            )
+            .map(Fp8AnyLinear::Std)
         })
         .collect()
 }
@@ -305,12 +339,13 @@ pub fn load_layered_fp8_linear(
 pub fn load_layered_fp8_linear_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     output_dtype: DType,
 ) -> Result<Vec<Fp8AnyLinear>> {
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             Fp8Linear::load_concat(gw, &refs, output_dtype).map(Fp8AnyLinear::Std)
         })
@@ -320,13 +355,18 @@ pub fn load_layered_fp8_linear_concat(
 pub fn load_layered_fp8_block_linear(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     output_dtype: DType,
 ) -> Result<Vec<Fp8AnyLinear>> {
     (0..n_layers)
         .map(|layer| {
-            Fp8BlockLinear::load(gw, &layer_weight_path(layer, suffix), output_dtype)
-                .map(Fp8AnyLinear::Block)
+            Fp8BlockLinear::load(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                output_dtype,
+            )
+            .map(Fp8AnyLinear::Block)
         })
         .collect()
 }
@@ -334,12 +374,13 @@ pub fn load_layered_fp8_block_linear(
 pub fn load_layered_fp8_block_linear_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     output_dtype: DType,
 ) -> Result<Vec<Fp8AnyLinear>> {
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             Fp8BlockLinear::load_concat(gw, &refs, output_dtype).map(Fp8AnyLinear::Block)
         })
@@ -350,6 +391,7 @@ pub fn load_layered_fp8_block_linear_concat(
 pub fn load_layered_bnb4(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffix: &str,
     code_gpu: GpuTensor,
     dequant_scratch: GpuTensor,
@@ -361,7 +403,7 @@ pub fn load_layered_bnb4(
         .map(|layer| {
             Bnb4bitLinear::load(
                 gw,
-                &layer_weight_path(layer, suffix),
+                &layer_weight_path_with_root(root, layer, suffix),
                 code_gpu,
                 dequant_scratch,
                 out_features,
@@ -376,6 +418,7 @@ pub fn load_layered_bnb4(
 pub fn load_layered_bnb4_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
     code_gpu: GpuTensor,
     dequant_scratch: GpuTensor,
@@ -385,7 +428,7 @@ pub fn load_layered_bnb4_concat(
 ) -> Result<Vec<Bnb4bitLinear>> {
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             Bnb4bitLinear::load_concat(
                 gw,

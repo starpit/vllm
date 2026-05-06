@@ -70,6 +70,14 @@ struct ForwardArgs {
     /// (u32, u32, u32))`. The macro-emitted `VisionArchWeights` impl
     /// forwards its `pixel_pack` associated fn to this path.
     pixel_pack: Option<syn::Path>,
+    /// Path to a `pub const PROCESSOR: ferrite_vision::MmMetadata` in
+    /// the per-arch crate declaring CPU-side host preprocessing
+    /// metadata (placeholder token id key, size policy, tokens-per-
+    /// image policy, preprocess fn). Required for `#[vision_forward]`,
+    /// ignored by `#[forward]`. Baked into every emitted
+    /// `FerriteMmRegistration` row. ferrite stays arch-agnostic — every
+    /// arch-specific knob is data on the const, not a switch in ferrite.
+    processor: Option<syn::Path>,
     /// Span used for error reporting when a required arg is
     /// missing.
     span: Span,
@@ -81,6 +89,7 @@ impl Parse for ForwardArgs {
         let mut workloads: Option<Vec<u64>> = None;
         let mut sk_buckets: Option<Vec<u64>> = None;
         let mut pixel_pack: Option<syn::Path> = None;
+        let mut processor: Option<syn::Path> = None;
 
         fn parse_u64_list(input: ParseStream) -> syn::Result<Vec<u64>> {
             let list;
@@ -104,6 +113,7 @@ impl Parse for ForwardArgs {
                 "workloads" => workloads = Some(parse_u64_list(input)?),
                 "sk_buckets" => sk_buckets = Some(parse_u64_list(input)?),
                 "pixel_pack" => pixel_pack = Some(input.parse::<syn::Path>()?),
+                "processor" => processor = Some(input.parse::<syn::Path>()?),
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -133,6 +143,7 @@ impl Parse for ForwardArgs {
             workloads,
             sk_buckets,
             pixel_pack,
+            processor,
             span,
         })
     }
@@ -475,6 +486,23 @@ fn compile_common(
             format!("weights.json in {}: {e}", models_dir.display()),
         )
     })?;
+
+    // Vision-prelude programs route safetensors prefixes through
+    // the per-arch layout. Pull from the representative model;
+    // every variant of one vision arch shares the layout (only
+    // `d_model` differs across variants — the layout itself is
+    // arch-uniform). Decoder programs leave it `None`.
+    if matches!(mode.prelude, classified::Prelude::Vision) {
+        classified.vision_layout = models[0].vision_layout.clone();
+    }
+    // Decoder-side safetensors-prefix override (e.g. Gemma3-MM nests
+    // the text decoder under `language_model.<...>`). Pulled from the
+    // representative model — variants of one decoder arch share the
+    // disk layout. Decoder programs that don't set the JSON field
+    // (text-only, Qwen-style VL) leave it `None`.
+    if matches!(mode.prelude, classified::Prelude::Decoder) {
+        classified.decoder_safetensors_prefix = models[0].decoder_safetensors_prefix.clone();
+    }
 
     // Shape inference may flag reshape-recoverable mismatches (e.g.
     // per-head QK-norm in Qwen3/Gemma3). Catch those, synthesize the
@@ -857,6 +885,7 @@ fn compile_common(
                 // `scalar_mul_inplace` / `tanh_softcap_inplace` lines.
                 "quick_gelu_inplace",
                 "gelu_erf_inplace",
+                "gelu_tanh_inplace",
                 // Vision-prelude pixels materialization (G.5.e.1).
                 // Synthesized by `vision_lowering::materialize_pixels`;
                 // emits a single D2D copy that wraps `ctx.fwd.pixels`
@@ -870,6 +899,15 @@ fn compile_common(
                 // window-attention dispatch — same class as the other
                 // memory-bound vision primitives.
                 "embedding_gather",
+                // 2-D average pool over the patch grid (G.7(b)). Used
+                // by Gemma3-MM's SigLIP→text projector to reduce the
+                // 64×64 patch grid down to 16×16 = 256 tokens. Memory-
+                // bound with one thread per output cell; non-gemm.
+                "avg_pool_2d",
+                // Vision learned positional embedding lookup (G.7(c.1)).
+                // Reuses the decoder's `embedding_gather_masked` kernel;
+                // same memory-bound class as `embed_ref`.
+                "pos_embed_ref",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
@@ -1067,11 +1105,19 @@ fn compile_common(
         // `pixel_pack` is None for arches that use the trait's
         // default (delegating to `VisionConfig::patches_from_normalized_chw`).
         let vision_glue = if matches!(mode.prelude, classified::Prelude::Vision) {
+            let processor = args.processor.as_ref().ok_or_else(|| {
+                syn::Error::new(
+                    args.span,
+                    "#[vision_forward] missing required `processor = path::PROCESSOR` arg \
+                     (path to a `pub const PROCESSOR: ferrite_vision::MmMetadata`)",
+                )
+            })?;
             vision_glue::emit_per_variant(
                 sm.model,
                 &arch_name,
                 args.pixel_pack.as_ref(),
                 &manifest.pad_to_mult8,
+                processor,
             )
         } else {
             proc_macro2::TokenStream::new()

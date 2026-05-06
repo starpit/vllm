@@ -315,6 +315,44 @@ unsafe extern "C" {
     fn gelu_erf_inplace_bf16(x: *mut u16, n_elements: c_int, stream: CUstream);
     fn gelu_erf_inplace_f32(x: *mut f32, n_elements: c_int, stream: CUstream);
 
+    // GELU (tanh approximation, PyTorch nn.GELU(approximate="tanh"),
+    // HuggingFace `gelu_pytorch_tanh`):
+    //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+    // Used by SigLIP / Gemma3-MM vision MLP. Distinct from
+    // `gelu_erf_inplace` and `quick_gelu_inplace` — the three differ in
+    // numerical form.
+    fn gelu_tanh_inplace_f16(x: *mut u16, n_elements: c_int, stream: CUstream);
+    fn gelu_tanh_inplace_bf16(x: *mut u16, n_elements: c_int, stream: CUstream);
+    fn gelu_tanh_inplace_f32(x: *mut f32, n_elements: c_int, stream: CUstream);
+
+    // 2-D non-overlapping average pool over a flat patch grid.
+    // Input  [ph * ph, e] → output [(ph/k) * (ph/k), e]. Stride == kernel.
+    // Used by Gemma3-MM's SigLIP→text projector (Phase G.7(b)).
+    fn avg_pool_2d_f16(
+        out: *mut u16,
+        x: *const u16,
+        ph: c_int,
+        k: c_int,
+        e: c_int,
+        stream: CUstream,
+    );
+    fn avg_pool_2d_bf16(
+        out: *mut u16,
+        x: *const u16,
+        ph: c_int,
+        k: c_int,
+        e: c_int,
+        stream: CUstream,
+    );
+    fn avg_pool_2d_f32(
+        out: *mut f32,
+        x: *const f32,
+        ph: c_int,
+        k: c_int,
+        e: c_int,
+        stream: CUstream,
+    );
+
     // Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
     fn tanh_softcap_inplace_f16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
     fn tanh_softcap_inplace_bf16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
@@ -1990,6 +2028,82 @@ pub unsafe fn gelu_erf_inplace(x: GpuTensor, stream: CUstream) {
         DType::F32 => gelu_erf_inplace_f32(x.as_mut_ptr(), n, stream),
         _ => panic!("gelu_erf_inplace: unsupported dtype {:?}", x.dtype()),
     }
+}
+
+/// In-place GELU (tanh approximation):
+/// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+///
+/// Matches PyTorch `nn.GELU(approximate="tanh")` / HuggingFace
+/// `gelu_pytorch_tanh`. Used by SigLIP / Gemma3-MM vision MLP.
+/// Distinct from `quick_gelu_inplace` (1.702 sigmoid) and
+/// `gelu_erf_inplace` (exact erf).
+///
+/// # Safety
+/// Same as [`quick_gelu_inplace`].
+pub unsafe fn gelu_tanh_inplace(x: GpuTensor, stream: CUstream) {
+    let n = x.numel() as c_int;
+    if n == 0 {
+        return;
+    }
+    match x.dtype() {
+        DType::F16 => gelu_tanh_inplace_f16(x.as_mut_ptr(), n, stream),
+        DType::BF16 => gelu_tanh_inplace_bf16(x.as_mut_ptr(), n, stream),
+        DType::F32 => gelu_tanh_inplace_f32(x.as_mut_ptr(), n, stream),
+        _ => panic!("gelu_tanh_inplace: unsupported dtype {:?}", x.dtype()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AvgPool2d (non-overlapping) over a flat patch grid
+// ---------------------------------------------------------------------------
+
+/// 2-D non-overlapping average pool over a square patch grid.
+///
+/// Treats `x: [ph * ph, e]` as `[ph, ph, e]`, applies a stride-k k×k
+/// average pool (stride == kernel — non-overlapping), and flattens back
+/// to `[(ph/k) * (ph/k), e]`. Used by Gemma3-MM's SigLIP→text projector
+/// (Phase G.7(b)).
+///
+/// `ph` must be divisible by `k`. Allocates a fresh output tensor from
+/// the caching allocator.
+///
+/// # Safety
+/// `x` must be a valid `[ph * ph, e]` GPU tensor; the caller serializes
+/// against other kernel writes to `x`.
+pub unsafe fn avg_pool_2d(
+    x: GpuTensor,
+    ph: u32,
+    k: u32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let l = x.dim(0);
+    let e = x.dim(1);
+    let ph_us = ph as usize;
+    let k_us = k as usize;
+    assert!(
+        ph_us > 0 && k_us > 0 && ph_us.is_multiple_of(k_us),
+        "avg_pool_2d: ph ({ph}) must be a positive multiple of k ({k})"
+    );
+    assert_eq!(
+        l,
+        ph_us * ph_us,
+        "avg_pool_2d: input leading dim {l} must equal ph² ({})",
+        ph_us * ph_us,
+    );
+    let ph_out = ph_us / k_us;
+    let l_out = ph_out * ph_out;
+    let out = alloc.alloc_tensor(&[l_out, e], x.dtype());
+    let ph_c = ph as c_int;
+    let k_c = k as c_int;
+    let e_c = e as c_int;
+    match x.dtype() {
+        DType::F16 => avg_pool_2d_f16(out.as_mut_ptr(), x.as_ptr(), ph_c, k_c, e_c, stream),
+        DType::BF16 => avg_pool_2d_bf16(out.as_mut_ptr(), x.as_ptr(), ph_c, k_c, e_c, stream),
+        DType::F32 => avg_pool_2d_f32(out.as_mut_ptr(), x.as_ptr(), ph_c, k_c, e_c, stream),
+        _ => panic!("avg_pool_2d: unsupported dtype {:?}", x.dtype()),
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -20,12 +20,23 @@
 //! arch-specific extras (`intermediate_size`, `window_size`, …) in a
 //! sibling struct.
 
+#[cfg(feature = "cuda")]
 use anyhow::Result;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::CUstream;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::driver;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::tensor::GpuTensor;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::weights::GpuWeights;
+#[cfg(feature = "cuda")]
 use ferrite_kernels::layers::Linear;
+
+pub mod mm_meta;
+pub mod preprocess;
+
+pub use mm_meta::{MmMetadata, PlaceholderPolicy, PreprocessFn, SizePolicy, TokensPerImage};
 
 /// RoPE base used by every Qwen2/2.5-VL tower (and the working assumption
 /// for the next VL arches). Lift to a `VisionConfig` field if a future
@@ -281,6 +292,7 @@ impl VisionConfig {
 /// `weights` must outlive the returned `Linear`'s underlying allocation
 /// (the new pointer is registered via `record_alloc` so the
 /// caching/weights allocator owns it).
+#[cfg(feature = "cuda")]
 pub unsafe fn pad_linear_k_to_mult8(
     linear: Linear,
     weights: &mut GpuWeights,
@@ -327,10 +339,12 @@ pub unsafe fn pad_linear_k_to_mult8(
 /// Env-driven (`FERRITE_VIT_DUMP_DIR=<dir>`) intermediate-tensor
 /// recorder. Construct once per forward (`TraceDump::from_env`); call
 /// `dump_tensor` between encoder stages to write `.bin` + jsonl metadata.
+#[cfg(feature = "cuda")]
 pub struct TraceDump {
     dir: Option<std::path::PathBuf>,
 }
 
+#[cfg(feature = "cuda")]
 impl TraceDump {
     pub fn from_env() -> Self {
         let dir = std::env::var("FERRITE_VIT_DUMP_DIR").ok().and_then(|s| {

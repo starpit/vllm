@@ -13,5 +13,7 @@ nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl"]
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
+vllm-common = { path = "../vllm-common" }
 anyhow = { workspace = true }
 half = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

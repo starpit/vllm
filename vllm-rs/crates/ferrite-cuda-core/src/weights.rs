@@ -1113,6 +1113,149 @@ impl GpuWeights {
         })
     }
 
+    /// Rewrite a safetensors entry's shape in place. Element count
+    /// must match the on-disk size. Used to flatten conv-style
+    /// tensors (e.g. Qwen2-VL `visual.patch_embed.proj.weight`
+    /// `[E, C, T, P, P]` 5D, or SigLIP's `[E, C, P, P]` 4D) to the
+    /// 2D form a downstream `take`-style loader expects, when that
+    /// loader doesn't have a shape-override entry point. No data is
+    /// moved; only the shape metadata changes.
+    pub fn reshape_in_place(&mut self, name: &str, new_shape: &[usize]) -> Result<()> {
+        let cpu_ref = self
+            .tensors
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("reshape_in_place: weight not found: {name}"))?;
+        let old_numel: usize = cpu_ref.shape.iter().product();
+        let new_numel: usize = new_shape.iter().product();
+        anyhow::ensure!(
+            old_numel == new_numel,
+            "reshape_in_place: {name} on-disk shape {:?} (numel {old_numel}) != new shape {:?} (numel {new_numel})",
+            cpu_ref.shape,
+            new_shape,
+        );
+        cpu_ref.shape = new_shape.to_vec();
+        Ok(())
+    }
+
+    /// Physically transpose a 2D weight in place at CPU side, before
+    /// any `take`/`take_with_shape` runs. The `CpuTensorRef` switches
+    /// from mmap-backed to owned-backed: an owned `Vec<u8>` of the same
+    /// size is allocated, the source bytes are copied with axes swapped,
+    /// and the shape metadata is `[d0, d1]` → `[d1, d0]`. Element dtype
+    /// must be 2-byte (bf16 / fp16) or 4-byte (fp32).
+    ///
+    /// Used by `LinearLayer::load_raw` for `nn.Parameter` weights that
+    /// ship matmul-natural `[K, N]` (HF `Gemma3MultiModalProjector::
+    /// mm_input_projection_weight`, used as `act @ param`) — ferrite's
+    /// gemm expects `[N, K]` (PyTorch nn.Linear convention), so the
+    /// transpose lands the on-disk param into the runtime convention.
+    pub fn transpose_2d_in_place(&mut self, name: &str) -> Result<()> {
+        let cpu_ref = self
+            .tensors
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("transpose_2d_in_place: weight not found: {name}"))?;
+        anyhow::ensure!(
+            cpu_ref.shape.len() == 2,
+            "transpose_2d_in_place: {name} must be 2D, got {:?}",
+            cpu_ref.shape,
+        );
+        let d0 = cpu_ref.shape[0];
+        let d1 = cpu_ref.shape[1];
+        let elem = cpu_ref.dtype.size_bytes();
+        let total_bytes = d0 * d1 * elem;
+        let src = cpu_ref.data();
+        anyhow::ensure!(
+            src.len() == total_bytes,
+            "transpose_2d_in_place: {name} byte length {} doesn't match shape {:?} × elem {}",
+            src.len(),
+            cpu_ref.shape,
+            elem,
+        );
+
+        let mut buf = vec![0u8; total_bytes];
+        for i in 0..d0 {
+            for j in 0..d1 {
+                let src_off = (i * d1 + j) * elem;
+                let dst_off = (j * d0 + i) * elem;
+                buf[dst_off..dst_off + elem].copy_from_slice(&src[src_off..src_off + elem]);
+            }
+        }
+
+        cpu_ref.mmap = None;
+        cpu_ref.data_offset = 0;
+        cpu_ref.size_bytes = total_bytes;
+        cpu_ref.shape = vec![d1, d0];
+        cpu_ref.owned = Some(Arc::new(buf));
+        Ok(())
+    }
+
+    /// Zero-pad a 2D weight's `dim` axis (0 or 1) to the next multiple
+    /// of `mult` at CPU side, before any `take`/`take_with_shape` runs.
+    /// The CpuTensorRef switches from mmap-backed to owned-backed: an
+    /// owned `Vec<u8>` of the padded size is allocated, zero-init'd,
+    /// and the original on-disk bytes are memcpy'd into the leading
+    /// slice. Subsequent loads see the padded shape directly. No-op
+    /// when the axis is already a multiple of `mult`.
+    ///
+    /// Used by the vision encoder to work around cuBLAS bf16 GEMM
+    /// failing on K=3420 (Qwen2.5-VL-3B `vision_intermediate_size`):
+    /// padding K (or N on the producing weights) to the next mult of
+    /// 8 lands every gemm on an algo cuBLAS supports, with zero-fill
+    /// columns/rows preserving math (`silu(0)·0 = 0` on the activation
+    /// side, weight-side zero rows contract to zero in the next gemm).
+    pub fn pad_axis_to_mult8(&mut self, name: &str, dim: usize, mult: usize) -> Result<()> {
+        let cpu_ref = self
+            .tensors
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("pad_axis_to_mult8: weight not found: {name}"))?;
+        anyhow::ensure!(
+            cpu_ref.shape.len() == 2,
+            "pad_axis_to_mult8: {name} must be 2D, got {:?}",
+            cpu_ref.shape,
+        );
+        anyhow::ensure!(dim < 2, "pad_axis_to_mult8: dim must be 0 or 1, got {dim}");
+        let old_shape = cpu_ref.shape.clone();
+        let pad_to = old_shape[dim].next_multiple_of(mult);
+        if pad_to == old_shape[dim] {
+            return Ok(());
+        }
+        let elem = cpu_ref.dtype.size_bytes();
+        let mut new_shape = old_shape.clone();
+        new_shape[dim] = pad_to;
+        let new_numel: usize = new_shape.iter().product();
+        let new_size_bytes = new_numel * elem;
+
+        let src = cpu_ref.data();
+        let mut buf = vec![0u8; new_size_bytes];
+        match dim {
+            0 => {
+                // Padding rows: copy old `[d0_old, d1] * elem` bytes
+                // to leading slice; trailing rows stay zero.
+                let copy_bytes = old_shape[0] * old_shape[1] * elem;
+                buf[..copy_bytes].copy_from_slice(&src[..copy_bytes]);
+            }
+            1 => {
+                // Padding cols: per-row copy of `d1_old * elem` bytes
+                // into the first `d1_old * elem` of each padded row.
+                let src_row = old_shape[1] * elem;
+                let dst_row = new_shape[1] * elem;
+                let rows = old_shape[0];
+                for r in 0..rows {
+                    let s = &src[r * src_row..(r + 1) * src_row];
+                    buf[r * dst_row..r * dst_row + src_row].copy_from_slice(s);
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        cpu_ref.mmap = None;
+        cpu_ref.data_offset = 0;
+        cpu_ref.size_bytes = new_size_bytes;
+        cpu_ref.shape = new_shape;
+        cpu_ref.owned = Some(Arc::new(buf));
+        Ok(())
+    }
+
     /// Tensor shape lookup that checks all three backing maps —
     /// safetensors `tensors`, `gguf_dense`, and `quantized`. Used by
     /// the per-variant fingerprint sniff which needs to verify

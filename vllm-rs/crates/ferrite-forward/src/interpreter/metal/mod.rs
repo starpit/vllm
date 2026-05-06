@@ -32,4 +32,4 @@ pub use model_meta::{BufferRef, MetalModelMeta};
 #[cfg(feature = "metal")]
 pub use runtime::RuntimeBindings;
 #[cfg(feature = "metal")]
-pub use worker::{ArenaLayout, BucketBaking, ExecSegment, MetalWorker, WorkerError};
+pub use worker::{ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker, WorkerError};

@@ -25,22 +25,27 @@
 //! different specialized pipelines (e.g. per-layer `RmsNorm.eps`
 //! varying) become separate segments.
 //!
-//! `KernelId::Gemm` is opaque to the function-constant cache — Metal
-//! Performance Shaders' `matmul2d` is not an MSL kernel we can bake
-//! function constants into. Phase 5.C punts: `MetalWorker::new`
-//! returns [`WorkerError::OpaqueGemmNotYetRouted`] when it
-//! encounters one. The choice between (a) MPS dispatch interleaved
-//! with the per-segment loop and (b) a hand-rolled f16 GEMM tile
-//! shader lives in Phase 5.C.5; tracked in `TaskList`.
+//! `KernelId::Gemm` is routed differently. MPS' `matmul2d` is opaque
+//! to the function-constant cache — and it doesn't fit into an ICB
+//! either, since `encodeToCommandBuffer` opens its own internal
+//! compute encoder(s). 5.C.5 lifts the per-bucket plan to a
+//! [`Vec<BucketStep>`] where each step is either an ICB run (under
+//! one `MTLComputePipelineState`) or an MPS GEMM dispatch. The
+//! per-forward path walks the steps; ICB steps reuse the encoder
+//! they share, and a `Gemm` step ends the current encoder, encodes
+//! the GEMM directly into the command buffer, and the next ICB step
+//! opens a fresh encoder.
 
 #![cfg(feature = "metal")]
 
 use std::sync::Arc;
 
+use ferrite_metal_kernels::gemm::{encode_gemm_into_command_buffer, GemmError};
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
 use ferrite_metal_kernels::metal::foreign_types::ForeignType;
 use ferrite_metal_kernels::metal::{
-    Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
+    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    MTLResourceOptions, MTLSize,
 };
 
 use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape};
@@ -54,32 +59,65 @@ use crate::CanonicalParams;
 /// for the Phase 5.C smoke test the test sets it explicitly.
 pub type ArenaLayout = Vec<u64>;
 
-/// One contiguous run of ICB commands sharing a pipeline state.
-/// The forward path executes one segment with
-/// `encoder.set_compute_pipeline_state(&pipeline);
-///  icb.execute_on_encoder(encoder, range);`
-pub struct ExecSegment {
-    /// Pipeline state bound to the encoder before the range fires.
-    /// Held for lifetime so the ICB's inheritPipelineState=true
-    /// inherit picks up a live pipeline.
-    pub pipeline: ComputePipelineState,
-    /// Commands `[start, end)` in the bucket's ICB.
-    pub range: std::ops::Range<usize>,
+/// One unit of execution in a bucket's plan.
+///
+/// `Icb` is a contiguous run of ICB commands sharing a single
+/// pipeline state — fired with one
+/// `set_compute_pipeline_state` + `executeCommandsInBuffer` pair.
+/// `Gemm` is an MPS dense `y = x @ W^T` dispatch encoded directly
+/// into the command buffer between ICB encoder boundaries.
+pub enum BucketStep {
+    Icb {
+        /// Pipeline state bound to the encoder before the range
+        /// fires. Held for lifetime so the ICB's
+        /// `inheritPipelineState=true` inherit picks up a live
+        /// pipeline.
+        pipeline: ComputePipelineState,
+        /// Commands `[start, end)` in the bucket's ICB.
+        range: std::ops::Range<usize>,
+    },
+    Gemm {
+        /// Activation buffer bound to MPS' `leftMatrix` (shape
+        /// `[m, k]`).
+        a: BoundBuffer,
+        /// Weight buffer bound to MPS' `rightMatrix`. Linear-layer
+        /// convention is `[n, k]` with `transposeRight=true`.
+        b: BoundBuffer,
+        /// Output buffer bound to MPS' `resultMatrix` (shape
+        /// `[m, n]`).
+        c: BoundBuffer,
+        m: u32,
+        n: u32,
+        k: u32,
+    },
+}
+
+/// A `(buffer, offset)` pair held by a `BucketStep::Gemm`. The
+/// arena/weight buffers themselves outlive the worker (the arena
+/// lives on the worker; weight buffers live on the model meta which
+/// the pool keeps alive), so a non-owning `Buffer` clone is
+/// equivalent to an `Arc` clone — `metal::Buffer` is itself a
+/// reference-counted handle.
+pub struct BoundBuffer {
+    pub buffer: Buffer,
+    pub offset: u64,
 }
 
 /// One bucket's baked artifacts: the ICB (commands recorded linearly
-/// at indices `[0, num_commands)`) and the per-segment execution plan.
+/// at indices `[0, num_commands)`) and the execution plan walking it.
+///
+/// The ICB stores ICB commands only — GEMM steps are *not* recorded
+/// into the ICB (MPS doesn't fit ICBs). The `steps` vector is the
+/// authoritative ordering; ICB ranges in `BucketStep::Icb` index into
+/// `icb`, while `BucketStep::Gemm` stands alone.
 pub struct BucketBaking {
     pub bucket_m: u32,
     pub icb: RecordingContext,
-    pub segments: Vec<ExecSegment>,
+    pub steps: Vec<BucketStep>,
 }
 
 #[derive(Debug)]
 pub enum WorkerError {
-    /// `KernelId::Gemm` is opaque to the function-constant pipeline
-    /// cache (MPS-backed). Phase 5.C.5 picks a routing strategy.
-    OpaqueGemmNotYetRouted,
     /// Lookup against [`SpecializedPipelines`] failed.
     PipelineLookup(PipelineLookupError),
     /// `RecordingContext::new` returned an error (ICB descriptor
@@ -100,15 +138,29 @@ pub enum WorkerError {
         slot: u32,
         arena_len: usize,
     },
+    /// `KernelId::Gemm` reached the bake step but its
+    /// `LoweredCommand::gemm_dims` was `None`. Indicates a lowering
+    /// bug — the lowering pass owns populating those for `Gemm`
+    /// commands.
+    MissingGemmDims {
+        bucket_index: usize,
+        command_index: usize,
+    },
+    /// `KernelId::Gemm` had unexpected bindings. The worker expects
+    /// (output, input, weight) at indices 0/1/2 — anything else
+    /// is a lowering / model-meta contract violation.
+    GemmBindingsMalformed {
+        bucket_index: usize,
+        command_index: usize,
+        reason: &'static str,
+    },
+    /// `encode_gemm_into_command_buffer` rejected the dispatch.
+    GemmEncode(GemmError),
 }
 
 impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::OpaqueGemmNotYetRouted => f.write_str(
-                "MetalWorker: KernelId::Gemm is not yet routable through the worker; \
-                 5.C.5 is responsible for picking the routing strategy",
-            ),
             Self::PipelineLookup(e) => write!(f, "MetalWorker: pipeline lookup: {e}"),
             Self::Recording(e) => write!(f, "MetalWorker: ICB recording: {e}"),
             Self::ArenaShapeMismatch { expected, actual } => write!(
@@ -125,6 +177,24 @@ impl std::fmt::Display for WorkerError {
                 "MetalWorker: bucket {bucket_index} command {command_index} \
                  references arena slot {slot} but arena has only {arena_len} slots"
             ),
+            Self::MissingGemmDims {
+                bucket_index,
+                command_index,
+            } => write!(
+                f,
+                "MetalWorker: bucket {bucket_index} command {command_index}: \
+                 KernelId::Gemm has no gemm_dims (lowering bug)"
+            ),
+            Self::GemmBindingsMalformed {
+                bucket_index,
+                command_index,
+                reason,
+            } => write!(
+                f,
+                "MetalWorker: bucket {bucket_index} command {command_index}: \
+                 GEMM bindings malformed ({reason})"
+            ),
+            Self::GemmEncode(e) => write!(f, "MetalWorker: MPS GEMM encode: {e}"),
         }
     }
 }
@@ -202,21 +272,73 @@ impl<W: CanonicalParams> MetalWorker<W> {
         })
     }
 
-    /// Walk a bucket's exec plan against `encoder`. For every segment
-    /// the encoder pipeline is set, then the corresponding ICB range
-    /// is `executeCommandsInBuffer`'d. The caller is responsible for
-    /// staging all `RuntimeBindings` buffer contents *before* this
-    /// call, and for `endEncoding`ing the encoder afterward.
+    /// Walk a bucket's plan against `cmdbuf`. For ICB steps the
+    /// worker opens a compute encoder, sets the segment's pipeline,
+    /// and `executeCommandsInBuffer`'s the segment's ICB range; for
+    /// GEMM steps it ends the encoder and encodes the MPS GEMM
+    /// directly into the command buffer. Adjacent ICB steps reuse
+    /// the same encoder; an intervening GEMM forces an encoder
+    /// boundary on each side.
+    ///
+    /// The caller is responsible for staging all `RuntimeBindings`
+    /// buffer contents *before* this call, and for committing /
+    /// awaiting `cmdbuf` afterwards.
     ///
     /// Per-forward this is the entire hot path on the Metal side —
     /// no allocator interaction, no argument-buffer mutation, no
     /// re-recording.
-    pub fn run_bucket(&self, bucket: usize, encoder: &ComputeCommandEncoderRef) {
+    pub fn run_bucket(
+        &self,
+        bucket: usize,
+        device: &Device,
+        cmdbuf: &CommandBufferRef,
+    ) -> Result<(), WorkerError> {
         let baking = &self.bucket_bakings[bucket];
-        for seg in &baking.segments {
-            encoder.set_compute_pipeline_state(&seg.pipeline);
-            baking.icb.execute_on_encoder(encoder, seg.range.clone());
+        // We open compute encoders lazily so a leading-GEMM bucket
+        // doesn't open an empty one. `current` is `Some` only while
+        // an encoder is live — every Gemm step ends it, every Icb
+        // step opens it on demand.
+        let mut current: Option<&ComputeCommandEncoderRef> = None;
+        // Storage for the live encoder. `metal-rs` returns a
+        // `&ComputeCommandEncoderRef` borrowed from the cmd buffer;
+        // there's no owned wrapper, so we keep the active one in a
+        // local `Option` and re-fetch via `cmdbuf.new_compute_command_encoder()`
+        // when we need a new one.
+        for step in &baking.steps {
+            match step {
+                BucketStep::Icb { pipeline, range } => {
+                    let enc = current.unwrap_or_else(|| cmdbuf.new_compute_command_encoder());
+                    enc.set_compute_pipeline_state(pipeline);
+                    baking.icb.execute_on_encoder(enc, range.clone());
+                    current = Some(enc);
+                }
+                BucketStep::Gemm { a, b, c, m, n, k } => {
+                    if let Some(enc) = current.take() {
+                        enc.end_encoding();
+                    }
+                    encode_gemm_into_command_buffer(
+                        device,
+                        cmdbuf,
+                        &a.buffer,
+                        &b.buffer,
+                        &c.buffer,
+                        *m,
+                        *n,
+                        *k,
+                        1.0,
+                        0.0,
+                        false,
+                        true,
+                        true,
+                    )
+                    .map_err(WorkerError::GemmEncode)?;
+                }
+            }
         }
+        if let Some(enc) = current.take() {
+            enc.end_encoding();
+        }
+        Ok(())
     }
 }
 
@@ -237,13 +359,39 @@ fn bake_bucket<W: CanonicalParams>(
         });
     }
 
+    // ICB capacity sized for the worst case (one ICB slot per
+    // command); GEMM steps don't consume slots but the slack is
+    // cheap (a few bytes per slot) and keeps the index = command
+    // index invariant.
     let mut ctx = RecordingContext::new(device, tape.commands.len().max(1))
         .map_err(WorkerError::Recording)?;
-    let mut segments: Vec<ExecSegment> = Vec::new();
+    let mut steps: Vec<BucketStep> = Vec::new();
 
     for (cmd_idx, cmd) in tape.commands.iter().enumerate() {
         if matches!(cmd.kernel, KernelId::Gemm) {
-            return Err(WorkerError::OpaqueGemmNotYetRouted);
+            let dims = cmd
+                .gemm_dims
+                .ok_or(WorkerError::MissingGemmDims {
+                    bucket_index,
+                    command_index: cmd_idx,
+                })?;
+            let (a, b, c) = resolve_gemm_buffers(
+                bucket_index,
+                cmd_idx,
+                cmd,
+                arena,
+                model_meta,
+                runtime,
+            )?;
+            steps.push(BucketStep::Gemm {
+                a,
+                b,
+                c,
+                m: dims.m,
+                n: dims.n,
+                k: dims.k,
+            });
+            continue;
         }
 
         let extras = model_meta.kernel_extras_for(cmd);
@@ -257,16 +405,20 @@ fn bake_bucket<W: CanonicalParams>(
         let (tg, tpt) = mtl_size_pair(cmd);
         ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
 
-        // Coalesce with previous segment iff pipelines share the
-        // underlying ObjC pointer (specialized pipelines are
-        // refcounted — same key returns same handle from the cache).
+        // Coalesce with the previous step iff (a) it's an ICB step
+        // (a Gemm step forces an encoder boundary) and (b) its
+        // pipeline shares the underlying ObjC pointer (specialized
+        // pipelines are refcounted — same key returns same handle
+        // from the cache).
         let recorded_at = cmd_idx;
-        match segments.last_mut() {
-            Some(seg) if same_pipeline(&seg.pipeline, &pipeline) => {
-                seg.range.end = recorded_at + 1;
+        match steps.last_mut() {
+            Some(BucketStep::Icb { pipeline: prev, range })
+                if same_pipeline(prev, &pipeline) =>
+            {
+                range.end = recorded_at + 1;
             }
             _ => {
-                segments.push(ExecSegment {
+                steps.push(BucketStep::Icb {
                     pipeline,
                     range: recorded_at..(recorded_at + 1),
                 });
@@ -277,8 +429,53 @@ fn bake_bucket<W: CanonicalParams>(
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         icb: ctx,
-        segments,
+        steps,
     })
+}
+
+/// Resolve `(out, in, weight)` buffers for a `KernelId::Gemm` command.
+///
+/// The lowering pass guarantees the binding order: index 0 → output
+/// arena slot, index 1 → input arena slot, index 2 → LinearLayer
+/// weight thunk. Anything else is a contract violation surfaced as
+/// [`WorkerError::GemmBindingsMalformed`].
+fn resolve_gemm_buffers<W: CanonicalParams>(
+    bucket_index: usize,
+    command_index: usize,
+    cmd: &LoweredCommand<W>,
+    arena: &[Buffer],
+    model_meta: &dyn MetalModelMeta<W>,
+    runtime: &RuntimeBindings,
+) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
+    let bound = resolve_bindings(bucket_index, command_index, cmd, arena, model_meta, runtime)?;
+    if bound.len() != 3 {
+        return Err(WorkerError::GemmBindingsMalformed {
+            bucket_index,
+            command_index,
+            reason: "expected exactly 3 bindings (out, in, weight)",
+        });
+    }
+    // Bindings are produced in the order the lowering pass listed
+    // them; their `binding_index` field carries the encoder slot but
+    // we only care about positional ordering. The lowering pass uses
+    // 0 = out, 1 = in, 2 = weight.
+    let out = bound[0];
+    let inp = bound[1];
+    let wt = bound[2];
+    Ok((
+        BoundBuffer {
+            buffer: inp.0.clone(),
+            offset: inp.1,
+        },
+        BoundBuffer {
+            buffer: wt.0.clone(),
+            offset: wt.1,
+        },
+        BoundBuffer {
+            buffer: out.0.clone(),
+            offset: out.1,
+        },
+    ))
 }
 
 /// Resolve every binding on `cmd` to (buffer, offset, binding-index).
@@ -400,6 +597,12 @@ mod tests {
     /// hookup (Phase 5.G).
     struct StubMeta {
         rmsnorm_weight: Buffer,
+        /// Backing for `LinearLayer` weight bundles (GEMM routing).
+        /// Sized to the largest TinyLlama-class projection
+        /// (`Q_SIZE × Q_SIZE` f16 = ~8 MB) so the buffer-length checks
+        /// inside `encode_gemm_into_command_buffer` are satisfied for
+        /// the smoke-test dimensions.
+        linear_weight: Buffer,
     }
 
     impl MetalModelMeta<TinyLlamaProbe> for StubMeta {
@@ -414,7 +617,11 @@ mod tests {
                     buffer: &self.rmsnorm_weight,
                     offset: 0,
                 },
-                _ => unreachable!("smoke test only exercises RmsNorm bindings"),
+                WeightBundleKind::LinearLayer(_) => BufferRef {
+                    buffer: &self.linear_weight,
+                    offset: 0,
+                },
+                _ => unreachable!("smoke tests only exercise RmsNorm + LinearLayer bindings"),
             }
         }
 
@@ -481,6 +688,7 @@ mod tests {
                     binding_index: 2,
                 },
             ],
+            gemm_dims: None,
         };
         let fused_add_rmsnorm = LoweredCommand {
             kernel: KernelId::FusedAddRmsNorm,
@@ -504,6 +712,7 @@ mod tests {
                     binding_index: 2,
                 },
             ],
+            gemm_dims: None,
         };
         // Two RmsNorm commands then two FusedAddRmsNorm commands —
         // exercises both kernels and the coalescer's same-pipeline
@@ -563,7 +772,18 @@ mod tests {
                         },
                     })
                     .collect(),
+                gemm_dims: self.gemm_dims,
             }
+        }
+    }
+
+    /// Helper: extract the `range` from a `BucketStep::Icb`, panic
+    /// otherwise. Used by the smoke tests that assert on the
+    /// per-bucket plan.
+    fn icb_range(step: &BucketStep) -> std::ops::Range<usize> {
+        match step {
+            BucketStep::Icb { range, .. } => range.clone(),
+            BucketStep::Gemm { .. } => panic!("expected ICB step, got Gemm"),
         }
     }
 
@@ -583,6 +803,7 @@ mod tests {
 
         let meta = StubMeta {
             rmsnorm_weight: alloc_buffer(&device, 4096),
+            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
         };
         let runtime = empty_runtime(&device, 1);
 
@@ -606,11 +827,12 @@ mod tests {
         // Each bucket has 4 commands: 2 RmsNorm then 2 FusedAddRmsNorm.
         // Adjacent same-kernel-with-same-extras commands must coalesce
         // into one segment (pipeline-pointer identity); cross-kernel
-        // boundary forces a new segment. So: 2 segments per bucket.
+        // boundary forces a new segment. So: 2 ICB steps per bucket,
+        // no GEMM steps.
         for baking in &worker.bucket_bakings {
-            assert_eq!(baking.segments.len(), 2, "expected RmsNorm + FusedAddRmsNorm coalesced");
-            assert_eq!(baking.segments[0].range, 0..2);
-            assert_eq!(baking.segments[1].range, 2..4);
+            assert_eq!(baking.steps.len(), 2, "expected RmsNorm + FusedAddRmsNorm coalesced");
+            assert_eq!(icb_range(&baking.steps[0]), 0..2);
+            assert_eq!(icb_range(&baking.steps[1]), 2..4);
         }
     }
 
@@ -629,6 +851,7 @@ mod tests {
         let pipelines = SpecializedPipelines::new(cache);
         let meta = StubMeta {
             rmsnorm_weight: alloc_buffer(&device, 4096),
+            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
         };
         let runtime = empty_runtime(&device, 1);
 
@@ -672,6 +895,7 @@ mod tests {
 
         let meta = StubMeta {
             rmsnorm_weight: alloc_buffer(&device, 4096),
+            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
         };
         let runtime = empty_runtime(&device, 1);
 
@@ -709,6 +933,7 @@ mod tests {
                     binding_index: 5,
                 },
             ],
+            gemm_dims: None,
         };
         let tape = LoweredMetalTape {
             bucket_m: 1,
@@ -728,13 +953,55 @@ mod tests {
 
         assert_eq!(worker.bucket_bakings.len(), 1);
         let baking = &worker.bucket_bakings[0];
-        // One command → one segment.
-        assert_eq!(baking.segments.len(), 1);
-        assert_eq!(baking.segments[0].range, 0..1);
+        assert_eq!(baking.steps.len(), 1);
+        assert_eq!(icb_range(&baking.steps[0]), 0..1);
     }
 
+    /// Build a `KernelId::Gemm` lowered command at bucket=`bucket_m`
+    /// projecting `[bucket_m, k]` × `[n, k]^T` → `[bucket_m, n]`.
+    /// Bindings match the lowering pass: arena slots `(0, 1)` for
+    /// (out, in) and a `LinearLayer` weight thunk.
+    fn build_gemm_command(bucket_m: u32, n: u32, k: u32) -> LoweredCommand<TinyLlamaProbe> {
+        // Stub linear thunk — never invoked (StubMeta resolves by
+        // discriminant). Cast to a `WtFn` so the variant type-checks.
+        fn linear_stub(_w: &TinyLlamaProbe, _layer: u32) -> &'static LinearLayer {
+            unreachable!("StubMeta resolves LinearLayer by discriminant only")
+        }
+        LoweredCommand {
+            kernel: KernelId::Gemm,
+            dispatch: DispatchShape {
+                threadgroups: (bucket_m.div_ceil(16), n.div_ceil(16), 1),
+                threads_per_threadgroup: (16, 16, 1),
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: 0,
+                    binding_index: 0,
+                },
+                Binding::ArenaSlot {
+                    slot: 1,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: WeightBundleKind::LinearLayer(linear_stub),
+                    which: WeightTensor::Weight,
+                    layer: 0,
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: Some(crate::interpreter::metal::lowered::GemmDims {
+                m: bucket_m,
+                n,
+                k,
+            }),
+        }
+    }
+
+    /// Phase 5.C.5: a tape carrying just one `KernelId::Gemm` command
+    /// produces a single `BucketStep::Gemm` with the M/N/K the
+    /// lowering pass populated. No ICB step is emitted.
     #[test]
-    fn gemm_command_is_rejected_in_5c() {
+    fn worker_routes_gemm_step() {
         let Some(device) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
             return;
@@ -748,37 +1015,148 @@ mod tests {
         let pipelines = SpecializedPipelines::new(cache);
         let meta = StubMeta {
             rmsnorm_weight: alloc_buffer(&device, 4096),
+            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
         };
         let runtime = empty_runtime(&device, 1);
 
-        // Tape with a single GEMM command — should bail out.
-        let gemm = LoweredCommand {
-            kernel: KernelId::Gemm,
-            dispatch: DispatchShape {
-                threadgroups: (1, 1, 1),
-                threads_per_threadgroup: (16, 16, 1),
-            },
-            bindings: vec![Binding::ArenaSlot {
-                slot: 0,
-                binding_index: 0,
-            }],
-        };
         let tape = LoweredMetalTape {
             bucket_m: 1,
-            num_arena_slots: 1,
-            commands: vec![gemm],
+            num_arena_slots: 2,
+            commands: vec![build_gemm_command(1, 2048, 2048)],
         };
 
-        let err = MetalWorker::<TinyLlamaProbe>::new(
+        let worker = MetalWorker::<TinyLlamaProbe>::new(
             device,
-            &vec![1024],
+            // Q-size buffers (2048 f16 = 4096 bytes; pad up).
+            &vec![64 * 1024, 64 * 1024],
             &[tape],
             &pipelines,
             &meta,
             &runtime,
         )
-        .err()
-        .expect("expected GEMM rejection");
-        assert!(matches!(err, WorkerError::OpaqueGemmNotYetRouted));
+        .expect("worker bakes GEMM command");
+
+        assert_eq!(worker.bucket_bakings.len(), 1);
+        let baking = &worker.bucket_bakings[0];
+        assert_eq!(baking.steps.len(), 1, "one Gemm step, no ICB step");
+        match &baking.steps[0] {
+            BucketStep::Gemm { m, n, k, .. } => {
+                assert_eq!(*m, 1);
+                assert_eq!(*n, 2048);
+                assert_eq!(*k, 2048);
+            }
+            BucketStep::Icb { .. } => panic!("expected Gemm step, got Icb"),
+        }
+    }
+
+    /// Phase 5.C.5: an ICB→Gemm→ICB tape produces three steps. The
+    /// Gemm forces an encoder boundary, so the post-Gemm RmsNorm
+    /// cannot coalesce with the pre-Gemm RmsNorm even though both
+    /// share the same specialized pipeline.
+    #[test]
+    fn worker_interleaves_gemm_with_icb() {
+        let Some(device) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = Arc::new(device.device.clone());
+
+        let cache = Arc::new(
+            SpecializedPipelineCache::with_standard_shaders((*device).clone())
+                .expect("compile standard shaders"),
+        );
+        let pipelines = SpecializedPipelines::new(cache);
+        let meta = StubMeta {
+            rmsnorm_weight: alloc_buffer(&device, 4096),
+            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
+        };
+        let runtime = empty_runtime(&device, 1);
+
+        let rmsnorm_pre = LoweredCommand {
+            kernel: KernelId::RmsNorm,
+            dispatch: DispatchShape {
+                threadgroups: (1, 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: 0,
+                    binding_index: 0,
+                },
+                Binding::ArenaSlot {
+                    slot: 1,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: WeightBundleKind::RmsNorm(stub_rmsnorm),
+                    which: WeightTensor::Weight,
+                    layer: 0,
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: None,
+        };
+        let rmsnorm_post = LoweredCommand {
+            kernel: KernelId::RmsNorm,
+            dispatch: rmsnorm_pre.dispatch,
+            bindings: rmsnorm_pre
+                .bindings
+                .iter()
+                .map(|b| match b {
+                    Binding::ArenaSlot {
+                        slot,
+                        binding_index,
+                    } => Binding::ArenaSlot {
+                        slot: *slot,
+                        binding_index: *binding_index,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm(f),
+                        which,
+                        layer,
+                        binding_index,
+                    } => Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm(*f),
+                        which: *which,
+                        layer: *layer,
+                        binding_index: *binding_index,
+                    },
+                    _ => unreachable!("rmsnorm_pre uses only ArenaSlot + RmsNorm Weight"),
+                })
+                .collect(),
+            gemm_dims: None,
+        };
+
+        let tape = LoweredMetalTape {
+            bucket_m: 1,
+            num_arena_slots: 2,
+            commands: vec![
+                rmsnorm_pre,
+                build_gemm_command(1, 2048, 2048),
+                rmsnorm_post,
+            ],
+        };
+
+        let worker = MetalWorker::<TinyLlamaProbe>::new(
+            device,
+            &vec![64 * 1024, 64 * 1024],
+            &[tape],
+            &pipelines,
+            &meta,
+            &runtime,
+        )
+        .expect("worker bakes mixed tape");
+
+        let baking = &worker.bucket_bakings[0];
+        assert_eq!(
+            baking.steps.len(),
+            3,
+            "Icb (rmsnorm_pre) | Gemm | Icb (rmsnorm_post)"
+        );
+        assert!(matches!(&baking.steps[0], BucketStep::Icb { range, .. } if *range == (0..1)));
+        assert!(matches!(&baking.steps[1], BucketStep::Gemm { m: 1, n: 2048, k: 2048, .. }));
+        // Post-GEMM RmsNorm is at command index 2, not coalesced with
+        // the pre-GEMM RmsNorm despite the identical pipeline.
+        assert!(matches!(&baking.steps[2], BucketStep::Icb { range, .. } if *range == (2..3)));
     }
 }

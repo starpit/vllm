@@ -8,10 +8,139 @@
 
 use crate::{MetalDevice, MetalStream};
 use metal::foreign_types::{ForeignType, ForeignTypeRef};
-use metal::Buffer;
+use metal::{Buffer, CommandBufferRef, DeviceRef};
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::Arc;
+
+/// Encode an MPS f16/f32 GEMM into a borrowed command buffer.
+///
+/// The Phase 5.C.5 GEMM-routing entry point: the `MetalWorker` calls
+/// this between ICB segments to keep dense `y = x @ W^T` dispatches
+/// inside the same command buffer as the rest of the bucket. No
+/// `MetalStream` wrapping, no internal commit — the caller owns the
+/// command buffer and any `commit()` boundary.
+///
+/// `transpose_b = true` reproduces Linear-layer convention (weight
+/// stored as `[N, K]`). `alpha = 1.0`, `beta = 0.0` is the canonical
+/// case; pass through if a future caller needs accumulation.
+///
+/// The same MPS objects (descriptors, matrices, kernel) are
+/// allocated per-call and retained by the command buffer until it
+/// completes — manual release would double-free, mirroring the
+/// existing `MetalGemm::execute` contract.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_gemm_into_command_buffer(
+    device: &DeviceRef,
+    cmdbuf: &CommandBufferRef,
+    a: &Buffer,
+    b: &Buffer,
+    c: &Buffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    alpha: f32,
+    beta: f32,
+    transpose_a: bool,
+    transpose_b: bool,
+    use_f16: bool,
+) -> Result<(), GemmError> {
+    let elem_size = if use_f16 { 2 } else { 4 };
+
+    let a_rows = if transpose_a { k } else { m };
+    let a_cols = if transpose_a { m } else { k };
+    let b_rows = if transpose_b { n } else { k };
+    let b_cols = if transpose_b { k } else { n };
+
+    let expected_a_size = (a_rows * a_cols * elem_size) as u64;
+    let expected_b_size = (b_rows * b_cols * elem_size) as u64;
+    let expected_c_size = (m * n * elem_size) as u64;
+
+    if a.length() < expected_a_size {
+        return Err(GemmError::InvalidDimensions(format!(
+            "A buffer too small: expected {expected_a_size}, got {}",
+            a.length()
+        )));
+    }
+    if b.length() < expected_b_size {
+        return Err(GemmError::InvalidDimensions(format!(
+            "B buffer too small: expected {expected_b_size}, got {}",
+            b.length()
+        )));
+    }
+    if c.length() < expected_c_size {
+        return Err(GemmError::InvalidDimensions(format!(
+            "C buffer too small: expected {expected_c_size}, got {}",
+            c.length()
+        )));
+    }
+
+    unsafe {
+        let data_type: u64 = if use_f16 { 268435472 } else { 268435488 };
+
+        let a_row_bytes = (a_cols * elem_size) as u64;
+        let a_desc: *mut Object = msg_send![class!(MPSMatrixDescriptor),
+            matrixDescriptorWithRows:a_rows as u64
+            columns:a_cols as u64
+            rowBytes:a_row_bytes
+            dataType:data_type
+        ];
+        let b_row_bytes = (b_cols * elem_size) as u64;
+        let b_desc: *mut Object = msg_send![class!(MPSMatrixDescriptor),
+            matrixDescriptorWithRows:b_rows as u64
+            columns:b_cols as u64
+            rowBytes:b_row_bytes
+            dataType:data_type
+        ];
+        let c_row_bytes = (n * elem_size) as u64;
+        let c_desc: *mut Object = msg_send![class!(MPSMatrixDescriptor),
+            matrixDescriptorWithRows:m as u64
+            columns:n as u64
+            rowBytes:c_row_bytes
+            dataType:data_type
+        ];
+
+        let a_matrix: *mut Object = msg_send![class!(MPSMatrix), alloc];
+        let a_matrix: *mut Object = msg_send![a_matrix,
+            initWithBuffer: a.as_ptr()
+            offset: 0u64
+            descriptor: a_desc
+        ];
+        let b_matrix: *mut Object = msg_send![class!(MPSMatrix), alloc];
+        let b_matrix: *mut Object = msg_send![b_matrix,
+            initWithBuffer: b.as_ptr()
+            offset: 0u64
+            descriptor: b_desc
+        ];
+        let c_matrix: *mut Object = msg_send![class!(MPSMatrix), alloc];
+        let c_matrix: *mut Object = msg_send![c_matrix,
+            initWithBuffer: c.as_ptr()
+            offset: 0u64
+            descriptor: c_desc
+        ];
+
+        let gemm_kernel: *mut Object = msg_send![class!(MPSMatrixMultiplication), alloc];
+        let gemm_kernel: *mut Object = msg_send![gemm_kernel,
+            initWithDevice: device.as_ptr()
+            transposeLeft: if transpose_a { YES } else { NO }
+            transposeRight: if transpose_b { YES } else { NO }
+            resultRows: m as u64
+            resultColumns: n as u64
+            interiorColumns: k as u64
+            alpha: alpha as f64
+            beta: beta as f64
+        ];
+
+        let _: () = msg_send![gemm_kernel,
+            encodeToCommandBuffer: cmdbuf.as_ptr()
+            leftMatrix: a_matrix
+            rightMatrix: b_matrix
+            resultMatrix: c_matrix
+        ];
+    }
+
+    Ok(())
+}
 
 /// Errors specific to GEMM operations
 #[derive(Debug)]

@@ -26,7 +26,7 @@
 use crate::{CanonicalParams, Instruction};
 
 use super::lowered::{
-    Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
+    Binding, DispatchShape, GemmDims, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 
@@ -138,6 +138,7 @@ fn lower_one<W: CanonicalParams>(
                     binding_index: 2,
                 },
             ],
+            gemm_dims: None,
         },
 
         // ── Standalone RMSNorm ─────────────────────────────────────
@@ -165,6 +166,7 @@ fn lower_one<W: CanonicalParams>(
                     binding_index: 2,
                 },
             ],
+            gemm_dims: None,
         },
 
         // ── Fused residual-add + RMSNorm ───────────────────────────
@@ -193,15 +195,17 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 2,
                     },
                 ],
+                gemm_dims: None,
             }
         }
 
         // ── Generic dense GEMM ─────────────────────────────────────
-        I::Gemm(in_slot, out_slot, layer, wt_fn, n, _k) => {
-            // 2D dispatch: (M / TILE_M) × (N / TILE_N) threadgroups.
-            // Tile dims are placeholders; Phase 5.B's specialized
-            // pipeline cache will pick architecture-tuned tiles per
-            // bucket and bake them via function constants.
+        I::Gemm(in_slot, out_slot, layer, wt_fn, n, k) => {
+            // Dispatch shape is a no-op for MPS (the worker reads
+            // `gemm_dims` and calls MPSMatrixMultiplication), but a
+            // hypothetical hand-rolled GEMM tile shader could still
+            // consume it. Tile values are placeholders; the actual
+            // execution path picks its own.
             let tg_x = bucket_m.div_ceil(GEMM_TILE_M);
             let tg_y = (*n).div_ceil(GEMM_TILE_N);
             LoweredCommand {
@@ -226,6 +230,11 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 2,
                     },
                 ],
+                gemm_dims: Some(GemmDims {
+                    m: bucket_m,
+                    n: *n,
+                    k: *k,
+                }),
             }
         }
 
@@ -258,6 +267,7 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 2,
                     },
                 ],
+                gemm_dims: None,
             }
         }
 
@@ -323,6 +333,7 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 7,
                     },
                 ],
+                gemm_dims: None,
             }
         }
 
@@ -364,6 +375,7 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 5,
                     },
                 ],
+                gemm_dims: None,
             }
         }
 
@@ -398,6 +410,7 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 4,
                     },
                 ],
+                gemm_dims: None,
             }
         }
 
@@ -417,6 +430,7 @@ fn lower_one<W: CanonicalParams>(
                     binding_index: 1,
                 },
             ],
+            gemm_dims: None,
         },
 
         // ── Scalar-multiply broadcast ──────────────────────────────
@@ -436,6 +450,7 @@ fn lower_one<W: CanonicalParams>(
                 // constant on the specialized pipeline (Phase 5.B);
                 // no runtime binding needed.
             ],
+            gemm_dims: None,
         },
 
         // ── Metadata-only: no Metal dispatch ───────────────────────

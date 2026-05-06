@@ -207,6 +207,28 @@ pub struct LoweredCommand<W: CanonicalParams> {
     pub kernel: KernelId,
     pub dispatch: DispatchShape,
     pub bindings: Vec<Binding<W>>,
+    /// Dense-GEMM dimensions when `kernel == KernelId::Gemm`; `None`
+    /// for every other kernel. The worker reads `(m, n, k)` from
+    /// here when encoding the MPS dispatch (5.C.5 routing).
+    /// Carried on the lowered command rather than baked into
+    /// `DispatchShape` because MPS does not consume threadgroup
+    /// counts — the dimensions are the actual API parameters.
+    pub gemm_dims: Option<GemmDims>,
+}
+
+/// Dense-GEMM dimensions for `KernelId::Gemm`.
+///
+/// `out = in @ weight^T` for the canonical row-major Linear layer:
+/// `in: [m, k]`, `weight: [n, k]`, `out: [m, n]`. Future quantized
+/// or transposed variants get sibling structs once they land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmDims {
+    /// Rows of the activation / output (= bucket_m).
+    pub m: u32,
+    /// Output columns (= weight rows; from `Instruction::Gemm`'s `n`).
+    pub n: u32,
+    /// Inner dimension (= weight columns = activation columns).
+    pub k: u32,
 }
 
 /// One bucket's lowered tape — the input the `MetalWorker` walks at

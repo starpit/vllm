@@ -247,11 +247,27 @@ Added the two paged-cache CPU references the Metal lowering's KV-cache path need
 
 Four new unit tests: `test_rope_append_writes_paged_cache` (no-rotation cos=1/sin=0; verifies V un-rotated, K rotated, slot indexing correct), `test_rope_append_actually_rotates` (90° rotation cos=0/sin=1), `test_attention_via_cache_matches_decode_ref` (1-seq paged matches `attention_decode` for the same K/V data), `test_attention_via_cache_zero_kv_len` (no-op edge case). 45/45 ferrite-forward Metal lib tests pass total (14 cpu_golden + 31 interpreter).
 
-**Known gap surfaced during 5.G.2:** `pipelines.rs` references `rope_append_f16_specialized` but `shaders/rope.metal` only defines the legacy non-specialized `rope_neox_*` / `rope_interleaved_*` kernels. Pipeline lookup for `KernelId::RopeAppend` will fail at runtime — no test currently exercises it (worker tests use synthetic RmsNorm-only tapes). The cpu_golden ref documents what the shader must compute when written; tracked as a 5.G prereq alongside writing the shader.
+**Known gap surfaced during 5.G.2 (closed by 5.G.3):** `pipelines.rs` referenced `rope_append_f16_specialized` but `shaders/rope.metal` only had the legacy non-specialized `rope_neox_*` / `rope_interleaved_*` kernels. The cpu_golden ref documented what the shader must compute; 5.G.3 wrote it.
 
-**5.G.3 (next) — Per-bucket CPU-vs-Metal diff harness.** Walk one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena, assert elementwise difference under tolerance. Needs the missing `rope_append_f16_specialized` shader before any tape with `RopeAppend` can be exercised end-to-end.
+**5.G.3 — `rope_append_f16_specialized` MSL kernel + numerical correctness test. ✅ COMPLETE (2026-05-06)**
 
-**5.G.4 (after 5.G.3) — TinyLlama-1.1B end-to-end via vllm-e2e.** Blocked on real `MetalModelMeta` impl backed by safetensors (current 5.F.5 emission is panic-stub accessors).
+Wrote the missing `rope_append_f16_specialized` kernel in `shaders/rope.metal`:
+- Function constants 0..4 = `HEAD_DIM` / `NUM_Q_HEADS` / `NUM_KV_HEADS` / `ROT_DIM` / `BLOCK_SIZE`. Index 4 (`BLOCK_SIZE`) is new — required for the paged-write index math; plumbed through `pipelines::constants_for(KernelId::RopeAppend)` from `KernelExtras::block_size` (same value the model_meta supplies for `AttentionViaCache`).
+- Bindings 0..7 = `q_inout`, `k_inout`, `v_inout`, `cos_sin`, `positions`, `slot_mapping`, `kv_cache_k`, `kv_cache_v` — matches the lowering's binding plan exactly.
+- Dispatch: threadgroups `(bucket_m, NUM_Q_HEADS, 1)` × `HEAD_DIM` threads — one threadgroup per `(token, q_head)` pair. NeoX-style pairing (element `d` with `d + half_dim`).
+- GQA owner-q_head pattern: each `kv_head` is owned by one q_head (`q_head % group_ratio == 0`); other q_heads do Q-only and exit. Avoids double-write to the cache slot.
+- Threadgroup barrier between the K rotation and the paged write — thread `d=half_dim+k` reads `k_row[half_dim+k]` written by thread `d=k`, so the barrier is required to fence the rotation.
+- V is un-rotated (copied through). Partial-rope models (`ROT_DIM < HEAD_DIM`) handled implicitly: the `[ROT_DIM, HEAD_DIM)` tail of `k_row` is untouched and copies through the paged write unchanged.
+
+Two device-bound tests added:
+- `rope_append_pipeline_builds_and_caches` — verifies the kernel compiles against the 5-element function-constant bag and shares one pipeline entry across buckets (no `M`-derived constant; same collapse pattern as `AttentionPrefillContiguous`).
+- `rope_append_matches_cpu_golden` — synthetic deterministic Q/K/V/cos_sin/positions/slot_mapping/kv_cache buffers; dispatches the kernel directly (no ICB/worker — just `set_compute_pipeline_state` + `set_buffer` + `dispatch_thread_groups`); reads back f16 outputs; asserts max-abs error < 5e-3 vs `cpu_golden::rope_append`. Passed first run — proves Q rotation, K rotation, paged write, GQA owner-q_head dispatch, threadgroup barrier, and V un-rotated copy are all correct end-to-end.
+
+`half = { workspace = true }` added to `ferrite-forward/Cargo.toml` as dev-dep (used for f32↔f16 conversion at the test boundary). 47/47 ferrite-forward Metal lib tests pass.
+
+**5.G.4 (next) — Per-bucket CPU-vs-Metal diff harness.** Now unblocked. Walk one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena; assert elementwise difference under tolerance. Pattern is established (see `rope_append_matches_cpu_golden`); the harness generalizes it across the lowered tape's full op set.
+
+**5.G.5 (after 5.G.4) — TinyLlama-1.1B end-to-end via vllm-e2e.** Blocked on real `MetalModelMeta` impl backed by safetensors (current 5.F.5 emission is panic-stub accessors).
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
 Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
@@ -290,6 +306,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.F.5 Complete:** 2026-05-06 ✅ (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` + `metal_pool()`; quant-variant skip under metal; metal feature on llama/mistral/qwen3/phi3/granite)
 - **Phase 5.G.1 Complete:** 2026-05-06 ✅ (`cpu_golden::{embed, add, scalar_mul, fused_add_rmsnorm, fused_gate_up_silu_mul}` per-op refs + 5 unit tests; matches `fused_add_rmsnorm_f16_specialized` shader semantics)
 - **Phase 5.G.2 Complete:** 2026-05-06 ✅ (`cpu_golden::{rope_append, attention_via_cache}` paged-cache refs + 4 unit tests; matches metal shader's `inv_sum = 1/(sum_exp + 1e-6)` guard; surfaces missing `rope_append_f16_specialized` shader)
+- **Phase 5.G.3 Complete:** 2026-05-06 ✅ (`rope_append_f16_specialized` MSL kernel + `BLOCK_SIZE` function constant + 2 device-bound tests; numerical match against `cpu_golden::rope_append` within 5e-3 f16 tolerance)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

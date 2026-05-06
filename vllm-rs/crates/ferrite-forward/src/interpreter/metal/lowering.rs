@@ -30,6 +30,39 @@ use super::lowered::{
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 
+/// Lower one bucket's `(backbone ++ lm_head)` instruction stream.
+///
+/// Concatenation matches the cuda interpreter's effective behavior:
+/// `forward()` runs backbone then lm_head in sequence for a given
+/// bucket. Lowering them as one stream lets the worker bake both
+/// halves into the bucket's single ICB plan, with no extra mid-bucket
+/// boundary the caller needs to manage.
+///
+/// Avoids requiring `Instruction<W>: Clone` — the caller hands two
+/// `&[Instruction<W>]` slices and we walk them in place, unrolling
+/// `Loop` per the same rules as the single-slice [`lower`]. Loop
+/// bodies that span the backbone/lm_head boundary are not supported
+/// (no model emits one — the cuda lowering pass partitions loops
+/// strictly inside one half), but if one ever shows up the malformed-
+/// loop check fires inside the offending half and surfaces the
+/// per-half index.
+pub fn lower_pair<W: CanonicalParams>(
+    backbone: &[Instruction<W>],
+    lm_head: &[Instruction<W>],
+    bucket_m: u32,
+    num_arena_slots: u32,
+) -> Result<LoweredMetalTape<W>, LoweringError> {
+    let bb = lower(backbone, bucket_m, num_arena_slots)?;
+    let lh = lower(lm_head, bucket_m, num_arena_slots)?;
+    let mut commands = bb.commands;
+    commands.extend(lh.commands);
+    Ok(LoweredMetalTape {
+        bucket_m,
+        num_arena_slots,
+        commands,
+    })
+}
+
 /// Lower one bucket's `Instruction<W>` tape.
 ///
 /// `bucket_m` is the bucket point this tape is specialized for —

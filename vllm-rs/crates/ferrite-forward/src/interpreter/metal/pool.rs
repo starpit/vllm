@@ -28,13 +28,111 @@ use ferrite_metal_kernels::metal::{
     Buffer, CommandQueue, Device, MTLCommandBufferStatus,
 };
 
+use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
+
 use super::forward::{ForwardError, ForwardInputs};
 use super::lowered::LoweredMetalTape;
+use super::lowering::lower_pair;
 use super::model_meta::MetalModelMeta;
 use super::pipelines::SpecializedPipelines;
 use super::runtime::RuntimeBindings;
 use super::worker::{ArenaLayout, MetalWorker, WorkerError};
-use crate::CanonicalParams;
+use crate::{CanonicalParams, Instruction};
+
+/// One bucket's compile-time data, ready to be lowered + handed to a
+/// [`MetalWorkerPool`].
+///
+/// Emitted by the `#[forward]` macro (Phase 5.F.5) as one row per
+/// solved bucket per canonical model. The macro materializes:
+///  - `bucket_m` — the workload point this bucket was specialized for;
+///  - `num_arena_slots` — colored slot count from `colored_slot_map()`;
+///  - `backbone` / `lm_head` — the bucket's `Instruction<W>` static
+///    slices, identical to the cuda-side `BACKBONE_M_<wp>` /
+///    `LM_HEAD_M_<wp>` statics.
+///
+/// [`MetalWorkerPool::for_buckets`] calls [`lower`] on the concatenated
+/// `(backbone ++ lm_head)` to produce a [`LoweredMetalTape`] per spec
+/// at constructor time. Concatenation matches the cuda interpreter's
+/// behavior — `forward()` runs backbone then lm_head as one logical
+/// pass for a given bucket — and the metal worker bakes both halves
+/// into the bucket's single ICB plan so `forward()` issues one
+/// `executeCommandsInBuffer` per segment without an extra mid-bucket
+/// boundary.
+///
+/// The slices are `&'static` because the macro emits them as static
+/// items; the spec is `Copy` so callers can drop the bucket plan into
+/// an `Arc<[MetalBucketSpec<W>]>` cheaply.
+pub struct MetalBucketSpec<W: CanonicalParams + 'static> {
+    pub bucket_m: u32,
+    pub num_arena_slots: u32,
+    pub backbone: &'static [Instruction<W>],
+    pub lm_head: &'static [Instruction<W>],
+}
+
+impl<W: CanonicalParams + 'static> Clone for MetalBucketSpec<W> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<W: CanonicalParams + 'static> Copy for MetalBucketSpec<W> {}
+
+/// Errors surfaced by [`MetalWorkerPool::for_buckets`] before the pool
+/// reaches its first eager-spawn `WorkerError` path.
+///
+/// Covers (a) the `with_standard_shaders` shader-compile call —
+/// distinct from per-worker `WorkerError::PipelineLookup` because the
+/// failure is one-shot and pre-pool; (b) per-bucket `lower()` failures
+/// — the macro should make these structurally impossible, but
+/// surfacing them with `bucket_m` context beats panicking when a
+/// future variant slips through; (c) any `WorkerError` from the
+/// inner [`MetalWorkerPool::new`] call.
+#[derive(Debug)]
+pub enum PoolBuildError {
+    /// `SpecializedPipelineCache::with_standard_shaders` failed —
+    /// usually a missing or malformed MSL source. Message is the
+    /// underlying [`MetalStreamError`](ferrite_metal_kernels::stream::MetalStreamError).
+    PipelineCacheBuild(String),
+    /// One bucket's [`lower`] failed. `bucket_m` identifies the row
+    /// for the model author; `error` is the `Display` of the
+    /// underlying [`LoweringError`].
+    BucketLower {
+        bucket_m: u32,
+        error: String,
+    },
+    /// The eager-spawn first worker (or any structural pool prereq)
+    /// reported a [`WorkerError`].
+    Worker(WorkerError),
+    /// Caller-provided `bucket_specs` was empty. The pool always
+    /// needs at least one bucket; degenerate models that emit none
+    /// would fail at `pick_bucket` time anyway, so we fail early.
+    NoBuckets,
+}
+
+impl std::fmt::Display for PoolBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PipelineCacheBuild(s) => write!(
+                f,
+                "MetalWorkerPool::for_buckets: pipeline cache build failed: {s}"
+            ),
+            Self::BucketLower { bucket_m, error } => write!(
+                f,
+                "MetalWorkerPool::for_buckets: lowering bucket M={bucket_m} failed: {error}"
+            ),
+            Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
+            Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
+        }
+    }
+}
+
+impl std::error::Error for PoolBuildError {}
+
+impl From<WorkerError> for PoolBuildError {
+    fn from(e: WorkerError) -> Self {
+        Self::Worker(e)
+    }
+}
 
 /// Factory closure invoked once per worker creation to produce a
 /// fresh [`RuntimeBindings`] sized for the worker's largest bucket.
@@ -150,6 +248,79 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             inner.available.push(first);
         }
         Ok(pool)
+    }
+
+    /// Build the pool from a flat `&[MetalBucketSpec<W>]` plus the
+    /// caller-supplied model_meta + arena layout + runtime factory.
+    ///
+    /// This is the runtime-side prerequisite the `#[forward]` macro's
+    /// emitted `metal_pool(...)` (Phase 5.F.5) calls into. The macro
+    /// materializes the static slices that back the `bucket_specs`
+    /// and supplies the model-specific `MetalModelMeta` impl; the
+    /// caller is responsible for the device, the arena byte-layout,
+    /// the runtime factory, and the worker cap (typically derived
+    /// from `floor((device_total - weights - misc) / per_worker_arena)`).
+    ///
+    /// Pipeline:
+    ///  1. Build a [`SpecializedPipelineCache`] via
+    ///     [`SpecializedPipelineCache::with_standard_shaders`] (one
+    ///     shader compile per loaded model — cached across workers
+    ///     via `Arc`).
+    ///  2. Wrap in [`SpecializedPipelines`].
+    ///  3. For each spec, lower `(backbone ++ lm_head)` to a
+    ///     [`LoweredMetalTape`] keyed at `bucket_m`. Lowering is the
+    ///     hot path *once* — the resulting tape is shared across all
+    ///     workers via `Arc<[…]>`.
+    ///  4. Hand off to [`Self::new`], which eagerly spawns the first
+    ///     worker (records every bucket's ICB once) so allocation /
+    ///     pipeline / recording failures surface here, not on the
+    ///     first forward.
+    ///
+    /// Lowering errors are returned with the offending `bucket_m`
+    /// surfaced so the model author can pinpoint which bucket's
+    /// macro emission needs an additional `lower_one` arm.
+    pub fn for_buckets(
+        device: Arc<Device>,
+        model_meta: Arc<dyn MetalModelMeta<W>>,
+        bucket_specs: &[MetalBucketSpec<W>],
+        arena_layout: ArenaLayout,
+        runtime_factory: RuntimeFactory,
+        max_workers: usize,
+    ) -> Result<Self, PoolBuildError> {
+        if bucket_specs.is_empty() {
+            return Err(PoolBuildError::NoBuckets);
+        }
+
+        let cache = SpecializedPipelineCache::with_standard_shaders((*device).clone())
+            .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
+        let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
+
+        let mut tapes: Vec<LoweredMetalTape<W>> = Vec::with_capacity(bucket_specs.len());
+        for spec in bucket_specs {
+            let tape = lower_pair(
+                spec.backbone,
+                spec.lm_head,
+                spec.bucket_m,
+                spec.num_arena_slots,
+            )
+            .map_err(|e| PoolBuildError::BucketLower {
+                bucket_m: spec.bucket_m,
+                error: format!("{e}"),
+            })?;
+            tapes.push(tape);
+        }
+        let bucket_tapes: Arc<[LoweredMetalTape<W>]> = Arc::from(tapes);
+
+        Self::new(
+            device,
+            model_meta,
+            pipelines,
+            bucket_tapes,
+            arena_layout,
+            runtime_factory,
+            max_workers,
+        )
+        .map_err(PoolBuildError::Worker)
     }
 
     pub fn max_workers(&self) -> usize {
@@ -966,5 +1137,128 @@ mod tests {
             1,
             "worker returned to pool after validation failure"
         );
+    }
+
+    // ──────────────── Phase 5.F.4: for_buckets() ────────────────
+
+    /// Empty backbone + lm_head per bucket — exercises the
+    /// constructor's lower→pool-build path without requiring a real
+    /// `Instruction<W>` to be constructible at the test site (the
+    /// macro emits those at codegen time; pool tests stay structural).
+    /// The resulting tape carries zero commands; the worker still
+    /// bakes a (trivially empty) ICB per bucket and the pool still
+    /// stands one worker up eagerly.
+    const EMPTY_BACKBONE: &[Instruction<TinyLlamaProbe>] = &[];
+    const EMPTY_LM_HEAD: &[Instruction<TinyLlamaProbe>] = &[];
+
+    fn build_via_for_buckets(
+        bucket_specs: &[MetalBucketSpec<TinyLlamaProbe>],
+        max_workers: usize,
+    ) -> Option<Result<MetalWorkerPool<TinyLlamaProbe>, PoolBuildError>> {
+        let device = ferrite_metal_kernels::detect_device()?;
+        let device = Arc::new(device.device.clone());
+        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
+            rmsnorm_weight: alloc(&device, 4096),
+        });
+        let arena_layout: ArenaLayout = vec![4096, 4096];
+        let runtime_factory: RuntimeFactory = Arc::new(|d| empty_runtime(d, 1));
+        Some(MetalWorkerPool::<TinyLlamaProbe>::for_buckets(
+            device,
+            meta,
+            bucket_specs,
+            arena_layout,
+            runtime_factory,
+            max_workers,
+        ))
+    }
+
+    /// Empty bucket_specs surfaces `PoolBuildError::NoBuckets` —
+    /// ahead of any Metal-device interaction so this test runs even
+    /// on non-Apple hosts.
+    #[test]
+    fn for_buckets_rejects_empty_specs() {
+        // Note: this path runs without a Metal device because the
+        // `NoBuckets` check fires before any device call — no
+        // silent-skip needed.
+        let device = match ferrite_metal_kernels::detect_device() {
+            Some(d) => Arc::new(d.device.clone()),
+            None => {
+                eprintln!("skipping: no Metal device");
+                return;
+            }
+        };
+        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
+            rmsnorm_weight: alloc(&device, 16),
+        });
+        let arena_layout: ArenaLayout = vec![];
+        let runtime_factory: RuntimeFactory = Arc::new(|d| empty_runtime(d, 1));
+        let res = MetalWorkerPool::<TinyLlamaProbe>::for_buckets(
+            device,
+            meta,
+            &[],
+            arena_layout,
+            runtime_factory,
+            1,
+        );
+        match res {
+            Err(PoolBuildError::NoBuckets) => {}
+            Err(other) => panic!("expected NoBuckets, got Err({other})"),
+            Ok(_) => panic!("expected NoBuckets, got Ok(_)"),
+        }
+    }
+
+    /// Single empty bucket builds: lower_pair on `(empty, empty)`
+    /// produces an empty-command tape with the right `bucket_m` and
+    /// `num_arena_slots`; the worker bakes one no-op ICB; the pool
+    /// stands up a worker eagerly. Verifies the constructor wires
+    /// pipeline cache / lowering / pool spawn end-to-end.
+    #[test]
+    fn for_buckets_builds_pool_for_single_empty_bucket() {
+        let specs = [MetalBucketSpec {
+            bucket_m: 1,
+            num_arena_slots: 2,
+            backbone: EMPTY_BACKBONE,
+            lm_head: EMPTY_LM_HEAD,
+        }];
+        let Some(res) = build_via_for_buckets(&specs, 2) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let pool = res.expect("for_buckets constructs pool");
+        assert_eq!(pool.max_workers(), 2);
+        assert_eq!(pool.current_size(), 1, "first worker eagerly created");
+        assert_eq!(pool.available(), 1);
+    }
+
+    /// Two empty buckets — verifies pick_bucket sees both
+    /// `bucket_m`s and the constructor preserves spec order via
+    /// `Arc<[…]>`.
+    #[test]
+    fn for_buckets_preserves_bucket_order() {
+        let specs = [
+            MetalBucketSpec {
+                bucket_m: 1,
+                num_arena_slots: 2,
+                backbone: EMPTY_BACKBONE,
+                lm_head: EMPTY_LM_HEAD,
+            },
+            MetalBucketSpec {
+                bucket_m: 8,
+                num_arena_slots: 2,
+                backbone: EMPTY_BACKBONE,
+                lm_head: EMPTY_LM_HEAD,
+            },
+        ];
+        let Some(res) = build_via_for_buckets(&specs, 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let pool = res.expect("for_buckets constructs pool");
+        assert_eq!(pool.pick_bucket(1).unwrap(), 0);
+        assert_eq!(pool.pick_bucket(8).unwrap(), 1);
+        assert!(matches!(
+            pool.pick_bucket(9),
+            Err(ForwardError::NoBucketFits { .. })
+        ));
     }
 }

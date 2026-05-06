@@ -10,18 +10,16 @@
 // layer struct *definitions* below only reference `GpuTensor` and primitives,
 // so they compile on every backend (including Metal on macOS). Methods that
 // invoke CUDA kernels are gated below.
-use ferrite_cuda_core::tensor::GpuTensor;
-
-#[cfg(feature = "cuda")]
 use anyhow::Result;
+use ferrite_cuda_core::tensor::GpuTensor;
+use ferrite_cuda_core::weights::GpuWeights;
+
 #[cfg(feature = "cuda")]
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
 #[cfg(feature = "cuda")]
 use ferrite_cuda_core::cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 use ferrite_cuda_core::tensor::TensorView;
-#[cfg(feature = "cuda")]
-use ferrite_cuda_core::weights::GpuWeights;
 
 #[cfg(feature = "nccl")]
 use ferrite_cuda_core::nccl::NcclGroup;
@@ -170,7 +168,6 @@ fn per_rank_bias_slice(
     full.narrow_dim0(start, per_rank_out)
 }
 
-#[cfg(feature = "cuda")]
 fn try_synthesize_packed_slice(weights: &mut GpuWeights, prefix: &str) -> Result<()> {
     let (parent, suffix) = match prefix.rsplit_once('.') {
         Some(split) => split,
@@ -200,7 +197,6 @@ pub struct Linear {
     pub bias: Option<GpuTensor>, // [out_features]
 }
 
-#[cfg(feature = "cuda")]
 impl Linear {
     /// Create from explicit weight and bias tensors.
     pub fn new(weight: GpuTensor, bias: Option<GpuTensor>) -> Self {
@@ -265,6 +261,7 @@ impl Linear {
     /// `world == 1` is supported and degrades to the unsharded
     /// `Self::load` semantics (bias is loaded on rank 0, which is
     /// the only rank). `dim` must be 0 or 1 — anything else panics.
+    #[cfg(feature = "cuda")]
     pub fn load_sharded(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -312,6 +309,7 @@ impl Linear {
     ///
     /// # Safety
     /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -378,12 +376,12 @@ pub struct MarlinLinear {
     pub bias: Option<GpuTensor>,
 }
 
-#[cfg(feature = "cuda")]
 impl MarlinLinear {
     /// Forward: y = marlin_gemm(x, qweight, scales, zeros)
     ///
     /// `x`: `[num_tokens, size_k]` (F16 or BF16)
     /// Returns: `[num_tokens, size_n]`
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -466,12 +464,12 @@ pub struct Bnb4bitLinear {
     pub bias: Option<GpuTensor>,
 }
 
-#[cfg(feature = "cuda")]
 impl Bnb4bitLinear {
     /// Forward: dequantize → cuBLAS GEMM.
     ///
     /// `x`: `[num_tokens, in_features]`
     /// Returns: `[num_tokens, out_features]`
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -527,12 +525,12 @@ pub struct GgmlLinear {
     pub bias: Option<GpuTensor>,
 }
 
-#[cfg(feature = "cuda")]
 impl GgmlLinear {
     /// Forward: y = ggml_matmul(weight, x) + bias
     ///
     /// Activations must be f32 (GGML kernels operate on f32).
     /// Output is f32 `[num_tokens, out_features]`.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -632,13 +630,13 @@ pub struct Fp8Linear {
     pub output_dtype: ferrite_cuda_core::dtype::DType,
 }
 
-#[cfg(feature = "cuda")]
 impl Fp8Linear {
     /// Forward: quantize activations → CUTLASS FP8 GEMM → output in output_dtype.
     ///
     /// Uses fused CUTLASS `cutlass_scaled_mm` (single kernel launch) with per-row
     /// activation scales and per-tensor weight scale in the epilogue.
     /// Matches Python vLLM's `cutlass_scaled_mm` exactly.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -756,9 +754,9 @@ pub enum LinearLayer {
     Fp8Block(Box<Fp8BlockLinear>),
 }
 
-#[cfg(feature = "cuda")]
 impl LinearLayer {
     /// Forward: y = x @ W^T (dense) or quantized GEMM variant.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -854,6 +852,7 @@ impl LinearLayer {
 
     /// Access the raw dense weight tensor. Panics if quantized —
     /// CUTLASS standalone GEMM only works with dense bf16 weights.
+    #[cfg(feature = "cuda")]
     pub fn dense_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
         match self {
             Self::Dense(l) => l.weight,
@@ -891,6 +890,7 @@ impl LinearLayer {
     /// Access the bias tensor from a dense layer. Returns the bias
     /// `GpuTensor` or `None` if the layer has no bias. Panics on
     /// quantized variants — solver only supports dense bf16.
+    #[cfg(feature = "cuda")]
     pub fn dense_bias(&self) -> Option<ferrite_cuda_core::tensor::GpuTensor> {
         match self {
             Self::Dense(l) => l.bias,
@@ -900,6 +900,7 @@ impl LinearLayer {
 
     /// Cheap copy for dense layers (GpuTensor metadata only, no weight copy).
     /// Panics on quantized variants — solver only supports dense bf16.
+    #[cfg(feature = "cuda")]
     pub fn shallow_clone(&self) -> Self {
         match self {
             Self::Dense(l) => Self::Dense(Linear::new(l.weight, l.bias)),
@@ -910,24 +911,40 @@ impl LinearLayer {
     pub fn out_features(&self) -> usize {
         match self {
             Self::Dense(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Marlin(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Ggml(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::GgmlConcat(branches) => branches.iter().map(|b| b.out_features()).sum(),
+            #[cfg(feature = "cuda")]
             Self::Bnb4bit(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8Block(l) => l.out_features(),
+            #[cfg(not(feature = "cuda"))]
+            _ => panic!("out_features: non-Dense LinearLayer not supported on this backend"),
         }
     }
 
     pub fn in_features(&self) -> usize {
         match self {
             Self::Dense(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Marlin(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Ggml(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::GgmlConcat(branches) => branches[0].in_features(),
+            #[cfg(feature = "cuda")]
             Self::Bnb4bit(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8Block(l) => l.in_features(),
+            #[cfg(not(feature = "cuda"))]
+            _ => panic!("in_features: non-Dense LinearLayer not supported on this backend"),
         }
     }
 
@@ -1003,6 +1020,7 @@ impl LinearLayer {
     /// quantizers ship gate/up with identical layouts) but the
     /// guard prevents silent corruption if an arch ever pairs
     /// different quants.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_concat_or_ggml(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -1120,6 +1138,7 @@ impl LinearLayer {
     /// (`dim = 0`) or row-parallel (`dim = 1`). Pass `(rank, world)`
     /// from the runtime; `world == 1` short-circuits to the same
     /// behavior as `load_dense` plus shard-kind-aware bias rules.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_sharded(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -1200,6 +1219,7 @@ impl LinearLayer {
     /// If any source weight has a bias, all of them must — the biases
     /// are concatenated in the same order as the weights. Otherwise
     /// the returned layer has no bias.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_concat(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -1338,6 +1358,7 @@ impl LinearLayer {
     /// `skip`s indivisible (variant, tp) tuples (per the activation
     /// commit `889c44b2f`), so this is a runtime invariant the
     /// compile-time set guarantees, not a per-call assertion.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_concat_sharded(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -1612,12 +1633,12 @@ pub struct Fp8BlockLinear {
     pub output_dtype: ferrite_cuda_core::dtype::DType,
 }
 
-#[cfg(feature = "cuda")]
 impl Fp8BlockLinear {
     /// Forward: dequant FP8 → BF16 per block, then cuBLAS GEMM.
     ///
     /// Current implementation: CPU-side dequant-then-GEMM for correctness.
     /// TODO: CUTLASS block-scaled FP8 GEMM for perf parity.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -1680,7 +1701,6 @@ pub enum Fp8AnyLinear {
     Block(Fp8BlockLinear),
 }
 
-#[cfg(feature = "cuda")]
 impl Fp8AnyLinear {
     /// Forward: dispatches to whichever inner FP8 layer is wrapped.
     /// Both variants take the same arguments and return `OwnedTensor`.
@@ -1689,6 +1709,7 @@ impl Fp8AnyLinear {
     /// All tensors must be valid GPU memory; `cublas` / `alloc` /
     /// `stream` must be live. Inner `forward`s carry the same
     /// invariants.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -1729,7 +1750,6 @@ pub struct Embedding {
     pub weight: GpuTensor, // [vocab_size, hidden_size]
 }
 
-#[cfg(feature = "cuda")]
 impl Embedding {
     pub fn new(weight: GpuTensor) -> Self {
         debug_assert_eq!(weight.ndim(), 2);
@@ -1750,6 +1770,7 @@ impl Embedding {
     /// inherits, which is what makes `tie_weights` self-consistent
     /// at tp>1 — both sharded slices come from the same dim-0 cut).
     /// `world == 1` degrades to the same shape `Self::load` produces.
+    #[cfg(feature = "cuda")]
     pub fn load_sharded(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -1787,6 +1808,7 @@ impl Embedding {
     /// # Safety
     /// All tensors must be valid GPU memory. Stream must be valid.
     /// This currently uses a simple gather kernel (TODO: implement via CUDA kernel).
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         _input_ids: TensorView<'_>,
@@ -1814,7 +1836,6 @@ pub struct RmsNorm {
     pub eps: f32,
 }
 
-#[cfg(feature = "cuda")]
 impl RmsNorm {
     pub fn new(weight: GpuTensor, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -1845,7 +1866,6 @@ pub struct LayerNorm {
     pub eps: f32,
 }
 
-#[cfg(feature = "cuda")]
 impl LayerNorm {
     pub fn new(weight: GpuTensor, bias: Option<GpuTensor>, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);

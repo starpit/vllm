@@ -14,6 +14,10 @@ default = []
 # (e.g. ferrite-metal) on machines without a CUDA toolkit.
 cuda = ["dep:cudarc", "ferrite-cuda-core/cuda"]
 nccl = ["cuda", "ferrite-cuda-core/nccl"]
+# Metal backend: layer struct *types* (RmsNorm, LinearLayer, …) + the
+# platform-neutral `load(...)` methods compile under metal too. Quant
+# kernel wrappers and cuBLAS forwards stay cuda-only.
+metal = ["ferrite-cuda-core/metal"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }

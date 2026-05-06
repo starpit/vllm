@@ -25,7 +25,7 @@ nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forwa
 # bring those in. The cfg gate inside `interpreter::metal::pipelines`
 # also requires `target_os = "macos"` so non-Apple builds with the
 # `metal` feature still compile (lowering only).
-metal = ["dep:ferrite-metal-kernels", "ferrite-forward-macro/metal", "ferrite-cuda-core/metal"]
+metal = ["dep:ferrite-metal-kernels", "ferrite-forward-macro/metal", "ferrite-cuda-core/metal", "ferrite-kernels/metal"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the

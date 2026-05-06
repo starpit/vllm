@@ -306,7 +306,31 @@ Test fixtures rebuilt: `TestWeights` carries real layer instances; `build_test_w
 
 Loose end (next chunk, not part of Stage D): the macro under metal still emits a `Weights;` ZST + panic-stub accessor methods (5.F.5 emission). The new `metal_pool` resolves symbols correctly but actually calling it would WtFn into the panic stubs at bake time. The macro needs to emit the same real `Weights` struct cuda emits (real loader, real `try_load(&mut GpuWeights)`) so the panics go away and 5.G.5 (TinyLlama-1.1B end-to-end) becomes runnable.
 
-**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** Unblocked once the macro emits the cuda-shape `Weights` under metal too.
+**Stage E — Macro emits real `Weights` + `load()` under metal. ✅ COMPLETE (2026-05-06)**
+
+Closes the Stage D loose end above. After E.2 the per-canonical metal surface is byte-identical-shape to cuda's: real struct fields, real accessor methods (no panic stubs), real `pub fn load(gw, max_model_len, tp_rank) -> Result<Weights>`. The eager-first-worker bake inside `metal_pool` now resolves WtFn → real `GpuTensor` → `MetalAllocator::buffer_for` → `(&MTLBuffer, offset)` against actual loaded weights instead of panicking.
+
+E.1 (commit `6605cf612`) — Backend-neutral helpers:
+- `GpuWeights::alloc_packed_from_host(data, shape, dtype)`: thin wrapper over `DeviceAllocator::alloc_and_copy_host`. Backend-neutral.
+- `LinearLayer::load_dense_concat_packed`: stream-free counterpart to cuda's `load_dense_concat`. CPU-concat per-prefix bytes via `take_cpu`, single allocator call. One CPU memcpy per prefix in exchange for not needing a `CUstream`.
+- `RotaryCache::new_from_gpuweights`: same CPU cos/sin compute as `new_from_stream`, uploads via `alloc_packed_from_host`. Currently covers basic + Llama3-scaling case; LongRoPE / partial-rotary / Yarn variants follow the same pattern when needed (next sub-phase).
+- `pub mod rotary` lifted out of `cfg(feature = "cuda")`; cudarc-using `_from_stream` constructors and helpers individually cuda-gated. Yarn helpers gated cuda-only.
+
+E.2 (commit `37bda1693`) — Macro emission:
+- `weights_def`: collapsed cuda/metal split. One `pub struct Weights { ... }` with real fields under either backend.
+- `emit_weights_accessor_methods` / `rotary_cos_sin_methods`: dropped `cfg(feature = "cuda")` on impl blocks — accessors return `&self.<field>` under metal too.
+- Deleted `emit_weights_accessor_methods_metal` + `rotary_cos_sin_methods_metal` panic-stub generators.
+- `emit_unindexed_let` / `emit_layered_load_body` `LinearConcat` arms: branch on `cfg!(feature = "metal")` at proc-macro compile time. Metal routes through `LinearLayer::load_dense_concat_packed` / `load_layered_linear_dense_concat_packed`; cuda keeps existing `_or_ggml` / `_sharded` / `_vision` paths.
+- New `rotary_load_metal` / `rotary_local_load_metal` token generators emit `RotaryCache::new_from_gpuweights` calls (basic + Llama3 only). Other scaling families (LongRoPE / Yarn / partial-rotary) emit `compile_error!` at macro expansion.
+- Per-canonical match arm: emit `pub fn load(gw, max_model_len, tp_rank)` cfg(metal) alongside cuda's `load_with` / `load`. Body shares `lets` and `field_shorthand` with cuda; skips marlin/bnb4/fp8 preludes (quant variants filtered out at config-load under metal). Shim `load` delegates to canonical's metal `load`.
+- Loaders (`ferrite-forward/src/loaders.rs`): `pub mod loaders` lifted out of `cfg(feature = "cuda")`. Per-fn cuda gates on `_sharded` / `_concat` / `_concat_vision` / `_concat_sharded` and all quant helpers. New `load_layered_linear_dense_concat_packed` (no stream).
+
+Per-arch state under metal:
+- `ferrite-model-llama` `metal_emission_tests::tinyllama_metal_symbols_resolve` extended to fn-pointer-check `load` too. 1/1 passes.
+- `ferrite-model-{llama, mistral, qwen3, granite}`: still compile cleanly under `--features metal`. 49/49 ferrite-forward metal lib tests pass.
+- `ferrite-model-phi3`: `metal` feature commented out — Phi-3 needs LongRoPE which `RotaryCache::new_from_gpuweights` doesn't yet cover (compile_error fires at macro expansion). Re-enable in a follow-up that ports `build_longrope` + `new_partial_longrope_from_stream` to a `_from_gpuweights` counterpart.
+
+**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** 🔜 NEXT — unblocked. Hook into the existing `vllm-e2e` golden framework targeting `tinyllama_1_1b::load` + `tinyllama_1_1b::metal_pool`. Same path CUDA uses; no bespoke Metal-only scaffolding (per `feedback_no_reinvent_testing.md`).
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
 Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
@@ -353,6 +377,8 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Backend-unification Stage D.1 Complete:** 2026-05-06 ✅ (LinearLayer accessors ungated; commit `e022c93b0`)
 - **Backend-unification Stage D.2 Complete:** 2026-05-06 ✅ (KernelExtras killed; CanonicalParams gains RMS_NORM_EPS / BLOCK_SIZE / MAX_BLOCKS_PER_SEQ / PREFILL_TILE_Q / ROT_DIM; commit `e492b17b1`)
 - **Backend-unification Stage D Complete:** 2026-05-06 ✅ (MetalModelMeta + BufferRef + model_meta.rs deleted; worker resolves Binding::Weight via WtFn + MetalAllocator::buffer_for; metal_pool ctor signature updated; commit `da9f5ec7f`)
+- **Stage E.1 Complete:** 2026-05-06 ✅ (backend-neutral `LinearLayer::load_dense_concat_packed` + `RotaryCache::new_from_gpuweights` + `GpuWeights::alloc_packed_from_host`; commit `6605cf612`)
+- **Stage E.2 Complete:** 2026-05-06 ✅ (macro emits real `Weights` + `load()` under metal — drops ZST + panic-stub accessors; metal `load` body shares cuda's `lets`; per-arch crates llama / mistral / qwen3 / granite compile under metal; commit `37bda1693`)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

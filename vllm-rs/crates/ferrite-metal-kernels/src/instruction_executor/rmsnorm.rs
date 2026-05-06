@@ -3,9 +3,9 @@
 
 //! RMSNorm instruction recording for Metal ICB.
 
-use super::{dispatch_1d, RecordingContext};
+use super::{RecordingContext, dispatch_1d};
 use crate::shader_cache::ShaderCache;
-use metal::{MTLResourceOptions, MTLSize};
+use metal::{MTLSize, MTLResourceOptions};
 use std::sync::Arc;
 
 /// Record an RMSNorm kernel dispatch into the ICB.
@@ -27,27 +27,27 @@ pub fn record_rmsnorm(
     input_buffer: &metal::Buffer,
     output_buffer: &metal::Buffer,
     weight_buffer: &metal::Buffer,
-    num_tokens: u32,
-    hidden_size: u32,
+    num_tokens: usize,
+    hidden_size: usize,
     eps: f32,
     dtype: &str,
 ) -> Result<(), String> {
     // Get or compile shader
-    let shader_cache = ShaderCache::new(ctx.device.as_ref().clone())
+    let shader_cache = ShaderCache::new((*ctx.device).clone())
         .map_err(|e| format!("Failed to create shader cache: {:?}", e))?;
     let kernel_name = match dtype {
         "fp16" => "rmsnorm_f16",
         "bf16" => "rmsnorm_bf16",
         _ => return Err(format!("Unsupported dtype: {}", dtype)),
     };
-
+    
     let pipeline = shader_cache
         .get_pipeline(kernel_name)
         .map_err(|e| format!("Failed to compile RMSNorm shader: {:?}", e))?;
 
     // Calculate dispatch size
     // Each thread processes one token (row)
-    let (threadgroups, threads_per_threadgroup) = dispatch_1d(num_tokens as usize, 256);
+    let (threadgroups, threads_per_threadgroup) = dispatch_1d(num_tokens, 256);
 
     // Prepare constant buffer for eps and hidden_size
     let constants = [eps, hidden_size as f32];
@@ -100,9 +100,13 @@ mod tests {
 
         // Record RMSNorm dispatch
         let result = record_rmsnorm(
-            &mut ctx, &input, &output, &weight, 1024, // num_tokens
-            4096, // hidden_size
-            1e-6, // eps
+            &mut ctx,
+            &input,
+            &output,
+            &weight,
+            1024,  // num_tokens
+            4096,  // hidden_size
+            1e-6,  // eps
             "fp16",
         );
 

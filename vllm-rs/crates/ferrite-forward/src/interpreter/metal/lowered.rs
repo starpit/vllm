@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Buffer-pointer-free Metal tape produced by the lowering pass.
+//!
+//! `LoweredMetalTape` is computed once per `(model variant, bucket)` and
+//! shared across every `MetalWorker` in the pool via `Arc`. It carries
+//! pipeline keys, dispatch shapes, scalar constants, and slot ids only —
+//! never raw `metal::Buffer` pointers. Each `MetalWorker` instantiates
+//! the tape against its own arena at worker init time, resolving
+//! `Binding::ArenaSlot` against `arena[slot]` and recording the result
+//! into a private `IndirectCommandBuffer`.
+//!
+//! Per the architecture doc (`FERRITE_METAL_ARCHITECTURE.md` §1, §2):
+//! the lowered tape is structurally a sequence of `LoweredCommand`s,
+//! with `Loop` instructions already statically unrolled by the lowering
+//! pass (CUDA's runtime `Loop` interpreter has no analogue on Metal —
+//! the per-bucket ICB is fully baked).
+
+use crate::CanonicalParams;
+
+/// One-of identifier for the kernel a `LoweredCommand` invokes.
+///
+/// The `MetalWorker` resolves `(KernelId, bucket)` against a
+/// `SpecializedPipelineCache` (Phase 5.B) to find the right
+/// `MTLComputePipelineState`. Each variant corresponds to one Metal
+/// kernel under `crates/ferrite-metal-kernels/shaders/` and one
+/// recorder under `crates/ferrite-metal-kernels/src/instruction_executor/`.
+///
+/// The set is closed and small on purpose: the TinyLlama-1.1B critical
+/// path covers ~13 of these, with more added as additional models come
+/// online. Variants the lowering pass cannot yet produce surface as a
+/// `LoweringError::UnsupportedVariant` rather than appearing here as a
+/// stub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KernelId {
+    /// Token embedding gather: rows of `embed_tokens.weight` indexed
+    /// by `input_ids`. Output `[num_tokens, hidden_size]`.
+    Embed,
+    /// Standalone RMSNorm: `out = weight * x / sqrt(mean(x²) + eps)`.
+    RmsNorm,
+    /// Fused residual-add + RMSNorm: writes `residual += delta` and
+    /// publishes `weight * residual / sqrt(mean(residual²) + eps)`.
+    FusedAddRmsNorm,
+    /// Generic dense GEMM: `y = x @ W^T`. Backed by Metal Performance
+    /// Shaders' `matmul2d` (or a hand-rolled tile shader once the
+    /// fused kernels land).
+    Gemm,
+    /// Fused gate-up SwiGLU MLP: `silu(gate) * up` after a single GEMM
+    /// produces the stacked `[gate; up]` activation. TinyLlama-1.1B's
+    /// MLP path.
+    FusedGateUpSiluMul,
+    /// Apply RoPE to a fresh QKV projection and write K/V to the
+    /// paged KV cache at the per-request slot. Output: rotated Q
+    /// only (K/V are sunk into cache).
+    RopeAppend,
+    /// Decode-bucket attention reading from the paged KV cache.
+    /// Single-query-token-per-sequence path.
+    AttentionViaCache,
+    /// Prefill-bucket attention over contiguous Q/K/V tiles. Causal
+    /// mask, per-sequence boundaries from `cu_seqlens_q`.
+    AttentionPrefillContiguous,
+    /// Pure scalar broadcast multiply: `out = x * scale`.
+    ScalarMul,
+    /// Elementwise residual add: `lhs += rhs`. Output is the lhs slot
+    /// rebound (in-place semantics).
+    Add,
+    /// Static reshape: rebinds a slot to a fresh logical shape; does
+    /// not touch device memory. Lowering treats this as a metadata
+    /// op — no `LoweredCommand` is emitted, only the slot's logical
+    /// shape registers in the dispatcher.
+    /// (Present in this enum for symmetry / future zero-copy ops.)
+    Reshape,
+}
+
+/// Per-axis dispatch grid: threadgroup count + threads per group.
+///
+/// The lowering pass computes both from `(bucket M, kernel-specific
+/// tile dims)`. Kept as `(u32, u32, u32)` rather than Metal's `MTLSize`
+/// so this type stays available without the `metal` crate (lowering is
+/// pure CPU code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchShape {
+    /// (x, y, z) threadgroup count.
+    pub threadgroups: (u32, u32, u32),
+    /// (x, y, z) threads per threadgroup.
+    pub threads_per_threadgroup: (u32, u32, u32),
+}
+
+impl DispatchShape {
+    /// 1D dispatch helper: `total_threads` rounded up by
+    /// `threads_per_group`.
+    pub fn dispatch_1d(total_threads: u32, threads_per_group: u32) -> Self {
+        let groups = total_threads.div_ceil(threads_per_group);
+        Self {
+            threadgroups: (groups, 1, 1),
+            threads_per_threadgroup: (threads_per_group, 1, 1),
+        }
+    }
+}
+
+/// Where the worker should source the buffer for a binding at worker
+/// init time.
+///
+/// `LoweredMetalTape` is parameterized by `W: CanonicalParams` so the
+/// lowering pass can carry weight-resolution thunks (`WtFn<W, L>`)
+/// through to the worker without committing to a specific Metal weight
+/// representation here. The worker (Phase 5.C) is the first place that
+/// resolves these thunks against a `MetalModelMeta` to obtain
+/// concrete `metal::Buffer` pointers for the ICB.
+pub enum Binding<W: CanonicalParams> {
+    /// `MetalWorker.arena[slot]` — the worker's private tile-arena
+    /// buffer for this slot. The arena is sized for the colored
+    /// `NUM_TILES` post-FUF coloring (linear-scan reg allocation
+    /// performed by `colored_slot_map()` in
+    /// `ferrite-forward-macro/src/interpreter_codegen.rs`).
+    ArenaSlot { slot: u32, binding_index: u8 },
+    /// A weight bundle resolved against `MetalModelMeta` at worker
+    /// init time. The thunk + layer index are carried verbatim from
+    /// the source `Instruction<W>` variant; the worker walks them
+    /// once and records the resulting buffer pointers into the ICB.
+    ///
+    /// `which` selects which of the bundle's tensors this binding
+    /// targets — RmsNorm has only `weight`, but `LinearLayer` exposes
+    /// `weight` + optional `bias`, and `RopeAppend` consumes the
+    /// per-layer cos/sin pair. The worker resolves it.
+    Weight {
+        kind: WeightBundleKind<W>,
+        which: WeightTensor,
+        layer: u32,
+        binding_index: u8,
+    },
+    /// A buffer drawn from `ForwardCtx`-equivalent runtime state at
+    /// `forward()` time (input_ids, positions, KV cache pages,
+    /// cu_seqlens, etc.). The worker's bucket-selection layer
+    /// rebinds these on every forward — `executeCommandsInBuffer`
+    /// does not re-record, so runtime bindings reach the GPU via a
+    /// pre-`executeCommandsInBuffer` `setBuffer` on the encoder.
+    Runtime {
+        kind: RuntimeBindingKind,
+        binding_index: u8,
+    },
+}
+
+/// Discriminator over the typed weight thunks `Instruction<W>` carries.
+///
+/// Stays generic over `W` so the lowering pass doesn't have to convert
+/// `WtFn<W, RmsNorm>` to a backend-neutral type; the worker (Phase
+/// 5.C) handles the bridge to Metal weight buffers.
+pub enum WeightBundleKind<W: CanonicalParams> {
+    Embedding(crate::WtFn<W, ferrite_kernels::layers::Embedding>),
+    RmsNorm(crate::WtFn<W, ferrite_kernels::layers::RmsNorm>),
+    LinearLayer(crate::WtFn<W, ferrite_kernels::layers::LinearLayer>),
+    /// RoPE cos/sin table lookup: `CosSinFn<W>` returns the per-layer
+    /// table directly (no struct wrapper).
+    CosSin(crate::CosSinFn<W>),
+}
+
+/// Which tensor inside a multi-tensor weight bundle this binding
+/// references. Most bundles have a single weight tensor (`Weight`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightTensor {
+    /// The bundle's primary weight (`RmsNorm.weight`,
+    /// `LinearLayer::Dense(Linear { weight, .. })`,
+    /// `Embedding.weight`).
+    Weight,
+    /// The bundle's bias, if present (`Linear.bias`,
+    /// `LayerNorm.bias`). The worker treats absent bias as
+    /// `LoweringError::MissingBias` if a binding asks for it.
+    Bias,
+}
+
+/// Categories of buffers the worker rebinds per forward call.
+///
+/// These map 1:1 to fields on the runtime context the engine threads
+/// into the Metal forward (the Metal analogue of `ForwardCtx`). The
+/// worker's `forward()` consults `RuntimeBindingKind` to know which
+/// runtime buffer to bind at which encoder slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RuntimeBindingKind {
+    /// `[num_tokens]` u32 — tokens to embed.
+    InputIds,
+    /// `[num_tokens]` u32 — RoPE position per token (1D path) or
+    /// `[3, num_tokens]` for MRoPE arches.
+    Positions,
+    /// `[num_tokens]` u32 — paged-cache slot per token.
+    SlotMapping,
+    /// `[batch+1]` u32 — prefill-only sequence boundaries.
+    CuSeqlensQ,
+    /// `[batch]` u32 — current K-axis used length per sequence.
+    SeqUsedK,
+    /// `[batch, max_blocks]` u32 — per-sequence block table.
+    BlockTable,
+    /// Paged KV cache pool (the worker resolves to the K and V
+    /// halves at the right layer offset based on `layer`).
+    KvCacheK {
+        layer: u32,
+    },
+    KvCacheV {
+        layer: u32,
+    },
+}
+
+/// One ICB command: kernel + dispatch shape + bindings.
+///
+/// All bindings are by-slot/by-thunk references (no raw buffer
+/// pointers) so this struct is shareable across workers via `Arc`.
+pub struct LoweredCommand<W: CanonicalParams> {
+    pub kernel: KernelId,
+    pub dispatch: DispatchShape,
+    pub bindings: Vec<Binding<W>>,
+}
+
+/// One bucket's lowered tape — the input the `MetalWorker` walks at
+/// init time to record its per-bucket ICB.
+pub struct LoweredMetalTape<W: CanonicalParams> {
+    /// Bucket M (number of tokens this tape was specialized for).
+    /// Used by the worker to pick the right specialized pipeline
+    /// (Phase 5.B) and the right runtime-buffer shapes.
+    pub bucket_m: u32,
+    /// Number of arena slots the tape references (post-coloring tile
+    /// count). The worker allocates exactly this many arena buffers
+    /// per shape class.
+    pub num_arena_slots: u32,
+    pub commands: Vec<LoweredCommand<W>>,
+}
+
+/// Errors produced by the lowering pass.
+///
+/// `LoweringError::UnsupportedVariant` is the most common case during
+/// Phase 5.A: each model adds new `Instruction<W>` variants that the
+/// TinyLlama-only lowering doesn't yet handle. The variant name and
+/// the `Instruction<W>` index are surfaced so the model author knows
+/// exactly which instruction to add support for.
+#[derive(Debug)]
+pub enum LoweringError {
+    /// The lowering pass doesn't yet handle this `Instruction<W>`
+    /// variant. Add a match arm in `lowering::lower_one()` and a
+    /// matching kernel in `KernelId`.
+    UnsupportedVariant {
+        /// Index of the offending instruction in the source tape.
+        index: usize,
+        /// `std::any::type_name_of_val()` of the offending variant
+        /// — gives the variant name without requiring `Debug`.
+        variant_type: &'static str,
+    },
+    /// A `Loop(count, body_len)` instruction overran the source tape
+    /// when unrolling: the body extended past the end of the slice.
+    /// Indicates malformed codegen — every tape the macro produces
+    /// has been validated by the time it reaches lowering.
+    MalformedLoop {
+        index: usize,
+        count: u32,
+        body_len: u32,
+        remaining: usize,
+    },
+}
+
+impl std::fmt::Display for LoweringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVariant {
+                index,
+                variant_type,
+            } => write!(
+                f,
+                "lowering: unsupported instruction variant `{variant_type}` at tape index {index} \
+                 (TinyLlama-1.1B critical path is the only set covered in Phase 5.A; \
+                 add a match arm in `interpreter::metal::lowering::lower_one`)"
+            ),
+            Self::MalformedLoop {
+                index,
+                count,
+                body_len,
+                remaining,
+            } => write!(
+                f,
+                "lowering: malformed Loop({count}, {body_len}) at tape index {index} \
+                 — body extends past tape end (only {remaining} instructions remain)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoweringError {}

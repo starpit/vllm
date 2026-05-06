@@ -5,11 +5,22 @@
 //! `GpuTensor` (raw GPU pointers). Forward passes use cuBLAS GEMM from
 //! the `GpuDevice` and fused CUDA kernels.
 
-use anyhow::Result;
+// Always-available imports: `GpuTensor` lives in the unconditional
+// `ferrite_cuda_core::tensor` module (pure metadata, no CUDA calls). The
+// layer struct *definitions* below only reference `GpuTensor` and primitives,
+// so they compile on every backend (including Metal on macOS). Methods that
+// invoke CUDA kernels are gated below.
+use ferrite_cuda_core::tensor::GpuTensor;
 
+#[cfg(feature = "cuda")]
+use anyhow::Result;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::cublas::CublasHandle;
-use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::tensor::TensorView;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::weights::GpuWeights;
 
 #[cfg(feature = "nccl")]
@@ -31,6 +42,7 @@ use std::sync::Arc;
 /// `gguf_dense` first and returns the GpuTensor; we then D2D-copy
 /// each [rows, cols] slab into a packed [sum(rows), cols] buffer.
 /// Bias follows the same path.
+#[cfg(feature = "cuda")]
 fn load_gguf_dense_concat(
     weights: &mut GpuWeights,
     prefixes: &[&str],
@@ -141,6 +153,7 @@ fn load_gguf_dense_concat(
 ///
 /// `per_rank_out` is the weight's per-rank out-feature count (storage
 /// row count for quantized, or `dim(0)` for dense).
+#[cfg(feature = "cuda")]
 fn per_rank_bias_slice(
     full: ferrite_cuda_core::tensor::GpuTensor,
     rank: usize,
@@ -157,6 +170,7 @@ fn per_rank_bias_slice(
     full.narrow_dim0(start, per_rank_out)
 }
 
+#[cfg(feature = "cuda")]
 fn try_synthesize_packed_slice(weights: &mut GpuWeights, prefix: &str) -> Result<()> {
     let (parent, suffix) = match prefix.rsplit_once('.') {
         Some(split) => split,
@@ -186,6 +200,7 @@ pub struct Linear {
     pub bias: Option<GpuTensor>, // [out_features]
 }
 
+#[cfg(feature = "cuda")]
 impl Linear {
     /// Create from explicit weight and bias tensors.
     pub fn new(weight: GpuTensor, bias: Option<GpuTensor>) -> Self {
@@ -363,6 +378,7 @@ pub struct MarlinLinear {
     pub bias: Option<GpuTensor>,
 }
 
+#[cfg(feature = "cuda")]
 impl MarlinLinear {
     /// Forward: y = marlin_gemm(x, qweight, scales, zeros)
     ///
@@ -450,6 +466,7 @@ pub struct Bnb4bitLinear {
     pub bias: Option<GpuTensor>,
 }
 
+#[cfg(feature = "cuda")]
 impl Bnb4bitLinear {
     /// Forward: dequantize → cuBLAS GEMM.
     ///
@@ -506,10 +523,11 @@ impl Bnb4bitLinear {
 /// - BS=1: `dequantize_mul_mat_vec` (fused dequant + dot product)
 /// - BS>1: quantize activations to Q8_1, then integer dot products
 pub struct GgmlLinear {
-    pub storage: crate::ggml::GgmlStorage,
+    pub storage: ferrite_cuda_core::ggml_quant::GgmlStorage,
     pub bias: Option<GpuTensor>,
 }
 
+#[cfg(feature = "cuda")]
 impl GgmlLinear {
     /// Forward: y = ggml_matmul(weight, x) + bias
     ///
@@ -614,6 +632,7 @@ pub struct Fp8Linear {
     pub output_dtype: ferrite_cuda_core::dtype::DType,
 }
 
+#[cfg(feature = "cuda")]
 impl Fp8Linear {
     /// Forward: quantize activations → CUTLASS FP8 GEMM → output in output_dtype.
     ///
@@ -737,6 +756,7 @@ pub enum LinearLayer {
     Fp8Block(Box<Fp8BlockLinear>),
 }
 
+#[cfg(feature = "cuda")]
 impl LinearLayer {
     /// Forward: y = x @ W^T (dense) or quantized GEMM variant.
     pub unsafe fn forward(
@@ -1592,6 +1612,7 @@ pub struct Fp8BlockLinear {
     pub output_dtype: ferrite_cuda_core::dtype::DType,
 }
 
+#[cfg(feature = "cuda")]
 impl Fp8BlockLinear {
     /// Forward: dequant FP8 → BF16 per block, then cuBLAS GEMM.
     ///
@@ -1659,6 +1680,7 @@ pub enum Fp8AnyLinear {
     Block(Fp8BlockLinear),
 }
 
+#[cfg(feature = "cuda")]
 impl Fp8AnyLinear {
     /// Forward: dispatches to whichever inner FP8 layer is wrapped.
     /// Both variants take the same arguments and return `OwnedTensor`.
@@ -1707,6 +1729,7 @@ pub struct Embedding {
     pub weight: GpuTensor, // [vocab_size, hidden_size]
 }
 
+#[cfg(feature = "cuda")]
 impl Embedding {
     pub fn new(weight: GpuTensor) -> Self {
         debug_assert_eq!(weight.ndim(), 2);
@@ -1791,6 +1814,7 @@ pub struct RmsNorm {
     pub eps: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl RmsNorm {
     pub fn new(weight: GpuTensor, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -1821,6 +1845,7 @@ pub struct LayerNorm {
     pub eps: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl LayerNorm {
     pub fn new(weight: GpuTensor, bias: Option<GpuTensor>, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -1864,6 +1889,7 @@ pub struct ColumnParallelLinear {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl ColumnParallelLinear {
     pub fn new(inner: LinearLayer, gather_output: bool) -> Self {
         Self {
@@ -1922,6 +1948,7 @@ pub struct RowParallelLinear {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl RowParallelLinear {
     pub fn new(inner: LinearLayer, bias: Option<GpuTensor>) -> Self {
         Self {
@@ -1981,6 +2008,7 @@ pub struct VocabParallelEmbedding {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl VocabParallelEmbedding {
     pub fn new(inner: Embedding, vocab_start: usize, vocab_end: usize) -> Self {
         Self {
@@ -2017,6 +2045,7 @@ pub struct CohereLayerNorm {
     pub eps: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl CohereLayerNorm {
     pub fn new(weight: GpuTensor, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -2052,6 +2081,7 @@ pub struct LayerNormBias {
     pub eps: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl LayerNormBias {
     pub fn new(weight: GpuTensor, bias: GpuTensor, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -2077,6 +2107,7 @@ impl LayerNormBias {
 // layer where the quantized path diverges from dense. Off by default.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cuda")]
 mod ggml_probe {
     use super::*;
     use ferrite_cuda_core::dtype::DType;

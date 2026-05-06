@@ -13,13 +13,21 @@
 #[cfg(feature = "nccl")]
 use std::sync::Arc;
 
-use crate::kernels;
+// Always-available imports: only `GpuTensor` (and `Linear`, which holds
+// only `GpuTensor` fields). Cuda-tied imports are gated below.
 use crate::layers::Linear;
+use ferrite_cuda_core::tensor::GpuTensor;
+
+#[cfg(feature = "cuda")]
+use crate::kernels;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::alloc::OwnedTensor;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::device::GpuDevice;
 #[cfg(feature = "nccl")]
 use ferrite_cuda_core::nccl::NcclGroup;
-use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::tensor::TensorView;
 
 /// Dynamic BLOCK_M selection for fused MoE GEMM tiling.
 ///
@@ -60,6 +68,7 @@ pub struct MoeRouting<'a> {
 
 /// Dispatch the three router-selection variants. Returns `(topk_weights, topk_ids)`
 /// matching `topk_softmax`'s shape contract: `[num_tokens, top_k]` F32 / I32.
+#[cfg(feature = "cuda")]
 pub unsafe fn route_experts(
     router_logits: GpuTensor,
     cfg: &MoeRouting<'_>,
@@ -129,6 +138,7 @@ pub struct FusedMoELayer {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl FusedMoELayer {
     /// Load a Mixtral-style BF16 fused MoE layer from safetensors.
     ///
@@ -381,6 +391,7 @@ pub struct SharedFusedMoELayer {
     pub intermediate_size: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl SharedFusedMoELayer {
     /// Load a Qwen-MoE-style BF16 fused MoE + shared-expert layer.
     ///
@@ -577,6 +588,7 @@ pub struct DeepSeekV2MoELayer {
     pub routed_scaling_factor: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl DeepSeekV2MoELayer {
     /// Forward pass.
     pub unsafe fn forward(
@@ -763,6 +775,7 @@ pub struct DeepSeekV2Fp8BlockMoELayer {
     pub routed_scaling_factor: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl DeepSeekV2Fp8BlockMoELayer {
     /// Forward pass: `output = routed_scaling_factor * moe(x) + shared_expert(x)`.
     pub unsafe fn forward(
@@ -1076,6 +1089,7 @@ pub struct Fp8FusedMoELayer {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl Fp8FusedMoELayer {
     /// Forward pass — full FP8 MoE pipeline.
     pub unsafe fn forward(
@@ -1244,6 +1258,7 @@ pub struct Fp8BlockFusedMoELayer {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl Fp8BlockFusedMoELayer {
     pub unsafe fn forward(
         &self,
@@ -1390,6 +1405,7 @@ pub struct Fp8SharedFusedMoELayer {
     pub intermediate_size: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl Fp8SharedFusedMoELayer {
     pub unsafe fn forward(
         &self,
@@ -1471,10 +1487,10 @@ pub struct GgmlFusedMoELayer {
     pub gate: Linear,
     /// Stacked gate+up weights: `[num_experts, 2*intermediate_size, hidden_size]` quantized.
     /// GgmlStorage with nrows = num_experts * 2 * intermediate_size, ncols = hidden_size.
-    pub w1: crate::ggml::GgmlStorage,
+    pub w1: ferrite_cuda_core::ggml_quant::GgmlStorage,
     /// Stacked down weights: `[num_experts, hidden_size, intermediate_size]` quantized.
     /// GgmlStorage with nrows = num_experts * hidden_size, ncols = intermediate_size.
-    pub w2: crate::ggml::GgmlStorage,
+    pub w2: ferrite_cuda_core::ggml_quant::GgmlStorage,
     pub num_experts: usize,
     pub top_k: usize,
     pub intermediate_size: usize,
@@ -1487,6 +1503,7 @@ pub struct GgmlFusedMoELayer {
     pub routed_scaling_factor: f64,
 }
 
+#[cfg(feature = "cuda")]
 impl GgmlFusedMoELayer {
     /// Forward pass — full quantized MoE pipeline.
     ///
@@ -1694,6 +1711,7 @@ pub struct DeepSeekV2GgmlMoELayer {
     pub routed_scaling_factor: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl DeepSeekV2GgmlMoELayer {
     /// Forward pass: `output = routed_scaling_factor * moe(x) + shared_expert(x)`.
     ///
@@ -2000,6 +2018,7 @@ impl DeepSeekV2GgmlMoELayer {
 ///
 /// NOTE: This function should be called at model load time, not on the hot path.
 /// The returned tensors are BF16 and work with the existing `FusedMoELayer`.
+#[cfg(feature = "cuda")]
 pub fn load_fp8_moe_weights_dequant(
     w_fp8: GpuTensor, // [num_experts, dim, hidden] FP8 E4M3
     scale: GpuTensor, // [num_experts] f32 (per-tensor) or per-block
@@ -2056,6 +2075,7 @@ pub fn load_fp8_moe_weights_dequant(
 ///   for block_size_m in [8, 16, 32, 48, 64]:
 ///       if M * topk / E / block_size_m < 0.9: break
 /// Only thread_m_blocks=1 kernels are instantiated → max block_size = 16.
+#[cfg(feature = "cuda")]
 fn select_moe_block_size(num_tokens: usize, top_k: usize, num_experts: usize) -> usize {
     for &bs in &[8usize, 16] {
         if ((num_tokens * top_k) as f64 / num_experts as f64 / bs as f64) < 0.9 {
@@ -2106,6 +2126,7 @@ pub struct MarlinFusedMoELayer {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl MarlinFusedMoELayer {
     /// Forward pass — full Marlin MoE pipeline.
     ///
@@ -2281,6 +2302,7 @@ pub struct MarlinSharedFusedMoELayer {
     pub intermediate_size: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl MarlinSharedFusedMoELayer {
     pub unsafe fn forward(
         &self,

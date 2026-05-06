@@ -72,67 +72,61 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Runtime Interpreter 🔄 IN PROGRESS (5.1-5.5)
-**Goal:** Runtime interpreter that walks instruction tape and records to ICB  
-**Duration:** 1 week  
-**Status:** 🔄 IN PROGRESS - Skeleton created, recording loop TODO
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A done)
+**Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
+**Status:** 5.A complete; 5.B–5.G + 5.6 remaining.
 
-**Architecture (Parallel to CUDA's `run()`):**
-- **CUDA:** Walks instruction tape, calls `Instruction::eval()` on each
-- **Metal:** Walks instruction tape, calls `record_*()` methods, then executes ICB
+**Architecture pivot (2026-05-06).** The earlier 5.1–5.5 plan (`MetalExecutor` walks the tape and calls `record_to_icb()` methods on `Instruction<W>`) was replaced. Reasons:
+- A single `MetalExecutor` per model has no concurrency story (spec-decode draft+verify, prefill/decode overlap, multi-stream serving need bounded concurrency without N-fold weight duplication).
+- Hanging `record_to_icb()` off `Instruction<W>` mixes Metal-specific concerns (pipeline ids, dispatch shapes, slot resolution) into the shared frontend enum.
+- The `inheritBuffers=true` slot↔encoder-binding scheme in `FERRITE_METAL_ICB_INHERIT_BUFFERS.md` doesn't scale past Metal's 31-binding limit.
 
-**Key Insight:** Phase 5 uses Phase 4.6's ICB recording infrastructure. The interpreter walks the tape at init time and calls the existing `record_*()` methods to populate the ICB.
+The pivot:
+1. Explicit lowering pass — `From<&[Instruction<W>]> for LoweredMetalTape` translates one bucket's tape into a buffer-pointer-free lowered tape (pipeline keys, dispatch shape, scalar constants, slot ids only). Computed once per `(model, bucket)`; shared across workers via `Arc`.
+2. `MetalWorkerPool` — growable from 1 to `max_workers = floor((device_total - weights - misc) / per_worker_arena)`. Each worker owns one arena + one fully-baked ICB per bucket. `pool.checkout()` blocks under contention; `forward()` is `bind_inputs → executeCommandsInBuffer → checkin`.
+3. Function-constant pipeline specialization — every `(model variant, bucket, kernel)` gets its own `MTLComputePipelineState` with `M`, `hidden_size`, `num_heads`, `head_dim`, `eps`, `rope_theta`, etc. baked in via `MTLFunctionConstantValues`. Eliminates the runtime `constants` buffer; unlocks loop-unrolling / bounds-check elimination on hand-rolled kernels at small buckets.
 
-**Implementation:**
-- ✅ 5.1: Create `MetalExecutor` struct
-  - Location: `ferrite-forward/src/interpreter/metal.rs`
-  - Skeleton created with instruction matching
-  - TODO: Implement recording loop for each instruction variant
-  
-- ✅ 5.2: Create `RecordingContext` (from Phase 4.6)
-  - Location: `ferrite-metal-kernels/src/instruction_executor/mod.rs`
-  - ICB management with `inheritPipelineState=true`
-  - `record_compute_dispatch()` for recording commands
-  
-- [ ] 5.3: Implement instruction recording loop
-  - TODO: Match each `Instruction` variant
-  - TODO: Call corresponding `record_*()` method
-  - TODO: Handle weight slot mapping
-  
-- [ ] 5.4: Implement `forward()` execution
-  - TODO: Create tile table (Metal equivalent of Vec<Option<TileEntry>>)
-  - TODO: Bind runtime buffers (input_ids, positions)
-  - TODO: Execute ICB on compute encoder
-  
-- [ ] 5.5: Add MetalExecutor tests
-  - TODO: Test with synthetic instruction tape
-  - TODO: Verify ICB execution
+#### Phase 5.A: Lowering pass ✅ COMPLETE (2026-05-06)
+Pure-CPU translation `&[Instruction<W>] → LoweredMetalTape<W>`. Statically unrolls `Loop`. Drops metadata-only instructions (`Reshape`/`Alias`/`Free`). Covers TinyLlama-1.1B critical path: `Embed`, `RmsNorm`, `FusedAddRmsNorm`, `Gemm`, `FusedGateUpSiluMul`, `RopeAppend`, `AttentionViaCache`, `AttentionPrefillContiguous`, `Add`, `ScalarMul`. Other variants surface as `LoweringError::UnsupportedVariant { index, variant_type }`.
 
-**Files Created:**
-- `ferrite-forward/src/interpreter/metal.rs` (151 lines, skeleton)
-- `ferrite-forward/src/interpreter/metal_tests.rs` (placeholder)
-- `ferrite-forward/src/interpreter/mod.rs` (module declaration)
+To unblock compilation on Apple Silicon (no nvcc), this phase also extended feature flagging:
+- `ferrite-kernels/Cargo.toml`: `cudarc` is now `optional = true`, gated on `cuda` feature. Layer struct *types* (`RmsNorm`, `LinearLayer`, `Embedding`, `MarlinLinear`, `Bnb4bitLinear`, `Fp8AnyLinear`, `LayerNorm`, `Linear`, the MoE structs) compile without `cuda`; their cudarc-using `impl` blocks and helper fns are individually `#[cfg(feature = "cuda")]`-gated.
+- `ferrite-vision`: now an optional dep of `ferrite-forward`, pulled in only via `cuda` feature.
+- `ferrite-forward/src/instr.rs`: removed file-level `#![cfg(feature = "cuda")]`. The `Instruction<W>` enum, `CanonicalParams` trait, `WtFn`/`CosSinFn` aliases compile under either `cuda` or `metal`. `eval`/`run`/`run_backbone`/`InterpreterCtx`/`debug_dump`/helpers are individually cuda-gated.
+- `ferrite-forward/Cargo.toml`: new `metal = []` feature.
 
-**Files from Phase 4.6 (Reused):**
-- `ferrite-metal-kernels/src/instruction_executor/mod.rs` (RecordingContext)
-- `ferrite-metal-kernels/src/instruction_executor/rmsnorm.rs`
-- `ferrite-metal-kernels/src/instruction_executor/gemm.rs`
-- `ferrite-metal-kernels/src/instruction_executor/attention.rs`
-- `ferrite-metal-kernels/src/instruction_executor/fused.rs`
+This gating is acknowledged technical debt — when parallel Metal weight types (or generic `Linear<B>`-style backend params) land, the `#[cfg(feature = "cuda")] impl …` annotations lift in one pass.
 
-### Phase 5.6: Test with Real Model 🔜 NEXT
-**Goal:** Wire Metal backend into existing `vllm-e2e` golden test framework  
-**Duration:** 2-3 days  
-**Status:** Not started (blocked on Phase 5.3-5.5 completion)
+**Files:**
+- `crates/ferrite-forward/src/interpreter/metal/lowered.rs` — `LoweredMetalTape<W>`, `LoweredCommand<W>`, `KernelId`, `DispatchShape`, `Binding<W>` (ArenaSlot / Weight / Runtime), `WeightBundleKind<W>`, `WeightTensor`, `RuntimeBindingKind`, `LoweringError`.
+- `crates/ferrite-forward/src/interpreter/metal/lowering.rs` — `pub fn lower<W: CanonicalParams>(instructions, bucket_m, num_arena_slots) -> Result<LoweredMetalTape<W>, LoweringError>`.
+- `crates/ferrite-forward/src/interpreter/metal/mod.rs` — re-exports.
+- Deleted: `interpreter/metal.rs` (Err-stub `MetalExecutor` skeleton), `interpreter/metal_tests.rs` (synthetic-tape `MockRmsNormWeight` tests, per `feedback_no_reinvent_testing.md`).
 
-**Steps:**
-1. Complete Phase 5.3-5.5 (instruction recording loop + forward execution)
-2. Wire `#[forward]` macro to emit Metal code
-3. Implement `MetalWeights::load_safetensors()`
-4. Add Metal backend to `vllm-e2e` tests
-5. Debug and validate with TinyLlama-1.1B
+**Verification:** `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin without CUDA toolkit.
 
-See `FERRITE_METAL_PHASE5_PLAN.md` for detailed breakdown.
+#### Phase 5.B: Function-constant pipeline cache 🔜 NEXT
+Rewrite hand-rolled MSL shaders (`rmsnorm.metal`, `attention.metal`, `fused_*.metal`) to declare layer-independent params (`hidden_size`, `eps`, `num_heads`, `head_dim`, `rope_theta`, `intermediate_size`, …) as `[[function_constant(N)]]`. Build `SpecializedPipelineCache` keyed on `(model_variant_id, bucket_id, kernel_name)` that constructs `MTLComputePipelineState`s via `MTLFunctionConstantValues`. Removes the runtime `constants` buffer and saves a binding slot.
+
+#### Phase 5.C: `MetalWorker` 🔜 PLANNED
+Allocates the per-worker arena (one buffer per colored slot, sized for the max bucket). Walks the lowered tape, resolves `Binding::ArenaSlot` against `arena[slot]` and `Binding::Weight` against `MetalModelMeta`, records one ICB per bucket using the specialized pipelines from 5.B.
+
+#### Phase 5.D: `MetalWorkerPool` 🔜 PLANNED
+Growable, capped, semaphore-bounded checkout/checkin. RAII guard. `max_workers` derived from device memory at construction time.
+
+#### Phase 5.E: `forward()` 🔜 PLANNED
+Pick bucket from `num_tokens`, checkout worker, bind input/position buffers, `encoder.executeCommandsInBuffer(this bucket's ICB)`, checkin.
+
+#### Phase 5.F: Macro emission 🔜 PLANNED
+`#[forward]` emits `MetalWorkerPool::for_<model>()` constructor alongside CUDA's `try_load`. Lowering happens at constructor time.
+
+#### Phase 5.G: Correctness wiring 🔜 PLANNED
+Hook into existing `cpu_golden::*` per-op references and `vllm-e2e` golden framework — same path CUDA uses. No bespoke Metal-only test scaffolding (per `feedback_no_reinvent_testing.md`).
+
+### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
+Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
+
+See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_METAL_PHASE5_PLAN.md` for prior context (Phase 5.6+ steps still valid; 5.1–5.5 superseded).
 
 ### Phase 6: Production Readiness 🔜 PLANNED
 **Goal:** Polish and prepare for production use  
@@ -153,7 +147,8 @@ See `FERRITE_METAL_PHASE5_PLAN.md` for detailed breakdown.
 - **Phase 2 Complete:** 2026-05-05 ✅
 - **Phase 3 Complete:** 2026-05-05 ✅
 - **Phase 4 Complete:** 2026-05-06 ✅ (including 4.6 ICB infrastructure)
-- **Phase 5 Started:** 2026-05-06 🔄 (skeleton created, recording loop TODO)
+- **Phase 5 Started:** 2026-05-06 (initial skeleton; superseded by architecture pivot same day)
+- **Phase 5.A Complete:** 2026-05-06 ✅ (lowering pass + feature-flag refactor)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary
@@ -214,33 +209,27 @@ Created complete ICB recording infrastructure in `ferrite-metal-kernels/src/inst
 - All ICB commands share pipeline state from encoder
 - Avoids crashes on Apple Silicon
 
-### Phase 5.1-5.2: Runtime Interpreter Skeleton - ✅ COMPLETE
+### Phase 5: Architecture pivot + Phase 5.A landing - ✅ (2026-05-06)
 
-**Achievement: MetalExecutor Skeleton** ✅
+The earlier 5.1–5.2 `MetalExecutor` skeleton was deleted as part of the pivot. Replaced with:
+- `crates/ferrite-forward/src/interpreter/metal/{mod,lowered,lowering}.rs` — pure-CPU `lower()` pass with TinyLlama critical-path coverage.
+- Feature-flag refactor across `ferrite-kernels`, `ferrite-vision`, `ferrite-forward` so `Instruction<W>` compiles under either `cuda` or `metal` (Apple Silicon builds no longer need nvcc).
 
-Created `MetalExecutor` in `ferrite-forward/src/interpreter/metal.rs`:
-- Instruction matching skeleton for all variants
-- Integration with Phase 4.6's `RecordingContext`
-- TODO markers for recording loop implementation
-
-**Architecture Clarification:**
-- Phase 5 USES Phase 4.6's ICB recording infrastructure
-- Interpreter walks tape at init time
-- Calls existing `record_*()` methods to populate ICB
-- Executes ICB on each forward pass
+Architecture decisions captured in `FERRITE_METAL_ARCHITECTURE.md` (now the source of truth). `FERRITE_METAL_ICB_INHERIT_BUFFERS.md` superseded; `FERRITE_METAL_PHASE5_PLAN.md` 5.1–5.5 superseded but 5.6+ steps still valid.
 
 **Next Steps:**
-1. Phase 5.3: Implement instruction recording loop (call `record_*()` methods)
-2. Phase 5.4: Implement `forward()` execution (tile table + ICB execution)
-3. Phase 5.5: Add MetalExecutor tests
-4. Phase 5.6: Test with real model (TinyLlama-1.1B)
+1. Phase 5.B: Function-constant pipeline cache (rewrite hand-rolled MSL to declare layer-independent params as `function_constant`s)
+2. Phase 5.C: `MetalWorker` (arena + per-bucket ICB recording against the lowered tape)
+3. Phase 5.D: `MetalWorkerPool` (growable, capped, semaphore-bounded)
+4. Phase 5.E: `forward()` (bucket pick → checkout → bind inputs → executeCommandsInBuffer → checkin)
+5. Phase 5.F: `#[forward]` macro emits `MetalWorkerPool::for_<model>()` alongside CUDA's `try_load`
+6. Phase 5.G: Wire `cpu_golden` per-op + `vllm-e2e` end-to-end (no bespoke Metal-only test scaffolding)
+7. Phase 5.6: TinyLlama-1.1B golden under `--features metal`
 
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
-- Phase 5.1-5.2: ✅ COMPLETE - Skeleton created
-- Phase 5.3-5.5: 🔄 TODO - Recording loop + forward execution
-- Phase 5.6: 🔜 NEXT - Test with real model
-- Complete Metal execution pipeline verified
-- 78 tests passing
-- Foundation is solid and production-ready
-- Phase 5 reuses Phase 4.6's ICB recording infrastructure
+- Phase 5.A: ✅ COMPLETE - Lowering pass + feature-flag refactor
+- Phase 5.B–G + 5.6: 🔄 PLANNED - Specialized pipelines, worker, pool, forward, macro, e2e wiring
+- 78 Phase 1-4 tests passing
+- `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin
+- Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land

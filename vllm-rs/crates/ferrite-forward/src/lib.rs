@@ -12,7 +12,11 @@ pub mod attack_surface;
 pub mod cpu_golden;
 #[cfg(feature = "cuda")]
 pub mod info;
-#[cfg(feature = "cuda")]
+// `instr` is dual-mode: the `Instruction<W>` enum + `CanonicalParams` trait +
+// `WtFn`/`CosSinFn` aliases compile under either `cuda` or `metal`. The
+// CUDA-only eval/run/run_backbone fns inside are individually
+// `#[cfg(feature = "cuda")]`-gated.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod instr;
 #[cfg(feature = "cuda")]
 pub mod loaders;
@@ -21,14 +25,23 @@ pub mod tile_table;
 #[cfg(feature = "cuda")]
 pub mod vision_arch;
 
+// Metal interpreter: lowering pass + worker pool. Phase 5.A lands the
+// lowering data model and `From<&[Instruction<W>]>` impl.
+#[cfg(feature = "metal")]
+pub mod interpreter;
+
 #[cfg(feature = "cuda")]
 pub use info::{
     BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep, VariantDump,
     normalize_slice,
 };
 
+// Backend-agnostic frontend types. Available under either backend feature.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use instr::{CanonicalParams, CosSinFn, Instruction, WtFn};
+// CUDA-only runtime entry points.
 #[cfg(feature = "cuda")]
-pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone};
+pub use instr::{InterpreterCtx, run, run_backbone};
 #[cfg(feature = "cuda")]
 pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,

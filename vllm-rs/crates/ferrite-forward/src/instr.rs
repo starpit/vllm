@@ -22,17 +22,19 @@
 //! bucket, and a 1-line forward shim that delegates to [`run`].
 //! No `__dispatch_one`, no `__interpret`, no per-canonical `Op`.
 
-#![cfg(feature = "cuda")]
+// File compiles under either `cuda` or `metal`:
+// - The `Instruction<W>` enum, `CanonicalParams` trait, and `WtFn`/`CosSinFn`
+//   type aliases are backend-agnostic — only `GpuTensor` (always available)
+//   plus the layer struct *type names* (also always available; methods are
+//   cuda-gated inside `ferrite-kernels/src/layers.rs`).
+// - The `eval`/`run`/`run_backbone` fns and `InterpreterCtx` are cuda-only;
+//   each is individually `#[cfg(feature = "cuda")]`-gated below.
+//
+// Layer type names referenced by the enum variants come from
+// `ferrite_kernels::layers`/`layers_moe`; those modules and their re-exports
+// are now ungated at the lib.rs level (see `ferrite-kernels/src/lib.rs`).
 
-use crate::ForwardCtx;
-use crate::tile_table::{TileEntry, take_owned, tile_ref, view};
-use ferrite_cuda_core::alloc::OwnedTensor;
-use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::tensor::{GpuTensor, MAX_DIMS};
-use ferrite_kernels::attention_helpers as ah;
-use ferrite_kernels::cutlass;
-use ferrite_kernels::flashinfer;
-use ferrite_kernels::kernels;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
@@ -40,6 +42,23 @@ use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
     SharedFusedMoELayer,
 };
+
+#[cfg(feature = "cuda")]
+use crate::ForwardCtx;
+#[cfg(feature = "cuda")]
+use crate::tile_table::{TileEntry, take_owned, tile_ref, view};
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::alloc::OwnedTensor;
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::device::GpuDevice;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::attention_helpers as ah;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::cutlass;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::flashinfer;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::kernels;
 
 /// Per-canonical model parameters. Implemented by each canonical's
 /// `Weights` so the universal `Instruction::eval` body can read
@@ -105,6 +124,7 @@ pub trait CanonicalParams {
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
 /// Constants live on `W: CanonicalParams`, NOT here.
+#[cfg(feature = "cuda")]
 pub struct InterpreterCtx<'a, W> {
     pub wm: &'a W,
     pub tiles: &'a mut Vec<Option<TileEntry>>,
@@ -517,6 +537,7 @@ impl<W> Clone for Instruction<W> {
 /// the kernel itself uses the runtime tensor's shapes directly,
 /// so the assertion is purely a sanity check that's only sound at
 /// tp=1.
+#[cfg(feature = "cuda")]
 #[track_caller]
 fn assert_weight_shape(
     op: &'static str,
@@ -545,6 +566,7 @@ fn assert_weight_shape(
 /// runtime per-rank shapes legitimately disagree with the codegen's
 /// unified-bounds shapes.
 #[inline]
+#[cfg(feature = "cuda")]
 fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     #[cfg(feature = "nccl")]
     {
@@ -556,6 +578,7 @@ fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl<W: CanonicalParams> Instruction<W> {
     /// Evaluate one instruction. Closed match (no `_` arm).
     /// `Loop` is dispatched by [`run`] — never reaches here.
@@ -2880,6 +2903,7 @@ impl<W: CanonicalParams> Instruction<W> {
     }
 }
 
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn mla_attention_eval<W: CanonicalParams>(
     ctx: &mut InterpreterCtx<'_, W>,
@@ -3034,6 +3058,7 @@ unsafe fn mla_attention_eval<W: CanonicalParams>(
 /// Walk one slice in-place against ctx. `Instruction::Loop(count,
 /// body_len)` re-runs the next `body_len` instructions `count`
 /// times with `ctx.layer_offset` set to the iter index.
+#[cfg(feature = "cuda")]
 unsafe fn run_slice<W: CanonicalParams>(
     instructions: &[Instruction<W>],
     ctx: &mut InterpreterCtx<'_, W>,
@@ -3093,6 +3118,7 @@ unsafe fn run_slice<W: CanonicalParams>(
 /// Cost: one D2H + stream sync per slot per instruction. Useful
 /// only for single-request bisection runs; never enable in
 /// production.
+#[cfg(feature = "cuda")]
 mod debug_dump {
     use super::TileEntry;
     use ferrite_cuda_core::CUstream;
@@ -3183,6 +3209,7 @@ mod debug_dump {
 /// # Safety
 /// Both slices well-formed; tile slot indices in range; weight
 /// accessor fns produce live GPU memory.
+#[cfg(feature = "cuda")]
 pub unsafe fn run<W: CanonicalParams>(
     backbone: &[Instruction<W>],
     lm_head: &[Instruction<W>],
@@ -3213,6 +3240,7 @@ pub unsafe fn run<W: CanonicalParams>(
 ///
 /// # Safety
 /// Same as [`run`].
+#[cfg(feature = "cuda")]
 pub unsafe fn run_backbone<W: CanonicalParams>(
     backbone: &[Instruction<W>],
     wm: &W,

@@ -27,9 +27,13 @@ pub mod ggml;
 pub mod kernels;
 #[cfg(feature = "cuda")]
 pub mod kv_cache;
-#[cfg(feature = "cuda")]
+// `layers` and `layers_moe` are dual-mode: the struct *definitions* compile
+// without the `cuda` feature (they reference only `GpuTensor`, which lives in
+// the always-available `ferrite_cuda_core::tensor` module), so the
+// `Instruction<W>` enum the frontend produces resolves on Apple Silicon Metal
+// builds. The `impl` blocks that use cudarc / `CachingAllocator` / etc. are
+// individually `#[cfg(feature = "cuda")]`-gated inside each file.
 pub mod layers;
-#[cfg(feature = "cuda")]
 pub mod layers_moe;
 #[cfg(feature = "cuda")]
 pub mod layers_quant;
@@ -40,12 +44,14 @@ pub mod rotary;
 pub use forward_output::ForwardOutput;
 #[cfg(feature = "cuda")]
 pub use kv_cache::KvCachePool;
-#[cfg(feature = "cuda")]
+// Layer struct types compile without `cuda` (see comment above the module
+// declarations). Re-export them ungated so consumers (notably the
+// `Instruction<W>` enum in ferrite-forward) can name them without the cuda
+// feature.
 pub use layers::{
     Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
-#[cfg(feature = "cuda")]
 pub use layers_moe::{DeepSeekV2MoELayer, MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 #[cfg(feature = "cuda")]
 pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling};

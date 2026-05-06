@@ -2090,11 +2090,9 @@ dependencies = [
  "ferrite-cuda-core",
  "ferrite-forward-macro",
  "ferrite-kernels",
- "ferrite-metal-kernels",
  "ferrite-vision",
  "hf-hub",
  "inventory",
- "metal 0.29.0",
  "serde",
  "serde_json",
  "tracing",
@@ -2106,6 +2104,7 @@ name = "ferrite-forward-macro"
 version = "0.1.0"
 dependencies = [
  "ferrite-cuda-targets",
+ "ferrite-metal-kernels",
  "ferrite-metal-targets",
  "prettyplease",
  "proc-macro2",
@@ -2173,10 +2172,8 @@ dependencies = [
  "foreign-types 0.5.0",
  "half",
  "libm",
- "memmap2",
  "metal 0.29.0",
  "objc",
- "serde_json",
 ]
 
 [[package]]

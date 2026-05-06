@@ -21,10 +21,14 @@
 
 #![cfg(feature = "metal")]
 
+use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Condvar, Mutex};
 
-use ferrite_metal_kernels::metal::Device;
+use ferrite_metal_kernels::metal::{
+    Buffer, CommandQueue, Device, MTLCommandBufferStatus,
+};
 
+use super::forward::{ForwardError, ForwardInputs};
 use super::lowered::LoweredMetalTape;
 use super::model_meta::MetalModelMeta;
 use super::pipelines::SpecializedPipelines;
@@ -152,6 +156,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         self.max_workers
     }
 
+    /// The Metal device the pool's workers were allocated on. Callers
+    /// use it to spin up a `CommandQueue` for [`Self::forward`] (the
+    /// pool intentionally doesn't own the queue — the engine may
+    /// share one across multiple pools / streams).
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
     /// Total workers currently allocated by the pool (whether or
     /// not they're checked out). Monotonically grows up to
     /// `max_workers`.
@@ -244,6 +256,77 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
     }
 
+    /// Map a real `num_tokens` to the bucket index that should run.
+    ///
+    /// Picks the smallest bucket whose `bucket_m >= num_tokens`. Tape
+    /// ordering inside `bucket_tapes` is intentionally not assumed —
+    /// the macro / model loader supplies whatever order it likes
+    /// (typically ascending), and a linear scan over a handful of
+    /// buckets is cheaper than maintaining a sorted invariant.
+    pub fn pick_bucket(&self, num_tokens: u32) -> Result<usize, ForwardError> {
+        if num_tokens == 0 {
+            return Err(ForwardError::ZeroTokens);
+        }
+        let mut best: Option<(usize, u32)> = None;
+        let mut max_bucket: u32 = 0;
+        for (i, tape) in self.bucket_tapes.iter().enumerate() {
+            if tape.bucket_m > max_bucket {
+                max_bucket = tape.bucket_m;
+            }
+            if tape.bucket_m >= num_tokens {
+                best = match best {
+                    Some((_, bm)) if bm <= tape.bucket_m => best,
+                    _ => Some((i, tape.bucket_m)),
+                };
+            }
+        }
+        best.map(|(i, _)| i).ok_or(ForwardError::NoBucketFits {
+            num_tokens,
+            max_bucket,
+        })
+    }
+
+    /// Run one forward step.
+    ///
+    /// Pipeline:
+    ///  1. Pick the bucket from `inputs.num_tokens`.
+    ///  2. Check out a worker (eagerly grow the pool if below cap;
+    ///     block if at cap).
+    ///  3. Validate every present input slice against its runtime
+    ///     buffer's capacity; copy bytes into the buffer's
+    ///     `contents()`.
+    ///  4. Allocate a fresh command buffer from `queue`, walk the
+    ///     bucket's plan via `worker.run_bucket`, commit, and wait
+    ///     until completed.
+    ///  5. Run `with_output(&worker)` so the caller can read arena
+    ///     buffers (e.g. logits in the final slot) before the worker
+    ///     is checked back in.
+    ///  6. Drop the guard — the worker returns to the pool.
+    ///
+    /// All validation runs *before* any GPU work is submitted, so a
+    /// malformed [`ForwardInputs`] never partially executes.
+    pub fn forward<R>(
+        &self,
+        queue: &CommandQueue,
+        inputs: &ForwardInputs<'_>,
+        with_output: impl FnOnce(&MetalWorker<W>) -> R,
+    ) -> Result<R, ForwardError> {
+        let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        let guard = self.checkout()?;
+        write_runtime_inputs(&guard.runtime, inputs)?;
+
+        let cb = queue.new_command_buffer();
+        guard.worker.run_bucket(bucket_idx, &self.device, cb)?;
+        cb.commit();
+        cb.wait_until_completed();
+        let status = cb.status();
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(ForwardError::ExecutionFailed(status));
+        }
+
+        Ok(with_output(&guard.worker))
+    }
+
     fn spawn_worker(&self) -> Result<PooledWorker<W>, WorkerError> {
         let runtime = (self.runtime_factory)(&self.device);
         let worker = MetalWorker::<W>::new(
@@ -264,6 +347,66 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // this worker, the others stay blocked.
         self.cv.notify_one();
     }
+}
+
+/// Copy each present input slice into the matching runtime buffer's
+/// host-visible `contents()`. Validates length first; on overflow
+/// returns [`ForwardError::BufferTooSmall`] without touching any
+/// buffer.
+///
+/// The runtime buffers are `MTLResourceOptions::StorageModeShared`
+/// (per `RuntimeFactory` callers), so `contents()` is a host pointer
+/// directly into GPU-visible memory — no staging copy needed.
+fn write_runtime_inputs(
+    runtime: &RuntimeBindings,
+    inputs: &ForwardInputs<'_>,
+) -> Result<(), ForwardError> {
+    write_slice("input_ids", &runtime.input_ids, inputs.input_ids)?;
+    write_slice("positions", &runtime.positions, inputs.positions)?;
+    if let Some(s) = inputs.slot_mapping {
+        write_slice("slot_mapping", &runtime.slot_mapping, s)?;
+    }
+    if let Some(s) = inputs.cu_seqlens_q {
+        write_slice("cu_seqlens_q", &runtime.cu_seqlens_q, s)?;
+    }
+    if let Some(s) = inputs.seq_used_k {
+        write_slice("seq_used_k", &runtime.seq_used_k, s)?;
+    }
+    if let Some(s) = inputs.block_table {
+        write_slice("block_table", &runtime.block_table, s)?;
+    }
+    Ok(())
+}
+
+fn write_slice(
+    kind: &'static str,
+    buffer: &Buffer,
+    src: &[u32],
+) -> Result<(), ForwardError> {
+    let bytes_needed = std::mem::size_of_val(src);
+    let bytes_available = buffer.length() as usize;
+    if bytes_needed > bytes_available {
+        return Err(ForwardError::BufferTooSmall {
+            kind,
+            bytes_needed,
+            bytes_available,
+        });
+    }
+    if bytes_needed == 0 {
+        return Ok(());
+    }
+    // Safety: shared-storage buffers expose `contents()` as a
+    // host-visible pointer; we've bounds-checked the byte count
+    // against `length()` above; src and dst don't overlap (src is a
+    // Rust slice in CPU memory).
+    unsafe {
+        copy_nonoverlapping(
+            src.as_ptr() as *const u8,
+            buffer.contents() as *mut u8,
+            bytes_needed,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -582,5 +725,246 @@ mod tests {
             pool.current_size()
         );
         assert_eq!(pool.available(), pool.current_size());
+    }
+
+    // ---------------- Phase 5.E: forward() ----------------
+
+    /// Build a pool whose tape carries one bucket per provided
+    /// `bucket_m`. Arena slots are sized for the largest bucket so the
+    /// runtime buffers / arena handle every entry. The runtime factory
+    /// sizes per-token arrays for the largest bucket too — smaller
+    /// `num_tokens` values fit trivially.
+    fn build_multi_bucket_pool(
+        bucket_ms: &[u32],
+        max_workers: usize,
+    ) -> Option<MetalWorkerPool<TinyLlamaProbe>> {
+        let device = ferrite_metal_kernels::detect_device()?;
+        let device = Arc::new(device.device.clone());
+        let cache = Arc::new(
+            SpecializedPipelineCache::with_standard_shaders((*device).clone())
+                .expect("compile standard shaders"),
+        );
+        let pipelines = Arc::new(SpecializedPipelines::new(cache));
+        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
+            rmsnorm_weight: alloc(&device, 4096),
+        });
+        let tapes: Arc<[_]> = bucket_ms
+            .iter()
+            .copied()
+            .map(synthetic_tape)
+            .collect::<Vec<_>>()
+            .into();
+        // Arena slot for the synthetic RmsNorm: M × hidden_size f16 =
+        // M × Q_SIZE × 2 bytes. Sized for the worst-case bucket.
+        let max_m = bucket_ms.iter().copied().max().unwrap_or(1) as u64;
+        let slot_bytes = max_m * (TinyLlamaProbe::Q_SIZE as u64) * 2;
+        let arena_layout: ArenaLayout = vec![slot_bytes, slot_bytes];
+        // Per-token runtime arrays sized for max bucket.
+        let max_m_bytes = (max_m * 4).max(16);
+        let runtime_factory: RuntimeFactory = Arc::new(move |d| RuntimeBindings {
+            input_ids: alloc(d, max_m_bytes),
+            positions: alloc(d, max_m_bytes),
+            slot_mapping: alloc(d, max_m_bytes),
+            cu_seqlens_q: alloc(d, 16),
+            seq_used_k: alloc(d, 16),
+            block_table: alloc(d, 16),
+            kv_cache_k: vec![alloc(d, 16)],
+            kv_cache_v: vec![alloc(d, 16)],
+        });
+        Some(
+            MetalWorkerPool::<TinyLlamaProbe>::new(
+                device,
+                meta,
+                pipelines,
+                tapes,
+                arena_layout,
+                runtime_factory,
+                max_workers,
+            )
+            .expect("pool builds"),
+        )
+    }
+
+    #[test]
+    fn pick_bucket_returns_smallest_fit() {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8, 32], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        // Decode bucket.
+        assert_eq!(pool.pick_bucket(1).unwrap(), 0);
+        // Doesn't fit bucket 0; picks the next-smallest that fits.
+        assert_eq!(pool.pick_bucket(2).unwrap(), 1);
+        assert_eq!(pool.pick_bucket(8).unwrap(), 1);
+        assert_eq!(pool.pick_bucket(9).unwrap(), 2);
+        assert_eq!(pool.pick_bucket(32).unwrap(), 2);
+    }
+
+    #[test]
+    fn pick_bucket_zero_tokens_errors() {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert!(matches!(pool.pick_bucket(0), Err(ForwardError::ZeroTokens)));
+    }
+
+    #[test]
+    fn pick_bucket_overflow_errors() {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        match pool.pick_bucket(9) {
+            Err(ForwardError::NoBucketFits {
+                num_tokens: 9,
+                max_bucket: 8,
+            }) => {}
+            other => panic!("expected NoBucketFits {{ 9, 8 }}, got {other:?}"),
+        }
+    }
+
+    /// Tape order isn't required to be sorted — `pick_bucket` should
+    /// still find the smallest fit when buckets come in arbitrary
+    /// order.
+    #[test]
+    fn pick_bucket_handles_unsorted_tape_order() {
+        let Some(pool) = build_multi_bucket_pool(&[32, 1, 8], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        assert_eq!(pool.pick_bucket(1).unwrap(), 1, "smallest bucket at index 1");
+        assert_eq!(pool.pick_bucket(8).unwrap(), 2, "8 fits index 2 (bucket_m=8)");
+        assert_eq!(pool.pick_bucket(9).unwrap(), 0, "9 only fits the 32 bucket");
+    }
+
+    #[test]
+    fn forward_runs_one_decode_step() {
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let queue = pool.device().new_command_queue();
+        let inputs = ForwardInputs {
+            num_tokens: 1,
+            input_ids: &[0u32],
+            positions: &[0u32],
+            slot_mapping: None,
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_table: None,
+        };
+        // Closure runs *while* the worker is checked out — assertion
+        // is that we got it (not on numerical correctness; that's
+        // 5.G's job via cpu_golden).
+        let saw = pool
+            .forward(&queue, &inputs, |worker| {
+                // Worker arena is alive in the closure; reading its
+                // contents would inspect the rmsnorm output. We only
+                // assert structural facts here.
+                assert_eq!(worker.bucket_bakings.len(), 1);
+                42u32
+            })
+            .expect("forward succeeds");
+        assert_eq!(saw, 42);
+        assert_eq!(pool.available(), 1, "worker returned to pool after forward");
+    }
+
+    #[test]
+    fn forward_rejects_zero_tokens() {
+        let Some(pool) = build_multi_bucket_pool(&[1], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let queue = pool.device().new_command_queue();
+        let inputs = ForwardInputs {
+            num_tokens: 0,
+            input_ids: &[],
+            positions: &[],
+            slot_mapping: None,
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_table: None,
+        };
+        let err = pool
+            .forward(&queue, &inputs, |_| ())
+            .err()
+            .expect("zero-token forward rejected");
+        assert!(matches!(err, ForwardError::ZeroTokens));
+        // Worker was never checked out — pool stays at the eager 1.
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn forward_rejects_oversized_token_count() {
+        let Some(pool) = build_multi_bucket_pool(&[1, 8], 1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let queue = pool.device().new_command_queue();
+        let big = vec![0u32; 9];
+        let inputs = ForwardInputs {
+            num_tokens: 9,
+            input_ids: &big,
+            positions: &big,
+            slot_mapping: None,
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_table: None,
+        };
+        match pool.forward(&queue, &inputs, |_| ()) {
+            Err(ForwardError::NoBucketFits {
+                num_tokens: 9,
+                max_bucket: 8,
+            }) => {}
+            other => panic!("expected NoBucketFits {{ 9, 8 }}, got {other:?}"),
+        }
+        assert_eq!(pool.available(), 1, "no checkout on bucket failure");
+    }
+
+    /// `BufferTooSmall` fires when the caller stages more bytes than
+    /// the runtime buffer can hold. Crafted by sizing the runtime
+    /// `input_ids` buffer to 16 bytes (default in this test setup) and
+    /// passing a 5-element slice (20 bytes).
+    #[test]
+    fn forward_rejects_oversized_input_slice() {
+        // Single-bucket pool with the *smaller* runtime layout — the
+        // existing `build_pool` allocates 16-byte runtime buffers,
+        // perfect for triggering the overflow path.
+        let Some(pool) = build_pool(1) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let queue = pool.device().new_command_queue();
+        // 5 × u32 = 20 bytes; runtime input_ids buffer is 16 bytes.
+        let too_big = [0u32, 0u32, 0u32, 0u32, 0u32];
+        let inputs = ForwardInputs {
+            num_tokens: 1, // pick_bucket succeeds (bucket 0 = decode)
+            input_ids: &too_big,
+            positions: &[0u32],
+            slot_mapping: None,
+            cu_seqlens_q: None,
+            seq_used_k: None,
+            block_table: None,
+        };
+        let err = pool
+            .forward(&queue, &inputs, |_| ())
+            .err()
+            .expect("oversized slice rejected");
+        match err {
+            ForwardError::BufferTooSmall {
+                kind: "input_ids",
+                bytes_needed: 20,
+                bytes_available: 16,
+            } => {}
+            other => panic!("expected BufferTooSmall on input_ids, got {other:?}"),
+        }
+        // Checkout happened (validation runs after checkout) — verify
+        // the worker came back via guard drop on the early Err return.
+        assert_eq!(
+            pool.available(),
+            1,
+            "worker returned to pool after validation failure"
+        );
     }
 }

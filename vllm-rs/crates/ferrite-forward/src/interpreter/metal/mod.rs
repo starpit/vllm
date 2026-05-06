@@ -12,6 +12,8 @@ pub mod lowering;
 pub mod pipelines;
 
 #[cfg(feature = "metal")]
+pub mod forward;
+#[cfg(feature = "metal")]
 pub mod model_meta;
 #[cfg(feature = "metal")]
 pub mod pool;
@@ -29,6 +31,8 @@ pub use pipelines::{
     constants_for, KernelExtras, PipelineLookupError, SpecializedPipelines,
 };
 
+#[cfg(feature = "metal")]
+pub use forward::{ForwardError, ForwardInputs};
 #[cfg(feature = "metal")]
 pub use model_meta::{BufferRef, MetalModelMeta};
 #[cfg(feature = "metal")]

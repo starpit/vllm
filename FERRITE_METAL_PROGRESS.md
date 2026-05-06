@@ -218,8 +218,27 @@ Build results under `--features metal`: text-only non-quantized models now compi
 
 **Models with no Metal impl coverage (separate gap):** Mixtral, Qwen-MoE, Qwen3-MoE (Moe op), DeepSeek-V2/V3 (MlaSplit op), CommandR (Mean op). Will not compile under metal feature until the missing impls are added. Out of scope for the TinyLlama-1.1B path.
 
-#### Phase 5.G: Correctness wiring 🔜 PLANNED
+#### Phase 5.G: Correctness wiring 🔄 IN PROGRESS (5.G.1 done)
 Hook into existing `cpu_golden::*` per-op references and `vllm-e2e` golden framework — same path CUDA uses. No bespoke Metal-only test scaffolding (per `feedback_no_reinvent_testing.md`).
+
+**5.G.1 — `cpu_golden::*` per-op refs for metal-lowered ops. ✅ COMPLETE (2026-05-06)**
+
+Extended `crates/ferrite-forward/src/cpu_golden.rs` with the per-op CPU references the Metal lowering exercises but the file didn't yet cover. The lowering covers ten `KernelId` arms (`Embed`, `RmsNorm`, `FusedAddRmsNorm`, `Gemm`, `FusedGateUpSiluMul`, `RopeAppend`, `AttentionViaCache`, `AttentionPrefillContiguous`, `Add`, `ScalarMul`); pre-5.G.1 the file already had `rmsnorm`, `gemm`/`gemm_add`, `silu`, `mul`, `rope`, `attention_decode`, `attention_prefill`. Five new functions land here:
+
+- `embed(input_ids, embed_weight, output, hidden_size)` — vocab-table gather; mirrors `Instruction::Embed`.
+- `add(a, b, output)` — elementwise sum; mirrors `Instruction::Add(delta_slot, residual_slot)` (CUDA path is in-place, this golden writes a fresh output for testability).
+- `scalar_mul(input, output, scale)` — elementwise scale; mirrors `Instruction::ScalarMul`.
+- `fused_add_rmsnorm(residual, delta, weight, eps, hidden_size)` — matches the `fused_add_rmsnorm_f16_specialized` shader semantics exactly: pass 1 `residual += delta` in-place, pass 2 `delta = rmsnorm(residual_after_add, weight, eps)`. Mirrors CUDA's `fused_add_rms_norm_inplace`.
+- `fused_gate_up_silu_mul(gate, up, output)` — `output = silu(gate) * up`. Mirrors `Instruction::FusedGateUpSiluMul`. Takes post-Gemm activations as inputs (only models the SiLU + elementwise multiply tail of the Metal kernel; the Gemm halves go through the existing `gemm` ref).
+
+Five new unit tests against handcrafted small inputs (`test_embed_gather`, `test_add_elementwise`, `test_scalar_mul_basic`, `test_fused_add_rmsnorm_two_rows`, `test_fused_gate_up_silu_mul_signs`). 41/41 ferrite-forward Metal lib tests pass (5 new + 36 prior). CUDA build path also clean (`cargo check -p ferrite-forward --no-default-features --features cuda` ✓ — `cpu_golden` is shared across both backends).
+
+**Out of scope for 5.G.1, queued for 5.G.2:**
+- `rope_append` golden — needs paged KV-cache write semantics. Distinct from existing `rope`/`attention_decode` (contiguous K/V).
+- `attention_via_cache` golden — paged decode reading K/V via `block_table` + `seq_used_k`. Existing `attention_decode` is contiguous-only.
+- `attention_prefill_contiguous` is structurally covered by existing `attention_prefill`; revisit if causal-mask semantics drift.
+
+**5.G.2 (next) — paged-cache golden refs + per-bucket diff harness.** Add `rope_append` and `attention_via_cache` to `cpu_golden`, then build a CPU-vs-Metal per-bucket diff: walks one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena, asserts elementwise difference under tolerance. Foundation for 5.G.3 (TinyLlama smoke test).
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
 Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
@@ -256,6 +275,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.F.3 Complete:** 2026-05-06 ✅ (Metal impls' fan_out / opcode_shape wiring via CUDA RefImpl delegation; sliding-attention; matches() neuter on no-variant impls)
 - **Phase 5.F.4 Complete:** 2026-05-06 ✅ (`MetalWorkerPool::for_buckets` + `lower_pair` + `MetalBucketSpec` + `PoolBuildError`; 3 new device-bound pool tests)
 - **Phase 5.F.5 Complete:** 2026-05-06 ✅ (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` + `metal_pool()`; quant-variant skip under metal; metal feature on llama/mistral/qwen3/phi3/granite)
+- **Phase 5.G.1 Complete:** 2026-05-06 ✅ (`cpu_golden::{embed, add, scalar_mul, fused_add_rmsnorm, fused_gate_up_silu_mul}` per-op refs + 5 unit tests; matches `fused_add_rmsnorm_f16_specialized` shader semantics)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

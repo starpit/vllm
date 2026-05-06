@@ -12,10 +12,12 @@
 //! and the caching allocator.
 
 // Always-available types (pure metadata, no CUDA calls).
+pub mod device_allocator;
 pub mod dtype;
 pub mod ggml_quant;
 pub mod tensor;
 
+pub use device_allocator::DeviceAllocator;
 pub use dtype::DType;
 pub use ggml_quant::{GgmlDType, GgmlStorage};
 pub use tensor::{GpuTensor, TensorView};
@@ -27,6 +29,8 @@ pub mod alloc;
 pub mod arena;
 #[cfg(feature = "cuda")]
 pub mod cpu_gpu_buf;
+#[cfg(feature = "cuda")]
+pub mod cuda_allocator;
 #[cfg(feature = "cuda")]
 pub mod cublas;
 #[cfg(feature = "cuda")]
@@ -40,6 +44,17 @@ pub mod weights;
 
 #[cfg(feature = "cuda")]
 pub use alloc::{CachingAllocator, OwnedTensor, RawGpuAlloc, RawGpuMem};
+#[cfg(feature = "cuda")]
+pub use cuda_allocator::CudaAllocator;
+
+/// The concrete allocator type for the active backend. CUDA xor
+/// Metal — features are mutually exclusive — so this is statically
+/// determined at build time. `GpuWeights` holds one as a field, and
+/// backend-specific accessors (e.g. `take_gpu_allocs` returning
+/// `Vec<RawGpuMem>`) live on `impl GpuWeights` blocks gated to the
+/// matching feature.
+#[cfg(feature = "cuda")]
+pub type BackendAllocator = CudaAllocator;
 #[cfg(feature = "cuda")]
 pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 #[cfg(feature = "cuda")]

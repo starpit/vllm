@@ -386,23 +386,29 @@ struct PrecastState {
 pub struct GpuWeights {
     /// Per-tensor CPU references, keyed by tensor name.
     tensors: HashMap<String, CpuTensorRef>,
-    /// Stream used for H2D copies.
-    stream: CUstream,
     /// Target dtype for floating-point weights. When set, F32 weights are cast
     /// to this dtype on CPU before H2D copy.
     target_dtype: Option<DType>,
-    /// Reusable pinned host buffer for synchronous dtype casting (fallback
-    /// when precast pipeline hasn't processed a tensor yet).
-    /// (ptr, capacity_bytes). Grown as needed, never shrunk.
-    cast_pinned: (*mut u8, usize),
+    /// Reusable host scratch for the synchronous-cast slow path
+    /// (fallback when the precast pipeline hasn't processed a
+    /// tensor yet). Pageable; CUDA's `memcpy_htod_async` from
+    /// pageable memory blocks the CPU but correctness is fine, and
+    /// the slow path is rare (precast handles the hot path).
+    /// Grows as needed, never shrinks.
+    cast_scratch: Vec<u8>,
     /// Pre-cast pipeline state, shared with background thread.
+    /// CUDA-only optimization (uses pinned host memory for DMA);
+    /// `None` under non-CUDA backends.
+    #[cfg(feature = "cuda")]
     precast: Option<Arc<PrecastState>>,
-    /// Join handle for the background precast thread.
+    /// Join handle for the background precast thread (CUDA-only).
+    #[cfg(feature = "cuda")]
     precast_handle: Option<std::thread::JoinHandle<()>>,
-    /// All GPU allocations made by `take()` / `take_into()` / `take_shard()`.
-    /// Tracked so the caller can free weight memory on sleep without walking
-    /// model structs. RAII: `RawGpuMem` calls `driver::mem_free` on drop.
-    gpu_allocs: Vec<crate::alloc::RawGpuMem>,
+    /// Backend allocator: device memory + H2D primitive. The
+    /// concrete type is `CudaAllocator` under cuda or
+    /// `MetalAllocator` under metal — see [`BackendAllocator`]
+    /// (`crate::BackendAllocator`).
+    allocator: crate::BackendAllocator,
     /// Keep mmaps alive for the lifetime of GpuWeights.
     ///
     /// `take()` and `take_into()` use `memcpy_htod_async` which reads from
@@ -444,12 +450,11 @@ impl GpuWeights {
     pub fn empty(stream: CUstream) -> Self {
         Self {
             tensors: HashMap::new(),
-            stream,
             target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
+            cast_scratch: Vec::new(),
             precast: None,
             precast_handle: None,
-            gpu_allocs: Vec::new(),
+            allocator: crate::CudaAllocator::new(stream),
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -460,7 +465,7 @@ impl GpuWeights {
     /// by the GGUF loader so quantized-weight GPU memory is freed
     /// alongside the rest of the `GpuWeights` allocations.
     pub fn push_gpu_alloc(&mut self, alloc: crate::alloc::RawGpuMem) {
-        self.gpu_allocs.push(alloc);
+        self.allocator.push_alloc(alloc);
     }
 
     /// Load all weights from a model directory (CPU-only — no GPU allocation).
@@ -579,12 +584,11 @@ impl GpuWeights {
         let path = path.as_ref();
         let mut gw = Self {
             tensors: HashMap::new(),
-            stream,
             target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
+            cast_scratch: Vec::new(),
             precast: None,
             precast_handle: None,
-            gpu_allocs: Vec::new(),
+            allocator: crate::CudaAllocator::new(stream),
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -625,12 +629,11 @@ impl GpuWeights {
             // Single shard — no need for threading.
             let mut gw = Self {
                 tensors: HashMap::new(),
-                stream,
                 target_dtype: None,
-                cast_pinned: (std::ptr::null_mut(), 0),
+                cast_scratch: Vec::new(),
                 precast: None,
                 precast_handle: None,
-                gpu_allocs: Vec::new(),
+                allocator: crate::CudaAllocator::new(stream),
                 _mmaps: Vec::new(),
                 quantized: HashMap::new(),
                 gguf_dense: HashMap::new(),
@@ -670,12 +673,11 @@ impl GpuWeights {
 
         Ok(Self {
             tensors,
-            stream,
             target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
+            cast_scratch: Vec::new(),
             precast: None,
             precast_handle: None,
-            gpu_allocs: Vec::new(),
+            allocator: crate::CudaAllocator::new(stream),
             _mmaps: mmaps,
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -692,23 +694,9 @@ impl GpuWeights {
 
     /// Ensure the pinned cast buffer has at least `needed` bytes.
     /// Grows by freeing + reallocating (pinned memory can't realloc).
-    fn ensure_pinned_buf(&mut self, needed: usize) {
-        if needed <= self.cast_pinned.1 {
-            return;
-        }
-        // Free old buffer if any.
-        if !self.cast_pinned.0.is_null() {
-            unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
-        }
-        // Allocate new pinned buffer. Round up to 1MB alignment for reuse.
-        let alloc_size = needed.next_power_of_two().max(1 << 20);
-        let ptr = unsafe { driver::mem_alloc_host(alloc_size) }
-            .expect("failed to allocate pinned host memory for dtype cast");
-        self.cast_pinned = (ptr, alloc_size);
-    }
-
     /// If target_dtype is set and the weight needs casting, cast on CPU into
-    /// pinned host memory. Returns (data_ptr, size_bytes, effective_dtype).
+    /// the reusable host scratch buffer. Returns (data_ptr, size_bytes,
+    /// effective_dtype).
     ///
     /// Only floating-point weights (F32, BF16, F16) are cast. Integer dtypes
     /// (I32, U32, I64) are left untouched — they're used for indices/metadata.
@@ -726,10 +714,15 @@ impl GpuWeights {
 
         let numel = cpu_ref.size_bytes / cpu_ref.dtype.size_bytes();
         let cast_size = numel * target.size_bytes();
-        self.ensure_pinned_buf(cast_size);
+        // Vec::resize is grow-only-cheap when capacity already
+        // satisfies; the slow path is rare, so an occasional realloc
+        // is fine.
+        if self.cast_scratch.len() < cast_size {
+            self.cast_scratch.resize(cast_size, 0);
+        }
 
         let src = cpu_ref.data();
-        let dst = self.cast_pinned.0;
+        let dst = self.cast_scratch.as_mut_ptr();
 
         // Dispatch cast. The common case is F32 → BF16/F16.
         match (cpu_ref.dtype, target) {
@@ -884,51 +877,22 @@ impl GpuWeights {
 
         // Fast path: check if precast pipeline has this tensor ready.
         if let Some(entry) = self.take_precast(name) {
-            let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
-            self.gpu_allocs
-                .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, entry.size_bytes) });
+            // The allocator's `alloc_and_copy_host` synchronizes
+            // before returning, so the entry's pinned buffer is safe
+            // to free immediately after.
+            let gpu_ptr = unsafe {
+                self.allocator
+                    .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
+            };
             unsafe {
-                driver::memcpy_htod_async(
-                    gpu_ptr,
-                    entry.pinned_ptr as *const u8,
-                    entry.size_bytes,
-                    self.stream,
-                )?;
-            }
-            let tensor = unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, entry.dtype) };
-            // Free pinned buffer after DMA completes. We synchronize the stream
-            // to ensure the DMA has finished reading from the pinned buffer.
-            unsafe {
-                driver::stream_synchronize(self.stream)?;
                 driver::mem_free_host(entry.pinned_ptr).ok();
             }
-            return Ok(tensor);
+            return Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, entry.dtype) });
         }
 
         // Slow path: synchronous pre-fault + cast + DMA.
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
-
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-
-        // The cast destination is `self.cast_pinned`, a SHARED pinned
-        // buffer reused across calls (see `ensure_pinned_buf`). Without
-        // a sync here, the next `take` would overwrite this buffer
-        // BEFORE the GPU has actually drained the async memcpy — every
-        // queued copy then reads whichever cast we wrote last, and
-        // many distinct GPU pointers end up with the same payload.
-        // (The fast/precast path already syncs before freeing its
-        // per-tensor pinned buffer; the slow path needs the same
-        // serialization because it reuses one shared buffer.)
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
-            if used_shared_pinned {
-                driver::stream_synchronize(self.stream)?;
-            }
-        }
-
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
     }
 
@@ -969,35 +933,16 @@ impl GpuWeights {
         );
 
         if let Some(entry) = self.take_precast(name) {
-            let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
-            self.gpu_allocs
-                .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, entry.size_bytes) });
-            unsafe {
-                driver::memcpy_htod_async(
-                    gpu_ptr,
-                    entry.pinned_ptr as *const u8,
-                    entry.size_bytes,
-                    self.stream,
-                )?;
-            }
-            let tensor = unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) };
-            unsafe {
-                driver::stream_synchronize(self.stream)?;
-                driver::mem_free_host(entry.pinned_ptr).ok();
-            }
-            return Ok(tensor);
+            let gpu_ptr = unsafe {
+                self.allocator
+                    .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
+            };
+            unsafe { driver::mem_free_host(entry.pinned_ptr).ok(); }
+            return Ok(unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) });
         }
 
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
-
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
-        }
-
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
     }
 
@@ -1034,13 +979,13 @@ impl GpuWeights {
         // Slow path.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
+        // If the cast wrote into our shared `cast_scratch`, sync the
+        // stream before returning so the next `take_into` doesn't
+        // overwrite the buffer mid-DMA. (No-op when `data` points at
+        // the original mmap — that memory isn't reused.)
+        let used_shared_scratch = data == self.cast_scratch.as_ptr();
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
-        if used_shared_pinned {
-            // Same race as `take`'s slow path — the next `take_into`
-            // would overwrite `cast_pinned` before this async memcpy
-            // drains. Sync to make this call effectively synchronous
-            // when the cast destination is the shared buffer.
+        if used_shared_scratch {
             driver::stream_synchronize(stream)?;
         }
 
@@ -1286,18 +1231,7 @@ impl GpuWeights {
         // Remove temporarily to satisfy borrow checker, then re-insert.
         let cpu_ref = self.tensors.remove(name)?;
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
-
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes).ok()? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
-            if used_shared_pinned {
-                driver::stream_synchronize(self.stream).ok()?;
-            }
-        }
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes).ok()? };
 
         let shape = cpu_ref.shape.clone();
         self.tensors.insert(name.to_string(), cpu_ref);
@@ -1747,24 +1681,21 @@ impl GpuWeights {
     /// Called by quantized weight loaders (AWQ, GPTQ, Marlin, etc.) that
     /// allocate GPU memory via `driver::mem_alloc` outside of `take()`.
     pub fn record_alloc(&mut self, ptr: *mut u8, size_bytes: usize) {
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(ptr, size_bytes) });
+        self.allocator
+            .push_alloc(unsafe { crate::alloc::RawGpuMem::new(ptr, size_bytes) });
     }
 
     /// Remove a previously-recorded allocation from tracking (e.g. after repack
     /// frees it separately). The removed `RawGpuMem` is leaked — caller is
     /// responsible for freeing the GPU memory.
     pub fn unrecord_alloc(&mut self, ptr: *mut u8) {
-        if let Some(pos) = self.gpu_allocs.iter().position(|m| m.ptr() == ptr) {
-            let removed = self.gpu_allocs.swap_remove(pos);
-            removed.leak(); // prevent Drop from freeing — caller will free
-        }
+        self.allocator.unrecord_alloc(ptr);
     }
 
     /// Drain all tracked GPU allocations. The caller takes ownership of the
     /// `RawGpuMem` wrappers — dropping them frees the GPU memory.
     pub fn take_gpu_allocs(&mut self) -> Vec<crate::alloc::RawGpuMem> {
-        std::mem::take(&mut self.gpu_allocs)
+        self.allocator.take_allocations()
     }
 
     /// Iterator over all tensor names.
@@ -1787,7 +1718,7 @@ impl GpuWeights {
 
     /// Get the stream used for H2D copies.
     pub fn stream(&self) -> CUstream {
-        self.stream
+        self.allocator.stream()
     }
 
     // -----------------------------------------------------------------------
@@ -1991,12 +1922,7 @@ impl GpuWeights {
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
         dump_shard_head(name, dim, rank, world_size, &shard_shape, dtype, data);
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
-        }
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
 
         Ok(unsafe { GpuTensor::new(gpu_ptr, &shard_shape, dtype) })
     }
@@ -2071,9 +1997,10 @@ impl GpuWeights {
             let col_start = rank * shard_size;
             let shard_row_bytes = shard_size * elem_size;
             let needed = rows * shard_row_bytes;
-            self.ensure_pinned_buf(needed);
-
-            let dst = self.cast_pinned.0;
+            if self.cast_scratch.len() < needed {
+                self.cast_scratch.resize(needed, 0);
+            }
+            let dst = self.cast_scratch.as_mut_ptr();
             for r in 0..rows {
                 let src_offset = (r * cols + col_start) * elem_size;
                 let dst_offset = r * shard_row_bytes;
@@ -2203,11 +2130,10 @@ impl Drop for GpuWeights {
                 unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
             }
         }
-        // Free the synchronous pinned cast buffer if allocated.
-        if !self.cast_pinned.0.is_null() {
-            unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
-        }
-        // GPU memory allocated by take()/take_into() is owned by model layers.
+        // `cast_scratch: Vec<u8>` drops itself.
+        // `allocator` (RAII over GPU + pinned host scratch) drops itself.
+        // GPU memory allocated by take()/take_into() is owned by model layers
+        //   (transferred via take_gpu_allocs); the rest is freed by allocator's Drop.
         // CPU mmaps are dropped automatically when Arc<Mmap> refcounts reach zero.
     }
 }

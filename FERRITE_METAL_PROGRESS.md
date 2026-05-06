@@ -72,9 +72,9 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E done; 5.F partial)
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E + 5.F.1–5.F.3 done)
 **Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
-**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene) and 5.F.2 (cfg-gate impl pushes) complete; 5.F.3 (Metal impls' fan_out / opcode_shape wiring) is the substantive macro-emission work and is next. 5.G + 5.6 still pending.
+**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene), 5.F.2 (cfg-gate impl pushes), and 5.F.3 (Metal impls' fan_out / opcode_shape wiring) all complete. 5.F (residual: macro-emitted constructor) + 5.G + 5.6 still pending.
 
 **Architecture pivot (2026-05-06).** The earlier 5.1–5.5 plan (`MetalExecutor` walks the tape and calls `record_to_icb()` methods on `Instruction<W>`) was replaced. Reasons:
 - A single `MetalExecutor` per model has no concurrency story (spec-decode draft+verify, prefill/decode overlap, multi-stream serving need bounded concurrency without N-fold weight duplication).
@@ -159,8 +159,30 @@ Also gated `tp_lowering::insert_mm_splices` call site (`lib.rs:765`) behind `#[c
 
 Three new metal kernel names added to the classifier: `metal_embed_f16`, `metal_reshape`, `metal_bias_add_f16` (all gated `cfg(feature = "metal")`).
 
-**5.F.3 — Wire `fan_out` / `opcode_shape` on Metal impls. 🔜 NEXT (substantive macro-emission work).**
-~30 Metal impls in `crates/ferrite-forward-macro/src/metal/*.rs` and `metal_bridge.rs` have `name()` but no `fan_out()` / `opcode_shape()`. Default `fan_out -> None` triggers the codegen panic: `Impl <metal_*> has no fan_out — unmigrated to host interpreter IR. Override opcode_shape + fan_out on metal_*, and ensure the matching Instruction<W> variant exists in ferrite_forward::instr.` Each Metal impl must emit `Instruction<W>` entries matching its CUDA-side counterpart so the macro produces a static slice the `MetalWorker` can lower via `LoweredMetalTape::from(&[Instruction<W>])`. `cargo build --bin vllm -Fmetal` panics on every text-only model (qwen3 / phi3 / granite / mistral / gemma3 / llama / etc.) until this lands.
+**5.F.3 (commit `eff0b2ed6`) — Wire `fan_out` / `opcode_shape` on Metal impls. ✅ COMPLETE**
+Each Metal impl now emits a structurally identical `Instruction<W>` variant to its CUDA counterpart by delegating `opcode_shape` / `fan_out` (and where relevant `output_alias` / `consumes_input_tiles` / `required_weights`) to the corresponding CUDA `RefImpl`. The codegen panic `Impl <metal_*> has no fan_out` no longer fires.
+
+Per-impl wiring:
+- Embed/RmsNorm/Gemm/Reshape/Add/TanhSoftCap/RopeAppend/RopeAppendInterleaved: delegate to canonical RefImpls; alias / consume hooks mirrored where they affect codegen.
+- ScalarMul: rewired `matches()` to claim Tile+Scalar `OpKind::Mul` (mirror CUDA `ScalarMulImpl`); the prior `matches() -> None` left Gemma's `embed * sqrt(hidden_size)` unclaimed under metal.
+- FusedAddRmsNorm: delegate matches to the CUDA shape (claim both Add + RmsNorm tiles, alias both outputs onto the upstream Add inputs).
+- FusedGateUpSiluMul/GeluMul: delegate matches to the 4-tile (Gemm, Gemm, Silu/Gelu, Mul) CUDA matcher seeded on the gate Gemm. Prior 1-or-2-tile claim missed the Gemms, breaking the packed `[gate|up]` weight accessor.
+- Attention: split into decode (M=1, emits `AttentionViaCache`) vs prefill (M>=2, emits `AttentionPrefillContiguous`) via a workload-constraint refinement keyed on the existing `is_multihead` flag. New `is_sliding: bool` field + 2 new constructors restore `OpKind::SlidingAttention` coverage (Gemma2/Gemma3).
+
+Neutered `matches() -> None` on Metal impls with no `Instruction<W>` counterpart (Mul, Sub, BiasAdd, Activation): a lone occurrence now surfaces as `SolveError::UnclaimedTile` — the canonical library-gap signal, same failure mode as the CUDA library's intentional gaps.
+
+Wiring updates: 2 sliding-attention pushes added to `starter_library()`; `metal_scalar_mul_f16/bf16` + `metal_tanh_softcap_f16/bf16` added to `NON_GEMM_NAMES`; `fa2` prefix arm extended to recognize `metal_sliding_attention_*`.
+
+Build results under `--features metal`: text-only non-quantized models now compile cleanly — **qwen3-0.6b, mistral-7b-instruct-v0.3, phi-3-5-mini-instruct, granite-3.1-2b-instruct, llama-2-13b, gemma2-27b, gemma-3-12b-it**. 33/33 ferrite-forward Metal lib tests still pass. `cargo check -p ferrite-forward-macro --features {metal,cuda}` ✓.
+
+**Open follow-up — boilerplate reduction (user note 2026-05-06).** The Metal impl files now contain ~50% delegation boilerplate (`fn opcode_shape() { CudaImpl.opcode_shape() }` etc.). A future attr-macro `#[delegate_codegen_to(EmbedRefImpl)]` would let Metal impls weave in shapes / fan_out patterns declaratively rather than re-implementing the trait method. Out of scope for this commit; tracked as a future cleanup pass alongside the deferred `ferrite-forward-ir` extraction (5.F.2).
+
+**Models still uncovered** (clean `SolveError::UnclaimedTile`, all out of scope for the TinyLlama/Llama-class path):
+- Moe (mixtral, qwen2-moe, qwen3-moe) — needs MetalMoeImpl variants.
+- MlaSplit (deepseek-v2/v3, moonlight) — needs MlaSplit / MlaAttention metal impls.
+- Mean (commandr, modernbert) — needs Mean metal impl (or fused MeanSubRmsNorm).
+- BiasAdd (qwen2 0.5b, slimed-qwen-3) — qkv biases need a `MetalFusedQkvBias`-style fusion.
+- Quantized fused MLP (awq/bnb/fp8/ggml gate-up paths) — non-Dense gate Gemms fail `FusedGateUpSiluMul`'s Dense check, leaving Silu/Gelu unclaimed.
 
 **Models with no Metal impl coverage (separate gap):** Mixtral, Qwen-MoE, Qwen3-MoE (Moe op), DeepSeek-V2/V3 (MlaSplit op), CommandR (Mean op). Will not compile under metal feature until the missing impls are added. Out of scope for the TinyLlama-1.1B path.
 
@@ -199,6 +221,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.E Complete:** 2026-05-06 ✅ (`forward()` + `pick_bucket` + ICB residency/pipeline prerequisites)
 - **Phase 5.F.1 Complete:** 2026-05-06 ✅ (build hygiene — ferrite-vision gate, macro feature plumbing, classifier symmetry)
 - **Phase 5.F.2 Complete:** 2026-05-06 ✅ (cfg-gate impl pushes in starter_library; MmEmbedSplice cuda-only)
+- **Phase 5.F.3 Complete:** 2026-05-06 ✅ (Metal impls' fan_out / opcode_shape wiring via CUDA RefImpl delegation; sliding-attention; matches() neuter on no-variant impls)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

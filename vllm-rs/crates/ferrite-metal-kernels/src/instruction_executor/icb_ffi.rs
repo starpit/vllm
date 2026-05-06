@@ -161,6 +161,16 @@ impl IndirectCommandBuffer {
 
 // Note: Metal manages the ICB's lifetime via ARC, no manual release needed
 
+// MTLIndirectCommandBuffer is documented as thread-safe for refcounting and for
+// recording-from-one-thread / executing-from-another. The ferrite-metal pool
+// (Phase 5.D) needs to move a baked ICB between threads (a checked-out worker
+// runs on a different thread than the one that recorded it). The pool's
+// semaphore-bounded checkout guarantees a given ICB is touched by at most one
+// thread at a time, which makes Send sound. Sync is intentionally NOT
+// implemented — concurrent mutation of `command_index` / `reset_with_range`
+// from multiple threads is not supported.
+unsafe impl Send for IndirectCommandBuffer {}
+
 /// Wrapper for MTLIndirectComputeCommand
 pub struct IndirectComputeCommand {
     command: *mut Object,

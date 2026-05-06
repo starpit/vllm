@@ -14,6 +14,8 @@ pub mod pipelines;
 #[cfg(feature = "metal")]
 pub mod model_meta;
 #[cfg(feature = "metal")]
+pub mod pool;
+#[cfg(feature = "metal")]
 pub mod runtime;
 #[cfg(feature = "metal")]
 pub mod worker;
@@ -29,6 +31,8 @@ pub use pipelines::{
 
 #[cfg(feature = "metal")]
 pub use model_meta::{BufferRef, MetalModelMeta};
+#[cfg(feature = "metal")]
+pub use pool::{MetalWorkerPool, PooledWorker, RuntimeFactory, WorkerGuard};
 #[cfg(feature = "metal")]
 pub use runtime::RuntimeBindings;
 #[cfg(feature = "metal")]

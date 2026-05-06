@@ -72,9 +72,9 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E + 5.F.1–5.F.4 done)
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E + 5.F.1–5.F.5 done)
 **Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
-**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene), 5.F.2 (cfg-gate impl pushes), 5.F.3 (Metal impls' fan_out / opcode_shape wiring), and 5.F.4 (`MetalWorkerPool::for_buckets` + `lower_pair`) all complete. 5.F.5 (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` static + `metal_pool()` constructor) + 5.G + 5.6 still pending.
+**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene), 5.F.2 (cfg-gate impl pushes), 5.F.3 (Metal impls' fan_out / opcode_shape wiring), 5.F.4 (`MetalWorkerPool::for_buckets` + `lower_pair`), and 5.F.5 (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` static + `metal_pool()` constructor) all complete. 5.G + 5.6 still pending.
 
 **Architecture pivot (2026-05-06).** The earlier 5.1–5.5 plan (`MetalExecutor` walks the tape and calls `record_to_icb()` methods on `Instruction<W>`) was replaced. Reasons:
 - A single `MetalExecutor` per model has no concurrency story (spec-decode draft+verify, prefill/decode overlap, multi-stream serving need bounded concurrency without N-fold weight duplication).
@@ -171,7 +171,25 @@ New types in `crates/ferrite-forward/src/interpreter/metal/`:
 
 3 new device-bound pool tests (silent-skip on non-Apple): `for_buckets_rejects_empty_specs`, `for_buckets_builds_pool_for_single_empty_bucket`, `for_buckets_preserves_bucket_order`. Use `EMPTY_BACKBONE: &[Instruction<TinyLlamaProbe>] = &[]` slices — exercises the constructor's lowering→pool-spawn pipeline without requiring real `Instruction<W>` values constructible at the test site (the macro emits those at codegen time; pool tests stay structural). 36/36 ferrite-forward Metal lib tests pass total.
 
-**5.F.5 (next) — macro emission of per-canonical `Weights` ZST + accessor stubs + `METAL_BUCKETS` static + `metal_pool()` constructor.** Substantial — the macro currently emits the per-model module entirely under `#[cfg(feature = "cuda")]` (Weights struct, accessor methods, CanonicalParams impl, instruction_alias, static slices, FORWARD_TABLE, forward / forward_backbone / dump fns), so under `--features metal` each `pub mod <model>` is empty. 5.F.5 needs to add a parallel path under `#[cfg(feature = "metal")]`: a `pub struct Weights;` ZST, panic-stub accessor methods (one per `WeightAccessor` — preserve fn-pointer identity for `WtFn`-keyed `MetalModelMeta` lookup, prevent ICF folding via `#[inline(never)]` + unique `concat!("metal stub: ", stringify!(name))` panic message), `impl CanonicalParams for Weights` (mirror cuda values), `BACKBONE_M_<wp>` / `LM_HEAD_M_<wp>` static slices over `Instruction<Weights>`, a `pub static METAL_BUCKETS: &[MetalBucketSpec<Weights>]`, and a `pub fn metal_pool(...)` that delegates to `MetalWorkerPool::for_buckets(METAL_BUCKETS, ...)`. Shim variants get `pub use super::canonical::{Weights, METAL_BUCKETS, metal_pool}`.
+**5.F.5 — macro emission of per-canonical `Weights` ZST + accessor stubs + `METAL_BUCKETS` static + `metal_pool()` constructor. ✅ COMPLETE (2026-05-06)**
+
+Per-canonical metal surface now emits:
+- `pub struct Weights;` ZST gated `cfg(feature = "metal")` (mutually exclusive with the cuda loader struct).
+- Panic-stub accessor methods, one per `WeightAccessor` base name. `#[inline(never)]` + unique `concat!("metal stub: ", <base_lit>)` panic body defeats LLVM ICF so each fn-pointer keeps its distinct address (the `WtFn`-keyed `MetalModelMeta` lookup contract).
+- Panic-stub rotary cos_sin / rotary_local_cos_sin methods (CosSinFn fn-pointer identity).
+- `impl CanonicalParams for Weights` lifted out of the prior `cfg(cuda)` gate — the trait + every callsite is backend-agnostic, so one impl serves whichever Weights is in scope.
+- `instruction_alias` (`type __I = Instruction<Weights>;` + `use Instruction::*;`) lifted out of the cfg gate too — backbone / lm_head static slices reference `__I` and accessor names, and they need to compile under either backend.
+- `pub static METAL_BUCKETS: &[MetalBucketSpec<Weights>]` — one row per distinct `num_tokens` point (sk axis collapsed; metal pool dispatches on `num_tokens` only). Each row references the existing `BACKBONE_M_<wp>` / `LM_HEAD_M_<wp>` static slices.
+- `pub fn metal_pool(device, model_meta, arena_layout, runtime_factory, max_workers) -> Result<MetalWorkerPool<Weights>, PoolBuildError>` — thin wrapper over `MetalWorkerPool::for_buckets(METAL_BUCKETS, ...)`.
+- Shim variants get `pub use super::canonical::{METAL_BUCKETS, metal_pool}` plus `pub type Weights = super::canonical::Weights;` (mirror of cuda's shim shape).
+
+Type-path strategy: macro emission references `::ferrite_forward::interpreter::metal::*` exclusively. New re-exports added to `crates/ferrite-forward/src/interpreter/metal/mod.rs`: `MetalBucketSpec`, `PoolBuildError`, plus `__re::Device` (re-exporting `ferrite_metal_kernels::metal::Device`) so per-arch crates don't need a direct `ferrite-metal-kernels` dep.
+
+**Quant-variant skip under metal.** Two filters added to `config::load_dir`: (a) skip the `quantizations.json`-driven preset overlay loop entirely under `cfg!(feature = "metal")`; (b) drop any explicit `<size>-<preset>.json` base config whose `quantization` is non-None. The metal impl pool has no MarlinFusedGateUpSiluMul / Bnb4Linear / Fp8Linear / GgmlLinear claimants, so any quant variant explodes the solver with `UnclaimedTile` on the first quantized Silu. Re-enable once metal-quant impls land.
+
+**Per-arch metal feature.** `metal = ["ferrite-forward/metal"]` added to: `ferrite-model-llama`, `-mistral`, `-qwen3`, `-phi3`, `-granite`. Compiles cleanly under `--no-default-features --features metal` for every model in those arches (plus `smollm2-135m` / `-360m` / `tinyllama-1.1b` since they live under llama). gemma2 / gemma3 deferred — under metal they fail with `Add: input 0 (delta) must be a Tile (got Some(Weight))` on the dense base; not a 5.F.5 scope item, separate solver gap.
+
+Verification: `crates/ferrite-model-llama/src/lib.rs` gains a structural `metal_emission_tests::tinyllama_metal_symbols_resolve` test (gated `cfg(all(test, feature = "metal"))`) that asserts `tinyllama_1_1b::METAL_BUCKETS` is non-empty and pins `tinyllama_1_1b::metal_pool` to the expected fn-pointer signature. `cargo test -p ferrite-model-llama --no-default-features --features metal --lib` passes; `cargo test -p ferrite-forward --no-default-features --features metal --lib` still 36/36.
 
 **5.F.3 (commit `eff0b2ed6`) — Wire `fan_out` / `opcode_shape` on Metal impls. ✅ COMPLETE**
 Each Metal impl now emits a structurally identical `Instruction<W>` variant to its CUDA counterpart by delegating `opcode_shape` / `fan_out` (and where relevant `output_alias` / `consumes_input_tiles` / `required_weights`) to the corresponding CUDA `RefImpl`. The codegen panic `Impl <metal_*> has no fan_out` no longer fires.
@@ -237,6 +255,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.F.2 Complete:** 2026-05-06 ✅ (cfg-gate impl pushes in starter_library; MmEmbedSplice cuda-only)
 - **Phase 5.F.3 Complete:** 2026-05-06 ✅ (Metal impls' fan_out / opcode_shape wiring via CUDA RefImpl delegation; sliding-attention; matches() neuter on no-variant impls)
 - **Phase 5.F.4 Complete:** 2026-05-06 ✅ (`MetalWorkerPool::for_buckets` + `lower_pair` + `MetalBucketSpec` + `PoolBuildError`; 3 new device-bound pool tests)
+- **Phase 5.F.5 Complete:** 2026-05-06 ✅ (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` + `metal_pool()`; quant-variant skip under metal; metal feature on llama/mistral/qwen3/phi3/granite)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

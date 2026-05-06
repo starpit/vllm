@@ -8,6 +8,7 @@ description = "Ferrite Mixtral architecture (one #[forward] body)"
 [features]
 default = []
 cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+metal = ["ferrite-forward/metal"]
 nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
 
 [dependencies]

@@ -18,6 +18,17 @@ cuda = [
     "ferrite-cuda-core/cuda",
 ]
 nccl = ["cuda", "vllm-cuda/nccl", "ferrite-forward/nccl", "ferrite-cuda-core/nccl", "ferrite-models/nccl"]
+# Apple Silicon ferrite-metal backend. Pulls in the same ferrite-* crates as
+# `cuda` but with each crate's `metal` feature instead of `cuda`. Drives
+# `metal_worker::MetalWorker` (see that file's header for the unification plan).
+metal = [
+    "dep:ferrite-forward",
+    "dep:ferrite-models",
+    "dep:ferrite-cuda-core",
+    "ferrite-forward/metal",
+    "ferrite-models/metal",
+    "ferrite-cuda-core/metal",
+]
 guided-decoding = ["vllm-model/guided-decoding"]
 
 [dependencies]
@@ -28,9 +39,9 @@ vllm-engine = { workspace = true }
 vllm-model = { workspace = true }
 ferrite-gguf = { workspace = true }
 vllm-cuda = { workspace = true, optional = true }
-ferrite-forward = { path = "../ferrite-forward", optional = true }
-ferrite-models = { path = "../ferrite-models", optional = true }
-ferrite-cuda-core = { path = "../ferrite-cuda-core", optional = true }
+ferrite-forward = { path = "../ferrite-forward", optional = true, default-features = false }
+ferrite-models = { path = "../ferrite-models", optional = true, default-features = false }
+ferrite-cuda-core = { path = "../ferrite-cuda-core", optional = true, default-features = false }
 half = { workspace = true }
 tokenizers = { workspace = true }
 hf-hub = { workspace = true }

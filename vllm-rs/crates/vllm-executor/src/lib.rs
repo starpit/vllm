@@ -18,6 +18,8 @@ pub mod cuda_worker;
 pub mod error;
 #[cfg(feature = "cuda")]
 pub mod gpu_worker_base;
+#[cfg(feature = "metal")]
+pub mod metal_worker;
 pub mod input_batch;
 #[cfg(feature = "nccl")]
 pub mod multinode;

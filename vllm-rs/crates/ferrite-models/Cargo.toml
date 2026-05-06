@@ -52,7 +52,32 @@ all-arches = [
     "arch-qwen3-moe",
 ]
 
+# Apple Silicon metal backend. Forwards `metal` only to per-arch crates that
+# have a verified metal `load()` path (post-Stage-E: llama / mistral / qwen3 /
+# granite). Other crates' `metal` feature exists but their `load()` may
+# `compile_error!` for unsupported scaling families (LongRoPE on phi3, etc.) —
+# add them here as their loaders land.
+#
+# Unlike `cuda`, this feature *also* enables the arch-* features for each
+# supported arch directly, so callers turning on `metal` don't need to
+# additionally request `all-arches` (which would drag in arches whose macro
+# expansion fails under metal).
+metal = [
+    "arch-llama",
+    "arch-mistral",
+    "arch-qwen3",
+    "arch-granite",
+    "ferrite-model-llama?/metal",
+    "ferrite-model-mistral?/metal",
+    "ferrite-model-qwen3?/metal",
+    "ferrite-model-granite?/metal",
+]
+
 cuda = [
+    # Enable every arch under cuda — mirrors the historical `default = ["all-arches"]`
+    # behaviour. Callers that want a narrower cuda build can `default-features = false`
+    # the ferrite-models dep and then opt into individual arch- features alongside cuda.
+    "all-arches",
     "ferrite-model-commandr?/cuda",
     "ferrite-model-gemma2?/cuda",
     "ferrite-model-gemma3?/cuda",

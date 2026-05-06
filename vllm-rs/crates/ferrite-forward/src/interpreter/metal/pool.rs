@@ -33,10 +33,10 @@ use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
 use super::forward::{ForwardError, ForwardInputs};
 use super::lowered::LoweredMetalTape;
 use super::lowering::lower_pair;
-use super::model_meta::MetalModelMeta;
 use super::pipelines::SpecializedPipelines;
 use super::runtime::RuntimeBindings;
 use super::worker::{ArenaLayout, MetalWorker, WorkerError};
+use ferrite_cuda_core::MetalAllocator;
 use crate::{CanonicalParams, Instruction};
 
 /// One bucket's compile-time data, ready to be lowered + handed to a
@@ -191,7 +191,16 @@ impl<W: CanonicalParams> Drop for WorkerGuard<'_, W> {
 /// [`CanonicalParams`] — one pool per loaded model variant.
 pub struct MetalWorkerPool<W: CanonicalParams> {
     device: Arc<Device>,
-    model_meta: Arc<dyn MetalModelMeta<W>>,
+    /// The loaded `Weights` struct (per-canonical type the macro
+    /// emits). Holds layer structs (`RmsNorm`, `LinearLayer`,
+    /// `Embedding`, …) whose `GpuTensor` fields the worker resolves
+    /// via WtFn thunks at ICB-record time.
+    weights: Arc<W>,
+    /// Allocator that owns the `MTLBuffer` arenas the loaded
+    /// `GpuTensor`s point into. The worker uses
+    /// [`MetalAllocator::buffer_for`] to map a tensor's raw pointer
+    /// back to `(&MTLBuffer, offset)` for encoder bindings.
+    allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape<W>]>,
     arena_layout: Arc<ArenaLayout>,
@@ -219,7 +228,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// path (no creation cost on the first checkout).
     pub fn new(
         device: Arc<Device>,
-        model_meta: Arc<dyn MetalModelMeta<W>>,
+        weights: Arc<W>,
+        allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
         bucket_tapes: Arc<[LoweredMetalTape<W>]>,
         arena_layout: ArenaLayout,
@@ -229,7 +239,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         assert!(max_workers >= 1, "max_workers must be >= 1");
         let pool = Self {
             device,
-            model_meta,
+            weights,
+            allocator,
             pipelines,
             bucket_tapes,
             arena_layout: Arc::new(arena_layout),
@@ -251,37 +262,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     }
 
     /// Build the pool from a flat `&[MetalBucketSpec<W>]` plus the
-    /// caller-supplied model_meta + arena layout + runtime factory.
+    /// loaded model + its allocator + arena layout + runtime factory.
     ///
     /// This is the runtime-side prerequisite the `#[forward]` macro's
-    /// emitted `metal_pool(...)` (Phase 5.F.5) calls into. The macro
-    /// materializes the static slices that back the `bucket_specs`
-    /// and supplies the model-specific `MetalModelMeta` impl; the
-    /// caller is responsible for the device, the arena byte-layout,
-    /// the runtime factory, and the worker cap (typically derived
-    /// from `floor((device_total - weights - misc) / per_worker_arena)`).
-    ///
-    /// Pipeline:
-    ///  1. Build a [`SpecializedPipelineCache`] via
-    ///     [`SpecializedPipelineCache::with_standard_shaders`] (one
-    ///     shader compile per loaded model — cached across workers
-    ///     via `Arc`).
-    ///  2. Wrap in [`SpecializedPipelines`].
-    ///  3. For each spec, lower `(backbone ++ lm_head)` to a
-    ///     [`LoweredMetalTape`] keyed at `bucket_m`. Lowering is the
-    ///     hot path *once* — the resulting tape is shared across all
-    ///     workers via `Arc<[…]>`.
-    ///  4. Hand off to [`Self::new`], which eagerly spawns the first
-    ///     worker (records every bucket's ICB once) so allocation /
-    ///     pipeline / recording failures surface here, not on the
-    ///     first forward.
-    ///
-    /// Lowering errors are returned with the offending `bucket_m`
-    /// surfaced so the model author can pinpoint which bucket's
-    /// macro emission needs an additional `lower_one` arm.
+    /// emitted `metal_pool(...)` calls into. The macro materializes
+    /// the static slices that back the `bucket_specs` and threads the
+    /// loaded `Weights` + the `MetalAllocator` that owns its
+    /// `MTLBuffer` arenas; the caller is responsible for the device,
+    /// the arena byte-layout, the runtime factory, and the worker
+    /// cap (typically derived from
+    /// `floor((device_total - weights - misc) / per_worker_arena)`).
     pub fn for_buckets(
         device: Arc<Device>,
-        model_meta: Arc<dyn MetalModelMeta<W>>,
+        weights: Arc<W>,
+        allocator: Arc<MetalAllocator>,
         bucket_specs: &[MetalBucketSpec<W>],
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
@@ -313,7 +307,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 
         Self::new(
             device,
-            model_meta,
+            weights,
+            allocator,
             pipelines,
             bucket_tapes,
             arena_layout,
@@ -505,7 +500,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             &self.arena_layout,
             &self.bucket_tapes,
             &self.pipelines,
-            &*self.model_meta,
+            &self.weights,
+            &self.allocator,
             &runtime,
         )?;
         Ok(PooledWorker { worker, runtime })
@@ -587,18 +583,21 @@ mod tests {
         Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind,
         WeightTensor,
     };
-    use crate::interpreter::metal::model_meta::BufferRef;
+    use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
     use ferrite_kernels::layers::RmsNorm;
     use ferrite_metal_kernels::metal::{Buffer, MTLResourceOptions};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    /// Mirror of the `TinyLlamaProbe` in `worker.rs::tests` — pool
-    /// tests share the same model shape so the same compiled
-    /// pipelines are reused across tests run in one process.
-    struct TinyLlamaProbe;
-    impl CanonicalParams for TinyLlamaProbe {
+    /// Test fixture: holds `CanonicalParams` constants AND the layer
+    /// instances the WtFn thunks below dereference. Pool tests only
+    /// exercise RmsNorm bindings (the `synthetic_tape` builder
+    /// below), so only the rmsnorm layer needs real backing.
+    struct TestWeights {
+        rmsnorm_layer: RmsNorm,
+    }
+    impl CanonicalParams for TestWeights {
         const HEAD_DIM: u32 = 64;
         const NUM_Q_HEADS: u32 = 32;
         const NUM_KV_HEADS: u32 = 4;
@@ -617,29 +616,27 @@ mod tests {
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
 
-    fn stub_rmsnorm(_w: &TinyLlamaProbe, _layer: u32) -> &'static RmsNorm {
-        unreachable!("test meta resolves by discriminant, not by invoking the WtFn")
+    fn rmsnorm_thunk(w: &TestWeights, _layer: u32) -> &RmsNorm {
+        &w.rmsnorm_layer
     }
 
-    /// Trivial meta — every weight ask returns one shared buffer.
-    /// Sufficient for verifying pool flow; numerical correctness is
-    /// 5.G's responsibility.
-    struct StubMeta {
-        rmsnorm_weight: Buffer,
-    }
-
-    impl MetalModelMeta<TinyLlamaProbe> for StubMeta {
-        fn weight_buffer(
-            &self,
-            _kind: &WeightBundleKind<TinyLlamaProbe>,
-            _layer: u32,
-            _which: WeightTensor,
-        ) -> BufferRef<'_> {
-            BufferRef {
-                buffer: &self.rmsnorm_weight,
-                offset: 0,
-            }
-        }
+    /// Build a `TestWeights` + the allocator that owns its RmsNorm
+    /// weight's backing MTLBuffer. The allocator is also threaded
+    /// into the pool so the worker can map `weight.raw_ptr()` back
+    /// to `(&MTLBuffer, offset)` at ICB-record time.
+    fn build_test_weights(device: &Device) -> (Arc<TestWeights>, Arc<MetalAllocator>) {
+        let mut allocator = MetalAllocator::new(device.clone());
+        let bytes = vec![0u8; TestWeights::Q_SIZE * 2];
+        let ptr = unsafe {
+            allocator
+                .alloc_and_copy_host(bytes.as_ptr(), bytes.len())
+                .expect("rmsnorm weight alloc")
+        };
+        let tensor = unsafe { GpuTensor::new(ptr, &[TestWeights::Q_SIZE], DType::F16) };
+        let weights = Arc::new(TestWeights {
+            rmsnorm_layer: RmsNorm::new(tensor, 1e-5),
+        });
+        (weights, Arc::new(allocator))
     }
 
     fn alloc(device: &Device, bytes: u64) -> Buffer {
@@ -662,7 +659,7 @@ mod tests {
     /// Single-bucket synthetic tape: one RmsNorm command. Enough to
     /// verify the worker bakes; the kernel itself isn't fired in
     /// 5.D tests (5.E hooks `run_bucket` to a real cmdbuf).
-    fn synthetic_tape(bucket_m: u32) -> LoweredMetalTape<TinyLlamaProbe> {
+    fn synthetic_tape(bucket_m: u32) -> LoweredMetalTape<TestWeights> {
         let cmd = LoweredCommand {
             kernel: KernelId::RmsNorm,
             dispatch: DispatchShape {
@@ -679,7 +676,7 @@ mod tests {
                     binding_index: 1,
                 },
                 Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm(stub_rmsnorm),
+                    kind: WeightBundleKind::RmsNorm(rmsnorm_thunk),
                     which: WeightTensor::Weight,
                     layer: 0,
                     binding_index: 2,
@@ -697,7 +694,7 @@ mod tests {
     /// Build a pool with `max_workers = max` for a one-bucket
     /// TinyLlama-shaped synthetic tape. Returns `None` when no
     /// Metal device is present (lets each test silent-skip).
-    fn build_pool(max: usize) -> Option<MetalWorkerPool<TinyLlamaProbe>> {
+    fn build_pool(max: usize) -> Option<MetalWorkerPool<TestWeights>> {
         let device = ferrite_metal_kernels::detect_device()?;
         let device = Arc::new(device.device.clone());
 
@@ -707,9 +704,7 @@ mod tests {
         );
         let pipelines = Arc::new(SpecializedPipelines::new(cache));
 
-        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
-            rmsnorm_weight: alloc(&device, 4096),
-        });
+        let (weights, allocator) = build_test_weights(&device);
 
         let tapes: Arc<[_]> = Arc::from(vec![synthetic_tape(1)]);
         let arena_layout: ArenaLayout = vec![4096, 4096];
@@ -717,9 +712,10 @@ mod tests {
             Arc::new(|d| empty_runtime(d, 1));
 
         Some(
-            MetalWorkerPool::<TinyLlamaProbe>::new(
+            MetalWorkerPool::<TestWeights>::new(
                 device,
-                meta,
+                weights,
+                allocator,
                 pipelines,
                 tapes,
                 arena_layout,
@@ -900,7 +896,7 @@ mod tests {
     fn build_multi_bucket_pool(
         bucket_ms: &[u32],
         max_workers: usize,
-    ) -> Option<MetalWorkerPool<TinyLlamaProbe>> {
+    ) -> Option<MetalWorkerPool<TestWeights>> {
         let device = ferrite_metal_kernels::detect_device()?;
         let device = Arc::new(device.device.clone());
         let cache = Arc::new(
@@ -908,9 +904,7 @@ mod tests {
                 .expect("compile standard shaders"),
         );
         let pipelines = Arc::new(SpecializedPipelines::new(cache));
-        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
-            rmsnorm_weight: alloc(&device, 4096),
-        });
+        let (weights, allocator) = build_test_weights(&device);
         let tapes: Arc<[_]> = bucket_ms
             .iter()
             .copied()
@@ -920,7 +914,7 @@ mod tests {
         // Arena slot for the synthetic RmsNorm: M × hidden_size f16 =
         // M × Q_SIZE × 2 bytes. Sized for the worst-case bucket.
         let max_m = bucket_ms.iter().copied().max().unwrap_or(1) as u64;
-        let slot_bytes = max_m * (TinyLlamaProbe::Q_SIZE as u64) * 2;
+        let slot_bytes = max_m * (TestWeights::Q_SIZE as u64) * 2;
         let arena_layout: ArenaLayout = vec![slot_bytes, slot_bytes];
         // Per-token runtime arrays sized for max bucket.
         let max_m_bytes = (max_m * 4).max(16);
@@ -935,9 +929,10 @@ mod tests {
             kv_cache_v: vec![alloc(d, 16)],
         });
         Some(
-            MetalWorkerPool::<TinyLlamaProbe>::new(
+            MetalWorkerPool::<TestWeights>::new(
                 device,
-                meta,
+                weights,
+                allocator,
                 pipelines,
                 tapes,
                 arena_layout,
@@ -1140,23 +1135,22 @@ mod tests {
     /// The resulting tape carries zero commands; the worker still
     /// bakes a (trivially empty) ICB per bucket and the pool still
     /// stands one worker up eagerly.
-    const EMPTY_BACKBONE: &[Instruction<TinyLlamaProbe>] = &[];
-    const EMPTY_LM_HEAD: &[Instruction<TinyLlamaProbe>] = &[];
+    const EMPTY_BACKBONE: &[Instruction<TestWeights>] = &[];
+    const EMPTY_LM_HEAD: &[Instruction<TestWeights>] = &[];
 
     fn build_via_for_buckets(
-        bucket_specs: &[MetalBucketSpec<TinyLlamaProbe>],
+        bucket_specs: &[MetalBucketSpec<TestWeights>],
         max_workers: usize,
-    ) -> Option<Result<MetalWorkerPool<TinyLlamaProbe>, PoolBuildError>> {
+    ) -> Option<Result<MetalWorkerPool<TestWeights>, PoolBuildError>> {
         let device = ferrite_metal_kernels::detect_device()?;
         let device = Arc::new(device.device.clone());
-        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
-            rmsnorm_weight: alloc(&device, 4096),
-        });
+        let (weights, allocator) = build_test_weights(&device);
         let arena_layout: ArenaLayout = vec![4096, 4096];
         let runtime_factory: RuntimeFactory = Arc::new(|d| empty_runtime(d, 1));
-        Some(MetalWorkerPool::<TinyLlamaProbe>::for_buckets(
+        Some(MetalWorkerPool::<TestWeights>::for_buckets(
             device,
-            meta,
+            weights,
+            allocator,
             bucket_specs,
             arena_layout,
             runtime_factory,
@@ -1179,14 +1173,13 @@ mod tests {
                 return;
             }
         };
-        let meta: Arc<dyn MetalModelMeta<TinyLlamaProbe>> = Arc::new(StubMeta {
-            rmsnorm_weight: alloc(&device, 16),
-        });
+        let (weights, allocator) = build_test_weights(&device);
         let arena_layout: ArenaLayout = vec![];
         let runtime_factory: RuntimeFactory = Arc::new(|d| empty_runtime(d, 1));
-        let res = MetalWorkerPool::<TinyLlamaProbe>::for_buckets(
+        let res = MetalWorkerPool::<TestWeights>::for_buckets(
             device,
-            meta,
+            weights,
+            allocator,
             &[],
             arena_layout,
             runtime_factory,

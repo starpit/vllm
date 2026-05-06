@@ -48,11 +48,11 @@ use ferrite_metal_kernels::metal::{
     MTLResourceOptions, MTLResourceUsage, MTLSize, ResourceRef,
 };
 
-use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape};
-use super::model_meta::MetalModelMeta;
+use super::lowered::{Binding, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind, WeightTensor};
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
 use crate::CanonicalParams;
+use ferrite_cuda_core::MetalAllocator;
 
 /// Byte size of arena slot `i`. The macro's `colored_slot_map()`
 /// computes this from the FUF's per-slot shape × dtype × max bucket;
@@ -165,6 +165,13 @@ pub enum WorkerError {
     },
     /// `encode_gemm_into_command_buffer` rejected the dispatch.
     GemmEncode(GemmError),
+    /// Resolving a `Binding::Weight` via the WtFn thunk + allocator
+    /// failed. Either the layer struct didn't carry the requested
+    /// tensor (e.g. bias absent on a no-bias linear) or the tensor's
+    /// raw pointer didn't fall inside any of the allocator's arenas.
+    WeightLookupFailed {
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -204,6 +211,9 @@ impl std::fmt::Display for WorkerError {
                  GEMM bindings malformed ({reason})"
             ),
             Self::GemmEncode(e) => write!(f, "MetalWorker: MPS GEMM encode: {e}"),
+            Self::WeightLookupFailed { reason } => {
+                write!(f, "MetalWorker: weight lookup: {reason}")
+            }
         }
     }
 }
@@ -234,7 +244,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
         arena_layout: &ArenaLayout,
         bucket_tapes: &[LoweredMetalTape<W>],
         pipelines: &SpecializedPipelines,
-        model_meta: &dyn MetalModelMeta<W>,
+        weights: &W,
+        allocator: &MetalAllocator,
         runtime: &RuntimeBindings,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
@@ -267,7 +278,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 tape,
                 &arena,
                 pipelines,
-                model_meta,
+                weights,
+                allocator,
                 runtime,
                 device.clone(),
             )?;
@@ -388,7 +400,8 @@ fn bake_bucket<W: CanonicalParams>(
     tape: &LoweredMetalTape<W>,
     arena: &[Buffer],
     pipelines: &SpecializedPipelines,
-    model_meta: &dyn MetalModelMeta<W>,
+    weights: &W,
+    allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
     device: Arc<Device>,
 ) -> Result<BucketBaking, WorkerError> {
@@ -433,7 +446,8 @@ fn bake_bucket<W: CanonicalParams>(
                 cmd_idx,
                 cmd,
                 arena,
-                model_meta,
+                weights,
+                allocator,
                 runtime,
             )?;
             steps.push(BucketStep::Gemm {
@@ -454,7 +468,8 @@ fn bake_bucket<W: CanonicalParams>(
             .pipeline_for::<W>(cmd.kernel, tape.bucket_m)
             .map_err(WorkerError::PipelineLookup)?;
 
-        let bound = resolve_bindings(bucket_index, cmd_idx, cmd, arena, model_meta, runtime)?;
+        let bound =
+            resolve_bindings(bucket_index, cmd_idx, cmd, arena, weights, allocator, runtime)?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|&(b, off, idx)| (b, off, idx)).collect();
         for &(b, _, _) in &bound_refs {
@@ -503,10 +518,19 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     command_index: usize,
     cmd: &LoweredCommand<W>,
     arena: &[Buffer],
-    model_meta: &dyn MetalModelMeta<W>,
+    weights: &W,
+    allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
 ) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
-    let bound = resolve_bindings(bucket_index, command_index, cmd, arena, model_meta, runtime)?;
+    let bound = resolve_bindings(
+        bucket_index,
+        command_index,
+        cmd,
+        arena,
+        weights,
+        allocator,
+        runtime,
+    )?;
     if bound.len() != 3 {
         return Err(WorkerError::GemmBindingsMalformed {
             bucket_index,
@@ -537,13 +561,56 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     ))
 }
 
+/// Resolve a `Binding::Weight` against the loaded model `weights`
+/// and the allocator that owns the underlying `MTLBuffer` arenas.
+///
+/// Calls the typed `WtFn` thunk in `kind` to get a reference to the
+/// layer struct (`&RmsNorm`, `&LinearLayer`, `&Embedding`), pulls
+/// out the raw GpuTensor pointer matching `which`, and asks the
+/// allocator which buffer + offset that pointer belongs to.
+///
+/// Same shape CUDA's interpreter uses: WtFn → layer struct →
+/// `GpuTensor`. The Metal-side delta is just the final pointer →
+/// `(&Buffer, offset)` reverse lookup against the arena allocator.
+fn resolve_weight<'a, W: CanonicalParams>(
+    weights: &W,
+    allocator: &'a MetalAllocator,
+    kind: &WeightBundleKind<W>,
+    layer: u32,
+    which: WeightTensor,
+) -> Result<(&'a Buffer, u64), WorkerError> {
+    let tensor = match kind {
+        WeightBundleKind::RmsNorm(wtfn) => (wtfn)(weights, layer).weight,
+        WeightBundleKind::Embedding(wtfn) => (wtfn)(weights, layer).weight,
+        WeightBundleKind::LinearLayer(wtfn) => {
+            let l = (wtfn)(weights, layer);
+            match which {
+                WeightTensor::Weight => l.dense_weight(),
+                WeightTensor::Bias => l
+                    .dense_bias()
+                    .ok_or(WorkerError::WeightLookupFailed {
+                        reason: "LinearLayer bias requested but not present",
+                    })?,
+            }
+        }
+        WeightBundleKind::CosSin(cosfn) => (cosfn)(weights, layer),
+    };
+    allocator
+        .buffer_for(tensor.raw_ptr())
+        .ok_or(WorkerError::WeightLookupFailed {
+            reason: "weight pointer not in any MetalAllocator arena \
+                     — was it loaded through this allocator?",
+        })
+}
+
 /// Resolve every binding on `cmd` to (buffer, offset, binding-index).
 fn resolve_bindings<'a, W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand<W>,
     arena: &'a [Buffer],
-    model_meta: &'a dyn MetalModelMeta<W>,
+    weights: &W,
+    allocator: &'a MetalAllocator,
     runtime: &'a RuntimeBindings,
 ) -> Result<Vec<(&'a Buffer, u64, u64)>, WorkerError> {
     let mut out: Vec<(&'a Buffer, u64, u64)> = Vec::with_capacity(cmd.bindings.len());
@@ -567,8 +634,8 @@ fn resolve_bindings<'a, W: CanonicalParams>(
                 layer,
                 binding_index,
             } => {
-                let r = model_meta.weight_buffer(kind, *layer, *which);
-                (r.buffer, r.offset, *binding_index as u64)
+                let (b, off) = resolve_weight(weights, allocator, kind, *layer, *which)?;
+                (b, off, *binding_index as u64)
             }
             Binding::Runtime {
                 kind,
@@ -607,16 +674,21 @@ mod tests {
     use crate::interpreter::metal::lowered::{
         Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, WeightBundleKind, WeightTensor,
     };
-    use crate::interpreter::metal::model_meta::BufferRef;
     use crate::CanonicalParams;
-    use ferrite_kernels::layers::{Embedding, LinearLayer, RmsNorm};
+    use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
+    use ferrite_kernels::layers::{Embedding, Linear, LinearLayer, RmsNorm};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
     use std::sync::Arc;
 
-    /// CanonicalParams stub modelled on TinyLlama-1.1B; matches the
-    /// probe in `pipelines.rs` so the same pipelines compile.
-    struct TinyLlamaProbe;
-    impl CanonicalParams for TinyLlamaProbe {
+    /// Test fixture: holds `CanonicalParams` constants AND the layer
+    /// instances the WtFn thunks below dereference. Plays the role
+    /// of the per-canonical `Weights` struct the macro will emit.
+    struct TestWeights {
+        rmsnorm_layer: RmsNorm,
+        linear_layer: LinearLayer,
+        embedding_layer: Embedding,
+    }
+    impl CanonicalParams for TestWeights {
         const HEAD_DIM: u32 = 64;
         const NUM_Q_HEADS: u32 = 32;
         const NUM_KV_HEADS: u32 = 4;
@@ -635,54 +707,78 @@ mod tests {
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
 
-    // Stubs for typed `WtFn`. Never actually invoked — the worker
-    // identifies a binding by `WeightBundleKind` discriminant alone
-    // (the function-pointer identity is the model-meta's job to
-    // resolve, and the test's meta uses neither).
-    fn stub_rmsnorm(_w: &TinyLlamaProbe, _layer: u32) -> &'static RmsNorm {
-        unreachable!("test meta resolves by discriminant, not by invoking the WtFn")
+    // WtFn thunks for the three layer kinds the smoke tests use.
+    // They look layers up by name on `TestWeights` directly — same
+    // pattern the macro will emit for real canonical Weights.
+    fn rmsnorm_thunk(w: &TestWeights, _layer: u32) -> &RmsNorm {
+        &w.rmsnorm_layer
     }
-    fn _stub_linear(_w: &TinyLlamaProbe, _layer: u32) -> &'static LinearLayer {
-        unreachable!("test meta resolves by discriminant, not by invoking the WtFn")
+    fn linear_thunk(w: &TestWeights, _layer: u32) -> &LinearLayer {
+        &w.linear_layer
     }
-    fn _stub_embedding(_w: &TinyLlamaProbe, _layer: u32) -> &'static Embedding {
-        unreachable!("test meta resolves by discriminant, not by invoking the WtFn")
-    }
-
-    /// Trivial model meta: every weight ask returns the same backing
-    /// buffer. Sufficient for verifying the worker's recording flow
-    /// — actual numerical correctness lives behind the cpu_golden
-    /// hookup (Phase 5.G).
-    struct StubMeta {
-        rmsnorm_weight: Buffer,
-        /// Backing for `LinearLayer` weight bundles (GEMM routing).
-        /// Sized to the largest TinyLlama-class projection
-        /// (`Q_SIZE × Q_SIZE` f16 = ~8 MB) so the buffer-length checks
-        /// inside `encode_gemm_into_command_buffer` are satisfied for
-        /// the smoke-test dimensions.
-        linear_weight: Buffer,
+    fn _embedding_thunk(w: &TestWeights, _layer: u32) -> &Embedding {
+        &w.embedding_layer
     }
 
-    impl MetalModelMeta<TinyLlamaProbe> for StubMeta {
-        fn weight_buffer(
-            &self,
-            kind: &WeightBundleKind<TinyLlamaProbe>,
-            _layer: u32,
-            _which: WeightTensor,
-        ) -> BufferRef<'_> {
-            match kind {
-                WeightBundleKind::RmsNorm(_) => BufferRef {
-                    buffer: &self.rmsnorm_weight,
-                    offset: 0,
-                },
-                WeightBundleKind::LinearLayer(_) => BufferRef {
-                    buffer: &self.linear_weight,
-                    offset: 0,
-                },
-                _ => unreachable!("smoke tests only exercise RmsNorm + LinearLayer bindings"),
-            }
-        }
+    /// Build a `TestWeights` + the `MetalAllocator` that owns its
+    /// MTLBuffer arenas. The allocator is also used by the pool to
+    /// resolve `Binding::Weight` lookups; tests that build a worker
+    /// directly thread the same allocator into `MetalWorker::new`.
+    ///
+    /// Allocations are zero-filled — sufficient for verifying the
+    /// recording flow. Numerical correctness lives in `pipelines.rs`'s
+    /// `*_matches_cpu_golden` tests.
+    fn build_test_weights() -> (Arc<TestWeights>, Arc<MetalAllocator>) {
+        let device = ferrite_metal_kernels::detect_device()
+            .expect("test fixture: a Metal device")
+            .device
+            .clone();
+        let mut allocator = MetalAllocator::new(device);
 
+        // RmsNorm weight: [Q_SIZE] f16 = 4 KB.
+        let rmsnorm_bytes = vec![0u8; TestWeights::Q_SIZE * 2];
+        let rmsnorm_ptr = unsafe {
+            allocator
+                .alloc_and_copy_host(rmsnorm_bytes.as_ptr(), rmsnorm_bytes.len())
+                .expect("rmsnorm tensor")
+        };
+        let rmsnorm_tensor =
+            unsafe { GpuTensor::new(rmsnorm_ptr, &[TestWeights::Q_SIZE], DType::F16) };
+
+        // LinearLayer weight: [Q_SIZE, Q_SIZE] f16 = ~8 MB. Sized to
+        // the largest TinyLlama-class projection so the GEMM dim
+        // checks inside `encode_gemm_into_command_buffer` pass.
+        let linear_bytes = vec![0u8; TestWeights::Q_SIZE * TestWeights::Q_SIZE * 2];
+        let linear_ptr = unsafe {
+            allocator
+                .alloc_and_copy_host(linear_bytes.as_ptr(), linear_bytes.len())
+                .expect("linear tensor")
+        };
+        let linear_tensor = unsafe {
+            GpuTensor::new(
+                linear_ptr,
+                &[TestWeights::Q_SIZE, TestWeights::Q_SIZE],
+                DType::F16,
+            )
+        };
+
+        // Embedding weight: [vocab=128, hidden=Q_SIZE] f16. Tiny vocab
+        // — embedding tests don't exercise vocab-size correctness.
+        let embedding_bytes = vec![0u8; 128 * TestWeights::Q_SIZE * 2];
+        let embedding_ptr = unsafe {
+            allocator
+                .alloc_and_copy_host(embedding_bytes.as_ptr(), embedding_bytes.len())
+                .expect("embedding tensor")
+        };
+        let embedding_tensor =
+            unsafe { GpuTensor::new(embedding_ptr, &[128, TestWeights::Q_SIZE], DType::F16) };
+
+        let weights = Arc::new(TestWeights {
+            rmsnorm_layer: RmsNorm::new(rmsnorm_tensor, 1e-5),
+            linear_layer: LinearLayer::Dense(Linear::new(linear_tensor, None)),
+            embedding_layer: Embedding::new(embedding_tensor),
+        });
+        (weights, Arc::new(allocator))
     }
 
     fn alloc_buffer(device: &Device, bytes: u64) -> Buffer {
@@ -706,7 +802,7 @@ mod tests {
     /// same `[RmsNorm, FusedAddRmsNorm]` shape twice. Verifies:
     /// arena allocation, ICB recording per command, segment
     /// coalescing across same-pipeline neighbours.
-    fn build_synthetic_tape(bucket_m: u32) -> LoweredMetalTape<TinyLlamaProbe> {
+    fn build_synthetic_tape(bucket_m: u32) -> LoweredMetalTape<TestWeights> {
         let rmsnorm = LoweredCommand {
             kernel: KernelId::RmsNorm,
             dispatch: DispatchShape {
@@ -723,7 +819,7 @@ mod tests {
                     binding_index: 1,
                 },
                 Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm(stub_rmsnorm),
+                    kind: WeightBundleKind::RmsNorm(rmsnorm_thunk),
                     which: WeightTensor::Weight,
                     layer: 0,
                     binding_index: 2,
@@ -747,7 +843,7 @@ mod tests {
                     binding_index: 1,
                 },
                 Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm(stub_rmsnorm),
+                    kind: WeightBundleKind::RmsNorm(rmsnorm_thunk),
                     which: WeightTensor::Weight,
                     layer: 0,
                     binding_index: 2,
@@ -771,11 +867,11 @@ mod tests {
         }
     }
 
-    impl LoweredCommand<TinyLlamaProbe> {
+    impl LoweredCommand<TestWeights> {
         // Helper for the test: hand-clone (the public LoweredCommand
         // intentionally does NOT derive Clone so the live tape stays
         // single-owner).
-        fn clone_for_test(&self) -> LoweredCommand<TinyLlamaProbe> {
+        fn clone_for_test(&self) -> LoweredCommand<TestWeights> {
             LoweredCommand {
                 kernel: self.kernel,
                 dispatch: self.dispatch,
@@ -842,22 +938,20 @@ mod tests {
         );
         let pipelines = SpecializedPipelines::new(cache);
 
-        let meta = StubMeta {
-            rmsnorm_weight: alloc_buffer(&device, 4096),
-            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
-        };
+        let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         // Two buckets: M=1 (decode) and M=8 (small prefill).
         let tapes = vec![build_synthetic_tape(1), build_synthetic_tape(8)];
         let arena_layout: ArenaLayout = vec![4 * 1024, 4 * 1024];
 
-        let worker = MetalWorker::<TinyLlamaProbe>::new(
+        let worker = MetalWorker::<TestWeights>::new(
             device,
             &arena_layout,
             &tapes,
             &pipelines,
-            &meta,
+            &weights,
+            &allocator,
             &runtime,
         )
         .expect("worker builds");
@@ -890,18 +984,15 @@ mod tests {
                 .expect("compile standard shaders"),
         );
         let pipelines = SpecializedPipelines::new(cache);
-        let meta = StubMeta {
-            rmsnorm_weight: alloc_buffer(&device, 4096),
-            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
-        };
+        let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         let tapes = vec![build_synthetic_tape(1)]; // num_arena_slots = 2
 
         // Layout has only 1 slot — should error.
         let bad_layout: ArenaLayout = vec![4 * 1024];
-        let err = MetalWorker::<TinyLlamaProbe>::new(
-            device, &bad_layout, &tapes, &pipelines, &meta, &runtime,
+        let err = MetalWorker::<TestWeights>::new(
+            device, &bad_layout, &tapes, &pipelines, &weights, &allocator, &runtime,
         )
         .err()
         .expect("expected arena shape mismatch error");
@@ -934,10 +1025,7 @@ mod tests {
         );
         let pipelines = SpecializedPipelines::new(cache);
 
-        let meta = StubMeta {
-            rmsnorm_weight: alloc_buffer(&device, 4096),
-            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
-        };
+        let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         // Single AttentionViaCache command at decode bucket=1
@@ -945,8 +1033,8 @@ mod tests {
         let attn = LoweredCommand {
             kernel: KernelId::AttentionViaCache,
             dispatch: DispatchShape {
-                threadgroups: (1, TinyLlamaProbe::NUM_Q_HEADS, 1),
-                threads_per_threadgroup: (TinyLlamaProbe::HEAD_DIM, 1, 1),
+                threadgroups: (1, TestWeights::NUM_Q_HEADS, 1),
+                threads_per_threadgroup: (TestWeights::HEAD_DIM, 1, 1),
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -982,12 +1070,13 @@ mod tests {
             commands: vec![attn],
         };
 
-        let worker = MetalWorker::<TinyLlamaProbe>::new(
+        let worker = MetalWorker::<TestWeights>::new(
             device,
             &vec![1024, 1024],
             &[tape],
             &pipelines,
-            &meta,
+            &weights,
+            &allocator,
             &runtime,
         )
         .expect("worker bakes attention command");
@@ -1002,12 +1091,7 @@ mod tests {
     /// projecting `[bucket_m, k]` × `[n, k]^T` → `[bucket_m, n]`.
     /// Bindings match the lowering pass: arena slots `(0, 1)` for
     /// (out, in) and a `LinearLayer` weight thunk.
-    fn build_gemm_command(bucket_m: u32, n: u32, k: u32) -> LoweredCommand<TinyLlamaProbe> {
-        // Stub linear thunk — never invoked (StubMeta resolves by
-        // discriminant). Cast to a `WtFn` so the variant type-checks.
-        fn linear_stub(_w: &TinyLlamaProbe, _layer: u32) -> &'static LinearLayer {
-            unreachable!("StubMeta resolves LinearLayer by discriminant only")
-        }
+    fn build_gemm_command(bucket_m: u32, n: u32, k: u32) -> LoweredCommand<TestWeights> {
         LoweredCommand {
             kernel: KernelId::Gemm,
             dispatch: DispatchShape {
@@ -1024,7 +1108,7 @@ mod tests {
                     binding_index: 1,
                 },
                 Binding::Weight {
-                    kind: WeightBundleKind::LinearLayer(linear_stub),
+                    kind: WeightBundleKind::LinearLayer(linear_thunk),
                     which: WeightTensor::Weight,
                     layer: 0,
                     binding_index: 2,
@@ -1054,10 +1138,7 @@ mod tests {
                 .expect("compile standard shaders"),
         );
         let pipelines = SpecializedPipelines::new(cache);
-        let meta = StubMeta {
-            rmsnorm_weight: alloc_buffer(&device, 4096),
-            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
-        };
+        let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         let tape = LoweredMetalTape {
@@ -1066,13 +1147,14 @@ mod tests {
             commands: vec![build_gemm_command(1, 2048, 2048)],
         };
 
-        let worker = MetalWorker::<TinyLlamaProbe>::new(
+        let worker = MetalWorker::<TestWeights>::new(
             device,
             // Q-size buffers (2048 f16 = 4096 bytes; pad up).
             &vec![64 * 1024, 64 * 1024],
             &[tape],
             &pipelines,
-            &meta,
+            &weights,
+            &allocator,
             &runtime,
         )
         .expect("worker bakes GEMM command");
@@ -1107,10 +1189,7 @@ mod tests {
                 .expect("compile standard shaders"),
         );
         let pipelines = SpecializedPipelines::new(cache);
-        let meta = StubMeta {
-            rmsnorm_weight: alloc_buffer(&device, 4096),
-            linear_weight: alloc_buffer(&device, 16 * 1024 * 1024),
-        };
+        let (weights, allocator) = build_test_weights();
         let runtime = empty_runtime(&device, 1);
 
         let rmsnorm_pre = LoweredCommand {
@@ -1129,7 +1208,7 @@ mod tests {
                     binding_index: 1,
                 },
                 Binding::Weight {
-                    kind: WeightBundleKind::RmsNorm(stub_rmsnorm),
+                    kind: WeightBundleKind::RmsNorm(rmsnorm_thunk),
                     which: WeightTensor::Weight,
                     layer: 0,
                     binding_index: 2,
@@ -1178,12 +1257,13 @@ mod tests {
             ],
         };
 
-        let worker = MetalWorker::<TinyLlamaProbe>::new(
+        let worker = MetalWorker::<TestWeights>::new(
             device,
             &vec![64 * 1024, 64 * 1024],
             &[tape],
             &pipelines,
-            &meta,
+            &weights,
+            &allocator,
             &runtime,
         )
         .expect("worker bakes mixed tape");

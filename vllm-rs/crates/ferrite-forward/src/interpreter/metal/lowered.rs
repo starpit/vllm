@@ -103,9 +103,11 @@ impl DispatchShape {
 /// `LoweredMetalTape` is parameterized by `W: CanonicalParams` so the
 /// lowering pass can carry weight-resolution thunks (`WtFn<W, L>`)
 /// through to the worker without committing to a specific Metal weight
-/// representation here. The worker (Phase 5.C) is the first place that
-/// resolves these thunks against a `MetalModelMeta` to obtain
-/// concrete `metal::Buffer` pointers for the ICB.
+/// representation here. The worker resolves these thunks at ICB-record
+/// time: it calls the `WtFn` against the loaded `&Weights` to get a
+/// `&Layer` struct, pulls out the requested `GpuTensor`, and asks the
+/// `MetalAllocator` which arena buffer + offset that pointer belongs
+/// to.
 pub enum Binding<W: CanonicalParams> {
     /// `MetalWorker.arena[slot]` — the worker's private tile-arena
     /// buffer for this slot. The arena is sized for the colored
@@ -113,10 +115,12 @@ pub enum Binding<W: CanonicalParams> {
     /// performed by `colored_slot_map()` in
     /// `ferrite-forward-macro/src/interpreter_codegen.rs`).
     ArenaSlot { slot: u32, binding_index: u8 },
-    /// A weight bundle resolved against `MetalModelMeta` at worker
-    /// init time. The thunk + layer index are carried verbatim from
-    /// the source `Instruction<W>` variant; the worker walks them
-    /// once and records the resulting buffer pointers into the ICB.
+    /// A weight bundle resolved at ICB-record time by calling the
+    /// `WtFn` against `&Weights` and looking the resulting tensor's
+    /// raw pointer up in the `MetalAllocator`'s arena registry. The
+    /// thunk + layer index are carried verbatim from the source
+    /// `Instruction<W>` variant; the worker walks them once and
+    /// records the resulting buffer pointers into the ICB.
     ///
     /// `which` selects which of the bundle's tensors this binding
     /// targets — RmsNorm has only `weight`, but `LinearLayer` exposes

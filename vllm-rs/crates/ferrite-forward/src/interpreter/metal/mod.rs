@@ -14,8 +14,6 @@ pub mod pipelines;
 #[cfg(feature = "metal")]
 pub mod forward;
 #[cfg(feature = "metal")]
-pub mod model_meta;
-#[cfg(feature = "metal")]
 pub mod pool;
 #[cfg(feature = "metal")]
 pub mod runtime;
@@ -31,8 +29,6 @@ pub use pipelines::{constants_for, PipelineLookupError, SpecializedPipelines};
 
 #[cfg(feature = "metal")]
 pub use forward::{ForwardError, ForwardInputs};
-#[cfg(feature = "metal")]
-pub use model_meta::{BufferRef, MetalModelMeta};
 #[cfg(feature = "metal")]
 pub use pool::{
     MetalBucketSpec, MetalWorkerPool, PoolBuildError, PooledWorker, RuntimeFactory, WorkerGuard,

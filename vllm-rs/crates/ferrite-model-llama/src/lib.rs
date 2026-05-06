@@ -56,11 +56,8 @@ mod metal_emission_tests {
         // taking the fn-pointer proves the symbol + signature compiled.
         let _ctor: fn(
             ::std::sync::Arc<::ferrite_forward::interpreter::metal::__re::Device>,
-            ::std::sync::Arc<
-                dyn ::ferrite_forward::interpreter::metal::MetalModelMeta<
-                    crate::tinyllama_1_1b::Weights,
-                >,
-            >,
+            ::std::sync::Arc<crate::tinyllama_1_1b::Weights>,
+            ::std::sync::Arc<::ferrite_cuda_core::MetalAllocator>,
             ::ferrite_forward::interpreter::metal::ArenaLayout,
             ::ferrite_forward::interpreter::metal::RuntimeFactory,
             usize,

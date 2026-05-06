@@ -5099,9 +5099,8 @@ pub fn emit_model(
             device: ::std::sync::Arc<
                 ::ferrite_forward::interpreter::metal::__re::Device,
             >,
-            model_meta: ::std::sync::Arc<
-                dyn ::ferrite_forward::interpreter::metal::MetalModelMeta<Weights>,
-            >,
+            weights: ::std::sync::Arc<Weights>,
+            allocator: ::std::sync::Arc<::ferrite_cuda_core::MetalAllocator>,
             arena_layout: ::ferrite_forward::interpreter::metal::ArenaLayout,
             runtime_factory: ::ferrite_forward::interpreter::metal::RuntimeFactory,
             max_workers: usize,
@@ -5111,7 +5110,8 @@ pub fn emit_model(
         > {
             ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
                 device,
-                model_meta,
+                weights,
+                allocator,
                 METAL_BUCKETS,
                 arena_layout,
                 runtime_factory,

@@ -72,9 +72,9 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.C done)
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E done; 5.F partial)
 **Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
-**Status:** 5.A, 5.B, 5.C complete; 5.D–5.G + 5.6 remaining.
+**Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene) and 5.F.2 (cfg-gate impl pushes) complete; 5.F.3 (Metal impls' fan_out / opcode_shape wiring) is the substantive macro-emission work and is next. 5.G + 5.6 still pending.
 
 **Architecture pivot (2026-05-06).** The earlier 5.1–5.5 plan (`MetalExecutor` walks the tape and calls `record_to_icb()` methods on `Instruction<W>`) was replaced. Reasons:
 - A single `MetalExecutor` per model has no concurrency story (spec-decode draft+verify, prefill/decode overlap, multi-stream serving need bounded concurrency without N-fold weight duplication).
@@ -125,14 +125,44 @@ Allocates the per-worker arena (one buffer per colored slot, sized for the max b
 
 **Tests at 5.C close:** 18 `ferrite-forward` unit tests + 3 `specialized_pipeline_cache` tests pass. Includes `worker_builds_and_segments_coalesce`, `worker_records_attention_via_cache`, `attention_pipelines_build_and_cache`, `worker_routes_gemm_step`, `worker_interleaves_gemm_with_icb`.
 
-#### Phase 5.D: `MetalWorkerPool` 🔜 PLANNED
-Growable, capped, semaphore-bounded checkout/checkin. RAII guard. `max_workers` derived from device memory at construction time.
+#### Phase 5.D: `MetalWorkerPool` ✅ COMPLETE (2026-05-06, commit `2fcc82647`)
+Growable from 1 to `max_workers`, semaphore-bounded `Mutex<PoolInner> + Condvar` (no async primitives needed — sync caller per-checkout). Eager first-worker creation surfaces alloc / recording / pipeline-lookup failures at construction time. Blocking `checkout()` + non-blocking `try_checkout()` (distinguishes "full" from GPU OOM); RAII `WorkerGuard` returns the worker on drop. `RuntimeFactory = Arc<dyn Fn(&Device) -> RuntimeBindings + Send + Sync>` so each spawned worker gets its own private `RuntimeBindings`. `unsafe impl Send for IndirectCommandBuffer` justified by single-thread-at-a-time access via the semaphore.
 
-#### Phase 5.E: `forward()` 🔜 PLANNED
-Pick bucket from `num_tokens`, checkout worker, bind input/position buffers, `encoder.executeCommandsInBuffer(this bucket's ICB)`, checkin.
+7 device-bound pool tests added (silent-skip on non-Apple): `pool_starts_with_one_worker`, `checkout_returns_eagerly_created_worker_first`, `pool_grows_under_demand_up_to_cap`, `guard_drop_returns_worker_to_pool`, `checkout_blocks_when_at_cap_unblocks_on_checkin`, `try_checkout_at_cap_returns_none`, `concurrent_growth_to_cap`. 25 ferrite-forward Metal lib tests pass total.
 
-#### Phase 5.F: Macro emission 🔜 PLANNED
+#### Phase 5.E: `forward()` ✅ COMPLETE (2026-05-06, commits `0212fe8a2` + `f6712474b`)
+Split into two commits: 5.E.1 = ICB execution prerequisites (purely additive Metal-API fixes), 5.E proper = the forward path itself.
+
+**5.E.1 (commit `0212fe8a2`):** two ICB-firing prerequisites surfaced once 5.E added the first test that *executes* an ICB rather than just bakes it.
+- `ferrite-metal-kernels/src/specialized_pipeline_cache.rs`: build pipelines via `MTLComputePipelineDescriptor` with `set_support_indirect_command_buffers(true)`. The shorter `new_compute_pipeline_state_with_function` path defaults the flag to NO and trips the validation layer with "compute pipeline set on this encoder does not support indirect command buffers" under `inheritPipelineState=YES`.
+- `ferrite-forward/src/interpreter/metal/worker.rs`: `BucketBaking` gains `baked_resources: Vec<Buffer>` (deduped by raw `metal::Buffer` ptr identity at bake time). `MetalWorker::run_bucket` calls `enc.use_resources(&baked_resources, Read | Write)` on every fresh encoder. Required because the ICB descriptor uses `inheritBuffers=false`, so the firing encoder must declare every ICB-referenced buffer resident.
+
+**5.E (commit `f6712474b`):** `MetalWorkerPool::pick_bucket(num_tokens) -> Result<usize, ForwardError>` (linear scan, smallest `bucket_m >= num_tokens`, no sort assumption). `MetalWorkerPool::forward<R>(queue, inputs, with_output: impl FnOnce(&MetalWorker<W>) -> R) -> Result<R, ForwardError>` (closure form so the caller reads arena state while the worker is still checked out; checkin on guard drop after the closure returns). New `forward.rs` (~125 lines) with `ForwardInputs<'a>` (num_tokens + per-RuntimeBindingKind `&[u32]` slices, `cu_seqlens_q`/`slot_mapping`/`seq_used_k`/`block_table` as `Option`) and `ForwardError { ZeroTokens, NoBucketFits, BufferTooSmall, Worker, ExecutionFailed }`. Sync model: commit + `wait_until_completed` + status check.
+
+8 new `pool::tests` device-bound tests: `pick_bucket_returns_smallest_fit`, `pick_bucket_zero_tokens_errors`, `pick_bucket_overflow_errors`, `pick_bucket_handles_unsorted_tape_order`, `forward_runs_one_decode_step`, `forward_rejects_zero_tokens`, `forward_rejects_oversized_token_count`, `forward_rejects_oversized_input_slice`. 33 ferrite-forward Metal lib tests pass total under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`.
+
+#### Phase 5.F: Macro emission 🔄 IN PROGRESS (5.F.1 + 5.F.2 done; 5.F.3 next)
 `#[forward]` emits `MetalWorkerPool::for_<model>()` constructor alongside CUDA's `try_load`. Lowering happens at constructor time.
+
+**5.F.1 (commit `81371a644`) — Build hygiene for `--features metal` macro path. ✅ COMPLETE**
+Strict prerequisite for the macro to even *compile* under `--features metal` without implicitly pulling in CUDA. None of these are sufficient to make the binary build, but each fail-closes one ungated CUDA assumption.
+- `ferrite-vision`: gate the four CUDA imports + `pad_linear_k_to_mult8` + `TraceDump::dump_tensor` behind `cfg(feature = "cuda")`. Host-side helpers (`build_cu_seqlens_i32`, `f32_to_bf16`, `WindowDispatch`, …) stay ungated.
+- `ferrite-forward-macro`: drop `default = ["cuda"]` so cargo's feature unification doesn't silently flip the macro into the cuda branch under a metal-only consumer graph. The macro's `compile_error!` enforces "exactly one of cuda/metal" at expansion time; consumers must opt in explicitly.
+- `ferrite-forward`: mirror its own `cuda` / `metal` features into `ferrite-forward-macro/{cuda,metal}` and depend on the macro with `default-features = false`.
+- `ferrite-forward-macro/src/target.rs`: cfg-gate `from_profile_def` + the `ferrite_cuda_targets::ProfileDef` import under `feature = "cuda"`. Symmetric closure with the already-gated `from_metal_profile`.
+- Kernel-class classifier in `ferrite-forward-macro/src/lib.rs`: add Metal kernel names to `NON_GEMM_NAMES` (gated `cfg(feature = "metal")`); add `metal_attention_*` (fa2-class) and `metal_gemm_*` (cutlass-class) prefix arms (gated `cfg!(feature = "metal") &&`); gate every CUDA-specific prefix arm (`flashinfer`, `mla_`, `marlin`, `fp8`, `bnb4`/`ggml`, `cutlass`, NCCL collectives, `mm_embed_splice`, `fused_*`/`gemm_ref`) via `cfg!(feature = "cuda") &&`.
+
+**5.F.2 (commit `49b0d3c13`) — cfg-gate cuda + metal impl pushes in `starter_library()`. ✅ COMPLETE**
+Many CUDA impls had `target_compatible(_) -> true` (no backend gating). Under Metal target the solver therefore considered CUDA impls as candidates alongside Metal impls and at least 8 CUDA impls won bucket picks for various models, causing the macro to emit CUDA-typed slices under `--features metal`. Cfg-gating the *push* means: under `cuda` only CUDA impls are in the pool; under `metal` only Metal impls. The architectural split (extract `ferrite-forward-ir` regular crate, move CUDA impls to `ferrite-cuda-impl-lib`, Metal impls to the existing `ferrite-metal-impl-lib`) was attempted (`0e947ffa0`) and dropped — dep graph wider than expected (`Implementation` trait surface entangles with classified, fuf, shape, weights_manifest; ~6000+ lines would need to move). Deferred as a future cleanup pass; cfg-gates are the interim that achieves the user's runtime goal without the multi-day refactor.
+
+Also gated `tp_lowering::insert_mm_splices` call site (`lib.rs:765`) behind `#[cfg(feature = "cuda")]`. The lone matcher (`MmEmbedSpliceImpl`) is CUDA-only; under metal the synthesized splice nodes had no claimant and the solver exploded with "no Impl matched tile … op MmEmbedSplice". Text-only models unaffected (splice is a runtime no-op there).
+
+Three new metal kernel names added to the classifier: `metal_embed_f16`, `metal_reshape`, `metal_bias_add_f16` (all gated `cfg(feature = "metal")`).
+
+**5.F.3 — Wire `fan_out` / `opcode_shape` on Metal impls. 🔜 NEXT (substantive macro-emission work).**
+~30 Metal impls in `crates/ferrite-forward-macro/src/metal/*.rs` and `metal_bridge.rs` have `name()` but no `fan_out()` / `opcode_shape()`. Default `fan_out -> None` triggers the codegen panic: `Impl <metal_*> has no fan_out — unmigrated to host interpreter IR. Override opcode_shape + fan_out on metal_*, and ensure the matching Instruction<W> variant exists in ferrite_forward::instr.` Each Metal impl must emit `Instruction<W>` entries matching its CUDA-side counterpart so the macro produces a static slice the `MetalWorker` can lower via `LoweredMetalTape::from(&[Instruction<W>])`. `cargo build --bin vllm -Fmetal` panics on every text-only model (qwen3 / phi3 / granite / mistral / gemma3 / llama / etc.) until this lands.
+
+**Models with no Metal impl coverage (separate gap):** Mixtral, Qwen-MoE, Qwen3-MoE (Moe op), DeepSeek-V2/V3 (MlaSplit op), CommandR (Mean op). Will not compile under metal feature until the missing impls are added. Out of scope for the TinyLlama-1.1B path.
 
 #### Phase 5.G: Correctness wiring 🔜 PLANNED
 Hook into existing `cpu_golden::*` per-op references and `vllm-e2e` golden framework — same path CUDA uses. No bespoke Metal-only test scaffolding (per `feedback_no_reinvent_testing.md`).
@@ -165,6 +195,10 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.A Complete:** 2026-05-06 ✅ (lowering pass + feature-flag refactor)
 - **Phase 5.B Complete:** 2026-05-06 ✅ (function-constant pipelines for rmsnorm/fused_add_rmsnorm/silu)
 - **Phase 5.C Complete:** 2026-05-06 ✅ (worker scaffolding + attention rewrite + MPS GEMM routing)
+- **Phase 5.D Complete:** 2026-05-06 ✅ (`MetalWorkerPool`, growable+capped, semaphore-bounded checkout/checkin)
+- **Phase 5.E Complete:** 2026-05-06 ✅ (`forward()` + `pick_bucket` + ICB residency/pipeline prerequisites)
+- **Phase 5.F.1 Complete:** 2026-05-06 ✅ (build hygiene — ferrite-vision gate, macro feature plumbing, classifier symmetry)
+- **Phase 5.F.2 Complete:** 2026-05-06 ✅ (cfg-gate impl pushes in starter_library; MmEmbedSplice cuda-only)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary
@@ -240,17 +274,33 @@ Specialized pipelines for the hand-rolled-kernel set (rmsnorm / fused-add-rmsnor
 - `1beee7599` — 5.C.4 (`attention_via_cache_f16_specialized` + `attention_prefill_contiguous_f16_specialized`, function-constant specialized; `KernelExtras` extended with `block_size`/`max_blocks_per_seq`/`prefill_tile_q`).
 - `6209efbaa` — 5.C.5 (MPS GEMM interleaved with ICB segments; `BucketBaking::steps: Vec<BucketStep>` (Icb | Gemm); `run_bucket(&CommandBufferRef)` manages compute encoder lifecycle across GEMM boundaries; new `gemm::encode_gemm_into_command_buffer` helper; `WorkerError::OpaqueGemmNotYetRouted` removed).
 
+### Phase 5.D + 5.E + 5.F.1 + 5.F.2 landed - ✅ (2026-05-06)
+
+Pool, forward path, and `--features metal` build hygiene shipped in five commits:
+- `2fcc82647` — 5.D (`MetalWorkerPool<W: CanonicalParams>`, `Mutex<PoolInner> + Condvar`, eager first-worker, RAII `WorkerGuard`, `RuntimeFactory` closure; `unsafe impl Send for IndirectCommandBuffer`).
+- `0212fe8a2` — 5.E.1 (ICB prerequisites: `set_support_indirect_command_buffers(true)` on specialized pipelines; `BucketBaking::baked_resources` + `enc.use_resources(.., Read | Write)` residency on every fresh encoder).
+- `f6712474b` — 5.E (`MetalWorkerPool::pick_bucket` + `forward<R>(queue, inputs, with_output)`; `forward.rs` with `ForwardInputs<'a>` + `ForwardError`; sync commit + `wait_until_completed` + status check; 8 device-bound pool tests).
+- `81371a644` — 5.F.1 (build hygiene: ferrite-vision CUDA imports + 2 fns gated under `cuda`; ferrite-forward-macro `default = []` + feature mirror through ferrite-forward; `target.rs::from_profile_def` + `ProfileDef` import gated `cuda`; classifier symmetry — Metal arms gated `metal`, CUDA arms gated `cuda`).
+- `49b0d3c13` — 5.F.2 (cfg-gate cuda + metal impl pushes in `starter_library()`; gate `tp_lowering::insert_mm_splices` cuda-only since its lone matcher is CUDA; `metal_embed_f16`/`metal_reshape`/`metal_bias_add_f16` added to classifier).
+
+The architectural split (extract `ferrite-forward-ir` regular crate, move CUDA impls to `ferrite-cuda-impl-lib`, Metal impls to existing `ferrite-metal-impl-lib`) was attempted as commit `0e947ffa0` and dropped after dep-graph mapping showed ~6000+ lines would need to move (Implementation trait surface entangles with classified, fuf, shape, weights_manifest). Deferred as future cleanup pass; cfg-gates achieve the runtime goal in the meantime.
+
+**Test results across 5.D + 5.E + 5.F.1 + 5.F.2:** 33/33 ferrite-forward Metal lib tests pass, including under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. `cargo check -p ferrite-forward-macro --features metal` ✓ and `--features cuda` ✓.
+
 **Next Steps:**
-1. Phase 5.D: `MetalWorkerPool` (growable, capped, semaphore-bounded checkout/checkin; `max_workers = floor((device_total - weights - misc) / per_worker_arena)`)
-2. Phase 5.E: `forward()` (bucket pick → checkout → bind inputs → `run_bucket` → checkin → commit cmdbuf)
-3. Phase 5.F: `#[forward]` macro emits `MetalWorkerPool::for_<model>()` alongside CUDA's `try_load`
-4. Phase 5.G: Wire `cpu_golden` per-op + `vllm-e2e` end-to-end (no bespoke Metal-only test scaffolding)
-5. Phase 5.6: TinyLlama-1.1B golden under `--features metal` on M1+; profile function-constant specialization win
+1. Phase 5.F.3 — Wire `fan_out` + `opcode_shape` on every Metal impl (~30 impls in `ferrite-forward-macro/src/metal/*.rs` and `metal_bridge.rs`). Each must emit `Instruction<W>` entries matching its CUDA-side counterpart so the macro produces a static slice the `MetalWorker` can lower via `LoweredMetalTape::from(&[Instruction<W>])`. `cargo build --bin vllm -Fmetal` panics on text-only models with `Impl <metal_*> has no fan_out — unmigrated to host interpreter IR` until this lands. This is the substantive macro-emission work; the prior 5.F.1 + 5.F.2 commits were build-hygiene prerequisites.
+2. Phase 5.F (residual) — `#[forward]` macro emits `MetalWorkerPool::for_<model>()` constructor alongside CUDA's `try_load`. Lowering happens at constructor time. Builds on 5.F.3's IR-emission wiring.
+3. Phase 5.G — Wire `cpu_golden` per-op + `vllm-e2e` end-to-end (no bespoke Metal-only test scaffolding).
+4. Phase 5.6 — TinyLlama-1.1B golden under `--features metal` on M1+; profile function-constant specialization win.
+5. Future cleanup pass (separate sub-phase) — Architectural split of ferrite-forward-macro into `ferrite-forward-ir` (regular crate, trait + IR types) + `ferrite-cuda-impl-lib` + `ferrite-metal-impl-lib`. Replaces the cfg-gate interim from 5.F.2.
+
+**Models with no Metal impl coverage (separate gap):** Mixtral, Qwen-MoE, Qwen3-MoE (Moe op), DeepSeek-V2/V3 (MlaSplit op), CommandR (Mean op). These won't compile under metal feature until the missing Metal impls are added. Out of scope for TinyLlama path.
 
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
-- Phase 5.A–5.C: ✅ COMPLETE - Lowering, function-constant cache, worker (incl. attention + GEMM)
-- Phase 5.D–G + 5.6: 🔜 PLANNED - Pool, forward, macro emission, e2e wiring, golden
+- Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
+- Phase 5.F.1 + 5.F.2: ✅ COMPLETE - Build hygiene + cfg-gated impl pushes
+- Phase 5.F.3 + 5.F (residual) + 5.G + 5.6: 🔜 PLANNED - Per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
 - 78 Phase 1-4 tests + 18 ferrite-forward unit tests + 3 cache tests passing
 - `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land

@@ -31,6 +31,7 @@ mod cfg;
 mod classified;
 mod classify;
 mod codegen;
+#[cfg(feature = "metal")]
 mod codegen_metal;
 mod concurrency;
 mod config;
@@ -39,7 +40,9 @@ mod emit;
 mod fuf;
 mod impl_lib;
 mod interpreter_codegen;
+#[cfg(feature = "metal")]
 mod metal_bridge;
+#[cfg(feature = "metal")]
 mod metal;
 mod parse;
 mod quantization;

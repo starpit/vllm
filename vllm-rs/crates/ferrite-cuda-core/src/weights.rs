@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use cudarc::driver::sys::CUstream;
 
+use crate::DeviceAllocator;
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;

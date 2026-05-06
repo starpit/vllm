@@ -238,7 +238,20 @@ Five new unit tests against handcrafted small inputs (`test_embed_gather`, `test
 - `attention_via_cache` golden — paged decode reading K/V via `block_table` + `seq_used_k`. Existing `attention_decode` is contiguous-only.
 - `attention_prefill_contiguous` is structurally covered by existing `attention_prefill`; revisit if causal-mask semantics drift.
 
-**5.G.2 (next) — paged-cache golden refs + per-bucket diff harness.** Add `rope_append` and `attention_via_cache` to `cpu_golden`, then build a CPU-vs-Metal per-bucket diff: walks one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena, asserts elementwise difference under tolerance. Foundation for 5.G.3 (TinyLlama smoke test).
+**5.G.2 — Paged-cache `cpu_golden::*` refs. ✅ COMPLETE (2026-05-06)**
+
+Added the two paged-cache CPU references the Metal lowering's KV-cache path needs:
+
+- `rope_append(q_in, k_in, v_in, positions, slot_mapping, cos_table, sin_table, q_out, kv_cache_k, kv_cache_v, num_q_heads, num_kv_heads, head_dim, block_size)` — NeoX-style RoPE rotation on Q (returned in `q_out`) and K (rotated then written to the cache slot); V un-rotated, copied directly to the slot. Slot id is global: `block_id = slot / block_size`, `block_offset = slot % block_size`. KV cache layout `[num_blocks, num_kv_heads, block_size, head_dim]` matches the Metal shader's `attention_via_cache_f16_specialized` reader. Mirrors `Instruction::RopeAppend` (CUDA) and `KernelId::RopeAppend` (Metal). Documents the contract a future `rope_append_f16_specialized` shader must satisfy.
+- `attention_via_cache(q, kv_cache_k, kv_cache_v, block_table, seq_used_k, output, num_q_heads, num_kv_heads, head_dim, block_size, max_blocks_per_seq, attn_scale)` — paged-cache decode SDPA. Walks `seq_used_k[seq]` tokens via `block_table[seq, logical] -> physical_block`, runs Q·K → softmax → ·V per (seq, q_head). Uses `inv_sum = 1 / (sum_exp + 1e-6)` to match the shader's numerical guard exactly (the existing `attention_decode` ref uses bare `1/sum_exp`; the paged ref drifts from it only on this term, ensuring per-bucket diffs in 5.G.3 don't see spurious mismatch). Mirrors `Instruction::AttentionViaCache` (CUDA) and `attention_via_cache_f16_specialized` (Metal).
+
+Four new unit tests: `test_rope_append_writes_paged_cache` (no-rotation cos=1/sin=0; verifies V un-rotated, K rotated, slot indexing correct), `test_rope_append_actually_rotates` (90° rotation cos=0/sin=1), `test_attention_via_cache_matches_decode_ref` (1-seq paged matches `attention_decode` for the same K/V data), `test_attention_via_cache_zero_kv_len` (no-op edge case). 45/45 ferrite-forward Metal lib tests pass total (14 cpu_golden + 31 interpreter).
+
+**Known gap surfaced during 5.G.2:** `pipelines.rs` references `rope_append_f16_specialized` but `shaders/rope.metal` only defines the legacy non-specialized `rope_neox_*` / `rope_interleaved_*` kernels. Pipeline lookup for `KernelId::RopeAppend` will fail at runtime — no test currently exercises it (worker tests use synthetic RmsNorm-only tapes). The cpu_golden ref documents what the shader must compute when written; tracked as a 5.G prereq alongside writing the shader.
+
+**5.G.3 (next) — Per-bucket CPU-vs-Metal diff harness.** Walk one bucket's `LoweredMetalTape` on both backends from the same synthetic input arena, assert elementwise difference under tolerance. Needs the missing `rope_append_f16_specialized` shader before any tape with `RopeAppend` can be exercised end-to-end.
+
+**5.G.4 (after 5.G.3) — TinyLlama-1.1B end-to-end via vllm-e2e.** Blocked on real `MetalModelMeta` impl backed by safetensors (current 5.F.5 emission is panic-stub accessors).
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
 Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
@@ -276,6 +289,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Phase 5.F.4 Complete:** 2026-05-06 ✅ (`MetalWorkerPool::for_buckets` + `lower_pair` + `MetalBucketSpec` + `PoolBuildError`; 3 new device-bound pool tests)
 - **Phase 5.F.5 Complete:** 2026-05-06 ✅ (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` + `metal_pool()`; quant-variant skip under metal; metal feature on llama/mistral/qwen3/phi3/granite)
 - **Phase 5.G.1 Complete:** 2026-05-06 ✅ (`cpu_golden::{embed, add, scalar_mul, fused_add_rmsnorm, fused_gate_up_silu_mul}` per-op refs + 5 unit tests; matches `fused_add_rmsnorm_f16_specialized` shader semantics)
+- **Phase 5.G.2 Complete:** 2026-05-06 ✅ (`cpu_golden::{rope_append, attention_via_cache}` paged-cache refs + 4 unit tests; matches metal shader's `inv_sum = 1/(sum_exp + 1e-6)` guard; surfaces missing `rope_append_f16_specialized` shader)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

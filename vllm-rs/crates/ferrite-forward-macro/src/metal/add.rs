@@ -5,11 +5,13 @@
 //!
 //! Elementwise addition: out = a + b
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    AddRefImpl, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
+    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -144,6 +146,32 @@ impl Implementation for MetalAddImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // Add's output is a `TensorView` aliasing the residual (slot-1)
+    // upstream — `add_inplace` mutates that buffer directly. Mirror
+    // `AddRefImpl::output_alias` so the codegen drop pass keeps the
+    // residual `OwnedTensor` alive while consumers hold the alias.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        AddRefImpl.output_alias(claimed_tiles, fuf)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        AddRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        AddRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

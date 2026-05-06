@@ -5,11 +5,14 @@
 //!
 //! Elementwise scalar multiplication: out = input * scalar
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
-use crate::fuf::{Fuf, TileId};
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    Resources, ScalarMulImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -65,16 +68,38 @@ impl Implementation for MetalScalarMulImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Mirror `ScalarMulImpl::matches`: claim singleton `OpKind::Mul`
+        // tiles whose two inputs are exactly one Tile + one Scalar
+        // (the `x * scale` pattern, e.g. Gemma's embedding scale).
+        // Tile+Tile Muls inside SwiGLU/GeluMLP fuse via
+        // `MetalFusedGateUpSiluMulImpl` and aren't claimed here.
         let node = fuf.get(seed);
-        // ScalarMul is an Instruction variant but not an OpKind
-        // It's synthesized during lowering, not matched from FUF tiles
-        // This implementation is a placeholder for future ICB recording
-        return None;
-
-        // Singleton claim - just this ScalarMul tile
+        if node.op != OpKind::Mul || node.inputs.len() != 2 {
+            return None;
+        }
+        let mut has_tile = false;
+        let mut has_scalar = false;
+        for inp in &node.inputs {
+            match inp {
+                FufInput::Tile { .. } => has_tile = true,
+                FufInput::Scalar(_) => has_scalar = true,
+                _ => return None,
+            }
+        }
+        if !(has_tile && has_scalar) {
+            return None;
+        }
+        let tile_input: Vec<TileId> = node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
         Some(MatchInfo {
             claimed_tiles: vec![seed],
-            boundary_inputs: vec![],
+            boundary_inputs: tile_input,
             boundary_outputs: vec![seed],
         })
     }
@@ -145,6 +170,38 @@ impl Implementation for MetalScalarMulImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // Delegate the codegen-affecting hooks to `ScalarMulImpl`. Unity
+    // passthrough (`x * 1.0` → alias of source) and the in-place
+    // `take_owned → kernel → reinsert` pattern are codegen contracts —
+    // mismatched semantics here would break the drop pass.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        ScalarMulImpl.output_alias(claimed_tiles, fuf)
+    }
+    fn consumes_input_tiles(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<(TileId, u8)> {
+        ScalarMulImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        ScalarMulImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        ScalarMulImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

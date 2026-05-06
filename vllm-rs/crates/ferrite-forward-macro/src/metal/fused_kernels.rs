@@ -5,10 +5,13 @@
 //!
 //! Wraps Metal fused kernels (Add+RMSNorm, Gate-Up-SiLU-Mul) to satisfy ferrite's Implementation trait.
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
+    CostCtx, FusedAddRmsNormImpl, FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl, Handoff,
+    Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap,
     WeightAccessor, WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
@@ -80,44 +83,13 @@ impl Implementation for MetalFusedAddRmsNormImpl {
         WorkloadConstraint::Any
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        
-        // Must start with an Add operation
-        if node.op != OpKind::Add {
-            return None;
-        }
-        
-        // Check if the Add output flows into an RMSNorm
-        // Look for consumers of this Add tile
-        let add_id = seed;
-        let mut rmsnorm_id = None;
-        
-        for candidate in &fuf.nodes {
-            if candidate.op == OpKind::RmsNorm {
-                // Check if this RMSNorm consumes the Add output
-                for input in &candidate.inputs {
-                    if let crate::fuf::FufInput::Tile { id, slot: _ } = input {
-                        if *id == add_id {
-                            rmsnorm_id = Some(candidate.id);
-                            break;
-                        }
-                    }
-                }
-            }
-            if rmsnorm_id.is_some() {
-                break;
-            }
-        }
-        
-        let rmsnorm_id = rmsnorm_id?;
-        
-        // Claim both tiles: Add + RMSNorm
-        Some(MatchInfo {
-            claimed_tiles: vec![add_id, rmsnorm_id],
-            boundary_inputs: vec![],
-            boundary_outputs: vec![rmsnorm_id], // Output is the RMSNorm result
-        })
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Defer the (Add, RmsNorm) claim shape to the canonical CUDA
+        // impl — same tile pattern, same boundary inputs, same
+        // both-tiles-aliased output semantics. Only the kernel cost
+        // model and the bound `target_compatible` differ between
+        // backends.
+        FusedAddRmsNormImpl.matches(fuf, seed, profile)
     }
 
     fn cost_us(&self, match_info: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -198,6 +170,33 @@ impl Implementation for MetalFusedAddRmsNormImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // `fused_add_rms_norm_inplace` mutates both the residual buffer
+    // (Add output → updated residual) and the delta buffer (RmsNorm
+    // output, normed-in-place); both outputs are TensorView aliases
+    // of the upstream Add inputs. Mirror the CUDA contract so the
+    // codegen drop pass preserves both upstreams correctly.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        FusedAddRmsNormImpl.output_alias(claimed_tiles, fuf)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        FusedAddRmsNormImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        FusedAddRmsNormImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 
@@ -289,75 +288,17 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         WorkloadConstraint::Any
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        
-        // Pattern: Silu/Gelu -> Mul or just Mul (if activation already applied)
-        // Start with either Silu/Gelu or Mul
-        let (activation_id, mul_id) = if node.op == OpKind::Silu || node.op == OpKind::Gelu {
-            // Found activation, look for Mul consumer
-            let activation_id = seed;
-            let mut mul_id = None;
-            
-            for candidate in &fuf.nodes {
-                if candidate.op == OpKind::Mul {
-                    // Check if this Mul consumes the activation output
-                    for input in &candidate.inputs {
-                        if let crate::fuf::FufInput::Tile { id, slot: _ } = input {
-                            if *id == activation_id {
-                                mul_id = Some(candidate.id);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if mul_id.is_some() {
-                    break;
-                }
-            }
-            
-            (Some(activation_id), mul_id?)
-        } else if node.op == OpKind::Mul {
-            // Found Mul, look for Silu/Gelu input
-            let mul_id = seed;
-            let mut activation_id = None;
-            
-            for input in &node.inputs {
-                if let crate::fuf::FufInput::Tile { id, slot: _ } = input {
-                    let input_node = fuf.get(*id);
-                    if input_node.op == OpKind::Silu || input_node.op == OpKind::Gelu {
-                        activation_id = Some(*id);
-                        break;
-                    }
-                }
-            }
-            
-            (activation_id, mul_id)
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Defer to the canonical CUDA matcher's 4-tile (Gemm, Gemm,
+        // Silu/Gelu, Mul) claim shape — seeding on the gate Gemm and
+        // walking forward. The Metal impl's prior 1-or-2-tile claim
+        // missed the Gemms, breaking the fused weight accessor that
+        // `required_weights` (and hence `fan_out`) depend on.
+        if self.is_gelu {
+            FusedGateUpGeluMulImpl.matches(fuf, seed, profile)
         } else {
-            return None;
-        };
-        
-        // Check activation type matches impl variant
-        if let Some(act_id) = activation_id {
-            let act_node = fuf.get(act_id);
-            let is_gelu_pattern = act_node.op == OpKind::Gelu;
-            if is_gelu_pattern != self.is_gelu {
-                return None;
-            }
+            FusedGateUpSiluMulImpl.matches(fuf, seed, profile)
         }
-        
-        // Claim tiles based on what we found
-        let claimed = if let Some(act_id) = activation_id {
-            vec![act_id, mul_id]
-        } else {
-            vec![mul_id]
-        };
-        
-        Some(MatchInfo {
-            claimed_tiles: claimed,
-            boundary_inputs: vec![],
-            boundary_outputs: vec![mul_id], // Output is the Mul result
-        })
     }
 
     fn cost_us(&self, match_info: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -422,7 +363,39 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         fuf: &Fuf,
         program: &Program,
     ) -> Vec<WeightAccessor> {
-        default_required_weights(claimed_tiles, fuf, program)
+        // The fused MLP needs ONE accessor whose source aggregates
+        // both the gate_proj and up_proj weight refs (the loader packs
+        // them into a single `[gate|up]` LinearLayer at runtime).
+        // Delegate to the CUDA impls' override — the default
+        // per-tile-input accessor would emit two separate accessors
+        // and the kernel would fail to find a packed weight at runtime.
+        if self.is_gelu {
+            FusedGateUpGeluMulImpl.required_weights(claimed_tiles, fuf, program)
+        } else {
+            FusedGateUpSiluMulImpl.required_weights(claimed_tiles, fuf, program)
+        }
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        if self.is_gelu {
+            FusedGateUpGeluMulImpl.opcode_shape()
+        } else {
+            FusedGateUpSiluMulImpl.opcode_shape()
+        }
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        if self.is_gelu {
+            FusedGateUpGeluMulImpl.fan_out(m, fuf, program, bounds, slots)
+        } else {
+            FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots)
+        }
     }
 }
 

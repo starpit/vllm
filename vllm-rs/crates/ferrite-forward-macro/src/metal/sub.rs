@@ -66,18 +66,15 @@ impl Implementation for MetalSubImpl {
         WorkloadConstraint::Any
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        if node.op != OpKind::Sub {
-            return None;
-        }
-
-        // Singleton claim - just this Sub tile
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: vec![],
-            boundary_outputs: vec![seed],
-        })
+    fn matches(&self, _fuf: &Fuf, _seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Standalone Sub has no `Instruction<W>` variant — it appears
+        // in DSLs only as part of `(Mean, Sub, RmsNorm)` /
+        // `(Mean, Sub, RmsNorm, BiasAdd)` LayerNorm-flavored fusions
+        // (see `MeanSubRmsNormImpl` / `MeanSubRmsNormBiasAddImpl` on
+        // CUDA). Until a Metal counterpart for those fusions lands,
+        // a lone Sub surfaces as `SolveError::UnclaimedTile` rather
+        // than getting wired to a non-existent kernel.
+        None
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {

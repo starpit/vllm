@@ -7,11 +7,13 @@
 //! table [vocab_size, hidden_size], produces output [N, hidden_size] by indexing
 //! into the table.
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, EmbedRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
+    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -150,5 +152,26 @@ impl Implementation for MetalEmbedImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // Host-interpreter codegen: delegate to the CUDA `EmbedRefImpl` so
+    // both backends produce structurally identical `Embed` variants
+    // and `OpInstance`s. The emission is target-agnostic — it just
+    // names a slot index and a `Weights::embed_tokens` accessor — so
+    // duplication here would be pure boilerplate. (The CUDA impl is
+    // never *registered* in a metal-feature build per 5.F.2's
+    // cfg-gated `starter_library`; we only borrow its emission.)
+    fn opcode_shape(&self) -> OpcodeShape {
+        EmbedRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        EmbedRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }

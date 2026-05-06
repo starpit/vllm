@@ -951,6 +951,18 @@ fn compile_common(
                 "metal_rope_append_interleaved_f16",
                 #[cfg(feature = "metal")]
                 "metal_fatrelu_f16",
+                // Metal counterparts of the CUDA `scalar_mul_inplace`
+                // and `tanh_softcap_inplace` non-gemm in-place
+                // mutators. Same kernel class — bandwidth-bound
+                // elementwise unary.
+                #[cfg(feature = "metal")]
+                "metal_scalar_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_scalar_mul_bf16",
+                #[cfg(feature = "metal")]
+                "metal_tanh_softcap_f16",
+                #[cfg(feature = "metal")]
+                "metal_tanh_softcap_bf16",
                 // Vision-prelude pixels materialization (G.5.e.1).
                 // Synthesized by `vision_lowering::materialize_pixels`;
                 // emits a single D2D copy that wraps `ctx.fwd.pixels`
@@ -997,6 +1009,8 @@ fn compile_common(
                         || name.starts_with("fa2_")
                         || name == "encoder_attention"
                         || (cfg!(feature = "metal") && name.starts_with("metal_attention_"))
+                        || (cfg!(feature = "metal")
+                            && name.starts_with("metal_sliding_attention_"))
                     {
                         Some(0) // fa2
                     } else if cfg!(feature = "cuda") && name.starts_with("marlin") {

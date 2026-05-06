@@ -6,11 +6,15 @@
 //! Wraps Metal attention kernels (basic, paged, multi-head, GQA, optimized)
 //! to satisfy ferrite's Implementation trait.
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    AttentionPrefillContiguousImpl, AttentionViaCacheImpl, CostCtx, Handoff, Implementation,
+    LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlidingAttentionPrefillContiguousImpl,
+    SlidingAttentionViaCacheImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -30,10 +34,19 @@ pub struct MetalAttentionImpl {
     dtype: &'static str,
     /// Whether this is paged attention (uses block tables)
     is_paged: bool,
-    /// Whether this is multi-head attention
+    /// Whether this is multi-head attention. Drives the
+    /// decode (M=1, false) vs prefill (M>=2, true) workload-constraint
+    /// split that mirrors `AttentionViaCacheImpl` /
+    /// `AttentionPrefillContiguousImpl` on CUDA.
     is_multihead: bool,
     /// Whether this uses optimized vectorized loads
     is_optimized: bool,
+    /// Whether this variant claims `OpKind::SlidingAttention` instead
+    /// of `OpKind::Attention`. The two opcodes differ in masking but
+    /// share the same FUF tile shape; flagging at impl-construction
+    /// time keeps `opcode_shape` deterministic per impl (one variant
+    /// per declaration is the trait contract).
+    is_sliding: bool,
 }
 
 impl MetalAttentionImpl {
@@ -45,6 +58,7 @@ impl MetalAttentionImpl {
             is_paged: false,
             is_multihead: false,
             is_optimized: false,
+            is_sliding: false,
         }
     }
 
@@ -56,6 +70,7 @@ impl MetalAttentionImpl {
             is_paged: true,
             is_multihead: false,
             is_optimized: false,
+            is_sliding: false,
         }
     }
 
@@ -67,6 +82,7 @@ impl MetalAttentionImpl {
             is_paged: true,
             is_multihead: true,
             is_optimized: false,
+            is_sliding: false,
         }
     }
 
@@ -78,6 +94,34 @@ impl MetalAttentionImpl {
             is_paged: true,
             is_multihead: true,
             is_optimized: true,
+            is_sliding: false,
+        }
+    }
+
+    /// Sliding-window paged attention, decode (M=1) — Gemma2/Gemma3
+    /// alternating-layer attention. Reuses the paged-decode kernel with
+    /// the sliding-window mask flag baked into the kernel constants.
+    pub fn new_sliding_paged_fp16() -> Self {
+        Self {
+            kernel_name: "sliding_attention_paged_f16",
+            dtype: "fp16",
+            is_paged: true,
+            is_multihead: false,
+            is_optimized: false,
+            is_sliding: true,
+        }
+    }
+
+    /// Sliding-window prefill (M>=2). Same multihead-optimized base
+    /// kernel as the non-sliding prefill variant; differs only in mask.
+    pub fn new_sliding_multihead_optimized_fp16() -> Self {
+        Self {
+            kernel_name: "sliding_attention_multihead_optimized_f16",
+            dtype: "fp16",
+            is_paged: true,
+            is_multihead: true,
+            is_optimized: true,
+            is_sliding: true,
         }
     }
 
@@ -119,14 +163,13 @@ impl MetalAttentionImpl {
 
 impl Implementation for MetalAttentionImpl {
     fn name(&self) -> &'static str {
-        if self.is_optimized {
-            "metal_attention_multihead_optimized_f16"
-        } else if self.is_multihead {
-            "metal_attention_multihead_f16"
-        } else if self.is_paged {
-            "metal_attention_paged_f16"
-        } else {
-            "metal_attention_basic_f16"
+        match (self.is_sliding, self.is_optimized, self.is_multihead, self.is_paged) {
+            (true, true, _, _) => "metal_sliding_attention_multihead_optimized_f16",
+            (true, _, _, _) => "metal_sliding_attention_paged_f16",
+            (false, true, _, _) => "metal_attention_multihead_optimized_f16",
+            (false, _, true, _) => "metal_attention_multihead_f16",
+            (false, _, _, true) => "metal_attention_paged_f16",
+            (false, _, _, false) => "metal_attention_basic_f16",
         }
     }
 
@@ -136,23 +179,35 @@ impl Implementation for MetalAttentionImpl {
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        WorkloadConstraint::Any
+        // Mirror the CUDA decode/prefill split. The non-multihead
+        // variants (basic, paged) wrap kernels designed for the
+        // single-Q-token paged-cache decode path; the multihead
+        // variants drive the contiguous-Q/K/V prefill path. Without
+        // this split, all 4 variants compete at every bucket and the
+        // solver picks one whose `Instruction` shape doesn't match
+        // the upstream layout the FUF produces at that bucket.
+        if self.is_multihead {
+            WorkloadConstraint::NumTokensRange {
+                min: 2,
+                max: u32::MAX,
+            }
+        } else {
+            WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+        }
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        
-        // Match both Attention and SlidingAttention
-        if node.op != OpKind::Attention && node.op != OpKind::SlidingAttention {
-            return None;
+    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
+        // Defer the matcher (incl. the kv_cache-extern gate that
+        // distinguishes decoder from encoder attention) to the CUDA
+        // counterpart. `workload_constraint` above already gates
+        // decode-only vs prefill-only; `is_sliding` selects between
+        // `OpKind::Attention` and `OpKind::SlidingAttention`.
+        match (self.is_sliding, self.is_multihead) {
+            (false, false) => AttentionViaCacheImpl.matches(fuf, seed, profile),
+            (false, true) => AttentionPrefillContiguousImpl.matches(fuf, seed, profile),
+            (true, false) => SlidingAttentionViaCacheImpl.matches(fuf, seed, profile),
+            (true, true) => SlidingAttentionPrefillContiguousImpl.matches(fuf, seed, profile),
         }
-
-        // Singleton claim - just this Attention tile
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: vec![],
-            boundary_outputs: vec![seed],
-        })
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -229,6 +284,32 @@ impl Implementation for MetalAttentionImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        match (self.is_sliding, self.is_multihead) {
+            (false, false) => AttentionViaCacheImpl.opcode_shape(),
+            (false, true) => AttentionPrefillContiguousImpl.opcode_shape(),
+            (true, false) => SlidingAttentionViaCacheImpl.opcode_shape(),
+            (true, true) => SlidingAttentionPrefillContiguousImpl.opcode_shape(),
+        }
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        match (self.is_sliding, self.is_multihead) {
+            (false, false) => AttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
+            (false, true) => AttentionPrefillContiguousImpl.fan_out(m, fuf, program, bounds, slots),
+            (true, false) => SlidingAttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
+            (true, true) => {
+                SlidingAttentionPrefillContiguousImpl.fan_out(m, fuf, program, bounds, slots)
+            }
+        }
     }
 }
 

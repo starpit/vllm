@@ -130,20 +130,18 @@ impl Implementation for MetalActivationImpl {
         WorkloadConstraint::Any
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        
-        // Match the appropriate OpKind for this activation type
-        if node.op != self.matches_op_kind() {
-            return None;
-        }
-
-        // Singleton claim - just this activation tile
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: vec![],
-            boundary_outputs: vec![seed],
-        })
+    fn matches(&self, _fuf: &Fuf, _seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Standalone Silu/Gelu activations have no `Instruction<W>`
+        // variant — they only appear inside the `(Gemm, Gemm,
+        // Silu/Gelu, Mul)` MLP fusion claimed by
+        // `MetalFusedGateUpSiluMulImpl`. The FatReLU variant claims
+        // `OpKind::TanhSoftCap` but that's `MetalTanhSoftCapImpl`'s
+        // territory and the matchers should not collide. Until a
+        // proper standalone-activation `Instruction` variant lands
+        // (and a corresponding lowering arm), keep these out of the
+        // candidate pool. Mirrors the CUDA library's structural
+        // choice of having no singleton Silu/Gelu impl.
+        None
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {

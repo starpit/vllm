@@ -6,11 +6,14 @@
 //! Reshape is a metadata-only operation that doesn't require actual computation.
 //! It just changes the view of the tensor without moving data.
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    Resources, ReshapeRefImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -101,6 +104,33 @@ impl Implementation for MetalReshapeImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // Reshape's output is a `TensorView` aliasing the upstream tile.
+    // Mirror `ReshapeRefImpl::output_alias` so the codegen drop pass
+    // keeps the upstream `OwnedTensor` alive while any consumer of
+    // this view is live. Without this override the default `None`
+    // alias would drop the upstream prematurely.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        ReshapeRefImpl.output_alias(claimed_tiles, fuf)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        ReshapeRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        ReshapeRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

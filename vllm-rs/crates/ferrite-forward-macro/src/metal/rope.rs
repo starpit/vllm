@@ -3,11 +3,14 @@
 
 //! Metal Implementation adapters for RoPE operations
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    Resources, RopeAppendRefImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -148,6 +151,31 @@ impl Implementation for MetalRopeAppendImpl {
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
     }
+
+    // RopeAppend's three outputs (q', k', v') are 3D `TensorView`
+    // reshapes over the upstream Q/K/V buffers — no allocation, no
+    // move. Mirror the CUDA contract.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        RopeAppendRefImpl.output_alias(claimed_tiles, fuf)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        RopeAppendRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        RopeAppendRefImpl.fan_out(m, fuf, program, bounds, slots)
+    }
 }
 
 /// Metal implementation for RopeAppendInterleaved (GPT-J style)
@@ -275,6 +303,31 @@ impl Implementation for MetalRopeAppendInterleavedImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // Same alias contract + same `Instruction::RopeAppend` shape as
+    // the NeoX variant; the `interleaved: bool` field on the variant
+    // distinguishes them at codegen time, so one shape covers both.
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        RopeAppendRefImpl.output_alias(claimed_tiles, fuf)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        RopeAppendRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        RopeAppendRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

@@ -5,11 +5,13 @@
 //!
 //! Wraps Metal Performance Shaders GEMM to satisfy ferrite's Implementation trait.
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, GemmRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
+    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -152,6 +154,23 @@ impl Implementation for MetalGemmImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // `Instruction::Gemm { in_slot, out_slot, layer, weight_fn, n, k }`
+    // is shared between cuda + metal. Mirror the CUDA `GemmRefImpl`
+    // emission (slot resolution + N,K from FUF + layered accessor).
+    fn opcode_shape(&self) -> OpcodeShape {
+        GemmRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        GemmRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

@@ -1829,11 +1829,20 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_fp16()));
         lib.push(Box::new(crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_bf16()));
         lib.push(Box::new(crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_gelu_fp16()));
-        // Metal Attention implementations - only match Metal targets
+        // Metal Attention implementations - only match Metal targets.
+        // Decode (M=1) variants emit `Instruction::AttentionViaCache`;
+        // multihead variants emit `Instruction::AttentionPrefillContiguous`
+        // at M>=2 — mirrors the CUDA `AttentionViaCacheImpl` /
+        // `AttentionPrefillContiguousImpl` workload split.
         lib.push(Box::new(crate::metal::MetalAttentionImpl::new_basic_fp16()));
         lib.push(Box::new(crate::metal::MetalAttentionImpl::new_paged_fp16()));
         lib.push(Box::new(crate::metal::MetalAttentionImpl::new_multihead_fp16()));
         lib.push(Box::new(crate::metal::MetalAttentionImpl::new_multihead_optimized_fp16()));
+        // Sliding-window variants (Gemma2/Gemma3 alternating layers) —
+        // emit `Instruction::SlidingAttentionViaCache` /
+        // `Instruction::SlidingAttentionPrefillContiguous`.
+        lib.push(Box::new(crate::metal::MetalAttentionImpl::new_sliding_paged_fp16()));
+        lib.push(Box::new(crate::metal::MetalAttentionImpl::new_sliding_multihead_optimized_fp16()));
         // Metal Activation implementations - only match Metal targets
         lib.push(Box::new(crate::metal::MetalActivationImpl::new_silu_fp16()));
         lib.push(Box::new(crate::metal::MetalActivationImpl::new_gelu_fp16()));

@@ -6,11 +6,14 @@
 //! Logit capping: out = cap * tanh(input / cap)
 //! Used in Gemma2 to prevent logits from growing too large
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    Resources, SlotMap, TanhSoftCapImpl, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -165,6 +168,30 @@ impl Implementation for MetalTanhSoftCapImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // `tanh_softcap_inplace` is consume-style — `take_owned → mutate
+    // → reinsert`. Mirror the CUDA contract so the codegen drop pass
+    // doesn't double-free the upstream buffer.
+    fn consumes_input_tiles(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<(TileId, u8)> {
+        TanhSoftCapImpl.consumes_input_tiles(claimed_tiles, fuf)
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        TanhSoftCapImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        TanhSoftCapImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

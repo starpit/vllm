@@ -66,18 +66,18 @@ impl Implementation for MetalMulImpl {
         WorkloadConstraint::Any
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        let node = fuf.get(seed);
-        if node.op != OpKind::Mul {
-            return None;
-        }
-
-        // Singleton claim - just this Mul tile
-        Some(MatchInfo {
-            claimed_tiles: vec![seed],
-            boundary_inputs: vec![],
-            boundary_outputs: vec![seed],
-        })
+    fn matches(&self, _fuf: &Fuf, _seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Standalone elementwise Mul has no `Instruction<W>` variant.
+        // Mirror the CUDA library's structural choice: tile-vs-tile
+        // Mul is always claimed by `MetalFusedGateUpSiluMulImpl` (the
+        // 4-tile gate→up→silu→mul fusion), and tile-vs-scalar Mul is
+        // claimed by `MetalScalarMulImpl` (emits `Instruction::ScalarMul`).
+        // Returning `None` keeps the singleton kernel out of the
+        // candidate pool — an unmatched lone Mul surfaces as
+        // `SolveError::UnclaimedTile`, the canonical library-gap
+        // signal (matching the CUDA `Silu`/`Mul` precedent in
+        // `impl_lib.rs`).
+        None
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {

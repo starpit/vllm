@@ -5,11 +5,14 @@
 //!
 //! Wraps Metal RMSNorm kernels to satisfy ferrite's Implementation trait.
 
+use std::collections::BTreeMap;
+
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    Resources, RmsNormRefImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -149,6 +152,24 @@ impl Implementation for MetalRmsNormImpl {
         program: &Program,
     ) -> Vec<WeightAccessor> {
         default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    // Delegate to the CUDA `RmsNormRefImpl` for opcode shape + fan_out.
+    // `Instruction::RmsNorm { in_slot, out_slot, layer, weight_fn }` is
+    // shared between backends; the emission depends only on the FUF
+    // structure, not on cuda/metal.
+    fn opcode_shape(&self) -> OpcodeShape {
+        RmsNormRefImpl.opcode_shape()
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        RmsNormRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
 

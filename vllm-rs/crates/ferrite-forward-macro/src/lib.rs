@@ -789,6 +789,16 @@ fn compile_common(
             // splice inside `Instruction::Embed::eval` mistakenly
             // overwrote). Vision encoders skip — splice belongs on
             // the decoder side, not the encoder side.
+            // MmEmbedSplice's only matcher is the CUDA-only
+            // `MmEmbedSpliceImpl` (D2D-copy via cuMemcpyDtoDAsync). Under
+            // `--features metal` the impl pool can't claim the synthesized
+            // splice node, so the solver explodes with "no Impl matched
+            // tile … op MmEmbedSplice". Keep the splice insertion CUDA-
+            // only until a Metal MmEmbedSplice lands. Text-only models
+            // are unaffected at the runtime level — this splice is a
+            // no-op there in both backends. Multimodal Metal will need
+            // a Metal `MmEmbedSpliceImpl` and to flip this back on.
+            #[cfg(feature = "cuda")]
             if mode.apply_mm_splice {
                 tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
             }
@@ -919,6 +929,12 @@ fn compile_common(
                 // CUDA build doesn't carry dead names in its classifier.
                 #[cfg(feature = "metal")]
                 "metal_add_f16",
+                #[cfg(feature = "metal")]
+                "metal_embed_f16",
+                #[cfg(feature = "metal")]
+                "metal_reshape",
+                #[cfg(feature = "metal")]
+                "metal_bias_add_f16",
                 #[cfg(feature = "metal")]
                 "metal_rmsnorm_f16",
                 #[cfg(feature = "metal")]

@@ -95,19 +95,22 @@ impl KernelExtras {
 /// proven.
 fn kernel_msl_names(kernel: KernelId) -> Result<(&'static str, &'static str), PipelineLookupError> {
     Ok(match kernel {
-        KernelId::Embed => ("embed", "embed_tokens_f16"),
-        KernelId::RmsNorm => ("rmsnorm", "rmsnorm_f16"),
-        KernelId::FusedAddRmsNorm => ("fused_add_rmsnorm", "fused_add_rmsnorm_f16"),
-        KernelId::FusedGateUpSiluMul => {
-            ("fused_gate_up_silu_mul", "fused_gate_up_silu_mul_f16")
+        KernelId::Embed => ("embed", "embed_f16_specialized"),
+        KernelId::RmsNorm => ("rmsnorm", "rmsnorm_f16_specialized"),
+        KernelId::FusedAddRmsNorm => {
+            ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized")
         }
-        KernelId::RopeAppend => ("rope", "rope_append_f16"),
-        KernelId::AttentionViaCache => ("attention", "attention_via_cache_f16"),
+        KernelId::FusedGateUpSiluMul => (
+            "fused_gate_up_silu_mul",
+            "fused_gate_up_silu_mul_f16_specialized",
+        ),
+        KernelId::RopeAppend => ("rope", "rope_append_f16_specialized"),
+        KernelId::AttentionViaCache => ("attention", "attention_via_cache_f16_specialized"),
         KernelId::AttentionPrefillContiguous => {
-            ("attention", "attention_prefill_contiguous_f16")
+            ("attention", "attention_prefill_contiguous_f16_specialized")
         }
-        KernelId::Add => ("elementwise", "residual_add_f16"),
-        KernelId::ScalarMul => ("elementwise", "scalar_mul_f16"),
+        KernelId::Add => ("elementwise", "residual_add_f16_specialized"),
+        KernelId::ScalarMul => ("elementwise", "scalar_mul_f16_specialized"),
         // GEMM does not get a function-constant pipeline at this
         // layer — Metal Performance Shaders' matmul2d is opaque.
         // Surfaces as a hard error so the worker (5.C) routes GEMM
@@ -324,5 +327,60 @@ mod tests {
         let err = constants_for::<TinyLlamaProbe>(KernelId::Reshape, 1, KernelExtras::NONE)
             .unwrap_err();
         assert!(matches!(err, PipelineLookupError::MetadataOnly(_)));
+    }
+
+    /// Device-bound smoke test for the Phase 5.B.3 specialized
+    /// rmsnorm shader rewrite. Requires a Metal device, so it
+    /// silently passes on non-Apple hardware.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rmsnorm_pipeline_builds_and_caches() {
+        let Some(device) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        // RmsNorm at bucket=1 (decode) and bucket=8 (small prefill).
+        let extras = KernelExtras {
+            eps: 1e-5,
+            ..KernelExtras::NONE
+        };
+        let _p1 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 1, extras)
+            .expect("rmsnorm bucket=1");
+        let _p8 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 8, extras)
+            .expect("rmsnorm bucket=8");
+        let _p1_again = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, 1, extras)
+            .expect("rmsnorm bucket=1 cache hit");
+        // Two pipelines (one per bucket); third call hits the cache.
+        assert_eq!(pipelines.cached_count(), 2);
+
+        // FusedAddRmsNorm at the same buckets, same eps. Adds two
+        // more entries; full cache count should be 4.
+        let _f1 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, 1, extras)
+            .expect("fused_add_rmsnorm bucket=1");
+        let _f8 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, 8, extras)
+            .expect("fused_add_rmsnorm bucket=8");
+        assert_eq!(pipelines.cached_count(), 4);
+
+        // FusedGateUpSiluMul (Phase 5.B.4 scope — silu only; gemm is
+        // opaque/MPS). Two buckets → six pipelines total.
+        let _g1 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 1, KernelExtras::NONE)
+            .expect("silu bucket=1");
+        let _g8 = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 8, KernelExtras::NONE)
+            .expect("silu bucket=8");
+        assert_eq!(pipelines.cached_count(), 6);
     }
 }

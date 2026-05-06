@@ -52,6 +52,50 @@ kernel void rmsnorm_f16(
     }
 }
 
+/// Phase 5.B.3 specialized variant: layer-independent params baked
+/// in via `[[function_constant(N)]]`, no runtime constants buffer.
+/// Index assignments must match `ferrite-forward::interpreter::metal::pipelines`:
+///   0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
+constant uint  RMSNORM_M           [[function_constant(0)]];
+constant uint  RMSNORM_HIDDEN_SIZE [[function_constant(1)]];
+constant float RMSNORM_EPS         [[function_constant(2)]];
+
+kernel void rmsnorm_f16_specialized(
+    device const half* input  [[buffer(0)]],
+    device       half* output [[buffer(1)]],
+    device const half* weight [[buffer(2)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (gid >= RMSNORM_M) return;
+
+    threadgroup float shared_sum[1024];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
+        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
+
+    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
+        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+        float w   = float(weight[i]);
+        output[gid * RMSNORM_HIDDEN_SIZE + i] = half((val / rms) * w);
+    }
+}
+
 /// BF16 variant (uses float16 as Metal doesn't have native bfloat16)
 kernel void rmsnorm_bf16(
     device const float* input [[buffer(0)]],

@@ -126,6 +126,68 @@ kernel void fused_add_rmsnorm_bf16(
     }
 }
 
+/// Phase 5.B.3 specialized variant: layer-independent params baked
+/// in via `[[function_constant(N)]]`. Index assignments must match
+/// `ferrite-forward::interpreter::metal::pipelines`:
+///   0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
+constant uint  FUSED_ARN_M           [[function_constant(0)]];
+constant uint  FUSED_ARN_HIDDEN_SIZE [[function_constant(1)]];
+constant float FUSED_ARN_EPS         [[function_constant(2)]];
+
+/// Specialized fused add+rmsnorm matching the CUDA `fused_add_rms_norm_inplace`
+/// semantics (`ferrite-kernels::kernels::fused_add_rms_norm_inplace`):
+///   - `residual += delta` in place
+///   - `delta` is overwritten with `rmsnorm(residual_after_add, weight, eps)`
+///
+/// Bindings (must match `interpreter::metal::lowering::lower_one` for
+/// `Instruction::FusedAddRmsNorm`):
+///   buffer(0) = residual (in/out)
+///   buffer(1) = delta    (in/out — overwritten with normed result)
+///   buffer(2) = weight   (in)
+///
+/// Dispatch: `(M, 1, 1)` threadgroups × `tg_size` threads, cooperative
+/// reduction over `HIDDEN_SIZE`.
+kernel void fused_add_rmsnorm_f16_specialized(
+    device       half* residual [[buffer(0)]],
+    device       half* delta    [[buffer(1)]],
+    device const half* weight   [[buffer(2)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (gid >= FUSED_ARN_M) return;
+
+    threadgroup float shared_sum[1024];
+
+    // Pass 1: residual += delta in place, accumulate sum-of-squares.
+    float local_sum = 0.0f;
+    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
+        float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float s = r + d;
+        residual[gid * FUSED_ARN_HIDDEN_SIZE + i] = half(s);
+        local_sum += s * s;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
+
+    // Pass 2: write `rmsnorm(residual, weight)` back into `delta`.
+    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
+        float s = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float w = float(weight[i]);
+        delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = half((s / rms) * w);
+    }
+}
+
 /// Optimized variant with vectorized loads (half4) for better memory bandwidth
 /// Requires N to be multiple of 4
 kernel void fused_add_rmsnorm_f16_vec4(

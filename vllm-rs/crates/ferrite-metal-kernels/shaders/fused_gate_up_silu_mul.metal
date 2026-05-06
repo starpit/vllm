@@ -197,3 +197,32 @@ kernel void fused_gate_up_gelu_mul_f16(
 
 // Note: Metal does not have erf() function, so exact GELU is not available
 // Use approximate GELU instead (gelu_approx above)
+
+/// Phase 5.B.4 specialized variant: layer-independent params baked
+/// in via `[[function_constant(N)]]`, no runtime constants buffer.
+/// Index assignments must match
+/// `ferrite-forward::interpreter::metal::pipelines`:
+///   0 = M (uint), 1 = N/INTERMEDIATE_SIZE (uint).
+///
+/// Bindings match `interpreter::metal::lowering::lower_one` for
+/// `Instruction::FusedGateUpSiluMul`:
+///   buffer(0) = output    [M, N]
+///   buffer(1) = gate_up   [M, 2*N]  (concatenated gate then up)
+constant uint FUSED_SILU_M     [[function_constant(0)]];
+constant uint FUSED_SILU_INTER [[function_constant(1)]];
+
+kernel void fused_gate_up_silu_mul_f16_specialized(
+    device       half* output  [[buffer(0)]],
+    device const half* gate_up [[buffer(1)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (gid >= FUSED_SILU_M) return;
+
+    for (uint i = tid; i < FUSED_SILU_INTER; i += tg_size) {
+        float gate = float(gate_up[gid * (2u * FUSED_SILU_INTER) + i]);
+        float up   = float(gate_up[gid * (2u * FUSED_SILU_INTER) + FUSED_SILU_INTER + i]);
+        output[gid * FUSED_SILU_INTER + i] = half(silu(gate) * up);
+    }
+}

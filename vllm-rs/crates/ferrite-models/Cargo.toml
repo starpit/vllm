@@ -74,6 +74,22 @@ cuda = [
     "ferrite-model-deepseek-v3-flat?/cuda",
 ]
 
+# Metal umbrella. Forwards `metal` to every per-arch crate whose
+# Cargo.toml advertises a `metal` feature; the per-arch crate itself
+# is the source-of-truth compatibility checker. Per-arch metal feature
+# absent ⇒ the `?/metal` line is a no-op (cargo silently drops it).
+metal = [
+    "ferrite-model-commandr?/metal",
+    "ferrite-model-gemma2?/metal",
+    "ferrite-model-gemma3?/metal",
+    "ferrite-model-granite?/metal",
+    "ferrite-model-llama?/metal",
+    "ferrite-model-mistral?/metal",
+    "ferrite-model-modernbert?/metal",
+    "ferrite-model-qwen2?/metal",
+    "ferrite-model-qwen3?/metal",
+]
+
 # Tensor-parallel umbrella. Forwards `nccl` through to every per-arch
 # crate so a single `--features nccl` on this crate flips the whole
 # tree onto the TP-aware build. Until task #7's compile() outer-loop

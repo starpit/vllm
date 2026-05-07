@@ -4781,7 +4781,12 @@ pub fn emit_model(
             /* num_slots */ u32,
             /* backbone_slot */ u32,
             /* terminal_slot */ u32,
-            /* arena_bytes per slot, length = num_slots */ Vec<u64>,
+            /* slots: shared coloring across every bucket in this
+             * canonical's group. Per-bucket arena_bytes (below in
+             * the metal emission loop) computes its OWN sizes from
+             * this map + that bucket's bounds, so each bucket gets
+             * a tight arena sized for its own num_tokens. */
+            crate::impl_lib::SlotMap,
         ),
     > = BTreeMap::new();
     // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
@@ -4911,41 +4916,6 @@ pub fn emit_model(
             },
         };
 
-        // Per-slot byte sizes for the metal arena. Each color in
-        // `slots` may be shared by multiple `(TileId, output_slot)`
-        // pairs (linear-scan reg allocation). The arena slot must
-        // be sized for the largest pair sharing it, evaluated against
-        // the canonical's bucket-specific bounds (so dynamic dims
-        // like `num_tokens` get a concrete byte count). All metal
-        // forward tiles run in f16 (the metal kernel set is
-        // `_f16_specialized`-only), so dtype size is 2 bytes per
-        // element.
-        let mut arena_bytes_b: Vec<u64> = vec![0u64; num_slots as usize];
-        for ((tile_id, out_slot), color) in slots.iter() {
-            let node = fuf.get(tile_id);
-            let shape = &node.outputs[out_slot as usize];
-            let elems: u64 = crate::impl_lib::eval_shape_with(shape, &bounds)
-                .expect("shape inference left a Var in a tile output — codegen invariant")
-                .into_iter()
-                .product();
-            // f16 = 2 bytes/element; metal kernels are f16-only.
-            let bytes = elems.saturating_mul(2);
-            let slot_idx = color as usize;
-            if bytes > arena_bytes_b[slot_idx] {
-                arena_bytes_b[slot_idx] = bytes;
-            }
-        }
-        // Every color must have at least one (tile, slot) pair; if
-        // the worker ever sees a 0-byte arena slot it'll fail the
-        // ICB residency. Guarantee a 1-byte minimum so unused
-        // colors (none expected, but defensive) still allocate a
-        // valid `MTLBuffer`.
-        for b in &mut arena_bytes_b {
-            if *b == 0 {
-                *b = 1;
-            }
-        }
-
         canonical_lowered.insert(
             *wp,
             (
@@ -4956,7 +4926,7 @@ pub fn emit_model(
                 num_slots,
                 backbone_slot,
                 terminal_slot,
-                arena_bytes_b,
+                slots,
             ),
         );
     }
@@ -5166,7 +5136,6 @@ pub fn emit_model(
     // themselves are backend-agnostic).
     let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
-    let mut emitted_arena_statics: HashSet<crate::solver::WorkloadPoint> = HashSet::new();
     for &m in &num_tokens_points {
         // Prefer the sk=0 canonical for this `m`; fall back to any wp
         // at `m` if the model never declared sk=0 explicitly.
@@ -5183,20 +5152,54 @@ pub fn emit_model(
         let canonical = bucket_canonical[i];
         let bb_static = bucket_static_ident("BACKBONE_M", canonical);
         let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
-        let (_, num_slots_b, _, terminal_slot_b, arena_bytes_b) = &canonical_lowered[&canonical];
+        let (_, num_slots_b, _, terminal_slot_b, slots_b) = &canonical_lowered[&canonical];
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
         let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
-        let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", canonical);
-        if emitted_arena_statics.insert(canonical) {
-            let arena_bytes_lits = arena_bytes_b
-                .iter()
-                .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
-            metal_arena_bytes_statics.push(quote! {
-                #[cfg(feature = "metal")]
-                static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
-            });
+
+        // Per-bucket arena_bytes: register-coloring tells us which
+        // (tile, output_slot) pairs share an arena slot; for THIS
+        // bucket M we evaluate each tile's output shape against this
+        // bucket's bounds and take the per-color max. Each bucket
+        // gets a tight arena sized exactly for its own num_tokens —
+        // the worker pool elementwise-maxes across MetalBucketSpec
+        // entries once at init time to size the per-worker arena
+        // (init-time alloc, reused across every forward).
+        let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
+        let mut bucket_arena_bytes: Vec<u64> = vec![0u64; *num_slots_b as usize];
+        for ((tile_id, out_slot), color) in slots_b.iter() {
+            let node = fuf.get(tile_id);
+            let shape = &node.outputs[out_slot as usize];
+            let elems: u64 = crate::impl_lib::eval_shape_with(shape, &bp_bounds)
+                .expect("shape inference left a Var in a tile output — codegen invariant")
+                .into_iter()
+                .product();
+            // f16 = 2 bytes/element; metal kernels are f16-only.
+            let bytes = elems.saturating_mul(2);
+            let slot_idx = color as usize;
+            if bytes > bucket_arena_bytes[slot_idx] {
+                bucket_arena_bytes[slot_idx] = bytes;
+            }
         }
+        // Every color must have at least one (tile, slot) pair; if
+        // the worker ever sees a 0-byte arena slot it'll fail the
+        // ICB residency. Guarantee a 1-byte minimum so unused colors
+        // (none expected, but defensive) still allocate a valid
+        // `MTLBuffer`.
+        for b in &mut bucket_arena_bytes {
+            if *b == 0 {
+                *b = 1;
+            }
+        }
+
+        let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", wp);
+        let arena_bytes_lits = bucket_arena_bytes
+            .iter()
+            .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+        metal_arena_bytes_statics.push(quote! {
+            #[cfg(feature = "metal")]
+            static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
+        });
         metal_bucket_entries.push(quote! {
             ::ferrite_forward::interpreter::metal::MetalBucketSpec {
                 bucket_m: #bucket_m_lit,
@@ -5233,20 +5236,50 @@ pub fn emit_model(
         proc_macro2::Literal::u64_unsuffixed(vocab)
     };
 
-    // Per-worker arena peak in bytes — sum of `arena_bytes` across
-    // every slot for this canonical. All buckets in one canonical
-    // share the SAME `METAL_ARENA_BYTES` static, so the elementwise-
-    // max across rows is identically that single static; sum gives
-    // the per-worker resident-arena bytes. The metal worker reads
-    // this via the FerriteWeights trait to size the
-    // `peak_activation_bytes` argument to `compute_available_kv_bytes`.
+    // Per-worker arena peak in bytes — sum across every slot of the
+    // worker's arena layout, where each slot is sized to fit the
+    // largest bucket's claim on that color. The pool computes this
+    // exact layout at runtime via elementwise-max across each
+    // `MetalBucketSpec.arena_bytes`; we mirror that calculation here
+    // at compile time so the metal worker can pre-declare its
+    // resident-arena bytes via the FerriteWeights trait (used to
+    // size the `peak_activation_bytes` argument to
+    // `compute_available_kv_bytes`).
     let metal_arena_peak_bytes_lit = {
-        let canonical_arena_sum: u64 = canonical_lowered
-            .values()
-            .map(|(_, _, _, _, arena_bytes)| arena_bytes.iter().sum::<u64>())
-            .max()
-            .unwrap_or(0);
-        proc_macro2::Literal::u64_unsuffixed(canonical_arena_sum)
+        let mut layout: Vec<u64> = Vec::new();
+        for &m in &num_tokens_points {
+            let wp = bucket_points
+                .iter()
+                .find(|wp| wp.num_tokens == m && wp.sk_bucket == 0)
+                .copied()
+                .or_else(|| bucket_points.iter().find(|wp| wp.num_tokens == m).copied())
+                .expect("every num_tokens point has at least one wp");
+            let i = bucket_points
+                .iter()
+                .position(|w| *w == wp)
+                .expect("wp came from bucket_points");
+            let canonical = bucket_canonical[i];
+            let (_, num_slots_b, _, _, slots_b) = &canonical_lowered[&canonical];
+            if layout.len() < *num_slots_b as usize {
+                layout.resize(*num_slots_b as usize, 0);
+            }
+            let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
+            for ((tile_id, out_slot), color) in slots_b.iter() {
+                let node = fuf.get(tile_id);
+                let shape = &node.outputs[out_slot as usize];
+                let elems: u64 = crate::impl_lib::eval_shape_with(shape, &bp_bounds)
+                    .expect("shape inference left a Var in a tile output")
+                    .into_iter()
+                    .product();
+                let bytes = elems.saturating_mul(2);
+                let slot_idx = color as usize;
+                if bytes > layout[slot_idx] {
+                    layout[slot_idx] = bytes;
+                }
+            }
+        }
+        let total: u64 = layout.iter().sum();
+        proc_macro2::Literal::u64_unsuffixed(total)
     };
 
     let metal_emission = quote! {

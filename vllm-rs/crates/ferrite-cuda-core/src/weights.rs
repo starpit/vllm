@@ -2106,13 +2106,24 @@ impl GpuWeights {
 
     /// Take a tensor's raw CPU bytes without uploading to GPU.
     /// Returns (data_bytes, shape, dtype).
+    ///
+    /// Routes through [`Self::maybe_cast_cpu`] so the bytes match
+    /// `target_dtype` when one is set — same cast surface cuda's
+    /// `take_into` uses, so callers don't have to track the dtype
+    /// drift between disk and target separately. Under metal this is
+    /// the only on-the-way-in cast path; under cuda it's available to
+    /// pre-allocated-host loaders that don't run on a stream.
     pub fn take_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {
         let cpu_ref = self
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
-        let data = cpu_ref.data().to_vec();
-        Ok((data, cpu_ref.shape, cpu_ref.dtype))
+        let (ptr, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+        // SAFETY: `ptr` points into either `cpu_ref.data()` (if no cast
+        // happened) or `self.cast_scratch` (filled by `maybe_cast_cpu`).
+        // We immediately copy out before either source is reused.
+        let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
+        Ok((data, cpu_ref.shape, dtype))
     }
 }
 

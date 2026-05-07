@@ -134,7 +134,10 @@ pub fn constants_for<W: CanonicalParams>(
             ConstantValue::uint(0, bucket_m),
             ConstantValue::uint(1, W::INTERMEDIATE_SIZE as u32),
         ],
-        KernelId::Embed => vec![ConstantValue::uint(0, W::Q_SIZE as u32)],
+        KernelId::Embed => vec![
+            ConstantValue::uint(0, bucket_m),
+            ConstantValue::uint(1, W::Q_SIZE as u32),
+        ],
         KernelId::RopeAppend => vec![
             ConstantValue::uint(0, W::HEAD_DIM),
             ConstantValue::uint(1, W::NUM_Q_HEADS),

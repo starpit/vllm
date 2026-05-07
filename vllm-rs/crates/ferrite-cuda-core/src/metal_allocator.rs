@@ -27,6 +27,8 @@
 
 #![cfg(feature = "metal")]
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use metal::{Buffer, Device, MTLResourceOptions};
 
@@ -56,17 +58,35 @@ unsafe impl Send for MetalArena {}
 unsafe impl Sync for MetalArena {}
 
 /// Metal-backed [`DeviceAllocator`]. Holds a `Device` handle and a
-/// `Vec<MetalArena>` — one per ~256 MB arena. Allocations are
+/// shared `Vec<MetalArena>` — one per ~256 MB arena. Allocations are
 /// served from the current arena until full, then a new arena is
 /// pushed.
+///
+/// `Clone` shares state via `Arc<Mutex<…>>` on `arenas`. Both the
+/// loader-side `GpuWeights<MetalAllocator>` and the runtime-side
+/// `GpuDevice.allocator` need to see the SAME arena set so the
+/// worker's `buffer_for` reverse-lookup can resolve a freshly-uploaded
+/// weight pointer back to its `MTLBuffer`. Cloning the allocator is
+/// the only way to share state across owners that take it by value
+/// (`GpuWeights::from_dir(_, BackendAllocator)`).
 pub struct MetalAllocator {
     device: Device,
-    arenas: Vec<MetalArena>,
+    arenas: Arc<Mutex<Vec<MetalArena>>>,
     chunk_bytes: usize,
 }
 
 unsafe impl Send for MetalAllocator {}
 unsafe impl Sync for MetalAllocator {}
+
+impl Clone for MetalAllocator {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            arenas: Arc::clone(&self.arenas),
+            chunk_bytes: self.chunk_bytes,
+        }
+    }
+}
 
 impl MetalAllocator {
     /// Create an allocator on `device`. No buffer is allocated until
@@ -74,7 +94,7 @@ impl MetalAllocator {
     pub fn new(device: Device) -> Self {
         Self {
             device,
-            arenas: Vec::new(),
+            arenas: Arc::new(Mutex::new(Vec::new())),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
         }
     }
@@ -85,7 +105,7 @@ impl MetalAllocator {
     pub fn with_chunk_bytes(device: Device, chunk_bytes: usize) -> Self {
         Self {
             device,
-            arenas: Vec::new(),
+            arenas: Arc::new(Mutex::new(Vec::new())),
             chunk_bytes,
         }
     }
@@ -101,13 +121,18 @@ impl MetalAllocator {
     /// `(buffer, offset)` suitable for `set_buffer(...)`. Returns
     /// `None` if `ptr` is not within any arena (caller bug —
     /// raw-pointer parameters never crossed this allocator).
-    pub fn buffer_for(&self, ptr: *const u8) -> Option<(&Buffer, u64)> {
-        for arena in &self.arenas {
+    ///
+    /// Returns an owned `Buffer` (refcounted ObjC handle, cheap to
+    /// clone) so the caller doesn't have to thread the allocator's
+    /// `Mutex` lock guard through the dispatch pipeline.
+    pub fn buffer_for(&self, ptr: *const u8) -> Option<(Buffer, u64)> {
+        let arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
+        for arena in arenas.iter() {
             let start = arena.base as usize;
             let end = start + arena.used;
             let p = ptr as usize;
             if p >= start && p < end {
-                return Some((&arena.buffer, (p - start) as u64));
+                return Some((arena.buffer.clone(), (p - start) as u64));
             }
         }
         None
@@ -115,22 +140,31 @@ impl MetalAllocator {
 
     /// Number of live arenas. Diagnostic.
     pub fn arena_count(&self) -> usize {
-        self.arenas.len()
+        self.arenas.lock().expect("MetalAllocator arenas Mutex").len()
     }
 
     /// Total bytes allocated across all arenas (sum of `used`).
     /// Diagnostic.
     pub fn used_bytes(&self) -> usize {
-        self.arenas.iter().map(|a| a.used).sum()
+        self.arenas
+            .lock()
+            .expect("MetalAllocator arenas Mutex")
+            .iter()
+            .map(|a| a.used)
+            .sum()
     }
 
     /// Push a new arena buffer of at least `min_bytes`, rounded up
-    /// to `chunk_bytes`. Returns the index of the new arena.
-    fn push_arena(&mut self, min_bytes: usize) -> Result<usize> {
-        let capacity = min_bytes.max(self.chunk_bytes);
-        let buffer = self
-            .device
-            .new_buffer(capacity as u64, MTLResourceOptions::StorageModeShared);
+    /// to `chunk_bytes`. Returns the index of the new arena. The
+    /// caller already holds the `arenas` lock.
+    fn push_arena_locked(
+        device: &Device,
+        arenas: &mut Vec<MetalArena>,
+        chunk_bytes: usize,
+        min_bytes: usize,
+    ) -> Result<usize> {
+        let capacity = min_bytes.max(chunk_bytes);
+        let buffer = device.new_buffer(capacity as u64, MTLResourceOptions::StorageModeShared);
         let base = buffer.contents() as *mut u8;
         if base.is_null() {
             anyhow::bail!(
@@ -138,47 +172,39 @@ impl MetalAllocator {
                 capacity
             );
         }
-        self.arenas.push(MetalArena {
+        arenas.push(MetalArena {
             buffer,
             base,
             capacity,
             used: 0,
         });
-        Ok(self.arenas.len() - 1)
-    }
-
-    /// Find an arena with `bytes` free, or push a new one. Returns
-    /// the arena index and the offset within that arena where
-    /// `bytes` will be placed (post-bump, the destination).
-    fn reserve(&mut self, bytes: usize) -> Result<(usize, usize)> {
-        if let Some(idx) = self
-            .arenas
-            .iter()
-            .rposition(|a| a.capacity - a.used >= bytes)
-        {
-            let offset = self.arenas[idx].used;
-            return Ok((idx, offset));
-        }
-        let idx = self.push_arena(bytes)?;
-        Ok((idx, 0))
+        Ok(arenas.len() - 1)
     }
 }
 
 impl DeviceAllocator for MetalAllocator {
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
+        let mut arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
         // Zero-byte tensors are legal (e.g. an unused bias slot);
         // pick any non-null sentinel so the GpuTensor isn't `is_null()`.
         if bytes == 0 {
-            // Push a placeholder arena if none exists so we have a
-            // base to point into.
-            if self.arenas.is_empty() {
-                self.push_arena(0)?;
+            if arenas.is_empty() {
+                Self::push_arena_locked(&self.device, &mut arenas, self.chunk_bytes, 0)?;
             }
-            return Ok(self.arenas[0].base);
+            return Ok(arenas[0].base);
         }
 
-        let (idx, offset) = self.reserve(bytes)?;
-        let arena = &mut self.arenas[idx];
+        // Find an arena with `bytes` free, or push a new one.
+        let idx = if let Some(idx) = arenas
+            .iter()
+            .rposition(|a| a.capacity - a.used >= bytes)
+        {
+            idx
+        } else {
+            Self::push_arena_locked(&self.device, &mut arenas, self.chunk_bytes, bytes)?
+        };
+        let arena = &mut arenas[idx];
+        let offset = arena.used;
         let dst = unsafe { arena.base.add(offset) };
         // Unified-memory memcpy. `dst` is host-writable AND device-
         // visible — no DMA to schedule, no synchronization needed.

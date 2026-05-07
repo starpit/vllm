@@ -11,9 +11,10 @@
 // modules register with `inventory::submit!` for auto-discovery by
 // `ferrite_forward::try_load`. Without this, the linker gc's the
 // crate (no direct symbol references after the Phase B collapse)
-// and the inventory comes up empty. Cuda-only because the metal
-// dispatcher's registration plumbing lights up in Phase F Step 3.
-#[cfg(feature = "cuda")]
+// and the inventory comes up empty. Mirrored under metal now that
+// the per-canonical metal `forward` body + `inventory::submit!`
+// registration are emitted under `cfg(any(cuda, metal))` (Step 3.E).
+#[cfg(any(feature = "cuda", feature = "metal"))]
 extern crate ferrite_models as _;
 
 use std::collections::HashMap;
@@ -9403,14 +9404,18 @@ impl Worker for FerriteWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
         let device_arc = std::sync::Arc::new(metal_dev.device.clone());
-        let device_allocator = std::sync::Arc::new(MetalAllocator::new((*device_arc).clone()));
-        let gpu_device = GpuDevice::new(device_arc.clone(), device_allocator);
-
-        // Weights upload allocator — separate from `gpu_device.allocator`
-        // because `GpuWeights::from_dir` consumes the allocator. Both
-        // arena into the same unified-memory pool.
-        let weights_alloc = MetalAllocator::new((*device_arc).clone());
-        let mut weights = GpuWeights::from_dir(&model_dir, weights_alloc)
+        // Single allocator shared between `GpuWeights` (loader-side
+        // bump arena) and `GpuDevice.allocator` (worker-side
+        // `buffer_for` reverse-lookup at ICB-record time). `MetalAllocator::clone`
+        // shares the underlying arena vec via `Arc<Mutex<…>>`, so a
+        // weight allocated through the GpuWeights clone is reachable
+        // via the GpuDevice clone — same `MTLBuffer`s, same offsets.
+        let allocator = MetalAllocator::new((*device_arc).clone());
+        let gpu_device = GpuDevice::new(
+            device_arc.clone(),
+            std::sync::Arc::new(allocator.clone()),
+        );
+        let mut weights = GpuWeights::from_dir(&model_dir, allocator)
             .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
         info!(
             "FerriteWorker(metal): parsed {} weight tensors",

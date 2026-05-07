@@ -104,6 +104,10 @@ impl BenchStats {
 fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     use vllm_serve::llm::{ChatMessage, LLM};
 
+    if let Ok(level) = std::env::var("RUST_LOG") {
+        vllm_common::telemetry::init_tracing(&level);
+    }
+
     let t0 = std::time::Instant::now();
 
     let mut builder = LLM::builder(model).device(&args.device).dtype(&args.dtype);

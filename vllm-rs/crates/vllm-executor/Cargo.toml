@@ -21,11 +21,13 @@ cuda = [
 ]
 metal = [
     "dep:ferrite-forward",
+    "dep:ferrite-models",
     "dep:ferrite-cuda-core",
     "dep:ferrite-kernels",
     "dep:ferrite-metal-kernels",
     "dep:metal",
     "ferrite-forward/metal",
+    "ferrite-models/metal",
     "ferrite-cuda-core/metal",
     "ferrite-kernels/metal",
 ]

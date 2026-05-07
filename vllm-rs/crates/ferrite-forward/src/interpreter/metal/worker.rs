@@ -464,9 +464,9 @@ fn bake_bucket<W: CanonicalParams>(
             runtime,
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
-            bound.iter().map(|&(b, off, idx)| (b, off, idx)).collect();
-        for &(b, _, _) in &bound_refs {
-            record_resource(b, &mut baked_seen, &mut baked_resources);
+            bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
+        for (b, _, _) in &bound_refs {
+            record_resource(*b, &mut baked_seen, &mut baked_resources);
         }
         let (tg, tpt) = mtl_size_pair(cmd);
         ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
@@ -536,20 +536,21 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     // them; their `binding_index` field carries the encoder slot but
     // we only care about positional ordering. The lowering pass uses
     // 0 = out, 1 = in, 2 = weight.
-    let out = bound[0];
-    let inp = bound[1];
-    let wt = bound[2];
+    let mut iter = bound.into_iter();
+    let out = iter.next().expect("bound[0]");
+    let inp = iter.next().expect("bound[1]");
+    let wt = iter.next().expect("bound[2]");
     Ok((
         BoundBuffer {
-            buffer: inp.0.clone(),
+            buffer: inp.0,
             offset: inp.1,
         },
         BoundBuffer {
-            buffer: wt.0.clone(),
+            buffer: wt.0,
             offset: wt.1,
         },
         BoundBuffer {
-            buffer: out.0.clone(),
+            buffer: out.0,
             offset: out.1,
         },
     ))
@@ -566,13 +567,13 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
 /// Same shape CUDA's interpreter uses: WtFn → layer struct →
 /// `GpuTensor`. The Metal-side delta is just the final pointer →
 /// `(&Buffer, offset)` reverse lookup against the arena allocator.
-fn resolve_weight<'a, W: CanonicalParams>(
+fn resolve_weight<W: CanonicalParams>(
     weights: &W,
-    allocator: &'a MetalAllocator,
+    allocator: &MetalAllocator,
     kind: &WeightBundleKind<W>,
     layer: u32,
     which: WeightTensor,
-) -> Result<(&'a Buffer, u64), WorkerError> {
+) -> Result<(Buffer, u64), WorkerError> {
     let tensor = match kind {
         WeightBundleKind::RmsNorm(wtfn) => (wtfn)(weights, layer).weight,
         WeightBundleKind::Embedding(wtfn) => (wtfn)(weights, layer).weight,
@@ -596,16 +597,20 @@ fn resolve_weight<'a, W: CanonicalParams>(
 }
 
 /// Resolve every binding on `cmd` to (buffer, offset, binding-index).
-fn resolve_bindings<'a, W: CanonicalParams>(
+///
+/// Returns owned `Buffer` clones (cheap ObjC refcount) so callers
+/// don't have to thread the [`MetalAllocator`]'s arenas-`Mutex` lock
+/// guard through to the encoder.
+fn resolve_bindings<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand<W>,
-    arena: &'a [Buffer],
+    arena: &[Buffer],
     weights: &W,
-    allocator: &'a MetalAllocator,
-    runtime: &'a RuntimeBindings,
-) -> Result<Vec<(&'a Buffer, u64, u64)>, WorkerError> {
-    let mut out: Vec<(&'a Buffer, u64, u64)> = Vec::with_capacity(cmd.bindings.len());
+    allocator: &MetalAllocator,
+    runtime: &RuntimeBindings,
+) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
+    let mut out: Vec<(Buffer, u64, u64)> = Vec::with_capacity(cmd.bindings.len());
     for binding in &cmd.bindings {
         let (buf, off, idx) = match binding {
             Binding::ArenaSlot {
@@ -621,7 +626,7 @@ fn resolve_bindings<'a, W: CanonicalParams>(
                         arena_len: arena.len(),
                     });
                 }
-                (&arena[s], 0u64, *binding_index as u64)
+                (arena[s].clone(), 0u64, *binding_index as u64)
             }
             Binding::Weight {
                 kind,
@@ -635,7 +640,11 @@ fn resolve_bindings<'a, W: CanonicalParams>(
             Binding::Runtime {
                 kind,
                 binding_index,
-            } => (runtime.buffer_for(*kind), 0u64, *binding_index as u64),
+            } => (
+                runtime.buffer_for(*kind).clone(),
+                0u64,
+                *binding_index as u64,
+            ),
         };
         out.push((buf, off, idx));
     }

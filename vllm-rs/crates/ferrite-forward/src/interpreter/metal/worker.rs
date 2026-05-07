@@ -497,6 +497,19 @@ fn bake_bucket<W: CanonicalParams>(
                 allocator,
                 runtime,
             )?;
+            // Mark every GEMM-touched buffer resident on subsequent
+            // ICB encoders even though MPS' own encoder doesn't fire
+            // through our ICB. The surrounding `inheritBuffers=false`
+            // ICB encoders re-issue `useResources(baked_resources, …)`
+            // each time they open; a buffer that is read by a post-
+            // GEMM ICB segment but never bound into an ICB segment's
+            // own bindings (e.g. the lm_head's output that the host
+            // reads after commit) would otherwise miss the residency
+            // contract on every encoder it touches. Cheap dedupe via
+            // raw pointer identity.
+            record_resource(&a.buffer, &mut baked_seen, &mut baked_resources);
+            record_resource(&b.buffer, &mut baked_seen, &mut baked_resources);
+            record_resource(&c.buffer, &mut baked_seen, &mut baked_resources);
             steps.push(BucketStep::Gemm {
                 a,
                 b,

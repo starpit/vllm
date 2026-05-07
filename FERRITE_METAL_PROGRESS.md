@@ -330,10 +330,38 @@ Per-arch state under metal:
 - `ferrite-model-{llama, mistral, qwen3, granite}`: still compile cleanly under `--features metal`. 49/49 ferrite-forward metal lib tests pass.
 - `ferrite-model-phi3`: `metal` feature commented out — Phi-3 needs LongRoPE which `RotaryCache::new_from_gpuweights` doesn't yet cover (compile_error fires at macro expansion). Re-enable in a follow-up that ports `build_longrope` + `new_partial_longrope_from_stream` to a `_from_gpuweights` counterpart.
 
-**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** 🔜 NEXT — unblocked. Hook into the existing `vllm-e2e` golden framework targeting `tinyllama_1_1b::load` + `tinyllama_1_1b::metal_pool`. Same path CUDA uses; no bespoke Metal-only scaffolding (per `feedback_no_reinvent_testing.md`).
+**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** 🔄 IN PROGRESS via the F.* phases below.
+
+### Phase F: Worker integration → vllm-e2e TinyLlama golden 🔄 IN PROGRESS
+
+`vllm-e2e` drives a real `vllm-serve` child process; under metal that needs a `Worker` impl to load the model, hold the KV cache, and run forward steps. Phase F delivers it.
+
+**HEAD: `fb66f88b7`** (= base `48a057011 Revert M.1` + `b3947b62d` Stage A ggml fixup — fixes a pre-Phase-F cuda build break in `ferrite-kernels/src/ggml.rs:1942` where `GpuWeights::empty(stream)` had drifted from Stage A's `BackendAllocator` rename).
+
+**First attempt reverted (2026-05-07).** A 16-commit chain (F.2 `Backend` trait + associated types, F.3.* `CudaWorker → FerriteWorker<B: Backend>` generification, F.4.1 `MetalBackend` + `OwnedMetalTensor`/`MetalTensorView`, F.4.2 `MetalKvCachePool`, F.4.3 MSL `argmax_f16` kernel, F.4.4–F.4.8 metal worker through the trait) was reset out. The `Backend` trait was a runtime-generic abstraction over what the codebase already does as **cfg-mutex** (`DeviceAllocator` + `pub type BackendAllocator = CudaAllocator | MetalAllocator`, cfg-resolved at build time). Exposing `OwnedTensor` / `GpuTensorView` / `KvCachePool` as trait associated types invited and got parallel metal types instead of lifting the existing ones out of `cfg(cuda)`. Don't do it again.
+
+# THE PLAN — DO THIS, DO NOT SECOND-GUESS IT
+
+The worker layer differs between backends in exactly three places: kernels (already split into `ferrite-kernels` vs `ferrite-metal-kernels`), allocator (already behind `BackendAllocator`), device handle (small). Everything else — request lifecycle, input batch, scheduler interface, paged KV layout, `OwnedTensor`, per-canonical `Weights`, macro emission, rotary cache — is already shared or trivially shareable. **Do not introduce a `Backend` trait. Do not add `<B>` parameters. Do not fork types per backend.**
+
+**Step 1 — Lift `OwnedTensor` and `KvCachePool` to backend-neutral.** Move both from `cfg(cuda)` to `cfg(any(cuda, metal))`. Tensor descriptors are pure data; the `Drop` free-path goes through `BackendAllocator` (cfg-resolved). `KvCachePool`'s storage layout, sizing, slot decomposition, and span/FP8 bookkeeping all stay one place; buffer allocation goes through `BackendAllocator`. FP8 scales + span GPU mirrors + `gather_kv_contiguous` stay `cfg(feature = "cuda")` *inside* the unified types — they shrink the surface under metal, they do not fork it. No `OwnedMetalTensor`. No `MetalKvCachePool`. One type each.
+
+**Step 2 — One `FerriteWorker`, sampling kernel, vllm-serve arm.** Rename `CudaWorker` → `FerriteWorker`. No `<B>` parameter. Cuda-only orchestration fields (graph runners, NCCL, FP8, Qwen3Next state, logits processors) stay `cfg(feature = "cuda")` *fields* on the same struct; metal-only fields under `cfg(feature = "metal")`. The `Worker` trait impl `#[cfg]`-branches at the ~6 places that genuinely differ (`load_model` dispatcher, `initialize_cache` shape, `execute_model` body, sampling, `determine_available_memory`'s profile path, `compile_or_warm_up_model`). Same file, same struct, same impl block — cfg branches *inside*. Land `argmax_f16` MSL kernel + Rust dispatcher in `ferrite-metal-kernels` for greedy sampling (reflog `661b96481` has a working prior version to read). Wire `vllm-serve` to instantiate `FerriteWorker` under `cfg(feature = "metal")` for llama / mistral / qwen3 / granite; fall back to `MlxWorker` for arches ferrite-metal doesn't support.
+
+**Step 3 — TinyLlama-1.1B vllm-e2e golden under metal.** Same harness CUDA uses. Closes 5.G.5.
+
+# RULES FOR EXECUTING THE PLAN
+
+- **No `Backend` trait. No `<B>` parameter. No per-backend forks of `OwnedTensor` / `KvCachePool` / `Worker`.** If you find yourself reaching for these, stop — re-read this section.
+- **Cfg branches go inside one type, not across two types.** A field that's cuda-only is `#[cfg(feature = "cuda")] foo: Foo` on the shared struct, not a separate `MetalFoo`. A method that branches is one `fn` with `#[cfg]` arms inside, not two impl blocks.
+- **Kernel work belongs in `ferrite-metal-kernels`, period.** Sampling kernels, attention kernels, GEMM kernels — every one lands on a self-contained commit in the kernels crate that doesn't depend on the worker / scheduler / unification surface. Step 2's sampling-kernel deliverable is one of those commits; it is not a sub-step that has to be entangled with the worker rename.
+- **Steps 1 and 2 land as cohesive units, not as 7 micro-commits each.** A step is one PR-sized piece of work. The cuda host re-runs goldens between steps, not between every cfg-gate flip inside a step.
+- **Do not "audit first" or "scope-trim" or "defer to a follow-up" any of the three steps.** If a method on `KvCachePool` is genuinely cuda-only, it goes behind `cfg(feature = "cuda")` *inside the unified type* — it does not get deferred to "a future cleanup pass." If a field on the worker is cuda-only, same answer. If something feels invasive, it is invasive: do it anyway. The previous attempt broke because every "this is too big, let me start with a small foundation" decision pushed toward the trait. The plan above is the small foundation.
+- **Do not delete cuda functionality or cuda test coverage to make metal compile.** Cuda is the working backend; it stays working through every step. Cuda host runs `cargo test` and `vllm-e2e` goldens after each of steps 1, 2, 3 — green-stays-green.
+- **The phrase "this is risky, can I confirm before doing X"** is not in scope for the three steps. The three steps are the confirmation. Execute.
 
 ### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
-Pass the existing TinyLlama-1.1B golden under `--features metal` on M1+. Profile the function-constant specialization win at small buckets vs. an unspecialized control build.
+Same as Phase F.7 — closing 5.G.5 IS the 5.6 goal. Profile the function-constant specialization win at small buckets vs. an unspecialized control build as a follow-up.
 
 See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_METAL_PHASE5_PLAN.md` for prior context (Phase 5.6+ steps still valid; 5.1–5.5 superseded).
 
@@ -379,6 +407,7 @@ See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_
 - **Backend-unification Stage D Complete:** 2026-05-06 ✅ (MetalModelMeta + BufferRef + model_meta.rs deleted; worker resolves Binding::Weight via WtFn + MetalAllocator::buffer_for; metal_pool ctor signature updated; commit `da9f5ec7f`)
 - **Stage E.1 Complete:** 2026-05-06 ✅ (backend-neutral `LinearLayer::load_dense_concat_packed` + `RotaryCache::new_from_gpuweights` + `GpuWeights::alloc_packed_from_host`; commit `6605cf612`)
 - **Stage E.2 Complete:** 2026-05-06 ✅ (macro emits real `Weights` + `load()` under metal — drops ZST + panic-stub accessors; metal `load` body shares cuda's `lets`; per-arch crates llama / mistral / qwen3 / granite compile under metal; commit `37bda1693`)
+- **Phase F first attempt (Backend trait + metal port through it) Reverted:** 2026-05-07 ❌ (16 commits reset out — Backend trait was a runtime-generic abstraction over what the codebase already does as cfg-mutex. HEAD `fb66f88b7` = base + Stage A ggml fixup `b3947b62d` cherry-picked. Phase F retried via cfg-mutex extension; see Phase F section above for the next-step plan.)
 - **Target Completion:** 2025-03-XX
 
 ## Test Results Summary

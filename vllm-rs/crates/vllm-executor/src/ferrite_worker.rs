@@ -6221,8 +6221,8 @@ impl Worker for FerriteWorker {
                 model.head_dim(),
                 kv_dtype,
                 |bytes| {
-                    let ptr = unsafe { driver::mem_alloc(bytes)? };
-                    Ok(unsafe { vllm_cuda::RawGpuMem::new(ptr, bytes) })
+                    let ptr = driver::mem_alloc(bytes)?;
+                    Ok(vllm_cuda::RawGpuMem::new(ptr, bytes))
                 },
             )
         }
@@ -6372,8 +6372,8 @@ impl Worker for FerriteWorker {
                 model.head_dim(),
                 self.model_dtype,
                 |bytes| {
-                    let ptr = unsafe { driver::mem_alloc(bytes)? };
-                    Ok(unsafe { vllm_cuda::RawGpuMem::new(ptr, bytes) })
+                    let ptr = driver::mem_alloc(bytes)?;
+                    Ok(vllm_cuda::RawGpuMem::new(ptr, bytes))
                 },
             )
         }

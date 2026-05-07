@@ -2475,6 +2475,7 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
         lib.push(Box::new(FusedMoeRefImpl));
         lib.push(Box::new(SharedFusedMoeRefImpl));
+        lib.push(Box::new(Fp8SharedFusedMoeRefImpl));
         lib.push(Box::new(GdnAttentionRefImpl));
         lib.push(Box::new(GatedAttentionRefImpl));
 
@@ -11050,6 +11051,18 @@ fn is_fp8_block_moe(fuf: &Fuf, tile: TileId) -> bool {
     )
 }
 
+/// True if `tile` is a `Moe` whose `moe[layer]` weight resolves to FP8 storage
+/// of any scale scheme (per-tensor, per-channel, or block). Used by the FP8
+/// MoE impl family to claim, and by the BF16 `SharedFusedMoeRefImpl` /
+/// `FusedMoeRefImpl` / `DeepSeekMoeRefImpl` to defer.
+fn is_fp8_any_moe(fuf: &Fuf, tile: TileId) -> bool {
+    let node = fuf.get(tile);
+    if node.op != OpKind::Moe {
+        return false;
+    }
+    matches!(weight_storage_of(node), Some(StorageFormat::Fp8 { .. }))
+}
+
 /// True if `tile` is a `Moe` whose `moe[layer]` weight resolves to
 /// GGML/GGUF storage. Used by `DeepSeekGgmlMoeImpl` to claim, and by
 /// `DeepSeekMoeRefImpl` (BF16) to defer.
@@ -16601,7 +16614,8 @@ impl Implementation for SharedFusedMoeRefImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
-        if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
+        // Defer to FP8 / GGML peers when expert storage isn't dense BF16.
+        if is_fp8_any_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
             return None;
         }
         single_tile_match(fuf, seed, OpKind::Moe)
@@ -16715,6 +16729,161 @@ impl Implementation for SharedFusedMoeRefImpl {
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         Some(vec![OpInstance::new(
             syn::Ident::new("SharedFusedMoe", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #in_slot_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { Weights::#base_ident },
+            ],
+        )])
+    }
+}
+
+// ── Fp8SharedFusedMoeRefImpl ─────────────────────────────────────────────────
+//
+// FP8 peer of `SharedFusedMoeRefImpl`. Claims `OpKind::Moe` tiles for any
+// `num_experts`-family arch (Qwen2-MoE / Qwen3-MoE / Qwen3-Next) when the
+// `moe[layer]` weight resolves to `StorageFormat::Fp8 { .. }`. The loaded type
+// is `Fp8SharedFusedMoELayer` which internally uses `Fp8BlockFusedMoELayer` —
+// per-channel scales are encoded as `block_size = [1, K]`, per-tensor as
+// `[N_max, K_max]`, and blockwise pass through unchanged. Matches the DeepSeek
+// precedent where `DeepSeekFp8BlockMoeImpl` is the FP8 peer of `DeepSeekMoeRefImpl`.
+#[derive(Debug, Default)]
+pub struct Fp8SharedFusedMoeRefImpl;
+
+impl Implementation for Fp8SharedFusedMoeRefImpl {
+    fn name(&self) -> &'static str {
+        "fp8_shared_fused_moe_ref"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // Same family gate as the BF16 peer: `num_experts` without DeepSeek
+        // (`n_routed_experts`) or Mixtral (`num_local_experts`) markers.
+        let b = &ctx.model.bounds;
+        b.contains_key("num_experts")
+            && !b.contains_key("num_local_experts")
+            && !b.contains_key("n_routed_experts")
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        if !is_fp8_any_moe(fuf, seed) {
+            return None;
+        }
+        single_tile_match(fuf, seed, OpKind::Moe)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers_moe::Fp8SharedFusedMoELayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "Fp8SharedFusedMoe",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                (
+                    "weight_fn",
+                    syn::parse_quote!(
+                        for<'a> fn(
+                            &'a Weights,
+                            u32,
+                        )
+                            -> &'a ::ferrite_kernels::layers_moe::Fp8SharedFusedMoELayer
+                    ),
+                ),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("Fp8SharedFusedMoe: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors
+            .first()
+            .expect("Fp8SharedFusedMoe: required_weights returned empty");
+        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        Some(vec![OpInstance::new(
+            syn::Ident::new("Fp8SharedFusedMoe", proc_macro2::Span::call_site()),
             vec![
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },

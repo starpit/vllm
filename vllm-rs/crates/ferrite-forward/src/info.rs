@@ -635,6 +635,15 @@ impl<W> Instruction<W> {
                     F::LayerKind("SharedFusedMoELayer"),
                 ],
             ),
+            Instruction::Fp8SharedFusedMoe(in_slot, out_slot, layer, _wf) => (
+                "Fp8SharedFusedMoe",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("Fp8SharedFusedMoELayer"),
+                ],
+            ),
             Instruction::GdnAttention(in_slot, out_slot, layer, _wf) => (
                 "GdnAttention",
                 vec![

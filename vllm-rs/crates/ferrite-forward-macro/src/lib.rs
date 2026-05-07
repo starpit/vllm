@@ -932,6 +932,7 @@ fn compile_common(
                 "deepseek_moe_ggml",
                 "fused_moe_ref",
                 "shared_fused_moe_ref",
+                "fp8_shared_fused_moe_ref",
                 "gdn_attention_ref",
                 "gated_attention_ref",
                 "fused_add_rms_norm",

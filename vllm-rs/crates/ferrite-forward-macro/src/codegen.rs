@@ -3718,6 +3718,7 @@ fn emit_layered_load_body(
                     ::ferrite_forward::load_layered_linear_dense_concat_packed(
                         gw,
                         #n_lit,
+                        #dec_root_lit,
                         &[ #(#suffixes),* ],
                     )?
                 }

@@ -292,11 +292,12 @@ pub fn load_layered_linear_dense_concat_sharded(
 pub fn load_layered_linear_dense_concat_packed(
     gw: &mut GpuWeights,
     n_layers: u32,
+    root: &str,
     suffixes: &[&str],
 ) -> Result<Vec<LinearLayer>> {
     (0..n_layers)
         .map(|layer| {
-            let paths = concat_paths_for_layer(layer, suffixes);
+            let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             LinearLayer::load_dense_concat_packed(gw, &refs)
         })

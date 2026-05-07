@@ -60,9 +60,14 @@ constant uint  RMSNORM_M           [[function_constant(0)]];
 constant uint  RMSNORM_HIDDEN_SIZE [[function_constant(1)]];
 constant float RMSNORM_EPS         [[function_constant(2)]];
 
+// Bindings (must match `interpreter::metal::lowering::lower_one` for
+// `Instruction::RmsNorm`):
+//   buffer(0) = output (out_slot — written)
+//   buffer(1) = input  (in_slot  — read)
+//   buffer(2) = weight (read)
 kernel void rmsnorm_f16_specialized(
-    device const half* input  [[buffer(0)]],
-    device       half* output [[buffer(1)]],
+    device       half* output [[buffer(0)]],
+    device const half* input  [[buffer(1)]],
     device const half* weight [[buffer(2)]],
     uint gid     [[threadgroup_position_in_grid]],
     uint tid     [[thread_position_in_threadgroup]],

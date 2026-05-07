@@ -379,6 +379,67 @@ impl<W: CanonicalParams> MetalWorker<W> {
         }
         Ok(())
     }
+
+    /// Debug-only mirror of [`Self::run_bucket`] that commits + waits
+    /// after EACH step, with eprintln tracing. Used to bisect a GPU
+    /// hang to a specific kernel dispatch. Gated behind
+    /// `FERRITE_METAL_STEP_DEBUG=1`. Each step gets its own command
+    /// buffer; a hang on step N blocks `wait_until_completed` for that
+    /// cmdbuf and the trace pinpoints the failing kernel by index.
+    pub fn run_bucket_per_step_debug(
+        &self,
+        bucket: usize,
+        device: &Device,
+        queue: &ferrite_metal_kernels::metal::CommandQueue,
+    ) -> Result<(), WorkerError> {
+        use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
+        let baking = &self.bucket_bakings[bucket];
+        let resource_refs: Vec<&ResourceRef> = baking
+            .baked_resources
+            .iter()
+            .map(|b| {
+                let r: &ResourceRef = b;
+                r
+            })
+            .collect();
+        for (idx, step) in baking.steps.iter().enumerate() {
+            let cb = queue.new_command_buffer();
+            match step {
+                BucketStep::Icb { pipeline, range } => {
+                    eprintln!("[step {idx}] Icb range={:?}", range);
+                    let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
+                    let enc = cb.new_compute_command_encoder();
+                    if !resource_refs.is_empty() {
+                        enc.use_resources(
+                            &resource_refs,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        );
+                    }
+                    enc.set_compute_pipeline_state(pipeline);
+                    baking.icb.execute_on_encoder(enc, range.clone());
+                    enc.end_encoding();
+                }
+                BucketStep::Gemm { a, b, c, m, n, k } => {
+                    eprintln!("[step {idx}] Gemm m={m} n={n} k={k}");
+                    encode_gemm_into_command_buffer(
+                        device, cb, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0, false,
+                        true, true,
+                    )
+                    .map_err(WorkerError::GemmEncode)?;
+                }
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            let status = cb.status();
+            eprintln!("[step {idx}] status={:?}", status);
+            if status != MTLCommandBufferStatus::Completed {
+                return Err(WorkerError::WeightLookupFailed {
+                    reason: "per-step commit failed (see eprintln above)",
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Bake one bucket's ICB + execution plan.

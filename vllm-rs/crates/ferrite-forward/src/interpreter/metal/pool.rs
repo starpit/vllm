@@ -508,13 +508,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout(weights)?;
         write_runtime_inputs(&guard.runtime, inputs)?;
 
-        let cb = queue.new_command_buffer();
-        guard.worker.run_bucket(bucket_idx, &self.device, cb)?;
-        cb.commit();
-        cb.wait_until_completed();
-        let status = cb.status();
-        if status != MTLCommandBufferStatus::Completed {
-            return Err(ForwardError::ExecutionFailed(status));
+        if std::env::var_os("FERRITE_METAL_STEP_DEBUG").is_some() {
+            // Per-step commit/wait to isolate which kernel hangs the
+            // GPU. Each `BucketStep` (ICB segment with one pipeline,
+            // or one MPS GEMM) gets its own command buffer so we can
+            // see exactly which one stalls. Slow — only enable when
+            // debugging.
+            guard
+                .worker
+                .run_bucket_per_step_debug(bucket_idx, &self.device, queue)?;
+        } else {
+            let cb = queue.new_command_buffer();
+            guard.worker.run_bucket(bucket_idx, &self.device, cb)?;
+            cb.commit();
+            cb.wait_until_completed();
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed {
+                return Err(ForwardError::ExecutionFailed(status));
+            }
         }
 
         Ok(with_output(&guard.worker, bucket_idx))
@@ -582,19 +593,36 @@ fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), F
             bytes_available,
         });
     }
-    if bytes_needed == 0 {
-        return Ok(());
-    }
+    // Zero the WHOLE runtime buffer first, then overwrite the leading
+    // `bytes_needed` from `src`. The kernels dispatch over the bucket's
+    // padded M (= the buffer's full length), but only the first
+    // `actual_num_tokens` of input data is meaningful — without this
+    // zero-fill, padding lanes read whatever was left in the buffer
+    // from a previous forward's RuntimeBindings allocation. RoPE is
+    // the canary: `positions[t]` for `t >= actual_n` indexes the
+    // cos_sin table, and a stale (uninitialized) value blows past the
+    // table's bounds, faulting the GPU and hanging the command
+    // buffer in `wait_until_completed`.
+    //
+    // Position 0 is always a valid index into cos_sin / slot_mapping
+    // / seq_used_k / block_table (every paged-cache structure has a
+    // 0-th block). So zero-padding makes padding lanes do well-defined
+    // no-op-equivalent work that doesn't leak into the actual-token
+    // output.
+    //
     // Safety: shared-storage buffers expose `contents()` as a
     // host-visible pointer; we've bounds-checked the byte count
     // against `length()` above; src and dst don't overlap (src is a
     // Rust slice in CPU memory).
     unsafe {
-        copy_nonoverlapping(
-            src.as_ptr() as *const u8,
-            buffer.contents() as *mut u8,
-            bytes_needed,
-        );
+        std::ptr::write_bytes(buffer.contents() as *mut u8, 0u8, bytes_available);
+        if bytes_needed > 0 {
+            copy_nonoverlapping(
+                src.as_ptr() as *const u8,
+                buffer.contents() as *mut u8,
+                bytes_needed,
+            );
+        }
     }
     Ok(())
 }

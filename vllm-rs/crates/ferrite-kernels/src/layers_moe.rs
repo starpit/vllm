@@ -370,6 +370,30 @@ impl FusedMoELayer {
     }
 }
 
+#[cfg(feature = "metal")]
+impl FusedMoELayer {
+    /// Metal stub. The fused MoE GEMM + topk + softmax/sigmoid kernel
+    /// chain is cuda-only — no Apple-silicon counterpart yet. Returning
+    /// `Err` keeps the macro emission for MoE arches well-typed under
+    /// `--features metal`; trying to actually load a Mixtral / Qwen-MoE
+    /// / DeepSeek-MoE checkpoint on metal surfaces this error at the
+    /// load site rather than blowing up during shader compilation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        _gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        _prefix: &str,
+        _num_experts: usize,
+        _top_k: usize,
+        _intermediate_size: usize,
+        _hidden_size: usize,
+        _stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "FusedMoELayer not supported on metal: port MoE GEMM + topk kernels first"
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SharedFusedMoELayer (Qwen2/3 MoE)
 // ---------------------------------------------------------------------------
@@ -569,6 +593,26 @@ impl SharedFusedMoELayer {
     }
 }
 
+#[cfg(feature = "metal")]
+impl SharedFusedMoELayer {
+    /// Metal stub — see `FusedMoELayer::load`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        _gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        _prefix: &str,
+        _num_experts: usize,
+        _top_k: usize,
+        _moe_intermediate_size: usize,
+        _shared_expert_intermediate_size: usize,
+        _hidden_size: usize,
+        _stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "SharedFusedMoELayer not supported on metal: port MoE GEMM + topk kernels first"
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DeepSeekV2MoELayer
 // ---------------------------------------------------------------------------
@@ -751,6 +795,31 @@ impl DeepSeekV2MoELayer {
             shared_intermediate_size: shared_inter,
             routed_scaling_factor,
         })
+    }
+}
+
+#[cfg(feature = "metal")]
+impl DeepSeekV2MoELayer {
+    /// Metal stub — see `FusedMoELayer::load`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        _gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        _prefix: &str,
+        _n_routed_experts: usize,
+        _n_shared_experts: usize,
+        _top_k: usize,
+        _moe_intermediate_size: usize,
+        _hidden_size: usize,
+        _norm_topk_prob: bool,
+        _routed_scaling_factor: f32,
+        _use_sigmoid: bool,
+        _n_expert_group: usize,
+        _topk_group: usize,
+        _stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "DeepSeekV2MoELayer not supported on metal: port MoE GEMM + topk kernels first"
+        )
     }
 }
 

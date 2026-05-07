@@ -2551,13 +2551,19 @@ fn emit_weights_struct(
                     )?;
                 }
             }
+            // LongRoPE / YaRN / partial-rotary scaling families: the
+            // macro can't emit a working metal init yet (no
+            // `*_from_gpuweights` counterpart in `ferrite-kernels::rotary`).
+            // Stub to a runtime panic so the build remains green for the
+            // metal-supported subset; arches that hit this won't load
+            // successfully under metal until the proper port lands.
             _ => quote! {
-                ::core::compile_error!(
+                let rotary: ::ferrite_kernels::rotary::RotaryCache = ::core::unimplemented!(
                     "metal: rotary scaling variant not yet supported \
                      (LongRoPE / Yarn / partial-rotary). Land a metal \
                      counterpart to RotaryCache::new_from_gpuweights for \
-                     this scaling family before enabling this model under \
-                     --features metal."
+                     this scaling family before enabling this model \
+                     under --features metal."
                 );
             },
         }
@@ -5654,7 +5660,9 @@ fn emit_shim_model(
         pub use super::#canonical::{dump, forward, forward_backbone};
 
         #[cfg(feature = "metal")]
-        pub use super::#canonical::{METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool};
+        pub use super::#canonical::{
+            forward, METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
+        };
     }
 }
 

@@ -1006,7 +1006,12 @@ fn compile_common(
                     // `cutlass` etc. from being silently mis-classed.
                     let bucket = if cfg!(feature = "cuda") && name.starts_with("flashinfer") {
                         Some(1) // fi
-                    } else if cfg!(feature = "cuda") && name.starts_with("mla_") {
+                    } else if name.starts_with("mla_") {
+                        // MLA singletons (`mla_split_ref`, `mla_attention_ref`)
+                        // and `DeepSeekMoeRefImpl`-family are registered under
+                        // both backends — runtime support diverges, but the
+                        // classifier just buckets by name for the build-time
+                        // mix line.
                         Some(2) // mla
                     } else if name.starts_with("attention_")
                         || name.starts_with("sliding_attention_")
@@ -1055,10 +1060,15 @@ fn compile_common(
                         // they share the "not a GEMM / not a normal
                         // per-token kernel" shape.
                         Some(7) // comm
-                    } else if cfg!(feature = "cuda")
-                        && (name.starts_with("fused_") || name == "gemm_ref")
-                    {
-                        Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
+                    } else if name.starts_with("fused_") || name == "gemm_ref" {
+                        // `fused_gemm_bias` (qwen2 K/V) and the gemma
+                        // fusion families (`fused_add_rms_norm`,
+                        // `fused_add_rms_norm_with_offset`,
+                        // `scalar_offset_rms_norm`) live in both backends
+                        // now. cuda routes through cuBLAS gemm_bias; metal
+                        // routes through its own GEMM path. Same
+                        // build-time class for accounting.
+                        Some(3) // cublas / cublas-equivalent
                     } else {
                         None
                     };

@@ -11,7 +11,7 @@ otel = ["vllm-serve/otel"]
 gce = ["vllm-gce"]
 k8s = ["vllm-k8s"]
 bench = ["vllm-bench"]
-cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-bench?/cuda", "dep:ferrite-forward", "ferrite-forward/cuda", "dep:ferrite-cuda-targets"]
+cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-bench?/cuda", "dep:ferrite-forward", "ferrite-forward/cuda", "dep:ferrite-cuda-targets", "dep:vllm-cuda"]
 nccl = ["cuda", "vllm-cuda/nccl", "vllm-serve/nccl", "vllm-executor/nccl"]
 profiling = ["cuda"]
 metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal"]
@@ -34,7 +34,7 @@ vllm-config = { workspace = true }
 vllm-serve = { workspace = true }
 vllm-executor = { workspace = true }
 vllm-model = { workspace = true }
-vllm-cuda = { workspace = true }
+vllm-cuda = { workspace = true, optional = true }
 ferrite-forward = { path = "../ferrite-forward", optional = true }
 ferrite-cuda-targets = { path = "../ferrite-cuda-targets", optional = true }
 vllm-gce = { workspace = true, optional = true }

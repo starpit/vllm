@@ -1910,6 +1910,57 @@ pub fn starter_library() -> ImplementationLibrary {
         // Metal Sub implementations - elementwise subtraction
         lib.push(Box::new(crate::metal::MetalSubImpl::new_fp16()));
         lib.push(Box::new(crate::metal::MetalSubImpl::new_bf16()));
+        // Gemma-style `rmsnorm(x, w + scalar)` fusion. Claims the
+        // (Weight, Scalar) `Add` tile + downstream `RmsNorm` and emits
+        // `Instruction::ScalarOffsetRmsNorm`. The cuda Implementation
+        // is target-agnostic (`target_compatible` ≡ `true`) — its
+        // `fan_out` only references the FUF graph and the emitted
+        // opcode is shared between backends. The Metal interpreter
+        // lowering pass handles the resulting `Instruction` variant
+        // via `KernelId::RmsNormWithOffset`.
+        lib.push(Box::new(ScalarOffsetRmsNormImpl));
+        // Three-tile gemma fusion: residual `Add(Tile, Tile)` +
+        // scalar-offset `Add(Weight, Scalar)` + downstream `RmsNorm`,
+        // emitted as a single `Instruction::FusedAddRmsNormWithOffset`.
+        // Claimed in preference to the 2-tile `FusedAddRmsNorm` +
+        // standalone `ScalarOffsetRmsNorm` because it's a larger claim.
+        lib.push(Box::new(FusedAddRmsNormWithOffsetImpl));
+        // CohereLayerNorm-style `(Mean, Sub, RmsNorm)` fusion (Cohere)
+        // and `(Mean, Sub, RmsNorm, BiasAdd)` (ModernBERT). Both impls
+        // are target-agnostic — they emit `Instruction::CohereLayerNorm`
+        // / `Instruction::LayerNormBias` which the Metal interpreter
+        // lowering pass handles via the `LayerNorm` / `LayerNormBias`
+        // KernelIds (added below).
+        lib.push(Box::new(MeanSubRmsNormImpl));
+        lib.push(Box::new(MeanSubRmsNormBiasAddImpl));
+        // Standalone `(Gemm, BiasAdd)` fusion for K/V projections that
+        // don't pack into a fused QKV+RoPE path (qwen2's per-head bias).
+        // Emits `Instruction::FusedGemmBias` — Metal interpreter lowering
+        // routes through the Metal GEMM path with a follow-up bias-add
+        // kernel.
+        lib.push(Box::new(FusedGemmBiasImpl));
+        // DeepSeek MLA + MoE singletons. `MlaSplitRefImpl` claims the
+        // `kv_a → kv_latent + k_pe` split, `MlaAttentionImpl` claims
+        // the full MLA attention sequence. The four `*MoeImpl` variants
+        // claim `OpKind::Moe` tiles by quantization shape (BF16, FP8
+        // block, GGUF). Target-agnostic; emit `Instruction::MlaSplit`
+        // / `MlaAttention` / `Moe` for the metal interpreter to handle.
+        lib.push(Box::new(MlaSplitRefImpl));
+        lib.push(Box::new(MlaAttentionImpl));
+        lib.push(Box::new(DeepSeekMoeRefImpl));
+        lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
+        lib.push(Box::new(DeepSeekGgmlMoeImpl));
+        lib.push(Box::new(FusedMoeRefImpl));
+        lib.push(Box::new(SharedFusedMoeRefImpl));
+        // Encoder/bidirectional attention — claims the 3-arg
+        // `attention(q, k, v)` form (no kv_cache). ModernBERT and
+        // Cohere encoder backbones rely on this.
+        lib.push(Box::new(EncoderAttentionImpl));
+        // GELU MLP fusion `(Gemm, Gemm, Gelu, Mul)` — gemma2 and
+        // ModernBERT GeGLU MLPs route through this when no cuBLAS
+        // peer is available. Standalone Gelu / Mul tiles also fall
+        // out of the claim when a fusion isn't applicable.
+        lib.push(Box::new(FusedGateUpGeluMulImpl));
     }
     #[cfg(feature = "cuda")]
     {

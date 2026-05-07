@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use crate::classified::{OpKind, Program};
-use crate::fuf::{Fuf, TileId};
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     AddRefImpl, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
     OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
@@ -68,14 +68,35 @@ impl Implementation for MetalAddImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let node = fuf.get(seed);
-        if node.op != OpKind::Add {
+        if node.op != OpKind::Add || node.inputs.len() != 2 {
             return None;
         }
-
-        // Singleton claim - just this Add tile
+        // Both inputs must be Tiles. (Weight, Scalar) Adds — Gemma's
+        // `w + 1.0` feeding rmsnorm — are claimed by
+        // `ScalarOffsetRmsNormImpl` / `FusedAddRmsNormWithOffsetImpl`,
+        // not by us. Falling through here would route a Weight-input
+        // Add into `AddRefImpl::fan_out`, which panics.
+        let slot_a = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        let slot_b = match &node.inputs[1] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        // Defer to `(Add, RmsNorm)` fusion (`MetalFusedAddRmsNormImpl`)
+        // when the downstream is a RmsNorm; this singleton only fires
+        // for residual Adds whose downstream isn't an immediate norm.
+        let downstream_is_rmsnorm = fuf
+            .nodes
+            .iter()
+            .any(|n| n.op == OpKind::RmsNorm && consumes_tile(n, seed));
+        if downstream_is_rmsnorm {
+            return None;
+        }
         Some(MatchInfo {
             claimed_tiles: vec![seed],
-            boundary_inputs: vec![],
+            boundary_inputs: vec![slot_a, slot_b],
             boundary_outputs: vec![seed],
         })
     }
@@ -173,6 +194,12 @@ impl Implementation for MetalAddImpl {
     ) -> Option<Vec<OpInstance>> {
         AddRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
+}
+
+fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
+    node.inputs
+        .iter()
+        .any(|i| matches!(i, FufInput::Tile { id, .. } if *id == producer))
 }
 
 #[cfg(all(test, feature = "metal"))]

@@ -586,7 +586,7 @@ unsafe fn fp8_decode_attention_graphed(
 
     // cu_seqlens_k lives in the graph runner's persistent buffer.
     // During capture: filled with dummy prefix sums by fill_dummy_decode_fp8.
-    // During replay: updated by cuda_worker before graph launch.
+    // During replay: updated by ferrite_worker before graph launch.
     let cu_seqlens_k_gpu = GpuTensor::new(ctx.cu_seqlens_k, &[batch_size + 1], DType::I32);
 
     // Dequant into pre-allocated buffers with over-sized grid.

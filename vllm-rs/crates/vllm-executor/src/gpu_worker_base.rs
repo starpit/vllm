@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Shared GPU worker utilities.
 //!
-//! Common logic used by all GPU-based `Worker` implementations (CudaWorker,
+//! Common logic used by all GPU-based `Worker` implementations (FerriteWorker,
 //! TkWorkerAdapter, etc.): model path resolution, HF config parsing, and
 //! memory estimation.
 //!
@@ -25,7 +25,7 @@ use crate::error::{ExecutorError, ExecutorResult};
 /// 2. Local directory → returns as-is
 /// 3. HuggingFace Hub model ID → downloads and returns cache path
 ///
-/// Extracted from `CudaWorker::resolve_model_path` for reuse across backends.
+/// Extracted from `FerriteWorker::resolve_model_path` for reuse across backends.
 pub fn resolve_model_path(
     model_path: &str,
     hf_token: Option<&str>,
@@ -159,7 +159,7 @@ pub fn resolve_model_path(
 
 /// Parse a `LlamaConfig` from a HuggingFace `config.json`.
 ///
-/// Extracted from `CudaWorker::llama_config_from_hf` for reuse across backends.
+/// Extracted from `FerriteWorker::llama_config_from_hf` for reuse across backends.
 #[cfg(feature = "cuda")]
 pub fn llama_config_from_hf(
     hf: &vllm_model::weight::HfModelConfig,

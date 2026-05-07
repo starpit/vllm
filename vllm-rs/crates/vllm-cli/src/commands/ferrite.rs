@@ -28,7 +28,7 @@ use ferrite_forward::{BackboneDumpRegistration, BucketDump, NormalizedField, Nor
 use crate::args::{ColorWhen, FerriteInfoArgs};
 
 // Inventory submissions for `ferrite_models` are kept alive by
-// `vllm-executor::cuda_worker`'s `extern crate ferrite_models as _;`,
+// `vllm-executor::ferrite_worker`'s `extern crate ferrite_models as _;`,
 // which the CLI binary transitively pulls in.
 
 pub async fn run_info(args: FerriteInfoArgs) -> anyhow::Result<()> {

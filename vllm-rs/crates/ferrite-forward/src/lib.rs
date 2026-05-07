@@ -266,7 +266,7 @@ mod ctx {
         ///   the rope kernel reads each rotary index from the row that
         ///   `mrope_section` assigns it to. Must be set up by whoever
         ///   constructs the `ForwardCtx` (currently the `Self::Ferrite`
-        ///   arm in `vllm-executor::cuda_worker`); ferrite-forward
+        ///   arm in `vllm-executor::ferrite_worker`); ferrite-forward
         ///   itself is shape-agnostic past the kernel boundary.
         pub positions: TensorView<'a>,
         pub slot_mapping: TensorView<'a>,
@@ -360,7 +360,7 @@ mod ctx {
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when
         // built with `--features nccl` AND the worker constructed an
-        // NCCL group for this rank — see vllm-executor::cuda_worker.
+        // NCCL group for this rank — see vllm-executor::ferrite_worker.
         #[cfg(feature = "nccl")]
         pub tp_group: Option<&'a std::sync::Arc<ferrite_cuda_core::NcclGroup>>,
     }
@@ -515,7 +515,7 @@ mod dispatcher {
     // extension on `FerriteWeights`. Text-only arches don't
     // implement it. Discovery uses a sibling inventory row so the
     // text-side `FerriteArchRegistration` stays untouched and
-    // text-only arches never need to know MM exists. cuda_worker
+    // text-only arches never need to know MM exists. ferrite_worker
     // calls `try_load_mm` after `try_load` succeeds; an arch with
     // no MM submission yields `Ok(None)` and the worker proceeds
     // text-only. Phase B of the multimodal plan
@@ -542,7 +542,7 @@ mod dispatcher {
     /// it. The slice is `[token_offset .. token_offset + length]`
     /// of `vision_forward`'s returned `OwnedTensor`. Mirrors
     /// `vllm-common::PlaceholderRange` but in token-space (post-
-    /// expansion); cuda_worker's splice consumes these directly.
+    /// expansion); ferrite_worker's splice consumes these directly.
     ///
     /// `grid_t` / `grid_h_merged` / `grid_w_merged` carry the
     /// per-image grid dimensions (post spatial-merge) so the
@@ -550,7 +550,7 @@ mod dispatcher {
     /// bearing batches on Qwen2-VL-class arches: image tokens
     /// scan in `(t, h, w)` row-major order with each row of the
     /// positions tensor holding the corresponding axis's coordinate.
-    /// Caller (cuda_worker) initializes these to zero when
+    /// Caller (ferrite_worker) initializes these to zero when
     /// constructing the input `placeholders`; `vision_forward` fills
     /// them on the returned `Vec<EmbedPatch>` by zipping its
     /// per-image `grid_thw` with `placeholders`. Text-only arches
@@ -597,7 +597,7 @@ mod dispatcher {
         ///   order they appear in the input batch.
         /// - A `Vec<EmbedPatch>` of the same length as `pixel_batches`
         ///   recording where each image's slice lands in the token
-        ///   sequence. `cuda_worker`'s splice consumes these to D2D-
+        ///   sequence. `ferrite_worker`'s splice consumes these to D2D-
         ///   copy each slice into the corresponding `Embed` tile rows.
         ///
         /// # Safety
@@ -621,7 +621,7 @@ mod dispatcher {
         /// req: vision encoder already ran on a prior step and the
         /// projected embeds live in cached KV blocks) uses this to
         /// reconstruct the same per-image grid info that
-        /// `cuda_worker::build_mrope_positions_2d` needs to compute
+        /// `ferrite_worker::build_mrope_positions_2d` needs to compute
         /// MRoPE positions for the cached tokens. Without it, fall-back
         /// 1D positions for the trailing new tokens disagree with the
         /// 3D MRoPE positions used to encode the cached KV → attention
@@ -707,7 +707,7 @@ mod dispatcher {
     /// Until task #7's outer-loop fanout lands, every emitted
     /// registration is at `tp_world_size = 1`, so callers passing
     /// `tp_world_size > 1` always see `Ok(None)` (and fall back) —
-    /// matching the current behavior, since cuda_worker already gates
+    /// matching the current behavior, since ferrite_worker already gates
     /// ferrite eligibility on `!use_tp`.
     pub fn try_load(
         gw: &mut GpuWeights,
@@ -745,7 +745,7 @@ mod dispatcher {
     /// [`FerriteMmRegistration`] rows for the same
     /// `(arch_hint, tp_world_size)` filter. Returns `Ok(None)`
     /// when no MM-capable arch claims the HF identifier — the
-    /// expected case for text-only checkpoints, where cuda_worker
+    /// expected case for text-only checkpoints, where ferrite_worker
     /// proceeds with `embed_patches: &[]`. Phase D of the
     /// multimodal plan lands the first row.
     pub fn try_load_mm(

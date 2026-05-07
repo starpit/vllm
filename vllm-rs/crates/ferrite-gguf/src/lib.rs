@@ -646,7 +646,7 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
     // The arch hint stamped into `architectures` is the GGUF tag
     // itself (`"deepseek2"`, `"llama"`, …), not an HF class string.
     // Forward arches advertise their gguf-tag claims via
-    // `FerriteArchRegistration::gguf_archs`; cuda_worker hands the
+    // `FerriteArchRegistration::gguf_archs`; ferrite_worker hands the
     // first `architectures` entry to `try_load`, which filters by
     // (`hf_arches` ∪ `gguf_archs`). Stamping the gguf tag means a
     // single tag like `"deepseek2"` fans out to every claiming forward

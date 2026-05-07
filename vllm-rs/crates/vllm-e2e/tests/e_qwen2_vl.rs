@@ -204,7 +204,7 @@ async fn test_qwen2_vl_image_max_tokens() {
 
 /// **Bug 1 reproducer.** Single fresh-prefill MM-bearing request whose
 /// `total_tokens` lands on a captured prefill-graph size. Without the
-/// `!req_has_mm` gate at `cuda_worker.rs:8600+`, replay skips
+/// `!req_has_mm` gate at `ferrite_worker.rs:8600+`, replay skips
 /// `run_mm_vision_forward` + the `Embed` splice and the decoder gets
 /// placeholder tokens with no visual content — producing fluent nonsense
 /// unrelated to the actual image (the original symptom: "a person on a

@@ -2378,7 +2378,7 @@ async fn test_cuda_paged_fa2_interleaved_multi_turn() {
 // ===========================================================================
 // CUDA Logprobs tests
 // ===========================================================================
-// Validates that logprobs are correctly returned from CudaWorker (forces CPU
+// Validates that logprobs are correctly returned from FerriteWorker (forces CPU
 // fallback path where logprobs are computed).
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_logprobs -- --ignored --test-threads=1
@@ -2470,7 +2470,7 @@ async fn test_cuda_logprobs_completion() {
 // ===========================================================================
 // CUDA Grammar / constrained decoding tests
 // ===========================================================================
-// Validates that guided_regex constrains output via CudaWorker grammar state.
+// Validates that guided_regex constrains output via FerriteWorker grammar state.
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_grammar -- --ignored --test-threads=1
 
@@ -2587,7 +2587,7 @@ async fn test_cuda_grammar_ebnf_digits() {
     );
 }
 
-// Validates structural_tag response_format constrains output via CudaWorker.
+// Validates structural_tag response_format constrains output via FerriteWorker.
 // The structural tag defines a trigger that forces JSON schema output between tags.
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_grammar_structural_tag -- --ignored --test-threads=1

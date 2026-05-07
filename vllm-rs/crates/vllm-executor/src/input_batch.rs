@@ -951,7 +951,7 @@ mod tests {
 
     /// Regression test for the super-fast graph path deferred commit bug.
     ///
-    /// Simulates the deferred commit pattern from CudaWorker's super-fast
+    /// Simulates the deferred commit pattern from FerriteWorker's super-fast
     /// graph path. Each iteration:
     ///   1. Capture `token_counts` via `fast_path_token_counts()` BEFORE
     ///      resolving the previous step's pending commit.
@@ -1233,14 +1233,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // Preemption / resumption tests
     //
-    // These tests directly model the invariants that CudaWorker must maintain
+    // These tests directly model the invariants that FerriteWorker must maintain
     // during KV cache preemption and resumption.  The root bug was:
     //   add_request(req_id, all_tokens, blocks_for_scheduled_chunk)
     // where len(all_tokens) > blocks_for_scheduled_chunk * block_size, causing
     // seq_lens > available_blocks → slot_mapping = -1 → CUDA fault.
     // -----------------------------------------------------------------------
 
-    /// Helper: simulate the invariant CudaWorker must uphold when re-adding a
+    /// Helper: simulate the invariant FerriteWorker must uphold when re-adding a
     /// resumed request.  Returns true if block coverage is sufficient.
     fn blocks_cover_tokens(tokens: &[u32], block_ids: &[usize], block_size: usize) -> bool {
         if tokens.is_empty() {
@@ -1374,7 +1374,7 @@ mod tests {
         );
     }
 
-    /// Simulate the exact CudaWorker bug: full token_buffers passed to
+    /// Simulate the exact FerriteWorker bug: full token_buffers passed to
     /// add_request but blocks only cover a scheduled chunk.
     ///
     /// This tests the invariant that was VIOLATED before the fix:
@@ -1670,7 +1670,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Extended preemption/resumption coverage
-    // Every nuance of the CudaWorker preemption fix is covered below.
+    // Every nuance of the FerriteWorker preemption fix is covered below.
     // -----------------------------------------------------------------------
 
     /// Removing the LAST active request leaves an empty batch.
@@ -1955,7 +1955,7 @@ mod tests {
     /// update_blocks for a resumed request must happen BEFORE remove+add_request,
     /// and the final block table must come from add_request, not update_blocks.
     ///
-    /// This tests that the CudaWorker pattern:
+    /// This tests that the FerriteWorker pattern:
     ///   1. update_blocks(req_id, new_block_ids)  ← from cached-reqs loop
     ///   2. remove_request(req_id)               ← preemption fixup
     ///   3. add_request(req_id, tokens, new_block_ids, num_computed) ← resumption

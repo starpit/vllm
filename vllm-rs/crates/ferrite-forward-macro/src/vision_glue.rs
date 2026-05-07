@@ -296,7 +296,7 @@ pub fn emit_per_variant(
         }
 
         // Vision is replicated per-rank — register at every tp size
-        // so cuda_worker's `try_load_mm` finds us regardless of
+        // so ferrite_worker's `try_load_mm` finds us regardless of
         // `tp_world_size`. Each rank loads the full `visual.*`
         // weights independently and runs `vision_forward` to
         // produce identical mm_embeds; the post-Embed

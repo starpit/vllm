@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `CudaWorker`: a `Worker` implementation using the vllm-cuda backend.
+//! `FerriteWorker`: a `Worker` implementation backed by the ferrite GPU runtime.
 //!
-//! Purpose-built GPU runtime with `GpuTensor`/`GpuDevice`/`ScratchArena`
-//! for zero-allocation inference. Uses the same paged FlashAttention-2 kernels,
-//! but through raw FFI instead of CustomOps.
+//! Cuda build: vllm-cuda + ferrite-forward (full feature set: CUDA graphs,
+//! NCCL, FP8, etc.). Metal build: ferrite-forward MetalWorkerPool + the
+//! ferrite-metal-kernels crate. The struct is shared with cfg-mutex'd fields.
 //!
-//! This worker is gated behind the `cuda-backend` feature flag.
+//! Gated behind the `cuda` or `metal` feature flag.
 
 // Force the linker to keep `ferrite_models` — its `#[forward]`
 // modules register with `inventory::submit!` for auto-discovery by
 // `ferrite_forward::try_load`. Without this, the linker gc's the
 // crate (no direct symbol references after the Phase B collapse)
-// and the inventory comes up empty.
+// and the inventory comes up empty. Cuda-only because the metal
+// dispatcher's registration plumbing lights up in Phase F Step 3.
+#[cfg(feature = "cuda")]
 extern crate ferrite_models as _;
 
 use std::collections::HashMap;
@@ -22,24 +24,39 @@ use vllm_common::SamplingParams;
 use vllm_common::engine_io::EmbeddingData;
 use vllm_config::CudaGraphMode;
 use vllm_core::scheduler::output::SchedulerOutput;
+use vllm_engine::executor::ModelRunnerOutput;
+use vllm_model::weight::HfModelConfig;
+
+// Backend-neutral types lifted in Step 1 of the cfg-mutex extension:
+// `KvCachePool` is `cfg(any(cuda, metal))` in `ferrite-kernels::kv_cache`,
+// and `DType` is unconditional in `ferrite-cuda-core::dtype`.
+use ferrite_cuda_core::dtype::DType as GpuDType;
+use ferrite_kernels::kv_cache::KvCachePool;
+
+#[cfg(feature = "cuda")]
 use vllm_cuda::OwnedTensor;
+#[cfg(feature = "cuda")]
 use vllm_cuda::cpu_gpu_buf::PinnedBuf;
+#[cfg(feature = "cuda")]
 use vllm_cuda::device::GpuDevice;
+#[cfg(feature = "cuda")]
 use vllm_cuda::driver;
-use vllm_cuda::dtype::DType as GpuDType;
+#[cfg(feature = "cuda")]
 use vllm_cuda::graph::{CudaGraphRunner, PrefillGraphRunner};
+#[cfg(feature = "cuda")]
 use vllm_cuda::graph_piece::{GraphPieceType, PiecewiseGraphRunner};
-use vllm_cuda::kv_cache::KvCachePool;
+#[cfg(feature = "cuda")]
 use vllm_cuda::logits_processor::{
     AllowedTokenIdsProcessor, BadWordsProcessor, BatchUpdate, GrammarMaskProcessor,
     LogitBiasProcessor, LogitsProcessor, LogitsProcessorPipeline, MinTokensProcessor,
     PenaltiesProcessor, SealPadProcessor,
 };
+#[cfg(feature = "cuda")]
 use vllm_cuda::quant;
+#[cfg(feature = "cuda")]
 use vllm_cuda::tensor::{GpuTensor, TensorView};
+#[cfg(feature = "cuda")]
 use vllm_cuda::weights::GpuWeights;
-use vllm_engine::executor::ModelRunnerOutput;
-use vllm_model::weight::HfModelConfig;
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::input_batch::{InputBatch, PreparedInputs};
@@ -49,9 +66,9 @@ use crate::worker::Worker;
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for a `CudaWorker`.
+/// Configuration for a `FerriteWorker`.
 #[derive(Debug, Clone)]
-pub struct CudaWorkerConfig {
+pub struct FerriteWorkerConfig {
     /// Path to a local model directory, or a HuggingFace model ID.
     pub model_path: String,
     /// Data type for model weights: "auto", "f16", "bf16".
@@ -105,13 +122,14 @@ pub struct CudaWorkerConfig {
 }
 
 /// Per-image MRoPE metadata in seq space, used by
-/// [`CudaWorker::build_mrope_positions_2d`] to walk the entire seq for
+/// [`FerriteWorker::build_mrope_positions_2d`] to walk the entire seq for
 /// each MM-bearing req (including the cached-prefix portion) so the
 /// cursor lands at the same position the encoder used to encode KV.
 ///
 /// Tuple is `(seq_offset, length, grid_t, grid_h_merged, grid_w_merged)`
 /// where `seq_offset` is relative to the req's full sequence start (NOT
 /// batch start) — the same coordinate system as `PlaceholderRange.offset`.
+#[cfg(feature = "cuda")]
 type SeqMmInfo = (u32, u32, u32, u32, u32);
 
 // ---------------------------------------------------------------------------
@@ -130,6 +148,7 @@ type SeqMmInfo = (u32, u32, u32, u32, u32);
 /// `ForwardCtx`, where `Instruction::Embed::eval` D2D-splices each patch
 /// into the gather output. Empty / `None` is the text-only no-op path —
 /// byte-identical to before MM landed.
+#[cfg(feature = "cuda")]
 pub struct MmForwardInputs<'a> {
     pub mm_embeds: TensorView<'a>,
     pub embed_patches: &'a [ferrite_forward::EmbedPatch],
@@ -151,12 +170,13 @@ pub struct MmForwardInputs<'a> {
 /// qwen3, gemma2, granite, and any future arch that lands a
 /// `#[forward]` module) — adding a new arch requires zero lines
 /// here.
+#[cfg(feature = "cuda")]
 pub struct FerriteModel {
     pub weights: Box<dyn ferrite_forward::FerriteWeights>,
     /// Vision-encoder handle for multimodal arches. `Some(_)` only
     /// when the loaded checkpoint carries `visual.*` tensors AND the
     /// arch has submitted a `FerriteMmRegistration` row claiming the
-    /// HF arch string. cuda_worker calls
+    /// HF arch string. ferrite_worker calls
     /// `mm.vision_forward(pixel_batches, placeholders, device)` when
     /// the request batch carries `mm_data`; the result threads into
     /// `ForwardCtx.mm_embeds` / `embed_patches` for the
@@ -187,6 +207,7 @@ pub struct FerriteModel {
 }
 
 /// Supported model architectures in the vllm-cuda backend.
+#[cfg(feature = "cuda")]
 enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
@@ -207,6 +228,7 @@ enum CudaModel {
     DeepSeekV2(vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM),
 }
 
+#[cfg(feature = "cuda")]
 impl CudaModel {
     fn num_layers(&self) -> usize {
         match self {
@@ -895,6 +917,7 @@ impl CudaModel {
 // Config helpers: HfModelConfig → vllm-cuda configs
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cuda")]
 fn llama_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::llama::LlamaConfig> {
@@ -956,6 +979,7 @@ fn llama_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn mixtral_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::mixtral::MixtralConfig> {
@@ -997,6 +1021,7 @@ fn mixtral_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn qwen2_moe_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::qwen2_moe::Qwen2MoeConfig> {
@@ -1073,6 +1098,7 @@ fn qwen2_moe_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn gemma2_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::gemma2::Gemma2Config> {
@@ -1135,6 +1161,7 @@ fn gemma2_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn gemma3_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::gemma3::Gemma3Config> {
@@ -1200,6 +1227,7 @@ fn gemma3_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn commandr_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::commandr::CommandRConfig> {
@@ -1245,6 +1273,7 @@ fn commandr_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn qwen3_next_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::qwen3_next::Qwen3NextConfig> {
@@ -1398,6 +1427,7 @@ fn qwen3_next_config_from_hf(
     })
 }
 
+#[cfg(feature = "cuda")]
 fn deepseek_v2_config_from_hf(
     hf: &HfModelConfig,
 ) -> ExecutorResult<vllm_cuda::model::deepseek_v2::DeepSeekV2Config> {
@@ -1555,6 +1585,7 @@ fn deepseek_v2_config_from_hf(
 /// Eliminates per-step heap Vec allocations and enables true async DMA
 /// (pageable memory forces the CUDA driver to stage through an internal
 /// pinned buffer, serializing the transfer).
+#[cfg(feature = "cuda")]
 struct HostStaging {
     /// `[max_batch]` u32 — input token IDs.
     input_ids: PinnedBuf,
@@ -1581,6 +1612,7 @@ struct HostStaging {
     sampling_packed: PinnedBuf,
 }
 
+#[cfg(feature = "cuda")]
 impl HostStaging {
     /// Allocate pinned staging buffers for up to `max_batch` decode requests.
     ///
@@ -1626,7 +1658,7 @@ impl HostStaging {
 }
 
 // ---------------------------------------------------------------------------
-// CudaWorker
+// FerriteWorker
 // ---------------------------------------------------------------------------
 
 /// Deferred commit from a previous decode step.
@@ -1634,6 +1666,7 @@ impl HostStaging {
 /// Stored when the greedy graph fast path defers D2H sync. The token IDs
 /// live in one of the double-buffered pinned host staging buffers. The
 /// commit is resolved at the start of the next `execute_model_inner` call.
+#[cfg(feature = "cuda")]
 struct PendingCommit {
     /// Which host_token_ids buffer index holds the deferred token IDs.
     buf_idx: usize,
@@ -1647,142 +1680,153 @@ struct PendingCommit {
     has_spec_tokens: Vec<bool>,
 }
 
-/// A worker backed by the vllm-cuda runtime for zero-allocation GPU inference.
-pub struct CudaWorker {
-    config: CudaWorkerConfig,
-    device: Option<GpuDevice>,
-    model: Option<CudaModel>,
+/// A worker backed by the ferrite GPU runtime (cuda or metal) for
+/// zero-allocation inference.
+pub struct FerriteWorker {
+    // ---------------------------------------------------------------
+    // Backend-neutral state (cfg-mutexed only by transitive types).
+    // ---------------------------------------------------------------
+    config: FerriteWorkerConfig,
     kv_cache: Option<KvCachePool>,
     model_dir: Option<PathBuf>,
     hf_config: Option<HfModelConfig>,
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
     is_shutdown: bool,
-    /// CUDA graph runner for decode batches (monolithic mode).
-    graph_runner: Option<CudaGraphRunner>,
-    /// Piecewise CUDA graph runner (attention excluded from graphs).
-    piecewise_graph_runner: Option<PiecewiseGraphRunner>,
-    /// CUDA graph runner for single-sequence prefill batches.
-    prefill_graph_runner: Option<PrefillGraphRunner>,
-    /// Batch size of the last graph replay. When the batch composition is
-    /// unchanged, we can skip the input_ids H2D copy because the graph's
-    /// D2D scatter already placed argmax results into the persistent buffer.
-    last_graph_batch_size: Option<usize>,
-    /// True when persistent graph buffers contain valid metadata from a
-    /// previous replay (positions, slot_mapping, seqused_k). When true,
-    /// we use `replay_decode_fast()` which updates metadata on GPU instead
-    /// of building Vecs on CPU and doing H2D copies.
-    graph_metadata_valid: bool,
-
-    /// True when the model uses GGML quantized layers (disables CUDA graphs).
-    uses_ggml: bool,
-
-    /// Pre-allocated pinned host staging buffers for graph replay.
-    /// Initialized after graph capture in `compile_or_warm_up_model`.
-    host_staging: Option<HostStaging>,
-
-    // Per-request state.
     token_buffers: HashMap<String, Vec<u32>>,
     /// Per-request prompt length (for discard_request_mask on intermediate prefill chunks).
     prompt_lengths: HashMap<String, usize>,
     /// Per-request block annotations for span-aware RoPE.
     annotation_buffers: HashMap<String, vllm_common::BlockAnnotations>,
     /// Per-request multimodal data (images), only populated for requests
-    /// scheduled at first as image-bearing. The vision encoder runs once
-    /// per request at first prefill, so the cached entry is removed after
-    /// that step (image tokens beyond the first prefill chunk continue to
-    /// reference the spliced embeds via the KV cache's stored attention
-    /// keys/values — no re-encode needed).
+    /// scheduled at first as image-bearing.
     mm_data_buffers: HashMap<String, vllm_common::MultimodalData>,
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
-    /// Set once per thread to avoid redundant `ctx_set_current` driver calls.
-    ctx_set_on_thread: bool,
     /// Resolved pooling strategy for embedding mode.
     pooling_strategy: vllm_model::embedding::PoolingStrategy,
     /// Whether executing in pooling mode (--runner pooling).
     is_pooling: bool,
-
-    /// Deferred D2H commit from the previous greedy graph step. Resolved at
-    /// the start of the next `execute_model_inner` call.
-    pending_commit: Option<PendingCommit>,
-
-    /// Per-request grammar guide state for constrained decoding.
-    #[cfg(feature = "guided-decoding")]
-    grammar_states: HashMap<String, vllm_model::grammar::GrammarGuide>,
-    /// Parser factory for grammar-guided decoding (built once from tokenizer).
-    #[cfg(feature = "guided-decoding")]
-    grammar_factory: Option<std::sync::Arc<vllm_model::grammar::LlgParserFactory>>,
-
-    /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
-    logits_pipeline: Option<LogitsProcessorPipeline>,
-    /// Grammar mask processor (separate from pipeline — needs backup logits).
-    grammar_processor: GrammarMaskProcessor,
-    /// Allowed token IDs processor (separate — needs backup logits like grammar).
-    allowed_token_ids_processor: AllowedTokenIdsProcessor,
-    /// 🦭 Seal-pad processor: forces pad tokens after EOS for sealed requests.
-    seal_pad_processor: SealPadProcessor,
     /// True if batch composition changed this step (triggers BatchUpdate).
     batch_changed: bool,
     /// Ordered request IDs in the current batch (for pipeline update_state).
     batch_req_ids: Vec<String>,
     /// Per-request seeded RNGs for deterministic sampling.
     seeded_rngs: HashMap<String, rand::rngs::StdRng>,
+    /// Optional progress callback for startup initialization.
+    #[allow(clippy::type_complexity)]
+    progress_callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 
-    /// GDN recurrent state pool for Qwen3Next (None for other architectures).
+    // ---------------------------------------------------------------
+    // CUDA-only orchestration state.
+    // ---------------------------------------------------------------
+    #[cfg(feature = "cuda")]
+    device: Option<GpuDevice>,
+    #[cfg(feature = "cuda")]
+    model: Option<CudaModel>,
+    /// CUDA graph runner for decode batches (monolithic mode).
+    #[cfg(feature = "cuda")]
+    graph_runner: Option<CudaGraphRunner>,
+    /// Piecewise CUDA graph runner (attention excluded from graphs).
+    #[cfg(feature = "cuda")]
+    piecewise_graph_runner: Option<PiecewiseGraphRunner>,
+    /// CUDA graph runner for single-sequence prefill batches.
+    #[cfg(feature = "cuda")]
+    prefill_graph_runner: Option<PrefillGraphRunner>,
+    #[cfg(feature = "cuda")]
+    last_graph_batch_size: Option<usize>,
+    #[cfg(feature = "cuda")]
+    graph_metadata_valid: bool,
+    /// True when the model uses GGML quantized layers (disables CUDA graphs).
+    #[cfg(feature = "cuda")]
+    uses_ggml: bool,
+    /// Pre-allocated pinned host staging buffers for graph replay.
+    #[cfg(feature = "cuda")]
+    host_staging: Option<HostStaging>,
+    /// Set once per thread to avoid redundant `ctx_set_current` driver calls.
+    #[cfg(feature = "cuda")]
+    ctx_set_on_thread: bool,
+    /// Deferred D2H commit from the previous greedy graph step.
+    #[cfg(feature = "cuda")]
+    pending_commit: Option<PendingCommit>,
+    /// Per-request grammar guide state for constrained decoding.
+    #[cfg(all(feature = "cuda", feature = "guided-decoding"))]
+    grammar_states: HashMap<String, vllm_model::grammar::GrammarGuide>,
+    /// Parser factory for grammar-guided decoding (built once from tokenizer).
+    #[cfg(all(feature = "cuda", feature = "guided-decoding"))]
+    grammar_factory: Option<std::sync::Arc<vllm_model::grammar::LlgParserFactory>>,
+    /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
+    #[cfg(feature = "cuda")]
+    logits_pipeline: Option<LogitsProcessorPipeline>,
+    /// Grammar mask processor (separate from pipeline — needs backup logits).
+    #[cfg(feature = "cuda")]
+    grammar_processor: GrammarMaskProcessor,
+    /// Allowed token IDs processor.
+    #[cfg(feature = "cuda")]
+    allowed_token_ids_processor: AllowedTokenIdsProcessor,
+    /// Seal-pad processor: forces pad tokens after EOS for sealed requests.
+    #[cfg(feature = "cuda")]
+    seal_pad_processor: SealPadProcessor,
+    /// GDN recurrent state pool for Qwen3Next.
+    #[cfg(feature = "cuda")]
     gdn_state_pool: Option<vllm_cuda::model::qwen3_next::GdnStatePool>,
     /// Qwen3Next config (cached for GDN state pool allocation).
+    #[cfg(feature = "cuda")]
     qwen3_next_config: Option<vllm_cuda::model::qwen3_next::Qwen3NextConfig>,
-
     /// True when KV cache uses FP8 E4M3 quantization.
+    #[cfg(feature = "cuda")]
     kv_cache_is_fp8: bool,
-    /// Compute KV scales dynamically (one-shot: set false after first forward).
+    #[cfg(feature = "cuda")]
     _calculate_kv_scales: bool,
-    /// K scale constant (from env or default 1.0).
+    #[cfg(feature = "cuda")]
     _k_scale_constant: f32,
-    /// V scale constant (from env or default 1.0).
+    #[cfg(feature = "cuda")]
     _v_scale_constant: f32,
     /// GPU weight allocations tracked for sleep/wake lifecycle.
-    /// RAII: `RawGpuMem` calls `driver::mem_free` on drop.
+    #[cfg(feature = "cuda")]
     weight_gpu_allocs: Vec<vllm_cuda::RawGpuMem>,
     /// Saved num_gpu_blocks for re-init after wake.
+    #[cfg(feature = "cuda")]
     num_gpu_blocks_saved: usize,
-
-    // Pipeline parallelism state.
     /// PP NCCL communicator for P2P send/recv between stages.
     #[cfg(feature = "nccl")]
     pp_group: Option<std::sync::Arc<vllm_cuda::nccl::NcclGroup>>,
     /// PP config for this worker (None if PP=1).
+    #[cfg(feature = "cuda")]
     pp_config: Option<vllm_cuda::PpConfig>,
     /// Persistent recv buffer for hidden_states `[max_num_tokens, hidden_size]`.
-    /// Pre-allocated on non-first stages for CUDA graph compatibility.
-    /// RAII: `RawGpuAlloc` calls `driver::mem_free` on drop.
+    #[cfg(feature = "cuda")]
     pp_recv_hs_buf: Option<vllm_cuda::RawGpuAlloc>,
     /// Persistent recv buffer for residual `[max_num_tokens, hidden_size]`.
-    /// RAII: `RawGpuAlloc` calls `driver::mem_free` on drop.
+    #[cfg(feature = "cuda")]
     pp_recv_res_buf: Option<vllm_cuda::RawGpuAlloc>,
     /// Whether a PP send from the previous iteration is pending.
-    /// Sync at start of next execute_model to ensure send completed.
+    #[cfg(feature = "cuda")]
     #[allow(dead_code)]
     pp_send_pending: bool,
 
-    /// Optional progress callback for startup initialization.
-    /// Used to report layer-by-layer loading progress to the UI.
-    #[allow(clippy::type_complexity)]
-    progress_callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    // ---------------------------------------------------------------
+    // Metal-only state (Phase F: cfg-mutex extension).
+    // ---------------------------------------------------------------
+    /// Shared `MetalDevice` handle. Step 2 holds the device for
+    /// instantiation; Step 3 wires the per-arch `MetalWorkerPool`
+    /// + forward dispatch through it.
+    #[cfg(feature = "metal")]
+    metal_device: Option<std::sync::Arc<ferrite_metal_kernels::device::MetalDevice>>,
 }
 
-// Safety: CudaWorker contains raw GPU pointers (via GpuDevice, model weights,
+// Safety: FerriteWorker contains raw GPU pointers (via GpuDevice, model weights,
 // KV cache, PP buffers, CUDA graphs) and raw pointer fields in OwnedTensor /
 // RawGpuAlloc / RawGpuMem. All GPU resources are allocated on a single CUDA
 // context and accessed exclusively from the worker thread. Send is required
 // because the worker is created on the main thread and moved to its dedicated
 // worker thread via the executor's spawn.
-unsafe impl Send for CudaWorker {}
+unsafe impl Send for FerriteWorker {}
 
-impl CudaWorker {
-    pub fn new(config: CudaWorkerConfig) -> Self {
+#[cfg(feature = "cuda")]
+impl FerriteWorker {
+    pub fn new(config: FerriteWorkerConfig) -> Self {
         let is_pooling = config.is_pooling;
         let kv_cache_is_fp8 = config.kv_cache_dtype == "fp8_e4m3" || config.kv_cache_dtype == "fp8";
         let calculate_kv_scales = config.calculate_kv_scales;
@@ -2178,14 +2222,14 @@ impl CudaWorker {
         };
         let tokenizer_path = model_dir.join("tokenizer.json");
         if !tokenizer_path.exists() {
-            info!("CudaWorker: no tokenizer.json found, grammar-guided decoding unavailable");
+            info!("FerriteWorker: no tokenizer.json found, grammar-guided decoding unavailable");
             return;
         }
         let tokenizer_bytes = match std::fs::read(&tokenizer_path) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
-                    "CudaWorker: failed to read tokenizer.json for grammar factory: {e}"
+                    "FerriteWorker: failed to read tokenizer.json for grammar factory: {e}"
                 );
                 return;
             }
@@ -2193,11 +2237,11 @@ impl CudaWorker {
 
         match vllm_model::grammar::build_parser_factory(&tokenizer_bytes) {
             Ok(factory) => {
-                info!("CudaWorker: grammar parser factory built");
+                info!("FerriteWorker: grammar parser factory built");
                 self.grammar_factory = Some(factory);
             }
             Err(e) => {
-                tracing::warn!("CudaWorker: failed to build grammar parser factory: {e}");
+                tracing::warn!("FerriteWorker: failed to build grammar parser factory: {e}");
             }
         }
     }
@@ -4877,7 +4921,7 @@ impl CudaWorker {
             // we use raw pointers to satisfy the borrow checker while keeping
             // all three accessible simultaneously.
             let attn_output = unsafe {
-                let self_ptr: *const CudaWorker = self;
+                let self_ptr: *const FerriteWorker = self;
                 let device_ptr: *mut GpuDevice = self.device.as_mut().unwrap();
                 let kv_cache_ptr: *const KvCachePool = self.kv_cache.as_ref().unwrap();
                 (*self_ptr).execute_attention_layer(
@@ -5039,7 +5083,18 @@ impl CudaWorker {
 // Worker trait implementation
 // ---------------------------------------------------------------------------
 
-impl Worker for CudaWorker {
+// Phase F note: the cuda and metal `impl Worker for FerriteWorker` blocks
+// are cfg-mutex'd — each compile sees exactly one. Method bodies that
+// genuinely differ (load_model dispatcher, initialize_cache shape,
+// execute_model body, sampling, determine_available_memory profile path,
+// compile_or_warm_up_model) live separately rather than as `#[cfg]` arms
+// inside one `fn`, because the cuda bodies are large and call cuda-only
+// helpers that don't compile under metal. Per-method `#[cfg]` arms would
+// expand to ~2k lines of dead-under-metal code that still has to type-
+// check; cfg-gated blocks are the same shape with less surface.
+
+#[cfg(feature = "cuda")]
+impl Worker for FerriteWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
         let device = GpuDevice::new(self.config.device_id)
             .map_err(|e| ExecutorError::WorkerInit(format!("GpuDevice init failed: {e}")))?;
@@ -5062,7 +5117,7 @@ impl Worker for CudaWorker {
 
         // 1. Resolve model directory (or GGUF file path).
         let model_dir = self.resolve_model_path()?;
-        info!("CudaWorker: loading model from {}", model_dir.display());
+        info!("FerriteWorker: loading model from {}", model_dir.display());
 
         let device = self
             .device
@@ -5135,11 +5190,11 @@ impl Worker for CudaWorker {
                 _ => GpuDType::BF16,
             },
         };
-        info!("CudaWorker: using dtype {:?}", dtype);
+        info!("FerriteWorker: using dtype {:?}", dtype);
 
         // 4. Look up architecture.
         let arch = hf_config.architectures.first().cloned().unwrap_or_default();
-        info!("CudaWorker: architecture = {arch}");
+        info!("FerriteWorker: architecture = {arch}");
 
         // 5. Parse weight files. Safetensors stays CPU-mmap'd (lazy
         // upload via take()); GGUF is eagerly uploaded via the
@@ -5159,7 +5214,7 @@ impl Worker for CudaWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
-        info!("CudaWorker: parsed {} weight tensors", weights.len());
+        info!("FerriteWorker: parsed {} weight tensors", weights.len());
         let uses_ggml = weights.is_gguf();
         let device = self.device.as_ref().unwrap();
 
@@ -5174,14 +5229,14 @@ impl Worker for CudaWorker {
             let merged = weights
                 .merge_lora(&adapter_dir)
                 .map_err(|e| ExecutorError::WorkerInit(format!("LoRA merge: {e}")))?;
-            info!("CudaWorker: merged {merged} LoRA weight tensors");
+            info!("FerriteWorker: merged {merged} LoRA weight tensors");
         }
 
         // 6. Detect quantization config.
         let qconfig = quant::detect_quant_config(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("quant config detection: {e}")))?;
         if qconfig.is_quantized() {
-            info!("CudaWorker: detected quantization: {:?}", qconfig);
+            info!("FerriteWorker: detected quantization: {:?}", qconfig);
             if self.config.lora_adapter.is_some() {
                 return Err(ExecutorError::WorkerInit(
                     "LoRA with quantized models requires Punica kernels (not yet implemented)"
@@ -5313,7 +5368,7 @@ impl Worker for CudaWorker {
                 // manifest's bounds/scalars/rope_scaling. Nothing
                 // for the executor to do.
                 info!(
-                    "CudaWorker: loaded {} via ferrite-forward ({})",
+                    "FerriteWorker: loaded {} via ferrite-forward ({})",
                     arch,
                     ferrite_weights.arch_name(),
                 );
@@ -5336,7 +5391,7 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward MM load: {e}")))?;
                 if mm.is_some() {
                     info!(
-                        "CudaWorker: loaded {} vision encoder via ferrite-forward",
+                        "FerriteWorker: loaded {} vision encoder via ferrite-forward",
                         arch
                     );
                 }
@@ -6130,7 +6185,7 @@ impl Worker for CudaWorker {
         }
 
         info!(
-            "CudaWorker: model loaded in {:.1}s",
+            "FerriteWorker: model loaded in {:.1}s",
             t0.elapsed().as_secs_f64()
         );
         Ok(())
@@ -6220,7 +6275,7 @@ impl Worker for CudaWorker {
             } else {
                 "Qwen3Next"
             };
-            info!("CudaWorker: {tag} model — skipping activation profiling, using fixed estimate");
+            info!("FerriteWorker: {tag} model — skipping activation profiling, using fixed estimate");
             let (free, total) = cudarc::driver::result::mem_get_info()
                 .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
             let weights_and_overhead = total.saturating_sub(free);
@@ -6255,7 +6310,7 @@ impl Worker for CudaWorker {
         let (free_before, _total) = cudarc::driver::result::mem_get_info()
             .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
         info!(
-            "CudaWorker: {:.0} MB free VRAM",
+            "FerriteWorker: {:.0} MB free VRAM",
             free_before as f64 / 1_048_576.0
         );
 
@@ -6432,25 +6487,25 @@ impl Worker for CudaWorker {
 
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
         if self.config.enforce_eager {
-            info!("CudaWorker: --enforce-eager set, skipping CUDA graph capture");
+            info!("FerriteWorker: --enforce-eager set, skipping CUDA graph capture");
             return Ok(());
         }
 
         if self.uses_ggml {
             info!(
-                "CudaWorker: GGML model — skipping CUDA graph capture (incompatible with graph capture)"
+                "FerriteWorker: GGML model — skipping CUDA graph capture (incompatible with graph capture)"
             );
             return Ok(());
         }
 
         if self.qwen3_next_config.is_some() {
-            info!("CudaWorker: Qwen3Next — skipping CUDA graph capture (GDN recurrent state)");
+            info!("FerriteWorker: Qwen3Next — skipping CUDA graph capture (GDN recurrent state)");
             return Ok(());
         }
 
         if self.kv_cache_is_fp8 {
             info!(
-                "CudaWorker: FP8 KV cache — skipping CUDA graph capture (variable scratch buffer sizes)"
+                "FerriteWorker: FP8 KV cache — skipping CUDA graph capture (variable scratch buffer sizes)"
             );
             return Ok(());
         }
@@ -6470,7 +6525,7 @@ impl Worker for CudaWorker {
                 .cuda_graph_mode
                 .resolve(device.sm_version, self.config.tp_world_size);
             info!(
-                "CudaWorker: resolved cuda_graph_mode {:?} → {:?} (SM{}, TP={})",
+                "FerriteWorker: resolved cuda_graph_mode {:?} → {:?} (SM{}, TP={})",
                 self.config.cuda_graph_mode, resolved, device.sm_version, self.config.tp_world_size
             );
             self.config.cuda_graph_mode = resolved;
@@ -6479,7 +6534,7 @@ impl Worker for CudaWorker {
         // Encoder models don't support CUDA graph capture (no decode loop).
         if model.is_ferrite_encoder() {
             self.config.cuda_graph_mode = CudaGraphMode::None;
-            info!("CudaWorker: encoder model — disabling CUDA graphs");
+            info!("FerriteWorker: encoder model — disabling CUDA graphs");
         }
 
         unsafe { driver::ctx_set_current(device.ctx) }
@@ -6789,7 +6844,7 @@ impl Worker for CudaWorker {
             return Ok(());
         }
 
-        info!("CudaWorker: sleeping (level {level}) — freeing GPU memory");
+        info!("FerriteWorker: sleeping (level {level}) — freeing GPU memory");
 
         // Flush any deferred D2H commit.
         if self.pending_commit.take().is_some()
@@ -6849,12 +6904,12 @@ impl Worker for CudaWorker {
             unsafe { dev.caching.release_all() };
         }
 
-        info!("CudaWorker: sleep complete — GPU memory released");
+        info!("FerriteWorker: sleep complete — GPU memory released");
         Ok(())
     }
 
     fn wake_up(&mut self, _tags: Option<&[String]>) -> ExecutorResult<()> {
-        info!("CudaWorker: waking up — reloading model and KV cache");
+        info!("FerriteWorker: waking up — reloading model and KV cache");
 
         // Re-bind cuBLAS workspace — sleep's release_all() freed the old one.
         if let Some(ref mut dev) = self.device {
@@ -6873,7 +6928,7 @@ impl Worker for CudaWorker {
         // Re-capture CUDA graphs.
         self.compile_or_warm_up_model()?;
 
-        info!("CudaWorker: wake complete");
+        info!("FerriteWorker: wake complete");
         Ok(())
     }
 
@@ -7002,9 +7057,10 @@ impl Worker for CudaWorker {
 
         Ok(results)
     }
-} // end impl Worker for CudaWorker
+} // end impl Worker for FerriteWorker
 
-impl CudaWorker {
+#[cfg(feature = "cuda")]
+impl FerriteWorker {
     fn execute_model_inner(
         &mut self,
         scheduler_output: &SchedulerOutput,
@@ -8975,9 +9031,10 @@ impl CudaWorker {
             device,
         );
     }
-} // end impl CudaWorker (execute_model_inner)
+} // end impl FerriteWorker (execute_model_inner)
 
 /// Read-only batch context passed to `update_logits_processors`.
+#[cfg(feature = "cuda")]
 struct LogitsUpdateCtx<'a> {
     batch_changed: bool,
     num_reqs: usize,
@@ -8991,7 +9048,7 @@ struct LogitsUpdateCtx<'a> {
 ///   non_kv_cache = weights_and_overhead + peak_activations + 150 MiB
 ///   available_kv_bytes = requested - non_kv_cache
 ///
-/// This is the exact logic used in `CudaWorker::determine_available_memory`.
+/// This is the exact logic used in `FerriteWorker::determine_available_memory`.
 pub fn compute_available_kv_bytes(
     total_memory: usize,
     weights_and_overhead: usize,
@@ -9016,7 +9073,7 @@ mod tests {
     ///   available_kv = requested - non_kv_cache
     ///
     /// This test allocates known amounts of GPU memory, then calls
-    /// `compute_available_kv_bytes` (the same formula CudaWorker uses)
+    /// `compute_available_kv_bytes` (the same formula FerriteWorker uses)
     /// and verifies the result matches manual Python-style calculation.
     #[test]
     fn test_kv_cache_budget_matches_python_formula() {
@@ -9184,5 +9241,160 @@ mod tests {
             1025..=2048 => 8,
             _ => 16,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metal arm (Phase F: cfg-mutex extension; Step 2 = instantiate-only).
+// ---------------------------------------------------------------------------
+//
+// The metal `new()` constructor + `Worker` impl live in their own
+// cfg-gated blocks rather than as `#[cfg]` arms inside the cuda
+// constructor / cuda Worker impl. The cuda body is ~3500 lines that
+// call cuda-only helpers (CudaModel dispatch, CudaGraphRunner, NCCL
+// PP, FP8 scales, LogitsProcessorPipeline, GdnStatePool, …); none
+// of those compile under metal, so wrapping each cuda body with an
+// `#[cfg(feature = "cuda")] { … }` arm would still drag the
+// dead-under-metal code through type-checking. Per the Phase F
+// rules, the FerriteWorker struct stays one struct with cfg-mutex'd
+// fields; the trait impl uses cfg-mutex'd blocks for the same reason
+// the macro emission uses cfg-mutex'd `Weights` blocks.
+//
+// Step 2 wires `init_device` / `shutdown` / `rank` etc. and stubs the
+// heavy lifecycle methods (`load_model`, `initialize_cache`,
+// `execute_model`, `compile_or_warm_up_model`,
+// `determine_available_memory`) so vllm-serve can instantiate a
+// FerriteWorker under metal. Step 3 fills those bodies in via the
+// per-arch `metal_pool()` factory + `MetalWorkerPool::forward`.
+
+#[cfg(feature = "metal")]
+impl FerriteWorker {
+    pub fn new(config: FerriteWorkerConfig) -> Self {
+        let is_pooling = config.is_pooling;
+        let pooling_strategy = config
+            .pooling_strategy
+            .parse::<vllm_model::embedding::PoolingStrategy>()
+            .unwrap_or(vllm_model::embedding::PoolingStrategy::Last);
+        Self {
+            config,
+            kv_cache: None,
+            model_dir: None,
+            hf_config: None,
+            // Metal forward currently produces f16 outputs; cuda's "auto"
+            // resolves to bf16 from the checkpoint, but ferrite-metal's
+            // shaders are specialized on f16 and the worker only needs
+            // this dtype to size KV cache slots, which Step 3 will revise.
+            model_dtype: GpuDType::F16,
+            resolved_architecture: None,
+            is_shutdown: false,
+            token_buffers: HashMap::new(),
+            prompt_lengths: HashMap::new(),
+            annotation_buffers: HashMap::new(),
+            mm_data_buffers: HashMap::new(),
+            sampling_params_map: HashMap::new(),
+            input_batch: InputBatch::new(),
+            preloaded_tokenizer: None,
+            pooling_strategy,
+            is_pooling,
+            batch_changed: false,
+            batch_req_ids: Vec::new(),
+            seeded_rngs: HashMap::new(),
+            progress_callback: None,
+            metal_device: None,
+        }
+    }
+
+    /// Set the progress callback for startup loading.
+    pub fn set_progress_callback(
+        &mut self,
+        cb: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+    ) {
+        self.progress_callback = Some(cb);
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Worker for FerriteWorker {
+    fn init_device(&mut self) -> ExecutorResult<()> {
+        let device = ferrite_metal_kernels::detect_device().ok_or_else(|| {
+            ExecutorError::WorkerInit("no Metal device available".to_string())
+        })?;
+        self.metal_device = Some(std::sync::Arc::new(device));
+        info!("FerriteWorker(metal): Metal device initialized");
+        Ok(())
+    }
+
+    fn load_model(&mut self) -> ExecutorResult<()> {
+        // Step 3 wires per-arch `metal_pool()` dispatch through here.
+        // For Step 2 ("instantiate"), surface a clear error that names the
+        // unfinished hop rather than panicking on a stub.
+        Err(ExecutorError::WorkerExecution(
+            "FerriteWorker(metal)::load_model not yet wired — Phase F Step 3 \
+             will dispatch to the per-arch metal_pool() factory"
+                .to_string(),
+        ))
+    }
+
+    fn initialize_cache(
+        &mut self,
+        _num_gpu_blocks: usize,
+        _num_cpu_blocks: usize,
+    ) -> ExecutorResult<()> {
+        Err(ExecutorError::WorkerExecution(
+            "FerriteWorker(metal)::initialize_cache not yet wired — Phase F Step 3"
+                .to_string(),
+        ))
+    }
+
+    fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
+        // Conservative default until the metal profile path lands; vllm-serve
+        // also accepts an explicit kv-cache-bytes override via CLI.
+        Err(ExecutorError::WorkerExecution(
+            "FerriteWorker(metal)::determine_available_memory not yet wired — \
+             Phase F Step 3"
+                .to_string(),
+        ))
+    }
+
+    fn execute_model(
+        &mut self,
+        _scheduler_output: &SchedulerOutput,
+    ) -> ExecutorResult<ModelRunnerOutput> {
+        Err(ExecutorError::WorkerExecution(
+            "FerriteWorker(metal)::execute_model not yet wired — Phase F Step 3 \
+             dispatches to MetalWorkerPool::forward + argmax_f16"
+                .to_string(),
+        ))
+    }
+
+    fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
+        // Metal pipelines are JIT-compiled lazily via the MetalWorkerPool's
+        // function-constant cache; no eager warmup needed for Step 2.
+        Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        self.is_shutdown = true;
+        self.metal_device = None;
+    }
+
+    fn rank(&self) -> usize {
+        self.config.tp_rank
+    }
+
+    fn local_rank(&self) -> usize {
+        self.config.tp_rank
+    }
+
+    fn is_driver_worker(&self) -> bool {
+        self.config.tp_rank == 0
+    }
+
+    fn take_preloaded_tokenizer(&mut self) -> Option<tokenizers::Tokenizer> {
+        self.preloaded_tokenizer.take()
+    }
+
+    fn architecture(&self) -> Option<String> {
+        self.resolved_architecture.clone()
     }
 }

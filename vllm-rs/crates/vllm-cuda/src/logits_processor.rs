@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! LogitsProcessor framework for CudaWorker — mirrors Python vLLM's
+//! LogitsProcessor framework for FerriteWorker — mirrors Python vLLM's
 //! `vllm/v1/sample/logits_processor/` architecture.
 //!
 //! Each processor maintains persistent GPU state that is rebuilt only when
@@ -532,7 +532,7 @@ impl LogitsProcessor for MinTokensProcessor {
                     // total - prompt length. But we store output tokens only
                     // starting from decode, so buf.len() tracks total tokens
                     // including prompt. We need the output token count.
-                    // Actually, token_buffers in CudaWorker stores prompt_ids
+                    // Actually, token_buffers in FerriteWorker stores prompt_ids
                     // initially then appends generated tokens. The "generated"
                     // count is tracked by the scheduler. For min_tokens, we
                     // check if the number of generated tokens (output tokens)
@@ -698,7 +698,7 @@ impl LogitsProcessor for AllowedTokenIdsProcessor {
 
     fn apply(&self, _logits: GpuTensor, _device: &mut GpuDevice) {
         // apply_with_backup is used instead (needs backup logits).
-        // This is a no-op; the CudaWorker calls apply_with_backup directly.
+        // This is a no-op; the FerriteWorker calls apply_with_backup directly.
     }
 
     fn is_argmax_invariant(&self) -> bool {

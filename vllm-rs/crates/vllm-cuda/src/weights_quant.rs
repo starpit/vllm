@@ -2916,7 +2916,7 @@ mod tests {
         )
         .unwrap();
 
-        // Strip "model." prefix to match what CudaWorker does.
+        // Strip "model." prefix to match what FerriteWorker does.
         // Actually, merge_lora looks for "{prefix}.weight" keys, so let's check
         // what keys we have.
         let keys: Vec<String> = gw.tensors.keys().cloned().collect();

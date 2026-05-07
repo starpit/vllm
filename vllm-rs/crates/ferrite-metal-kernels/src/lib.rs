@@ -8,6 +8,7 @@
 
 pub mod activation;
 pub mod allocator;
+pub mod argmax;
 pub mod awq;
 pub mod device;
 pub mod fused_kernels;

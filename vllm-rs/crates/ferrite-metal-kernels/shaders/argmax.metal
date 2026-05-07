@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project
+
+#include <metal_stdlib>
+using namespace metal;
+
+// ---------------------------------------------------------------------------
+// argmax_f16 — greedy sampler.
+//
+// Input:  logits[batch, vocab]   (half)
+// Output: token  [batch]         (uint)
+//
+// Dispatch: threadgroups (batch, 1, 1), threads_per_threadgroup
+// (TG_SIZE, 1, 1) where TG_SIZE is a power of 2 ≤ 1024. One
+// threadgroup per batch row; threads in a group cooperate over the
+// `vocab` axis. Each thread keeps a (max_val, max_idx) running pair
+// over its strided slice; a power-of-two reduction in threadgroup
+// memory yields the per-row argmax.
+//
+// Tie-break: on equal-max values the smaller index wins, matching
+// the numpy / torch `argmax` convention. Keeps results
+// deterministic across thread schedule changes (e.g. different
+// threadgroup sizes for the same input).
+//
+// Vocab can exceed `TG_SIZE` (50K-150K is typical for LLMs); each
+// thread may walk many elements. Reduction overhead is bounded by
+// `log2(TG_SIZE)` barriers.
+//
+// Bindings (must match `argmax::dispatch_argmax_f16`):
+//   buffer(0) = logits  [batch, vocab]   half
+//   buffer(1) = output  [batch]          uint
+//   buffer(2) = batch   constant uint
+//   buffer(3) = vocab   constant uint
+// ---------------------------------------------------------------------------
+kernel void argmax_f16(
+    device const half*  logits   [[buffer(0)]],
+    device       uint*  output   [[buffer(1)]],
+    constant     uint&  batch    [[buffer(2)]],
+    constant     uint&  vocab    [[buffer(3)]],
+    uint  gid [[threadgroup_position_in_grid]],
+    uint  tid [[thread_position_in_threadgroup]],
+    uint  tg  [[threads_per_threadgroup]])
+{
+    if (gid >= batch) return;
+
+    threadgroup float shared_max[1024];
+    threadgroup uint  shared_idx[1024];
+
+    // Per-thread reduction over a strided slice of the vocab axis.
+    float local_max = -INFINITY;
+    uint  local_idx = 0;
+
+    device const half* row = logits + uint(gid) * vocab;
+    for (uint i = tid; i < vocab; i += tg) {
+        float v = float(row[i]);
+        // Tie-break on smaller index — needed to make per-thread
+        // intermediate state agree with the final reduction's
+        // tie-break before any cross-thread compare happens.
+        if (v > local_max || (v == local_max && i < local_idx)) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    shared_max[tid] = local_max;
+    shared_idx[tid] = local_idx;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction. Pairwise compare; on tie, keep the smaller
+    // index. `tg` is power-of-two by contract (caller picks 256 /
+    // 512 / 1024 as appropriate).
+    for (uint stride = tg / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float a  = shared_max[tid];
+            float b  = shared_max[tid + stride];
+            uint  ai = shared_idx[tid];
+            uint  bi = shared_idx[tid + stride];
+            if (b > a || (b == a && bi < ai)) {
+                shared_max[tid] = b;
+                shared_idx[tid] = bi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        output[gid] = shared_idx[0];
+    }
+}

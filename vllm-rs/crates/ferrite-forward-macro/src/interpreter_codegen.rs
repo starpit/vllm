@@ -134,16 +134,32 @@ pub fn colored_slot_map(
     // points at the *flattened* owner, so we resolve chains for the
     // last-use extension below; for the color-distinction constraint
     // we use the resolved owner since that's what the View holds.
+    //
+    // `view_alias` parallel-tracks dst keys whose producing Impl
+    // declares `output_alias_is_view = true` — Reshape and RopeAppend
+    // today. Those dst slots are EXCLUDED from same-shape collapse
+    // (the next-block decision): the eval body writes
+    // `TileEntry::Reshaped { ref_slot, tensor }` at dst, which would
+    // overwrite-and-drop the owner's `OwnedTensor` if dst shared the
+    // owner's color. Forcing dst to its own color guarantees
+    // `out_slot != in_slot` at the runtime level — the precondition
+    // that lets `Instruction::Reshape::eval` and `RopeAppend::eval`
+    // drop their `pinned_owned` runtime safety net.
     let mut alias_to_owner: HashMap<(TileId, u8), (TileId, u8)> = HashMap::new();
+    let mut view_alias: HashSet<(TileId, u8)> = HashSet::new();
     for &sg in &order_arr {
         let imp_id = sfuf
             .impl_of(sg)
             .expect("every scheduled subgraph has an Impl");
         let imp = lib.get(imp_id);
         let claimed = sfuf.tiles_in_subgraph(sg);
+        let is_view = imp.output_alias_is_view();
         for (dst, src_opt) in imp.output_alias(&claimed, fuf) {
             if let Some(src) = src_opt {
                 alias_to_owner.insert(dst, src);
+                if is_view {
+                    view_alias.insert(dst);
+                }
             }
         }
     }
@@ -287,7 +303,20 @@ pub fn colored_slot_map(
         // Same-shape alias collapse: dst pins to owner's color.
         // No active entry (the owner's already covers the combined
         // lifetime via `owner_last_use` resolution).
-        if is_alias {
+        //
+        // EXCEPT for view aliases (Reshape, RopeAppend): the eval
+        // body writes `TileEntry::Reshaped { ref_slot, tensor }` at
+        // dst's color, which — if collapsed to owner's color — would
+        // overwrite-and-drop the owner's `OwnedTensor`, freeing the
+        // GPU memory the new `Reshaped` aliases. The
+        // `Implementation::output_alias_is_view` discriminant marks
+        // these; force them down the different-color path. Since
+        // shape pools partition by shape, dst still gets its own
+        // color, the prelude emits an `Op::Alias` row writing
+        // `View { ref_slot: owner_color }`, and the eval body's
+        // overwrite drops only that View — the owner stays alive at
+        // its own slot.
+        if is_alias && !view_alias.contains(&(tile, slot)) {
             let owner = resolve((tile, slot));
             let owner_shape = fuf.get(owner.0).outputs[owner.1 as usize].clone();
             if owner_shape == tile_shape {
@@ -1122,6 +1151,7 @@ mod tests {
         name: &'static str,
         alias_to: Option<(TileId, u8)>,
         consumes: Vec<(TileId, u8)>,
+        view_alias: bool,
     }
 
     impl crate::impl_lib::Implementation for StubImpl {
@@ -1180,6 +1210,9 @@ mod tests {
         }
         fn consumes_input_tiles(&self, _claimed: &[TileId], _fuf: &Fuf) -> Vec<(TileId, u8)> {
             self.consumes.clone()
+        }
+        fn output_alias_is_view(&self) -> bool {
+            self.view_alias
         }
     }
 
@@ -1241,6 +1274,7 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(&[TileId(0), TileId(1), TileId(2)], &[id_plain; 3]);
         let lp = linear_loop(3);
@@ -1271,6 +1305,7 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2), TileId(3)],
@@ -1308,6 +1343,7 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(&[TileId(0), TileId(1), TileId(2)], &[id_plain; 3]);
         let lp = linear_loop(3);
@@ -1349,11 +1385,13 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let id_alias = lib.push(Box::new(StubImpl {
             name: "stub_alias",
             alias_to: Some((TileId(0), 0)),
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2)],
@@ -1427,12 +1465,14 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let id_all_reduce = lib.push(Box::new(StubImpl {
             name: "all_reduce",
             // Same-shape in-place: dst slot 0 aliases gemm output.
             alias_to: Some((TileId(0), 0)),
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2)],
@@ -1484,11 +1524,13 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let id_alias = lib.push(Box::new(StubImpl {
             name: "stub_reshape",
             alias_to: Some((TileId(0), 0)),
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2)],
@@ -1502,6 +1544,142 @@ mod tests {
             sm.of(TileId(0), 0),
             sm.of(TileId(1), 0),
             "different-shape alias dst needs its own slot for the View entry",
+        );
+    }
+
+    /// Same-shape *view* alias (Reshape / RopeAppend) MUST get its
+    /// own color, never collapse onto the owner's. The eval body
+    /// writes `TileEntry::Reshaped { ref_slot, tensor }` at the dst;
+    /// if dst shared the owner's color, the overwrite would drop the
+    /// owner's `OwnedTensor` and free the GPU memory the new
+    /// `Reshaped` aliases — silent UAF when a downstream
+    /// `caching.alloc_tensor` reuses the freed block.
+    ///
+    /// Witness for the G.7(e.tail.2) gemma3-mm "second image returns
+    /// NaN logits / `<pad>` tokens" bug: in real bodies the dst and
+    /// owner shapes differ and the prior same-shape collapse path
+    /// didn't fire, but a future arch with a same-shape Reshape (or
+    /// a Reshape synthesized by `apply_reshape_hints` whose target
+    /// shape happens to match the producer's structurally — e.g.,
+    /// `Dim`-equal vectors over the same bound names) would. The
+    /// `Implementation::output_alias_is_view` discriminant marks the
+    /// hazard at the codegen layer; this test pins that
+    /// `colored_slot_map` honors it.
+    #[test]
+    fn coloring_same_shape_view_alias_keeps_own_slot() {
+        // Synthetic body: `add → reshape (same-shape) → add`. Only
+        // path that gets dst.shape == owner.shape from a Reshape is
+        // an identity-shape reshape; this is the worst case the
+        // colorer must defend against.
+        let f = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Add,
+                    inputs: vec![],
+                    outputs: vec![vec![Dim::Lit(6)]],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Reshape,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    // Identity-shape reshape: structurally `[6]`, same
+                    // as upstream. Pre-fix this triggered same-shape
+                    // collapse and `out_slot == in_slot`.
+                    outputs: vec![vec![Dim::Lit(6)]],
+                },
+                add_tile(2, &[(TileId(1), 0)]),
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let id_plain = lib.push(Box::new(StubImpl {
+            name: "stub",
+            alias_to: None,
+            consumes: vec![],
+            view_alias: false,
+        }));
+        let id_view_alias = lib.push(Box::new(StubImpl {
+            name: "stub_reshape_view",
+            alias_to: Some((TileId(0), 0)),
+            consumes: vec![],
+            view_alias: true,
+        }));
+        let sfuf = linear_assignment(
+            &[TileId(0), TileId(1), TileId(2)],
+            &[id_plain, id_view_alias, id_plain],
+        );
+        let lp = linear_loop(3);
+        let protected: HashSet<(TileId, u8)> = HashSet::new();
+        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+
+        assert_ne!(
+            sm.of(TileId(0), 0),
+            sm.of(TileId(1), 0),
+            "view alias (output_alias_is_view = true) must get its \
+             own color even when dst.shape == owner.shape — runtime \
+             eval body writes Reshaped at dst, which would UAF the \
+             owner's OwnedTensor on overwrite if collapsed",
+        );
+    }
+
+    /// Counterexample to `coloring_same_shape_view_alias_keeps_own_slot`:
+    /// the SAME synthetic FUF, but the alias-producing Impl declares
+    /// `output_alias_is_view = false` (in-place mutation semantics).
+    /// Same-shape collapse fires; dst shares the owner's color.
+    /// Pins that the discriminant flips behavior cleanly without
+    /// regressing the in-place AllReduce / FusedAddRmsNorm path.
+    #[test]
+    fn coloring_same_shape_inplace_alias_collapses() {
+        let f = Fuf {
+            nodes: vec![
+                FufNode {
+                    id: TileId(0),
+                    op: OpKind::Add,
+                    inputs: vec![],
+                    outputs: vec![vec![Dim::Lit(6)]],
+                },
+                FufNode {
+                    id: TileId(1),
+                    op: OpKind::Add,
+                    inputs: vec![FufInput::Tile {
+                        id: TileId(0),
+                        slot: 0,
+                    }],
+                    outputs: vec![vec![Dim::Lit(6)]],
+                },
+                add_tile(2, &[(TileId(1), 0)]),
+            ],
+        };
+        let mut lib = ImplementationLibrary::new();
+        let id_plain = lib.push(Box::new(StubImpl {
+            name: "stub",
+            alias_to: None,
+            consumes: vec![],
+            view_alias: false,
+        }));
+        let id_inplace = lib.push(Box::new(StubImpl {
+            name: "stub_inplace",
+            alias_to: Some((TileId(0), 0)),
+            consumes: vec![],
+            view_alias: false,
+        }));
+        let sfuf = linear_assignment(
+            &[TileId(0), TileId(1), TileId(2)],
+            &[id_plain, id_inplace, id_plain],
+        );
+        let lp = linear_loop(3);
+        let protected: HashSet<(TileId, u8)> = HashSet::new();
+        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+
+        assert_eq!(
+            sm.of(TileId(0), 0),
+            sm.of(TileId(1), 0),
+            "in-place same-shape alias still collapses to owner's \
+             color — the kernel mutates the owner's buffer, downstream \
+             reads find the mutated data at the same slot",
         );
     }
 
@@ -1540,6 +1718,7 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
+            view_alias: false,
         }));
         let sfuf = linear_assignment(&[TileId(0), TileId(1)], &[id_plain; 2]);
         let lp = linear_loop(2);

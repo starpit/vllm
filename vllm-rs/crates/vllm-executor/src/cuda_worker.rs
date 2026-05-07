@@ -1689,11 +1689,18 @@ pub struct CudaWorker {
     annotation_buffers: HashMap<String, vllm_common::BlockAnnotations>,
     /// Per-request multimodal data (images), only populated for requests
     /// scheduled at first as image-bearing. The vision encoder runs once
-    /// per request at first prefill, so the cached entry is removed after
-    /// that step (image tokens beyond the first prefill chunk continue to
-    /// reference the spliced embeds via the KV cache's stored attention
-    /// keys/values — no re-encode needed).
+    /// per request — the projected `[total_mm_tokens, hidden]` buffer
+    /// lives in `mm_embeds_cache` until the request finishes so chunked-
+    /// prefill steps can splice the right windowed slice into each chunk's
+    /// Embed tile. Both maps are cleared on `release_request`.
     mm_data_buffers: HashMap<String, vllm_common::MultimodalData>,
+    /// Per-request cached vision-encoder output `[total_mm_tokens, hidden]`,
+    /// produced lazily by `run_mm_vision_forward` on the first chunk that
+    /// overlaps any image placeholder for the request. Survives across
+    /// chunked-prefill steps so each chunk can window into the same buffer
+    /// (Bug 4 / Known limitation #1: chunked-prefill across image-placeholder
+    /// boundaries). Dropped on `release_request`.
+    mm_embeds_cache: HashMap<String, OwnedTensor>,
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
@@ -1821,6 +1828,7 @@ impl CudaWorker {
             prompt_lengths: HashMap::new(),
             annotation_buffers: HashMap::new(),
             mm_data_buffers: HashMap::new(),
+            mm_embeds_cache: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
@@ -2521,34 +2529,47 @@ impl CudaWorker {
         ))
     }
 
-    /// Run the vision encoder for any active request whose first prefill
-    /// chunk includes its image placeholders. Returns
-    /// `(mm_embeds, embed_patches)` ready to thread into
-    /// `MmForwardInputs` — `mm_embeds` is `[total_mm_tokens, hidden]`,
-    /// `embed_patches[i].token_offset` is the destination row in the
-    /// flat input-id sequence (post batch concatenation).
+    /// Run the vision encoder for any active request whose chunk window
+    /// overlaps any of its image placeholders, then build a per-chunk
+    /// staging `mm_embeds` + windowed `EmbedPatch` list ready to thread
+    /// into `MmForwardInputs`.
     ///
-    /// Returns `None` when there's nothing to encode this step:
+    /// Returns `None` when there's nothing to splice this step:
     /// - non-Ferrite arch, or Ferrite arch with no MM handle (text-only),
     /// - no req in the active batch carries `mm_data`,
-    /// - no MM-bearing req is at its first scheduling step
-    ///   (`tokens_before == 0`).
+    /// - every MM req's chunk window `[tokens_before, tokens_before + q_len)`
+    ///   misses every image placeholder in seq space.
     ///
-    /// MVP: assumes the prefill chunk for an MM-bearing req covers ALL
-    /// its image placeholders (no chunked-prefill split across image
-    /// boundaries). For typical Qwen2-VL-2B prompts (256 tokens / image)
-    /// this holds inside a single 2048-token prefill chunk; the chunked
-    /// case is a follow-up.
+    /// Chunked-prefill (Bug 4 / Known limitation #1): the per-request
+    /// projected `[total_mm_tokens, hidden]` buffer is computed once via
+    /// `mm.vision_forward(...)` on the first chunk that overlaps any
+    /// placeholder for that request, then cached in `mm_embeds_cache`
+    /// keyed by `req_id`. Subsequent chunks reuse the cache. Per-chunk
+    /// patches are windowed to the chunk's
+    /// `[tokens_before, tokens_before + q_len)` extent: a placeholder at
+    /// seq positions `[s, s+L)` whose
+    /// overlap with the chunk window is `[ovl_lo, ovl_hi)` produces a
+    /// patch with chunk-local `token_offset = batch_offset +
+    /// (ovl_lo - tokens_before)`, length `ovl_hi - ovl_lo`, and pulls
+    /// `length` rows from the cached buffer starting at row
+    /// `cum_prior_lengths + (ovl_lo - s)`. Cache cleared on
+    /// `release_request`.
+    ///
+    /// Per-chunk slices from possibly-multiple cached buffers are
+    /// concatenated into a fresh staging `[chunk_overlap_rows, hidden]`
+    /// allocation so `Instruction::SpliceMmEmbeds::eval`'s implicit
+    /// running cursor over `mm_embeds` rows still maps each patch's
+    /// `length` rows to the right destination.
     ///
     /// # Safety
     /// `device` must be the live CUDA device the encoder kernels
     /// launch on. The returned `OwnedTensor` is on `device.compute_stream`
     /// — the caller must keep it alive across the language-side
-    /// `model.forward` call so the `Instruction::Embed::eval` D2D
-    /// splice still has live source memory.
+    /// `model.forward` call so the splice has live source memory.
     unsafe fn run_mm_vision_forward(
         model: &CudaModel,
         mm_data_buffers: &HashMap<String, vllm_common::MultimodalData>,
+        mm_embeds_cache: &mut HashMap<String, OwnedTensor>,
         prepared: &PreparedInputs,
         device: &mut GpuDevice,
     ) -> Option<(OwnedTensor, Vec<ferrite_forward::EmbedPatch>)> {
@@ -2557,42 +2578,135 @@ impl CudaWorker {
         };
         let mm = fm.mm.as_ref()?;
         let meta = &prepared.attn_meta;
-        let mut pixel_inputs: Vec<ferrite_forward::PixelInput<'_>> = Vec::new();
-        let mut placeholders: Vec<ferrite_forward::EmbedPatch> = Vec::new();
+
+        // Pass 1: walk the batch, compute per-chunk overlapping slices
+        // for every MM-bearing req. For each req with overlap, ensure
+        // `mm_embeds_cache` is populated (lazy vision_forward on first
+        // overlap). Collect (req_id, src_row, length, token_offset)
+        // tuples in batch order so the staging concat below preserves
+        // the patch-order invariant.
+        struct ChunkSlice {
+            req_id: String,
+            src_row: u32,
+            length: u32,
+            token_offset: u32,
+        }
+        let mut chunk_slices: Vec<ChunkSlice> = Vec::new();
         for (i, req) in prepared.req_inputs.iter().enumerate() {
             let Some(mm_data) = mm_data_buffers.get(&req.req_id) else {
                 continue;
             };
-            // Only run vision_forward for the first prefill chunk —
-            // subsequent decode steps consume already-spliced KV cache.
-            if meta.tokens_before[i] != 0 {
+            if mm_data.images.is_empty() {
                 continue;
             }
+            let tokens_before = meta.tokens_before[i] as u32;
+            let q_len = meta.q_lens[i] as u32;
+            let chunk_seq_lo = tokens_before;
+            let chunk_seq_hi = tokens_before + q_len;
             let batch_offset = meta.query_start_loc[i] as u32;
-            for (img, ph) in mm_data.images.iter().zip(mm_data.image_placeholders.iter()) {
-                pixel_inputs.push(ferrite_forward::PixelInput {
-                    pixels: &img.pixels,
-                    height: img.height as u32,
-                    width: img.width as u32,
-                });
-                placeholders.push(ferrite_forward::EmbedPatch {
-                    token_offset: batch_offset + ph.offset as u32,
-                    length: ph.length as u32,
-                    // Filled by `vision_forward` from per-image
-                    // `grid_thw` + `spatial_merge_size`. Default zero
-                    // here is invalid for MRoPE; the encoder must
-                    // populate before the executor reads them.
-                    grid_t: 0,
-                    grid_h_merged: 0,
-                    grid_w_merged: 0,
-                });
+
+            let mut req_overlap: Vec<ChunkSlice> = Vec::new();
+            let mut cum_off: u32 = 0;
+            for ph in mm_data.image_placeholders.iter() {
+                let ph_lo = ph.offset as u32;
+                let ph_hi = ph_lo + ph.length as u32;
+                let ovl_lo = chunk_seq_lo.max(ph_lo);
+                let ovl_hi = chunk_seq_hi.min(ph_hi);
+                if ovl_lo < ovl_hi {
+                    req_overlap.push(ChunkSlice {
+                        req_id: req.req_id.clone(),
+                        src_row: cum_off + (ovl_lo - ph_lo),
+                        length: ovl_hi - ovl_lo,
+                        token_offset: batch_offset + (ovl_lo - tokens_before),
+                    });
+                }
+                cum_off += ph.length as u32;
             }
+            if req_overlap.is_empty() {
+                continue;
+            }
+
+            // Lazy: only run vision_forward once per req, on the first
+            // chunk whose window overlaps any placeholder for that req.
+            if !mm_embeds_cache.contains_key(&req.req_id) {
+                let pixel_inputs: Vec<ferrite_forward::PixelInput<'_>> = mm_data
+                    .images
+                    .iter()
+                    .map(|img| ferrite_forward::PixelInput {
+                        pixels: &img.pixels,
+                        height: img.height as u32,
+                        width: img.width as u32,
+                    })
+                    .collect();
+                // `vision_forward` reads `placeholders[i].length` only as
+                // the per-image row count; token_offset is unused inside
+                // it (we re-window per chunk below). grid_* are filled
+                // on the returned Vec — discarded here because MRoPE
+                // positions go through `embed_patch_grids` instead.
+                let placeholders: Vec<ferrite_forward::EmbedPatch> = mm_data
+                    .image_placeholders
+                    .iter()
+                    .map(|ph| ferrite_forward::EmbedPatch {
+                        token_offset: 0,
+                        length: ph.length as u32,
+                        grid_t: 0,
+                        grid_h_merged: 0,
+                        grid_w_merged: 0,
+                    })
+                    .collect();
+                let (mm_embeds, _patches) =
+                    unsafe { mm.vision_forward(&pixel_inputs, &placeholders, device) };
+                mm_embeds_cache.insert(req.req_id.clone(), mm_embeds);
+            }
+
+            chunk_slices.extend(req_overlap);
         }
-        if pixel_inputs.is_empty() {
+
+        if chunk_slices.is_empty() {
             return None;
         }
-        let (out, patches) = unsafe { mm.vision_forward(&pixel_inputs, &placeholders, device) };
-        Some((out, patches))
+
+        // Pass 2: concat the chunk's per-slice rows from possibly-multiple
+        // cached `mm_embeds` buffers into a fresh staging `[total_rows,
+        // hidden]` tensor. Each patch's `length` rows live contiguously
+        // in staging so the splice eval's implicit running cursor maps
+        // patch i to staging rows `[sum(prior length), sum(prior length)
+        // + length)` — same invariant as the pre-fix non-chunked path.
+        let total_rows: usize = chunk_slices.iter().map(|s| s.length as usize).sum();
+        let first_buf = mm_embeds_cache
+            .get(&chunk_slices[0].req_id)
+            .expect("cached above");
+        let hidden = first_buf.dim(1);
+        let dtype = first_buf.dtype();
+        let staging = device.caching.alloc_tensor(&[total_rows, hidden], dtype);
+        let staging_gpu = staging.as_gpu_tensor();
+        let row_bytes = hidden * dtype.size_bytes();
+        let dst_base = staging_gpu.raw_ptr();
+
+        let mut out_patches: Vec<ferrite_forward::EmbedPatch> =
+            Vec::with_capacity(chunk_slices.len());
+        let mut dst_row: usize = 0;
+        for slice in &chunk_slices {
+            let src_buf = mm_embeds_cache.get(&slice.req_id).expect("cached above");
+            let src_base = src_buf.as_gpu_tensor().raw_ptr();
+            let src = unsafe { src_base.add((slice.src_row as usize) * row_bytes) };
+            let dst = unsafe { dst_base.add(dst_row * row_bytes) };
+            let bytes = (slice.length as usize) * row_bytes;
+            let _ = unsafe { driver::memcpy_dtod_async(dst, src, bytes, device.compute_stream) };
+            out_patches.push(ferrite_forward::EmbedPatch {
+                token_offset: slice.token_offset,
+                length: slice.length,
+                // grid_* unused on the splice path; MRoPE positions are
+                // built separately via `build_per_req_mm_seq_info` from
+                // `embed_patch_grids` (CPU-only, runs every step).
+                grid_t: 0,
+                grid_h_merged: 0,
+                grid_w_merged: 0,
+            });
+            dst_row += slice.length as usize;
+        }
+
+        Some((staging, out_patches))
     }
 
     /// Build per-req seq-space MM info for **every** MM-bearing req in
@@ -7038,6 +7152,7 @@ impl CudaWorker {
             self.prompt_lengths.remove(req_id);
             self.annotation_buffers.remove(req_id);
             self.mm_data_buffers.remove(req_id);
+            self.mm_embeds_cache.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
             #[cfg(feature = "guided-decoding")]
@@ -7396,6 +7511,16 @@ impl CudaWorker {
             // remaining. A cached request with num_scheduled > 1 that has already
             // completed its prefill is just a normal decode (e.g. spec decode or
             // scheduler batching artifact) and must NOT be re-armed.
+            //
+            // The "still has prompt remaining" check is `num_computed_here <
+            // prompt_len` (BEFORE this chunk processes anything). The previous
+            // form `num_computed_here + num_scheduled_for_req < prompt_len` was
+            // wrong for the LAST prefill chunk that exactly completes the prompt
+            // (e.g. prompt_len=1678, chunk 0 covered 1024 → chunk 1 with
+            // num_scheduled=654 satisfies 1024+654 == 1678, not strictly <):
+            // that chunk got skipped here, fell through to prepare_inputs as
+            // decode (q_len=1), and the worker silently dropped 653 prompt
+            // tokens. Surfaced by Bug 4 (`test_qwen2_vl_bug4_chunked_prefill_across_image`).
             let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
             let num_computed_here = scheduler_output
                 .scheduled_cached_reqs
@@ -7403,9 +7528,8 @@ impl CudaWorker {
                 .get(i)
                 .copied()
                 .unwrap_or(0) as usize;
-            let is_chunked_prefill_continuation = !is_resumed
-                && num_scheduled_for_req > 1
-                && num_computed_here + num_scheduled_for_req < prompt_len;
+            let is_chunked_prefill_continuation =
+                !is_resumed && num_scheduled_for_req > 1 && num_computed_here < prompt_len;
             if !is_resumed && !is_chunked_prefill_continuation {
                 continue;
             }
@@ -8751,7 +8875,13 @@ impl CudaWorker {
                     // could otherwise alias the same memory region
                     // before the splice kernel actually runs.
                     _mm_holder = unsafe {
-                        Self::run_mm_vision_forward(model, &self.mm_data_buffers, &prepared, device)
+                        Self::run_mm_vision_forward(
+                            model,
+                            &self.mm_data_buffers,
+                            &mut self.mm_embeds_cache,
+                            &prepared,
+                            device,
+                        )
                     };
                     // For image-bearing batches on MRoPE arches, override
                     // the 1D `gpu_positions` with a `[3, n_tokens]` u32

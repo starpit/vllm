@@ -619,6 +619,38 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         Vec::new()
     }
 
+    /// Discriminant on `output_alias` semantics: `true` for impls
+    /// whose eval body writes a `TileEntry::Reshaped { ref_slot,
+    /// tensor }` at the dst slot (a metadata-cloned view of the
+    /// owner's storage), `false` for impls whose kernel mutates the
+    /// owner's buffer in place and the dst slot is the same physical
+    /// buffer as the owner.
+    ///
+    /// `colored_slot_map` MUST NOT collapse a view alias (`true`
+    /// here) onto the owner's color, even when the dst and owner
+    /// shapes are structurally identical. The collapse path was
+    /// designed for in-place mutation aliases (`CutlassFusedAddRmsNormGemm`,
+    /// `FusedAddRmsNormImpl`, AllReduce-in-place, …) where the kernel
+    /// writes into the owner's buffer and downstream reads find the
+    /// mutated data at the same color. For a view alias, collapsing
+    /// places dst at the owner's slot; the eval body's
+    /// `tiles[dst] = Some(Reshaped { … })` overwrite then drops the
+    /// owner's `OwnedTensor`, freeing the GPU memory the new
+    /// `Reshaped` aliases — silent UAF when a downstream
+    /// `caching.alloc_tensor` reuses the freed block.
+    ///
+    /// The G.7(e.tail.2) gemma3-mm second-image-NaN bug was a
+    /// runtime witness of this hazard. Fixing it at the codegen
+    /// layer (here) eliminates the need for `InterpreterCtx::pinned_owned`,
+    /// the runtime safety net that pinned the prior `Owned` past the
+    /// overwrite.
+    ///
+    /// Default: `false` (in-place mutation aliases are the common
+    /// case; view aliases are limited to `Reshape` and `RopeAppend`).
+    fn output_alias_is_view(&self) -> bool {
+        false
+    }
+
     // ── Host-interpreter codegen ────────────────────────────────────
     //
     // Each Impl owns the shape of its own opcode — variant ident
@@ -1606,6 +1638,14 @@ impl Implementation for ReshapeRefImpl {
             _ => None,
         };
         vec![((reshape_id, 0), upstream)]
+    }
+
+    fn output_alias_is_view(&self) -> bool {
+        // Reshape's eval body writes `TileEntry::Reshaped` at the dst
+        // slot — see `Instruction::Reshape::eval`. Must NOT collapse
+        // onto the owner's color (would UAF the owner's `OwnedTensor`
+        // on overwrite).
+        true
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -7978,6 +8018,18 @@ impl Implementation for RopeAppendRefImpl {
             ((rope_id, 1), k_src),
             ((rope_id, 2), v_src),
         ]
+    }
+
+    fn output_alias_is_view(&self) -> bool {
+        // RopeAppend's eval body writes `TileEntry::Reshaped` at each
+        // of q_out/k_out/v_out — see `Instruction::RopeAppend::eval`.
+        // Inputs are 2D `[T, heads*head_dim]`; outputs are 3D
+        // `[T, heads, head_dim]`, so today's shapes already differ
+        // and same-shape collapse never fires for any in-tree arch.
+        // Setting this `true` is defense-in-depth: a future arch with
+        // a 3D-shaped Q upstream would otherwise inherit the same UAF
+        // hazard `Instruction::Reshape` had at G.7(e.tail.2).
+        true
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -16453,6 +16505,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            decoder_safetensors_prefix: None,
         };
 
         let scale = attention_scale_for(&model);
@@ -16478,6 +16531,7 @@ mod tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
@@ -16500,6 +16554,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            decoder_safetensors_prefix: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16557,6 +16612,7 @@ mod tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16578,6 +16634,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            decoder_safetensors_prefix: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16657,6 +16714,7 @@ mod tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16678,6 +16736,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            decoder_safetensors_prefix: None,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17206,6 +17265,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            decoder_safetensors_prefix: None,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {

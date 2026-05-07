@@ -349,6 +349,63 @@ async fn test_qwen2_vl_bug3_same_image_twice_cached_prefix() {
     assert_coherent_text(second, 8);
 }
 
+/// Bug 4 / Known limitation #1: chunked-prefill across image-placeholder
+/// boundaries. With `--max-num-batched-tokens 1024`, the streamlit-chat
+/// prompt (~1681 tokens) is forced through a multi-chunk prefill: chunk 0
+/// covers the leading text + first ~1000 image-pad tokens, chunk 1 covers
+/// the trailing image-pad tokens + the final text suffix.
+///
+/// Pre-fix: `run_mm_vision_forward` is gated on `tokens_before == 0`, so
+/// vision_forward runs only in chunk 0 with `placeholder.token_offset =
+/// batch_offset + ph.offset`. ph.offset can fit in chunk 0 but
+/// `ph.length = ~1640` extends past the chunk's input tile —
+/// `Instruction::SpliceMmEmbeds::eval` writes ~640 image rows past the
+/// chunk's `[chunk_tokens, hidden]` Embed buffer, corrupting downstream
+/// allocations. Symptom is either an out-of-bounds CUDA error or wildly
+/// wrong response. Chunk 1 then has no encoder run at all, so any image
+/// rows in `[1024, 1681)` get raw `<|image_pad|>` text embeddings.
+///
+/// Post-fix: vision_forward runs once per request (lazy, on the first
+/// chunk that overlaps any image placeholder); the resulting mm_embeds is
+/// cached in `mm_embeds_cache` keyed by `req_id`; per-chunk patches are
+/// windowed to the chunk's `[tokens_before, tokens_before + q_len)` extent
+/// with chunk-local `token_offset` and the corresponding slice of
+/// mm_embeds rows. Cache drops on `release_request`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_qwen2_vl_bug4_chunked_prefill_across_image() {
+    let png_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../docs/assets/deployment/streamlit-chat.png");
+    let png_bytes =
+        std::fs::read(&png_path).expect("streamlit-chat.png must exist for Bug 4 reproducer");
+    use base64::Engine;
+    let png_b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+    let server = TestServer::builder(TestModels::QWEN2_VL_2B_INSTRUCT)
+        .with_args(&["--max-num-batched-tokens", "1024"])
+        .start()
+        .await
+        .expect("Qwen2-VL server should start with --max-num-batched-tokens 1024");
+    let client = Client::new(server.base_url());
+
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg_with_image("What is shown on the page?", &png_b64)],
+        max_tokens: Some(64),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 8);
+    assert_mentions_any(
+        text,
+        &["chat", "vllm", "streamlit", "interface", "page", "screen"],
+        "Bug 4: chunked-prefill over image — pre-fix the image rows are \
+         dropped or splice writes OOB, response describes nothing coherent",
+    );
+}
+
 // ===========================================================================
 // TP=2 tests (Phase F) — require 2 CUDA GPUs + NCCL
 // ===========================================================================

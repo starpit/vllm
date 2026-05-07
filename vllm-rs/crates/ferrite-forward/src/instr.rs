@@ -105,6 +105,17 @@ pub trait CanonicalParams {
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
 /// Constants live on `W: CanonicalParams`, NOT here.
+///
+/// **Reshape / RopeAppend `out_slot != in_slot` invariant.** Both
+/// instructions write `TileEntry::Reshaped { ref_slot, tensor }` at
+/// `out_slot`. The codegen `colored_slot_map` guarantees `out_slot !=
+/// in_slot` for every Impl that declares `output_alias_is_view = true`
+/// (today: `ReshapeRefImpl`, `RopeAppendRefImpl`) — so the overwrite
+/// at `tiles[out_slot]` never drops the upstream's `OwnedTensor` at
+/// `tiles[in_slot]`. The G.7(e.tail.2) bug fix had a runtime safety
+/// net (`pinned_owned: Vec<OwnedTensor>`) that pinned the prior Owned
+/// past the overwrite; once the codegen invariant is in place, the
+/// safety net is unnecessary and was deleted in this commit.
 pub struct InterpreterCtx<'a, W> {
     pub wm: &'a W,
     pub tiles: &'a mut Vec<Option<TileEntry>>,
@@ -112,29 +123,6 @@ pub struct InterpreterCtx<'a, W> {
     pub device: &'a mut GpuDevice,
     /// Iter index of the enclosing `Op::Loop`, else 0.
     pub layer_offset: u32,
-    /// `OwnedTensor`s removed from `tiles` to make room for a
-    /// `Reshaped` at the same slot index. Keeping them here pins
-    /// the underlying GPU memory for the rest of the run, so any
-    /// `Reshaped { ref_slot, tensor }` that aliases this storage
-    /// continues to point at live memory.
-    ///
-    /// **Why this exists.** When `Instruction::Reshape(in_slot,
-    /// out_slot, ...)` is emitted with `out_slot == in_slot`, the
-    /// previous `TileEntry::Owned(OwnedTensor)` at that slot would
-    /// be dropped on overwrite — freeing its block back to the
-    /// caching allocator. The new `TileEntry::Reshaped` still holds
-    /// the original GPU pointer in its `tensor` field, but that
-    /// memory is now in the free pool; subsequent `alloc_tensor`
-    /// calls in the same forward (e.g., a downstream attention
-    /// kernel's output) hand the same address back, the kernel
-    /// writes there while still reading the Reshaped, and the
-    /// supposedly-still-live "input" tile sees torn writes (NaN /
-    /// extreme magnitudes). Pinning here is the minimum-invasive
-    /// fix: the codegen contract that `Reshaped::ref_slot` "pins
-    /// the slot whose `OwnedTensor` actually owns the storage" only
-    /// works when the OwnedTensor still lives at `ref_slot`; in the
-    /// in-place case it has already been overwritten. Stash it.
-    pub pinned_owned: Vec<OwnedTensor>,
 }
 
 // Type aliases for variant fields.
@@ -704,16 +692,24 @@ impl<W: CanonicalParams> Instruction<W> {
                     shape[i] = d / div;
                 }
                 let reshaped = upstream.reshape(&shape[..nd]);
-                // Pin overwritten Owned: if `out_slot == in_slot`, the
-                // existing `TileEntry::Owned` would otherwise drop here,
-                // freeing the very memory the new `Reshaped` aliases.
-                // See `pinned_owned` doc on `InterpreterCtx`. Take the
-                // old entry out first so we can stash any Owned without
-                // double-borrowing `ctx.tiles`.
-                let prev = std::mem::take(&mut ctx.tiles[out_slot as usize]);
-                if let Some(TileEntry::Owned(t)) = prev {
-                    ctx.pinned_owned.push(t);
-                }
+                // The codegen `colored_slot_map` guarantees
+                // `out_slot != in_slot` for every Impl that declares
+                // `output_alias_is_view = true` (here:
+                // ReshapeRefImpl). With that invariant in place,
+                // overwriting `tiles[out_slot]` cannot drop the
+                // upstream `Owned` at `tiles[in_slot]`. Whatever was
+                // at `tiles[out_slot]` (a stale `View` from the alias
+                // prelude, an old slot's spill in a reused color)
+                // either has no GPU storage of its own (`View` /
+                // `Reshaped`) or is a freed slot whose drop here is
+                // the natural deallocation point for that color.
+                debug_assert_ne!(
+                    in_slot, out_slot,
+                    "Reshape: codegen invariant violated — \
+                     `output_alias_is_view = true` Impl had its \
+                     output collapsed onto its input's slot. \
+                     `colored_slot_map`'s view-alias guard is broken."
+                );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Reshaped {
                     ref_slot: in_slot,
                     tensor: reshaped,
@@ -1839,14 +1835,27 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 let nt_q = (*q_view).dim(0);
                 let q_3d = q_view.reshape(&[nt_q, W::NUM_Q_HEADS as usize, W::HEAD_DIM as usize]);
-                // Pin any Owned overwritten by these three Reshaped
-                // writes. See InterpreterCtx::pinned_owned for the why.
-                for slot in [q_out_slot, k_out_slot, v_out_slot] {
-                    let prev = std::mem::take(&mut ctx.tiles[slot as usize]);
-                    if let Some(TileEntry::Owned(t)) = prev {
-                        ctx.pinned_owned.push(t);
-                    }
-                }
+                // `colored_slot_map`'s view-alias guard
+                // (`output_alias_is_view = true` on
+                // `RopeAppendRefImpl`) makes `q/k/v_out_slot !=
+                // q/k/v_slot` a codegen-time invariant — see the
+                // matching debug_assert + comment in
+                // `Instruction::Reshape::eval`. Without that
+                // invariant the writes below would drop the
+                // upstream Q/K/V `OwnedTensor`s while the new
+                // `Reshaped` entries still alias their GPU storage.
+                debug_assert_ne!(
+                    q_slot, q_out_slot,
+                    "RopeAppend: q output collapsed onto q input"
+                );
+                debug_assert_ne!(
+                    k_slot, k_out_slot,
+                    "RopeAppend: k output collapsed onto k input"
+                );
+                debug_assert_ne!(
+                    v_slot, v_out_slot,
+                    "RopeAppend: v output collapsed onto v input"
+                );
                 ctx.tiles[q_out_slot as usize] = Some(TileEntry::Reshaped {
                     ref_slot: q_slot,
                     tensor: *q_3d,
@@ -3199,7 +3208,6 @@ pub unsafe fn run<W: CanonicalParams>(
         fwd,
         device,
         layer_offset: 0,
-        pinned_owned: Vec::new(),
     };
     unsafe {
         run_slice(backbone, &mut ctx);
@@ -3228,7 +3236,6 @@ pub unsafe fn run_backbone<W: CanonicalParams>(
         fwd,
         device,
         layer_offset: 0,
-        pinned_owned: Vec::new(),
     };
     unsafe {
         run_slice(backbone, &mut ctx);

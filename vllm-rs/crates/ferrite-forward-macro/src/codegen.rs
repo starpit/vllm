@@ -5095,6 +5095,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            decoder_safetensors_prefix: None,
         }
     }
 
@@ -5812,6 +5813,7 @@ mod fingerprint_tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         }
     }
 

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::info;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use vllm_config::CudaGraphMode;
 use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
@@ -214,13 +214,75 @@ fn create_worker(
 ) -> Result<WorkerCreationResult> {
     let is_pooling = config.runner == "pooling";
 
-    // Try MLX backend first when metal feature is enabled.
-    // Phase F Step 2 lands `FerriteWorker` (compilable + instantiable
-    // under metal) but does not yet route arch dispatch through it —
-    // the routing source-of-truth is ferrite-forward's metal
-    // registration mechanism, which Step 3 wires up.
+    // Try ferrite-metal first under the metal feature; the
+    // per-arch metal forward is the preferred fast path. If
+    // ferrite-forward has no metal variant for the architecture
+    // (`ExecutorError::ArchNotSupported`), fall back to MlxWorker —
+    // the same fall-through pattern cuda already uses inside
+    // FerriteWorker::load_model, surfaced here at the worker-creation
+    // boundary because metal has no in-FerriteWorker legacy fallback.
     #[cfg(feature = "metal")]
     if should_use_mlx(&config.device) {
+        use vllm_executor::error::ExecutorError;
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
+
+        let ferrite_config = FerriteWorkerConfig {
+            model_path: model_path.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            block_size: config.block_size,
+            device_id: 0,
+            enforce_eager: config.enforce_eager,
+            cuda_graph_mode: config
+                .cuda_graph_mode
+                .parse()
+                .unwrap_or(CudaGraphMode::Auto),
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            cuda_graph_sizes: config
+                .cuda_graph_config
+                .as_ref()
+                .map(|c| c.capture_sizes.clone())
+                .unwrap_or_default(),
+            cublas_autotune: config.cublas_autotune,
+            gpu_memory_utilization: config.gpu_memory_utilization,
+            pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
+            tp_rank: 0,
+            tp_world_size: 1,
+            pp_rank: 0,
+            pp_size: 1,
+            gguf_file: config.gguf_file.clone(),
+            lora_adapter: config.lora_adapter.clone(),
+            kv_cache_dtype: config.kv_cache_dtype.clone(),
+            calculate_kv_scales: config.calculate_kv_scales,
+            eos_token_ids: vec![],
+            max_model_len: config.max_model_len,
+        };
+
+        let mut ferrite = FerriteWorker::new(ferrite_config);
+        ferrite
+            .init_device()
+            .context("failed to initialize Metal device for FerriteWorker")?;
+        match ferrite.load_model() {
+            Ok(()) => {
+                info!("Using ferrite-metal backend (Apple Silicon GPU)");
+                let hf_config = ferrite
+                    .hf_config()
+                    .context("model config not available after ferrite-metal load")?
+                    .clone();
+                let model_dir = ferrite.model_dir().map(|p| p.to_path_buf());
+                let dtype_elem_bytes = ferrite.resolved_dtype_elem_bytes();
+                return Ok((Box::new(ferrite), hf_config, model_dir, dtype_elem_bytes));
+            }
+            Err(ExecutorError::ArchNotSupported(arch)) => {
+                info!(
+                    "ferrite-metal has no variant for arch `{arch}` — falling back to MLX backend"
+                );
+                drop(ferrite);
+            }
+            Err(e) => return Err(e).context("failed to load ferrite-metal model"),
+        }
+
         info!("Using MLX backend (Apple Silicon GPU)");
         let mlx_config = MlxWorkerConfig {
             model_path: model_path.clone(),

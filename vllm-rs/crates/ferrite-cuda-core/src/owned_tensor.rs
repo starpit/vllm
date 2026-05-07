@@ -75,6 +75,17 @@ impl OwnedTensor {
         self.inner
     }
 
+    /// Borrow the backing `MTLBuffer`. Apple silicon's unified memory
+    /// means `buffer.contents()` is the same VA as `inner.raw_ptr()` —
+    /// callers that bind the buffer to a compute encoder (e.g.
+    /// `dispatch_argmax_f16`) read identical bytes either way. The
+    /// buffer reference is what the metal-rs binder API expects;
+    /// kernels can't be set with raw pointers.
+    #[cfg(feature = "metal")]
+    pub fn metal_buffer(&self) -> &metal::Buffer {
+        &self._buffer
+    }
+
     /// Consume self, return GpuTensor WITHOUT freeing. The block
     /// stays allocated but is removed from the caching allocator's
     /// active-blocks tracking (so `free_leaked_blocks` can find it).

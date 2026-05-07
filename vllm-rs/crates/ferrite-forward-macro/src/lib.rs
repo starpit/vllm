@@ -1461,6 +1461,23 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
+    // emits this const from the macro's per-canonical metal_emission;
+    // shim variants re-export the canonical's. The trait impl below
+    // dispatches on `Weights` variant and returns the matched module's
+    // const so `determine_available_memory` reads the right per-arch
+    // peak rather than a 512 MiB placeholder.
+    let metal_arena_peak_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => #model_ident::METAL_ARENA_PEAK_BYTES,
+            }
+        })
+        .collect();
+
     // Accessor methods on Weights — each returns a per-variant
     // constant from the matched model's bounds. Consumers (e.g.
     // vllm-executor's CudaModel enum) delegate their own accessor
@@ -1800,6 +1817,13 @@ fn emit_arch_dispatcher(
                         "metal forward_backbone — pipeline-parallel intermediate \
                          ranks aren't supported on metal yet (no PP fanout)"
                     )
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_arena_peak_bytes(&self) -> u64 {
+                match self {
+                    #(#metal_arena_peak_arms)*
                 }
             }
         }

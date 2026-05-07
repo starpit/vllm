@@ -447,6 +447,24 @@ mod dispatcher {
             device: &mut GpuDevice,
             num_tokens: u64,
         ) -> OwnedTensor;
+
+        /// Per-worker arena peak in bytes (metal only).
+        ///
+        /// `MetalWorkerPool::for_buckets` derives the per-worker arena
+        /// layout as the elementwise-max across [`METAL_BUCKETS`]'
+        /// `arena_bytes` rows; the peak resident bytes per worker is
+        /// the sum of that elementwise-max. The metal worker reads
+        /// this to size `peak_activation_bytes` in
+        /// `determine_available_memory`, replacing the 512 MiB
+        /// placeholder from Step 3.B.
+        ///
+        /// Default returns 512 MiB so cuda-backed arches that never
+        /// override this still surface a sane placeholder if the
+        /// trait method is reached on a non-metal build path.
+        #[cfg(feature = "metal")]
+        fn metal_arena_peak_bytes(&self) -> u64 {
+            512 * 1024 * 1024
+        }
     }
 
     /// Minimal HF-config view threaded into `try_load` so per-variant

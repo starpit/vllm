@@ -5227,6 +5227,22 @@ pub fn emit_model(
         proc_macro2::Literal::u64_unsuffixed(vocab)
     };
 
+    // Per-worker arena peak in bytes — sum of `arena_bytes` across
+    // every slot for this canonical. All buckets in one canonical
+    // share the SAME `METAL_ARENA_BYTES` static, so the elementwise-
+    // max across rows is identically that single static; sum gives
+    // the per-worker resident-arena bytes. The metal worker reads
+    // this via the FerriteWeights trait to size the
+    // `peak_activation_bytes` argument to `compute_available_kv_bytes`.
+    let metal_arena_peak_bytes_lit = {
+        let canonical_arena_sum: u64 = canonical_lowered
+            .values()
+            .map(|(_, _, _, _, arena_bytes)| arena_bytes.iter().sum::<u64>())
+            .max()
+            .unwrap_or(0);
+        proc_macro2::Literal::u64_unsuffixed(canonical_arena_sum)
+    };
+
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
 
@@ -5253,6 +5269,17 @@ pub fn emit_model(
         /// `[num_tokens, METAL_VOCAB_SIZE]` f16.
         #[cfg(feature = "metal")]
         pub const METAL_VOCAB_SIZE: u64 = #vocab_size_lit;
+
+        /// Per-worker arena peak in bytes for this canonical. The
+        /// pool's `arena_layout` is the elementwise-max across every
+        /// bucket spec's `arena_bytes`; per-canonical that's the
+        /// shared `METAL_ARENA_BYTES_M_<m>` static (every bucket in
+        /// one canonical points at the same row), so the sum equals
+        /// the worker's resident-arena byte footprint. Read by
+        /// `FerriteWorker(metal)::determine_available_memory` to
+        /// replace the 512 MiB peak-activation placeholder.
+        #[cfg(feature = "metal")]
+        pub const METAL_ARENA_PEAK_BYTES: u64 = #metal_arena_peak_bytes_lit;
 
         /// Build a [`MetalWorkerPool`] for this canonical. Thin
         /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
@@ -5627,7 +5654,7 @@ fn emit_shim_model(
         pub use super::#canonical::{dump, forward, forward_backbone};
 
         #[cfg(feature = "metal")]
-        pub use super::#canonical::{METAL_BUCKETS, metal_pool};
+        pub use super::#canonical::{METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool};
     }
 }
 

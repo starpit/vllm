@@ -58,6 +58,17 @@ use vllm_cuda::tensor::{GpuTensor, TensorView};
 #[cfg(feature = "cuda")]
 use vllm_cuda::weights::GpuWeights;
 
+// Backend-neutral types used by metal lifecycle bodies. Under cfg(metal),
+// `GpuDevice` resolves to the Apple-silicon arm carrying `device + queue +
+// allocator`; `OwnedTensor` / `TensorView` / `GpuTensor` / `GpuWeights` are
+// the ones lifted to `cfg(any(cuda, metal))` in Step 1; `MetalAllocator`
+// is the metal-side `BackendAllocator`; `RawGpuMem::from_buffer` wraps
+// `metal::Buffer` for `KvCachePool::new`.
+#[cfg(feature = "metal")]
+use ferrite_cuda_core::weights::GpuWeights;
+#[cfg(feature = "metal")]
+use ferrite_cuda_core::{GpuDevice, GpuTensor, MetalAllocator, RawGpuMem, TensorView};
+
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::input_batch::{InputBatch, PreparedInputs};
 use crate::worker::Worker;
@@ -1809,11 +1820,28 @@ pub struct FerriteWorker {
     // ---------------------------------------------------------------
     // Metal-only state (Phase F: cfg-mutex extension).
     // ---------------------------------------------------------------
-    /// Shared `MetalDevice` handle. Step 2 holds the device for
-    /// instantiation; Step 3 wires the per-arch `MetalWorkerPool`
-    /// + forward dispatch through it.
+    /// Shared `MetalDevice` handle. Set in `init_device`; carries
+    /// `recommended_max_working_set_size` / `current_allocated_size`
+    /// for `determine_available_memory`'s pre-load profile path.
     #[cfg(feature = "metal")]
     metal_device: Option<std::sync::Arc<ferrite_metal_kernels::device::MetalDevice>>,
+    /// Device + command queue + caching allocator. Built lazily in
+    /// `load_model` from `metal_device.device.clone()` once we know we
+    /// will be loading weights through ferrite. Holds the `GpuWeights`
+    /// allocator (via `Arc<MetalAllocator>` shared with the per-arch
+    /// `Weights::load` upload path) plus the per-step CommandQueue.
+    #[cfg(feature = "metal")]
+    gpu_device: Option<GpuDevice>,
+    /// Loaded ferrite-forward weights — `Box<dyn FerriteWeights>`
+    /// dispatched through `try_load`. The trait `forward` body
+    /// collapses to the per-canonical metal `forward` fn under
+    /// cfg(metal); the worker calls it through the trait vtable.
+    #[cfg(feature = "metal")]
+    model: Option<Box<dyn ferrite_forward::FerriteWeights>>,
+    /// Compiled greedy-sampling pipeline. Cached once at load_model
+    /// to avoid recompiling the MSL kernel each step.
+    #[cfg(feature = "metal")]
+    argmax_kernels: Option<ferrite_metal_kernels::argmax::ArgmaxKernels>,
 }
 
 // Safety: FerriteWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -1823,6 +1851,143 @@ pub struct FerriteWorker {
 // because the worker is created on the main thread and moved to its dedicated
 // worker thread via the executor's spawn.
 unsafe impl Send for FerriteWorker {}
+
+/// Resolve model path: local dir, local GGUF file, or HF download.
+///
+/// Returns a `PathBuf` that is either:
+/// - A directory containing safetensors + config.json (normal path)
+/// - A `.gguf` file path (GGUF path — load_model detects this)
+///
+/// Backend-neutral: pure host I/O against `FerriteWorkerConfig`. Lifted
+/// out of the cuda-only impl so the metal `load_model` body can share
+/// the same HF-Hub plumbing without duplicating the download logic.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn resolve_model_path(config: &FerriteWorkerConfig) -> ExecutorResult<PathBuf> {
+    let path = Path::new(&config.model_path);
+
+    // Local .gguf file.
+    if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
+        return Ok(path.to_path_buf());
+    }
+
+    // Local directory.
+    if path.is_dir() {
+        return Ok(path.to_path_buf());
+    }
+
+    info!(
+        "Downloading model from HuggingFace Hub: {}",
+        config.model_path
+    );
+    let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
+    if let Some(ref token) = config.hf_token {
+        builder = builder.with_token(Some(token.clone()));
+    }
+    let api = builder
+        .build()
+        .map_err(|e| ExecutorError::WorkerInit(format!("failed to build HF API: {e}")))?;
+    let repo = api.model(config.model_path.clone());
+
+    // GGUF download: explicit filename or auto-detect from repo.
+    let gguf_filename = config.gguf_file.clone().or_else(|| {
+        // Auto-detect: if model name looks like a GGUF repo, find smallest Q4_K_M file.
+        if !config.model_path.to_ascii_uppercase().contains("GGUF") {
+            return None;
+        }
+        let info = repo.info().ok()?;
+        let mut gguf_files: Vec<_> = info
+            .siblings
+            .iter()
+            .filter(|s| s.rfilename.ends_with(".gguf"))
+            .collect();
+        if gguf_files.is_empty() {
+            return None;
+        }
+        for pattern in &["Q4_K_M", "Q4_K_S", "Q4_K", "Q4_0", "Q8_0"] {
+            if let Some(f) = gguf_files.iter().find(|s| s.rfilename.contains(pattern)) {
+                return Some(f.rfilename.clone());
+            }
+        }
+        gguf_files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
+        Some(gguf_files[0].rfilename.clone())
+    });
+    if let Some(ref gguf_file) = gguf_filename {
+        info!("Downloading GGUF file: {gguf_file}");
+        let gguf_path = repo.get(gguf_file).map_err(|e| {
+            ExecutorError::WorkerInit(format!("failed to download GGUF {gguf_file}: {e}"))
+        })?;
+        let _ = repo.get("tokenizer.json");
+        let _ = repo.get("tokenizer_config.json");
+        return Ok(gguf_path);
+    }
+
+    let config_path = repo
+        .get("config.json")
+        .map_err(|e| ExecutorError::WorkerInit(format!("failed to download config.json: {e}")))?;
+    let model_dir = config_path.parent().unwrap().to_path_buf();
+
+    let _ = repo.get("tokenizer.json");
+    let _ = repo.get("tokenizer_config.json");
+
+    if repo.get("model.safetensors").is_ok() {
+        return Ok(model_dir);
+    }
+    if let Ok(index_path) = repo.get("model.safetensors.index.json") {
+        let index = vllm_model::weight::SafeTensorsIndex::from_file(&index_path)
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse index: {e}")))?;
+        let sorted_shards = index.shard_files();
+        let total = sorted_shards.len();
+
+        let needed: Vec<&String> = sorted_shards
+            .iter()
+            .filter(|s| !model_dir.join(s).exists())
+            .collect();
+
+        if needed.is_empty() {
+            info!("All {total} shard files already cached");
+        } else {
+            info!(
+                "Downloading {} of {total} shard files (up to 8 in parallel)",
+                needed.len()
+            );
+
+            let multi = indicatif::MultiProgress::new();
+            const MAX_PARALLEL: usize = 8;
+            let repo = &repo;
+            let multi = &multi;
+
+            for chunk in needed.chunks(MAX_PARALLEL) {
+                let results: Vec<ExecutorResult<()>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = chunk
+                        .iter()
+                        .map(|shard| {
+                            let bar = multi.add(indicatif::ProgressBar::new(0));
+                            s.spawn(move || {
+                                repo.download_with_progress(shard, bar).map(|_| ()).map_err(
+                                    |e| {
+                                        ExecutorError::WorkerInit(format!(
+                                            "failed to download {shard}: {e}"
+                                        ))
+                                    },
+                                )
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                for result in results {
+                    result?;
+                }
+            }
+        }
+        return Ok(model_dir);
+    }
+
+    Err(ExecutorError::WorkerInit(format!(
+        "no safetensors weights found for {}",
+        config.model_path
+    )))
+}
 
 #[cfg(feature = "cuda")]
 impl FerriteWorker {
@@ -2244,144 +2409,6 @@ impl FerriteWorker {
                 tracing::warn!("FerriteWorker: failed to build grammar parser factory: {e}");
             }
         }
-    }
-
-    /// Resolve model path: local dir, local GGUF file, or HF download.
-    ///
-    /// Returns a `PathBuf` that is either:
-    /// - A directory containing safetensors + config.json (normal path)
-    /// - A `.gguf` file path (GGUF path — load_model detects this)
-    fn resolve_model_path(&self) -> ExecutorResult<PathBuf> {
-        let path = Path::new(&self.config.model_path);
-
-        // Local .gguf file.
-        if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
-            return Ok(path.to_path_buf());
-        }
-
-        // Local directory.
-        if path.is_dir() {
-            return Ok(path.to_path_buf());
-        }
-
-        info!(
-            "Downloading model from HuggingFace Hub: {}",
-            self.config.model_path
-        );
-        let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
-        if let Some(ref token) = self.config.hf_token {
-            builder = builder.with_token(Some(token.clone()));
-        }
-        let api = builder
-            .build()
-            .map_err(|e| ExecutorError::WorkerInit(format!("failed to build HF API: {e}")))?;
-        let repo = api.model(self.config.model_path.clone());
-
-        // GGUF download: explicit filename or auto-detect from repo.
-        let gguf_filename = self.config.gguf_file.clone().or_else(|| {
-            // Auto-detect: if model name looks like a GGUF repo, find smallest Q4_K_M file.
-            if !self.config.model_path.to_ascii_uppercase().contains("GGUF") {
-                return None;
-            }
-            let info = repo.info().ok()?;
-            let mut gguf_files: Vec<_> = info
-                .siblings
-                .iter()
-                .filter(|s| s.rfilename.ends_with(".gguf"))
-                .collect();
-            if gguf_files.is_empty() {
-                return None;
-            }
-            // Prefer Q4_K_M, then Q4_K_S, then any Q4, then smallest file.
-            for pattern in &["Q4_K_M", "Q4_K_S", "Q4_K", "Q4_0", "Q8_0"] {
-                if let Some(f) = gguf_files.iter().find(|s| s.rfilename.contains(pattern)) {
-                    return Some(f.rfilename.clone());
-                }
-            }
-            // Fallback: first GGUF file alphabetically.
-            gguf_files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
-            Some(gguf_files[0].rfilename.clone())
-        });
-        if let Some(ref gguf_file) = gguf_filename {
-            info!("Downloading GGUF file: {gguf_file}");
-            let gguf_path = repo.get(gguf_file).map_err(|e| {
-                ExecutorError::WorkerInit(format!("failed to download GGUF {gguf_file}: {e}"))
-            })?;
-            // Best-effort tokenizer download.
-            let _ = repo.get("tokenizer.json");
-            let _ = repo.get("tokenizer_config.json");
-            return Ok(gguf_path);
-        }
-
-        let config_path = repo.get("config.json").map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to download config.json: {e}"))
-        })?;
-        let model_dir = config_path.parent().unwrap().to_path_buf();
-
-        // Best-effort tokenizer download.
-        let _ = repo.get("tokenizer.json");
-        let _ = repo.get("tokenizer_config.json");
-
-        // Download weight files.
-        if repo.get("model.safetensors").is_ok() {
-            return Ok(model_dir);
-        }
-        if let Ok(index_path) = repo.get("model.safetensors.index.json") {
-            let index = vllm_model::weight::SafeTensorsIndex::from_file(&index_path)
-                .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse index: {e}")))?;
-            let sorted_shards = index.shard_files();
-            let total = sorted_shards.len();
-
-            // Filter out shards already present in the cache.
-            let needed: Vec<&String> = sorted_shards
-                .iter()
-                .filter(|s| !model_dir.join(s).exists())
-                .collect();
-
-            if needed.is_empty() {
-                info!("All {total} shard files already cached");
-            } else {
-                info!(
-                    "Downloading {} of {total} shard files (up to 8 in parallel)",
-                    needed.len()
-                );
-
-                let multi = indicatif::MultiProgress::new();
-                const MAX_PARALLEL: usize = 8;
-                let repo = &repo;
-                let multi = &multi;
-
-                for chunk in needed.chunks(MAX_PARALLEL) {
-                    let results: Vec<ExecutorResult<()>> = std::thread::scope(|s| {
-                        let handles: Vec<_> = chunk
-                            .iter()
-                            .map(|shard| {
-                                let bar = multi.add(indicatif::ProgressBar::new(0));
-                                s.spawn(move || {
-                                    repo.download_with_progress(shard, bar).map(|_| ()).map_err(
-                                        |e| {
-                                            ExecutorError::WorkerInit(format!(
-                                                "failed to download {shard}: {e}"
-                                            ))
-                                        },
-                                    )
-                                })
-                            })
-                            .collect();
-                        handles.into_iter().map(|h| h.join().unwrap()).collect()
-                    });
-                    for result in results {
-                        result?;
-                    }
-                }
-            }
-            return Ok(model_dir);
-        }
-
-        Err(ExecutorError::WorkerInit(format!(
-            "no safetensors weights found for {}",
-            self.config.model_path
-        )))
     }
 
     /// Resolve a LoRA adapter path: local directory or HF Hub download.
@@ -5116,7 +5143,7 @@ impl Worker for FerriteWorker {
         }
 
         // 1. Resolve model directory (or GGUF file path).
-        let model_dir = self.resolve_model_path()?;
+        let model_dir = resolve_model_path(&self.config)?;
         info!("FerriteWorker: loading model from {}", model_dir.display());
 
         let device = self
@@ -9303,12 +9330,35 @@ impl FerriteWorker {
             seeded_rngs: HashMap::new(),
             progress_callback: None,
             metal_device: None,
+            gpu_device: None,
+            model: None,
+            argmax_kernels: None,
         }
     }
 
     /// Set the progress callback for startup loading.
     pub fn set_progress_callback(&mut self, cb: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
         self.progress_callback = Some(cb);
+    }
+
+    /// Expose the HF config after load_model. Mirrors the cuda-side
+    /// accessor — vllm-serve reads this to drive `compute_num_blocks`
+    /// and the cache-init path.
+    pub fn hf_config(&self) -> Option<&HfModelConfig> {
+        self.hf_config.as_ref()
+    }
+
+    /// Expose the model directory after load_model.
+    pub fn model_dir(&self) -> Option<&Path> {
+        self.model_dir.as_deref()
+    }
+
+    /// Bytes per element for the model's KV cache dtype. Metal forces
+    /// f16 for both compute and cache, so this is a constant; we keep
+    /// the same accessor name as the cuda side so vllm-serve treats
+    /// the worker uniformly.
+    pub fn resolved_dtype_elem_bytes(&self) -> usize {
+        self.model_dtype.size_bytes()
     }
 }
 
@@ -9323,47 +9373,197 @@ impl Worker for FerriteWorker {
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
-        // Step 3 wires per-arch `metal_pool()` dispatch through here.
-        // For Step 2 ("instantiate"), surface a clear error that names the
-        // unfinished hop rather than panicking on a stub.
-        Err(ExecutorError::WorkerExecution(
-            "FerriteWorker(metal)::load_model not yet wired — Phase F Step 3 \
-             will dispatch to the per-arch metal_pool() factory"
-                .to_string(),
-        ))
+        let model_dir = resolve_model_path(&self.config)?;
+        info!(
+            "FerriteWorker(metal): loading model from {}",
+            model_dir.display()
+        );
+
+        // Metal currently supports safetensors only — GGUF requires the
+        // cuda-side dequant kernels. Surface that early with a clear
+        // message rather than failing deep in `GpuWeights::from_dir`.
+        if model_dir.is_file() && model_dir.extension().is_some_and(|e| e == "gguf") {
+            return Err(ExecutorError::WorkerInit(
+                "GGUF source not supported under metal (safetensors only)".into(),
+            ));
+        }
+
+        let hf_config = HfModelConfig::from_path(&model_dir)
+            .map_err(|e| ExecutorError::WorkerInit(format!("config parse failed: {e}")))?;
+        let arch = hf_config.architectures.first().cloned().unwrap_or_default();
+        info!("FerriteWorker(metal): architecture = {arch}");
+
+        // Build the metal `GpuDevice` (device + queue + allocator). The
+        // allocator goes inside `GpuWeights` (consumed by `from_dir`) and
+        // a parallel `Arc<MetalAllocator>` rides on `GpuDevice` for
+        // dummy-tensor allocation during profiling. Both wrap the same
+        // underlying `metal::Device` (cheap ObjC retain).
+        let metal_dev = self
+            .metal_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
+        let device_arc = std::sync::Arc::new(metal_dev.device.clone());
+        let device_allocator = std::sync::Arc::new(MetalAllocator::new((*device_arc).clone()));
+        let gpu_device = GpuDevice::new(device_arc.clone(), device_allocator);
+
+        // Weights upload allocator — separate from `gpu_device.allocator`
+        // because `GpuWeights::from_dir` consumes the allocator. Both
+        // arena into the same unified-memory pool.
+        let weights_alloc = MetalAllocator::new((*device_arc).clone());
+        let mut weights = GpuWeights::from_dir(&model_dir, weights_alloc)
+            .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
+        info!(
+            "FerriteWorker(metal): parsed {} weight tensors",
+            weights.len()
+        );
+
+        // Metal kernels are specialized on f16; force the upload path to
+        // cast F32 / BF16 source weights into f16. Mirrors cuda's
+        // `set_target_dtype` after-load step.
+        weights.set_target_dtype(GpuDType::F16);
+
+        // Build HF fingerprint — same disambiguation surface cuda uses.
+        let hf_fp = ferrite_forward::HfFingerprint {
+            max_position_embeddings: hf_config.max_position_embeddings.map(|v| v as u64),
+            rope_scaling_type: hf_config
+                .extra
+                .get("rope_scaling")
+                .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
+                .and_then(|v| v.as_str()),
+            rope_scaling_hash: hf_config
+                .extra
+                .get("rope_scaling")
+                .map(ferrite_forward::hash_json_value),
+        };
+
+        let max_model_len = self
+            .config
+            .max_model_len
+            .or(hf_config.max_position_embeddings)
+            .unwrap_or(4096);
+
+        // Under cfg(metal), `CUstream = ()`; the per-canonical
+        // `Weights::load` body ignores the stream parameter (uploads go
+        // through the allocator inside `GpuWeights`).
+        let model = ferrite_forward::try_load(
+            &mut weights,
+            (),
+            arch.as_str(),
+            1, // tp_world_size — metal is tp=1 only
+            0, // tp_rank
+            max_model_len,
+            hf_fp,
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("ferrite-forward load: {e}")))?
+        .ok_or_else(|| ExecutorError::ArchNotSupported(arch.clone()))?;
+
+        info!(
+            "FerriteWorker(metal): loaded {} via ferrite-forward ({})",
+            arch,
+            model.arch_name()
+        );
+
+        // Compile + cache the greedy-sampling pipeline once. Argmax fires
+        // outside the per-bucket ICB, so it owns its own pipeline cache
+        // here on the worker rather than living in the per-canonical
+        // `MetalWorkerPool`.
+        let argmax = ferrite_metal_kernels::argmax::ArgmaxKernels::new(&gpu_device.device)
+            .map_err(|e| ExecutorError::WorkerInit(format!("argmax kernel compile: {e:?}")))?;
+
+        self.gpu_device = Some(gpu_device);
+        self.model = Some(model);
+        self.argmax_kernels = Some(argmax);
+        self.model_dir = Some(model_dir);
+        self.hf_config = Some(hf_config);
+        self.resolved_architecture = Some(arch);
+
+        Ok(())
     }
 
     fn initialize_cache(
         &mut self,
-        _num_gpu_blocks: usize,
+        num_gpu_blocks: usize,
         _num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
-        Err(ExecutorError::WorkerExecution(
-            "FerriteWorker(metal)::initialize_cache not yet wired — Phase F Step 3".to_string(),
-        ))
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("model not loaded".into()))?;
+        let device = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
+
+        if self.config.kv_cache_dtype == "fp8_e4m3" || self.config.kv_cache_dtype == "fp8" {
+            return Err(ExecutorError::WorkerInit(
+                "FP8 KV cache not supported on metal — use F16".into(),
+            ));
+        }
+
+        // Metal KV cache is f16; the per-canonical `forward` reads block
+        // pointers via `KvCachePool::k_layer_mem` / `v_layer_mem` (added
+        // in 3.E forward half) and binds them into the per-bucket
+        // `RuntimeBindings.kv_cache_k/v` Buffer slots.
+        let mtl_device = device.device.clone();
+        let pool = unsafe {
+            KvCachePool::new(
+                model.num_hidden_layers() as usize,
+                num_gpu_blocks,
+                self.config.block_size,
+                model.num_key_value_heads() as usize,
+                model.head_dim() as usize,
+                GpuDType::F16,
+                |bytes| {
+                    let buffer = mtl_device.new_buffer(
+                        bytes as u64,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    );
+                    Ok(RawGpuMem::from_buffer(buffer))
+                },
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
+
+        info!(
+            "FerriteWorker(metal): KV cache initialized: {} layers × {} blocks × {} tokens",
+            model.num_hidden_layers(),
+            num_gpu_blocks,
+            self.config.block_size,
+        );
+        self.kv_cache = Some(pool);
+        Ok(())
     }
 
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
         // Apple unified memory: `recommendedMaxWorkingSetSize` is Apple's
-        // own recommended budget for resident MTLBuffers (typically ~75% of
-        // physical RAM on M-series, accounting for OS reservations).
-        // `currentAllocatedSize` covers everything Metal has allocated for
-        // this process so far — model weights live there post-`load_model`.
+        // own recommended budget for resident MTLBuffers (typically ~75%
+        // of physical RAM on M-series, accounting for OS reservations).
+        // `currentAllocatedSize` covers everything Metal has allocated
+        // for this process so far — model weights live there
+        // post-`load_model`.
         //
-        // TODO(Step 3.D): replace the 512 MiB placeholder with the accurate
-        // `sum(handle.arena_layout()) * max_workers + runtime_bindings_bytes
-        // * max_workers` once `MetalArchHandle` exposes the per-canonical
-        // arena layout. The macro already has the colored slot map at
-        // expansion time — Step 3.D wires it through as a static
-        // `METAL_ARENA_BYTES: &[u64]` per canonical so the handle can
-        // surface it here without a runtime tape walk.
+        // Peak activation: the metal pool's per-worker arena is sized
+        // for the elementwise-max across every bucket spec
+        // (`for_buckets` does the max). We expose that per-canonical
+        // sum via `FerriteWeights::metal_arena_peak_bytes()` (emitted
+        // by the per-canonical macro from the colored slot map at
+        // expansion time). For metal we currently run at most
+        // `max_workers = 1`, so peak == arena_peak. Runtime bindings
+        // (input_ids/positions/etc.) and the per-step staging buffers
+        // we allocate inside `execute_model` are <10 MiB and dwarfed
+        // by the arena; we add a 64 MiB pad as a conservative bound.
         let metal_device = self
             .metal_device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
         let total = metal_device.device.recommended_max_working_set_size() as usize;
         let weights_and_overhead = metal_device.device.current_allocated_size() as usize;
-        let peak_activation_estimate: usize = 512 * 1024 * 1024;
+        let arena_peak = self
+            .model
+            .as_ref()
+            .map(|m| m.metal_arena_peak_bytes() as usize)
+            .unwrap_or(512 * 1024 * 1024);
+        let peak_activation_estimate = arena_peak.saturating_add(64 * 1024 * 1024);
         let utilization = self.config.gpu_memory_utilization;
         let available = compute_available_kv_bytes(
             total,
@@ -9373,9 +9573,10 @@ impl Worker for FerriteWorker {
         );
         info!(
             "FerriteWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             est_activations=512 MiB, kv_budget={:.1} GiB",
+             arena_peak={:.1} MiB, kv_budget={:.1} GiB",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
+            arena_peak as f64 / 1_048_576.0,
             available as f64 / 1_073_741_824.0,
         );
         Ok(available)
@@ -9383,13 +9584,303 @@ impl Worker for FerriteWorker {
 
     fn execute_model(
         &mut self,
-        _scheduler_output: &SchedulerOutput,
+        scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        Err(ExecutorError::WorkerExecution(
-            "FerriteWorker(metal)::execute_model not yet wired — Phase F Step 3 \
-             dispatches to MetalWorkerPool::forward + argmax_f16"
-                .to_string(),
-        ))
+        // ── 1. Lifecycle: drop finished requests ──────────────────
+        for req_id in &scheduler_output.finished_req_ids {
+            self.token_buffers.remove(req_id);
+            self.prompt_lengths.remove(req_id);
+            self.annotation_buffers.remove(req_id);
+            self.mm_data_buffers.remove(req_id);
+            self.sampling_params_map.remove(req_id);
+            self.seeded_rngs.remove(req_id);
+        }
+        self.input_batch
+            .remove_finished(&scheduler_output.finished_req_ids);
+
+        // ── 2. Lifecycle: add newly scheduled requests ────────────
+        for new_req in &scheduler_output.scheduled_new_reqs {
+            let num_tokens = scheduler_output
+                .num_scheduled_tokens
+                .get(&new_req.req_id)
+                .copied()
+                .unwrap_or(0);
+            if num_tokens == 0 {
+                continue;
+            }
+            let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
+            let start = new_req.num_computed_tokens as usize;
+            let end = (start + num_tokens).min(prompt_ids.len());
+            let tokens_to_use = &prompt_ids[start..end];
+
+            self.token_buffers
+                .insert(new_req.req_id.clone(), prompt_ids.to_vec());
+            self.prompt_lengths
+                .insert(new_req.req_id.clone(), prompt_ids.len());
+            if let Some(ref params) = new_req.sampling_params {
+                self.sampling_params_map
+                    .insert(new_req.req_id.clone(), params.clone());
+            }
+            let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
+            self.input_batch.add_request(
+                new_req.req_id.clone(),
+                tokens_to_use,
+                block_ids,
+                new_req.num_computed_tokens,
+            );
+        }
+
+        // ── 3. Lifecycle: refresh cached requests' block tables ───
+        for (i, req_id) in scheduler_output
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .enumerate()
+        {
+            if let Some(Some(new_blocks)) =
+                scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
+                && let Some(group0) = new_blocks.first()
+            {
+                self.input_batch.update_blocks(req_id, group0.clone());
+            }
+        }
+        let cached = &scheduler_output.scheduled_cached_reqs;
+        if !cached.new_token_ids.is_empty() {
+            for (i, req_id) in cached.req_ids.iter().enumerate() {
+                if let Some(tokens) = cached.new_token_ids.get(i)
+                    && let Some(&last_token) = tokens.last()
+                {
+                    self.input_batch.set_last_token(req_id, last_token);
+                }
+            }
+        }
+
+        if self.input_batch.num_active() == 0 {
+            return Ok(ModelRunnerOutput::empty());
+        }
+
+        // ── 4. Prepare flat batch inputs ─────────────────────────
+        // Metal has no spec decoding; pass an empty draft-token map.
+        let spec_tokens = HashMap::new();
+        let mut prepared = self.input_batch.prepare_inputs(&spec_tokens);
+        let attn = &prepared.attn_meta;
+        let num_tokens = attn.total_tokens;
+        let num_reqs = attn.num_reqs;
+        let block_size = self.config.block_size;
+
+        // slot_mapping[t] = block_ids[abs_pos / bs] * bs + (abs_pos % bs)
+        // u32 under metal — the macro-emitted forward reads this as
+        // `&[u32]`. Rope kernel checks `slot_mapping[i] != u32::MAX`.
+        let mut slot_mapping_u32: Vec<u32> = Vec::with_capacity(num_tokens);
+        for i in 0..num_reqs {
+            let tokens_before = attn.tokens_before[i];
+            let q_len = attn.q_lens[i];
+            let block_ids = &attn.block_ids[i];
+            for t in 0..q_len {
+                let abs_pos = tokens_before + t;
+                let block_idx = abs_pos / block_size;
+                let offset = abs_pos % block_size;
+                if block_idx < block_ids.len() {
+                    slot_mapping_u32.push((block_ids[block_idx] * block_size + offset) as u32);
+                } else {
+                    slot_mapping_u32.push(u32::MAX);
+                }
+            }
+        }
+
+        // block_table padded to [num_reqs, max_blocks] u32.
+        let max_blocks = attn.block_ids.iter().map(|b| b.len()).max().unwrap_or(0);
+        let max_blocks_eff = max_blocks.max(1);
+        let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
+        if max_blocks > 0 {
+            for (i, blocks) in attn.block_ids.iter().enumerate() {
+                for (j, &bid) in blocks.iter().enumerate() {
+                    block_table_u32[i * max_blocks_eff + j] = bid as u32;
+                }
+            }
+        }
+
+        let cu_seqlens_u32: Vec<u32> = attn.query_start_loc.iter().map(|&v| v as u32).collect();
+        let seqused_k_u32: Vec<u32> = attn.seq_lens.iter().map(|&v| v as u32).collect();
+
+        let max_seqlen_q = attn.q_lens.iter().copied().max().unwrap_or(0);
+        let max_seqlen_k = attn.seq_lens.iter().copied().max().unwrap_or(0);
+        let sample_indices: Vec<u32> = attn.sample_indices();
+        let req_ids_in_order: Vec<String> = attn.req_ids.clone();
+        let q_lens: Vec<usize> = attn.q_lens.clone();
+
+        let input_ids_u32 = std::mem::take(&mut prepared.flat_token_ids);
+        let positions_u32 = std::mem::take(&mut prepared.flat_positions);
+
+        // ── 5. Allocate host-visible Metal buffers + memcpy ──────
+        let device_buf = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("gpu_device not initialized".into()))?;
+        let mtl_device = device_buf.device.clone();
+        let alloc_u32 = |data: &[u32]| -> metal::Buffer {
+            // `new_buffer` rejects zero-length allocations. Single-byte
+            // floor keeps the call safe; the macro-emitted forward
+            // checks `numel()` before reading, so empty buffers are
+            // never dereferenced.
+            let bytes = ((data.len().max(1)) * 4) as u64;
+            let buf = mtl_device.new_buffer(bytes, metal::MTLResourceOptions::StorageModeShared);
+            if !data.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        buf.contents() as *mut u32,
+                        data.len(),
+                    );
+                }
+            }
+            buf
+        };
+
+        let buf_input_ids = alloc_u32(&input_ids_u32);
+        let buf_positions = alloc_u32(&positions_u32);
+        let buf_slot_mapping = alloc_u32(&slot_mapping_u32);
+        let buf_cu_seqlens = alloc_u32(&cu_seqlens_u32);
+        let buf_seqused_k = alloc_u32(&seqused_k_u32);
+        let buf_block_table = alloc_u32(&block_table_u32);
+
+        // Build TensorViews. The macro-emitted forward only reads
+        // `as_raw().raw_ptr()` and `numel()` — dtype is purely
+        // descriptive here; we use U32 for every slice to match the
+        // `*const u32` cast inside the macro.
+        let dtype_u32 = ferrite_cuda_core::dtype::DType::U32;
+        let view_input_ids = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_input_ids.contents() as *mut u8,
+                &[num_tokens.max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_positions = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_positions.contents() as *mut u8,
+                &[num_tokens.max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_slot_mapping = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_slot_mapping.contents() as *mut u8,
+                &[num_tokens.max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_cu_seqlens = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_cu_seqlens.contents() as *mut u8,
+                &[cu_seqlens_u32.len().max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_seqused_k = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_seqused_k.contents() as *mut u8,
+                &[seqused_k_u32.len().max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_block_table = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_block_table.contents() as *mut u8,
+                &[num_reqs.max(1), max_blocks_eff],
+                dtype_u32,
+            ))
+        };
+
+        // ── 6. Forward + greedy sampling ─────────────────────────
+        let kv_cache = self
+            .kv_cache
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("kv_cache not initialized".into()))?;
+
+        // Disjoint borrows: `model` reads from `self.model`,
+        // `device_mut` borrows `self.gpu_device` mutably.
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".into()))?;
+        let argmax_kernels = self
+            .argmax_kernels
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("argmax_kernels not built".into()))?;
+        // SAFETY-NOTE: the immutable borrows above (kv_cache, model, argmax_kernels)
+        // and the mutable borrow of `gpu_device` below target disjoint fields,
+        // which the compiler accepts post-NLL.
+        let device_mut = self
+            .gpu_device
+            .as_mut()
+            .ok_or_else(|| ExecutorError::WorkerExecution("gpu_device not initialized".into()))?;
+
+        let ctx = ferrite_forward::ForwardCtx {
+            input_ids: view_input_ids,
+            positions: view_positions,
+            slot_mapping: view_slot_mapping,
+            cu_seqlens_q: view_cu_seqlens,
+            seqused_k: view_seqused_k,
+            block_table: view_block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+        };
+
+        let logits = unsafe { model.forward(&ctx, device_mut, num_tokens as u64) };
+        let vocab = logits.dim(1) as u32;
+        let total_n = logits.dim(0) as u32;
+
+        // Argmax over `[total_n, vocab]` → `[total_n]` u32. We
+        // post-gather per-request last-token rows host-side rather
+        // than emit a per-row gather kernel; greedy bring-up.
+        let argmax_out = mtl_device.new_buffer(
+            (total_n as u64).max(1) * 4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        ferrite_metal_kernels::argmax::dispatch_argmax_f16(
+            argmax_kernels,
+            &device_mut.queue,
+            logits.metal_buffer(),
+            &argmax_out,
+            total_n,
+            vocab,
+        )
+        .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_f16: {e:?}")))?;
+
+        let argmax_slice: &[u32] =
+            unsafe { std::slice::from_raw_parts(argmax_out.contents() as *const u32, total_n as usize) };
+
+        // ── 7. Build per-request sampled tokens + commit ─────────
+        let mut sampled_token_ids: Vec<Vec<u32>> = Vec::with_capacity(num_reqs);
+        let mut req_id_to_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(num_reqs);
+        for (i, req_id) in req_ids_in_order.iter().enumerate() {
+            let row = sample_indices[i] as usize;
+            debug_assert!(row < total_n as usize);
+            let tok = argmax_slice[row];
+            sampled_token_ids.push(vec![tok]);
+            req_id_to_index.insert(req_id.clone(), i);
+        }
+
+        // Commit per-request state (positions, last_token, prefill→decode).
+        for (i, req_id) in req_ids_in_order.iter().enumerate() {
+            let q_len = q_lens[i];
+            self.input_batch
+                .commit_step(req_id, &sampled_token_ids[i], q_len, false);
+        }
+
+        Ok(ModelRunnerOutput {
+            req_ids: req_ids_in_order,
+            req_id_to_index,
+            sampled_token_ids,
+            logprobs: None,
+            prompt_logprobs_dict: std::collections::HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: None,
+            d2h_resolver: None,
+        })
     }
 
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
@@ -9400,6 +9891,13 @@ impl Worker for FerriteWorker {
 
     fn shutdown(&mut self) {
         self.is_shutdown = true;
+        // Drop order matters: KV cache references device buffers; model
+        // holds Weights backed by `GpuWeights` whose allocator arenas
+        // back every weight tensor. Drop tensors before device.
+        self.kv_cache = None;
+        self.model = None;
+        self.argmax_kernels = None;
+        self.gpu_device = None;
         self.metal_device = None;
     }
 

@@ -272,6 +272,33 @@ fn lower_one<W: CanonicalParams>(
         }
 
         // ── Fused gate-up SwiGLU MLP ───────────────────────────────
+        // TODO(metal-fused-mlp): the bound shader
+        // `fused_gate_up_silu_mul_f16_specialized` ONLY does the
+        // post-GEMM elementwise step (`silu(gate)*up` over
+        // `gate_up [M, 2*intermediate]`). The Metal port carries no
+        // upstream Gemm here — `in_slot` is the post-rmsnorm hidden
+        // state `[M, hidden_size]`, `wt_fn` is the packed
+        // `[gate|up] LinearLayer` weight, but no kernel actually
+        // computes `gate_up = in @ wt^T`. Cuda's
+        // `Instruction::FusedGateUpSiluMul` (instr.rs:1040) calls
+        // `LinearLayer::forward` (cuBLAS) then `silu_and_mul_fused`;
+        // CUTLASS EVT fuses both into one launch.
+        //
+        // The fix is a real MPP-based fused kernel:
+        //   `fused_gate_up_silu_mul_gemm_f16_specialized` using
+        //   `mpp::tensor_ops::matmul2d` (Metal 4, requires
+        //   `MTLLanguageVersion::Version4_0` + the
+        //   `MetalPerformancePrimitives` framework header) running
+        //   two matmuls into cooperative_tensors over the gate and
+        //   up halves of the packed weight, applying silu*mul in
+        //   registers, storing `[M, intermediate_size]`. See
+        //   `project_metal_fused_mlp_kernel.md` for the design.
+        //
+        // Until that lands this dispatch reads garbage in `buffer(1)`
+        // (hidden state instead of gate_up) and the model produces
+        // garbage logits. Documented as a known correctness bug; the
+        // lowering arm is left structurally intact so the rest of
+        // the worker compiles.
         I::FusedGateUpSiluMul(in_slot, out_slot, layer, wt_fn) => {
             // Output is `[M, intermediate_size]`; tile shape mirrors
             // Gemm but the kernel writes silu(gate)*up in one pass.

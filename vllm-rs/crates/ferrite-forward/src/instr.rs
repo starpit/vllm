@@ -40,8 +40,8 @@ use ferrite_kernels::layers::{
 use ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer;
 use ferrite_kernels::layers_gdn::Qwen3NextGdnLayer;
 use ferrite_kernels::layers_moe::{
-    DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
-    SharedFusedMoELayer,
+    DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, Fp8SharedFusedMoELayer,
+    FusedMoELayer, SharedFusedMoELayer,
 };
 
 /// Per-canonical model parameters. Implemented by each canonical's
@@ -264,6 +264,10 @@ pub enum Instruction<W> {
     /// `FusedMoe` (with `renormalize=true`); the shared expert is a
     /// SwiGLU MLP gated by `sigmoid(shared_expert_gate(x))`.
     SharedFusedMoe(u32, u32, u32, WtFn<W, SharedFusedMoELayer>),
+    /// FP8 peer of `SharedFusedMoe` — same logical structure, but routed
+    /// experts run through `Fp8BlockFusedMoELayer` internally (per-tensor,
+    /// per-channel, or per-block scales encoded as a single `block_size`).
+    Fp8SharedFusedMoe(u32, u32, u32, WtFn<W, Fp8SharedFusedMoELayer>),
     /// Qwen3-Next Gated Delta Net linear-attention layer. Carries
     /// `(in_slot, out_slot, layer, weight_fn)` — the per-layer
     /// `Qwen3NextGdnLayer` accessor resolves the in_proj_qkvz /
@@ -1596,6 +1600,20 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::SharedFusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                dump::dump_tile("moe.in", layer, &v, ctx.device.compute_stream);
+                let w = (weight_fn)(ctx.wm, layer);
+                let out = w.forward(v, ctx.device);
+                dump::dump_tile(
+                    "moe.out",
+                    layer,
+                    &out.as_gpu_tensor(),
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::Fp8SharedFusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 dump::dump_tile("moe.in", layer, &v, ctx.device.compute_stream);

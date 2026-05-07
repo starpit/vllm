@@ -207,6 +207,21 @@ enum FieldLoad {
         shared_expert_intermediate_size: usize,
         hidden_size: usize,
     },
+    /// FP8 peer of `SharedFusedMoe`. Calls `Fp8SharedFusedMoELayer::load`
+    /// which auto-detects per-tensor / per-channel / per-block scale scheme
+    /// from on-disk scale shape and routes routed experts through
+    /// `Fp8BlockFusedMoELayer` with the appropriate `block_size`. Used by
+    /// compressed-tensors FP8 and neuralmagic/RedHatAI FP8 Qwen-family
+    /// checkpoints.
+    Fp8SharedFusedMoe {
+        prefix: String,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+        norm_topk_prob: bool,
+    },
     /// Qwen3-Next GDN linear-attention layer. Calls
     /// `Qwen3NextGdnLayer::load`. The variant carries everything
     /// the loader needs baked at codegen time: the per-layer
@@ -401,6 +416,9 @@ fn plan_field_load(
     let is_shared_fused_moe = ty.ends_with("::SharedFusedMoELayer")
         || ty == "SharedFusedMoELayer"
         || ty.ends_with("layers_moe::SharedFusedMoELayer");
+    let is_fp8_shared_fused_moe = ty.ends_with("::Fp8SharedFusedMoELayer")
+        || ty == "Fp8SharedFusedMoELayer"
+        || ty.ends_with("layers_moe::Fp8SharedFusedMoELayer");
     let is_gdn_attention = ty.ends_with("::Qwen3NextGdnLayer")
         || ty == "Qwen3NextGdnLayer"
         || ty.ends_with("layers_gdn::Qwen3NextGdnLayer");
@@ -807,6 +825,71 @@ fn plan_field_load(
             moe_intermediate_size,
             shared_expert_intermediate_size,
             hidden_size,
+        };
+    }
+
+    if is_fp8_shared_fused_moe {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "Fp8SharedFusedMoELayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        let prefix = prefixes.into_iter().next().unwrap();
+        let src = std::fs::read_to_string(&model.source_path).unwrap_or_default();
+        let v: serde_json::Value = serde_json::from_str(&src).unwrap_or(serde_json::Value::Null);
+        let num_experts = v
+            .get("num_experts")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| model.bounds.get("num_experts").copied().unwrap_or(60) as usize);
+        let top_k = v
+            .get("num_experts_per_tok")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("num_experts_per_tok")
+                    .copied()
+                    .unwrap_or(4) as usize
+            });
+        let moe_intermediate_size = v
+            .get("moe_intermediate_size")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("moe_intermediate_size")
+                    .copied()
+                    .unwrap_or(1408) as usize
+            });
+        let shared_expert_intermediate_size = v
+            .get("shared_expert_intermediate_size")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or_else(|| {
+                model
+                    .bounds
+                    .get("shared_expert_intermediate_size")
+                    .copied()
+                    .unwrap_or(0) as usize
+            });
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+        let norm_topk_prob = v
+            .get("norm_topk_prob")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true);
+        return FieldLoad::Fp8SharedFusedMoe {
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
         };
     }
 
@@ -1785,7 +1868,10 @@ fn emit_weights_struct(
             || ty.ends_with("layers::Fp8AnyLinear")
             || ty.ends_with("::DeepSeekV2Fp8BlockMoELayer")
             || ty == "DeepSeekV2Fp8BlockMoELayer"
-            || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer");
+            || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer")
+            || ty.ends_with("::Fp8SharedFusedMoELayer")
+            || ty == "Fp8SharedFusedMoELayer"
+            || ty.ends_with("layers_moe::Fp8SharedFusedMoELayer");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
@@ -1901,7 +1987,10 @@ fn emit_weights_struct(
     let any_fp8 = plans.iter().any(|p| {
         matches!(
             p,
-            FieldLoad::Fp8Linear { .. } | FieldLoad::Fp8BlockLinear { .. }
+            FieldLoad::Fp8Linear { .. }
+                | FieldLoad::Fp8BlockLinear { .. }
+                | FieldLoad::DeepSeekV2Fp8BlockMoe { .. }
+                | FieldLoad::Fp8SharedFusedMoe { .. }
         )
     });
     // `max(out_features * in_features)` across every BNB4 accessor
@@ -3233,6 +3322,36 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::Fp8SharedFusedMoe {
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+        } => {
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let shared_expert_intermediate_size = *shared_expert_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            quote! {
+                let #name = ::ferrite_kernels::layers_moe::Fp8SharedFusedMoELayer::load(
+                    gw,
+                    #prefix,
+                    #num_experts,
+                    #top_k,
+                    #moe_intermediate_size,
+                    #shared_expert_intermediate_size,
+                    #hidden_size,
+                    #norm_topk_prob,
+                    __fp8_dtype,
+                    stream,
+                )?;
+            }
+        }
         FieldLoad::GdnAttention {
             prefix,
             num_k_heads,
@@ -3751,6 +3870,41 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #moe_intermediate_size,
                             #shared_expert_intermediate_size,
                             #hidden_size,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        FieldLoad::Fp8SharedFusedMoe {
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+            norm_topk_prob,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let num_experts = *num_experts;
+            let top_k = *top_k;
+            let moe_intermediate_size = *moe_intermediate_size;
+            let shared_expert_intermediate_size = *shared_expert_intermediate_size;
+            let hidden_size = *hidden_size;
+            let norm_topk_prob = *norm_topk_prob;
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers_moe::Fp8SharedFusedMoELayer::load(
+                            gw,
+                            &#p,
+                            #num_experts,
+                            #top_k,
+                            #moe_intermediate_size,
+                            #shared_expert_intermediate_size,
+                            #hidden_size,
+                            #norm_topk_prob,
+                            __fp8_dtype,
                             stream,
                         )
                     })

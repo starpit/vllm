@@ -386,6 +386,18 @@ pub enum Instruction<W> {
     /// fresh `OwnedTensor` of shape `[(ph/k)², e]`. Used by Gemma3-MM's
     /// SigLIP→text projector. Stride == kernel (non-overlapping).
     AvgPool2d(u32, u32),
+    /// CLIP-class CLS-token strip: `(in_slot, out_slot)`. Reads the
+    /// rank-2 tile `[L, e]` from `in_slot` (where the CLS row has been
+    /// run through the encoder at row 0), copies rows `1..L` into a
+    /// fresh `OwnedTensor` of shape `[L - 1, e]`, and publishes that
+    /// at `out_slot`. No baked-in constant — input dims are read off
+    /// the source tile at runtime, so a misconfigured `vision_in_seq_len
+    /// = vision_num_positions - 1` invariant in the variant config
+    /// surfaces as a downstream shape mismatch (caught at expansion
+    /// time by the bound-resolved sig), not as a kernel panic. Used by
+    /// LLaVA-1.5 family with `vision_feature_select_strategy =
+    /// "default"`.
+    StripCls(u32, u32),
     FlashInferAttentionDecode(u32, u32, u32, CosSinFn<W>, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, CosSinFn<W>, bool),
@@ -1624,6 +1636,13 @@ impl<W: CanonicalParams> Instruction<W> {
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     )
+                };
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            }
+            Instruction::StripCls(in_slot, out_slot) => {
+                let owned = unsafe {
+                    let in_view = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                    kernels::strip_cls(*in_view, &mut ctx.device.caching, ctx.device.compute_stream)
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }

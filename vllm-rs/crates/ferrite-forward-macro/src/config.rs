@@ -119,6 +119,20 @@ pub struct ModelParams {
     /// `visual.patch_embed.proj.weight` leading_dim 0 (today's
     /// hardcoded 5D behavior).
     pub vision_patch_embed_flatten: Option<VisionPatchEmbedFlatten>,
+    /// CLIP-class CLS-token fold target. When `Some(_)`,
+    /// `vision_glue::try_load_mm` adds the rank-1 weight at
+    /// `class_embedding_key` into `target_row` of the rank-2 weight at
+    /// `target_key` at load time, then drops `class_embedding_key`
+    /// from the manifest tracking. Combined with a `pixel_pack`
+    /// override that prepends a zero row to the patch sequence (so
+    /// post-`patch_embedding_proj` the row 0 is zero), the
+    /// `pos_embed + add` chain in the DSL body injects
+    /// `class_embedding + position_embedding[0]` at row 0 — exactly
+    /// what HF computes via concat-then-add. Used by LLaVA-1.5-class
+    /// arches; `None` for non-CLIP towers (Qwen2-VL, SigLIP). The
+    /// math is byte-equivalent to a hypothetical `cls_prepend` op,
+    /// without any new compiler surface.
+    pub vision_class_embedding_fold: Option<VisionClassEmbeddingFold>,
     /// Decoder-side safetensors prefix to prepend to every text-decoder
     /// safetensors key. `None` for text-only and Qwen-style VL arches
     /// where the text decoder ships at top-level (`model.layers.<L>.<...>`,
@@ -130,6 +144,14 @@ pub struct ModelParams {
     /// `Program::decoder_safetensors_prefix` and consumed by
     /// [`crate::codegen::safetensors_prefix`] under `Prelude::Decoder`.
     pub decoder_safetensors_prefix: Option<String>,
+    /// HF `torch_dtype` string, lowercased. Used by vision-glue to bake
+    /// `VisionConfig::compute_dtype` so the host-side patch packer + RoPE
+    /// builder + activation upload all match the on-disk weight dtype
+    /// (F16 vs BF16). Text-side codegen does NOT read this — runtime
+    /// embedding lookup determines the activation dtype there. `None`
+    /// when the JSON omits the field (rare; modern HF configs always
+    /// have it). Vision-side defaults to BF16 when missing.
+    pub torch_dtype: Option<String>,
 }
 
 /// On-disk safetensors layout for a vision tower. Drives
@@ -151,6 +173,14 @@ pub struct VisionSafetensorsLayout {
     /// Gemma3-MM's `mm.mm_soft_emb_norm` to disk
     /// `multi_modal_projector.mm_soft_emb_norm`.
     pub subtrees: BTreeMap<String, String>,
+    /// DSL path segments that ship with a literal `<word>_<digit>`
+    /// disk attribute name (e.g. LLaVA-1.5's
+    /// `multi_modal_projector.linear_1` / `linear_2`). The default
+    /// `_<digit>` → `.<digit>` post-pass via
+    /// [`crate::codegen::translate_digit_suffix`] is meant for
+    /// `nn.Sequential` indices (`mlp.0` ↔ DSL `mlp_0`) and would
+    /// mistranslate these. Listed segments pass through verbatim.
+    pub verbatim_segments: Vec<String>,
 }
 
 impl VisionSafetensorsLayout {
@@ -161,6 +191,7 @@ impl VisionSafetensorsLayout {
             default_root: "visual".to_string(),
             layered_subpath: "blocks".to_string(),
             subtrees: BTreeMap::new(),
+            verbatim_segments: Vec::new(),
         }
     }
 }
@@ -186,6 +217,22 @@ impl VisionDModelFingerprint {
 pub struct VisionPatchEmbedFlatten {
     pub key: String,
     pub leading_dim: usize,
+}
+
+/// CLIP-class CLS-token fold descriptor — see
+/// [`ModelParams::vision_class_embedding_fold`].
+#[derive(Clone, Debug)]
+pub struct VisionClassEmbeddingFold {
+    /// Source rank-1 weight (e.g.
+    /// `vision_tower.vision_model.embeddings.class_embedding`).
+    pub class_embedding_key: String,
+    /// Target rank-2 weight whose `target_row` row will accumulate
+    /// `class_embedding_key` (e.g.
+    /// `vision_tower.vision_model.embeddings.position_embedding.weight`).
+    pub target_key: String,
+    /// Row index of `target_key` to fold into. Always 0 for CLIP-class
+    /// arches but kept generic for symmetry with future MM towers.
+    pub target_row: usize,
 }
 
 impl VisionPatchEmbedFlatten {
@@ -791,10 +838,15 @@ fn model_params_from_json(
     let vision_layout = extract_vision_layout(json);
     let vision_d_model_fingerprint = extract_vision_d_model_fingerprint(json);
     let vision_patch_embed_flatten = extract_vision_patch_embed_flatten(json);
+    let vision_class_embedding_fold = extract_vision_class_embedding_fold(json);
     let decoder_safetensors_prefix = json
         .get("decoder_safetensors_prefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let torch_dtype = json
+        .get("torch_dtype")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase());
 
     Ok(ModelParams {
         name,
@@ -812,7 +864,9 @@ fn model_params_from_json(
         vision_layout,
         vision_d_model_fingerprint,
         vision_patch_embed_flatten,
+        vision_class_embedding_fold,
         decoder_safetensors_prefix,
+        torch_dtype,
     })
 }
 
@@ -831,10 +885,20 @@ fn extract_vision_layout(json: &serde_json::Value) -> Option<VisionSafetensorsLa
             }
         }
     }
+    let verbatim_segments = obj
+        .get("verbatim_segments")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(VisionSafetensorsLayout {
         default_root,
         layered_subpath,
         subtrees,
+        verbatim_segments,
     })
 }
 
@@ -850,6 +914,20 @@ fn extract_vision_patch_embed_flatten(json: &serde_json::Value) -> Option<Vision
     let key = obj.get("key")?.as_str()?.to_string();
     let leading_dim = obj.get("leading_dim")?.as_u64()? as usize;
     Some(VisionPatchEmbedFlatten { key, leading_dim })
+}
+
+fn extract_vision_class_embedding_fold(
+    json: &serde_json::Value,
+) -> Option<VisionClassEmbeddingFold> {
+    let obj = json.get("vision_class_embedding_fold")?.as_object()?;
+    let class_embedding_key = obj.get("class_embedding_key")?.as_str()?.to_string();
+    let target_key = obj.get("target_key")?.as_str()?.to_string();
+    let target_row = obj.get("target_row")?.as_u64()? as usize;
+    Some(VisionClassEmbeddingFold {
+        class_embedding_key,
+        target_key,
+        target_row,
+    })
 }
 
 /// Extract `rope_scaling.mrope_section` as a fixed `[u32; 3]`. Returns

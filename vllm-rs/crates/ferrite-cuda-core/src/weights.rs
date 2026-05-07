@@ -1256,6 +1256,120 @@ impl GpuWeights {
         Ok(())
     }
 
+    /// CPU-side broadcast add: `target[target_row, :] += source[:]`.
+    ///
+    /// `source` must be a rank-1 tensor of length matching the
+    /// trailing dim of `target` (a rank-2 tensor). After the add,
+    /// `source` is removed from the manifest tracking — the loader
+    /// must not pull it again, and any downstream code that referenced
+    /// it must read its contribution off `target` row `target_row`.
+    /// Used by CLIP-class CLS-token folds (LLaVA-1.5 family): the
+    /// learnable `class_embedding` is added into `position_embedding`
+    /// row 0 at load time so the DSL body can collapse "concat CLS,
+    /// add positional" into one `add` against the pre-folded position
+    /// table.
+    ///
+    /// Dtype-dispatches across F32 / F16 / BF16 — both tensors must
+    /// share a dtype. Materializes `target`'s buffer as owned bytes
+    /// (mirroring `pad_axis_to_mult8`); the original mmap is dropped.
+    pub fn fold_row_add(&mut self, target: &str, target_row: usize, source: &str) -> Result<()> {
+        let src_ref = self
+            .tensors
+            .get(source)
+            .ok_or_else(|| anyhow::anyhow!("fold_row_add: source weight not found: {source}"))?;
+        anyhow::ensure!(
+            src_ref.shape.len() == 1,
+            "fold_row_add: source {source} must be rank-1, got {:?}",
+            src_ref.shape,
+        );
+        let cols = src_ref.shape[0];
+        let src_dtype = src_ref.dtype;
+        // Snapshot source bytes before mutating `target`; both tensors
+        // are borrowed off `self.tensors`.
+        let src_bytes = src_ref.data().to_vec();
+
+        let dst_ref = self
+            .tensors
+            .get_mut(target)
+            .ok_or_else(|| anyhow::anyhow!("fold_row_add: target weight not found: {target}"))?;
+        anyhow::ensure!(
+            dst_ref.shape.len() == 2,
+            "fold_row_add: target {target} must be rank-2, got {:?}",
+            dst_ref.shape,
+        );
+        anyhow::ensure!(
+            dst_ref.shape[1] == cols,
+            "fold_row_add: target {target} trailing dim {} != source {source} length {cols}",
+            dst_ref.shape[1],
+        );
+        anyhow::ensure!(
+            target_row < dst_ref.shape[0],
+            "fold_row_add: target_row {target_row} out of bounds for {target} shape {:?}",
+            dst_ref.shape,
+        );
+        anyhow::ensure!(
+            dst_ref.dtype == src_dtype,
+            "fold_row_add: dtype mismatch — target {target} is {:?}, source {source} is {:?}",
+            dst_ref.dtype,
+            src_dtype,
+        );
+
+        let elem = dst_ref.dtype.size_bytes();
+        let row_bytes = cols * elem;
+        let dst_total_bytes = dst_ref.shape.iter().product::<usize>() * elem;
+        let dst_data = dst_ref.data();
+        let mut buf = dst_data.to_vec();
+        anyhow::ensure!(
+            buf.len() == dst_total_bytes,
+            "fold_row_add: target {target} size mismatch: {} vs expected {dst_total_bytes}",
+            buf.len(),
+        );
+        let row_off = target_row * row_bytes;
+        let dst_row = &mut buf[row_off..row_off + row_bytes];
+
+        match dst_ref.dtype {
+            DType::F32 => {
+                anyhow::ensure!(src_bytes.len() == cols * 4, "F32 src size");
+                for i in 0..cols {
+                    let s = f32::from_le_bytes(src_bytes[i * 4..i * 4 + 4].try_into().unwrap());
+                    let d = f32::from_le_bytes(dst_row[i * 4..i * 4 + 4].try_into().unwrap());
+                    dst_row[i * 4..i * 4 + 4].copy_from_slice(&(d + s).to_le_bytes());
+                }
+            }
+            DType::F16 => {
+                use half::f16;
+                anyhow::ensure!(src_bytes.len() == cols * 2, "F16 src size");
+                for i in 0..cols {
+                    let s = f16::from_le_bytes(src_bytes[i * 2..i * 2 + 2].try_into().unwrap());
+                    let d = f16::from_le_bytes(dst_row[i * 2..i * 2 + 2].try_into().unwrap());
+                    let sum = f16::from_f32(d.to_f32() + s.to_f32());
+                    dst_row[i * 2..i * 2 + 2].copy_from_slice(&sum.to_le_bytes());
+                }
+            }
+            DType::BF16 => {
+                use half::bf16;
+                anyhow::ensure!(src_bytes.len() == cols * 2, "BF16 src size");
+                for i in 0..cols {
+                    let s = bf16::from_le_bytes(src_bytes[i * 2..i * 2 + 2].try_into().unwrap());
+                    let d = bf16::from_le_bytes(dst_row[i * 2..i * 2 + 2].try_into().unwrap());
+                    let sum = bf16::from_f32(d.to_f32() + s.to_f32());
+                    dst_row[i * 2..i * 2 + 2].copy_from_slice(&sum.to_le_bytes());
+                }
+            }
+            other => anyhow::bail!("fold_row_add: unsupported dtype {other:?} for {target}"),
+        }
+
+        dst_ref.mmap = None;
+        dst_ref.data_offset = 0;
+        dst_ref.size_bytes = dst_total_bytes;
+        dst_ref.owned = Some(Arc::new(buf));
+
+        // Drop source from manifest tracking — the loader must not pull
+        // it; its contribution now lives in target row `target_row`.
+        self.tensors.remove(source);
+        Ok(())
+    }
+
     /// Tensor shape lookup that checks all three backing maps —
     /// safetensors `tensors`, `gguf_dense`, and `quantized`. Used by
     /// the per-variant fingerprint sniff which needs to verify

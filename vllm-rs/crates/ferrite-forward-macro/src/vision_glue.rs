@@ -113,6 +113,27 @@ pub fn emit_per_variant(
     let d_model_usize_lit = proc_macro2::Literal::usize_unsuffixed(d_model as usize);
     let eps_lit = proc_macro2::Literal::f32_suffixed(eps);
 
+    // Vision compute dtype: drives host-side patch packer + RoPE
+    // builder + activation upload. Must match the on-disk weight dtype
+    // (cuBLAS keys its plan on the activation dtype, and an F16 weight
+    // × BF16-encoded host bytes upload reads the bytes as F16 — every
+    // value scrambled). Source: HF `torch_dtype` string. Default BF16
+    // when missing (every existing VL/MM arch in the tree is
+    // bfloat16; LLaVA-1.5 family is the first F16 vision tower).
+    let dtype_path: syn::Path = match model.torch_dtype.as_deref() {
+        Some("float16" | "fp16" | "f16" | "half") => {
+            syn::parse_str("::ferrite_cuda_core::DType::F16").unwrap()
+        }
+        Some("bfloat16" | "bf16") | None => {
+            syn::parse_str("::ferrite_cuda_core::DType::BF16").unwrap()
+        }
+        Some(other) => panic!(
+            "vision config `{}`: unsupported torch_dtype `{other}` \
+             (expected float16 or bfloat16)",
+            model.source_stem,
+        ),
+    };
+
     // Per-block zero-pad expansion for `__pad_to_mult8__` manifest
     // entries. Each PadHint's stem is treated as a per-block weight
     // suffix (matching the per-block convention shared with
@@ -156,6 +177,29 @@ pub fn emit_per_variant(
             // mult-of-8.
             #(#pad_calls)*
         }
+    };
+
+    // CLIP-class CLS-token fold (Phase H — LLaVA-1.5 family). When the
+    // variant config carries `vision_class_embedding_fold`, the
+    // emitted try_load_mm adds the rank-1 `class_embedding` weight
+    // into the configured row of the rank-2 target (typically
+    // `position_embedding.weight` row 0) at load time, then drops
+    // class_embedding from the manifest. Combined with a pixel_pack
+    // override that prepends a zero row (so post-patch_embedding the
+    // row 0 is zero), the body's `pos_embed + add` chain reproduces
+    // HF's `concat(class_embedding, patches) + position_embedding`
+    // sequence byte-equivalently. No-op for non-CLIP towers.
+    let cls_fold_prelude = match model.vision_class_embedding_fold.as_ref() {
+        Some(fold) => {
+            let cls_key_lit =
+                syn::LitStr::new(&fold.class_embedding_key, proc_macro2::Span::call_site());
+            let target_key_lit = syn::LitStr::new(&fold.target_key, proc_macro2::Span::call_site());
+            let target_row_lit = proc_macro2::Literal::usize_unsuffixed(fold.target_row);
+            quote! {
+                gw.fold_row_add(#target_key_lit, #target_row_lit, #cls_key_lit)?;
+            }
+        }
+        None => quote! {},
     };
 
     let arch_name_lit = syn::LitStr::new(arch_name, proc_macro2::Span::call_site());
@@ -223,6 +267,7 @@ pub fn emit_per_variant(
                     in_chans: #in_chans_lit,
                     d_model: #d_model_lit,
                     norm_eps: #eps_lit,
+                    compute_dtype: #dtype_path,
                 };
                 &C
             }
@@ -288,6 +333,7 @@ pub fn emit_per_variant(
                 }
             }
             #pad_prelude
+            #cls_fold_prelude
             let weights = load(gw, stream, max_model_len, tp_rank)?;
             ::std::result::Result::Ok(::std::option::Option::Some(
                 ::std::boxed::Box::new(::ferrite_forward::VisionWrapper::new(weights))

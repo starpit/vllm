@@ -438,4 +438,10 @@ impl TestModels {
     // (full at indices [7,15,23,31], windowed otherwise), entry-side
     // window permutation gather + reverse permutation post-merger.
     pub const QWEN2_5_VL_3B_INSTRUCT: &str = "Qwen/Qwen2.5-VL-3B-Instruct";
+
+    // LLaVA-1.5 multimodal — Phase H ferrite-model-llava crate. Vision
+    // tower is OpenAI CLIP-ViT-L/14 @ 336²; text decoder is Vicuna-7B
+    // (Llama-class via ferrite-model-llama). The HF mirror ships in
+    // FP16 (~14 GB) — fits an L4's 23 GB VRAM cleanly.
+    pub const LLAVA_1_5_7B_HF: &str = "llava-hf/llava-1.5-7b-hf";
 }

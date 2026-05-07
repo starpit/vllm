@@ -1831,7 +1831,28 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
 /// multi-tile fusions the `ferrite-kernels` shape requires.
 /// Replaced / augmented by calibrated target-specific impls as
 /// they're ported.
+///
+/// `bf16_only_kernels = false` drops every CUTLASS-routing Impl from
+/// the library: every CUTLASS GEMM kernel template in
+/// `cutlass_standalone_gemm.cu` is instantiated with
+/// `cutlass::bfloat16_t` (no F16 launchers). Letting the DP solver
+/// pick a CUTLASS Impl on an F16 model causes cuBLAS to dispatch the
+/// kernel against F16-encoded host bytes through a BF16 plan, and
+/// every value at the kernel's first read is misinterpreted (5-bit
+/// F16 exponent reinterpreted as 8-bit BF16 exponent → values in
+/// `[-2.13, 1.94]` came out roughly identical row-to-row at LLaVA-1.5
+/// fc1+bias output, cosine 0.997). Falling back to cuBLAS keeps the
+/// numerics correct at the cost of CUTLASS perf gains.
 pub fn starter_library() -> ImplementationLibrary {
+    starter_library_for(true)
+}
+
+/// Variant of [`starter_library`] that gates the CUTLASS Impl set on
+/// the model's compute dtype. Pass `bf16_only_kernels = false` when
+/// the model's `torch_dtype` is `float16` so the DP can't pick a
+/// BF16-only CUTLASS kernel.
+pub fn starter_library_for(bf16_only_kernels: bool) -> ImplementationLibrary {
+    let cutlass_enabled = bf16_only_kernels;
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
@@ -1906,12 +1927,14 @@ pub fn starter_library() -> ImplementationLibrary {
     // and bias passed as the C operand at ldc=0 (row broadcast). One
     // Impl per CUTLASS_TILE_ZOO entry, gated per-tile on calibrated
     // CSV row presence; the DP picks the best tile per workload.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedGemmBiasImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
+    if cutlass_enabled {
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedGemmBiasImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
     }
     // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpSiluMul
     // below is the cuBLAS-OFF peer.
@@ -1925,12 +1948,14 @@ pub fn starter_library() -> ImplementationLibrary {
     // tile is DP-pickable rather than hardcoded — the previous
     // hardcoded `cutlass_128x128_s3` lost to small-M tiles after the
     // tile_m=16 splitK additions, breaking SiLU MLP fusions.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedGateUpSiluMulImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
+    if cutlass_enabled {
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedGateUpSiluMulImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
     }
     // Gated on the cuBLAS env var (Step 5b) — CutlassFusedGateUpGeluMul
     // below is the cuBLAS-OFF peer.
@@ -1941,12 +1966,14 @@ pub fn starter_library() -> ImplementationLibrary {
     // structurally — packed CUTLASS GEMM at (M, 2I, K) followed by
     // BW-bound `gelu_and_mul_fused` — picking the GEMM tile per (M,
     // 2I, K) bucket. One Impl per CUTLASS_TILE_ZOO entry.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
+    if cutlass_enabled {
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedGateUpGeluMulImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
     }
     lib.push(Box::new(FusedAddRmsNormImpl));
     // Norm→Gemm fusion family: captures the lm_head + body Norm→Gemm
@@ -1956,25 +1983,27 @@ pub fn starter_library() -> ImplementationLibrary {
     // Tile-zoo-pickable; one Impl per CUTLASS_TILE_ZOO entry per
     // shape. matches() rejects multi-consumer norms so FusedQkvRope*
     // / FusedGateUp* keep claiming the body QKV / gate-up patterns.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedRmsNormGemmImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-        // CohereLayerNorm-flavored peer: claims `(Mean, Sub, RmsNorm,
-        // Gemm)` and emits `cohere_layer_norm + cutlass_gemm`. Cost
-        // calibration shared with the `CutlassFusedRmsNormGemm` row.
-        lib.push(Box::new(CutlassFusedMeanSubRmsNormGemmImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-        lib.push(Box::new(CutlassFusedAddRmsNormGemmImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
+    if cutlass_enabled {
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedRmsNormGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+            // CohereLayerNorm-flavored peer: claims `(Mean, Sub, RmsNorm,
+            // Gemm)` and emits `cohere_layer_norm + cutlass_gemm`. Cost
+            // calibration shared with the `CutlassFusedRmsNormGemm` row.
+            lib.push(Box::new(CutlassFusedMeanSubRmsNormGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+            lib.push(Box::new(CutlassFusedAddRmsNormGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
     }
     // Singleton fallback for residual `Add`s whose downstream is not
     // a RmsNorm — Cohere's parallel attn+MLP residual pair, layer-end
@@ -2032,17 +2061,19 @@ pub fn starter_library() -> ImplementationLibrary {
     // target_compatible gates each on calibrated CSV row presence.
     // matches() rejects biased claims (qwen2 keeps cuBLAS until the
     // bias-zoo CSV is shape-swept).
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassFusedQkvRopeCacheImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-        lib.push(Box::new(CutlassFusedQkvRopePrefillImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
+    if cutlass_enabled {
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassFusedQkvRopeCacheImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+            lib.push(Box::new(CutlassFusedQkvRopePrefillImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
     }
     // FusedQkvQkNormRopeCacheImpl (three-gemm + fused qk_norm_rope +
     // cache) is staged in this crate but intentionally NOT registered.
@@ -2088,38 +2119,40 @@ pub fn starter_library() -> ImplementationLibrary {
     // output flows into a fusion (RopeAppend / Silu / Mul) so the
     // solver can never pick cutlass for a QKV or gate/up gemm that
     // would otherwise break its fusion chain.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassGemmImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-    }
-    // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
-    // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
-    // FusedAddRmsNormImpl per layer-residual chain by cost.
-    for tile in CUTLASS_TILE_ZOO {
-        lib.push(Box::new(CutlassGemmAddImpl {
-            tile_m: tile.0,
-            tile_n: tile.1,
-            stages: tile.2,
-        }));
-    }
-    // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
-    // Closes the small-N/large-K tall-skinny shape class where the
-    // standard tile zoo leaves cuBLAS winning. target_compatible
-    // gates on CSV row presence, so uncalibrated targets skip
-    // these variants silently.
-    for &(tm, tn, st, sk) in CUTLASS_SPLITK_ZOO {
-        lib.push(Box::new(CutlassGemmSplitKImpl {
-            tile_m: tm,
-            tile_n: tn,
-            stages: st,
-            split_k: sk,
-        }));
-    }
+    if cutlass_enabled {
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassGemmImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
+        // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
+        // FusedAddRmsNormImpl per layer-residual chain by cost.
+        for tile in CUTLASS_TILE_ZOO {
+            lib.push(Box::new(CutlassGemmAddImpl {
+                tile_m: tile.0,
+                tile_n: tile.1,
+                stages: tile.2,
+            }));
+        }
+        // CUTLASS SplitK parallel — one Impl per (tile, split_k) tuple.
+        // Closes the small-N/large-K tall-skinny shape class where the
+        // standard tile zoo leaves cuBLAS winning. target_compatible
+        // gates on CSV row presence, so uncalibrated targets skip
+        // these variants silently.
+        for &(tm, tn, st, sk) in CUTLASS_SPLITK_ZOO {
+            lib.push(Box::new(CutlassGemmSplitKImpl {
+                tile_m: tm,
+                tile_n: tn,
+                stages: st,
+                split_k: sk,
+            }));
+        }
 
-    lib.push(Box::new(CutlassGemvImpl));
+        lib.push(Box::new(CutlassGemvImpl));
+    }
 
     // ── Marlin (AWQ / GPTQ) impls ───────────────────────────────
     //
@@ -2219,6 +2252,11 @@ pub fn starter_library() -> ImplementationLibrary {
     // `avg_pool_2d(x)` call; reduces the leading dim by the bake-time
     // `vision_pool_factor`. Used by Gemma3-MM's SigLIP→text projector.
     lib.push(Box::new(AvgPool2dImpl));
+    // CLIP-class CLS-token strip (Phase H). Claims any `strip_cls(x)`
+    // call; drops row 0 from a `[vision_num_positions, e]` tile and
+    // produces `[vision_in_seq_len, e]`. Used by LLaVA-1.5-class
+    // projectors with `vision_feature_select_strategy = "default"`.
+    lib.push(Box::new(StripClsImpl));
 
     // FlashInfer paged attention is disabled fleet-wide pending a fix
     // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
@@ -16505,7 +16543,9 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_class_embedding_fold: None,
             decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let scale = attention_scale_for(&model);
@@ -16554,7 +16594,9 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_class_embedding_fold: None,
             decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16634,7 +16676,9 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_class_embedding_fold: None,
             decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16736,7 +16780,9 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_class_embedding_fold: None,
             decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17265,7 +17311,9 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_class_embedding_fold: None,
             decoder_safetensors_prefix: None,
+            torch_dtype: None,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {
@@ -19529,6 +19577,102 @@ impl Implementation for AvgPool2dImpl {
         let out_slot_idx = slots.of(tile, 0);
         Some(vec![OpInstance::new(
             syn::Ident::new("AvgPool2d", proc_macro2::Span::call_site()),
+            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
+        )])
+    }
+}
+
+// ── StripClsImpl (Phase H) ───────────────────────────────────────
+//
+// Singleton on `OpKind::StripCls`. Claims any DSL call to
+// `strip_cls(x)` and emits one `Instruction::StripCls { in_slot,
+// out_slot }` row. The kernel reads `L = x.dim(0)` at runtime, so no
+// per-call discriminant or canonical-params bake is needed — a
+// misconfigured `vision_in_seq_len = vision_num_positions - 1`
+// invariant in the variant config trips the shape-resolver at
+// expansion time, NOT at runtime.
+//
+// Same allocation pattern as `AvgPool2d` / `EmbeddingGather`:
+// allocates a fresh `[L - 1, e]` output (output shape strictly
+// differs from input shape, so the input's allocation can't be
+// reused). `consumes_input_tiles` stays empty.
+
+#[derive(Debug, Default)]
+pub struct StripClsImpl;
+
+impl Implementation for StripClsImpl {
+    fn name(&self) -> &'static str {
+        "strip_cls"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::StripCls)
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Bandwidth-bound: read `(L-1) * e` elements, write the same.
+        // Same estimator as the other elementwise / gather Impls.
+        elementwise_cost(m, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "StripCls",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("StripCls: input 0 must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![OpInstance::new(
+            syn::Ident::new("StripCls", proc_macro2::Span::call_site()),
             vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
         )])
     }

@@ -2678,8 +2678,40 @@ fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     match ChatTemplate::from_tokenizer_config(&config_path) {
         Ok(Some(tpl)) => Some(tpl),
         Ok(None) => {
-            // Fallback: some models (e.g. AWQ quantized) store the template in a
-            // separate Jinja file instead of embedding it in tokenizer_config.json.
+            // Fallback chain for models that don't embed the template
+            // in `tokenizer_config.json`:
+            //   1. `chat_template.json` — LLaVA-1.5-class processors
+            //      put a JSON wrapper `{ "chat_template": "..." }` in
+            //      this file. HF transformers' `from_pretrained` looks
+            //      here when the tokenizer config is silent.
+            //   2. `chat_template.jinja` — some AWQ-quantized mirrors.
+            let json_path = model_dir.join("chat_template.json");
+            if json_path.exists() {
+                match std::fs::read_to_string(&json_path) {
+                    Ok(body) => {
+                        let template_str = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("chat_template")
+                                    .and_then(|x| x.as_str().map(String::from))
+                            });
+                        if let Some(s) = template_str {
+                            match ChatTemplate::new(s) {
+                                Ok(tpl) => {
+                                    info!("Chat template loaded from chat_template.json");
+                                    return Some(tpl);
+                                }
+                                Err(e) => {
+                                    info!("Failed to parse chat_template.json: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        info!("Failed to read chat_template.json: {e}");
+                    }
+                }
+            }
             let jinja_path = model_dir.join("chat_template.jinja");
             if jinja_path.exists() {
                 match std::fs::read_to_string(&jinja_path) {

@@ -635,3 +635,57 @@ void avg_pool_2d_bf16(void* out, const void* in, int ph, int k, int e, cudaStrea
 { LAUNCH_AVG_POOL_2D(__nv_bfloat16); }
 
 } // extern "C"
+
+// ──────────────────────────────────────────────────────────────────
+// strip_cls (Phase H — LLaVA-1.5 family)
+// ──────────────────────────────────────────────────────────────────
+//
+// Drop row 0 from a `[L, e]` tile and copy rows `1..L` into a fresh
+// `[L - 1, e]` buffer. Used by CLIP-class projectors with
+// `vision_feature_select_strategy = "default"` — HF strips the CLS
+// row before the multimodal projector runs.
+//
+// One thread per output element. For LLaVA-1.5 @ 336² (L=577, e=1024)
+// that's ~590k threads — bandwidth-bound, single contiguous read of
+// `(L-1) * e` elements + matching write. No synchronization, no
+// reductions; the kernel exists only because cudaMemcpyAsync of a
+// non-contiguous source slice would either need pointer arithmetic
+// the caller can't do (stream-async) or a host-bouncing detour.
+
+template <typename T>
+__global__ void strip_cls_kernel(
+    T* __restrict__ out,         // [(L - 1) * e]
+    const T* __restrict__ in,    // [L * e], starting at row 0
+    int total_out                // (L - 1) * e
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_out) return;
+    // `in + e` skips the first row exactly. `idx` then walks the
+    // remaining (L - 1) * e elements row-major.
+    out[idx] = in[idx];
+}
+
+extern "C" {
+
+#define LAUNCH_STRIP_CLS(T)                                                    \
+    do {                                                                       \
+        const int total_out = (l - 1) * e;                                     \
+        if (total_out <= 0) return;                                            \
+        const int threads = 256;                                               \
+        const int blocks = (total_out + threads - 1) / threads;                \
+        strip_cls_kernel<T><<<blocks, threads, 0, stream>>>(                   \
+            reinterpret_cast<T*>(out),                                         \
+            reinterpret_cast<const T*>(in) + e,                                \
+            total_out);                                                        \
+    } while (0)
+
+void strip_cls_f32(void* out, const void* in, int l, int e, cudaStream_t stream)
+{ LAUNCH_STRIP_CLS(float); }
+
+void strip_cls_f16(void* out, const void* in, int l, int e, cudaStream_t stream)
+{ LAUNCH_STRIP_CLS(__half); }
+
+void strip_cls_bf16(void* out, const void* in, int l, int e, cudaStream_t stream)
+{ LAUNCH_STRIP_CLS(__nv_bfloat16); }
+
+} // extern "C"

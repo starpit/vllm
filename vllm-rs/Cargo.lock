@@ -2158,6 +2158,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-model-llava"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-kernels",
+ "ferrite-vision",
+ "half",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-model-mistral"
 version = "0.1.0"
 dependencies = [
@@ -2293,6 +2306,7 @@ dependencies = [
  "ferrite-model-gemma3-mm",
  "ferrite-model-granite",
  "ferrite-model-llama",
+ "ferrite-model-llava",
  "ferrite-model-mistral",
  "ferrite-model-mixtral",
  "ferrite-model-modernbert",

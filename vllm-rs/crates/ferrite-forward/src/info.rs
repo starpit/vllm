@@ -500,6 +500,9 @@ impl<W> Instruction<W> {
             Instruction::AvgPool2d(in_slot, out_slot) => {
                 ("AvgPool2d", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
+            Instruction::StripCls(in_slot, out_slot) => {
+                ("StripCls", vec![F::Slot(in_slot), F::Slot(out_slot)])
+            }
             Instruction::FlashInferAttentionDecode(
                 in_slot,
                 out_slot,

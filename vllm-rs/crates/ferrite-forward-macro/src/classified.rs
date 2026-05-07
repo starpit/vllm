@@ -431,6 +431,24 @@ pub enum OpKind {
     /// reuses `kernels::embedding_gather_masked` (the same kernel
     /// `Instruction::Embed` calls) reading `ctx.fwd.position_ids`.
     PosEmbed,
+    /// CLS-token strip for CLIP-class encoders:
+    /// `out = strip_cls(x: [vision_num_positions, e]) -> [vision_in_seq_len, e]`.
+    ///
+    /// Drops row 0 (the CLS / class-token slot) and copies rows
+    /// `1..vision_num_positions` into a fresh `[vision_in_seq_len, e]`
+    /// buffer. Used by LLaVA-1.5-class projectors with
+    /// `vision_feature_select_strategy = "default"` — HF strips the
+    /// CLS row before the multimodal projector runs, so the projector
+    /// gemms operate on `vision_in_seq_len` rows (= `image_size /
+    /// patch_size`²). Mirror primitive of `cls_prepend` is unnecessary
+    /// in the current MM stack: every CLIP-class arch (LLaVA-1.5,
+    /// LLaVA-Next, InternVL) folds `class_embedding` into
+    /// `position_embedding[0]` host-side at load time and pads pixels
+    /// with a leading zero row, so the CLS contribution flows in via
+    /// the existing `pos_embed` + `add` sequence. Shape: leading dim
+    /// drops from `vision_num_positions` (= patches+1) to
+    /// `vision_in_seq_len` (= patches); trailing dim preserved.
+    StripCls,
 }
 
 impl OpKind {
@@ -474,6 +492,7 @@ impl OpKind {
             "embedding_gather" => Some(Self::EmbeddingGather),
             "avg_pool_2d" => Some(Self::AvgPool2d),
             "pos_embed" => Some(Self::PosEmbed),
+            "strip_cls" => Some(Self::StripCls),
             _ => None,
         }
     }
@@ -520,6 +539,7 @@ impl OpKind {
             Self::EmbeddingGather => "embedding_gather",
             Self::AvgPool2d => "avg_pool_2d",
             Self::PosEmbed => "pos_embed",
+            Self::StripCls => "strip_cls",
         }
     }
 }

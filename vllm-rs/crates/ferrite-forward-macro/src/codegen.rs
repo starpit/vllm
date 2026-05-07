@@ -68,11 +68,37 @@ fn safetensors_prefix(
     // manifest; translate `_<digit>` suffixes back to `.<digit>`
     // for the on-disk safetensors key (which uses Python-attribute
     // dotted form, including numeric submodule indices).
+    //
+    // Vision-prelude only: if the per-arch
+    // `vision_safetensors_layout.verbatim_segments` list contains a
+    // raw segment, it's passed through unchanged. LLaVA-1.5's
+    // `multi_modal_projector.linear_1` / `linear_2` are real Python
+    // attribute names with literal underscores — the heuristic
+    // would mistranslate them to `linear.1` / `linear.2`.
+    let is_vision_for_verbatim =
+        matches!(program.prelude, crate::classified::Prelude::Vision);
+    let qwen_default_layout = crate::config::VisionSafetensorsLayout::qwen_default();
+    let layout_for_verbatim = if is_vision_for_verbatim {
+        program.vision_layout.as_ref().unwrap_or(&qwen_default_layout)
+    } else {
+        &qwen_default_layout
+    };
     let segs: Vec<String> = program
         .weights
         .path(id)
         .iter()
-        .map(|seg| translate_digit_suffix(seg))
+        .map(|seg| {
+            if is_vision_for_verbatim
+                && layout_for_verbatim
+                    .verbatim_segments
+                    .iter()
+                    .any(|v| v == seg)
+            {
+                seg.to_string()
+            } else {
+                translate_digit_suffix(seg)
+            }
+        })
         .collect();
     let joined = segs.join(".");
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
@@ -2159,6 +2185,20 @@ fn emit_weights_struct(
         })
     });
 
+    // Compute dtype the rotary cache must match the model's compute dtype:
+    // the rope kernel dispatches on Q/K activation dtype but reinterprets
+    // cos/sin bytes through that same plan, so a BF16 cos/sin against F16
+    // activations reads the table through the wrong exponent width
+    // (5 vs 8 bits). Source from the model's `torch_dtype`. Affects every
+    // F16 model (LLaVA's Vicuna, etc.); BF16 default preserves prior
+    // behavior for all other arches in the tree.
+    let rope_dtype: TokenStream = match model.torch_dtype.as_deref() {
+        Some("float16" | "fp16" | "f16" | "half") => {
+            quote! { ::ferrite_cuda_core::dtype::DType::F16 }
+        }
+        _ => quote! { ::ferrite_cuda_core::dtype::DType::BF16 },
+    };
+
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::ferrite_kernels::rotary::RotaryCache, }
     } else {
@@ -2190,7 +2230,7 @@ fn emit_weights_struct(
                     #max_pos,
                     #local_theta,
                     None,
-                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    #rope_dtype,
                     stream,
                 )
             }?;
@@ -2285,7 +2325,7 @@ fn emit_weights_struct(
                     #max_pos,
                     #rope_theta,
                     None,
-                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    #rope_dtype,
                     stream,
                 )
             },
@@ -2310,7 +2350,7 @@ fn emit_weights_struct(
                             high_freq_factor: #high_freq_factor,
                             original_max_position_embeddings: #orig,
                         }),
-                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        #rope_dtype,
                         stream,
                     )
                 }
@@ -2339,7 +2379,7 @@ fn emit_weights_struct(
                             short_mscale: #short_mscale,
                             long_mscale: #long_mscale,
                         },
-                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        #rope_dtype,
                         stream,
                     )
                 }
@@ -2370,7 +2410,7 @@ fn emit_weights_struct(
                             mscale_all_dim: #mscale_all_dim,
                             original_max_position_embeddings: #orig,
                         },
-                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        #rope_dtype,
                         stream,
                     )
                 }
@@ -2382,7 +2422,7 @@ fn emit_weights_struct(
                     #max_pos,
                     #rope_theta,
                     None,
-                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    #rope_dtype,
                     stream,
                 )
             },
@@ -2408,7 +2448,7 @@ fn emit_weights_struct(
                             high_freq_factor: #high_freq_factor,
                             original_max_position_embeddings: #orig,
                         }),
-                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        #rope_dtype,
                         stream,
                     )
                 }
@@ -2438,7 +2478,7 @@ fn emit_weights_struct(
                             short_mscale: #short_mscale,
                             long_mscale: #long_mscale,
                         },
-                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        #rope_dtype,
                         stream,
                     )
                 }
@@ -5095,7 +5135,9 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_class_embedding_fold: None,
             decoder_safetensors_prefix: None,
+            torch_dtype: None,
         }
     }
 

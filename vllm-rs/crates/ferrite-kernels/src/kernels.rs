@@ -353,6 +353,14 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // CLIP-class CLS-token strip (Phase H). Drop row 0 from a [L, e]
+    // tile and copy rows 1..L into a fresh [L - 1, e] buffer. Used by
+    // LLaVA-1.5-class projectors with `vision_feature_select_strategy
+    // = "default"`.
+    fn strip_cls_f16(out: *mut u16, x: *const u16, l: c_int, e: c_int, stream: CUstream);
+    fn strip_cls_bf16(out: *mut u16, x: *const u16, l: c_int, e: c_int, stream: CUstream);
+    fn strip_cls_f32(out: *mut f32, x: *const f32, l: c_int, e: c_int, stream: CUstream);
+
     // Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
     fn tanh_softcap_inplace_f16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
     fn tanh_softcap_inplace_bf16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
@@ -2102,6 +2110,44 @@ pub unsafe fn avg_pool_2d(
         DType::BF16 => avg_pool_2d_bf16(out.as_mut_ptr(), x.as_ptr(), ph_c, k_c, e_c, stream),
         DType::F32 => avg_pool_2d_f32(out.as_mut_ptr(), x.as_ptr(), ph_c, k_c, e_c, stream),
         _ => panic!("avg_pool_2d: unsupported dtype {:?}", x.dtype()),
+    }
+    out
+}
+
+/// Drop row 0 of a `[L, e]` tile and return rows `1..L` as a fresh
+/// `[L - 1, e]` tensor.
+///
+/// Used by CLIP-class multimodal projectors with
+/// `vision_feature_select_strategy = "default"` (LLaVA-1.5 family).
+/// HF strips the CLS row before the projector runs; ferrite's
+/// equivalent is `Instruction::StripCls`, which calls into here.
+///
+/// Allocates a fresh output from the caching allocator. The kernel
+/// is one-thread-per-output-element memcpy under the hood — no
+/// padding, no broadcast, no reduction.
+///
+/// # Safety
+/// `x` must be a valid rank-2 `[L, e]` GPU tensor with `L >= 2`; the
+/// caller serializes against other kernel writes to `x`.
+pub unsafe fn strip_cls(
+    x: GpuTensor,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let l = x.dim(0);
+    let e = x.dim(1);
+    assert!(
+        l >= 2,
+        "strip_cls: input leading dim must be >= 2 ([CLS, ...patches]); got {l}"
+    );
+    let out = alloc.alloc_tensor(&[l - 1, e], x.dtype());
+    let l_c = l as c_int;
+    let e_c = e as c_int;
+    match x.dtype() {
+        DType::F16 => strip_cls_f16(out.as_mut_ptr(), x.as_ptr(), l_c, e_c, stream),
+        DType::BF16 => strip_cls_bf16(out.as_mut_ptr(), x.as_ptr(), l_c, e_c, stream),
+        DType::F32 => strip_cls_f32(out.as_mut_ptr(), x.as_ptr(), l_c, e_c, stream),
+        _ => panic!("strip_cls: unsupported dtype {:?}", x.dtype()),
     }
     out
 }

@@ -1,0 +1,57 @@
+{
+  "architectures": [
+    "LlavaForConditionalGeneration"
+  ],
+  "model_type": "llava_mm_vision",
+  "tie_word_embeddings": false,
+  "torch_dtype": "float16",
+
+  "d_model": 4096,
+
+  "vision_embed_dim": 1024,
+  "vision_depth": 23,
+  "vision_num_heads": 16,
+  "vision_head_dim": 64,
+  "vision_mlp_hidden": 4096,
+  "vision_in_chans": 3,
+  "vision_patch_size": 14,
+  "vision_image_size": 336,
+  "vision_in_features": 588,
+  "vision_num_positions": 577,
+  "vision_in_seq_len": 576,
+
+  "vision_temporal_patch_size": 1,
+  "vision_spatial_merge_size": 1,
+  "vision_rope_half_dim": 0,
+  "vision_merge_factor": 1,
+  "vision_merge_hidden": 1024,
+
+  "vision_norm_eps": 1.0e-5,
+
+  "decoder_safetensors_prefix": "language_model",
+
+  "vision_safetensors_layout": {
+    "default_root": "vision_tower.vision_model",
+    "layered_subpath": "encoder.layers",
+    "subtrees": {
+      "proj": "multi_modal_projector"
+    },
+    "verbatim_segments": ["linear_1", "linear_2"]
+  },
+
+  "vision_d_model_fingerprint": {
+    "key": "multi_modal_projector.linear_2.weight",
+    "dim": 0
+  },
+
+  "vision_patch_embed_flatten": {
+    "key": "vision_tower.vision_model.embeddings.patch_embedding.weight",
+    "leading_dim": 0
+  },
+
+  "vision_class_embedding_fold": {
+    "class_embedding_key": "vision_tower.vision_model.embeddings.class_embedding",
+    "target_key": "vision_tower.vision_model.embeddings.position_embedding.weight",
+    "target_row": 0
+  }
+}

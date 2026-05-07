@@ -33,6 +33,8 @@ use ferrite_cuda_core::weights::GpuWeights;
 #[cfg(feature = "cuda")]
 use ferrite_kernels::layers::Linear;
 
+use ferrite_cuda_core::DType;
+
 pub mod mm_meta;
 pub mod preprocess;
 
@@ -64,6 +66,15 @@ pub struct VisionConfig {
     /// `text_config.hidden_size`.
     pub d_model: u32,
     pub norm_eps: f32,
+    /// 16-bit GPU dtype the encoder runs in — must match the on-disk
+    /// model dtype. Drives `patches_from_normalized_chw` /
+    /// `build_rope_cos_sin` host-side conversion + `vision_arch.rs`'s
+    /// upload calls. Default BF16 covers Qwen2-VL / Qwen2.5-VL /
+    /// Gemma3-MM (all `torch_dtype: bfloat16`); LLaVA-1.5 / LLaVA-Next
+    /// override to F16 because the safetensors weights are F16 and
+    /// cuBLAS would otherwise read BF16-encoded host bytes through the
+    /// F16-keyed plan, scrambling every value from layer 0.
+    pub compute_dtype: DType,
 }
 
 impl VisionConfig {
@@ -97,10 +108,11 @@ impl VisionConfig {
 // h/w split lives entirely in the cos/sin layout — kernel is generic.
 
 impl VisionConfig {
-    /// Build per-token bf16 cos/sin tables `[total_l, head_dim/2]` for the 2D
-    /// vision RoPE. Result lives on the host; each VL crate uploads to the
-    /// device with `alloc_gpu_tensor_from_host`.
-    pub fn build_rope_cos_sin_bf16(
+    /// Build per-token cos/sin tables `[total_l, head_dim/2]` for the 2D
+    /// vision RoPE in `self.compute_dtype` (F16 or BF16). Result lives on
+    /// the host; each VL crate uploads to the device with
+    /// `alloc_gpu_tensor_from_host`.
+    pub fn build_rope_cos_sin(
         &self,
         grid_thw: &[(u32, u32, u32)],
         total_l: usize,
@@ -137,19 +149,20 @@ impl VisionConfig {
                     }
                 }
             }
+            let dt = self.compute_dtype;
             for _ in 0..t {
                 for token in 0..frame_len {
                     let hp = hpos[token] as f32;
                     let wp = wpos[token] as f32;
                     for &f in inv_freq.iter() {
                         let theta_h = hp * f;
-                        cos.push(f32_to_bf16(theta_h.cos()));
-                        sin.push(f32_to_bf16(theta_h.sin()));
+                        cos.push(f32_to_compute(theta_h.cos(), dt));
+                        sin.push(f32_to_compute(theta_h.sin(), dt));
                     }
                     for &f in inv_freq.iter() {
                         let theta_w = wp * f;
-                        cos.push(f32_to_bf16(theta_w.cos()));
-                        sin.push(f32_to_bf16(theta_w.sin()));
+                        cos.push(f32_to_compute(theta_w.cos(), dt));
+                        sin.push(f32_to_compute(theta_w.sin(), dt));
                     }
                 }
             }
@@ -260,7 +273,7 @@ impl VisionConfig {
                                     let row = ci * stride_c + img_h * stride_h + img_w_base;
                                     for pw in 0..p {
                                         let v = pixels[row + pw];
-                                        out[out_idx] = f32_to_bf16(v);
+                                        out[out_idx] = f32_to_compute(v, self.compute_dtype);
                                         out_idx += 1;
                                     }
                                 }
@@ -272,6 +285,63 @@ impl VisionConfig {
         }
         debug_assert_eq!(out_idx, l * feat);
         (out, (grid_t, grid_h as u32, grid_w as u32))
+    }
+
+    /// Phase H: CLIP-class pack with leading zero row for CLS slot.
+    /// Returns `[1 + L, feat]` bf16 patches where row 0 is all zeros
+    /// (placeholder for the CLS token; its content arrives via the
+    /// pre-folded `position_embedding[0]` in the DSL body's `add(...,
+    /// pos_emb)` step) and rows `1..1+L` are the natural row-major
+    /// patches from [`Self::patches_from_normalized_chw`]. The grid
+    /// triple is `(1, 1, 1 + L)` so [`build_cu_seqlens_i32`] emits a
+    /// single segment of length `1 + L` per image — matching
+    /// `vision_num_positions = (image_size / patch_size)² + 1`.
+    ///
+    /// Used by LLaVA-1.5 / LLaVA-Next / InternVL — every CLIP-class
+    /// vision tower with a learnable `class_embedding` prepended to
+    /// the patch sequence. Combined with the
+    /// `vision_class_embedding_fold` config knob (which folds the
+    /// learnable CLS into `position_embedding[0]` at load time), the
+    /// math is byte-equivalent to HF's
+    /// `concat(class_embeds, patches) + position_embedding`.
+    pub fn pack_pixels_clip_with_cls(
+        &self,
+        pixels: &[f32],
+        height: u32,
+        width: u32,
+    ) -> (Vec<u16>, (u32, u32, u32)) {
+        let (mut out, _grid) = self.patches_from_normalized_chw(pixels, height, width);
+        let p = self.patch_size as usize;
+        let s = self.spatial_merge_size as usize;
+        let t = self.temporal_patch_size as usize;
+        let c = self.in_chans as usize;
+        let feat = c * t * p * p;
+        // Per-image L = number of patches before CLS prepend.
+        let h = height as usize;
+        let w = width as usize;
+        let grid_h = h / p;
+        let grid_w = w / p;
+        let l = grid_h * grid_w / (s * s);
+        // Prepend zero row in front of `feat` patches. Resize to
+        // `(L + 1) * feat` u16 elements; leading `feat` u16 = 0 (= bf16
+        // zero); shift the existing patches `feat` slots forward.
+        out.resize(out.len() + feat, 0u16);
+        out.copy_within(0..l * feat, feat);
+        // Zero-init the new leading row (resize already wrote zeros at
+        // the tail; the copy_within shifted the original patches up to
+        // start at index `feat`, so the first `feat` slots now hold
+        // whatever the resize wrote there. Belt-and-braces: explicitly
+        // zero the leading row.)
+        for o in out[..feat].iter_mut() {
+            *o = 0u16;
+        }
+        // Single segment of length `L + 1` per image: grid_t=1,
+        // grid_h=1, grid_w=L+1. (Stuffing the post-CLS sequence into
+        // the trailing `w` slot keeps `build_cu_seqlens_i32` honest;
+        // build_rope_cos_sin builds [L+1, half_rot] tables that the
+        // LLaVA body never reads.)
+        let total = (l as u32) + 1;
+        (out, (1u32, 1u32, total))
     }
 } // impl VisionConfig (patch flatten)
 
@@ -405,6 +475,27 @@ impl TraceDump {
 
 pub fn f32_to_bf16(v: f32) -> u16 {
     half::bf16::from_f32(v).to_bits()
+}
+
+pub fn f32_to_f16(v: f32) -> u16 {
+    half::f16::from_f32(v).to_bits()
+}
+
+/// Convert one f32 value to its 16-bit GPU representation. The dtype
+/// must be `F16` or `BF16` — both occupy 2 bytes, so the caller's
+/// `Vec<u16>` buffer doesn't change shape; only the bit layout per slot
+/// flips. Panics on any other dtype because the vision pack pipeline
+/// only feeds these two cases.
+#[inline]
+pub fn f32_to_compute(v: f32, dtype: DType) -> u16 {
+    match dtype {
+        DType::F16 => f32_to_f16(v),
+        DType::BF16 => f32_to_bf16(v),
+        other => panic!(
+            "f32_to_compute: unsupported vision compute dtype {other:?} \
+             (expected F16 or BF16)"
+        ),
+    }
 }
 
 pub fn bf16_slice_as_bytes(s: &[u16]) -> &[u8] {

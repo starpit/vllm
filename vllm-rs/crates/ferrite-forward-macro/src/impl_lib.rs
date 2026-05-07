@@ -1832,27 +1832,15 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
 /// Replaced / augmented by calibrated target-specific impls as
 /// they're ported.
 ///
-/// `bf16_only_kernels = false` drops every CUTLASS-routing Impl from
-/// the library: every CUTLASS GEMM kernel template in
-/// `cutlass_standalone_gemm.cu` is instantiated with
-/// `cutlass::bfloat16_t` (no F16 launchers). Letting the DP solver
-/// pick a CUTLASS Impl on an F16 model causes cuBLAS to dispatch the
-/// kernel against F16-encoded host bytes through a BF16 plan, and
-/// every value at the kernel's first read is misinterpreted (5-bit
-/// F16 exponent reinterpreted as 8-bit BF16 exponent → values in
-/// `[-2.13, 1.94]` came out roughly identical row-to-row at LLaVA-1.5
-/// fc1+bias output, cosine 0.997). Falling back to cuBLAS keeps the
-/// numerics correct at the cost of CUTLASS perf gains.
+/// CUTLASS launchers in `cutlass_standalone_gemm.cu` are emitted in
+/// `_bf16_launch` / `_f16_launch` pairs (see commit templatizing the
+/// macros on `<typename T>`); the Rust-side dispatch in
+/// `ferrite-kernels::cutlass` reads `activation.dtype()` and picks
+/// the matching launcher. So registering CUTLASS Impls is dtype-
+/// independent — a model whose `torch_dtype` is `float16` reaches
+/// the same fused-EVT epilogues that BF16 models get.
 pub fn starter_library() -> ImplementationLibrary {
-    starter_library_for(true)
-}
-
-/// Variant of [`starter_library`] that gates the CUTLASS Impl set on
-/// the model's compute dtype. Pass `bf16_only_kernels = false` when
-/// the model's `torch_dtype` is `float16` so the DP can't pick a
-/// BF16-only CUTLASS kernel.
-pub fn starter_library_for(bf16_only_kernels: bool) -> ImplementationLibrary {
-    let cutlass_enabled = bf16_only_kernels;
+    let cutlass_enabled = true;
     let mut lib = ImplementationLibrary::new();
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));

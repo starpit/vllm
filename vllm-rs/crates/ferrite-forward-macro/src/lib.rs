@@ -532,19 +532,12 @@ fn compile_common(
         ferrite_cuda_targets::detect().map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
     let target_profile = target::from_profile_def(target_def);
 
-    // CUTLASS GEMM kernels in the workspace are compiled with
-    // `cutlass::bfloat16_t` only — no F16 launchers exist. If any of
-    // this arch's variants ships with `torch_dtype: float16`, the DP
-    // solver must not pick a CUTLASS Impl: cuBLAS will dispatch the
-    // F16-encoded host bytes through the BF16 kernel's plan and every
-    // value is misinterpreted (5-bit F16 exponent → 8-bit BF16 exponent),
-    // producing the row-collapse pattern we hit on LLaVA-1.5-7B fc1+bias
-    // (cosine 0.997 between rows of `[577, 4096]`). All other arches
-    // in the tree are bfloat16, so this gate is a no-op for them.
-    let bf16_only_kernels = models
-        .iter()
-        .all(|m| !matches!(m.torch_dtype.as_deref(), Some("float16" | "fp16" | "f16" | "half")));
-    let library = impl_lib::starter_library_for(bf16_only_kernels);
+    // CUTLASS GEMM kernels in the workspace are templatized over
+    // `<typename T>` — both `_bf16_launch` and `_f16_launch` symbols
+    // ship per tile. Rust-side dispatch (`ferrite-kernels::cutlass`)
+    // reads `activation.dtype()` and picks the matching launcher, so
+    // CUTLASS Impls register unconditionally (no dtype gate).
+    let library = impl_lib::starter_library();
 
     // Stable rebuild-on-JSON-change: emit `const _: &str =
     // include_str!("<abs path>");` for every file the macro read.

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Standalone CUTLASS 2.x bf16 GEMM launchers for the solver.
-// Generates one kernel + launch wrapper per (TB_M, TB_N, WARP_M, WARP_N, STAGES) config.
+// Standalone CUTLASS 2.x GEMM launchers for the solver, templatized
+// over the activation/output element type T (bf16 or f16). Each macro
+// invocation generates two kernel + launch wrappers per (TB_M, TB_N,
+// WARP_M, WARP_N, STAGES) config — one bf16, one f16. Both share the
+// HMMA tensor-core path on sm80/sm89/sm90 (same micro-arch shapes,
+// same alignment-8 LinearCombination), so cost calibration is shared.
 //
 // C[M,N] = alpha * A[M,K] @ B[K,N]^T + beta * C[M,N]
-// A: RowMajor bf16, B: ColumnMajor bf16, C: RowMajor bf16
+// A: RowMajor T, B: ColumnMajor T, C: RowMajor T
 
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm.h>
@@ -16,6 +20,8 @@
 #include <cuda_runtime.h>
 
 // ── Generic launch ──
+//
+// `T` is deduced from `GemmOp::ElementA` so callers stay unchanged.
 
 template <typename GemmOp>
 static int run_gemm(
@@ -24,12 +30,13 @@ static int run_gemm(
     float alpha, float beta,
     cudaStream_t stream
 ) {
+    using T = typename GemmOp::ElementA;
     typename GemmOp::Arguments args(
         {M, N, K},
-        {(cutlass::bfloat16_t const*)A, K},   // A [M,K] row-major, lda=K
-        {(cutlass::bfloat16_t const*)B, K},   // B [N,K] col-major, ldb=K
-        {(cutlass::bfloat16_t*)C, N},          // C [M,N] row-major, ldc=N
-        {(cutlass::bfloat16_t*)C, N},          // D = C (in-place for beta!=0)
+        {(T const*)A, K},   // A [M,K] row-major, lda=K
+        {(T const*)B, K},   // B [N,K] col-major, ldb=K
+        {(T*)C, N},          // C [M,N] row-major, ldc=N
+        {(T*)C, N},          // D = C (in-place for beta!=0)
         {alpha, beta}
     );
 
@@ -45,38 +52,49 @@ static int run_gemm(
 }
 
 // ── Macro: define type alias + extern "C" launch wrapper ──
+//
+// `DTYPE_TAG` is one of `bf16` / `f16`. `T` is the matching CUTLASS
+// element type. Each `CUTLASS_GEMM_TYPED(...)` invocation registers a
+// dtype-specific symbol (`cutlass_gemm_<tile>_<dtype>_launch`); the
+// public `CUTLASS_GEMM(...)` calls the typed variant twice — once for
+// each dtype.
 
-#define CUTLASS_GEMM_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)     \
-    using Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm< \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                             \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                          \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                             \
-        float,                                                                      \
-        cutlass::arch::OpClassTensorOp,                                             \
-        cutlass::arch::Sm80,                                                        \
-        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                \
-        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                          \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                       \
-        cutlass::epilogue::thread::LinearCombination<                               \
-            cutlass::bfloat16_t, 8, float, float>,                                  \
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,               \
-        STAGES                                                                      \
-    >;
+#define CUTLASS_GEMM_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    using Gemm_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES =                          \
+        cutlass::gemm::device::Gemm<                                                          \
+            T, cutlass::layout::RowMajor,                                                     \
+            T, cutlass::layout::ColumnMajor,                                                  \
+            T, cutlass::layout::RowMajor,                                                     \
+            float,                                                                            \
+            cutlass::arch::OpClassTensorOp,                                                   \
+            cutlass::arch::Sm80,                                                              \
+            cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                      \
+            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                                \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                             \
+            cutlass::epilogue::thread::LinearCombination<                                     \
+                T, 8, float, float>,                                                          \
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                     \
+            STAGES                                                                            \
+        >;
 
-#define CUTLASS_GEMM_LAUNCH(TB_M, TB_N, TB_K, STAGES)                              \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_launch(               \
-        void* C, const void* A, const void* B,                                      \
-        int M, int N, int K,                                                        \
-        float alpha, float beta,                                                    \
-        uint64_t stream                                                             \
-    ) {                                                                             \
-        return run_gemm<Gemm_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                \
-            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                   \
+#define CUTLASS_GEMM_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)                              \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_##DTYPE_TAG##_launch(           \
+        void* C, const void* A, const void* B,                                                \
+        int M, int N, int K,                                                                  \
+        float alpha, float beta,                                                              \
+        uint64_t stream                                                                       \
+    ) {                                                                                       \
+        return run_gemm<Gemm_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(            \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                             \
     }
 
-#define CUTLASS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)            \
-    CUTLASS_GEMM_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)         \
-    CUTLASS_GEMM_LAUNCH(TB_M, TB_N, TB_K, STAGES)
+#define CUTLASS_GEMM_TYPED(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)   \
+    CUTLASS_GEMM_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)      \
+    CUTLASS_GEMM_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)
+
+#define CUTLASS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)                       \
+    CUTLASS_GEMM_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    CUTLASS_GEMM_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)
 
 // ── Instantiate all configs ──
 //
@@ -104,19 +122,22 @@ CUTLASS_GEMM(256,   64,  32,    64,     32,     32,    3)
 // TB_K=64 variants — fewer main-loop iterations, better memory coalescing
 // at larger M. MMA shape stays 16×8×16 but TB_K doubles.
 // These need separate launch symbol names to avoid colliding with TB_K=32.
-#define CUTLASS_GEMM_K64_LAUNCH(TB_M, TB_N, STAGES)                            \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_k64_s##STAGES##_launch(      \
-        void* C, const void* A, const void* B,                                  \
-        int M, int N, int K,                                                    \
-        float alpha, float beta,                                                \
-        uint64_t stream                                                         \
-    ) {                                                                         \
-        return run_gemm<Gemm_##TB_M##x##TB_N##x64_s##STAGES>(                 \
-            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);               \
+#define CUTLASS_GEMM_K64_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES)                                \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_k64_s##STAGES##_##DTYPE_TAG##_launch(       \
+        void* C, const void* A, const void* B,                                                \
+        int M, int N, int K,                                                                  \
+        float alpha, float beta,                                                              \
+        uint64_t stream                                                                       \
+    ) {                                                                                       \
+        return run_gemm<Gemm_##DTYPE_TAG##_##TB_M##x##TB_N##x64_s##STAGES>(                  \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                             \
     }
-#define CUTLASS_GEMM_K64(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)          \
-    CUTLASS_GEMM_CONFIG(TB_M, TB_N, 64, WARP_M, WARP_N, WARP_K, STAGES)       \
-    CUTLASS_GEMM_K64_LAUNCH(TB_M, TB_N, STAGES)
+#define CUTLASS_GEMM_K64_TYPED(DTYPE_TAG, T, TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)     \
+    CUTLASS_GEMM_CONFIG(DTYPE_TAG, T, TB_M, TB_N, 64, WARP_M, WARP_N, WARP_K, STAGES)         \
+    CUTLASS_GEMM_K64_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES)
+#define CUTLASS_GEMM_K64(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)                          \
+    CUTLASS_GEMM_K64_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES) \
+    CUTLASS_GEMM_K64_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)
 
 CUTLASS_GEMM_K64( 64,   64,    32,     32,     64,    4)
 CUTLASS_GEMM_K64( 64,   64,    32,     32,     64,    3)
@@ -134,70 +155,82 @@ CUTLASS_GEMM_K64( 32,   64,    32,     32,     64,    4)
 CUTLASS_GEMM_K64( 32,  128,    32,     64,     64,    4)
 // 64x128_k64 with 8 warps (256 threads) — matches cuBLAS thread count
 // Warp shape 32x32x64: 64/32 x 128/32 = 2x4 = 8 warps
-#define CUTLASS_GEMM_K64_W8_CONFIG(TB_M, TB_N, STAGES)                          \
-    using Gemm_w8_##TB_M##x##TB_N##x64_s##STAGES = cutlass::gemm::device::Gemm< \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                          \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                       \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                          \
-        float,                                                                   \
-        cutlass::arch::OpClassTensorOp,                                          \
-        cutlass::arch::Sm80,                                                     \
-        cutlass::gemm::GemmShape<TB_M, TB_N, 64>,                               \
-        cutlass::gemm::GemmShape<32, 32, 64>,                                   \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                    \
-        cutlass::epilogue::thread::LinearCombination<                            \
-            cutlass::bfloat16_t, 8, float, float>,                               \
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,            \
-        STAGES                                                                   \
-    >;
-#define CUTLASS_GEMM_K64_W8_LAUNCH(TB_M, TB_N, STAGES)                          \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_k64w8_s##STAGES##_launch(     \
-        void* C, const void* A, const void* B,                                   \
-        int M, int N, int K,                                                     \
-        float alpha, float beta,                                                 \
-        uint64_t stream                                                          \
-    ) {                                                                          \
-        return run_gemm<Gemm_w8_##TB_M##x##TB_N##x64_s##STAGES>(               \
-            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                \
+#define CUTLASS_GEMM_K64_W8_CONFIG(DTYPE_TAG, T, TB_M, TB_N, STAGES)                          \
+    using Gemm_w8_##DTYPE_TAG##_##TB_M##x##TB_N##x64_s##STAGES =                              \
+        cutlass::gemm::device::Gemm<                                                          \
+            T, cutlass::layout::RowMajor,                                                     \
+            T, cutlass::layout::ColumnMajor,                                                  \
+            T, cutlass::layout::RowMajor,                                                     \
+            float,                                                                            \
+            cutlass::arch::OpClassTensorOp,                                                   \
+            cutlass::arch::Sm80,                                                               \
+            cutlass::gemm::GemmShape<TB_M, TB_N, 64>,                                        \
+            cutlass::gemm::GemmShape<32, 32, 64>,                                            \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                             \
+            cutlass::epilogue::thread::LinearCombination<                                     \
+                T, 8, float, float>,                                                          \
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                     \
+            STAGES                                                                            \
+        >;
+#define CUTLASS_GEMM_K64_W8_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES)                             \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_k64w8_s##STAGES##_##DTYPE_TAG##_launch(     \
+        void* C, const void* A, const void* B,                                                \
+        int M, int N, int K,                                                                  \
+        float alpha, float beta,                                                              \
+        uint64_t stream                                                                       \
+    ) {                                                                                       \
+        return run_gemm<Gemm_w8_##DTYPE_TAG##_##TB_M##x##TB_N##x64_s##STAGES>(               \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                             \
     }
-#define CUTLASS_GEMM_K64_W8(TB_M, TB_N, STAGES)                                 \
-    CUTLASS_GEMM_K64_W8_CONFIG(TB_M, TB_N, STAGES)                              \
-    CUTLASS_GEMM_K64_W8_LAUNCH(TB_M, TB_N, STAGES)
+#define CUTLASS_GEMM_K64_W8_TYPED(DTYPE_TAG, T, TB_M, TB_N, STAGES)                           \
+    CUTLASS_GEMM_K64_W8_CONFIG(DTYPE_TAG, T, TB_M, TB_N, STAGES)                              \
+    CUTLASS_GEMM_K64_W8_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES)
+#define CUTLASS_GEMM_K64_W8(TB_M, TB_N, STAGES)                                               \
+    CUTLASS_GEMM_K64_W8_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, STAGES)                  \
+    CUTLASS_GEMM_K64_W8_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, STAGES)
 
 CUTLASS_GEMM_K64_W8(64, 128, 3)
 CUTLASS_GEMM_K64_W8(64, 128, 4)
 CUTLASS_GEMM_K64_W8(64, 128, 2)
 // Also try TB_K=32 with 8-warp config (warp 32x32x32)
 // For TB 64x128x32: 2x4=8 warps, 8KB+16KB=24KB/stage
-#define CUTLASS_GEMM_W8_CONFIG(TB_M, TB_N, STAGES)                              \
-    using Gemm_w8_##TB_M##x##TB_N##x32_s##STAGES = cutlass::gemm::device::Gemm< \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                          \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                       \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                          \
-        float,                                                                   \
-        cutlass::arch::OpClassTensorOp,                                          \
-        cutlass::arch::Sm80,                                                     \
-        cutlass::gemm::GemmShape<TB_M, TB_N, 32>,                               \
-        cutlass::gemm::GemmShape<32, 32, 32>,                                   \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                    \
-        cutlass::epilogue::thread::LinearCombination<                            \
-            cutlass::bfloat16_t, 8, float, float>,                               \
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,            \
-        STAGES                                                                   \
-    >;
-#define CUTLASS_GEMM_W8_LAUNCH(TB_M, TB_N, STAGES)                              \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_w8_s##STAGES##_launch(        \
-        void* C, const void* A, const void* B,                                   \
-        int M, int N, int K,                                                     \
-        float alpha, float beta,                                                 \
-        uint64_t stream                                                          \
-    ) {                                                                          \
-        return run_gemm<Gemm_w8_##TB_M##x##TB_N##x32_s##STAGES>(               \
-            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                \
+//
+// Note: this shares the `Gemm_w8_<dtype>_<tile>x32_s<stages>` namespace
+// prefix with `CUTLASS_GEMM_K64_W8_CONFIG` (TB_K=64). The full typedef
+// name disambiguates them via the `x32` vs `x64` infix.
+#define CUTLASS_GEMM_W8_CONFIG(DTYPE_TAG, T, TB_M, TB_N, STAGES)                              \
+    using Gemm_w8_##DTYPE_TAG##_##TB_M##x##TB_N##x32_s##STAGES =                              \
+        cutlass::gemm::device::Gemm<                                                          \
+            T, cutlass::layout::RowMajor,                                                     \
+            T, cutlass::layout::ColumnMajor,                                                  \
+            T, cutlass::layout::RowMajor,                                                     \
+            float,                                                                            \
+            cutlass::arch::OpClassTensorOp,                                                   \
+            cutlass::arch::Sm80,                                                              \
+            cutlass::gemm::GemmShape<TB_M, TB_N, 32>,                                        \
+            cutlass::gemm::GemmShape<32, 32, 32>,                                            \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                             \
+            cutlass::epilogue::thread::LinearCombination<                                     \
+                T, 8, float, float>,                                                          \
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                     \
+            STAGES                                                                            \
+        >;
+#define CUTLASS_GEMM_W8_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES)                                 \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_w8_s##STAGES##_##DTYPE_TAG##_launch(        \
+        void* C, const void* A, const void* B,                                                \
+        int M, int N, int K,                                                                  \
+        float alpha, float beta,                                                              \
+        uint64_t stream                                                                       \
+    ) {                                                                                       \
+        return run_gemm<Gemm_w8_##DTYPE_TAG##_##TB_M##x##TB_N##x32_s##STAGES>(               \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                             \
     }
-#define CUTLASS_GEMM_W8(TB_M, TB_N, STAGES)                                     \
-    CUTLASS_GEMM_W8_CONFIG(TB_M, TB_N, STAGES)                                  \
-    CUTLASS_GEMM_W8_LAUNCH(TB_M, TB_N, STAGES)
+#define CUTLASS_GEMM_W8_TYPED(DTYPE_TAG, T, TB_M, TB_N, STAGES)                               \
+    CUTLASS_GEMM_W8_CONFIG(DTYPE_TAG, T, TB_M, TB_N, STAGES)                                  \
+    CUTLASS_GEMM_W8_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES)
+#define CUTLASS_GEMM_W8(TB_M, TB_N, STAGES)                                                   \
+    CUTLASS_GEMM_W8_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, STAGES)                      \
+    CUTLASS_GEMM_W8_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, STAGES)
 
 CUTLASS_GEMM_W8(64, 128, 3)
 CUTLASS_GEMM_W8(64, 128, 4)
@@ -249,37 +282,42 @@ CUTLASS_GEMM(256,   64,  32,    64,     32,     32,    6)
 // by reordering threadblock launch order.
 // GemmIdentityThreadblockSwizzle<N> swizzles N-wide in the N-tile dimension.
 // N=8 gives strong L2 locality for large grids.
-#define CUTLASS_GEMM_SWIZZLE_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
-    using Gemm_sw_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm<  \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                                  \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                               \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                                  \
-        float,                                                                           \
-        cutlass::arch::OpClassTensorOp,                                                  \
-        cutlass::arch::Sm80,                                                             \
-        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                     \
-        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                               \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                            \
-        cutlass::epilogue::thread::LinearCombination<                                    \
-            cutlass::bfloat16_t, 8, float, float>,                                       \
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>,                   \
-        STAGES                                                                           \
-    >;
+#define CUTLASS_GEMM_SWIZZLE_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    using Gemm_sw_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES =                              \
+        cutlass::gemm::device::Gemm<                                                                \
+            T, cutlass::layout::RowMajor,                                                           \
+            T, cutlass::layout::ColumnMajor,                                                        \
+            T, cutlass::layout::RowMajor,                                                           \
+            float,                                                                                  \
+            cutlass::arch::OpClassTensorOp,                                                         \
+            cutlass::arch::Sm80,                                                                    \
+            cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                            \
+            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                                      \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                                   \
+            cutlass::epilogue::thread::LinearCombination<                                           \
+                T, 8, float, float>,                                                                \
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>,                          \
+            STAGES                                                                                  \
+        >;
 
-#define CUTLASS_GEMM_SWIZZLE_LAUNCH(TB_M, TB_N, TB_K, STAGES)                           \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_sw_s##STAGES##_launch(                 \
-        void* C, const void* A, const void* B,                                           \
-        int M, int N, int K,                                                             \
-        float alpha, float beta,                                                         \
-        uint64_t stream                                                                  \
-    ) {                                                                                  \
-        return run_gemm<Gemm_sw_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                  \
-            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                        \
+#define CUTLASS_GEMM_SWIZZLE_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)                            \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_sw_s##STAGES##_##DTYPE_TAG##_launch(              \
+        void* C, const void* A, const void* B,                                                      \
+        int M, int N, int K,                                                                        \
+        float alpha, float beta,                                                                    \
+        uint64_t stream                                                                             \
+    ) {                                                                                             \
+        return run_gemm<Gemm_sw_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                                   \
     }
 
-#define CUTLASS_GEMM_SWIZZLE(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)         \
-    CUTLASS_GEMM_SWIZZLE_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)      \
-    CUTLASS_GEMM_SWIZZLE_LAUNCH(TB_M, TB_N, TB_K, STAGES)
+#define CUTLASS_GEMM_SWIZZLE_TYPED(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)  \
+    CUTLASS_GEMM_SWIZZLE_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)     \
+    CUTLASS_GEMM_SWIZZLE_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)
+
+#define CUTLASS_GEMM_SWIZZLE(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)                     \
+    CUTLASS_GEMM_SWIZZLE_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    CUTLASS_GEMM_SWIZZLE_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)
 
 // cuBLAS uses swizzle=1 for 128×128 at M=1024 — our worst remaining gap
 CUTLASS_GEMM_SWIZZLE(128,  128,  32,    64,     32,     32,    4)
@@ -300,44 +338,50 @@ CUTLASS_GEMM_SWIZZLE( 64,  256,  32,    32,     64,     32,    3)
 CUTLASS_GEMM_SWIZZLE( 64,  256,  32,    32,     64,     32,    2)
 
 // TB_K=64 splitK — combine wider K-tile with K-splitting
-#define CUTLASS_SPLITK_K64_CONFIG(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)  \
-    using GemmSplitK_##TB_M##x##TB_N##_k64_s##STAGES = cutlass::gemm::device::GemmSplitKParallel< \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                             \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                          \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                             \
-        float,                                                                      \
-        cutlass::arch::OpClassTensorOp,                                             \
-        cutlass::arch::Sm80,                                                        \
-        cutlass::gemm::GemmShape<TB_M, TB_N, 64>,                                  \
-        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                          \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                       \
-        cutlass::epilogue::thread::LinearCombination<                               \
-            cutlass::bfloat16_t, 8, float, float>,                                  \
-        cutlass::epilogue::thread::Convert<float, 8, float>,                        \
-        cutlass::reduction::thread::ReduceAdd<                                      \
-            float, float, 8>,                                                       \
-        cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,         \
-        STAGES                                                                      \
-    >;
+#define CUTLASS_SPLITK_K64_CONFIG(DTYPE_TAG, T, TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES) \
+    using GemmSplitK_##DTYPE_TAG##_##TB_M##x##TB_N##_k64_s##STAGES =                        \
+        cutlass::gemm::device::GemmSplitKParallel<                                          \
+            T, cutlass::layout::RowMajor,                                                   \
+            T, cutlass::layout::ColumnMajor,                                                \
+            T, cutlass::layout::RowMajor,                                                   \
+            float,                                                                          \
+            cutlass::arch::OpClassTensorOp,                                                 \
+            cutlass::arch::Sm80,                                                            \
+            cutlass::gemm::GemmShape<TB_M, TB_N, 64>,                                      \
+            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                              \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                           \
+            cutlass::epilogue::thread::LinearCombination<                                   \
+                T, 8, float, float>,                                                        \
+            cutlass::epilogue::thread::Convert<float, 8, float>,                            \
+            cutlass::reduction::thread::ReduceAdd<                                          \
+                float, float, 8>,                                                           \
+            cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,             \
+            STAGES                                                                          \
+        >;
 
-#define CUTLASS_SPLITK_K64_LAUNCH(TB_M, TB_N, STAGES, SLICES)                      \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_k64_s##STAGES##_sk##SLICES##_launch( \
-        void* C, const void* A, const void* B,                                      \
-        int M, int N, int K,                                                        \
-        float alpha, float beta,                                                    \
-        void* workspace,                                                            \
-        uint64_t stream                                                             \
-    ) {                                                                             \
-        return run_gemm_splitk<GemmSplitK_##TB_M##x##TB_N##_k64_s##STAGES>(        \
-            C, A, B, M, N, K, alpha, beta, SLICES, workspace, (cudaStream_t)stream); \
+#define CUTLASS_SPLITK_K64_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES, SLICES)                                \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_k64_s##STAGES##_sk##SLICES##_##DTYPE_TAG##_launch(    \
+        void* C, const void* A, const void* B,                                                          \
+        int M, int N, int K,                                                                            \
+        float alpha, float beta,                                                                        \
+        void* workspace,                                                                                \
+        uint64_t stream                                                                                 \
+    ) {                                                                                                 \
+        return run_gemm_splitk<GemmSplitK_##DTYPE_TAG##_##TB_M##x##TB_N##_k64_s##STAGES>(               \
+            C, A, B, M, N, K, alpha, beta, SLICES, workspace, (cudaStream_t)stream);                    \
     }
 
-#define CUTLASS_SPLITK_K64(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES, SLICES)    \
-    CUTLASS_SPLITK_K64_CONFIG(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)         \
-    CUTLASS_SPLITK_K64_LAUNCH(TB_M, TB_N, STAGES, SLICES)
+#define CUTLASS_SPLITK_K64_TYPED(DTYPE_TAG, T, TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES, SLICES) \
+    CUTLASS_SPLITK_K64_CONFIG(DTYPE_TAG, T, TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES)            \
+    CUTLASS_SPLITK_K64_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES, SLICES)
 
-#define CUTLASS_SPLITK_K64_LAUNCH_ONLY(TB_M, TB_N, STAGES, SLICES)                \
-    CUTLASS_SPLITK_K64_LAUNCH(TB_M, TB_N, STAGES, SLICES)
+#define CUTLASS_SPLITK_K64(TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES, SLICES)                     \
+    CUTLASS_SPLITK_K64_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES, SLICES) \
+    CUTLASS_SPLITK_K64_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, WARP_M, WARP_N, WARP_K, STAGES, SLICES)
+
+#define CUTLASS_SPLITK_K64_LAUNCH_ONLY(TB_M, TB_N, STAGES, SLICES)                                 \
+    CUTLASS_SPLITK_K64_LAUNCH(bf16, TB_M, TB_N, STAGES, SLICES)                                    \
+    CUTLASS_SPLITK_K64_LAUNCH(f16,  TB_M, TB_N, STAGES, SLICES)
 
 // stages=2 variants — less SMEM, more occupancy on sm89
 CUTLASS_GEMM( 64,   64,  32,    32,     32,     32,    2)
@@ -392,12 +436,13 @@ static int run_gemm_splitk(
     void* workspace,
     cudaStream_t stream
 ) {
+    using T = typename GemmSplitK::ElementA;
     typename GemmSplitK::Arguments args(
         {M, N, K},
-        {(cutlass::bfloat16_t const*)A, K},
-        {(cutlass::bfloat16_t const*)B, K},
-        {(cutlass::bfloat16_t*)C, N},
-        {(cutlass::bfloat16_t*)C, N},
+        {(T const*)A, K},
+        {(T const*)B, K},
+        {(T*)C, N},
+        {(T*)C, N},
         {alpha, beta},
         split_k_slices
     );
@@ -422,44 +467,50 @@ static int run_gemm_splitk(
 //   ElementA, LayoutA, ElementB, LayoutB, ElementC, LayoutC,
 //   Accumulator, OpClass, Arch, TBShape, WarpShape, InsnShape,
 //   EpilogueOp, ConvertScaledOp, ReductionOp, Swizzle, Stages
-#define CUTLASS_SPLITK_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
-    using GemmSplitK_##TB_M##x##TB_N##_s##STAGES = cutlass::gemm::device::GemmSplitKParallel< \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                             \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                          \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                             \
-        float,                                                                      \
-        cutlass::arch::OpClassTensorOp,                                             \
-        cutlass::arch::Sm80,                                                        \
-        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                \
-        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                          \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                       \
-        cutlass::epilogue::thread::LinearCombination<                               \
-            cutlass::bfloat16_t, 8, float, float>,                                  \
-        cutlass::epilogue::thread::Convert<float, 8, float>,                        \
-        cutlass::reduction::thread::ReduceAdd<                                      \
-            float, float, 8>,                                                       \
-        cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,         \
-        STAGES                                                                      \
-    >;
+#define CUTLASS_SPLITK_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    using GemmSplitK_##DTYPE_TAG##_##TB_M##x##TB_N##_s##STAGES =                              \
+        cutlass::gemm::device::GemmSplitKParallel<                                            \
+            T, cutlass::layout::RowMajor,                                                     \
+            T, cutlass::layout::ColumnMajor,                                                  \
+            T, cutlass::layout::RowMajor,                                                     \
+            float,                                                                            \
+            cutlass::arch::OpClassTensorOp,                                                   \
+            cutlass::arch::Sm80,                                                              \
+            cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                      \
+            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                                \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                             \
+            cutlass::epilogue::thread::LinearCombination<                                     \
+                T, 8, float, float>,                                                          \
+            cutlass::epilogue::thread::Convert<float, 8, float>,                              \
+            cutlass::reduction::thread::ReduceAdd<                                            \
+                float, float, 8>,                                                             \
+            cutlass::gemm::threadblock::GemmSplitKHorizontalThreadblockSwizzle,               \
+            STAGES                                                                            \
+        >;
 
-#define CUTLASS_SPLITK_LAUNCH(TB_M, TB_N, STAGES, SLICES)                          \
-    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_sk##SLICES##_launch(  \
-        void* C, const void* A, const void* B,                                      \
-        int M, int N, int K,                                                        \
-        float alpha, float beta,                                                    \
-        void* workspace,                                                            \
-        uint64_t stream                                                             \
-    ) {                                                                             \
-        return run_gemm_splitk<GemmSplitK_##TB_M##x##TB_N##_s##STAGES>(            \
-            C, A, B, M, N, K, alpha, beta, SLICES, workspace, (cudaStream_t)stream); \
+#define CUTLASS_SPLITK_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES, SLICES)                              \
+    extern "C" int cutlass_gemm_##TB_M##x##TB_N##_s##STAGES##_sk##SLICES##_##DTYPE_TAG##_launch(  \
+        void* C, const void* A, const void* B,                                                    \
+        int M, int N, int K,                                                                      \
+        float alpha, float beta,                                                                  \
+        void* workspace,                                                                          \
+        uint64_t stream                                                                           \
+    ) {                                                                                           \
+        return run_gemm_splitk<GemmSplitK_##DTYPE_TAG##_##TB_M##x##TB_N##_s##STAGES>(            \
+            C, A, B, M, N, K, alpha, beta, SLICES, workspace, (cudaStream_t)stream);              \
     }
 
-#define CUTLASS_SPLITK(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES, SLICES)  \
-    CUTLASS_SPLITK_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)       \
-    CUTLASS_SPLITK_LAUNCH(TB_M, TB_N, STAGES, SLICES)
+#define CUTLASS_SPLITK_TYPED(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES, SLICES) \
+    CUTLASS_SPLITK_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)            \
+    CUTLASS_SPLITK_LAUNCH(DTYPE_TAG, TB_M, TB_N, STAGES, SLICES)
 
-#define CUTLASS_SPLITK_LAUNCH_ONLY(TB_M, TB_N, STAGES, SLICES)                     \
-    CUTLASS_SPLITK_LAUNCH(TB_M, TB_N, STAGES, SLICES)
+#define CUTLASS_SPLITK(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES, SLICES)                     \
+    CUTLASS_SPLITK_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES, SLICES) \
+    CUTLASS_SPLITK_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES, SLICES)
+
+#define CUTLASS_SPLITK_LAUNCH_ONLY(TB_M, TB_N, STAGES, SLICES)                                       \
+    CUTLASS_SPLITK_LAUNCH(bf16, TB_M, TB_N, STAGES, SLICES)                                          \
+    CUTLASS_SPLITK_LAUNCH(f16,  TB_M, TB_N, STAGES, SLICES)
 
 // SplitK configs — 64×64 and 128×128 with 2, 4, 8 slices.
 // These cover the K=8192 shapes where standard GEMM loses to cuBLAS.
@@ -547,60 +598,57 @@ CUTLASS_SPLITK_K64_LAUNCH_ONLY(128, 128, 3, 4)
 // our GEMM's B (row-major [N,K]) becomes GEMV's A (row-major [N,K]).
 // Our GEMM's A[1,K] becomes GEMV's B (vector [K]).
 
-using GemvKernel_8 = cutlass::gemm::kernel::Gemv<
-    cutlass::bfloat16_t,              // ElementA (the weight matrix)
-    cutlass::layout::RowMajor,         // LayoutA
-    cutlass::bfloat16_t,              // ElementB (the input vector)
-    cutlass::bfloat16_t,              // ElementC (the output vector)
-    float,                             // ElementAccumulator
+// GEMV templated over T — bf16 and f16 both share the SIMT vector
+// path on sm80+ (alignment 8, scalar accumulator float).
+template <typename T>
+using GemvKernel_8_T = cutlass::gemm::kernel::Gemv<
+    T,                                 // ElementA (the weight matrix)
+    cutlass::layout::RowMajor,          // LayoutA
+    T,                                 // ElementB (the input vector)
+    T,                                 // ElementC (the output vector)
+    float,                              // ElementAccumulator
     cutlass::epilogue::thread::LinearCombination<
-        cutlass::bfloat16_t, 1, float, float>,
-    8                                  // kElementsPerAccess (max for bf16 vectorized load)
+        T, 1, float, float>,
+    8                                   // kElementsPerAccess (max for 16-bit vectorized load)
 >;
-using GemvOp_8 = cutlass::gemm::device::Gemv<GemvKernel_8>;
 
-extern "C" int cutlass_gemv_launch(
-    void* C, const void* A, const void* B,
-    int M, int N, int K,
-    float alpha, float beta,
-    uint64_t stream
-) {
-    // Our GEMM: C[M,N] = A[M,K] @ B[K,N]^T, A row-major, B col-major (= row-major [N,K])
-    // We ignore M (assume M=1) and map to GEMV:
-    //   y[N] = W[N,K] @ x[K]
-    //   W = our B (row-major [N,K]) → GEMV's ref_A
-    //   x = our A (the M=1 input row) → GEMV's ptr_B
-    //   y = our C (output row) → GEMV's ptr_D
-    if (M != 1) return -10;  // GEMV only valid at M=1
+#define CUTLASS_GEMV_LAUNCH(DTYPE_TAG, T)                                                         \
+    extern "C" int cutlass_gemv_##DTYPE_TAG##_launch(                                             \
+        void* C, const void* A, const void* B,                                                    \
+        int M, int N, int K,                                                                      \
+        float alpha, float beta,                                                                  \
+        uint64_t stream                                                                           \
+    ) {                                                                                           \
+        /* Our GEMM: C[M,N] = A[M,K] @ B[K,N]^T, A row-major, B col-major (= row-major [N,K]).  */\
+        /* We ignore M (assume M=1) and map to GEMV: y[N] = W[N,K] @ x[K] where W = our B.      */\
+        if (M != 1) return -10;                                                                   \
+        using Gemv = cutlass::gemm::device::Gemv<GemvKernel_8_T<T>>;                              \
+        using TensorRefA = typename Gemv::GemvKernel::TensorRefA;                                 \
+        TensorRefA ref_A{(T*)B, cutlass::layout::RowMajor(K)};                                    \
+        typename Gemv::Arguments args(                                                            \
+            cutlass::MatrixCoord{N, K},                                                           \
+            1,                                                                                    \
+            {alpha, beta},                                                                        \
+            ref_A,                                                                                \
+            A,                                                                                    \
+            C,                                                                                    \
+            C,                                                                                    \
+            (int64_t)N * K,                                                                       \
+            (int64_t)K,                                                                           \
+            (int64_t)N,                                                                           \
+            (int64_t)N                                                                            \
+        );                                                                                        \
+        Gemv op;                                                                                  \
+        auto status = op.can_implement(args);                                                     \
+        if (status != cutlass::Status::kSuccess) return -1;                                       \
+        status = op.initialize(args, nullptr, (cudaStream_t)stream);                              \
+        if (status != cutlass::Status::kSuccess) return -2;                                       \
+        status = op((cudaStream_t)stream);                                                        \
+        return (status == cutlass::Status::kSuccess) ? 0 : -3;                                    \
+    }
 
-    using Gemv = GemvOp_8;
-    using TensorRefA = typename Gemv::GemvKernel::TensorRefA;
-
-    TensorRefA ref_A{(cutlass::bfloat16_t*)B, cutlass::layout::RowMajor(K)};
-    typename Gemv::Arguments args(
-        cutlass::MatrixCoord{N, K},                                // problem_size {rows, cols}
-        1,                                                          // batch_count
-        {alpha, beta},                                              // epilogue params
-        ref_A,                                                      // ref_A (weight)
-        A,                                                          // ptr_B (input vector)
-        C,                                                          // ptr_C
-        C,                                                          // ptr_D
-        (int64_t)N * K,                                             // batch_stride_A
-        (int64_t)K,                                                 // batch_stride_B
-        (int64_t)N,                                                 // batch_stride_C
-        (int64_t)N                                                  // batch_stride_D
-    );
-
-    Gemv op;
-    auto status = op.can_implement(args);
-    if (status != cutlass::Status::kSuccess) return -1;
-
-    status = op.initialize(args, nullptr, (cudaStream_t)stream);
-    if (status != cutlass::Status::kSuccess) return -2;
-
-    status = op((cudaStream_t)stream);
-    return (status == cutlass::Status::kSuccess) ? 0 : -3;
-}
+CUTLASS_GEMV_LAUNCH(bf16, cutlass::bfloat16_t)
+CUTLASS_GEMV_LAUNCH(f16,  cutlass::half_t)
 
 // ── CUTLASS 3.x sm90 (Hopper) configs ──
 //
@@ -620,14 +668,10 @@ extern "C" int cutlass_gemv_launch(
 #include <cute/tensor.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
-namespace sm90_bf16 {
+namespace sm90 {
 
 using namespace cute;
 
-// Common types
-using ElementA = cutlass::bfloat16_t;
-using ElementB = cutlass::bfloat16_t;
-using ElementC = cutlass::bfloat16_t;
 using ElementAccumulator = float;
 
 // A: RowMajor [M,K], B: ColumnMajor [K,N] (= RowMajor [N,K])
@@ -635,7 +679,7 @@ using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
 
-// Alignment — 8 elements = 16 bytes for bf16
+// Alignment — 8 elements = 16 bytes for both bf16 and f16.
 static constexpr int AlignmentA = 8;
 static constexpr int AlignmentB = 8;
 
@@ -659,64 +703,67 @@ using EpilogueScheduleCoop2x1 = cutlass::epilogue::TmaWarpSpecializedCooperative
 
 // ── Macro for sm90 configs ──
 // Uses CollectiveBuilder to auto-configure TMA + wgmma mainloop.
+// `ELEMENT` is the activation/output element type (`cutlass::bfloat16_t`
+// or `cutlass::half_t`). One typedef family + one launch symbol per
+// (DTYPE_TAG, tile, schedule) combo.
 
-#define SM90_GEMM_CONFIG(TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX) \
-    using TileShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = Shape<_##TILE_M, _##TILE_N, _##TILE_K>; \
-    using ClusterShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = Shape<_##CLUSTER_M, _##CLUSTER_N, _1>; \
+#define SM90_GEMM_CONFIG(DTYPE_TAG, ELEMENT, TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX) \
+    using TileShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = Shape<_##TILE_M, _##TILE_N, _##TILE_K>; \
+    using ClusterShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = Shape<_##CLUSTER_M, _##CLUSTER_N, _1>; \
     \
-    using CollectiveMainloop_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
+    using CollectiveMainloop_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
         typename cutlass::gemm::collective::CollectiveBuilder< \
             cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, \
-            ElementA, LayoutA, AlignmentA, \
-            ElementB, LayoutB, AlignmentB, \
+            ELEMENT, LayoutA, AlignmentA, \
+            ELEMENT, LayoutB, AlignmentB, \
             ElementAccumulator, \
-            TileShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
-            ClusterShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+            TileShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+            ClusterShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
             cutlass::gemm::collective::StageCountAutoCarveout< \
                 static_cast<int>(sizeof(typename cutlass::epilogue::collective::CollectiveBuilder< \
                     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, \
-                    TileShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
-                    ClusterShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+                    TileShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+                    ClusterShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
                     cutlass::epilogue::collective::EpilogueTileAuto, \
                     ElementAccumulator, ElementAccumulator, \
-                    ElementC, LayoutC, AlignmentA, \
-                    ElementC, LayoutC, AlignmentA, \
+                    ELEMENT, LayoutC, AlignmentA, \
+                    ELEMENT, LayoutC, AlignmentA, \
                     EpilogueSchedule##SCHED_SUFFIX \
                 >::CollectiveOp::SharedStorage))>, \
             KernelSchedule##SCHED_SUFFIX \
         >::CollectiveOp; \
     \
-    using CollectiveEpilogue_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
+    using CollectiveEpilogue_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
         typename cutlass::epilogue::collective::CollectiveBuilder< \
             cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, \
-            TileShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
-            ClusterShape_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+            TileShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+            ClusterShape_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
             cutlass::epilogue::collective::EpilogueTileAuto, \
             ElementAccumulator, ElementAccumulator, \
-            ElementC, LayoutC, AlignmentA, \
-            ElementC, LayoutC, AlignmentA, \
+            ELEMENT, LayoutC, AlignmentA, \
+            ELEMENT, LayoutC, AlignmentA, \
             EpilogueSchedule##SCHED_SUFFIX \
         >::CollectiveOp; \
     \
-    using GemmKernel_sm90_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
+    using GemmKernel_sm90_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
         cutlass::gemm::kernel::GemmUniversal< \
             Shape<int, int, int, int>, \
-            CollectiveMainloop_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
-            CollectiveEpilogue_##TILE_M##x##TILE_N##_##SCHED_SUFFIX \
+            CollectiveMainloop_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX, \
+            CollectiveEpilogue_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX \
         >; \
     \
-    using Gemm_sm90_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
+    using Gemm_sm90_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX = \
         cutlass::gemm::device::GemmUniversalAdapter< \
-            GemmKernel_sm90_##TILE_M##x##TILE_N##_##SCHED_SUFFIX>;
+            GemmKernel_sm90_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX>;
 
-#define SM90_GEMM_LAUNCH(TILE_M, TILE_N, SCHED_SUFFIX, EXPORT_NAME) \
-    extern "C" int EXPORT_NAME( \
+#define SM90_GEMM_LAUNCH(DTYPE_TAG, ELEMENT, TILE_M, TILE_N, SCHED_SUFFIX, EXPORT_BASENAME) \
+    extern "C" int EXPORT_BASENAME##_##DTYPE_TAG##_launch( \
         void* C, const void* A, const void* B, \
         int M, int N, int K, \
         float alpha, float beta, \
         uint64_t stream \
     ) { \
-        using Gemm = Gemm_sm90_##TILE_M##x##TILE_N##_##SCHED_SUFFIX; \
+        using Gemm = Gemm_sm90_##DTYPE_TAG##_##TILE_M##x##TILE_N##_##SCHED_SUFFIX; \
         using StrideA = typename Gemm::GemmKernel::StrideA; \
         using StrideB = typename Gemm::GemmKernel::StrideB; \
         using StrideC = typename Gemm::GemmKernel::StrideC; \
@@ -728,8 +775,8 @@ using EpilogueScheduleCoop2x1 = cutlass::epilogue::TmaWarpSpecializedCooperative
         typename Gemm::Arguments args{ \
             cutlass::gemm::GemmUniversalMode::kGemm, \
             {M, N, K, 1}, \
-            {(ElementA const*)A, stride_a, (ElementB const*)B, stride_b}, \
-            {{alpha, beta}, (ElementC*)C, stride_c, (ElementC*)C, stride_d} \
+            {(ELEMENT const*)A, stride_a, (ELEMENT const*)B, stride_b}, \
+            {{alpha, beta}, (ELEMENT*)C, stride_c, (ELEMENT*)C, stride_d} \
         }; \
         Gemm op; \
         auto status = op.can_implement(args); \
@@ -749,9 +796,15 @@ using EpilogueScheduleCoop2x1 = cutlass::epilogue::TmaWarpSpecializedCooperative
         return (status == cutlass::Status::kSuccess) ? 0 : -3; \
     }
 
-#define SM90_GEMM(TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX, EXPORT_NAME) \
-    SM90_GEMM_CONFIG(TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX) \
-    SM90_GEMM_LAUNCH(TILE_M, TILE_N, SCHED_SUFFIX, EXPORT_NAME)
+#define SM90_GEMM_TYPED(DTYPE_TAG, ELEMENT, TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX, EXPORT_BASENAME) \
+    SM90_GEMM_CONFIG(DTYPE_TAG, ELEMENT, TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX) \
+    SM90_GEMM_LAUNCH(DTYPE_TAG, ELEMENT, TILE_M, TILE_N, SCHED_SUFFIX, EXPORT_BASENAME)
+
+// `EXPORT_BASENAME` is the symbol stem (no `_launch` suffix); the
+// macro appends `_<dtype>_launch` per instantiation.
+#define SM90_GEMM(TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX, EXPORT_BASENAME) \
+    SM90_GEMM_TYPED(bf16, cutlass::bfloat16_t, TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX, EXPORT_BASENAME) \
+    SM90_GEMM_TYPED(f16,  cutlass::half_t,    TILE_M, TILE_N, TILE_K, CLUSTER_M, CLUSTER_N, STAGES, SCHED_SUFFIX, EXPORT_BASENAME)
 
 // ── Instantiate sm90 configs ──
 //
@@ -763,42 +816,55 @@ using EpilogueScheduleCoop2x1 = cutlass::epilogue::TmaWarpSpecializedCooperative
 // These use wgmma + TMA, the native H100 datapath.
 
 // Large tiles with 1×1 cluster (safe default, always works)
-SM90_GEMM(128, 128, 64, 1, 1, 0, Cooperative, cutlass_sm90_gemm_128x128_coop_launch)
-SM90_GEMM(128, 256, 64, 1, 1, 0, Cooperative, cutlass_sm90_gemm_128x256_coop_launch)
-SM90_GEMM(256, 128, 64, 1, 1, 0, Cooperative, cutlass_sm90_gemm_256x128_coop_launch)
+SM90_GEMM(128, 128, 64, 1, 1, 0, Cooperative, cutlass_sm90_gemm_128x128_coop)
+SM90_GEMM(128, 256, 64, 1, 1, 0, Cooperative, cutlass_sm90_gemm_128x256_coop)
+SM90_GEMM(256, 128, 64, 1, 1, 0, Cooperative, cutlass_sm90_gemm_256x128_coop)
 
 // Smaller tiles with warp-specialized schedule
-SM90_GEMM( 64, 128, 64, 1, 1, 0, WS, cutlass_sm90_gemm_64x128_ws_launch)
-SM90_GEMM(128,  64, 64, 1, 1, 0, WS, cutlass_sm90_gemm_128x64_ws_launch)
-SM90_GEMM( 64,  64, 64, 1, 1, 0, WS, cutlass_sm90_gemm_64x64_ws_launch)
+SM90_GEMM( 64, 128, 64, 1, 1, 0, WS, cutlass_sm90_gemm_64x128_ws)
+SM90_GEMM(128,  64, 64, 1, 1, 0, WS, cutlass_sm90_gemm_128x64_ws)
+SM90_GEMM( 64,  64, 64, 1, 1, 0, WS, cutlass_sm90_gemm_64x64_ws)
 
 // Pingpong schedule — overlaps compute and memory
-SM90_GEMM(128, 128, 64, 1, 1, 0, Pingpong, cutlass_sm90_gemm_128x128_pp_launch)
-SM90_GEMM( 64, 128, 64, 1, 1, 0, Pingpong, cutlass_sm90_gemm_64x128_pp_launch)
-SM90_GEMM(128,  64, 64, 1, 1, 0, Pingpong, cutlass_sm90_gemm_128x64_pp_launch)
+SM90_GEMM(128, 128, 64, 1, 1, 0, Pingpong, cutlass_sm90_gemm_128x128_pp)
+SM90_GEMM( 64, 128, 64, 1, 1, 0, Pingpong, cutlass_sm90_gemm_64x128_pp)
+SM90_GEMM(128,  64, 64, 1, 1, 0, Pingpong, cutlass_sm90_gemm_128x64_pp)
 
 // 2×1 cluster — doubles occupancy via distributed shared memory
-SM90_GEMM(128, 128, 64, 2, 1, 0, Coop2x1, cutlass_sm90_gemm_128x128_c2x1_launch)
-SM90_GEMM(128, 256, 64, 2, 1, 0, Coop2x1, cutlass_sm90_gemm_128x256_c2x1_launch)
+SM90_GEMM(128, 128, 64, 2, 1, 0, Coop2x1, cutlass_sm90_gemm_128x128_c2x1)
+SM90_GEMM(128, 256, 64, 2, 1, 0, Coop2x1, cutlass_sm90_gemm_128x256_c2x1)
 
-} // namespace sm90_bf16
+} // namespace sm90
 
 #endif // __CUDACC_VER_MAJOR__ >= 12
 
-// Keep the old symbol names as aliases for backward compatibility
-// (solver_dispatch.rs references these directly).
-extern "C" int cutlass_gemm_128x128_launch(
+// Default-stages convenience aliases — shapes the solver uses by name
+// (solver_dispatch.rs references these directly). Both bf16 and f16
+// variants alias the matching `_s4` launcher.
+extern "C" int cutlass_gemm_128x128_bf16_launch(
     void* C, const void* A, const void* B,
     int M, int N, int K, float alpha, float beta, uint64_t stream
 ) {
-    return cutlass_gemm_128x128_s4_launch(C, A, B, M, N, K, alpha, beta, stream);
+    return cutlass_gemm_128x128_s4_bf16_launch(C, A, B, M, N, K, alpha, beta, stream);
+}
+extern "C" int cutlass_gemm_128x128_f16_launch(
+    void* C, const void* A, const void* B,
+    int M, int N, int K, float alpha, float beta, uint64_t stream
+) {
+    return cutlass_gemm_128x128_s4_f16_launch(C, A, B, M, N, K, alpha, beta, stream);
 }
 
-extern "C" int cutlass_gemm_64x64_launch(
+extern "C" int cutlass_gemm_64x64_bf16_launch(
     void* C, const void* A, const void* B,
     int M, int N, int K, float alpha, float beta, uint64_t stream
 ) {
-    return cutlass_gemm_64x64_s4_launch(C, A, B, M, N, K, alpha, beta, stream);
+    return cutlass_gemm_64x64_s4_bf16_launch(C, A, B, M, N, K, alpha, beta, stream);
+}
+extern "C" int cutlass_gemm_64x64_f16_launch(
+    void* C, const void* A, const void* B,
+    int M, int N, int K, float alpha, float beta, uint64_t stream
+) {
+    return cutlass_gemm_64x64_s4_f16_launch(C, A, B, M, N, K, alpha, beta, stream);
 }
 
 // ── CUTLASS GEMM with SiLU epilogue ──
@@ -810,37 +876,42 @@ extern "C" int cutlass_gemm_64x64_launch(
 // is fused into the GEMM epilogue, saving one kernel launch + one
 // full GMEM round-trip of the gate output.
 
-#define CUTLASS_GEMM_SILU_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)      \
-    using GemmSilu_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm<   \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                                   \
-        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                                \
-        cutlass::bfloat16_t, cutlass::layout::RowMajor,                                   \
-        float,                                                                            \
-        cutlass::arch::OpClassTensorOp,                                                   \
-        cutlass::arch::Sm80,                                                              \
-        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                      \
-        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                                \
-        cutlass::gemm::GemmShape<16, 8, 16>,                                              \
-        cutlass::epilogue::thread::LinearCombinationSilu<                                  \
-            cutlass::bfloat16_t, 8, float, float>,                                        \
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                     \
-        STAGES                                                                            \
-    >;
+#define CUTLASS_GEMM_SILU_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    using GemmSilu_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES =                          \
+        cutlass::gemm::device::Gemm<                                                              \
+            T, cutlass::layout::RowMajor,                                                         \
+            T, cutlass::layout::ColumnMajor,                                                      \
+            T, cutlass::layout::RowMajor,                                                         \
+            float,                                                                                \
+            cutlass::arch::OpClassTensorOp,                                                       \
+            cutlass::arch::Sm80,                                                                  \
+            cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                          \
+            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                                    \
+            cutlass::gemm::GemmShape<16, 8, 16>,                                                  \
+            cutlass::epilogue::thread::LinearCombinationSilu<                                     \
+                T, 8, float, float>,                                                              \
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                         \
+            STAGES                                                                                \
+        >;
 
-#define CUTLASS_GEMM_SILU_LAUNCH(TB_M, TB_N, TB_K, STAGES)                               \
-    extern "C" int cutlass_gemm_silu_##TB_M##x##TB_N##_s##STAGES##_launch(                \
-        void* C, const void* A, const void* B,                                            \
-        int M, int N, int K,                                                              \
-        float alpha, float beta,                                                          \
-        uint64_t stream                                                                   \
-    ) {                                                                                   \
-        return run_gemm<GemmSilu_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(                   \
-            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                         \
+#define CUTLASS_GEMM_SILU_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)                             \
+    extern "C" int cutlass_gemm_silu_##TB_M##x##TB_N##_s##STAGES##_##DTYPE_TAG##_launch(          \
+        void* C, const void* A, const void* B,                                                    \
+        int M, int N, int K,                                                                      \
+        float alpha, float beta,                                                                  \
+        uint64_t stream                                                                           \
+    ) {                                                                                           \
+        return run_gemm<GemmSilu_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(             \
+            C, A, B, M, N, K, alpha, beta, (cudaStream_t)stream);                                 \
     }
 
-#define CUTLASS_GEMM_SILU(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)             \
-    CUTLASS_GEMM_SILU_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)          \
-    CUTLASS_GEMM_SILU_LAUNCH(TB_M, TB_N, TB_K, STAGES)
+#define CUTLASS_GEMM_SILU_TYPED(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)   \
+    CUTLASS_GEMM_SILU_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)      \
+    CUTLASS_GEMM_SILU_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)
+
+#define CUTLASS_GEMM_SILU(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)                       \
+    CUTLASS_GEMM_SILU_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
+    CUTLASS_GEMM_SILU_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)
 
 // Same tile configs as the standard GEMM — solver picks per workload.
 CUTLASS_GEMM_SILU( 64,   64,  32,    32,     32,     32,    4)

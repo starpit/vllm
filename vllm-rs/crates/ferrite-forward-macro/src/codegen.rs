@@ -75,11 +75,13 @@ fn safetensors_prefix(
     // `multi_modal_projector.linear_1` / `linear_2` are real Python
     // attribute names with literal underscores — the heuristic
     // would mistranslate them to `linear.1` / `linear.2`.
-    let is_vision_for_verbatim =
-        matches!(program.prelude, crate::classified::Prelude::Vision);
+    let is_vision_for_verbatim = matches!(program.prelude, crate::classified::Prelude::Vision);
     let qwen_default_layout = crate::config::VisionSafetensorsLayout::qwen_default();
     let layout_for_verbatim = if is_vision_for_verbatim {
-        program.vision_layout.as_ref().unwrap_or(&qwen_default_layout)
+        program
+            .vision_layout
+            .as_ref()
+            .unwrap_or(&qwen_default_layout)
     } else {
         &qwen_default_layout
     };

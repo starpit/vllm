@@ -448,3 +448,96 @@ to a less-undertrained Qwen3-Next checkpoint when one fits in 14
 GB free / L4 VRAM. Diagnostic dump infra (`ferrite-cuda-core::dump`
 + in-GDN per-step dumps + `vllm-rs/scripts/gen_qwen3_next_golden.py`
 + `/tmp/dump_hf_gdn.py`) stays in tree as the audit harness.
+
+## 2026-05-07 — Phase 7a (scope shift to FP8): baseline wiring landed, TP-shard gap blocks load
+
+Scope shifted from BF16-golden green to FP8 enablement — the BF16
+golden is numerics-only perfect already (6c-iii) and the real target
+is `unsloth/Qwen3-Coder-Next-FP8-Dynamic` (78 GB, compressed-tensors
+per-channel weights + per-token dynamic activations, all Linears
+except layer 47 + routers + lm_head).
+
+Landed in `a9e3fc856`:
+- `Fp8SharedFusedMoELayer` now wraps `Fp8BlockFusedMoELayer`
+  internally so one `block_size` field covers all three
+  compressed-tensors schemes (per-tensor `[N,K]`, per-channel
+  `[1,K]`, block `[bn,bk]`) — the block kernel already does per-row
+  indexing when `block_n=1`. `shared_gate_up/down` widened to
+  `LinearLayer` so Qwen2-MoE FP8 (dense shared) and
+  Qwen3-Coder-Next (FP8 per-channel shared) both route without
+  fork. New `::load` probes expert-0 gate_proj scale shape,
+  classifies scheme, stacks scales into `[E, N/bn, K/bk]` F32 via
+  `ensure_f32_scale`.
+- New `Fp8SharedFusedMoeRefImpl` — arch-agnostic FP8 peer of
+  `SharedFusedMoeRefImpl`, gated on `num_experts` + `is_fp8_any_moe`.
+  BF16 peer now defers via `is_fp8_any_moe` instead of
+  `is_fp8_block_moe` so per-channel MoE routes to the FP8 peer too.
+- `FieldLoad::Fp8SharedFusedMoe` + dispatch + three emit arms
+  (accessor detector, `emit_unindexed_let`, `emit_layered_load_body`),
+  storage/accessor validator accepts Fp8→`Fp8SharedFusedMoELayer`,
+  `any_fp8` widened to include `Fp8SharedFusedMoe` +
+  (pre-existing omission fix) `DeepSeekV2Fp8BlockMoe`.
+- `Instruction::Fp8SharedFusedMoe` + eval arm (same dump shape as
+  BF16 peer), info naming, `fp8_shared_fused_moe_ref` added to
+  `NON_GEMM_NAMES`.
+- `configs/qwen3-coder-next-fp8.json` — the unsloth checkpoint's
+  variant (hidden 2048, inter 5120, rope θ 5e6, full_attn_period=4).
+
+Variant discovery works: `ferrite · qwen3-coder-next-fp8 · 389
+tiles · 196 waves · tp=1 · cublas cutlass non-gemm comm`. Release
+build clean with `--features cuda,nccl`. The 78 GB `unsloth/…`
+checkpoint then **OOMs during ferrite load** on nick3 (2×L40S,
+46 GB each) regardless of `--tensor-parallel-size`: the ferrite
+MoE load path is not TP-sharded — each rank calls
+`Fp8SharedFusedMoELayer::load(…, num_experts=512, …)` and allocates
+the full stacked `[E, 2*inter, hidden] Fp8` + `[E, hidden, inter]
+Fp8` arrays locally. The FP8 *shared-expert* projections (dense
+`Fp8Linear`) are similarly unsharded. Precedent is the same: the
+existing `DeepSeekV2Fp8BlockMoELayer::load` and
+`Fp8FusedMoELayer::load` also take no tp-rank/tp-size args.
+
+Next-session entry point (on nick3, worktree
+`/home/nickm/qwen3-next-fresh/vllm-rs/`):
+
+1. **TP-shard `Fp8SharedFusedMoELayer::load`** — add
+   `tp_rank`/`tp_size` params + an NCCL group ref; slice experts
+   along dim 0 (expert parallelism:
+   `experts[rank*E/tp..(rank+1)*E/tp]`) OR along the hidden-dim
+   of each expert (column-parallel gate/up, row-parallel down +
+   all-reduce). Expert parallelism is cheaper at prefill
+   (no per-layer all-reduce), hidden-dim is cheaper when tokens
+   outnumber selected experts. Python vLLM's
+   `CompressedTensorsW8A8Fp8MoEMethod.apply` uses hidden-dim for
+   small TP × large expert; pick that first to match parity.
+   Thread tp into the three codegen emit arms
+   (`emit_unindexed_let`, `emit_layered_load_body`, and the
+   storage/accessor validator doesn't change). Do the same for the
+   shared-expert `Fp8Linear`s — `Fp8Linear::load_concat` already
+   exists in a sharded variant somewhere in `layers_quant.rs`; if
+   not, add one.
+2. **Reproducer** (post-TP):
+   ```
+   oc rsh nick3 bash -c 'cd /home/nickm/qwen3-next-fresh/vllm-rs && \
+     cargo build -p vllm-cli --features cuda,nccl --release && \
+     ./target/release/vllm serve unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+       --device cuda --tensor-parallel-size 2 \
+       --max-model-len 256 --gpu-memory-utilization 0.9'
+   ```
+3. **Layer-47 mixed quant** is parked until load works. The
+   unsloth checkpoint's `ignore` list excludes layer 47's
+   full-attention + all experts + shared expert (+ `lm_head`, all
+   routers, all GDN layers and `shared_expert_gate` across the
+   board). The GDN / router / gate exclusions already land
+   correctly (those weights live on non-FP8 accessors via ferrite's
+   existing storage routing). The layer-47 exception is the hard
+   one: one `mlp[layer]` accessor is Fp8 on 47 layers and Dense on
+   1 — fix needs either per-layer accessor types or a `MoeAny`
+   enum. Not blocking TP-shard.
+
+Source-of-truth pointers (for quick reference):
+- Python: `vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py`
+  — `CompressedTensorsW8A8Fp8MoEMethod` (per-channel apply path)
+- DeepSeek TP-sharded FP8 load precedent:
+  `DeepSeekV2Fp8BlockMoELayer::load` in
+  `ferrite-kernels/src/layers_moe.rs` (note: still NOT tp-aware —
+  this gap is cross-arch, not Qwen3-Next-specific).

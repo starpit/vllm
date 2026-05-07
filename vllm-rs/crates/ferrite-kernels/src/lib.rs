@@ -25,7 +25,12 @@ pub mod forward_output;
 pub mod ggml;
 #[cfg(feature = "cuda")]
 pub mod kernels;
-#[cfg(feature = "cuda")]
+// `kv_cache` is dual-mode: storage layout, sizing, and span
+// bookkeeping live in one place. The buffer-allocation closure
+// that callers pass into `KvCachePool::new` is what differs per
+// backend; FP8 scale machinery + the D2D gather + GPU mirror flags
+// stay `cfg(feature = "cuda")` *inside* the unified type.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod kv_cache;
 // `layers` and `layers_moe` are dual-mode: the struct *definitions* compile
 // without the `cuda` feature (they reference only `GpuTensor`, which lives in
@@ -48,7 +53,7 @@ pub mod rotary;
 
 #[cfg(feature = "cuda")]
 pub use forward_output::ForwardOutput;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use kv_cache::KvCachePool;
 // Layer struct types compile without `cuda` (see comment above the module
 // declarations). Re-export them ungated so consumers (notably the

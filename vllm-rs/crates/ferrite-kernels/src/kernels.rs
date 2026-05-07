@@ -10043,6 +10043,10 @@ mod tests_fp8_kv {
                 num_kv_heads,
                 head_dim,
                 DType::Fp8E4m3,
+                |bytes| unsafe {
+                    let ptr = ferrite_cuda_core::driver::mem_alloc(bytes)?;
+                    Ok(ferrite_cuda_core::RawGpuMem::new(ptr, bytes))
+                },
             )
             .expect("FP8 pool");
 
@@ -10194,8 +10198,19 @@ mod tests_fp8_kv {
         unsafe {
             let (_alloc, stream) = test_init();
 
-            let pool = crate::kv_cache::KvCachePool::new(1, 16, 16, 2, 64, DType::Fp8E4m3)
-                .expect("FP8 pool");
+            let pool = crate::kv_cache::KvCachePool::new(
+                1,
+                16,
+                16,
+                2,
+                64,
+                DType::Fp8E4m3,
+                |bytes| unsafe {
+                    let ptr = ferrite_cuda_core::driver::mem_alloc(bytes)?;
+                    Ok(ferrite_cuda_core::RawGpuMem::new(ptr, bytes))
+                },
+            )
+            .expect("FP8 pool");
 
             pool.set_k_scale(0, 3.14, stream);
             pool.set_v_scale(0, 2.71, stream);

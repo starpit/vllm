@@ -44,13 +44,24 @@ pub mod device;
 pub mod driver;
 #[cfg(feature = "cuda")]
 pub mod gguf_loader;
+// Backend-neutral: descriptor + RAII handles. Cuda and metal
+// share these one-type-each; the storage / drop path inside is
+// cfg-mutexed.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod owned_tensor;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod raw_mem;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod weights;
 
 #[cfg(feature = "cuda")]
-pub use alloc::{CachingAllocator, OwnedTensor, RawGpuAlloc, RawGpuMem};
+pub use alloc::{CachingAllocator, RawGpuAlloc};
 #[cfg(feature = "cuda")]
 pub use cuda_allocator::CudaAllocator;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use owned_tensor::OwnedTensor;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use raw_mem::RawGpuMem;
 
 /// The concrete allocator type for the active backend. CUDA xor
 /// Metal — features are mutually exclusive — so this is statically

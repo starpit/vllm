@@ -6165,6 +6165,10 @@ impl Worker for CudaWorker {
                 model.num_kv_heads(),
                 model.head_dim(),
                 kv_dtype,
+                |bytes| {
+                    let ptr = unsafe { driver::mem_alloc(bytes)? };
+                    Ok(unsafe { vllm_cuda::RawGpuMem::new(ptr, bytes) })
+                },
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
@@ -6312,6 +6316,10 @@ impl Worker for CudaWorker {
                 model.num_kv_heads(),
                 model.head_dim(),
                 self.model_dtype,
+                |bytes| {
+                    let ptr = unsafe { driver::mem_alloc(bytes)? };
+                    Ok(unsafe { vllm_cuda::RawGpuMem::new(ptr, bytes) })
+                },
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("dummy KvCachePool: {e}")))?;

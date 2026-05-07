@@ -60,9 +60,8 @@ mod metal_emission_tests {
         // taking the fn-pointer proves the symbol + signature compiled.
         let _ctor: fn(
             ::std::sync::Arc<::ferrite_forward::interpreter::metal::__re::Device>,
-            ::std::sync::Arc<crate::tinyllama_1_1b::Weights>,
+            &crate::tinyllama_1_1b::Weights,
             ::std::sync::Arc<::ferrite_cuda_core::MetalAllocator>,
-            ::ferrite_forward::interpreter::metal::ArenaLayout,
             ::ferrite_forward::interpreter::metal::RuntimeFactory,
             usize,
         ) -> ::core::result::Result<
@@ -74,6 +73,7 @@ mod metal_emission_tests {
         // unit-test ctx.
         let _loader: fn(
             &mut ::ferrite_cuda_core::weights::GpuWeights,
+            ::ferrite_cuda_core::CUstream,
             usize,
             u8,
         ) -> ::anyhow::Result<crate::tinyllama_1_1b::Weights> = crate::tinyllama_1_1b::load;

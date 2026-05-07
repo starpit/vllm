@@ -241,11 +241,12 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod ctx {
     use ferrite_cuda_core::tensor::TensorView;
     use ferrite_kernels::kv_cache::KvCachePool;
 
+    #[cfg(feature = "cuda")]
     use super::EmbedPatch;
 
     /// Ambient runtime args the emitted forward fn needs. The
@@ -286,7 +287,9 @@ mod ctx {
         /// text-only batch, no splice — byte-identical to pre-MM
         /// behavior. `mm_embeds = None` is only valid when
         /// `embed_patches` is empty.
+        #[cfg(feature = "cuda")]
         pub mm_embeds: Option<TensorView<'a>>,
+        #[cfg(feature = "cuda")]
         pub embed_patches: &'a [EmbedPatch],
         /// Vision-tower 2D RoPE cos table, shape `[total_L, head_dim/2]`,
         /// bf16. Built host-side from `grid_thw` per vision-encoder call;
@@ -295,9 +298,11 @@ mod ctx {
         /// forward calls — the `Instruction::VisionRope` arm panics on
         /// `expect` if reached without these set, mirroring the
         /// `tp_group` contract for `Instruction::AllReduce` at tp>1.
+        #[cfg(feature = "cuda")]
         pub vision_rope_cos: Option<TensorView<'a>>,
         /// Vision-tower 2D RoPE sin table. Same shape / population /
         /// invariants as [`Self::vision_rope_cos`].
+        #[cfg(feature = "cuda")]
         pub vision_rope_sin: Option<TensorView<'a>>,
         /// Vision-tower input patches buffer, shape `[num_tokens,
         /// vision_in_features]`, bf16. The vision encoder's
@@ -317,6 +322,7 @@ mod ctx {
         /// counterpart copies this view into a tile-table OwnedTensor
         /// the rest of the encoder consumes. See
         /// [`crate::Instruction::LoadPixels`] for the eval body.
+        #[cfg(feature = "cuda")]
         pub pixels: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-image **full-frame**
         /// segmentation. Populated by the vision wrapper for arches
@@ -324,28 +330,34 @@ mod ctx {
         /// max_seqlen_full)` at fullatt-layer indices; `None` for
         /// every text-side call and for vision arches that use a
         /// single `cu_seqlens_q` (Qwen2-VL).
+        #[cfg(feature = "cuda")]
         pub vision_cu_seqlens_full: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-window segmentation.
         /// Populated by the vision wrapper for windowed-attention
         /// layers; same `None` semantics as
         /// [`Self::vision_cu_seqlens_full`].
+        #[cfg(feature = "cuda")]
         pub vision_cu_seqlens_window: Option<TensorView<'a>>,
         /// Qwen2.5-VL: max segment length under
         /// [`Self::vision_cu_seqlens_full`]. `None` when not in use.
+        #[cfg(feature = "cuda")]
         pub vision_max_seqlen_full: Option<usize>,
         /// Qwen2.5-VL: max segment length under
         /// [`Self::vision_cu_seqlens_window`]. `None` when not in use.
+        #[cfg(feature = "cuda")]
         pub vision_max_seqlen_window: Option<usize>,
         /// Qwen2.5-VL: per-merged-cell natural→window-grouped
         /// permutation `[L / spatial_merge_size²]` u32. Drives the
         /// entry-side `embedding_gather(x, window_index)` (and the
         /// matching `embedding_gather(cos/sin, window_index)`) so
         /// every windowed-attention layer reads contiguous segments.
+        #[cfg(feature = "cuda")]
         pub vision_window_index: Option<TensorView<'a>>,
         /// Qwen2.5-VL: inverse of [`Self::vision_window_index`] —
         /// per-merged-cell window-grouped→natural permutation that
         /// undoes the entry permute on the merger output before
         /// splice into the language-model embedding stream.
+        #[cfg(feature = "cuda")]
         pub vision_reverse_indices: Option<TensorView<'a>>,
         /// SigLIP-style learned positional embedding indices, shape
         /// `[num_tokens]` u32. Built host-side as `[0..num_pos,
@@ -355,6 +367,7 @@ mod ctx {
         /// text-side forward calls and for vision arches that don't
         /// need a positional embedding (Qwen2-VL / Qwen2.5-VL use
         /// 2D RoPE via `vision_rope` instead).
+        #[cfg(feature = "cuda")]
         pub vision_position_ids: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
@@ -365,10 +378,10 @@ mod ctx {
         pub tp_group: Option<&'a std::sync::Arc<ferrite_cuda_core::NcclGroup>>,
     }
 }
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use ctx::ForwardCtx;
 
-// ── Cross-arch dispatcher (cuda only) ────────────────────────────
+// ── Cross-arch dispatcher ────────────────────────────────────────
 //
 // Every `#[forward] fn <arch>()` macro invocation auto-emits an
 // `impl FerriteWeights for Weights` + an `inventory::submit!`
@@ -376,12 +389,21 @@ pub use ctx::ForwardCtx;
 // without a hand-written central list. Adding a new arch touches
 // only its source file plus a single `pub mod <arch>;` in the
 // calling crate's lib.rs (Rust module system requirement).
+//
+// Same trait + registration + walk under both backends. The trait
+// method signatures are identical character-for-character — the
+// types they reference (`GpuDevice`, `OwnedTensor`, `ForwardCtx`)
+// are cfg-mutex'd to their cuda or metal incarnation, so a single
+// signature serves both. Per-arch `impl FerriteWeights` bodies
+// (macro-emitted) cfg-mutex'd internally where the call shape
+// genuinely differs (cuda calls cuda's `forward(weights, ctx,
+// device, num_tokens)`; metal goes through `MetalWorkerPool::forward`).
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod dispatcher {
     use ferrite_cuda_core::CUstream;
-    use ferrite_cuda_core::alloc::OwnedTensor;
-    use ferrite_cuda_core::device::GpuDevice;
+    use ferrite_cuda_core::GpuDevice;
+    use ferrite_cuda_core::OwnedTensor;
     use ferrite_cuda_core::weights::GpuWeights;
 
     use super::ForwardCtx;
@@ -527,6 +549,7 @@ mod dispatcher {
     /// `MultimodalData` (`vllm-common::ImageData`) is the boundary
     /// type the engine plumbs in, this is the interior shape the
     /// vision encoder consumes.
+    #[cfg(feature = "cuda")]
     #[derive(Debug)]
     pub struct PixelInput<'a> {
         /// Flat normalized pixels in CHW layout, length =
@@ -557,6 +580,7 @@ mod dispatcher {
     /// that never call `vision_forward` leave them at zero —
     /// `length == grid_t * grid_h_merged * grid_w_merged` is the
     /// post-merger invariant for filled patches.
+    #[cfg(feature = "cuda")]
     #[derive(Debug, Clone, Default)]
     pub struct EmbedPatch {
         /// Position in the input-id sequence where this image's
@@ -587,6 +611,7 @@ mod dispatcher {
     /// Phase D of the multimodal plan lands the first impl
     /// (qwen2 vision encoder). Until then this trait has zero
     /// callers and `try_load_mm` always returns `Ok(None)`.
+    #[cfg(feature = "cuda")]
     pub trait MultimodalForward: Send + Sync {
         /// Encode one or more pixel batches and project into the
         /// language model's hidden space.
@@ -644,6 +669,7 @@ mod dispatcher {
     /// `Ok(None)` when the arch claims the HF arch string but the
     /// live checkpoint has no vision tensors (text-only checkpoint
     /// loaded through an MM-capable arch entry — falls through).
+    #[cfg(feature = "cuda")]
     pub type MmTryLoadFn = fn(
         &mut GpuWeights,
         CUstream,
@@ -666,6 +692,7 @@ mod dispatcher {
     /// arch-specific knob (placeholder token id key, size policy,
     /// tokens-per-image policy, preprocess fn) is data on this row,
     /// not a switch in ferrite or the macro.
+    #[cfg(feature = "cuda")]
     pub struct FerriteMmRegistration {
         pub arch_name: &'static str,
         pub hf_arches: &'static [&'static str],
@@ -675,6 +702,7 @@ mod dispatcher {
         pub mm_metadata: ferrite_vision::MmMetadata,
     }
 
+    #[cfg(feature = "cuda")]
     inventory::collect!(FerriteMmRegistration);
 
     /// Walk the [`FerriteMmRegistration`] inventory and return the
@@ -687,6 +715,7 @@ mod dispatcher {
     /// MM metadata is identical across the tp variants of an arch
     /// (preprocessing is host-side and replicated), so the first
     /// hit is sufficient.
+    #[cfg(feature = "cuda")]
     pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static FerriteMmRegistration> {
         inventory::iter::<FerriteMmRegistration>().find(|reg| {
             hf_arches
@@ -748,6 +777,7 @@ mod dispatcher {
     /// expected case for text-only checkpoints, where ferrite_worker
     /// proceeds with `embed_patches: &[]`. Phase D of the
     /// multimodal plan lands the first row.
+    #[cfg(feature = "cuda")]
     pub fn try_load_mm(
         gw: &mut GpuWeights,
         stream: CUstream,
@@ -767,14 +797,20 @@ mod dispatcher {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
+// Multimodal sibling surface — text-side only crates (every metal
+// arch today) skip; cuda owns the vision pipeline.
 #[cfg(feature = "cuda")]
 pub use dispatcher::{
-    EmbedPatch, FerriteArchRegistration, FerriteMmRegistration, FerriteWeights, HfFingerprint,
-    MmTryLoadFn, MultimodalForward, PixelInput, resolve_mm_metadata, try_load, try_load_mm,
+    EmbedPatch, FerriteMmRegistration, MmTryLoadFn, MultimodalForward, PixelInput,
+    resolve_mm_metadata, try_load_mm,
 };
 
 /// Re-export `inventory` so the `#[forward]`-macro-emitted
 /// `inventory::submit!` block resolves without the consuming crate
-/// having to add its own `inventory` dep.
-#[cfg(feature = "cuda")]
+/// having to add its own `inventory` dep. Available under either
+/// backend feature — the macro emits the same `inventory::submit!{
+/// FerriteArchRegistration{ ... }}` shape under both.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use inventory;

@@ -1566,7 +1566,7 @@ fn emit_arch_dispatcher(
         .map(|tp| {
             let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
             quote! {
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "metal"))]
                 ::ferrite_forward::inventory::submit! {
                     ::ferrite_forward::FerriteArchRegistration {
                         arch_name: #arch_name_lit,
@@ -1668,13 +1668,17 @@ fn emit_arch_dispatcher(
 
     Ok(quote! {
         /// One variant per compiled model config. Holds that
-        /// model's specialized `Weights`.
-        #[cfg(feature = "cuda")]
+        /// model's specialized `Weights`. Same shape under both
+        /// backends — the variant's per-canonical `Weights` struct
+        /// itself is cfg-mutex'd internally (cuda fields gated
+        /// `cfg(feature = "cuda")`, metal fields gated
+        /// `cfg(feature = "metal")`).
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub enum Weights {
             #(#variants),*
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         impl Weights {
             #(#accessor_methods)*
 
@@ -1708,19 +1712,23 @@ fn emit_arch_dispatcher(
         }
 
         /// Dispatching forward. Matches the `Weights` variant and
-        /// calls the per-model specialized `forward`.
+        /// calls the per-model specialized `forward`. Same body and
+        /// signature under both backends — the cfg-mutex'd
+        /// `GpuDevice` and `OwnedTensor` re-exports resolve to the
+        /// matching backend's struct, and per-canonical `forward`
+        /// fns now exist in both `cfg(cuda)` and `cfg(metal)` arms.
         ///
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
-        /// must be the live CUDA device.
-        #[cfg(feature = "cuda")]
+        /// must be the live backend device.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             w: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+        ) -> ::ferrite_cuda_core::OwnedTensor {
             match w {
                 #(#forward_arms)*
             }
@@ -1729,7 +1737,10 @@ fn emit_arch_dispatcher(
         /// Dispatching backbone-only forward (no lm_head). Returns
         /// `[num_tokens, hidden_size]` as an independently-owned
         /// `OwnedTensor`. For pipeline-parallel intermediate ranks
-        /// that hand hidden states to the next rank.
+        /// that hand hidden states to the next rank — cuda-only
+        /// today; metal has no PP fanout, so the per-canonical
+        /// `forward_backbone` is cfg(cuda)-gated and this dispatcher
+        /// matches.
         ///
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
@@ -1754,7 +1765,7 @@ fn emit_arch_dispatcher(
         // `inventory::submit!` adds this arch to the global registry.
         // No hand-written central list anywhere.
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         impl ::ferrite_forward::FerriteWeights for Weights {
             fn arch_name(&self) -> &'static str { #arch_name_lit }
             fn num_hidden_layers(&self) -> u64 { self.num_hidden_layers() }
@@ -1768,19 +1779,28 @@ fn emit_arch_dispatcher(
             unsafe fn forward(
                 &self,
                 ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> ::ferrite_cuda_core::OwnedTensor {
                 unsafe { forward(self, ctx, device, num_tokens) }
             }
 
             unsafe fn forward_backbone(
                 &self,
                 ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                unsafe { forward_backbone(self, ctx, device, num_tokens) }
+            ) -> ::ferrite_cuda_core::OwnedTensor {
+                #[cfg(feature = "cuda")]
+                { unsafe { forward_backbone(self, ctx, device, num_tokens) } }
+                #[cfg(feature = "metal")]
+                {
+                    let _ = (ctx, device, num_tokens);
+                    unimplemented!(
+                        "metal forward_backbone — pipeline-parallel intermediate \
+                         ranks aren't supported on metal yet (no PP fanout)"
+                    )
+                }
             }
         }
 

@@ -819,6 +819,13 @@ impl SlotMap {
     pub fn total(&self) -> u32 {
         self.total
     }
+
+    /// Iterate `((tile, output_slot), color)` for every registered
+    /// pair. Multiple pairs may share a `color` when the linear-scan
+    /// register allocator coalesced them into the same arena slot.
+    pub fn iter(&self) -> impl Iterator<Item = ((TileId, u8), u32)> + '_ {
+        self.map.iter().map(|(k, v)| (*k, *v))
+    }
 }
 
 /// The library: all available implementations for some target.

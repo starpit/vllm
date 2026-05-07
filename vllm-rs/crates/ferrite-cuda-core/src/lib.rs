@@ -18,6 +18,8 @@ pub mod ggml_quant;
 pub mod tensor;
 
 #[cfg(feature = "metal")]
+pub mod device_metal;
+#[cfg(feature = "metal")]
 pub mod metal_allocator;
 
 pub use device_allocator::DeviceAllocator;
@@ -79,14 +81,22 @@ pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 pub use device::GpuDevice;
+#[cfg(feature = "metal")]
+pub use device_metal::GpuDevice;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use weights::GpuWeights;
 
 /// Re-export `cudarc::driver::sys::CUstream` at a stable path so
 /// generated code (ferrite-forward, ferrite-models) doesn't have to
-/// pull cudarc into its own Cargo.toml.
+/// pull cudarc into its own Cargo.toml. Under metal this resolves
+/// to `()` — metal weight loading is synchronous, no stream
+/// concept — so the per-arch `try_load` fn-pointer signature is
+/// the same shape under both backends and downstream `inventory::
+/// submit!` blocks reference one name.
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::sys::CUstream;
+#[cfg(feature = "metal")]
+pub type CUstream = ();
 
 #[cfg(feature = "nccl")]
 pub mod nccl;

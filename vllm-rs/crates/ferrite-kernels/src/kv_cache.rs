@@ -250,6 +250,21 @@ impl KvCachePool {
         self.cache_dtype.is_fp8()
     }
 
+    /// Per-layer K-cache backing memory. Metal callers use this to
+    /// reach into the underlying `metal::Buffer` (via
+    /// `RawGpuMem::buffer()`) for ICB binding without re-allocating.
+    /// One `RawGpuMem` per layer, shape `[num_layers]`.
+    #[cfg(feature = "metal")]
+    pub fn k_layer_mem(&self, layer: usize) -> &RawGpuMem {
+        &self._k_ptrs[layer]
+    }
+
+    /// Per-layer V-cache backing memory. See [`Self::k_layer_mem`].
+    #[cfg(feature = "metal")]
+    pub fn v_layer_mem(&self, layer: usize) -> &RawGpuMem {
+        &self._v_ptrs[layer]
+    }
+
     /// GPU pointer to K scale for a layer (only valid when FP8).
     #[cfg(feature = "cuda")]
     pub fn k_scale_ptr(&self, layer: usize) -> *const f32 {

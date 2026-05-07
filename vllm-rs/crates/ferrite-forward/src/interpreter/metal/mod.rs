@@ -46,5 +46,5 @@ pub use worker::{ArenaLayout, BoundBuffer, BucketBaking, BucketStep, MetalWorker
 #[cfg(feature = "metal")]
 #[doc(hidden)]
 pub mod __re {
-    pub use ::ferrite_metal_kernels::metal::Device;
+    pub use ::ferrite_metal_kernels::metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 }

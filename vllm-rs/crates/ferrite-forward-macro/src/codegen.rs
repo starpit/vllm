@@ -1645,7 +1645,10 @@ fn emit_fingerprint_check(
     quote! {
         /// Per-variant compile-time fingerprint check. See
         /// macro's `emit_fingerprint_check` for the rules.
-        #[cfg(feature = "cuda")]
+        /// Backend-neutral — `gw` reads tensor shapes via the
+        /// shared `GpuWeights` API, so the same body sniffs cuda
+        /// and metal checkpoints identically.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub fn fingerprint_matches(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
             hf: ::ferrite_forward::HfFingerprint<'_>,
@@ -2651,6 +2654,19 @@ fn emit_weights_struct(
                 #(#fields)*
                 #rotary_field
                 #rotary_local_field
+                /// Lazy-initialized `MetalWorkerPool<Self>` used by
+                /// the metal `forward` body. Constructed on the
+                /// first call (caller-passed `ctx.kv_cache` provides
+                /// the per-layer KV buffers the runtime_factory
+                /// closure captures); after that every forward
+                /// reuses the same pool. The `OnceLock` lets the
+                /// pool live as a field on `Weights` without an
+                /// `Arc`-cycle — it borrows `&Weights` for each
+                /// `pool.forward(weights, ...)` call instead.
+                #[cfg(feature = "metal")]
+                pub metal_pool: ::std::sync::OnceLock<
+                    ::ferrite_forward::interpreter::metal::MetalWorkerPool<Self>,
+                >,
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
@@ -2710,6 +2726,8 @@ fn emit_weights_struct(
                     #(#field_shorthand,)*
                     #rotary_init
                     #rotary_local_init
+                    #[cfg(feature = "metal")]
+                    metal_pool: ::std::sync::OnceLock::new(),
                 })
             }
 
@@ -2726,9 +2744,11 @@ fn emit_weights_struct(
                 load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
             }
 
-            /// Metal entry — stream-free, no marlin_storage thread
-            /// (quant variants are filtered out at config-load time
-            /// under metal). The body shares the canonical's `lets`
+            /// Metal entry — same signature as cuda's `load` so the
+            /// top-level dispatching `Weights::load` walks both
+            /// backends through the same arms. `stream` is an alias
+            /// for `()` under metal (`ferrite_cuda_core::CUstream`)
+            /// and is unused; the body shares the canonical's `lets`
             /// and `field_shorthand` — `LinearConcat` arms route
             /// through `LinearLayer::load_dense_concat_packed` and
             /// the rotary load uses `RotaryCache::new_from_gpuweights`.
@@ -2736,6 +2756,7 @@ fn emit_weights_struct(
             #[allow(clippy::too_many_lines, unused_variables)]
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
                 max_model_len: usize,
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
@@ -2747,6 +2768,8 @@ fn emit_weights_struct(
                     #(#field_shorthand,)*
                     #rotary_init
                     #rotary_local_init
+                    #[cfg(feature = "metal")]
+                    metal_pool: ::std::sync::OnceLock::new(),
                 })
             }
         },
@@ -2769,17 +2792,18 @@ fn emit_weights_struct(
             }
 
             /// Metal shim — delegates to canonical's metal `load`.
-            /// Quant variants are filtered out at config-load time
-            /// under metal, so the variant's MarlinFormat is irrelevant
-            /// here (it's a load-time-only sniff for AWQ/GPTQ/CT).
+            /// Same signature as cuda's shim above; `stream` is `()`
+            /// under metal and is forwarded to the canonical's
+            /// `load` (which also ignores it).
             #[cfg(feature = "metal")]
             #[inline]
             pub fn load(
                 gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
                 max_model_len: usize,
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
-                super::#canonical::load(gw, max_model_len, tp_rank)
+                super::#canonical::load(gw, stream, max_model_len, tp_rank)
             }
         },
     }
@@ -4751,6 +4775,7 @@ pub fn emit_model(
             /* num_slots */ u32,
             /* backbone_slot */ u32,
             /* terminal_slot */ u32,
+            /* arena_bytes per slot, length = num_slots */ Vec<u64>,
         ),
     > = BTreeMap::new();
     // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
@@ -4880,6 +4905,41 @@ pub fn emit_model(
             },
         };
 
+        // Per-slot byte sizes for the metal arena. Each color in
+        // `slots` may be shared by multiple `(TileId, output_slot)`
+        // pairs (linear-scan reg allocation). The arena slot must
+        // be sized for the largest pair sharing it, evaluated against
+        // the canonical's bucket-specific bounds (so dynamic dims
+        // like `num_tokens` get a concrete byte count). All metal
+        // forward tiles run in f16 (the metal kernel set is
+        // `_f16_specialized`-only), so dtype size is 2 bytes per
+        // element.
+        let mut arena_bytes_b: Vec<u64> = vec![0u64; num_slots as usize];
+        for ((tile_id, out_slot), color) in slots.iter() {
+            let node = fuf.get(tile_id);
+            let shape = &node.outputs[out_slot as usize];
+            let elems: u64 = crate::impl_lib::eval_shape_with(shape, &bounds)
+                .expect("shape inference left a Var in a tile output — codegen invariant")
+                .into_iter()
+                .product();
+            // f16 = 2 bytes/element; metal kernels are f16-only.
+            let bytes = elems.saturating_mul(2);
+            let slot_idx = color as usize;
+            if bytes > arena_bytes_b[slot_idx] {
+                arena_bytes_b[slot_idx] = bytes;
+            }
+        }
+        // Every color must have at least one (tile, slot) pair; if
+        // the worker ever sees a 0-byte arena slot it'll fail the
+        // ICB residency. Guarantee a 1-byte minimum so unused
+        // colors (none expected, but defensive) still allocate a
+        // valid `MTLBuffer`.
+        for b in &mut arena_bytes_b {
+            if *b == 0 {
+                *b = 1;
+            }
+        }
+
         canonical_lowered.insert(
             *wp,
             (
@@ -4890,6 +4950,7 @@ pub fn emit_model(
                 num_slots,
                 backbone_slot,
                 terminal_slot,
+                arena_bytes_b,
             ),
         );
     }
@@ -4903,7 +4964,7 @@ pub fn emit_model(
     // detection picks the largest CONTIGUOUS run that genuinely
     // repeats — middle layers — and keeps the boundary residues as
     // straight-line code in prelude/suffix.
-    for (cl, _, _, _) in canonical_lowered.values_mut() {
+    for (cl, _, _, _, _) in canonical_lowered.values_mut() {
         crate::interpreter_codegen::apply_loop_compression(
             &arch_opcodes,
             &mut cl.backbone,
@@ -4945,7 +5006,7 @@ pub fn emit_model(
         if bucket_canonical[i] != *wp {
             continue;
         }
-        let (lowered, _, _, _) = &canonical_lowered[wp];
+        let (lowered, _, _, _, _) = &canonical_lowered[wp];
         let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
         let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
         static_slices.push(emit_bucket_static_slice(
@@ -5009,7 +5070,7 @@ pub fn emit_model(
         // prefill, freeing a slot vs the decode-bucket's separate
         // Add). The non-canonical buckets share their canonical's
         // slot metadata since they share its static slices.
-        let (_, num_slots_b, backbone_slot_b, terminal_slot_b) = &canonical_lowered[&canonical];
+        let (_, num_slots_b, backbone_slot_b, terminal_slot_b, _) = &canonical_lowered[&canonical];
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
         let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_b);
         let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
@@ -5098,6 +5159,8 @@ pub fn emit_model(
     // mutually-exclusive cfg-gated, but the slice statics
     // themselves are backend-agnostic).
     let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
+    let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
+    let mut emitted_arena_statics: HashSet<crate::solver::WorkloadPoint> = HashSet::new();
     for &m in &num_tokens_points {
         // Prefer the sk=0 canonical for this `m`; fall back to any wp
         // at `m` if the model never declared sk=0 explicitly.
@@ -5114,20 +5177,59 @@ pub fn emit_model(
         let canonical = bucket_canonical[i];
         let bb_static = bucket_static_ident("BACKBONE_M", canonical);
         let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
-        let (_, num_slots_b, _, _) = &canonical_lowered[&canonical];
+        let (_, num_slots_b, _, terminal_slot_b, arena_bytes_b) = &canonical_lowered[&canonical];
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
+        let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
+        let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", canonical);
+        if emitted_arena_statics.insert(canonical) {
+            let arena_bytes_lits = arena_bytes_b
+                .iter()
+                .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+            metal_arena_bytes_statics.push(quote! {
+                #[cfg(feature = "metal")]
+                static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
+            });
+        }
         metal_bucket_entries.push(quote! {
             ::ferrite_forward::interpreter::metal::MetalBucketSpec {
                 bucket_m: #bucket_m_lit,
                 num_arena_slots: #num_slots_lit,
+                terminal_slot: #terminal_slot_lit,
+                arena_bytes: #arena_static_ident,
                 backbone: #bb_static,
                 lm_head: #lm_static,
             },
         });
     }
 
+    // Largest `num_tokens` across all buckets — drives runtime
+    // buffer sizing in the metal forward body's `RuntimeFactory`.
+    let max_bucket_m_lit = {
+        let max_m = num_tokens_points
+            .iter()
+            .copied()
+            .max()
+            .expect("at least one num_tokens point per canonical");
+        proc_macro2::Literal::u32_unsuffixed(max_m as u32)
+    };
+
+    // Vocab size — baked from `model.bounds["vocab_size"]` at
+    // macro-expansion time. The metal forward body needs it to
+    // shape the `OwnedTensor` it returns from the bucket's terminal
+    // arena slot ([num_tokens, vocab_size] f16 logits).
+    let vocab_size_lit = {
+        let vocab = model
+            .bounds
+            .get("vocab_size")
+            .copied()
+            .expect("model.bounds must carry `vocab_size`");
+        proc_macro2::Literal::u64_unsuffixed(vocab)
+    };
+
     let metal_emission = quote! {
+        #(#metal_arena_bytes_statics)*
+
         /// Per-canonical bucket plan for the Metal pool. One row per
         /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`
         /// is a linear smallest-fit scan, so order matters.
@@ -5138,10 +5240,32 @@ pub fn emit_model(
                 #(#metal_bucket_entries)*
             ];
 
+        /// Largest `num_tokens` bucket across [`METAL_BUCKETS`]. The
+        /// metal forward body's `RuntimeFactory` allocates per-worker
+        /// runtime buffers (input_ids/positions/slot_mapping/...) at
+        /// `METAL_MAX_BUCKET_M * sizeof(u32)`; block_table at
+        /// `METAL_MAX_BUCKET_M * MAX_BLOCKS_PER_SEQ * sizeof(u32)`.
+        #[cfg(feature = "metal")]
+        pub const METAL_MAX_BUCKET_M: u32 = #max_bucket_m_lit;
+
+        /// Vocab size — baked from `model.bounds["vocab_size"]`. The
+        /// metal forward shapes its returned `OwnedTensor` as
+        /// `[num_tokens, METAL_VOCAB_SIZE]` f16.
+        #[cfg(feature = "metal")]
+        pub const METAL_VOCAB_SIZE: u64 = #vocab_size_lit;
+
         /// Build a [`MetalWorkerPool`] for this canonical. Thin
         /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
         /// the per-canonical [`METAL_BUCKETS`] static so callers don't
-        /// have to construct the bucket plan by hand.
+        /// have to construct the bucket plan by hand. The arena layout
+        /// is derived from each bucket's `arena_bytes` field — taking
+        /// the elementwise max so the single per-worker arena fits the
+        /// largest activation across every bucket.
+        ///
+        /// `weights` is borrowed; the pool stores no back-reference,
+        /// caller passes `&weights` again at every `forward` /
+        /// `checkout` so the pool can live as a field on the
+        /// `Weights` struct without an `Arc`-cycle.
         ///
         /// [`MetalWorkerPool`]: ::ferrite_forward::interpreter::metal::MetalWorkerPool
         /// [`MetalWorkerPool::for_buckets`]: ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets
@@ -5150,9 +5274,8 @@ pub fn emit_model(
             device: ::std::sync::Arc<
                 ::ferrite_forward::interpreter::metal::__re::Device,
             >,
-            weights: ::std::sync::Arc<Weights>,
+            weights: &Weights,
             allocator: ::std::sync::Arc<::ferrite_cuda_core::MetalAllocator>,
-            arena_layout: ::ferrite_forward::interpreter::metal::ArenaLayout,
             runtime_factory: ::ferrite_forward::interpreter::metal::RuntimeFactory,
             max_workers: usize,
         ) -> ::core::result::Result<
@@ -5164,10 +5287,179 @@ pub fn emit_model(
                 weights,
                 allocator,
                 METAL_BUCKETS,
-                arena_layout,
                 runtime_factory,
                 max_workers,
             )
+        }
+
+        /// Per-canonical metal forward dispatch. Lazy-inits
+        /// `weights.metal_pool` on the first call (factory closure
+        /// captures the per-layer `metal::Buffer` Arc-handles from
+        /// `ctx.kv_cache` and the `MAX_BLOCKS_PER_SEQ` block-table
+        /// stride from `<Weights as CanonicalParams>`); on every call
+        /// reads the runtime input slices off the host-visible
+        /// `ctx.<input>` `TensorView`s — under metal those raw_ptrs
+        /// are `metal::Buffer.contents()` so the slice borrow lives
+        /// as long as the call — hands them to
+        /// `MetalWorkerPool::forward`, and copies the bucket's
+        /// terminal arena slot out as a fresh `OwnedTensor` of
+        /// `[num_tokens, vocab_size]` f16 logits.
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
+            num_tokens: u64,
+        ) -> ::ferrite_cuda_core::OwnedTensor {
+            use ::ferrite_forward::CanonicalParams as _;
+            use ::ferrite_forward::interpreter::metal::__re::{Buffer, MTLResourceOptions};
+
+            // ── Lazy pool init ────────────────────────────────────
+            //
+            // Factory closure captures (a) the metal device handle
+            // for runtime-buffer allocation, (b) `MAX_BLOCKS_PER_SEQ`
+            // from the canonical's `CanonicalParams` (compile-time
+            // const), (c) Arc-handle clones of the per-layer KV
+            // buffers from `ctx.kv_cache` so worker spawns inherit
+            // them without re-allocation. The closure is invoked
+            // once per worker spawn — the pool starts at size 1 so
+            // the first `pool.forward` call below triggers the only
+            // factory invocation in single-worker configs.
+            let pool = wm.metal_pool.get_or_init(|| {
+                let num_layers = ctx.kv_cache.num_layers;
+                let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
+                    .map(|l| ctx.kv_cache.k_layer_mem(l).buffer().clone())
+                    .collect();
+                let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
+                    .map(|l| ctx.kv_cache.v_layer_mem(l).buffer().clone())
+                    .collect();
+                let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
+                    ::std::sync::Arc::new(move |dev| {
+                        let max_m = METAL_MAX_BUCKET_M as u64;
+                        let max_bps =
+                            <Weights as ::ferrite_forward::CanonicalParams>::MAX_BLOCKS_PER_SEQ
+                                as u64;
+                        let alloc = |bytes: u64| {
+                            dev.new_buffer(
+                                bytes.max(16),
+                                MTLResourceOptions::StorageModeShared,
+                            )
+                        };
+                        ::ferrite_forward::interpreter::metal::RuntimeBindings {
+                            input_ids: alloc(max_m * 4),
+                            positions: alloc(max_m * 4),
+                            slot_mapping: alloc(max_m * 4),
+                            cu_seqlens_q: alloc((max_m + 1) * 4),
+                            seq_used_k: alloc(max_m * 4),
+                            block_table: alloc(max_m * max_bps * 4),
+                            kv_cache_k: kv_k.clone(),
+                            kv_cache_v: kv_v.clone(),
+                        }
+                    });
+                ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
+                    device.device.clone(),
+                    wm,
+                    device.allocator.clone(),
+                    METAL_BUCKETS,
+                    factory,
+                    1,
+                )
+                .expect("MetalWorkerPool::for_buckets: pool init failed")
+            });
+
+            // ── Read host-visible input slices off ctx ────────────
+            //
+            // Under metal, every `TensorView` in `ctx` resolves to a
+            // pointer inside a `StorageModeShared` `MTLBuffer.contents()`,
+            // so reading as `&[u32]` is a direct CPU borrow. The
+            // shared buffer keeps backing the slice until the worker
+            // memcopies through `write_runtime_inputs`.
+            let n = num_tokens as usize;
+            let input_ids = ::std::slice::from_raw_parts(
+                ctx.input_ids.as_raw().raw_ptr() as *const u32,
+                n,
+            );
+            let positions = ::std::slice::from_raw_parts(
+                ctx.positions.as_raw().raw_ptr() as *const u32,
+                n,
+            );
+            let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
+                    n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let cu_seqlens_q = if !ctx.cu_seqlens_q.as_raw().raw_ptr().is_null() {
+                let cu_n = ctx.cu_seqlens_q.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.cu_seqlens_q.as_raw().raw_ptr() as *const u32,
+                    cu_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let seq_used_k = if !ctx.seqused_k.as_raw().raw_ptr().is_null() {
+                let su_n = ctx.seqused_k.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.seqused_k.as_raw().raw_ptr() as *const u32,
+                    su_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let block_table = if !ctx.block_table.as_raw().raw_ptr().is_null() {
+                let bt_n = ctx.block_table.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.block_table.as_raw().raw_ptr() as *const u32,
+                    bt_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+
+            let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
+                num_tokens: num_tokens as u32,
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seq_used_k,
+                block_table,
+            };
+
+            // ── Run forward + copy logits out ─────────────────────
+            //
+            // The pool picks the bucket from `num_tokens`, runs
+            // `executeCommandsInBuffer` (interleaved with MPS GEMMs
+            // on <M4 hardware), waits for completion, then invokes
+            // the closure with `&MetalWorker` + `bucket_idx`. The
+            // bucket's terminal arena slot holds the lm_head output;
+            // we wrap that buffer in a fresh `OwnedTensor` (Arc-
+            // handle clone — no copy) so the caller can read
+            // `[num_tokens, vocab_size]` f16 logits without taking
+            // ownership of the worker's arena.
+            pool.forward(
+                wm,
+                &device.queue,
+                &inputs,
+                |worker, bucket_idx| {
+                    let spec = &METAL_BUCKETS[bucket_idx];
+                    let buf = worker.arena[spec.terminal_slot as usize].clone();
+                    let vocab = METAL_VOCAB_SIZE as usize;
+                    let shape = [n, vocab];
+                    let bytes = n * vocab * 2; // f16
+                    let inner = ::ferrite_cuda_core::tensor::GpuTensor::new(
+                        buf.contents() as *mut u8,
+                        &shape,
+                        ::ferrite_cuda_core::dtype::DType::F16,
+                    );
+                    ::ferrite_cuda_core::OwnedTensor::from_metal_buffer(inner, buf, bytes)
+                },
+            )
+            .expect("MetalWorkerPool::forward")
         }
     };
 

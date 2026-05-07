@@ -6275,7 +6275,9 @@ impl Worker for FerriteWorker {
             } else {
                 "Qwen3Next"
             };
-            info!("FerriteWorker: {tag} model — skipping activation profiling, using fixed estimate");
+            info!(
+                "FerriteWorker: {tag} model — skipping activation profiling, using fixed estimate"
+            );
             let (free, total) = cudarc::driver::result::mem_get_info()
                 .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
             let weights_and_overhead = total.saturating_sub(free);
@@ -9305,10 +9307,7 @@ impl FerriteWorker {
     }
 
     /// Set the progress callback for startup loading.
-    pub fn set_progress_callback(
-        &mut self,
-        cb: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
-    ) {
+    pub fn set_progress_callback(&mut self, cb: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
         self.progress_callback = Some(cb);
     }
 }
@@ -9316,9 +9315,8 @@ impl FerriteWorker {
 #[cfg(feature = "metal")]
 impl Worker for FerriteWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
-        let device = ferrite_metal_kernels::detect_device().ok_or_else(|| {
-            ExecutorError::WorkerInit("no Metal device available".to_string())
-        })?;
+        let device = ferrite_metal_kernels::detect_device()
+            .ok_or_else(|| ExecutorError::WorkerInit("no Metal device available".to_string()))?;
         self.metal_device = Some(std::sync::Arc::new(device));
         info!("FerriteWorker(metal): Metal device initialized");
         Ok(())
@@ -9341,19 +9339,46 @@ impl Worker for FerriteWorker {
         _num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
         Err(ExecutorError::WorkerExecution(
-            "FerriteWorker(metal)::initialize_cache not yet wired — Phase F Step 3"
-                .to_string(),
+            "FerriteWorker(metal)::initialize_cache not yet wired — Phase F Step 3".to_string(),
         ))
     }
 
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
-        // Conservative default until the metal profile path lands; vllm-serve
-        // also accepts an explicit kv-cache-bytes override via CLI.
-        Err(ExecutorError::WorkerExecution(
-            "FerriteWorker(metal)::determine_available_memory not yet wired — \
-             Phase F Step 3"
-                .to_string(),
-        ))
+        // Apple unified memory: `recommendedMaxWorkingSetSize` is Apple's
+        // own recommended budget for resident MTLBuffers (typically ~75% of
+        // physical RAM on M-series, accounting for OS reservations).
+        // `currentAllocatedSize` covers everything Metal has allocated for
+        // this process so far — model weights live there post-`load_model`.
+        //
+        // TODO(Step 3.D): replace the 512 MiB placeholder with the accurate
+        // `sum(handle.arena_layout()) * max_workers + runtime_bindings_bytes
+        // * max_workers` once `MetalArchHandle` exposes the per-canonical
+        // arena layout. The macro already has the colored slot map at
+        // expansion time — Step 3.D wires it through as a static
+        // `METAL_ARENA_BYTES: &[u64]` per canonical so the handle can
+        // surface it here without a runtime tape walk.
+        let metal_device = self
+            .metal_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
+        let total = metal_device.device.recommended_max_working_set_size() as usize;
+        let weights_and_overhead = metal_device.device.current_allocated_size() as usize;
+        let peak_activation_estimate: usize = 512 * 1024 * 1024;
+        let utilization = self.config.gpu_memory_utilization;
+        let available = compute_available_kv_bytes(
+            total,
+            weights_and_overhead,
+            peak_activation_estimate,
+            utilization,
+        );
+        info!(
+            "FerriteWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
+             est_activations=512 MiB, kv_budget={:.1} GiB",
+            total as f64 / 1_073_741_824.0,
+            weights_and_overhead as f64 / 1_073_741_824.0,
+            available as f64 / 1_073_741_824.0,
+        );
+        Ok(available)
     }
 
     fn execute_model(

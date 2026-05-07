@@ -13,9 +13,9 @@
 //! * [`parallel`] -- Distributed parallel state types (TP/PP groups, rank management).
 //! * [`error`] -- Executor-specific error types.
 
+pub mod error;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod ferrite_worker;
-pub mod error;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod gpu_worker_base;
 pub mod input_batch;

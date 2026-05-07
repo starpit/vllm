@@ -92,7 +92,15 @@ pub fn dispatch_argmax_f16(
     batch: u32,
     vocab: u32,
 ) -> Result<(), MetalStreamError> {
-    dispatch_argmax_f16_with_tg_size(kernels, queue, logits, output, batch, vocab, ARGMAX_DEFAULT_TG_SIZE)
+    dispatch_argmax_f16_with_tg_size(
+        kernels,
+        queue,
+        logits,
+        output,
+        batch,
+        vocab,
+        ARGMAX_DEFAULT_TG_SIZE,
+    )
 }
 
 /// Variant of [`dispatch_argmax_f16`] with a caller-chosen threadgroup
@@ -236,8 +244,7 @@ mod tests {
         let mut logits = vec![half::f16::from_f32(0.0); vocab];
         logits[37] = half::f16::from_f32(99.0);
         let logits_buf = upload_shared_buffer(&device, &logits);
-        let output_buf =
-            device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let output_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
 
         dispatch_argmax_f16(&kernels, &queue, &logits_buf, &output_buf, 1, vocab as u32)
             .expect("dispatch");
@@ -301,8 +308,7 @@ mod tests {
         let mut logits = vec![half::f16::from_f32(0.0); vocab];
         // All-zero row → every index ties. Smallest (0) must win.
         let logits_buf = upload_shared_buffer(&device, &logits);
-        let output_buf =
-            device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let output_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
         dispatch_argmax_f16(&kernels, &queue, &logits_buf, &output_buf, 1, vocab as u32)
             .expect("dispatch all-zero");
         assert_eq!(unsafe { *(output_buf.contents() as *const u32) }, 0);
@@ -311,8 +317,7 @@ mod tests {
         logits[5] = half::f16::from_f32(7.0);
         logits[50] = half::f16::from_f32(7.0);
         let logits_buf = upload_shared_buffer(&device, &logits);
-        let output_buf =
-            device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let output_buf = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
         dispatch_argmax_f16(&kernels, &queue, &logits_buf, &output_buf, 1, vocab as u32)
             .expect("dispatch tie");
         assert_eq!(unsafe { *(output_buf.contents() as *const u32) }, 5);
@@ -337,7 +342,9 @@ mod tests {
         // Deterministic LCG so the test is reproducible without rand.
         let mut state = 0xdead_beef_u64;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state
         };
         let logits: Vec<half::f16> = (0..batch * vocab)
@@ -394,8 +401,8 @@ mod tests {
 
         let mut answers: Vec<Vec<u32>> = Vec::new();
         for &tg in &[64u64, 256, 1024] {
-            let output_buf = device
-                .new_buffer((batch * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let output_buf =
+                device.new_buffer((batch * 4) as u64, MTLResourceOptions::StorageModeShared);
             dispatch_argmax_f16_with_tg_size(
                 &kernels,
                 &queue,
@@ -459,18 +466,17 @@ mod tests {
         let queue = device.new_command_queue();
         let logits = device.new_buffer(64 * 2, MTLResourceOptions::StorageModeShared);
         let output = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
-        assert!(dispatch_argmax_f16_with_tg_size(
-            &kernels, &queue, &logits, &output, 1, 32, 100
-        )
-        .is_err());
-        assert!(dispatch_argmax_f16_with_tg_size(
-            &kernels, &queue, &logits, &output, 1, 32, 2048
-        )
-        .is_err());
+        assert!(
+            dispatch_argmax_f16_with_tg_size(&kernels, &queue, &logits, &output, 1, 32, 100)
+                .is_err()
+        );
+        assert!(
+            dispatch_argmax_f16_with_tg_size(&kernels, &queue, &logits, &output, 1, 32, 2048)
+                .is_err()
+        );
         // Power of two ≤ 1024 succeeds.
-        assert!(dispatch_argmax_f16_with_tg_size(
-            &kernels, &queue, &logits, &output, 1, 32, 64
-        )
-        .is_ok());
+        assert!(
+            dispatch_argmax_f16_with_tg_size(&kernels, &queue, &logits, &output, 1, 32, 64).is_ok()
+        );
     }
 }

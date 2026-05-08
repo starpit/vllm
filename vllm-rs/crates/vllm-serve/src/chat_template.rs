@@ -57,6 +57,19 @@ struct TokenizerConfig {
 fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     let mut env = Environment::new();
 
+    // HuggingFace's `apply_chat_template` renders with `trim_blocks=True`
+    // and `lstrip_blocks=True`. Templates are written assuming both —
+    // block tags `{% ... %}` live on their own lines and the surrounding
+    // whitespace is expected to be stripped. Without these the trailing
+    // `\n` after every `{% ... %}` line leaks into the rendered prompt,
+    // which then re-tokenizes differently than the model's training
+    // distribution. For TinyLlama-Chat-v1.0 the bare `<` of `<|user|>`
+    // is token 529 in the trained tokenization but lands as 29966 once a
+    // stray `\n` runs precede it; the model has effectively never seen
+    // that input, so generation produces nonsense fragments.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+
     // Enable Python string/dict/list methods (startswith, endswith, etc.)
     // that HuggingFace Jinja2 chat templates commonly use.
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);

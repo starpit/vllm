@@ -246,6 +246,210 @@ impl Qwen3NextGatedAttentionLayer {
         })
     }
 
+    /// Tensor-parallel sharded load. Mirrors Python vLLM's
+    /// `QKVParallelLinear` (column-parallel on dim 0 of qkv, each of
+    /// Q/K/V blocks sharded independently) and `RowParallelLinear`
+    /// (row-parallel on dim 1 of o_proj). Per-head `q_norm` / `k_norm`
+    /// stay replicated. `num_q_heads_full` / `num_kv_heads_full` are
+    /// the unsharded head counts from `config.json`; divided by
+    /// `tp_size` to obtain the per-rank counts stored on the struct.
+    /// At `tp_size <= 1` delegates to [`Self::load`] for
+    /// byte-equivalent behavior.
+    ///
+    /// Supports both fused `qkv_proj.weight`
+    /// (`[q_size + 2*kv_size, hidden]` — default on unsloth/HF-converted
+    /// Qwen3-Next checkpoints) and separate `q_proj.weight` /
+    /// `k_proj.weight` / `v_proj.weight`. For the fused case, uses
+    /// `synthesize_packed_row_split_sizes` to carve virtual
+    /// `{prefix}.q_proj.weight` etc. before the three `take_shard_into`
+    /// calls, matching the `Fp8Linear::load_concat_sharded` precedent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_sharded(
+        gw: &mut GpuWeights,
+        prefix: &str,
+        num_q_heads_full: usize,
+        num_kv_heads_full: usize,
+        head_dim: usize,
+        qk_norm_eps: f32,
+        attn_output_gate: bool,
+        tp_rank: usize,
+        tp_size: usize,
+        stream: CUstream,
+    ) -> Result<Self> {
+        if tp_size <= 1 {
+            return Self::load(
+                gw,
+                prefix,
+                num_q_heads_full,
+                num_kv_heads_full,
+                head_dim,
+                qk_norm_eps,
+                attn_output_gate,
+                stream,
+            );
+        }
+        anyhow::ensure!(
+            tp_rank < tp_size,
+            "Qwen3NextGatedAttentionLayer::load_sharded: tp_rank ({tp_rank}) >= tp_size ({tp_size})",
+        );
+        anyhow::ensure!(
+            num_q_heads_full.is_multiple_of(tp_size),
+            "Qwen3NextGatedAttentionLayer::load_sharded: num_q_heads_full ({num_q_heads_full}) not divisible by tp_size ({tp_size})",
+        );
+        anyhow::ensure!(
+            num_kv_heads_full.is_multiple_of(tp_size),
+            "Qwen3NextGatedAttentionLayer::load_sharded: num_kv_heads_full ({num_kv_heads_full}) not divisible by tp_size ({tp_size})",
+        );
+
+        let num_q_heads = num_q_heads_full / tp_size;
+        let num_kv_heads = num_kv_heads_full / tp_size;
+        let true_q_size = num_q_heads * head_dim;
+        let q_size = if attn_output_gate {
+            2 * true_q_size
+        } else {
+            true_q_size
+        };
+        let kv_size = num_kv_heads * head_dim;
+
+        // Full unsharded sizes for the packed-parent carve.
+        let true_q_size_full = num_q_heads_full * head_dim;
+        let q_size_full = if attn_output_gate {
+            2 * true_q_size_full
+        } else {
+            true_q_size_full
+        };
+        let kv_size_full = num_kv_heads_full * head_dim;
+
+        // If the checkpoint ships a fused `qkv_proj.weight`, carve
+        // virtual q/k/v children so `take_shard_into` can slice each
+        // block's dim 0 independently. No-op if the checkpoint already
+        // ships separate `q_proj` / `k_proj` / `v_proj` (returns false).
+        let _carved = gw.synthesize_packed_row_split_sizes(
+            &format!("{prefix}.qkv_proj"),
+            &[
+                ("q_proj", q_size_full),
+                ("k_proj", kv_size_full),
+                ("v_proj", kv_size_full),
+            ],
+        )?;
+
+        let q_name = format!("{prefix}.q_proj.weight");
+        let k_name = format!("{prefix}.k_proj.weight");
+        let v_name = format!("{prefix}.v_proj.weight");
+        let (q_shape, q_dtype) = gw
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+        let hidden_size = q_shape[1];
+        // Use the on-disk dtype for buffer sizing — `take_shard_into`
+        // copies raw bytes in this dtype (FP8 stays FP8, BF16 stays
+        // BF16). `tensor_info` returns the post-cast dtype for
+        // floating types, but FP8 and other non-float types fall
+        // through unchanged. Matches the non-sharded `load` path's
+        // allocation convention (`elem = q_dtype.size_bytes()`).
+        let elem = q_dtype.size_bytes();
+        let q_bytes = q_size * hidden_size * elem;
+        let kv_bytes = kv_size * hidden_size * elem;
+        let total = q_bytes + 2 * kv_bytes;
+        let ptr = unsafe { driver::mem_alloc(total)? };
+        unsafe {
+            gw.take_shard_into(&q_name, 0, tp_rank, tp_size, ptr, stream)?;
+            gw.take_shard_into(&k_name, 0, tp_rank, tp_size, ptr.add(q_bytes), stream)?;
+            gw.take_shard_into(
+                &v_name,
+                0,
+                tp_rank,
+                tp_size,
+                ptr.add(q_bytes + kv_bytes),
+                stream,
+            )?;
+        }
+        // `post_dtype` is the dtype the subsequent forward's cublas
+        // GEMM expects. At `target_dtype = BF16` with FP8 on-disk
+        // weights, this mismatches the actual buffer contents — this
+        // is the same pre-existing limitation as the non-sharded
+        // `load` path (FP8 attention weights are not yet dequantized
+        // or routed to an FP8-aware GEMM in `Linear::forward`).
+        let post_dtype = gw.target_dtype().unwrap_or(q_dtype);
+        let qkv_w =
+            unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden_size], post_dtype) };
+
+        let q_bias_name = format!("{prefix}.q_proj.bias");
+        let qkv_bias = if gw.contains(&q_bias_name) {
+            let (_, bias_dtype) = gw
+                .tensor_info(&q_bias_name)
+                .ok_or_else(|| anyhow::anyhow!("bias metadata missing: {q_bias_name}"))?;
+            let bias_elem = bias_dtype.size_bytes();
+            let q_b_bytes = q_size * bias_elem;
+            let kv_b_bytes = kv_size * bias_elem;
+            let bias_total = q_b_bytes + 2 * kv_b_bytes;
+            let bias_ptr = unsafe { driver::mem_alloc(bias_total)? };
+            let k_bias_name = format!("{prefix}.k_proj.bias");
+            let v_bias_name = format!("{prefix}.v_proj.bias");
+            unsafe {
+                gw.take_shard_into(&q_bias_name, 0, tp_rank, tp_size, bias_ptr, stream)?;
+                gw.take_shard_into(
+                    &k_bias_name,
+                    0,
+                    tp_rank,
+                    tp_size,
+                    bias_ptr.add(q_b_bytes),
+                    stream,
+                )?;
+                gw.take_shard_into(
+                    &v_bias_name,
+                    0,
+                    tp_rank,
+                    tp_size,
+                    bias_ptr.add(q_b_bytes + kv_b_bytes),
+                    stream,
+                )?;
+            }
+            Some(unsafe { GpuTensor::new(bias_ptr, &[q_size + 2 * kv_size], bias_dtype) })
+        } else {
+            None
+        };
+        let qkv_proj = Linear::new(qkv_w, qkv_bias);
+
+        // o_proj is row-parallel (shard dim 1 of `[hidden, q_size]`).
+        // Bias is added once on rank 0 after the AllReduce; the
+        // `Linear::load_sharded(dim=1)` contract handles both rules.
+        let o_proj = Linear::load_sharded(gw, &format!("{prefix}.o_proj"), 1, tp_rank, tp_size)?;
+
+        // Per-head RMSNorm weights are `[head_dim]` vectors — replicated.
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let q_norm_weight = if gw.contains(&q_norm_name) {
+            let w = gw.take(&q_norm_name)?;
+            unsafe { Self::add_one_inplace(&w, stream)? };
+            Some(w)
+        } else {
+            None
+        };
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let k_norm_weight = if gw.contains(&k_norm_name) {
+            let w = gw.take(&k_norm_name)?;
+            unsafe { Self::add_one_inplace(&w, stream)? };
+            Some(w)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj,
+            o_proj,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            q_size,
+            kv_size,
+            true_q_size,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            attn_output_gate,
+        })
+    }
+
     /// Forward pass — returns `[T, num_q_heads * head_dim]` ready for
     /// `o_proj` (already applied here; the returned tensor is the
     /// post-`o_proj` hidden delta).

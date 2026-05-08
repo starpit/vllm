@@ -1677,6 +1677,20 @@ impl<W: CanonicalParams> Instruction<W> {
                     num_seqs,
                     ctx.device,
                 );
+                // TP sync point. `Qwen3NextGdnLayer::load_sharded` shards
+                // the in-projection intermediate dim column-parallel and
+                // `out_proj` row-parallel, so the layer's output is a
+                // per-rank partial sum that must be all-reduced before
+                // re-entering the residual stream.
+                #[cfg(feature = "nccl")]
+                if let Some(group) = ctx.fwd.tp_group {
+                    group
+                        .all_reduce_inplace_promote(
+                            out.as_gpu_tensor(),
+                            &mut ctx.device.caching,
+                        )
+                        .expect("GdnAttention all_reduce failed");
+                }
                 dump::dump_tile(
                     "gdn_attn.out",
                     layer,
@@ -1705,6 +1719,20 @@ impl<W: CanonicalParams> Instruction<W> {
                     cos_sin,
                     ctx.device,
                 );
+                // TP sync point. `Qwen3NextGatedAttentionLayer::load_sharded`
+                // shards qkv_proj column-parallel (Q/K/V heads split by
+                // tp) and `o_proj` row-parallel, so the layer's output
+                // is a per-rank partial sum that must be all-reduced
+                // before re-entering the residual stream.
+                #[cfg(feature = "nccl")]
+                if let Some(group) = ctx.fwd.tp_group {
+                    group
+                        .all_reduce_inplace_promote(
+                            out.as_gpu_tensor(),
+                            &mut ctx.device.caching,
+                        )
+                        .expect("GatedAttention all_reduce failed");
+                }
                 dump::dump_tile(
                     "gated_attn.out",
                     layer,

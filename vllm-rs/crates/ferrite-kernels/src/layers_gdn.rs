@@ -295,6 +295,194 @@ impl Qwen3NextGdnLayer {
         })
     }
 
+    /// Tensor-parallel sharded load. Mirrors the Python vLLM
+    /// `Qwen3NextGatedDeltaNet.__init__` TP split:
+    ///
+    /// * `in_proj_qkvz.weight` — 4-block column-parallel
+    ///   `[key_dim, key_dim, value_dim, value_dim]`, each block sharded
+    ///   on dim 0 by `tp_size` (Python uses `MergedColumnParallelLinear`
+    ///   with `output_sizes=[sum(key+key+value+value)]`; our split
+    ///   matches the per-block layout that
+    ///   [`kernels::gdn_qkvz_split`] consumes at forward time).
+    /// * `in_proj_ba.weight` — 2-block column-parallel
+    ///   `[num_v_heads, num_v_heads]`, each block sharded on dim 0.
+    /// * `conv1d.weight` — 3-block column-parallel
+    ///   `[key_dim, key_dim, value_dim]` along dim 0 (Python uses
+    ///   `mamba_v2_sharded_weight_loader`). Loaded as CPU f32 then
+    ///   uploaded per-rank.
+    /// * `A_log` / `dt_bias` — `[num_v_heads]` sharded on dim 0.
+    /// * `norm.weight` — `[head_v_dim]`, replicated (per-head norm).
+    /// * `out_proj.weight` — row-parallel, shard dim 1.
+    ///
+    /// `num_k_heads_full` / `num_v_heads_full` are the full
+    /// `linear_num_{key,value}_heads` counts from `config.json`. At
+    /// `tp_size <= 1` delegates to [`Self::load`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_sharded(
+        gw: &mut GpuWeights,
+        prefix: &str,
+        num_k_heads_full: usize,
+        num_v_heads_full: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_kernel_size: usize,
+        rms_norm_eps: f32,
+        gdn_layer_idx: usize,
+        tp_rank: usize,
+        tp_size: usize,
+        stream: CUstream,
+    ) -> Result<Self> {
+        if tp_size <= 1 {
+            return Self::load(
+                gw,
+                prefix,
+                num_k_heads_full,
+                num_v_heads_full,
+                head_k_dim,
+                head_v_dim,
+                conv_kernel_size,
+                rms_norm_eps,
+                gdn_layer_idx,
+                stream,
+            );
+        }
+        anyhow::ensure!(
+            tp_rank < tp_size,
+            "Qwen3NextGdnLayer::load_sharded: tp_rank ({tp_rank}) >= tp_size ({tp_size})",
+        );
+        anyhow::ensure!(
+            num_k_heads_full.is_multiple_of(tp_size),
+            "Qwen3NextGdnLayer::load_sharded: num_k_heads_full ({num_k_heads_full}) not divisible by tp_size ({tp_size})",
+        );
+        anyhow::ensure!(
+            num_v_heads_full.is_multiple_of(tp_size),
+            "Qwen3NextGdnLayer::load_sharded: num_v_heads_full ({num_v_heads_full}) not divisible by tp_size ({tp_size})",
+        );
+
+        let num_k_heads = num_k_heads_full / tp_size;
+        let num_v_heads = num_v_heads_full / tp_size;
+        let key_dim_full = num_k_heads_full * head_k_dim;
+        let value_dim_full = num_v_heads_full * head_v_dim;
+        let key_dim = num_k_heads * head_k_dim;
+        let value_dim = num_v_heads * head_v_dim;
+        let conv_dim = 2 * key_dim + value_dim;
+        let conv_dim_full = 2 * key_dim_full + value_dim_full;
+
+        // `in_proj_qkvz.weight` on disk uses **per-head grouped** row
+        // layout: each of `num_k_heads` groups contains
+        // `[Q_k, K_k, V_{v_per_k}, Z_{v_per_k}]` contiguously. Python's
+        // `MergedColumnParallelLinear(output_sizes=[sum(...)])` (single
+        // output size) treats this as one merged column-parallel block:
+        // each rank gets `num_k_heads / tp_size` whole groups → a
+        // simple `dim=0` shard of the full weight, since the per-rank
+        // row count divides evenly on a group boundary. The GDN split
+        // kernel reads the group layout at runtime using the per-rank
+        // `num_k_heads`, so no reordering is needed.
+        let qkvz_w = gw.take_shard(
+            &format!("{prefix}.in_proj_qkvz.weight"),
+            0,
+            tp_rank,
+            tp_size,
+        )?;
+        let in_proj_qkvz = Linear::new(qkvz_w, None);
+
+        // `in_proj_ba.weight` has grouped row layout
+        // `[num_k_heads, 2 * v_per_k]`; sharding dim 0 keeps the group
+        // structure intact (each rank owns `num_k_heads / tp_size`
+        // groups). Python's `MergedColumnParallelLinear(output_sizes=[num_v_heads]*2)`
+        // reaches the same per-rank shape because
+        // `2*num_v_heads = num_k_heads * 2*v_per_k` and both blocks
+        // shard with the same per-rank count.
+        let ba_w = gw.take_shard(
+            &format!("{prefix}.in_proj_ba.weight"),
+            0,
+            tp_rank,
+            tp_size,
+        )?;
+        let in_proj_ba = Linear::new(ba_w, None);
+
+        // conv1d: `[conv_dim, kernel_size]`, 3-block dim-0 column-parallel
+        // `[key_dim, key_dim, value_dim]`. Stored/consumed as f32.
+        let conv_data_full = gw.take_to_cpu_f32(&format!("{prefix}.conv1d.weight"))?;
+        let conv_full_elems = conv_dim_full * conv_kernel_size;
+        anyhow::ensure!(
+            conv_data_full.len() >= conv_full_elems,
+            "conv1d weight too small: {} < {}",
+            conv_data_full.len(),
+            conv_full_elems,
+        );
+        let mut conv_local = Vec::<f32>::with_capacity(conv_dim * conv_kernel_size);
+        let mut src_row_offset = 0usize;
+        for block_rows in [key_dim_full, key_dim_full, value_dim_full] {
+            let per_rank_rows = block_rows / tp_size;
+            let rank_row_start = src_row_offset + tp_rank * per_rank_rows;
+            let start = rank_row_start * conv_kernel_size;
+            let end = start + per_rank_rows * conv_kernel_size;
+            conv_local.extend_from_slice(&conv_data_full[start..end]);
+            src_row_offset += block_rows;
+        }
+        let conv1d_weight =
+            unsafe { Self::upload_f32(&conv_local, &[conv_dim, conv_kernel_size], stream)? };
+
+        // A_log, dt_bias: `[num_v_heads]` sharded dim 0.
+        let a_log_full = gw.take_to_cpu_f32(&format!("{prefix}.A_log"))?;
+        anyhow::ensure!(
+            a_log_full.len() >= num_v_heads_full,
+            "A_log too small: {} < {}",
+            a_log_full.len(),
+            num_v_heads_full,
+        );
+        let a_log_start = tp_rank * num_v_heads;
+        let a_log =
+            unsafe { Self::upload_f32(&a_log_full[a_log_start..a_log_start + num_v_heads], &[num_v_heads], stream)? };
+
+        let dt_bias_full = gw.take_to_cpu_f32(&format!("{prefix}.dt_bias"))?;
+        anyhow::ensure!(
+            dt_bias_full.len() >= num_v_heads_full,
+            "dt_bias too small: {} < {}",
+            dt_bias_full.len(),
+            num_v_heads_full,
+        );
+        let dt_bias_start = tp_rank * num_v_heads;
+        let dt_bias = unsafe {
+            Self::upload_f32(
+                &dt_bias_full[dt_bias_start..dt_bias_start + num_v_heads],
+                &[num_v_heads],
+                stream,
+            )?
+        };
+
+        // norm.weight: `[head_v_dim]` — replicated (per-head RMSNorm).
+        let norm_data = gw.take_to_cpu_f32(&format!("{prefix}.norm.weight"))?;
+        let norm_weight = unsafe { Self::upload_f32(&norm_data, &[norm_data.len()], stream)? };
+
+        // out_proj: row-parallel (dim 1 of `[hidden, value_dim]`).
+        let out_proj =
+            Linear::load_sharded(gw, &format!("{prefix}.out_proj"), 1, tp_rank, tp_size)?;
+        let model_dtype = out_proj.weight.dtype();
+
+        Ok(Self {
+            in_proj_qkvz,
+            in_proj_ba,
+            conv1d_weight,
+            a_log,
+            dt_bias,
+            norm_weight,
+            out_proj,
+            norm_eps: rms_norm_eps,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_dim,
+            conv_kernel_size,
+            gdn_layer_idx,
+            model_dtype,
+        })
+    }
+
     /// GDN forward pass — returns `[T, hidden]` in `model_dtype`.
     ///
     /// Pipeline:

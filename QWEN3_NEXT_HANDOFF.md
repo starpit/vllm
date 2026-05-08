@@ -654,3 +654,145 @@ Source-of-truth pointers (for quick reference):
   `DeepSeekV2Fp8BlockMoELayer::load` in
   `ferrite-kernels/src/layers_moe.rs` (note: still NOT tp-aware —
   this gap is cross-arch, not Qwen3-Next-specific).
+
+## 2026-05-08 — Phase 7c: TP-shard gated-attention + GDN + pre-existing FP8 attention blocker
+
+Goal: make the Phase 7b model (`unsloth/Qwen3-Coder-Next-FP8-Dynamic`) at
+TP=2 on nick3 return coherent output. Partial — landed the TP-sharding
+as designed, but surfaced a pre-existing FP8-attention-weight handling
+gap that is still the forward blocker. Model loads and serves; first
+`/v1/completions` request still crashes, now traced to `Qwen3NextGatedAttentionLayer`
+loading FP8 `q_proj` / `k_proj` / `v_proj` / `o_proj` via `Linear`
+(BF16 cublas GEMM) when the on-disk dtype is `float8_e4m3fn`.
+
+Landed (Phase 7c proper):
+
+1. **`Qwen3NextGatedAttentionLayer::load_sharded`.** New method on
+   `layers_attn_gated.rs` that:
+   - Calls `gw.synthesize_packed_row_split_sizes(...qkv_proj, &[("q_proj", q_size_full), ("k_proj", kv_size_full), ("v_proj", kv_size_full)])`
+     so the fused-parent case (`qkv_proj.weight` present) carves
+     virtual children that re-use the packed-source fallback already
+     in `Linear::load`. No-op when the checkpoint ships separate
+     `q/k/v_proj` (the unsloth checkpoint's case).
+   - Allocates a per-rank packed `[q_size + 2*kv_size, hidden]` buffer
+     using `elem = q_dtype.size_bytes()` (the **on-disk** dtype — not
+     `post_dtype`, since `take_shard_into` copies raw bytes for FP8
+     and would half-fill a BF16-sized buffer, which is the bug I hit
+     on the first run and fixed).
+   - `o_proj`: `Linear::load_sharded(dim=1, tp_rank, tp_size)` — row-
+     parallel with bias on rank 0 only.
+   - `q_norm` / `k_norm`: `[head_dim]` vectors kept replicated (per-head
+     Gemma-style RMSNorm weight, `+1` baked in at load).
+   - Stores per-rank `num_q_heads = num_q_heads_full / tp_size` and
+     `num_kv_heads = num_kv_heads_full / tp_size` in the struct so
+     the existing `forward()` splits Q/K/V with the sharded head
+     counts without any forward-side rework.
+
+2. **`Qwen3NextGdnLayer::load_sharded`.** New method on
+   `layers_gdn.rs`:
+   - `in_proj_qkvz.weight` is a **single per-head grouped** block
+     (`[num_k_heads, 2*head_k + 2*v_per_k*head_v]` contiguous per
+     group). Python's `MergedColumnParallelLinear(output_sizes=[sum(...)])`
+     with one output size is effectively `ColumnParallelLinear`; a
+     simple `take_shard(dim=0, rank, tp_size)` gives each rank whole
+     head groups because `num_k_heads % tp_size == 0`. First draft
+     mistakenly did a 4-block synthesize + pack; kernel expects the
+     grouped layout and the 4-block version reordered rows — reverted.
+   - `in_proj_ba.weight` similarly stays as a simple dim=0 shard
+     (`[num_k_heads, 2*v_per_k]` grouped; same divisibility argument).
+   - `conv1d.weight` has **block layout** `[key_dim, key_dim, value_dim]`
+     along dim 0 (Python's `mamba_v2_sharded_weight_loader`). Manual
+     3-block shard on CPU f32 then upload per-rank.
+   - `A_log` / `dt_bias`: sharded dim 0 (`[num_v_heads]` → per-rank slice).
+   - `norm.weight`: replicated (per-head RMSNorm).
+   - `out_proj`: `Linear::load_sharded(dim=1, tp_rank, tp_size)`.
+
+3. **`GdnStatePool` per-rank sizing.** `make_gdn_state_pool`
+   (`vllm-cuda/src/model/qwen3_next.rs`) gained `tp_size`; shards
+   `conv_dim` and `num_v_heads` by tp. `head_v_dim` / `head_k_dim`
+   stay replicated (heads are the shard unit). `cuda_worker.rs`
+   passes `self.config.tp_world_size` to the call. This keeps the
+   per-slot ssm and conv state layouts consistent with the per-rank
+   `Qwen3NextGdnLayer`'s head counts.
+
+4. **FieldLoad emit arms.** `FieldLoad::GdnAttention` and
+   `FieldLoad::GatedAttention` in both `emit_unindexed_let` and
+   `emit_layered_load_body` now branch on `sharded = tp_world_size > 1`:
+   at tp>1 they call `load_sharded(..., tp_rank, tp_world_lit)`; at
+   tp=1 the original unsharded call is byte-identical.
+
+5. **Instruction eval AllReduces.** `Instruction::GdnAttention` and
+   `Instruction::GatedAttention` gained a `#[cfg(feature = "nccl")]
+   if let Some(group) = ctx.fwd.tp_group { group.all_reduce_inplace_promote(...) }`
+   block right after `w.forward(...)`, following the
+   `Instruction::Fp8SharedFusedMoe` precedent. Both layers are
+   row-parallel-on-output (`o_proj` for attention,
+   `out_proj` for GDN) so the hidden output is a per-rank partial
+   sum that must be all-reduced before the residual add.
+
+Reproducer state on nick3 (`/home/nickm/qwen3-next-fresh/vllm-rs`):
+
+```
+./target/release/vllm serve unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+  --device cuda --tensor-parallel-size 2 \
+  --max-model-len 256 --gpu-memory-utilization 0.85
+# → "Stack initialized with TP=2 in 23.2s" (was 23.5s in Phase 7b)
+# → Memory estimate: total=44.4 GiB, weights+overhead=40.1 GiB (was 41.3 GiB in Phase 7b — small win from GDN+attn shard)
+# → server binds, routes register
+# First request: CUDA_ERROR_ILLEGAL_ADDRESS in FA2 at layer 3, same crash as Phase 7b
+```
+
+The FA2 crash at layer 3 traces back to a pre-existing issue **not**
+addressed by TP-sharding: `Qwen3NextGatedAttentionLayer` routes
+`qkv_proj` and `o_proj` through the dense `Linear` type, whose forward
+is a BF16 cublas GEMM. On this checkpoint those four weights are
+`float8_e4m3fn` with per-channel BF16 `weight_scale` (verified via
+safetensors inspection of `model.layers.3.self_attn.{q,k,v,o}_proj.weight`
+and `.weight_scale`). The `Linear` loader copies raw FP8 bytes into
+a buffer and then wraps it as `GpuTensor::new(ptr, [rows, hidden], BF16)` —
+the bytes are FP8 but the claimed dtype is BF16, so cublas reads
+interleaved FP8 pairs as garbage BF16 values. The matmul doesn't
+OOB (byte count matches), but the garbage Q/K/V propagates into the
+paged K cache and eventually trips FA2's indirect indexing into an
+invalid address. Same behavior at tp=1 and tp=2 — TP-sharding doesn't
+interact with this, it's orthogonal.
+
+Next-session entry point (Phase 7d, on nick3):
+
+1. **Teach `Qwen3NextGatedAttentionLayer` to consume FP8 weights.**
+   Two viable paths:
+   - (a) Swap `Linear` for `Fp8AnyLinear` so FP8 weights go through
+     the existing per-channel `Fp8Linear::forward` path, matching
+     the MoE side. Needs a new fused-QKV Fp8 helper (Fp8Linear has
+     `load_concat_sharded` for gate_up; we'd reuse the pattern for
+     `[q_proj, k_proj, v_proj]`). `o_proj` is a single prefix — use
+     `Fp8Linear::load_sharded(dim=1)` directly.
+   - (b) Dequantize FP8 → BF16 at load time. Adds a one-shot kernel
+     (`fp8_dequant_to_bf16(weight_fp8, weight_scale, dst_bf16)`), keeps
+     `Linear::forward` unchanged. Cheaper code delta; memory cost
+     is 2× the attention FP8 bytes per rank (minor — attention is
+     ~1 GB of the ~40 GB per-rank footprint).
+   Recommend (a) for parity with the MoE path and the Python
+   reference, but (b) is a faster unblock if (a) proves too invasive.
+
+2. **Layer-47 full-attention stays in the BF16 `ignore` list.** Once
+   (1) lands, the existing `Linear`-based path is still the right
+   choice for that single layer. Thread a per-layer
+   `Fp8 vs Dense` picker through `FieldLoad::GatedAttention` — same
+   shape as the `Fp8SharedFusedMoE` vs `SharedFusedMoE` split that
+   Phase 7b landed for the MoE side (fingerprint-driven multi-layer
+   probe).
+
+3. **Re-run the reproducer.** `def fibonacci(n):` → coherent Python
+   on TP=2.
+
+Source-of-truth pointers:
+- Python FP8 attention: `QKVParallelLinear(..., quant_config=quant_config)`
+  in `vllm/model_executor/models/qwen3_next.py::Qwen3NextAttention.__init__`;
+  dispatches to `CompressedTensorsW8A8Fp8.apply` for per-channel FP8.
+- Existing Rust FP8 precedent (MoE): `Fp8Linear::load_concat_sharded`
+  and `Fp8SharedFusedMoELayer` in `ferrite-kernels/src/layers_{quant,moe}.rs`.
+- Pre-existing buffer sizing gotcha: `Qwen3NextGatedAttentionLayer::load`
+  already had the FP8-vs-BF16 elem-size mismatch; `load_sharded`
+  mirrors the same convention (`elem = q_dtype.size_bytes()`) so the
+  fix in (1) lands once and covers both paths.

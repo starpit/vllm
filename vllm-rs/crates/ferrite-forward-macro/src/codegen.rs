@@ -3466,19 +3466,38 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let conv_kernel_size = *conv_kernel_size;
             let rms_norm_eps = *rms_norm_eps;
             let gdn_layer_idx = *gdn_layer_idx;
-            quote! {
-                let #name = ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load(
-                    gw,
-                    #prefix,
-                    #num_k_heads,
-                    #num_v_heads,
-                    #head_k_dim,
-                    #head_v_dim,
-                    #conv_kernel_size,
-                    #rms_norm_eps,
-                    #gdn_layer_idx,
-                    stream,
-                )?;
+            if sharded {
+                quote! {
+                    let #name = ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load_sharded(
+                        gw,
+                        #prefix,
+                        #num_k_heads,
+                        #num_v_heads,
+                        #head_k_dim,
+                        #head_v_dim,
+                        #conv_kernel_size,
+                        #rms_norm_eps,
+                        #gdn_layer_idx,
+                        tp_rank as usize,
+                        #tp_world_lit as usize,
+                        stream,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load(
+                        gw,
+                        #prefix,
+                        #num_k_heads,
+                        #num_v_heads,
+                        #head_k_dim,
+                        #head_v_dim,
+                        #conv_kernel_size,
+                        #rms_norm_eps,
+                        #gdn_layer_idx,
+                        stream,
+                    )?;
+                }
             }
         }
         FieldLoad::GatedAttention {
@@ -3494,17 +3513,34 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let head_dim = *head_dim;
             let rms_norm_eps = *rms_norm_eps;
             let attn_output_gate = *attn_output_gate;
-            quote! {
-                let #name = ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer::load(
-                    gw,
-                    #prefix,
-                    #num_q_heads,
-                    #num_kv_heads,
-                    #head_dim,
-                    #rms_norm_eps,
-                    #attn_output_gate,
-                    stream,
-                )?;
+            if sharded {
+                quote! {
+                    let #name = ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer::load_sharded(
+                        gw,
+                        #prefix,
+                        #num_q_heads,
+                        #num_kv_heads,
+                        #head_dim,
+                        #rms_norm_eps,
+                        #attn_output_gate,
+                        tp_rank as usize,
+                        #tp_world_lit as usize,
+                        stream,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer::load(
+                        gw,
+                        #prefix,
+                        #num_q_heads,
+                        #num_kv_heads,
+                        #head_dim,
+                        #rms_norm_eps,
+                        #attn_output_gate,
+                        stream,
+                    )?;
+                }
             }
         }
     }
@@ -4066,23 +4102,46 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
             let head_v_dim = *head_v_dim;
             let conv_kernel_size = *conv_kernel_size;
             let rms_norm_eps = *rms_norm_eps;
-            quote! {
-                (0u32..#n_lit)
-                    .map(|layer: u32| -> ::anyhow::Result<_> {
-                        ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load(
-                            gw,
-                            &#p,
-                            #num_k_heads,
-                            #num_v_heads,
-                            #head_k_dim,
-                            #head_v_dim,
-                            #conv_kernel_size,
-                            #rms_norm_eps,
-                            layer as usize,
-                            stream,
-                        )
-                    })
-                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            if sharded {
+                quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load_sharded(
+                                gw,
+                                &#p,
+                                #num_k_heads,
+                                #num_v_heads,
+                                #head_k_dim,
+                                #head_v_dim,
+                                #conv_kernel_size,
+                                #rms_norm_eps,
+                                layer as usize,
+                                tp_rank as usize,
+                                #tp_world_lit as usize,
+                                stream,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                }
+            } else {
+                quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            ::ferrite_kernels::layers_gdn::Qwen3NextGdnLayer::load(
+                                gw,
+                                &#p,
+                                #num_k_heads,
+                                #num_v_heads,
+                                #head_k_dim,
+                                #head_v_dim,
+                                #conv_kernel_size,
+                                #rms_norm_eps,
+                                layer as usize,
+                                stream,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                }
             }
         }
         // Qwen3-Next's `attn[layer]` accessor is also sparse (hybrid),
@@ -4102,6 +4161,27 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
             let head_dim = *head_dim;
             let rms_norm_eps = *rms_norm_eps;
             let attn_output_gate = *attn_output_gate;
+            if sharded {
+                return quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            let _ = layer;
+                            ::ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer::load_sharded(
+                                gw,
+                                &#p,
+                                #num_q_heads,
+                                #num_kv_heads,
+                                #head_dim,
+                                #rms_norm_eps,
+                                #attn_output_gate,
+                                tp_rank as usize,
+                                #tp_world_lit as usize,
+                                stream,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                };
+            }
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {

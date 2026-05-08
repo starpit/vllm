@@ -182,6 +182,13 @@ pub use ferrite_kernels::layers_gdn::GdnStatePool;
 /// in `layer_types`, then forwards to
 /// [`GdnStatePool::new`](ferrite_kernels::layers_gdn::GdnStatePool::new).
 ///
+/// `tp_size` shards the per-rank pool: `conv_dim` and `num_v_heads`
+/// both shard by `tp_size` (mirrors `Qwen3NextGdnLayer::load_sharded`
+/// which shards `key_dim` and `value_dim` along dim 0 of every
+/// projection). `head_v_dim` / `head_k_dim` stay replicated because
+/// heads are the shard unit — each rank owns `num_v_heads / tp`
+/// whole heads, each still `head_v_dim` × `head_k_dim` bytes.
+///
 /// # Safety
 /// Same safety contract as the underlying constructor — `stream`
 /// must be a valid CUDA stream; the returned pool owns device
@@ -189,6 +196,7 @@ pub use ferrite_kernels::layers_gdn::GdnStatePool;
 pub unsafe fn make_gdn_state_pool(
     config: &Qwen3NextConfig,
     num_slots: usize,
+    tp_size: usize,
     stream: cudarc::driver::sys::CUstream,
 ) -> Result<GdnStatePool> {
     let num_gdn_layers = config
@@ -196,12 +204,28 @@ pub unsafe fn make_gdn_state_pool(
         .iter()
         .filter(|t| t.as_str() == "linear_attention")
         .count();
+    let tp = tp_size.max(1);
+    anyhow::ensure!(
+        config.linear_num_value_heads.is_multiple_of(tp),
+        "make_gdn_state_pool: linear_num_value_heads ({}) not divisible by tp_size ({tp})",
+        config.linear_num_value_heads,
+    );
+    anyhow::ensure!(
+        config.linear_num_key_heads.is_multiple_of(tp),
+        "make_gdn_state_pool: linear_num_key_heads ({}) not divisible by tp_size ({tp})",
+        config.linear_num_key_heads,
+    );
+    let conv_dim_full = config.conv_dim();
+    anyhow::ensure!(
+        conv_dim_full.is_multiple_of(tp),
+        "make_gdn_state_pool: conv_dim ({conv_dim_full}) not divisible by tp_size ({tp})",
+    );
     GdnStatePool::new(
         num_slots,
         num_gdn_layers,
-        config.conv_dim(),
+        conv_dim_full / tp,
         config.linear_conv_kernel_dim,
-        config.linear_num_value_heads,
+        config.linear_num_value_heads / tp,
         config.linear_value_head_dim,
         config.linear_key_head_dim,
         stream,

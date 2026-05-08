@@ -819,22 +819,58 @@ variant's compile-time `layer` literal at every weight-binding /
 KV-cache-binding site. Loop body iters pass `iter as u32`;
 straight-line code passes `0`.
 
-#### Open: bug #3 — wrong token still ❌
+#### Bug 3 — MPS Gemm offset hardcoded to 0 ✅ FIXED (`99520f26a`)
 
-Even with bugs #1 and #2 fixed, `vllm chat ... --device metal --quick "hi"`
-samples token 24272 (`" Syst"`) instead of a real response, and
-decode keeps re-sampling 24272. Per-step dump looks healthy
-(residual stream grows monotonically, rows distinct, magnitudes
-sensible through layer 21). Logits at lm_head are row-distinct but
-small magnitude. Suspect list:
-- RoPE math (cos_sin loading or per-pair rotation)
-- Some kernel arithmetic at M=64
-- Weight-loading dtype (bf16-on-disk → fp16 cast)
-- `tie_word_embeddings` handling for `lm_head.weight`
+`encode_gemm_into_command_buffer` ignored the per-binding offset
+and hardcoded `MPSMatrix.initWithBuffer:offset:` to `0u64` for
+`a` / `b` / `c`. The arena allocator packs many tensors into one
+shared `MTLBuffer` and surfaces them as `(buffer, offset)` pairs;
+zeroing the offset pointed every per-layer linear projection
+(Q / K / V / O / down / lm_head) at offset 0 of whichever buffer
+it landed in. This silently undid bug #2's fix at the Gemm side —
+the lowering correctly threaded `layer_offset` into the binding,
+the worker correctly resolved `(buffer, layer-N-offset)` from
+`MetalAllocator::buffer_for(ptr)`, and then MPS dropped the
+offset.
 
-Next session: add per-step rmsnorm + RoPE goldens at runtime
-conditions, or compare residual stream snapshots against a
-PyTorch reference.
+Caught by extending `FERRITE_METAL_BAKE_DEBUG=1` to dump
+`BucketStep::Gemm`'s `(buf, off)` tuples for a / b / c (commit
+`c9beb1577`). The dump showed `b=(buf=…, off=92278784)` for
+layer 0's K-Gemm vs MPS reading offset 0 — the bug fell out
+immediately.
+
+Fix: add `a_offset` / `b_offset` / `c_offset` parameters to
+`encode_gemm_into_command_buffer`, plumb them into MPSMatrix's
+`initWithBuffer:offset:descriptor:`, update bounds checks. Three
+worker call sites pass `BoundBuffer::offset` from the bound vec.
+
+#### Status after fix #3
+
+For "hi" prompt: prefill samples token 29966 (`<`). Generation:
+`<assistant>\n\n\n\n\n_\n<||}`. Different prompt → different
+output, so the residual stream is now genuinely a function of
+the input (verified across "hi" / "What is the capital of France?"
+/ "What is 1+1?"). Logits look healthy: -11..+16 range, all
+32000 columns non-zero, distinct per row.
+
+But the model still doesn't produce real responses — output is
+chat-template-like text that loops on tokens like `<assistant>`
+and newlines. At least one more bug, likely in attention, RoPE,
+or kernel arithmetic.
+
+#### Open: bug #4 — model loops on chat-template tokens ❌
+
+Suspect list (ordered by likelihood):
+- **Attention**: RoPE pair rotation, causal mask handling, softmax
+  numerics. The prefill kernel has a 2-sequence M=16 golden; add
+  M=64 single-sequence test matching the runtime cu_seqlens_q.
+- **Compare against PyTorch reference**: Run `transformers` on
+  the same prompt, capture residual stream after layer 0 / 5 / 21
+  and the lm_head input. Diff against the metal per-step dump.
+  First divergence pinpoints the bug.
+- **Decode-loop check**: even if prefill is mostly right, decode
+  uses `AttentionViaCache` which might mishandle stale KV.
+  `--max-tokens 1` isolates prefill output.
 
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
@@ -843,9 +879,9 @@ PyTorch reference.
 - Phase 5.F.3 + 5.F (residual) + 5.G + 5.6: 🔜 PLANNED - Per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
 - Phase 5.H: ⚠️ PARTIAL - simdgroup_matrix fused MLP landed; M4+ MPP variant + larger-tile tuning still TODO
 - Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch); lm_head logits all-zero (root cause = somewhere across the 22-layer chain, TBD)
-- Phase 5.J: ⚠️ IN PROGRESS - two lowering bugs fixed (RmsNorm slot swap + loop layer_offset). Model produces row-distinct, per-layer-weighted output but argmax still wrong. Bug #3 TBD.
+- Phase 5.J: ⚠️ IN PROGRESS - three bugs fixed (RmsNorm slot swap + loop layer_offset + MPS Gemm offset). Model output is now input-dependent. Bug #4 (still wrong tokens, loops on chat-template-like text) TBD.
 - 78 Phase 1-4 tests + 56 ferrite-forward metal lib tests passing
 - `cargo build --bin vllm -Fmetal` ✓ on darwin
-- `vllm chat ... --device metal` runs end-to-end, produces row-distinct but wrong-token output
+- `vllm chat ... --device metal` runs end-to-end, produces input-dependent but still-wrong text
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land
 - Multi-Q-token attention kernels are correctness-first reference impls; FlashAttention-style blocking + perf tuning is Phase 5.6 work

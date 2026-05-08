@@ -1661,9 +1661,17 @@ mod tests {
     /// against `cpu_golden::fused_add_rmsnorm`. Verifies the in-place
     /// `residual += delta` step lands in buffer(0) and the
     /// `rmsnorm(residual_after_add, weight)` lands in buffer(1).
+    /// Runs at M=4 (small smoke) AND M=64 (TinyLlama prefill bucket).
     #[cfg(target_os = "macos")]
     #[test]
     fn fused_add_rmsnorm_matches_cpu_golden() {
+        for m in [64usize, 4usize] {
+            run_fused_add_rmsnorm_check(m);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_fused_add_rmsnorm_check(m: usize) {
         use crate::cpu_golden;
         use ferrite_metal_kernels::metal::MTLSize;
 
@@ -1681,7 +1689,6 @@ mod tests {
             .expect("compile standard shaders");
         let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
 
-        let m: usize = 4;
         let hidden = TinyLlamaProbe::Q_SIZE;
         let pipeline = pipelines
             .pipeline_for::<TinyLlamaProbe>(KernelId::FusedAddRmsNorm, m as u32)

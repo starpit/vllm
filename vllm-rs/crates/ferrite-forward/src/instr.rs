@@ -1619,6 +1619,23 @@ impl<W: CanonicalParams> Instruction<W> {
                 dump::dump_tile("moe.in", layer, &v, ctx.device.compute_stream);
                 let w = (weight_fn)(ctx.wm, layer);
                 let out = w.forward(v, ctx.device);
+                // TP sync point. `Fp8SharedFusedMoELayer::load` shards the
+                // routed experts' intermediate dim and the shared expert
+                // (column-parallel gate/up + row-parallel down), so the
+                // layer's output is a per-rank partial sum that must be
+                // all-reduced before re-entering the residual stream.
+                // Single all-reduce covers both the routed MoE and the
+                // sigmoid-gated shared contribution (`sigmoid(gate)` is
+                // replicated, preserving partial-sum structure).
+                #[cfg(feature = "nccl")]
+                if let Some(group) = ctx.fwd.tp_group {
+                    group
+                        .all_reduce_inplace_promote(
+                            out.as_gpu_tensor(),
+                            &mut ctx.device.caching,
+                        )
+                        .expect("Fp8SharedFusedMoe all_reduce failed");
+                }
                 dump::dump_tile(
                     "moe.out",
                     layer,

@@ -541,3 +541,116 @@ Source-of-truth pointers (for quick reference):
   `DeepSeekV2Fp8BlockMoELayer::load` in
   `ferrite-kernels/src/layers_moe.rs` (note: still NOT tp-aware —
   this gap is cross-arch, not Qwen3-Next-specific).
+
+## 2026-05-07 — Phase 7b: MoE TP-shard + FP8 Linear TP-shard + fingerprint + layer-47 BF16 fallback — model serves on TP=2, forward still red
+
+Goal of this session: make `unsloth/Qwen3-Coder-Next-FP8-Dynamic`
+load on `nick3` (2×L40S 46 GB each) at `--tensor-parallel-size 2`.
+Achieved — the model now loads in 23.5 s, binds 0.0.0.0:8000, and
+all routes register. Forward still fails on the first request
+(illegal memory access in FA2) because Qwen3Next's gated-attention
+and GDN layers are not yet TP-sharded; that's Phase 7c.
+
+Landed:
+
+1. **`Fp8SharedFusedMoELayer::load` gained `tp_rank` / `tp_size`
+   params.** Intermediate-dim TP matching Python vLLM's
+   `_load_w13` (dim 0) / `_load_w2` (dim 1) per expert. Per-channel
+   `w1` scale shards along dim 0; per-channel `w2` scale stays
+   replicated (indexes the unsharded hidden output). Block-mode
+   sharding asserts `inter_full % (tp_size × block_{n,k})`. Router
+   gate and `shared_expert_gate` stay replicated. Shared expert
+   `gate_proj+up_proj` column-parallel via new
+   `Fp8Linear::load_concat_sharded`; `down_proj` row-parallel via
+   new `Fp8Linear::load_sharded` (dim 1). The DSL interpreter
+   (`Instruction::Fp8SharedFusedMoe`) performs one post-combine
+   all-reduce using `ForwardCtx::tp_group`, covering both the
+   routed partial and the sigmoid-gated shared partial
+   (replicated sigmoid preserves partial-sum structure).
+
+2. **Fingerprint sniff upgraded to a multi-layer scan.** The
+   original `fp8_marker_tensor = "model.layers.0.{fp_leaf}.weight_scale"`
+   misses on Qwen3-Next because layer 0 is GDN (no `self_attn.q_proj`),
+   and `last_layer = 47` misses on the unsloth checkpoint because
+   layer 47 is on the `ignore` list (dense BF16, no weight_scale).
+   Same story for the positive `last_tensor` existence check —
+   `weight_scale` at layer 47 isn't there either. The fix scans
+   `{0, n/4-1, n/2, 3n/4, n-1}` and accepts/rejects on any hit.
+   Without this, both the BF16 and FP8 variants either missed or
+   matched ambiguously, and the dispatcher picked the BF16
+   `SharedFusedMoELayer::load` (which blows through 78 GB per
+   rank). (Cross-arch change — pinned by `cargo build` across all
+   existing arches; no new test failures spotted in the variant
+   discovery output.)
+
+3. **Layer-47 BF16 fallback.** `Fp8SharedFusedMoELayer::load`
+   probes expert-0 dtype BEFORE consuming the router gate; if
+   it's BF16, delegates to the new
+   `SharedFusedMoELayer::load_sharded` (also intermediate-dim TP)
+   and parks a dummy `Fp8BlockFusedMoELayer` (via `::dummy()`) in
+   the outer struct's `moe` field. Forward path checks
+   `self.bf16_fallback` first; when `Some`, delegates entirely to
+   the BF16 peer. The instruction arm's all-reduce still closes
+   the loop because the BF16 peer is also sharded — both paths
+   produce per-rank partial sums.
+
+4. **FP8 Linear TP-sharding.** `FieldLoad::Fp8Linear` emit arms
+   (both `emit_unindexed_let` and `emit_layered_load_body`) now
+   thread `tp_rank` / `tp_world_size`, routing to new
+   `Fp8Linear::load_sharded` (single prefix, per-dim) and
+   `Fp8Linear::load_concat_sharded` (column-parallel fused) plus
+   two `ferrite-forward::load_layered_fp8_linear_sharded` /
+   `_concat_sharded` helpers. Applies to every compiled FP8
+   variant, not just Qwen3-Next; at tp=1 the short-circuits yield
+   byte-equivalent behavior.
+
+Reproducer state on nick3
+(`/home/nickm/qwen3-next-fresh/vllm-rs`):
+
+```
+./target/release/vllm serve unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+  --device cuda --tensor-parallel-size 2 \
+  --max-model-len 256 --gpu-memory-utilization 0.9
+# → "Stack initialized with TP=2 in 23.5s"
+# → "vLLM Rust server listening on http://0.0.0.0:8000"
+# Memory: per-rank total=44.4 GiB, weights+overhead=41.3 GiB,
+# est_activations=512 MiB, num_gpu_blocks=16.
+```
+
+First request crashes with
+`CUDA error at third_party/vllm-flash-attn/src/flash_fwd_launch_template.h:84: an illegal memory access was encountered`.
+Cause (unverified but strongly-inferred): the MoE path is now
+TP-sharded end-to-end, but Qwen3-Next's `Qwen3NextGatedAttentionLayer`
+and `Qwen3NextGdnLayer` still load full unsharded weights — the
+AllReduce the tp-lowering pass inserts after `o_proj` then sums
+replicated partials across ranks, producing doubled attn output
+that doesn't match the FA2 kernel's assumed shapes.
+
+Next-session entry point (Phase 7c, on nick3):
+
+1. **TP-shard `Qwen3NextGatedAttentionLayer::load`** — the QKV is
+   a fused `[q_size + 2*kv_size, hidden]` projection
+   (`q_size = 2*true_q_size` with `attn_output_gate`). Column-
+   parallel on dim 0 of qkv_proj, row-parallel on dim 1 of o_proj.
+   Per-head `q_norm` / `k_norm` are `[head_dim]` vectors and
+   replicated. Thread `tp_rank`/`tp_size` through
+   `FieldLoad::GatedAttention` emit arm + the layer's forward so
+   `num_q_heads` becomes `num_q_heads / tp_size` at runtime.
+
+2. **TP-shard `Qwen3NextGdnLayer::load`** —
+   `in_proj_qkvz` / `in_proj_ba` / `out_proj` / `conv1d`. Per-head
+   sharding mirrors the full-attn head split. Note the GDN
+   recurrent state (`GdnStatePool`) is already per-slot; the only
+   TP-adjacent concern is that `num_v_heads` / `num_k_heads` shard
+   by tp.
+
+3. **Re-run the reproducer**; confirm `/v1/completions` returns
+   coherent Python from the `def fibonacci(n):` prompt.
+
+Source-of-truth pointers (for quick reference):
+- Python: `vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe.py`
+  — `CompressedTensorsW8A8Fp8MoEMethod` (per-channel apply path)
+- DeepSeek TP-sharded FP8 load precedent:
+  `DeepSeekV2Fp8BlockMoELayer::load` in
+  `ferrite-kernels/src/layers_moe.rs` (note: still NOT tp-aware —
+  this gap is cross-arch, not Qwen3-Next-specific).

@@ -34,6 +34,7 @@ pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,
     load_layered_embedding_sharded, load_layered_fp8_block_linear,
     load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
+    load_layered_fp8_linear_concat_sharded, load_layered_fp8_linear_sharded,
     load_layered_layer_norm, load_layered_linear_dense, load_layered_linear_dense_concat,
     load_layered_linear_dense_concat_sharded, load_layered_linear_dense_sharded,
     load_layered_marlin_linear, load_layered_marlin_linear_concat, load_layered_rms_norm,

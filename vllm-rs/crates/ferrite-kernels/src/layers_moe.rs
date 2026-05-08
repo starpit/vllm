@@ -498,6 +498,193 @@ impl SharedFusedMoELayer {
         })
     }
 
+    /// Tensor-parallel sharded BF16 load — intermediate-dim sharded, same
+    /// scheme as [`Fp8SharedFusedMoELayer::load`] at tp>1. Only called by
+    /// `Fp8SharedFusedMoELayer::load`'s BF16 fallback path when the
+    /// checkpoint's `ignore` list ships an MoE layer dense BF16 inside an
+    /// otherwise FP8 model (the unsloth/Qwen3-Coder-Next-FP8-Dynamic
+    /// layer-47 case). `world == 1` yields per-rank dims equal to full.
+    ///
+    /// After load, the forward path produces per-rank partial sums; the
+    /// instruction arm's post-forward all-reduce (via `ForwardCtx::tp_group`)
+    /// closes them. `moe.tp_group` is left `None` — the outer all-reduce
+    /// is the single TP sync point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_sharded(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+        tp_rank: usize,
+        tp_size: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        use ferrite_cuda_core::driver;
+
+        anyhow::ensure!(
+            tp_size >= 1 && tp_rank < tp_size,
+            "SharedFusedMoELayer::load_sharded: invalid (tp_rank={tp_rank}, tp_size={tp_size})"
+        );
+        let inter_full = moe_intermediate_size;
+        anyhow::ensure!(
+            inter_full.is_multiple_of(tp_size),
+            "SharedFusedMoELayer::load_sharded: moe_intermediate_size={inter_full} not divisible by tp_size={tp_size}"
+        );
+        let inter = inter_full / tp_size;
+        let sharded = tp_size > 1;
+
+        let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
+
+        let first_gate = format!("{prefix}.experts.0.gate_proj.weight");
+        let (_, disk_dtype) = gw
+            .tensor_info(&first_gate)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
+        let dtype = gw.target_dtype().unwrap_or(disk_dtype);
+        let elem = dtype.size_bytes();
+
+        let w1_bytes = num_experts * 2 * inter * hidden_size * elem;
+        let w2_bytes = num_experts * hidden_size * inter * elem;
+        let w1_ptr = unsafe { driver::mem_alloc(w1_bytes)? };
+        let w2_ptr = unsafe { driver::mem_alloc(w2_bytes)? };
+
+        let gate_proj_bytes = inter * hidden_size * elem;
+        for e in 0..num_experts {
+            let gate_name = format!("{prefix}.experts.{e}.gate_proj.weight");
+            let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
+            let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
+            let expert_w1_off = e * 2 * inter * hidden_size * elem;
+            let expert_w2_off = e * hidden_size * inter * elem;
+            if sharded {
+                unsafe {
+                    gw.take_shard_into(&gate_name, 0, tp_rank, tp_size, w1_ptr.add(expert_w1_off), stream)?;
+                    gw.take_shard_into(
+                        &up_name,
+                        0,
+                        tp_rank,
+                        tp_size,
+                        w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                        stream,
+                    )?;
+                    gw.take_shard_into(&down_name, 1, tp_rank, tp_size, w2_ptr.add(expert_w2_off), stream)?;
+                }
+            } else {
+                unsafe {
+                    gw.take_into(&gate_name, w1_ptr.add(expert_w1_off), stream)?;
+                    gw.take_into(&up_name, w1_ptr.add(expert_w1_off + gate_proj_bytes), stream)?;
+                    gw.take_into(&down_name, w2_ptr.add(expert_w2_off), stream)?;
+                }
+            }
+        }
+
+        let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden_size], dtype) };
+        let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden_size, inter], dtype) };
+
+        let moe = FusedMoELayer {
+            gate,
+            w1,
+            w2,
+            num_experts,
+            top_k,
+            intermediate_size: inter,
+            hidden_size,
+            renormalize: true,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        };
+
+        // Shared expert: column-parallel gate_up (sharded dim 0), row-parallel
+        // down (sharded dim 1). gate_up is a simple dense `Linear`; pack the
+        // per-rank gate and up slices back-to-back into one `[2*shared_inter/tp, hidden]`
+        // buffer — same layout as the unsharded path, just with per-rank rows.
+        let shared_inter_per_rank = if shared_expert_intermediate_size > 0 {
+            anyhow::ensure!(
+                shared_expert_intermediate_size.is_multiple_of(tp_size),
+                "SharedFusedMoELayer::load_sharded: shared_expert_intermediate_size={shared_expert_intermediate_size} \
+                 not divisible by tp_size={tp_size}"
+            );
+            shared_expert_intermediate_size / tp_size
+        } else {
+            0
+        };
+        let (shared_gate_up, shared_down, shared_expert_gate) = if shared_expert_intermediate_size > 0 {
+            let shared_gate_proj_bytes = shared_inter_per_rank * hidden_size * elem;
+            let shared_total = 2 * shared_gate_proj_bytes;
+            let ptr = unsafe { driver::mem_alloc(shared_total)? };
+            unsafe {
+                if sharded {
+                    gw.take_shard_into(
+                        &format!("{prefix}.shared_expert.gate_proj.weight"),
+                        0,
+                        tp_rank,
+                        tp_size,
+                        ptr,
+                        stream,
+                    )?;
+                    gw.take_shard_into(
+                        &format!("{prefix}.shared_expert.up_proj.weight"),
+                        0,
+                        tp_rank,
+                        tp_size,
+                        ptr.add(shared_gate_proj_bytes),
+                        stream,
+                    )?;
+                } else {
+                    gw.take_into(
+                        &format!("{prefix}.shared_expert.gate_proj.weight"),
+                        ptr,
+                        stream,
+                    )?;
+                    gw.take_into(
+                        &format!("{prefix}.shared_expert.up_proj.weight"),
+                        ptr.add(shared_gate_proj_bytes),
+                        stream,
+                    )?;
+                }
+            }
+            let gu_w = unsafe {
+                GpuTensor::new(
+                    ptr,
+                    &[2 * shared_inter_per_rank, hidden_size],
+                    dtype,
+                )
+            };
+            let gate_up = crate::layers::Linear::new(gu_w, None);
+
+            // Down is row-parallel: shard its in-features (dim 1).
+            let down_w = if sharded {
+                gw.take_shard(
+                    &format!("{prefix}.shared_expert.down_proj.weight"),
+                    1,
+                    tp_rank,
+                    tp_size,
+                )?
+            } else {
+                gw.take(&format!("{prefix}.shared_expert.down_proj.weight"))?
+            };
+            let down = crate::layers::Linear::new(down_w, None);
+
+            let sgate = crate::layers::Linear::load(gw, &format!("{prefix}.shared_expert_gate"))?;
+            (Some(gate_up), Some(down), Some(sgate))
+        } else {
+            (None, None, None)
+        };
+
+        Ok(SharedFusedMoELayer {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_expert_gate,
+            intermediate_size: shared_inter_per_rank,
+        })
+    }
+
     /// Forward pass — MoE + shared expert.
     pub unsafe fn forward(
         &self,
@@ -1245,6 +1432,57 @@ pub struct Fp8BlockFusedMoELayer {
 }
 
 impl Fp8BlockFusedMoELayer {
+    /// Zero-alloc placeholder. Every field is a logically-invalid sentinel
+    /// (dangling `GpuTensor` pointers tagged with `[0, 0, 0]` / `[0, 0]`
+    /// shapes; a dummy `Linear`). Only used by
+    /// [`Fp8SharedFusedMoELayer`]'s BF16-fallback path to populate its
+    /// always-present `moe` field on layers whose experts arrive dense
+    /// BF16 (compressed-tensors `ignore` list). The outer forward short-
+    /// circuits to the BF16 peer before any of these fields are read.
+    pub fn dummy() -> Self {
+        use ferrite_cuda_core::dtype::DType;
+        let empty = || unsafe {
+            GpuTensor::new(
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                &[0, 0, 0],
+                DType::Fp8E4m3,
+            )
+        };
+        let empty_scale = || unsafe {
+            GpuTensor::new(
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                &[0, 0, 0],
+                DType::F32,
+            )
+        };
+        let dummy_gate_w = unsafe {
+            GpuTensor::new(
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                &[0, 0],
+                DType::BF16,
+            )
+        };
+        Self {
+            gate: Linear::new(dummy_gate_w, None),
+            w1: empty(),
+            w2: empty(),
+            w1_scale_inv: empty_scale(),
+            w2_scale_inv: empty_scale(),
+            block_size: [1, 1],
+            num_experts: 0,
+            top_k: 0,
+            intermediate_size: 0,
+            hidden_size: 0,
+            renormalize: false,
+            e_score_correction_bias: None,
+            n_expert_group: 0,
+            topk_group: 0,
+            routed_scaling_factor: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        }
+    }
+
     pub unsafe fn forward(
         &self,
         hidden_states: TensorView<'_>,
@@ -1397,7 +1635,16 @@ pub struct Fp8SharedFusedMoELayer {
     pub shared_down: Option<crate::layers::LinearLayer>,
     /// Shared-expert sigmoid gate `[1, hidden]` — always dense BF16 in practice.
     pub shared_expert_gate: Option<Linear>,
+    /// Per-rank shared-expert intermediate size (shared_expert_intermediate_size / tp_size).
+    /// Used by the silu_and_mul inside the shared branch. 0 when there is no shared expert.
     pub intermediate_size: usize,
+    /// BF16 fallback for layers the checkpoint's `ignore` list keeps dense
+    /// (e.g. layer 47 of `unsloth/Qwen3-Coder-Next-FP8-Dynamic`). When
+    /// `Some`, forward delegates to it and the FP8 fields are all-size
+    /// dummies. The delegate is TP-sharded along intermediate dim, so the
+    /// instruction arm's post-forward all-reduce behaves identically on
+    /// both paths.
+    pub bf16_fallback: Option<SharedFusedMoELayer>,
 }
 
 impl Fp8SharedFusedMoELayer {
@@ -1406,8 +1653,21 @@ impl Fp8SharedFusedMoELayer {
         hidden_states: TensorView<'_>,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
+        // BF16-fallback layers (checkpoint `ignore` list) delegate entirely
+        // to the BF16 peer. The peer's inner `tp_group` stays `None`; the
+        // DSL interpreter's all-reduce in `Instruction::Fp8SharedFusedMoe`
+        // closes the loop for both paths.
+        if let Some(ref bf16) = self.bf16_fallback {
+            return bf16.forward(hidden_states, device);
+        }
+
         let stream = device.compute_stream;
 
+        // Routed partial. The inner MoE's `tp_group` is `None` — the DSL
+        // interpreter performs a single post-combine all-reduce in
+        // `Instruction::Fp8SharedFusedMoe` using `ForwardCtx::tp_group`,
+        // which covers both the routed MoE partial and the sigmoid-gated
+        // shared partial with one collective.
         let moe_out = self.moe.forward(hidden_states, device);
 
         if let (Some(shared_gate_up), Some(shared_down), Some(shared_gate)) = (
@@ -1437,6 +1697,11 @@ impl Fp8SharedFusedMoELayer {
             );
             drop(shared_activated);
 
+            // Shared gate is replicated (dense `[1, hidden]`) — identical on
+            // every rank — so `sigmoid(gate) * shared_partial + moe_partial`
+            // preserves the per-rank partial-sum structure. The instruction
+            // arm's all-reduce (at the single TP sync point for this layer)
+            // produces the globally-correct `hidden` output.
             let gate_logits =
                 shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
 
@@ -1467,6 +1732,22 @@ impl Fp8SharedFusedMoELayer {
     ///
     /// Shared expert projections may be FP8 or dense BF16; the per-prefix
     /// choice follows on-disk weight dtype via `LinearLayer::load_dense_or_fp8`.
+    ///
+    /// At `tp_size > 1` this performs intermediate-dim tensor-parallel
+    /// sharding matching Python vLLM's `CompressedTensorsW8A8Fp8MoEMethod`
+    /// (`_load_w13` along output dim, `_load_w2` along input dim):
+    ///   * `gate_proj` / `up_proj`: each expert sharded along dim 0 (output)
+    ///     → `[inter/tp, hidden]` per-rank slice fused into `w1 = [E, 2*inter/tp, hidden]`
+    ///   * `down_proj`: each expert sharded along dim 1 (input) →
+    ///     `[hidden, inter/tp]` per-rank slice into `w2 = [E, hidden, inter/tp]`
+    ///   * Per-channel `w1` scales shard along dim 0; per-channel `w2` scales
+    ///     index output channels (hidden, not sharded) so stay replicated.
+    ///   * Shared expert: column-parallel `gate_proj+up_proj`, row-parallel
+    ///     `down_proj`; the outer forward all-reduces the sum after combining
+    ///     with the routed MoE output.
+    ///   * Router gate and `shared_expert_gate` are replicated across ranks
+    ///     (they consume full `[T, hidden]` activations and produce small
+    ///     replicated outputs).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         gw: &mut ferrite_cuda_core::weights::GpuWeights,
@@ -1478,6 +1759,8 @@ impl Fp8SharedFusedMoELayer {
         hidden_size: usize,
         norm_topk_prob: bool,
         output_dtype: ferrite_cuda_core::dtype::DType,
+        tp_rank: usize,
+        tp_size: usize,
         stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
         use crate::layers_quant::{block_scale_name, ensure_f32_scale};
@@ -1485,27 +1768,65 @@ impl Fp8SharedFusedMoELayer {
         use ferrite_cuda_core::dtype::DType;
         use ferrite_cuda_core::tensor::GpuTensor;
 
-        let inter = moe_intermediate_size;
+        anyhow::ensure!(
+            tp_size >= 1 && tp_rank < tp_size,
+            "Fp8SharedFusedMoELayer::load: invalid (tp_rank={tp_rank}, tp_size={tp_size})"
+        );
+        let inter_full = moe_intermediate_size;
+        anyhow::ensure!(
+            inter_full.is_multiple_of(tp_size),
+            "Fp8SharedFusedMoELayer::load: moe_intermediate_size={inter_full} not divisible by tp_size={tp_size}"
+        );
+        let inter = inter_full / tp_size;
+        let sharded = tp_size > 1;
 
-        // Router gate stays dense BF16 across every FP8 MoE family.
-        let gate = Linear::load(gw, &format!("{prefix}.gate"))?;
-
-        // Probe expert-0 gate_proj to derive layout + scale scheme.
+        // BF16 fallback probe — must run BEFORE any `gw.take` consumes
+        // tensors we'd need for the peer load (e.g. the router `gate`).
+        // Compressed-tensors checkpoints routinely land a handful of
+        // layers on the `ignore` list (e.g. the unsloth
+        // Qwen3-Coder-Next-FP8-Dynamic checkpoint ignores layer 47's
+        // experts + shared expert). The DSL emits `Fp8SharedFusedMoe`
+        // for every layer uniformly, so this layer arrives with BF16
+        // experts and needs the BF16 peer.
         let e0_gate_pfx = format!("{prefix}.experts.0.gate_proj");
         let e0_gate_w = format!("{e0_gate_pfx}.weight");
-        let (w_shape, w_dtype) = gw
-            .tensor_info(&e0_gate_w)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {e0_gate_w}"))?;
-        anyhow::ensure!(
-            w_dtype == DType::Fp8E4m3,
-            "Fp8SharedFusedMoELayer::load: expected Fp8E4m3 expert weights at {e0_gate_w}, got {w_dtype}"
-        );
-        let gate_n = w_shape[0]; // == moe_intermediate_size
+        let (w_shape, w_dtype) = {
+            let (s, d) = gw
+                .tensor_info(&e0_gate_w)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {e0_gate_w}"))?;
+            (s.to_vec(), d)
+        };
+        if w_dtype != DType::Fp8E4m3 {
+            let bf16 = SharedFusedMoELayer::load_sharded(
+                gw,
+                prefix,
+                num_experts,
+                top_k,
+                moe_intermediate_size,
+                shared_expert_intermediate_size,
+                hidden_size,
+                tp_rank,
+                tp_size,
+                stream,
+            )?;
+            return Ok(Self {
+                moe: Fp8BlockFusedMoELayer::dummy(),
+                shared_gate_up: None,
+                shared_down: None,
+                shared_expert_gate: None,
+                intermediate_size: 0,
+                bf16_fallback: Some(bf16),
+            });
+        }
+
+        // Router gate stays dense BF16 across every FP8 MoE family; replicated.
+        let gate = Linear::load(gw, &format!("{prefix}.gate"))?;
+        let gate_n_full = w_shape[0]; // == moe_intermediate_size (on-disk)
         let gate_k = w_shape[1]; // == hidden_size
         anyhow::ensure!(
-            gate_n == inter && gate_k == hidden_size,
+            gate_n_full == inter_full && gate_k == hidden_size,
             "Fp8SharedFusedMoELayer::load: expert gate_proj shape {w_shape:?} \
-             mismatches config (inter={inter}, hidden={hidden_size})"
+             mismatches config (inter={inter_full}, hidden={hidden_size})"
         );
 
         let e0_gate_s = block_scale_name(gw, &e0_gate_pfx);
@@ -1513,16 +1834,21 @@ impl Fp8SharedFusedMoELayer {
             .tensor_info(&e0_gate_s)
             .ok_or_else(|| anyhow::anyhow!("scale not found: {e0_gate_s}"))?;
 
-        // Scale-shape decoder, matching compressed-tensors strategies.
-        let (block_n, block_k) = match s_shape {
-            [] | [1] => (gate_n, gate_k),
-            [1, 1] => (gate_n, gate_k),
-            [n, 1] if *n == gate_n => (1, gate_k),
-            [n] if *n == gate_n => (1, gate_k),
+        // Three exclusive on-disk schemes — detected from full (unsharded) dims.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Scheme {
+            PerTensor,
+            PerChannel,
+            Block,
+        }
+        let (scheme, block_n, block_k) = match s_shape {
+            [] | [1] | [1, 1] => (Scheme::PerTensor, gate_n_full, gate_k),
+            [n, 1] if *n == gate_n_full => (Scheme::PerChannel, 1usize, gate_k),
+            [n] if *n == gate_n_full => (Scheme::PerChannel, 1usize, gate_k),
             [sn, sk] => {
-                let bn = gate_n.div_ceil(*sn).max(1);
+                let bn = gate_n_full.div_ceil(*sn).max(1);
                 let bk = gate_k.div_ceil(*sk).max(1);
-                (bn, bk)
+                (Scheme::Block, bn, bk)
             }
             other => anyhow::bail!(
                 "Fp8SharedFusedMoELayer::load: unrecognized scale shape {other:?} at {e0_gate_s} \
@@ -1530,9 +1856,22 @@ impl Fp8SharedFusedMoELayer {
             ),
         };
 
-        // Stacked expert layout: w1=[E, 2*inter, hidden] FP8, w2=[E, hidden, inter] FP8.
-        // `block_size = [block_n, block_k]` drives both GEMMs; for per-channel the kernel
-        // reads one scale per output row and collapses K to sk=0.
+        // Block-mode TP needs block-aligned sharding. Assert and stop if not.
+        if scheme == Scheme::Block && sharded {
+            anyhow::ensure!(
+                inter_full.is_multiple_of(tp_size * block_n) && inter_full.is_multiple_of(tp_size * block_k),
+                "Fp8SharedFusedMoELayer::load: block-mode TP requires inter ({inter_full}) to be \
+                 divisible by tp_size×block_n ({}) and tp_size×block_k ({}); drop tp_size or \
+                 move to per-channel",
+                tp_size * block_n,
+                tp_size * block_k,
+            );
+        }
+
+        // Per-rank stacked layout: w1=[E, 2*inter/tp, hidden] FP8,
+        // w2=[E, hidden, inter/tp] FP8. The fused GEMM derives
+        // `in_features`/`out_features` from the tensor dims at call time, so
+        // per-rank shapes flow through without kernel changes.
         let w1_n = 2 * inter;
         let w1_k = hidden_size;
         let w2_n = hidden_size;
@@ -1561,29 +1900,88 @@ impl Fp8SharedFusedMoELayer {
             let expert_w1_off = e * w1_n * w1_k;
             let gate_proj_bytes = inter * hidden_size;
             let expert_w2_off = e * w2_n * w2_k;
-            unsafe {
-                gw.take_into(
-                    &format!("{gate_pfx}.weight"),
-                    w1_ptr.add(expert_w1_off),
-                    stream,
-                )?;
-                gw.take_into(
-                    &format!("{up_pfx}.weight"),
-                    w1_ptr.add(expert_w1_off + gate_proj_bytes),
-                    stream,
-                )?;
-                gw.take_into(
-                    &format!("{down_pfx}.weight"),
-                    w2_ptr.add(expert_w2_off),
-                    stream,
-                )?;
+
+            // Weights.
+            if sharded {
+                unsafe {
+                    gw.take_shard_into(
+                        &format!("{gate_pfx}.weight"),
+                        0,
+                        tp_rank,
+                        tp_size,
+                        w1_ptr.add(expert_w1_off),
+                        stream,
+                    )?;
+                    gw.take_shard_into(
+                        &format!("{up_pfx}.weight"),
+                        0,
+                        tp_rank,
+                        tp_size,
+                        w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                        stream,
+                    )?;
+                    gw.take_shard_into(
+                        &format!("{down_pfx}.weight"),
+                        1,
+                        tp_rank,
+                        tp_size,
+                        w2_ptr.add(expert_w2_off),
+                        stream,
+                    )?;
+                }
+            } else {
+                unsafe {
+                    gw.take_into(
+                        &format!("{gate_pfx}.weight"),
+                        w1_ptr.add(expert_w1_off),
+                        stream,
+                    )?;
+                    gw.take_into(
+                        &format!("{up_pfx}.weight"),
+                        w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                        stream,
+                    )?;
+                    gw.take_into(
+                        &format!("{down_pfx}.weight"),
+                        w2_ptr.add(expert_w2_off),
+                        stream,
+                    )?;
+                }
             }
 
-            let expert_w1_scale_off = e * w1_scale_rows * w1_scale_cols * 4;
-            let gate_scale = {
-                let raw = gw.take(&block_scale_name(gw, &gate_pfx))?;
-                ensure_f32_scale(raw, stream)?
+            // Scales.
+            let take_scale = |gw: &mut ferrite_cuda_core::weights::GpuWeights,
+                              name: &str,
+                              dim: usize,
+                              shard_this: bool|
+             -> anyhow::Result<GpuTensor> {
+                let raw = if shard_this {
+                    gw.take_shard(name, dim, tp_rank, tp_size)?
+                } else {
+                    gw.take(name)?
+                };
+                ensure_f32_scale(raw, stream)
             };
+            let (gate_scale, up_scale, down_scale) = match scheme {
+                Scheme::PerTensor => (
+                    take_scale(gw, &block_scale_name(gw, &gate_pfx), 0, false)?,
+                    take_scale(gw, &block_scale_name(gw, &up_pfx), 0, false)?,
+                    take_scale(gw, &block_scale_name(gw, &down_pfx), 0, false)?,
+                ),
+                Scheme::PerChannel => (
+                    take_scale(gw, &block_scale_name(gw, &gate_pfx), 0, sharded)?,
+                    take_scale(gw, &block_scale_name(gw, &up_pfx), 0, sharded)?,
+                    // Down's output dim is hidden (not sharded) → full take.
+                    take_scale(gw, &block_scale_name(gw, &down_pfx), 0, false)?,
+                ),
+                Scheme::Block => (
+                    take_scale(gw, &block_scale_name(gw, &gate_pfx), 0, sharded)?,
+                    take_scale(gw, &block_scale_name(gw, &up_pfx), 0, sharded)?,
+                    take_scale(gw, &block_scale_name(gw, &down_pfx), 1, sharded)?,
+                ),
+            };
+
+            let expert_w1_scale_off = e * w1_scale_rows * w1_scale_cols * 4;
             let gate_scale_bytes = gate_scale_rows * w1_scale_cols * 4;
             unsafe {
                 driver::memcpy_dtod_async(
@@ -1593,10 +1991,6 @@ impl Fp8SharedFusedMoELayer {
                     stream,
                 )?;
             }
-            let up_scale = {
-                let raw = gw.take(&block_scale_name(gw, &up_pfx))?;
-                ensure_f32_scale(raw, stream)?
-            };
             let up_scale_rows = w1_scale_rows - gate_scale_rows;
             let up_scale_bytes = up_scale_rows * w1_scale_cols * 4;
             unsafe {
@@ -1608,10 +2002,6 @@ impl Fp8SharedFusedMoELayer {
                 )?;
             }
             let expert_w2_scale_off = e * w2_scale_rows * w2_scale_cols * 4;
-            let down_scale = {
-                let raw = gw.take(&block_scale_name(gw, &down_pfx))?;
-                ensure_f32_scale(raw, stream)?
-            };
             let down_scale_bytes = w2_scale_rows * w2_scale_cols * 4;
             unsafe {
                 driver::memcpy_dtod_async(
@@ -1647,6 +2037,10 @@ impl Fp8SharedFusedMoELayer {
             )
         };
 
+        // Leave `tp_group = None` on the inner MoE. The outer
+        // `Fp8SharedFusedMoELayer::forward` performs a single all-reduce
+        // covering both the routed MoE output and the sigmoid-gated shared
+        // partial — two all-reduces would be wasteful.
         let moe = Fp8BlockFusedMoELayer {
             gate,
             w1,
@@ -1672,6 +2066,11 @@ impl Fp8SharedFusedMoELayer {
         // of gate_proj and dispatch per-weight; dtype cannot mix across the
         // three projections for a given expert.
         let (shared_gate_up, shared_down, shared_expert_gate) = if shared_expert_intermediate_size > 0 {
+            anyhow::ensure!(
+                shared_expert_intermediate_size.is_multiple_of(tp_size),
+                "Fp8SharedFusedMoELayer::load: shared_expert_intermediate_size={shared_expert_intermediate_size} \
+                 not divisible by tp_size={tp_size}"
+            );
             let sg_gate_pfx = format!("{prefix}.shared_expert.gate_proj");
             let sg_up_pfx = format!("{prefix}.shared_expert.up_proj");
             let sg_down_pfx = format!("{prefix}.shared_expert.down_proj");
@@ -1680,23 +2079,64 @@ impl Fp8SharedFusedMoELayer {
                 .tensor_info(&probe_name)
                 .ok_or_else(|| anyhow::anyhow!("shared-expert weight not found: {probe_name}"))?;
             let (gu, dn) = if probe_dtype == DType::Fp8E4m3 {
-                let gu = crate::layers::Fp8Linear::load_concat(
-                    gw,
-                    &[&sg_gate_pfx, &sg_up_pfx],
-                    output_dtype,
-                )?;
-                let dn = crate::layers::Fp8Linear::load(gw, &sg_down_pfx, output_dtype)?;
+                let gu = if sharded {
+                    crate::layers::Fp8Linear::load_concat_sharded(
+                        gw,
+                        &[&sg_gate_pfx, &sg_up_pfx],
+                        tp_rank,
+                        tp_size,
+                        output_dtype,
+                    )?
+                } else {
+                    crate::layers::Fp8Linear::load_concat(
+                        gw,
+                        &[&sg_gate_pfx, &sg_up_pfx],
+                        output_dtype,
+                    )?
+                };
+                let dn = if sharded {
+                    crate::layers::Fp8Linear::load_sharded(
+                        gw,
+                        &sg_down_pfx,
+                        1,
+                        tp_rank,
+                        tp_size,
+                        output_dtype,
+                    )?
+                } else {
+                    crate::layers::Fp8Linear::load(gw, &sg_down_pfx, output_dtype)?
+                };
                 (
                     crate::layers::LinearLayer::Fp8(Box::new(gu)),
                     crate::layers::LinearLayer::Fp8(Box::new(dn)),
                 )
             } else {
-                let gu = crate::layers::LinearLayer::load_dense_concat(
-                    gw,
-                    &[&sg_gate_pfx, &sg_up_pfx],
-                    stream,
-                )?;
-                let dn = crate::layers::LinearLayer::load_dense(gw, &sg_down_pfx)?;
+                let gu = if sharded {
+                    crate::layers::LinearLayer::load_dense_concat_sharded(
+                        gw,
+                        &[&sg_gate_pfx, &sg_up_pfx],
+                        stream,
+                        tp_rank,
+                        tp_size,
+                    )?
+                } else {
+                    crate::layers::LinearLayer::load_dense_concat(
+                        gw,
+                        &[&sg_gate_pfx, &sg_up_pfx],
+                        stream,
+                    )?
+                };
+                let dn = if sharded {
+                    crate::layers::LinearLayer::load_dense_sharded(
+                        gw,
+                        &sg_down_pfx,
+                        1,
+                        tp_rank,
+                        tp_size,
+                    )?
+                } else {
+                    crate::layers::LinearLayer::load_dense(gw, &sg_down_pfx)?
+                };
                 (gu, dn)
             };
             let sg = Linear::load(gw, &format!("{prefix}.shared_expert_gate"))?;
@@ -1705,12 +2145,23 @@ impl Fp8SharedFusedMoELayer {
             (None, None, None)
         };
 
+        // Per-rank intermediate size for the shared-expert silu_and_mul.
+        // (Was moe_intermediate_size in the previous single-rank path, which
+        // matched only because Qwen3-Coder-Next happens to set
+        // `moe_intermediate_size == shared_expert_intermediate_size`.)
+        let shared_inter_per_rank = if shared_expert_intermediate_size > 0 {
+            shared_expert_intermediate_size / tp_size
+        } else {
+            0
+        };
+
         Ok(Self {
             moe,
             shared_gate_up,
             shared_down,
             shared_expert_gate,
-            intermediate_size: inter,
+            intermediate_size: shared_inter_per_rank,
+            bf16_fallback: None,
         })
     }
 }
@@ -2737,6 +3188,7 @@ mod tests {
             ))),
             shared_expert_gate: None,
             intermediate_size: 3072,
+            bf16_fallback: None,
         };
 
         assert_eq!(layer.moe.num_experts, 4);

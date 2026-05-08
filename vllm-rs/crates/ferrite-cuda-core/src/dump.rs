@@ -85,6 +85,62 @@ pub unsafe fn dump_tile(label: &str, layer: u32, t: &GpuTensor, stream: CUstream
     );
 }
 
+/// Download ALL elements from `t`, check for non-finite values, and emit a
+/// diagnostic line. Unlike `dump_tile` (first8/last8 sample), this scans the
+/// full tensor so Inf/NaN hiding in middle dimensions are not missed.
+///
+/// Emits: `FERRITE_DUMP_FINITE {json}` with fields:
+///   label, layer, shape, dtype, any_nonfinite (bool), first_nonfinite_idx,
+///   max_abs, count_nonfinite.
+///
+/// Gated by the same `FERRITE_DUMP` env var as `dump_tile`.
+///
+/// # Safety
+/// Same as `dump_tile`.
+pub unsafe fn dump_tile_check_finite(label: &str, layer: u32, t: &GpuTensor, stream: CUstream) {
+    if !enabled() {
+        return;
+    }
+    let n = t.numel();
+    if n == 0 {
+        return;
+    }
+    let dtype = t.dtype();
+    let bytes_per = dtype.size_bytes();
+    let mut buf = vec![0u8; n * bytes_per];
+    unsafe {
+        driver::memcpy_dtoh_async(buf.as_mut_ptr(), t.raw_ptr() as *const u8, n * bytes_per, stream)
+            .expect("FERRITE_DUMP_FINITE: dtoh");
+        driver::stream_synchronize(stream).expect("FERRITE_DUMP_FINITE: sync");
+    }
+    let vals = bytes_to_f32(&buf, dtype);
+    let mut count_nonfinite: usize = 0;
+    let mut first_nonfinite_idx: Option<usize> = None;
+    let mut max_abs: f32 = 0.0;
+    for (i, &v) in vals.iter().enumerate() {
+        if !v.is_finite() {
+            count_nonfinite += 1;
+            if first_nonfinite_idx.is_none() {
+                first_nonfinite_idx = Some(i);
+            }
+        } else if v.abs() > max_abs {
+            max_abs = v.abs();
+        }
+    }
+    eprintln!(
+        "FERRITE_DUMP_FINITE {{\"label\":\"{}\",\"layer\":{},\"shape\":{:?},\"dtype\":\"{}\",\
+         \"any_nonfinite\":{},\"first_nonfinite_idx\":{},\"count_nonfinite\":{},\"max_abs\":{}}}",
+        label,
+        layer,
+        t.shape(),
+        dtype,
+        count_nonfinite > 0,
+        first_nonfinite_idx.map(|i| i as i64).unwrap_or(-1),
+        count_nonfinite,
+        max_abs,
+    );
+}
+
 fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
     match dtype {
         DType::F32 => bytes

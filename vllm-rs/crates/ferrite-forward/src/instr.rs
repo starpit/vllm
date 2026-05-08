@@ -684,6 +684,15 @@ impl<W: CanonicalParams> Instruction<W> {
                     &residual,
                     ctx.device.compute_stream,
                 );
+                // Full-scan finite check: first8/last8 misses Inf in middle
+                // dims (4096-wide hidden). This catches the layer where the
+                // residual stream first goes non-finite for FP8 models.
+                dump::dump_tile_check_finite(
+                    "fused_add_rmsnorm.residual",
+                    layer,
+                    &residual,
+                    ctx.device.compute_stream,
+                );
             },
             Instruction::FusedAddRmsNormWithOffset(
                 delta_slot,
@@ -709,12 +718,26 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = (weight_fn)(ctx.wm, layer);
+                // Check the input (residual stream) for Inf/NaN before the
+                // final norm — Inf here → Inf*0=NaN in the lm_head input.
+                dump::dump_tile_check_finite(
+                    "scalar_offset_rmsnorm.in",
+                    layer,
+                    &v,
+                    ctx.device.compute_stream,
+                );
                 let out = kernels::rms_norm_with_offset(
                     *v,
                     w.weight,
                     w.eps,
                     offset,
                     &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                dump::dump_tile_check_finite(
+                    "scalar_offset_rmsnorm.out",
+                    layer,
+                    &out.as_gpu_tensor(),
                     ctx.device.compute_stream,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));

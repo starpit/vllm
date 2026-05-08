@@ -42,6 +42,30 @@ __global__ void fp32_to_bf16_vec_kernel(
     }
 }
 
+// Replace any non-finite BF16 element (NaN or ±Inf) with 0.0.
+// Called on the backbone output (after the final RmsNorm) before the
+// lm_head GEMM to prevent NaN propagation when the residual stream
+// accumulated BF16 Inf in a middle dimension (from FP8 dequantization).
+// The final RmsNorm computes sum_sq in F32: a BF16 Inf input causes
+// F32 Inf sum_sq → s_inv_rms = 0 → Inf * 0 = NaN for that dimension.
+template <int VEC>
+__global__ void nan_to_zero_bf16_vec_kernel(
+    __nv_bfloat16* __restrict__ x,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int base = idx * VEC;
+    if (base >= n) return;
+    #pragma unroll
+    for (int i = 0; i < VEC; i++) {
+        int j = base + i;
+        if (j < n) {
+            float v = __bfloat162float(x[j]);
+            if (!isfinite(v)) x[j] = __float2bfloat16(0.0f);
+        }
+    }
+}
+
 extern "C" {
 
 void bf16_to_fp32(const void* src, void* dst, int n, cudaStream_t stream) {
@@ -60,6 +84,15 @@ void fp32_to_bf16(const void* src, void* dst, int n, cudaStream_t stream) {
     int blocks = (total_vecs + threads - 1) / threads;
     fp32_to_bf16_vec_kernel<VEC><<<blocks, threads, 0, stream>>>(
         (const float*)src, (__nv_bfloat16*)dst, n);
+}
+
+void nan_to_zero_bf16_inplace(void* x, int n, cudaStream_t stream) {
+    constexpr int VEC = 4;
+    int threads = 256;
+    int total_vecs = (n + VEC - 1) / VEC;
+    int blocks = (total_vecs + threads - 1) / threads;
+    nan_to_zero_bf16_vec_kernel<VEC><<<blocks, threads, 0, stream>>>(
+        (__nv_bfloat16*)x, n);
 }
 
 }  // extern "C"

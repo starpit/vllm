@@ -1361,6 +1361,7 @@ unsafe extern "C" {
         v_head_dim: c_int,
         stream: CUstream,
     );
+    fn nan_to_zero_bf16_inplace(x: *mut u16, n: c_int, stream: CUstream);
 }
 
 // ---------------------------------------------------------------------------
@@ -12138,6 +12139,21 @@ mod tests_fused_qkv_rope_cache {
 
             driver::stream_destroy(stream).expect("destroy");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NaN / Inf sanitization
+// ---------------------------------------------------------------------------
+
+/// Replace any non-finite BF16 element (NaN or ±Inf) with 0.0 in-place.
+///
+/// # Safety
+/// `t` must be a valid BF16 GPU tensor.
+pub unsafe fn sanitize_bf16_inplace(t: GpuTensor, stream: CUstream) {
+    debug_assert_eq!(t.dtype(), DType::BF16);
+    unsafe {
+        nan_to_zero_bf16_inplace(t.as_mut_ptr::<u16>(), t.numel() as c_int, stream);
     }
 }
 

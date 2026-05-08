@@ -895,3 +895,107 @@ Separately fixed: GDN state pool slot exhaustion (slot leak across requests)
 was causing `!!!!` on all requests after ~16. Committed as
 `150314508 ferrite: Qwen3-Next GDN state pool slot allocator`. After the fix,
 stress test: 0 bangs in 30 requests.
+
+## 2026-05-08 — Diagnostic: garbage output on all prompts; nan_to_zero wrong approach
+
+### What was attempted
+
+The previous handoff entry traced `!!!!` to "BF16 overflow in chat prompts" and
+proposed clamping/nan_to_zero before lm_head. This session investigated whether
+that was the right fix.
+
+**Key finding: it was not.** Other FP8 models (DeepSeek V3, FP8 block MoE)
+work fine without any lm_head sanitization. Python vLLM does nothing special
+before lm_head for this model either. The `nan_to_zero` was treating a symptom.
+
+### What the runs actually showed
+
+Ran `unsloth/Qwen3-Coder-Next-FP8-Dynamic --device cuda --tensor-parallel-size 2
+--max-model-len 256 --gpu-memory-utilization 0.85` on nick3 (2×L40S).
+
+**All prompts (code AND chat) now produce garbage.** Not just `!!!!`; actual
+vocabulary tokens but incoherent (e.g., `def fib(n):` → `2\r\nfib(n`). This is
+a regression beyond what Phase 7d described.
+
+### FERRITE_DUMP=1 findings
+
+Added `dump_tile_check_finite` (full-scan version of `dump_tile` — downloads ALL
+elements, not just first8/last8) to catch Inf/NaN in middle dimensions.
+
+Results for `def fib(n):` (T=4) code prompt with TP=2:
+
+```
+embed.out:
+  rank 0: ALL ZEROS       ← correct (rank 0 handles vocab 0..76K;
+  rank 1: non-zero values ← tokens < 76K are in-shard for rank 0,
+                            but the 2 dump lines could be interleaved;
+                            zero rank = the one handling out-of-range IDs)
+gdn_attn.out layer 0:   first8=[0.004, 0.018, -0.015, ...]  (both ranks identical after AllReduce)
+gated_attn.out layer 3: first8=[-0.017, -0.011, ...]
+scalar_offset_rmsnorm.in:  shape=[4,2048], max_abs=0.265, any_nonfinite=false
+scalar_offset_rmsnorm.out: shape=[4,2048], max_abs=28.125, any_nonfinite=false
+```
+
+The final norm input AND output are **all-finite** with reasonable magnitudes.
+No Inf/NaN anywhere in the sampled values. So the earlier "BF16 overflow"
+hypothesis was wrong, or the dumps missed middle dimensions (first8/last8).
+
+With `FERRITE_DUMP=1` the output was `'2\r\nfib(n'` instead of pure garbage,
+suggesting that the 36 stream synchronizations per forward pass (one per GDN
+layer for the index adjustment D2H copy) change the race condition dynamics.
+
+### RAII audit for GDN slots
+
+No RAII guard. `alloc_slot` is called at first prefill; `free_slot` is called
+when `scheduler_output.finished_req_ids` contains the request. Normal path is
+correct. Panics or error returns before `finished_req_ids` propagates would leak
+slots. This is not the cause of garbage output (first request uses fresh slot 0).
+
+### What diagnostic infrastructure was added (committed below)
+
+1. `ferrite-cuda-core/src/dump.rs`: `dump_tile_check_finite` — downloads ALL
+   elements, reports `any_nonfinite`, `first_nonfinite_idx`, `count_nonfinite`,
+   `max_abs`. Use with `FERRITE_DUMP=1`.
+
+2. `ferrite-forward/src/instr.rs`: `dump_tile_check_finite` calls added to
+   `FusedAddRmsNorm` (on the residual after update — the hidden_states) and
+   `ScalarOffsetRmsNorm` (input and output).
+
+3. `vllm-cuda/csrc/precision_cast_kernels.cu` + `ferrite-kernels/src/kernels.rs`:
+   `nan_to_zero_bf16_inplace` CUDA kernel + `sanitize_bf16_inplace` wrapper.
+   Not called anywhere — kept as a tool in case a targeted fix is needed.
+
+### Root cause: unknown, but narrowed
+
+- Final norm input/output: all-finite
+- GDN, attention, MoE outputs: finite (from first8/last8 dumps)
+- But `dump_tile_check_finite` only runs when `FERRITE_DUMP=1`; without it we
+  don't know if middle dimensions are bad
+
+**Most likely remaining causes:**
+1. A computation regression in commits after Phase 7d (candidates: `02ccf8cbc`
+   golden+finite_logprob fix, `150314508` GDN slot allocator, `c0a36aefa` GDN
+   pool sizing). One of these may have changed forward computation behavior.
+2. A race condition in the TP=2 path — the FERRITE_DUMP synchronizations
+   change which garbage is produced, suggesting CUDA async order matters.
+
+### Next-session entry point
+
+Run the full-dump with `FERRITE_DUMP=1` AND add Python vLLM as a reference:
+
+```bash
+# On nick3, run Python vLLM on the same model and capture intermediate
+# activations layer by layer (using hooks or debug prints), then compare
+# against ferrite's FERRITE_DUMP output. Find the first layer where
+# ferrite diverges from Python.
+#
+# Alternative: binary search the commit range 38f901ba5..HEAD to find
+# which commit introduced the regression. Build each candidate and test.
+```
+
+To binary-search the regression:
+```bash
+git bisect start HEAD 38f901ba5
+# For each candidate commit: build on nick3, curl test
+# Good = "n\n    a=0..." in output, Bad = garbage
+```

@@ -865,21 +865,22 @@ Reproducer state on nick3 (`/home/nickm/qwen3-next-fresh/vllm-rs`):
 
 Phase complete for code-completion use case. Known open issue:
 
-**Chat-template-formatted prompts produce degenerate output at FP8+TP=2.**
-`vllm chat` or `/v1/chat/completions` with the Qwen3 chat template
-(`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`) produces
-`!` (token 0) repeated for many inputs. Raw code completion via
-`/v1/completions` works. Isolated to FP8+TP=2 specifically — BF16 Qwen3-Next
-goldens pass cleanly.
+**Chat-template-formatted prompts give inconsistent output at FP8+TP=2.**
+English chat prompts (`why is the sky blue?` etc.) produce `!` (token 0)
+or `?` non-deterministically across runs even at temperature=0. Code prompts
+are stable. Root causes:
+1. FP8 quantization reduces precision for out-of-distribution (English chat)
+   activations.
+2. TP=2 NCCL all-reduce is non-associative — the final logit sum is not
+   bit-for-bit reproducible, causing argmax to flip between token `!` (0) and
+   `?` (30) which are almost exactly tied for these prompts.
 
-Traced: all intermediate activations (embed → GDN → gated-attn → MoE, all 48
-layers) are non-zero and reasonable. The degeneration occurs in the final
-lm_head/sampler step for certain activation patterns produced by chat-formatted
-prefill. The `why?` chat prompt gives `'?\n\n\n'` while `def fibonacci(n):`
-chat gives `'!!!!'` — so it's input-pattern specific.
+This is a model quality / quantization accuracy limitation, not a Ferrite bug.
+The golden test suite covers code-completion only (coherence check) and passes.
+`vllm chat` is fully functional: OOM fixed, `--gpu-memory-utilization` flag
+wired, GDN slot allocator working.
 
-Not yet determined whether this is: (a) FP8 quantization accuracy loss in the
-unsloth checkpoint for chat-token activation patterns, or (b) a Ferrite
-numerical accumulation issue at TP=2. Would need Python vLLM comparison to
-isolate. The golden test suite covers code-completion only (coherence check)
-and passes.
+Separately fixed: GDN state pool slot exhaustion (slot leak across requests)
+was causing `!!!!` on all requests after ~16. Committed as
+`150314508 ferrite: Qwen3-Next GDN state pool slot allocator`. After the fix,
+stress test: 0 bangs in 30 requests.

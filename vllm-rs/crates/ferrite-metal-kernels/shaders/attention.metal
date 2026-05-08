@@ -342,6 +342,147 @@ kernel void attention_via_cache_f16_specialized(
     }
 }
 
+/// BF16 specialized variant of `attention_via_cache_f16_specialized`.
+/// Same dispatch shape, function constants, paged-cache layout.
+/// Bindings switch to `bfloat`; reductions stay in f32. Used by the
+/// decode-bucket lowering when the model's resolved dtype is bf16.
+kernel void attention_via_cache_bf16_specialized(
+    device       bfloat* output      [[buffer(0)]],
+    device const bfloat* q           [[buffer(1)]],
+    device const uint*   seq_used_k  [[buffer(2)]],
+    device const uint*   block_table [[buffer(3)]],
+    device const bfloat* k_cache     [[buffer(4)]],
+    device const bfloat* v_cache     [[buffer(5)]],
+    uint3  tg_pos  [[threadgroup_position_in_grid]],
+    uint3  tid     [[thread_position_in_threadgroup]],
+    uint   simd_id [[simdgroup_index_in_threadgroup]],
+    uint   lane_id [[thread_index_in_simdgroup]])
+{
+    const uint seq_idx     = tg_pos.x;
+    const uint q_head_idx  = tg_pos.y;
+    const uint d           = tid.x;
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const uint block_size  = ATTN_BLOCK_SIZE;
+    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
+    const float scale      = ATTN_SCALE_FC;
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+
+    const uint kv_blk_stride  = num_kv * block_size * head_dim;
+    const uint kv_head_stride = block_size * head_dim;
+    const uint kv_tok_stride  = head_dim;
+
+    device const bfloat* q_row =
+        q + (seq_idx * num_q + q_head_idx) * head_dim;
+    device       bfloat* o_row =
+        output + (seq_idx * num_q + q_head_idx) * head_dim;
+    device const uint*   row_block_table =
+        block_table + seq_idx * max_blocks;
+
+    threadgroup float  shared_logits[ATTN_MAX_SHARED_LOGITS];
+    threadgroup float  simd_scratch[32];
+    threadgroup bfloat q_local[1024];
+
+    if (d < head_dim) {
+        q_local[d] = q_row[d];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint kv_len = seq_used_k[seq_idx];
+    const uint num_logical_blocks = (kv_len + block_size - 1) / block_size;
+
+    float max_logit = -INFINITY;
+    for (uint logical_block = 0; logical_block < num_logical_blocks; ++logical_block) {
+        const uint physical_block = row_block_table[logical_block];
+        device const bfloat* k_block =
+            k_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride;
+        for (uint block_offset = 0; block_offset < block_size; ++block_offset) {
+            const uint token_idx = logical_block * block_size + block_offset;
+            if (token_idx >= kv_len) break;
+            if (token_idx >= ATTN_MAX_SHARED_LOGITS) break;
+            device const bfloat* k_vec = k_block + block_offset * kv_tok_stride;
+            float partial = 0.0f;
+            if (d < head_dim) {
+                partial = float(q_local[d]) * float(k_vec[d]);
+            }
+            float dot = simd_sum(partial);
+            if (head_dim > 32) {
+                if (lane_id == 0) simd_scratch[simd_id] = dot;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_id == 0) {
+                    const uint num_simds = (head_dim + 31) / 32;
+                    float v = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
+                    v = simd_sum(v);
+                    if (lane_id == 0) simd_scratch[0] = v;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                dot = simd_scratch[0];
+            }
+            const float logit = dot * scale;
+            if (d == 0) shared_logits[token_idx] = logit;
+            max_logit = max(max_logit, logit);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    max_logit = simd_max(max_logit);
+    if (lane_id == 0) simd_scratch[simd_id] = max_logit;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id == 0) {
+        const uint num_simds = (head_dim + 31) / 32;
+        float v = (lane_id < num_simds) ? simd_scratch[lane_id] : -INFINITY;
+        v = simd_max(v);
+        if (lane_id == 0) simd_scratch[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float global_max = simd_scratch[0];
+
+    float exp_sum = 0.0f;
+    const uint clamped_kv = min(kv_len, ATTN_MAX_SHARED_LOGITS);
+    for (uint t = d; t < clamped_kv; t += head_dim) {
+        const float val = exp(shared_logits[t] - global_max);
+        shared_logits[t] = val;
+        exp_sum += val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    exp_sum = simd_sum(exp_sum);
+    if (lane_id == 0) simd_scratch[simd_id] = exp_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id == 0) {
+        const uint num_simds = (head_dim + 31) / 32;
+        float v = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
+        v = simd_sum(v);
+        if (lane_id == 0) simd_scratch[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_sum = 1.0f / (simd_scratch[0] + 1e-6f);
+
+    if (d < head_dim) {
+        float acc = 0.0f;
+        for (uint logical_block = 0; logical_block < num_logical_blocks; ++logical_block) {
+            const uint physical_block = row_block_table[logical_block];
+            device const bfloat* v_block =
+                v_cache
+                + physical_block * kv_blk_stride
+                + kv_head_idx    * kv_head_stride;
+            for (uint block_offset = 0; block_offset < block_size; ++block_offset) {
+                const uint token_idx = logical_block * block_size + block_offset;
+                if (token_idx >= kv_len) break;
+                if (token_idx >= ATTN_MAX_SHARED_LOGITS) break;
+                const float w = shared_logits[token_idx] * inv_sum;
+                const float v = float(v_block[block_offset * kv_tok_stride + d]);
+                acc += w * v;
+            }
+        }
+        o_row[d] = bfloat(acc);
+    }
+}
+
 /// Prefill-bucket attention over contiguous Q/K/V tiles.
 ///
 /// Q: `[total_tokens, num_q_heads, head_dim]`,
@@ -694,6 +835,145 @@ kernel void attention_prefill_contiguous_f16_specialized(
                 acc += shared_logits[k_idx] * inv_sum * float(v_row[d]);
             }
             output[(global_q * num_q + q_head_idx) * head_dim + d] = half(acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+/// BF16 specialized variant of `attention_prefill_contiguous`. Mirror
+/// of the f16 path: same dispatch, function constants, causal mask,
+/// and softmax logic. Only the device pointer types switch to
+/// `bfloat`; reduction stays in f32.
+kernel void attention_prefill_contiguous_bf16_specialized(
+    device       bfloat* output       [[buffer(0)]],
+    device const bfloat* q            [[buffer(1)]],
+    device const bfloat* k            [[buffer(2)]],
+    device const bfloat* v            [[buffer(3)]],
+    device const uint*   cu_seqlens_q [[buffer(4)]],
+    uint3  tg_pos  [[threadgroup_position_in_grid]],
+    uint3  tid     [[thread_position_in_threadgroup]],
+    uint   simd_id [[simdgroup_index_in_threadgroup]],
+    uint   lane_id [[thread_index_in_simdgroup]])
+{
+    const uint q_tile_idx  = tg_pos.x;
+    const uint q_head_idx  = tg_pos.y;
+    const uint d           = tid.x;
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const float scale      = ATTN_SCALE_FC;
+    const uint tile_q      = ATTN_PREFILL_TILE_Q;
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+
+    threadgroup float simd_scratch[32];
+    threadgroup bfloat q_local[1024];
+    threadgroup float  shared_logits[ATTN_MAX_SHARED_LOGITS];
+
+    for (uint local_q = 0; local_q < tile_q; ++local_q) {
+        const uint global_q = q_tile_idx * tile_q + local_q;
+
+        uint seq_start = 0;
+        uint seq_end   = 0;
+        bool in_range  = false;
+        for (uint b = 0;; ++b) {
+            const uint lo = cu_seqlens_q[b];
+            const uint hi = cu_seqlens_q[b + 1];
+            if (global_q >= lo && global_q < hi) {
+                seq_start = lo;
+                seq_end   = hi;
+                in_range  = true;
+                break;
+            }
+            if (hi <= lo) break;
+            if (b > 1024u) break;
+        }
+        if (!in_range) {
+            if (d < head_dim) {
+                output[(global_q * num_q + q_head_idx) * head_dim + d] = bfloat(0.0);
+            }
+            continue;
+        }
+
+        const uint q_pos_in_seq = global_q - seq_start;
+
+        device const bfloat* q_row =
+            q + (global_q * num_q + q_head_idx) * head_dim;
+        if (d < head_dim) q_local[d] = q_row[d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint kv_len = seq_end - seq_start;
+        const uint clamped_kv = min(kv_len, ATTN_MAX_SHARED_LOGITS);
+
+        float local_max = -INFINITY;
+        for (uint k_idx = 0; k_idx < clamped_kv; ++k_idx) {
+            const uint k_global = seq_start + k_idx;
+            float partial = 0.0f;
+            if (d < head_dim) {
+                device const bfloat* k_row =
+                    k + (k_global * num_kv + kv_head_idx) * head_dim;
+                partial = float(q_local[d]) * float(k_row[d]);
+            }
+            float dot = simd_sum(partial);
+            if (head_dim > 32) {
+                if (lane_id == 0) simd_scratch[simd_id] = dot;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_id == 0) {
+                    const uint num_simds = (head_dim + 31) / 32;
+                    float vred = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
+                    vred = simd_sum(vred);
+                    if (lane_id == 0) simd_scratch[0] = vred;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                dot = simd_scratch[0];
+            }
+            float logit = dot * scale;
+            if (k_idx > q_pos_in_seq) logit = -INFINITY;
+            if (d == 0) shared_logits[k_idx] = logit;
+            local_max = max(local_max, logit);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        local_max = simd_max(local_max);
+        if (lane_id == 0) simd_scratch[simd_id] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_id == 0) {
+            const uint num_simds = (head_dim + 31) / 32;
+            float vmax = (lane_id < num_simds) ? simd_scratch[lane_id] : -INFINITY;
+            vmax = simd_max(vmax);
+            if (lane_id == 0) simd_scratch[0] = vmax;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float row_max = simd_scratch[0];
+
+        float local_sum = 0.0f;
+        for (uint k_idx = d; k_idx < clamped_kv; k_idx += head_dim) {
+            const float e = exp(shared_logits[k_idx] - row_max);
+            shared_logits[k_idx] = e;
+            local_sum += e;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        local_sum = simd_sum(local_sum);
+        if (lane_id == 0) simd_scratch[simd_id] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_id == 0) {
+            const uint num_simds = (head_dim + 31) / 32;
+            float vs = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
+            vs = simd_sum(vs);
+            if (lane_id == 0) simd_scratch[0] = vs;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv_sum = 1.0f / (simd_scratch[0] + 1e-6f);
+
+        if (d < head_dim) {
+            float acc = 0.0f;
+            for (uint k_idx = 0; k_idx < clamped_kv; ++k_idx) {
+                const uint k_global = seq_start + k_idx;
+                device const bfloat* v_row =
+                    v + (k_global * num_kv + kv_head_idx) * head_dim;
+                acc += shared_logits[k_idx] * inv_sum * float(v_row[d]);
+            }
+            output[(global_q * num_q + q_head_idx) * head_dim + d] = bfloat(acc);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

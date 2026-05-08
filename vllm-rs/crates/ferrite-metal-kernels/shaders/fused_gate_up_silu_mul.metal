@@ -422,6 +422,132 @@ kernel void fused_gate_up_silu_mul_gemm_f16_specialized(
     }
 }
 
+/// BF16 specialized variant of `fused_gate_up_silu_mul_gemm_f16_specialized`.
+/// Uses `simdgroup_bfloat8x8` (typedef of `simdgroup_matrix<bfloat, 8, 8>`,
+/// available in MSL since Metal 3.1; native MMA on M3+). Accumulators
+/// stay `simdgroup_float8x8` — bf16 → f32 accumulation is standard for
+/// matmul kernels and matches what cuda's bf16 GEMM does.
+kernel void fused_gate_up_silu_mul_gemm_bf16_specialized(
+    device       bfloat* output  [[buffer(0)]],
+    device const bfloat* input   [[buffer(1)]],
+    device const bfloat* weight  [[buffer(2)]],
+    uint3 tgid    [[threadgroup_position_in_grid]],
+    uint3 tid3    [[thread_position_in_threadgroup]],
+    uint  sg_lane [[thread_index_in_simdgroup]])
+{
+    const uint tid = tid3.x;
+    constexpr uint TILE = 8u;
+
+    const uint m_base = tgid.y * TILE;
+    const uint n_base = tgid.x * TILE;
+    if (m_base >= FUSED_MLP_M || n_base >= FUSED_MLP_N) return;
+
+    const uint M = FUSED_MLP_M;
+    const uint N = FUSED_MLP_N;
+    const uint K = FUSED_MLP_K;
+
+    const bool m_full = (m_base + TILE <= M);
+    const bool n_full = (n_base + TILE <= N);
+
+    simdgroup_float8x8 acc_gate = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 acc_up   = simdgroup_float8x8(0.0f);
+
+    threadgroup bfloat a_pad[TILE * TILE];
+    threadgroup bfloat b_pad[TILE * TILE];
+
+    for (uint k_base = 0u; k_base < K; k_base += TILE) {
+        const bool k_full = (k_base + TILE <= K);
+
+        simdgroup_bfloat8x8 A;
+        simdgroup_bfloat8x8 Bg;
+        simdgroup_bfloat8x8 Bu;
+
+        if (m_full && k_full) {
+            simdgroup_load(A, input + m_base * K + k_base, K);
+        } else {
+            for (uint t = tid; t < TILE * TILE; t += 32u) {
+                uint r = t / TILE;
+                uint c = t % TILE;
+                uint mr = m_base + r;
+                uint kc = k_base + c;
+                a_pad[r * TILE + c] = (mr < M && kc < K)
+                    ? input[mr * K + kc]
+                    : bfloat(0);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(A, a_pad, TILE);
+        }
+
+        if (n_full && k_full) {
+            simdgroup_load(Bg, weight + n_base * K + k_base, K, ulong2(0, 0), true);
+        } else {
+            for (uint t = tid; t < TILE * TILE; t += 32u) {
+                uint r = t / TILE;
+                uint c = t % TILE;
+                uint nr = n_base + r;
+                uint kc = k_base + c;
+                b_pad[r * TILE + c] = (nr < N && kc < K)
+                    ? weight[nr * K + kc]
+                    : bfloat(0);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(Bg, b_pad, TILE, ulong2(0, 0), true);
+        }
+        simdgroup_multiply_accumulate(acc_gate, A, Bg, acc_gate);
+
+        if (n_full && k_full) {
+            simdgroup_load(Bu, weight + (N + n_base) * K + k_base, K, ulong2(0, 0), true);
+        } else {
+            for (uint t = tid; t < TILE * TILE; t += 32u) {
+                uint r = t / TILE;
+                uint c = t % TILE;
+                uint nr = N + n_base + r;
+                uint kc = k_base + c;
+                b_pad[r * TILE + c] = (nr < 2u * N && kc < K)
+                    ? weight[nr * K + kc]
+                    : bfloat(0);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_load(Bu, b_pad, TILE, ulong2(0, 0), true);
+        }
+        simdgroup_multiply_accumulate(acc_up, A, Bu, acc_up);
+    }
+
+    threadgroup bfloat c_pad[TILE * TILE];
+    threadgroup float  gate_scratch[TILE * TILE];
+    threadgroup float  up_scratch  [TILE * TILE];
+
+    simdgroup_store(acc_gate, gate_scratch, TILE);
+    simdgroup_store(acc_up,   up_scratch,   TILE);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = tid; t < TILE * TILE; t += 32u) {
+        float g = gate_scratch[t];
+        float u = up_scratch[t];
+        float v = silu_f(g) * u;
+        c_pad[t] = bfloat(v);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (m_full && n_full) {
+        for (uint t = tid; t < TILE * TILE; t += 32u) {
+            uint r = t / TILE;
+            uint c = t % TILE;
+            output[(m_base + r) * N + (n_base + c)] = c_pad[r * TILE + c];
+        }
+    } else {
+        for (uint t = tid; t < TILE * TILE; t += 32u) {
+            uint r = t / TILE;
+            uint c = t % TILE;
+            uint mr = m_base + r;
+            uint nc = n_base + c;
+            if (mr < M && nc < N) {
+                output[mr * N + nc] = c_pad[r * TILE + c];
+            }
+        }
+    }
+}
+
 // ============================================================================
 // fused_gate_up_silu_mul_decode_f16_specialized
 // ============================================================================
@@ -628,6 +754,158 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
             const float u = up_result[tm];
             const float silu_g = g / (1.0f + exp(-g));
             output[out_row + tm] = half(silu_g * u);
+        }
+    }
+}
+
+/// BF16 specialized variant of the M=1 decode fused MLP. Direct
+/// translation of `..._decode_f16_specialized` with `bfloat` device
+/// pointers and `bfloat` thread-local buffers; accumulators stay
+/// f32 (matching the f16 variant's accumulation semantics).
+kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
+    device       bfloat* output  [[buffer(0)]],
+    device const bfloat* input   [[buffer(1)]],
+    device const bfloat* weight  [[buffer(2)]],
+    uint3 tid     [[threadgroup_position_in_grid]],
+    uint3 lid     [[thread_position_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    if (FUSED_MLP_DECODE_M != 1u) return;
+
+    constexpr int BM = 1;
+    constexpr int BN = 8;
+    constexpr int SM = 1;
+    constexpr int SN = 32;
+    constexpr int TM = 4;
+    constexpr int TN = 4;
+    constexpr int threadsM = BM * SM;
+    constexpr int threadsN = BN * SN;
+    constexpr int blockM   = threadsM * TM;
+    constexpr int blockN   = threadsN * TN;
+
+    const uint N = FUSED_MLP_DECODE_N;
+    const uint K = FUSED_MLP_DECODE_K;
+    const uint matrix_ld = K;
+
+    thread float gate_result[TM] = {0};
+    thread float up_result  [TM] = {0};
+    thread bfloat in_buf [TN];
+    thread bfloat gate_buf[TN];
+    thread bfloat up_buf  [TN];
+
+    const int thrM = SN != 32 ? int(simd_lid) / SN : 0;
+    const int thrN = SN != 32 ? int(simd_lid) % SN : int(simd_lid);
+
+    const int sgN = BN != 1 ? int(simd_gid) % BN : 0;
+    const int simdM = BN != 1 ? SM * (int(simd_gid) / BN) : SM * int(simd_gid);
+    const int simdN = BN != 1 ? SN * (int(simd_gid) % BN) : 0;
+
+    int bm = (simdM + thrM) * TM;
+    int bn = (simdN + thrN) * TN;
+
+    int out_row = int(tid.x) * blockM + bm;
+    if (out_row >= int(N)) return;
+
+    const int N_int = int(N);
+    out_row = out_row + TM <= N_int ? out_row : N_int - TM;
+
+    device const bfloat* gate_mat = weight + uint(out_row) * matrix_ld;
+    device const bfloat* up_mat   = weight + (N + uint(out_row)) * matrix_ld;
+
+    const int K_int = int(K);
+    const int n_iter = K_int / blockN;
+    const int last_iter = blockN * n_iter;
+    const int leftover = K_int - last_iter;
+
+    for (int i = 0; i < n_iter; ++i) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+            in_buf[tn] = input[bn + tn];
+        }
+
+        int mat_offset = 0;
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_buf[tn] = gate_mat[mat_offset + bn + tn];
+                up_buf[tn]   = up_mat  [mat_offset + bn + tn];
+            }
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
+                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+            }
+            mat_offset += int(matrix_ld);
+        }
+
+        bn += blockN;
+    }
+
+    if (leftover > 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+            in_buf[tn] = (bn + tn < K_int) ? input[bn + tn] : bfloat(0);
+        }
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_buf[tn] = (bn + tn < K_int)
+                    ? gate_mat[tm * int(matrix_ld) + bn + tn]
+                    : bfloat(0);
+                up_buf[tn] = (bn + tn < K_int)
+                    ? up_mat  [tm * int(matrix_ld) + bn + tn]
+                    : bfloat(0);
+            }
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
+                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+            }
+        }
+    }
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int tm = 0; tm < TM; tm++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+            gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
+            up_result[tm]   += simd_shuffle_down(up_result[tm], sn);
+        }
+    }
+
+    threadgroup float tgp_gate[BN * (blockM + TM)];
+    threadgroup float tgp_up  [BN * (blockM + TM)];
+
+    threadgroup float* gate_results = tgp_gate + sgN * (blockM + TM) + bm;
+    threadgroup float* up_results   = tgp_up   + sgN * (blockM + TM) + bm;
+    if (thrN == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            gate_results[tm] = gate_result[tm];
+            up_results[tm]   = up_result[tm];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgN == 0 && thrN == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int sgn = 1; sgn < BN; sgn++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                gate_result[tm] += tgp_gate[sgn * (blockM + TM) + bm + tm];
+                up_result[tm]   += tgp_up  [sgn * (blockM + TM) + bm + tm];
+            }
+        }
+
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            const float g = gate_result[tm];
+            const float u = up_result[tm];
+            const float silu_g = g / (1.0f + exp(-g));
+            output[out_row + tm] = bfloat(silu_g * u);
         }
     }
 }

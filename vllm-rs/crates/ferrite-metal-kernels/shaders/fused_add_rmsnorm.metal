@@ -188,6 +188,49 @@ kernel void fused_add_rmsnorm_f16_specialized(
     }
 }
 
+/// BF16 specialized variant. Mirror of `fused_add_rmsnorm_f16_specialized`
+/// — same function-constant bag, same reduction structure, same
+/// in-place semantics; the only differences are the `bfloat` binding
+/// types and the `bfloat(...)` casts on writeback.
+kernel void fused_add_rmsnorm_bf16_specialized(
+    device       bfloat* residual [[buffer(0)]],
+    device       bfloat* delta    [[buffer(1)]],
+    device const bfloat* weight   [[buffer(2)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (gid >= FUSED_ARN_M) return;
+
+    threadgroup float shared_sum[1024];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
+        float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float s = r + d;
+        residual[gid * FUSED_ARN_HIDDEN_SIZE + i] = bfloat(s);
+        local_sum += s * s;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
+
+    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
+        float s = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float w = float(weight[i]);
+        delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = bfloat((s / rms) * w);
+    }
+}
+
 /// Optimized variant with vectorized loads (half4) for better memory bandwidth
 /// Requires N to be multiple of 4
 kernel void fused_add_rmsnorm_f16_vec4(

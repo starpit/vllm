@@ -71,3 +71,20 @@ kernel void embed_f16_specialized(
         dst[i] = src[i];
     }
 }
+
+/// BF16 specialized variant — pure gather, no reductions, no casts;
+/// the only difference from the f16 path is binding type.
+kernel void embed_bf16_specialized(
+    device       bfloat* out     [[buffer(0)]],   // [num_tokens, hidden_size]
+    device const bfloat* table   [[buffer(1)]],   // [vocab_size, hidden_size]
+    device const uint*   indices [[buffer(2)]],   // [num_tokens]
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= EMBED_M) return;
+    uint idx = indices[tid];
+    device const bfloat* src = table + idx * EMBED_HIDDEN_SIZE;
+    device       bfloat* dst = out   + tid * EMBED_HIDDEN_SIZE;
+    for (uint i = 0; i < EMBED_HIDDEN_SIZE; i++) {
+        dst[i] = src[i];
+    }
+}

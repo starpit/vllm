@@ -2146,6 +2146,152 @@ mod tests {
         }
     }
 
+    /// BF16 fused MLP golden — exercises both shader variants:
+    /// `..._gemm_bf16_specialized` (M >= 2, uses `simdgroup_bfloat8x8`
+    /// MMA tiles) and `..._decode_bf16_specialized` (M=1 GEMV-style).
+    /// Validates that Metal's `simdgroup_matrix<bfloat,8,8>` runs on
+    /// this hardware and produces values within bf16 tolerance of the
+    /// cpu reference.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_mlp_bf16_matches_cpu_golden() {
+        for m in [64usize, 16usize, 1usize] {
+            run_fused_mlp_bf16_check(m);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_fused_mlp_bf16_check(m: usize) {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let n: usize = MlpProbe::INTERMEDIATE_SIZE;
+        let k: usize = MlpProbe::Q_SIZE;
+        assert_eq!(n % 8, 0);
+        assert_eq!(k % 8, 0);
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<MlpProbe>(
+                KernelId::FusedGateUpSiluMul,
+                m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("fused_mlp bf16 pipeline");
+
+        let input_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+        let weight_data: Vec<f32> = (0..(2 * n) * k)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.3)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf16_data: Vec<half::bf16> =
+                data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf16_data.as_slice());
+            let buf =
+                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf16_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let input_buf = alloc_bf16(&device, &input_data);
+        let weight_buf = alloc_bf16(&device, &weight_data);
+        let output_buf = alloc_zero_bf16(&device, m * n);
+
+        let (threadgroups, threads_per_threadgroup) = if m == 1 {
+            (
+                MTLSize::new((n as u64).div_ceil(4), 1, 1),
+                MTLSize::new(256, 1, 1),
+            )
+        } else {
+            (
+                MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
+                MTLSize::new(32, 1, 1),
+            )
+        };
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let input_bf16: Vec<f32> = input_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let weight_bf16: Vec<f32> = weight_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+
+        let gate_w = &weight_bf16[0..n * k];
+        let up_w = &weight_bf16[n * k..2 * n * k];
+        let mut gate = vec![0.0_f32; m * n];
+        let mut up = vec![0.0_f32; m * n];
+        cpu_golden::gemm(&input_bf16, gate_w, &mut gate, m, k, n);
+        cpu_golden::gemm(&input_bf16, up_w, &mut up, m, k, n);
+        let mut output_cpu = vec![0.0_f32; m * n];
+        cpu_golden::fused_gate_up_silu_mul(&gate, &up, &mut output_cpu);
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, output_cpu.len());
+
+        // bf16 has 7-bit mantissa vs fp16's 10-bit; loosen the
+        // tolerance correspondingly. Reduction over K=16 tile gives
+        // O(K * eps_bf16) cumulative error.
+        let tol: f32 = 2e-2;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "fused_mlp_bf16 m={m} [{i}] metal={} cpu={} diff={}",
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn run_fused_mlp_check(m: usize) {
         use crate::cpu_golden;

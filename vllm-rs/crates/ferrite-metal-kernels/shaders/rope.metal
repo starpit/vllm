@@ -348,6 +348,85 @@ kernel void rope_append_f16_specialized(
     v_dst[d] = v_row[d];
 }
 
+/// BF16 specialized variant — same dispatch shape, function constants,
+/// rotation math, and paged-cache layout as the f16 variant. Bindings
+/// switch to `device bfloat*`; the cos_sin cache must be uploaded as
+/// bf16 too (`upload_via_gpuweights` honors the dtype passed in).
+kernel void rope_append_bf16_specialized(
+    device       bfloat* q_inout      [[buffer(0)]],
+    device       bfloat* k_inout      [[buffer(1)]],
+    device       bfloat* v_inout      [[buffer(2)]],
+    device const bfloat* cos_sin      [[buffer(3)]],
+    device const uint*   positions    [[buffer(4)]],
+    device const uint*   slot_mapping [[buffer(5)]],
+    device       bfloat* kv_cache_k   [[buffer(6)]],
+    device       bfloat* kv_cache_v   [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid    [[thread_position_in_threadgroup]])
+{
+    const uint t        = tg_pos.x;
+    const uint q_head   = tg_pos.y;
+    const uint d        = tid.x;
+    const uint head_dim = ROPE_HEAD_DIM;
+    const uint rot_dim  = ROPE_ROT_DIM;
+    const uint half_dim = rot_dim / 2;
+    const uint num_q    = ROPE_NUM_Q_HEADS;
+    const uint num_kv   = ROPE_NUM_KV_HEADS;
+    const uint block_sz = ROPE_BLOCK_SIZE;
+    const uint group_r  = num_q / num_kv;
+
+    if (q_head >= num_q || d >= head_dim) return;
+
+    const uint pos = positions[t];
+    device const bfloat* cos_row = cos_sin + pos * rot_dim;
+    device const bfloat* sin_row = cos_sin + pos * rot_dim + half_dim;
+
+    const uint q_dim = num_q * head_dim;
+    device bfloat* q_row = q_inout + t * q_dim + q_head * head_dim;
+    if (d < half_dim) {
+        const float c  = float(cos_row[d]);
+        const float s  = float(sin_row[d]);
+        const float x0 = float(q_row[d]);
+        const float x1 = float(q_row[half_dim + d]);
+        q_row[d]            = bfloat(x0 * c - x1 * s);
+        q_row[half_dim + d] = bfloat(x1 * c + x0 * s);
+    }
+
+    if (q_head % group_r != 0) return;
+    const uint kv_head = q_head / group_r;
+    const uint kv_dim  = num_kv * head_dim;
+    device bfloat* k_row = k_inout + t * kv_dim + kv_head * head_dim;
+    device bfloat* v_row = v_inout + t * kv_dim + kv_head * head_dim;
+
+    if (d < half_dim) {
+        const float c  = float(cos_row[d]);
+        const float s  = float(sin_row[d]);
+        const float x0 = float(k_row[d]);
+        const float x1 = float(k_row[half_dim + d]);
+        k_row[d]            = bfloat(x0 * c - x1 * s);
+        k_row[half_dim + d] = bfloat(x1 * c + x0 * s);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    const uint slot         = slot_mapping[t];
+    const uint block_id     = slot / block_sz;
+    const uint block_offset = slot % block_sz;
+    const uint kv_blk_stride  = num_kv * block_sz * head_dim;
+    const uint kv_head_stride = block_sz * head_dim;
+    const uint kv_tok_stride  = head_dim;
+    device bfloat* k_dst = kv_cache_k
+        + block_id     * kv_blk_stride
+        + kv_head      * kv_head_stride
+        + block_offset * kv_tok_stride;
+    device bfloat* v_dst = kv_cache_v
+        + block_id     * kv_blk_stride
+        + kv_head      * kv_head_stride
+        + block_offset * kv_tok_stride;
+
+    k_dst[d] = k_row[d];
+    v_dst[d] = v_row[d];
+}
+
 /// BFloat16 variant of interleaved RoPE
 kernel void rope_interleaved_bf16(
     device bfloat* query [[buffer(0)]],

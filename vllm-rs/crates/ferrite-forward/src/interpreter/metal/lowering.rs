@@ -4,10 +4,10 @@
 //! Pure CPU code. No Metal device required, no kernel dispatch — just
 //! a structural translation that:
 //!
-//! 1. Statically unrolls `Loop(count, body_len)` over the loop body
-//!    (CUDA's runtime-`layer_offset` interpreter has no analogue on
-//!    Metal: every layer's commands are pre-baked into the bucket's
-//!    ICB).
+//! 1. Statically unrolls `Loop(count, body_len)` over the loop body —
+//!    each iteration's `iter` index is added to per-instruction
+//!    `layer` literals at weight-binding time (Metal mirror of the
+//!    cuda interpreter's `ctx.layer_offset = iter` pattern).
 //! 2. Drops metadata-only instructions (`Reshape`, `Alias`, `Free`)
 //!    that don't emit a Metal dispatch.
 //! 3. For each compute instruction, picks the right `KernelId`,
@@ -99,20 +99,22 @@ pub fn lower<W: CanonicalParams>(
                         remaining: instructions.len().saturating_sub(body_start),
                     })?;
                 let body = &instructions[body_start..body_end];
-                // Static unroll — every iteration's per-instruction
-                // weight resolution carries `layer_offset = iter` into
-                // the WtFn lookup, but in `Instruction<W>` the layer
-                // index lives directly on each variant (Gemm carries
-                // its own `layer`, etc.). The lowering pass is
-                // structural — the layer's value comes from the
-                // emitted tape, not from the runtime `layer_offset` —
-                // so unrolling here is just `count` repetitions of the
-                // body. The per-iteration layer numbering must already
-                // be baked into the body by the codegen that emitted
-                // the tape (the macro's `colored_slot_map()` stage).
-                for _ in 0..count_usize {
+                // Static unroll. Mirrors the cuda interpreter's
+                // `ctx.layer_offset = iter` pattern (`instr.rs:689` and
+                // friends): each variant's compile-time `layer`
+                // literal is added to the iteration index at WtFn
+                // resolution time, so `Loop(22, body)` over a body that
+                // names `layer = 0` resolves layer 0..21 across the 22
+                // iterations. Pass `iter as u32` into `lower_one` so
+                // the weight lookups bake the right per-layer offset.
+                for iter in 0..count_usize {
                     for (offset, inst) in body.iter().enumerate() {
-                        if let Some(cmd) = lower_one(inst, body_start + offset, bucket_m)? {
+                        if let Some(cmd) = lower_one(
+                            inst,
+                            body_start + offset,
+                            bucket_m,
+                            iter as u32,
+                        )? {
                             commands.push(cmd);
                         }
                     }
@@ -120,7 +122,7 @@ pub fn lower<W: CanonicalParams>(
                 i = body_end;
             }
             other => {
-                if let Some(cmd) = lower_one(other, i, bucket_m)? {
+                if let Some(cmd) = lower_one(other, i, bucket_m, 0)? {
                     commands.push(cmd);
                 }
                 i += 1;
@@ -138,10 +140,21 @@ pub fn lower<W: CanonicalParams>(
 /// Lower one non-`Loop` instruction. Returns `None` for metadata-only
 /// instructions (`Reshape`/`Alias`/`Free`) that don't emit a Metal
 /// dispatch.
+///
+/// `layer_offset` is the enclosing `Loop`'s iteration index (0 for
+/// straight-line code). Combined with each variant's compile-time
+/// `layer` literal at weight-binding time, this matches the cuda
+/// interpreter's `let layer = ctx.layer_offset + layer;` pattern in
+/// `instr.rs`. Without this, every iteration of a `Loop(N, body)`
+/// emits identical commands and every per-layer weight lookup
+/// resolves to layer 0 — which wedges the model on layer 0's norms,
+/// projections, RoPE caches, and KV-cache slots, producing nonsense
+/// logits at the end of the chain.
 fn lower_one<W: CanonicalParams>(
     inst: &Instruction<W>,
     index: usize,
     bucket_m: u32,
+    layer_offset: u32,
 ) -> Result<Option<LoweredCommand<W>>, LoweringError> {
     use Instruction as I;
 
@@ -199,7 +212,7 @@ fn lower_one<W: CanonicalParams>(
                 Binding::Weight {
                     kind: WeightBundleKind::RmsNorm(*wt_fn),
                     which: WeightTensor::Weight,
-                    layer: *layer,
+                    layer: *layer + layer_offset,
                     binding_index: 2,
                 },
             ],
@@ -228,7 +241,7 @@ fn lower_one<W: CanonicalParams>(
                     Binding::Weight {
                         kind: WeightBundleKind::RmsNorm(*wt_fn),
                         which: WeightTensor::Weight,
-                        layer: *layer,
+                        layer: *layer + layer_offset,
                         binding_index: 2,
                     },
                 ],
@@ -263,7 +276,7 @@ fn lower_one<W: CanonicalParams>(
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer(*wt_fn),
                         which: WeightTensor::Weight,
-                        layer: *layer,
+                        layer: *layer + layer_offset,
                         binding_index: 2,
                     },
                 ],
@@ -328,7 +341,7 @@ fn lower_one<W: CanonicalParams>(
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer(*wt_fn),
                         which: WeightTensor::Weight,
-                        layer: *layer,
+                        layer: *layer + layer_offset,
                         binding_index: 2,
                     },
                 ],
@@ -378,7 +391,7 @@ fn lower_one<W: CanonicalParams>(
                     Binding::Weight {
                         kind: WeightBundleKind::CosSin(*cos_sin_fn),
                         which: WeightTensor::Weight,
-                        layer: *layer,
+                        layer: *layer + layer_offset,
                         binding_index: 3,
                     },
                     Binding::Runtime {
@@ -390,11 +403,11 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 5,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheK { layer: *layer },
+                        kind: RuntimeBindingKind::KvCacheK { layer: *layer + layer_offset },
                         binding_index: 6,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheV { layer: *layer },
+                        kind: RuntimeBindingKind::KvCacheV { layer: *layer + layer_offset },
                         binding_index: 7,
                     },
                 ],
@@ -439,11 +452,11 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 3,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheK { layer: *layer },
+                        kind: RuntimeBindingKind::KvCacheK { layer: *layer + layer_offset },
                         binding_index: 4,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheV { layer: *layer },
+                        kind: RuntimeBindingKind::KvCacheV { layer: *layer + layer_offset },
                         binding_index: 5,
                     },
                 ],

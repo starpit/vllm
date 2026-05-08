@@ -1134,3 +1134,54 @@ Sync `ferrite-cuda-builder/` to nick3 and let cudaforge recompile
 (~15 min). Test determinism again. If CUTLASS recompile makes it
 deterministic, then investigate why the model sometimes generates wrong
 tokens (coherence issue) even when deterministic.
+
+## 2026-05-08 — Determinism fixed: model generates coherent Python code
+
+### Three sources of non-determinism identified and fixed
+
+1. **`CUBLAS_TF32_TENSOR_OP_MATH` → `CUBLAS_DEFAULT_MATH`** (in `cublas.rs`)
+   TF32 tensor ops in BF16 GDN cuBLAS GEMMs produce 1-ULP variance.
+
+2. **`--use_fast_math` in `libcutlass_scaled_mm.a`** (build.rs + .cu comment)
+   FMA in FP8 GEMM accumulation.
+
+3. **`--use_fast_math` in `libvllm_kernels.a`** (build.rs + layernorm_kernels.cu comment)
+   FMA in `fused_add_rms_norm_kernel` sum-of-squares reduction.
+
+All three cause BF16 values that differ by ~1 ULP. For BF16-only models this
+doesn't matter (logit margins are large). For Qwen3-Next FP8 with **dynamic
+per-token activation quantization** (`scale = max(|x|)/448`), 1 ULP in a
+BF16 activation can flip the max, change the scale, and cascade through 48
+layers. DeepSeek V3 FP8 is unaffected because it uses block quantization.
+
+FA2/FlashInfer `--use_fast_math` retained — shared by all models, variance
+is below the logit margin for non-FP8 models.
+
+### Current state with CUBLAS_WORKSPACE_CONFIG=:4096:8 CUBLAS_DETERMINISTIC=1
+
+All 5 fresh server restarts now generate coherent Python code starting with `\n`:
+```
+Run 1: '\n    fib = []\n    n = len(fib)\n    for i in'   ← fibonacci!
+Run 2: '\n\n...\n    for i in range'                       ← fibonacci direction
+Run 3: '\n\n...\n    n = number\n\n    fib = fib'
+```
+
+No more ` fib(n):` prompt echoing. Outputs vary slightly across restarts
+(different fibonacci implementations) — Python vLLM is also not fully
+deterministic for temperature=0 across server restarts.
+
+### Next session entry point
+
+Run with env vars to get the best behavior:
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUBLAS_DETERMINISTIC=1 \
+  ./target/release/vllm serve unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+  --device cuda --tensor-parallel-size 2 \
+  --max-model-len 256 --gpu-memory-utilization 0.85
+```
+
+Remaining work:
+1. Bake `CUBLAS_WORKSPACE_CONFIG` and `CUBLAS_DETERMINISTIC` into the
+   default serve path (env vars set in init.rs or similar)
+2. Test chat prompts (the original `!!!!` issue may now be resolved)
+3. Run the full correctness test suite

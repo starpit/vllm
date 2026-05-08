@@ -9519,9 +9519,14 @@ impl Worker for FerriteWorker {
                 model.head_dim() as usize,
                 GpuDType::F16,
                 |bytes| {
+                    // KV cache is GPU-only (no CPU touches between
+                    // forwards). StorageModePrivate avoids the
+                    // unified-memory first-touch cost that
+                    // StorageModeShared pays on each fresh cmdbuf
+                    // (~3s/forward observed at TinyLlama).
                     let buffer = mtl_device.new_buffer(
                         bytes as u64,
-                        metal::MTLResourceOptions::StorageModeShared,
+                        metal::MTLResourceOptions::StorageModePrivate,
                     );
                     Ok(RawGpuMem::from_buffer(buffer))
                 },

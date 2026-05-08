@@ -517,12 +517,46 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             guard
                 .worker
                 .run_bucket_per_step_debug(bucket_idx, &self.device, queue)?;
+        } else if std::env::var_os("FERRITE_METAL_PER_STEP_CMDBUF").is_some() {
+            // Same per-step semantics but no eprintln — used to
+            // measure whether the per-cmdbuf isolation is what makes
+            // per-step debug fast. Each step is its own cmdbuf with
+            // its own commit + wait_until_completed.
+            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+            let t0 = std::time::Instant::now();
+            guard
+                .worker
+                .run_bucket_per_step_silent(bucket_idx, &self.device, queue)?;
+            if trace {
+                eprintln!(
+                    "[forward bucket={} num_tokens={} per_step] total={:?}",
+                    bucket_idx,
+                    inputs.num_tokens,
+                    t0.elapsed(),
+                );
+            }
         } else {
+            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+            let t_pre = std::time::Instant::now();
             let cb = queue.new_command_buffer();
             guard.worker.run_bucket(bucket_idx, &self.device, cb)?;
+            let encoded = t_pre.elapsed();
             cb.commit();
+            let committed = t_pre.elapsed();
             cb.wait_until_completed();
+            let waited = t_pre.elapsed();
             let status = cb.status();
+            if trace {
+                eprintln!(
+                    "[forward bucket={} num_tokens={}] encode={:?} commit={:?} wait={:?} status={:?}",
+                    bucket_idx,
+                    inputs.num_tokens,
+                    encoded,
+                    committed - encoded,
+                    waited - committed,
+                    status,
+                );
+            }
             if status != MTLCommandBufferStatus::Completed {
                 return Err(ForwardError::ExecutionFailed(status));
             }

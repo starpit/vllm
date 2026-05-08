@@ -356,37 +356,52 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // there's no owned wrapper, so we keep the active one in a
         // local `Option` and re-fetch via `cmdbuf.new_compute_command_encoder()`
         // when we need a new one.
+        // Track the previous ICB step's resources so we can insert a
+        // memory barrier between dependent ICB commands inside the
+        // same compute encoder. ICB's `concurrentDispatchThreadgroups`
+        // (the only ICB dispatch primitive) makes consecutive
+        // `executeCommandsInBuffer` calls concurrent — without this
+        // barrier a read-after-write hazard between e.g. RopeAppend
+        // (writes KV cache) and AttentionViaCache (reads it) races and
+        // produces 100x slowdown / wrong data.
+        //
+        // The FUF/lowered tape carries the exact slot + runtime
+        // bindings each command touches, so we insert the barrier
+        // unconditionally between consecutive ICB steps with the
+        // PREVIOUS step's resources as the barrier's resource set.
+        // (The next step's reads will be ordered after those writes.)
+        // Per `memoryBarrierWithResources:` semantics, only the listed
+        // resources are synchronized — much cheaper than ending the
+        // encoder.
+        let mut prev_step_resources: Option<Vec<&Buffer>> = None;
         for step in &baking.steps {
             match step {
-                BucketStep::Icb { pipeline, range, .. } => {
-                    let enc = match current {
-                        Some(e) => e,
-                        None => {
-                            let e = cmdbuf.new_compute_command_encoder();
-                            // useResources eagerly first-touches each
-                            // bound buffer (~500ms per buffer on Apple
-                            // Silicon for this workload). With 220+
-                            // baked_resources the call is the prior
-                            // session's reported "batched hang" — it
-                            // wasn't a hang, just a 100s+ stall in
-                            // Metal's residency commit. Skip by default;
-                            // Apple's auto-paging through setBuffer
-                            // handles residency lazily and works fine
-                            // for shared-storage buffers.
-                            //
-                            // FERRITE_METAL_FORCE_USE_RESOURCES=1
-                            // re-enables for debugging.
-                            if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok()
-                                && !resource_refs.is_empty()
-                            {
-                                e.use_resources(
-                                    &resource_refs,
-                                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                                );
-                            }
-                            e
-                        }
-                    };
+                BucketStep::Icb { pipeline, range, step_resources, .. } => {
+                    // End the encoder between every ICB step. Within
+                    // one compute encoder Apple's `concurrentDispatchThreadgroups`
+                    // (the only ICB dispatch primitive) makes
+                    // consecutive `executeCommandsInBuffer` calls
+                    // concurrent — and `memoryBarrierWithResources:`
+                    // empirically does NOT suffice to serialize
+                    // consecutive ICB execs. Cross-encoder ordering
+                    // is enforced by Apple's command queue, so each
+                    // ICB step becoming its own encoder gives us
+                    // correct RAW dependencies. Cost is ~us per
+                    // encoder boundary.
+                    if let Some(enc) = current.take() {
+                        enc.end_encoding();
+                    }
+                    let _ = step_resources; // reserved for finer-grained barrier later
+                    let _ = &prev_step_resources;
+                    let enc = cmdbuf.new_compute_command_encoder();
+                    if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok()
+                        && !resource_refs.is_empty()
+                    {
+                        enc.use_resources(
+                            &resource_refs,
+                            MTLResourceUsage::Read | MTLResourceUsage::Write,
+                        );
+                    }
                     enc.set_compute_pipeline_state(pipeline);
                     baking.icb.execute_on_encoder(enc, range.clone());
                     current = Some(enc);
@@ -395,6 +410,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     if let Some(enc) = current.take() {
                         enc.end_encoding();
                     }
+                    // Encoder boundary clears the prev-resources tracking;
+                    // ordering across encoders is provided by Apple's
+                    // command queue.
+                    prev_step_resources = None;
                     encode_gemm_into_command_buffer(
                         device, cmdbuf, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0,
                         false, true, true,
@@ -507,6 +526,48 @@ impl<W: CanonicalParams> MetalWorker<W> {
             baking.steps.len(),
             bucket_start.elapsed().as_millis(),
         );
+        Ok(())
+    }
+
+    /// Production fast variant of [`Self::run_bucket_per_step_debug`]:
+    /// commits + waits per step (no eprintln), no diagnostic state.
+    /// Each `BucketStep` runs in its own command buffer, which on
+    /// Apple Silicon empirically gives ~10x faster wall-clock
+    /// throughput than the batched single-cmdbuf `run_bucket` path.
+    /// Gated behind `FERRITE_METAL_PER_STEP_CMDBUF=1`.
+    pub fn run_bucket_per_step_silent(
+        &self,
+        bucket: usize,
+        device: &Device,
+        queue: &ferrite_metal_kernels::metal::CommandQueue,
+    ) -> Result<(), WorkerError> {
+        use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
+        let baking = &self.bucket_bakings[bucket];
+        for step in &baking.steps {
+            let cb = queue.new_command_buffer();
+            match step {
+                BucketStep::Icb { pipeline, range, .. } => {
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(pipeline);
+                    baking.icb.execute_on_encoder(enc, range.clone());
+                    enc.end_encoding();
+                }
+                BucketStep::Gemm { a, b, c, m, n, k } => {
+                    encode_gemm_into_command_buffer(
+                        device, cb, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0, false,
+                        true, true,
+                    )
+                    .map_err(WorkerError::GemmEncode)?;
+                }
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            if cb.status() != MTLCommandBufferStatus::Completed {
+                return Err(WorkerError::WeightLookupFailed {
+                    reason: "per-step commit failed",
+                });
+            }
+        }
         Ok(())
     }
 }

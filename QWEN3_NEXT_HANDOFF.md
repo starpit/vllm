@@ -863,6 +863,23 @@ Reproducer state on nick3 (`/home/nickm/qwen3-next-fresh/vllm-rs`):
 # curl response: {"text":"n\n    a=0\n    b=0\n    if n<=0:..."}
 ```
 
-Phase complete. No open follow-ups — model loads, serves, and returns
-coherent output at TP=2 on the unsloth Qwen3-Coder-Next-FP8-Dynamic
-checkpoint.
+Phase complete for code-completion use case. Known open issue:
+
+**Chat-template-formatted prompts produce degenerate output at FP8+TP=2.**
+`vllm chat` or `/v1/chat/completions` with the Qwen3 chat template
+(`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n`) produces
+`!` (token 0) repeated for many inputs. Raw code completion via
+`/v1/completions` works. Isolated to FP8+TP=2 specifically — BF16 Qwen3-Next
+goldens pass cleanly.
+
+Traced: all intermediate activations (embed → GDN → gated-attn → MoE, all 48
+layers) are non-zero and reasonable. The degeneration occurs in the final
+lm_head/sampler step for certain activation patterns produced by chat-formatted
+prefill. The `why?` chat prompt gives `'?\n\n\n'` while `def fibonacci(n):`
+chat gives `'!!!!'` — so it's input-pattern specific.
+
+Not yet determined whether this is: (a) FP8 quantization accuracy loss in the
+unsloth checkpoint for chat-token activation patterns, or (b) a Ferrite
+numerical accumulation issue at TP=2. Would need Python vLLM comparison to
+isolate. The golden test suite covers code-completion only (coherence check)
+and passes.

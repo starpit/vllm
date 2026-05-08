@@ -82,6 +82,17 @@ pub enum BucketStep {
         /// is firing); coalesced ICB ranges share one pipeline so this
         /// kernel id is constant across the range.
         kernel: KernelId,
+        /// Resources THIS step's kernel(s) actually bind. Subset of
+        /// the bucket's `baked_resources`. Used for per-encoder
+        /// `useResources` so we don't pay O(N) for buffers this
+        /// dispatch doesn't read.
+        ///
+        /// Empirically: passing all 200+ bucket-wide resources to
+        /// `useResources` on each per-step encoder cost ~3s/dispatch
+        /// for `AttentionViaCache` on Apple Silicon (debug binary).
+        /// Restricting to just the kernel's bound buffers drops it to
+        /// ~200us.
+        step_resources: Vec<Buffer>,
     },
     Gemm {
         /// Activation buffer bound to MPS' `leftMatrix` (shape
@@ -352,9 +363,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         Some(e) => e,
                         None => {
                             let e = cmdbuf.new_compute_command_encoder();
-                            // Residency call must precede every
-                            // dispatch on a fresh encoder.
-                            if !resource_refs.is_empty() {
+                            // useResources eagerly first-touches each
+                            // bound buffer (~500ms per buffer on Apple
+                            // Silicon for this workload). With 220+
+                            // baked_resources the call is the prior
+                            // session's reported "batched hang" — it
+                            // wasn't a hang, just a 100s+ stall in
+                            // Metal's residency commit. Skip by default;
+                            // Apple's auto-paging through setBuffer
+                            // handles residency lazily and works fine
+                            // for shared-storage buffers.
+                            //
+                            // FERRITE_METAL_FORCE_USE_RESOURCES=1
+                            // re-enables for debugging.
+                            if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok()
+                                && !resource_refs.is_empty()
+                            {
                                 e.use_resources(
                                     &resource_refs,
                                     MTLResourceUsage::Read | MTLResourceUsage::Write,
@@ -399,7 +423,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
     ) -> Result<(), WorkerError> {
         use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
         let baking = &self.bucket_bakings[bucket];
-        let resource_refs: Vec<&ResourceRef> = baking
+        // Bucket-wide resource pool (used as fallback / for diagnostic
+        // only). The per-step path now uses each step's own
+        // `step_resources` subset for its `useResources` call.
+        let _bucket_resource_refs: Vec<&ResourceRef> = baking
             .baked_resources
             .iter()
             .map(|b| {
@@ -413,15 +440,34 @@ impl<W: CanonicalParams> MetalWorker<W> {
             let cb = queue.new_command_buffer();
             let kind: String;
             match step {
-                BucketStep::Icb { pipeline, range, kernel } => {
+                BucketStep::Icb { pipeline, range, kernel, step_resources } => {
                     kind = format!("Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
+                    let _ = step_resources; // see note below
                     let enc = cb.new_compute_command_encoder();
-                    if !resource_refs.is_empty() {
-                        enc.use_resources(
-                            &resource_refs,
-                            MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        );
+                    // SKIP useResources by default in the per-step
+                    // path. Empirically on Apple Silicon (M-series, 16GB
+                    // unified memory), `useResources` does eager
+                    // first-touch / residency commit work that costs
+                    // ~500ms per fresh buffer. With 6 distinct KV-cache
+                    // / runtime buffers per AttentionViaCache call,
+                    // that's ~3s/dispatch. Skipping the call relies on
+                    // Apple's automatic on-demand paging through
+                    // setBuffer (the buffers were already touched
+                    // earlier in the forward by rope_append / write_runtime_inputs
+                    // / Q-projection Gemm), which costs ~200us total.
+                    //
+                    // Set FERRITE_METAL_FORCE_USE_RESOURCES=1 to
+                    // re-enable the original behavior for debugging.
+                    if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok() {
+                        let step_refs: Vec<&ResourceRef> =
+                            step_resources.iter().map(|b| b as &ResourceRef).collect();
+                        if !step_refs.is_empty() {
+                            enc.use_resources(
+                                &step_refs,
+                                MTLResourceUsage::Read | MTLResourceUsage::Write,
+                            );
+                        }
                     }
                     enc.set_compute_pipeline_state(pipeline);
                     baking.icb.execute_on_encoder(enc, range.clone());
@@ -574,19 +620,33 @@ fn bake_bucket<W: CanonicalParams>(
         // pipelines are refcounted — same key returns same handle
         // from the cache).
         let recorded_at = cmd_idx;
+        let step_resources_for_cmd: Vec<Buffer> =
+            bound_refs.iter().map(|(b, _, _)| (*b).clone()).collect();
         match steps.last_mut() {
             Some(BucketStep::Icb {
                 pipeline: prev,
                 range,
+                step_resources,
                 ..
             }) if same_pipeline(prev, &pipeline) => {
                 range.end = recorded_at + 1;
+                // Coalesced ICB range — extend its resource set.
+                let mut seen: Vec<*const _> =
+                    step_resources.iter().map(|b| b.as_ptr() as *const _).collect();
+                for buf in &step_resources_for_cmd {
+                    let p = buf.as_ptr() as *const _;
+                    if !seen.contains(&p) {
+                        seen.push(p);
+                        step_resources.push(buf.clone());
+                    }
+                }
             }
             _ => {
                 steps.push(BucketStep::Icb {
                     pipeline,
                     range: recorded_at..(recorded_at + 1),
                     kernel: cmd.kernel,
+                    step_resources: step_resources_for_cmd,
                 });
             }
         }

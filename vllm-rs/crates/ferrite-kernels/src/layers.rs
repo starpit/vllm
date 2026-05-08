@@ -633,6 +633,37 @@ pub struct Fp8Linear {
 }
 
 impl Fp8Linear {
+    /// Zero-alloc placeholder with dangling tensors. Used by
+    /// [`crate::layers_attn_gated::Fp8GatedAttentionLayer`]'s BF16-fallback
+    /// path to populate its always-present `qkv_proj` / `o_proj` slots
+    /// on layers in the compressed-tensors `ignore` list. The outer
+    /// forward short-circuits to the BF16 peer before any of these
+    /// fields are read.
+    pub fn dummy() -> Self {
+        use ferrite_cuda_core::dtype::DType;
+        let empty = || unsafe {
+            GpuTensor::new(
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                &[0, 0],
+                DType::Fp8E4m3,
+            )
+        };
+        let empty_scale = || unsafe {
+            GpuTensor::new(
+                std::ptr::NonNull::<u8>::dangling().as_ptr(),
+                &[1],
+                DType::F32,
+            )
+        };
+        Self {
+            weight: empty(),
+            weight_scale: empty_scale(),
+            input_scale: None,
+            bias: None,
+            output_dtype: DType::BF16,
+        }
+    }
+
     /// Forward: quantize activations → CUTLASS FP8 GEMM → output in output_dtype.
     ///
     /// Uses fused CUTLASS `cutlass_scaled_mm` (single kernel launch) with per-row

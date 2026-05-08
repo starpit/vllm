@@ -839,7 +839,10 @@ pub fn storage_format_for_weight(
     //
     // `OpKind::Moe` carries one logical `moe[layer]` weight whose
     // underlying experts are matmul-quantizable in V3/Kimi K2 FP8
-    // checkpoints, so it counts as reaching a matmul.
+    // checkpoints, so it counts as reaching a matmul. Same for
+    // `OpKind::GatedAttention` (Qwen3-Next full-attention) whose
+    // aggregate accessor fronts FP8 q/k/v/o projections on the
+    // unsloth `Qwen3-Coder-Next-FP8-Dynamic` checkpoint.
     //
     // MLX-affine additionally quantizes the embedding table on the
     // disk (`model.embed_tokens.{weight,scales,biases}` triple —
@@ -851,6 +854,7 @@ pub fn storage_format_for_weight(
     for node in &fuf.nodes {
         let consumer = node.op == OpKind::Gemm
             || node.op == OpKind::Moe
+            || node.op == OpKind::GatedAttention
             || (affine_method && node.op == OpKind::Embed);
         if !consumer {
             continue;

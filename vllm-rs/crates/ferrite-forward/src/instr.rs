@@ -40,7 +40,7 @@ use ferrite_kernels::layers::AffineQuantEmbedding;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
-use ferrite_kernels::layers_attn_gated::Qwen3NextGatedAttentionLayer;
+use ferrite_kernels::layers_attn_gated::{Fp8GatedAttentionLayer, Qwen3NextGatedAttentionLayer};
 use ferrite_kernels::layers_gdn::Qwen3NextGdnLayer;
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, Fp8SharedFusedMoELayer,
@@ -547,6 +547,17 @@ pub enum Instruction<W> {
         u32,
         u32,
         WtFn<W, Qwen3NextGatedAttentionLayer>,
+        CosSinFn<W>,
+    ),
+    /// FP8 peer of `GatedAttention`. Same carrier shape; the weight
+    /// accessor resolves to `Fp8GatedAttentionLayer`, which internally
+    /// routes per-layer BF16-fallback via a runtime dtype probe at load
+    /// time (compressed-tensors `ignore` list).
+    Fp8GatedAttention(
+        u32,
+        u32,
+        u32,
+        WtFn<W, Fp8GatedAttentionLayer>,
         CosSinFn<W>,
     ),
     CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
@@ -2310,6 +2321,56 @@ impl<W: CanonicalParams> Instruction<W> {
                             &mut ctx.device.caching,
                         )
                         .expect("GatedAttention all_reduce failed");
+                }
+                dump::dump_tile(
+                    "gated_attn.out",
+                    layer,
+                    &out.as_gpu_tensor(),
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::Fp8GatedAttention(
+                in_slot,
+                out_slot,
+                layer,
+                weight_fn,
+                cos_sin_fn,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                dump::dump_tile("gated_attn.in", layer, &v, ctx.device.compute_stream);
+                let w = (weight_fn)(ctx.wm, layer);
+                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let out = w.forward(
+                    v,
+                    ctx.fwd.positions,
+                    ctx.fwd.slot_mapping,
+                    ctx.fwd.cu_seqlens_q,
+                    ctx.fwd.seqused_k,
+                    ctx.fwd.block_table,
+                    ctx.fwd.max_seqlen_q,
+                    ctx.fwd.max_seqlen_k,
+                    ctx.fwd.kv_cache,
+                    layer as usize,
+                    cos_sin,
+                    ctx.device,
+                );
+                // TP sync point. `Fp8GatedAttentionLayer::load` shards the
+                // FP8 qkv_proj column-parallel (via `Fp8Linear::load_concat_sharded`)
+                // and `o_proj` row-parallel (via `Fp8Linear::load_sharded` dim=1),
+                // so the layer's output is a per-rank partial sum that must
+                // be all-reduced before re-entering the residual stream. The
+                // BF16-fallback path is also tp-sharded and produces the
+                // same partial-sum structure, so one collective covers both.
+                #[cfg(feature = "nccl")]
+                if let Some(group) = ctx.fwd.tp_group {
+                    group
+                        .all_reduce_inplace_promote(
+                            out.as_gpu_tensor(),
+                            &mut ctx.device.caching,
+                        )
+                        .expect("Fp8GatedAttention all_reduce failed");
                 }
                 dump::dump_tile(
                     "gated_attn.out",

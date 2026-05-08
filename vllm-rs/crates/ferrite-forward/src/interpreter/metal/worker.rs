@@ -871,6 +871,23 @@ fn bake_bucket<W: CanonicalParams>(
             record_resource(&a.buffer, &mut baked_seen, &mut baked_resources);
             record_resource(&b.buffer, &mut baked_seen, &mut baked_resources);
             record_resource(&c.buffer, &mut baked_seen, &mut baked_resources);
+            if std::env::var_os("FERRITE_METAL_BAKE_DEBUG").is_some() {
+                eprintln!(
+                    "[bake bucket={} cmd={}] kernel=Gemm m={} n={} k={} \
+                     a=(buf=0x{:x},off={}) b=(buf=0x{:x},off={}) c=(buf=0x{:x},off={})",
+                    bucket_index,
+                    cmd_idx,
+                    dims.m,
+                    dims.n,
+                    dims.k,
+                    a.buffer.as_ptr() as usize,
+                    a.offset,
+                    b.buffer.as_ptr() as usize,
+                    b.offset,
+                    c.buffer.as_ptr() as usize,
+                    c.offset,
+                );
+            }
             steps.push(BucketStep::Gemm {
                 a,
                 b,

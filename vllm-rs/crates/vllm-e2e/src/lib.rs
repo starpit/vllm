@@ -188,6 +188,12 @@ impl TestModels {
     #[cfg(feature = "cuda")]
     pub const QWEN3_NEXT_DEV: &str = "Goekdeniz-Guelmez/Qwen3Next-Dev";
 
+    /// Qwen3-Coder-Next FP8-Dynamic (80B-A3B, compressed-tensors per-channel
+    /// FP8). Requires TP=2 on nick3 (2×L40S 46 GB). Tests the
+    /// `Fp8GatedAttentionRefImpl` + `Fp8SharedFusedMoeRefImpl` joint path.
+    #[cfg(feature = "cuda")]
+    pub const QWEN3_CODER_NEXT_FP8: &str = "unsloth/Qwen3-Coder-Next-FP8-Dynamic";
+
     // -----------------------------------------------------------------------
     // MLX-only models (metal backend)
     // -----------------------------------------------------------------------

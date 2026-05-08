@@ -3521,7 +3521,7 @@ fn build_chat_logprobs(
                         .unwrap_or_else(|| format!("<token_{}>", tlp.token_id));
                     protocol::ChatCompletionLogProb {
                         token: t,
-                        logprob: tlp.logprob as f64,
+                        logprob: finite_logprob(tlp.logprob),
                         bytes: None,
                     }
                 })
@@ -3529,7 +3529,7 @@ fn build_chat_logprobs(
 
             protocol::ChatCompletionLogProbsContent {
                 token: token_str,
-                logprob: lp.sampled.logprob as f64,
+                logprob: finite_logprob(lp.sampled.logprob),
                 bytes: None,
                 top_logprobs,
             }
@@ -3542,6 +3542,20 @@ fn build_chat_logprobs(
 }
 
 /// Convert engine logprobs to completion logprobs format.
+/// Clamp a logprob to a finite f64. JSON does not represent ±inf, so
+/// serde_json serializes `f64::NEG_INFINITY` as `null`, which breaks
+/// golden-test deserialization into `HashMap<String, f64>`. Matches
+/// Python vLLM's convention of replacing -inf with a large negative
+/// finite value (`-1e38`).
+#[inline]
+fn finite_logprob(logprob: f32) -> f64 {
+    if logprob.is_infinite() || logprob.is_nan() {
+        -1e38
+    } else {
+        logprob as f64
+    }
+}
+
 fn build_completion_logprobs(
     logprobs: &[vllm_common::LogprobsOutput],
     tokenizer: Option<&Tokenizer>,
@@ -3560,7 +3574,7 @@ fn build_completion_logprobs(
         text_offset.push(offset);
         offset += token_str.len() as u32;
 
-        token_logprobs.push(Some(lp.sampled.logprob as f64));
+        token_logprobs.push(Some(finite_logprob(lp.sampled.logprob)));
         tokens.push(token_str);
 
         if lp.top_logprobs.is_empty() {
@@ -3573,7 +3587,7 @@ fn build_completion_logprobs(
                     let t = tokenizer
                         .and_then(|tok| tok.decode(&[tlp.token_id], false).ok())
                         .unwrap_or_else(|| format!("<token_{}>", tlp.token_id));
-                    (t, tlp.logprob as f64)
+                    (t, finite_logprob(tlp.logprob))
                 })
                 .collect();
             top_logprobs.push(Some(top));

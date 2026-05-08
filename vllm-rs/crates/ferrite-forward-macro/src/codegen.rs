@@ -1656,8 +1656,49 @@ fn emit_fingerprint_check(
                 ..
             })
     );
-    let fp8_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
-    let fp8_marker_tensor = fp8_marker_tensor.as_str();
+    // FP8 marker sniff — must fire on hybrid archs like Qwen3-Next where
+    // (a) layer 0 is a GDN / linear_attn layer without `self_attn.q_proj`,
+    // and (b) the final full-attn layer (e.g. layer 47) can land on the
+    // checkpoint's `ignore` list and be shipped dense BF16 even in an
+    // otherwise FP8 model. Probing a single hardcoded layer misses both
+    // cases — the BF16 variant's exclusion then silently accepts an FP8
+    // checkpoint and the runtime picks the wrong MoE loader. Enumerate
+    // a handful of candidate layers and reject on any hit.
+    let fp8_candidate_layers: Vec<usize> = {
+        let n = num_hidden_layers as usize;
+        let mut v = vec![0usize];
+        if n >= 2 {
+            v.push(n - 1);
+        }
+        if n >= 4 {
+            v.push(n / 2);
+            v.push((n / 4).saturating_sub(1).max(1));
+            v.push((3 * n / 4).min(n - 1));
+        }
+        v.sort();
+        v.dedup();
+        v
+    };
+    let fp8_marker_tensors: Vec<String> = fp8_candidate_layers
+        .iter()
+        .map(|l| format!("model.layers.{l}.{fp_leaf}.weight_scale"))
+        .collect();
+    let fp8_marker_tensor_refs: Vec<&str> =
+        fp8_marker_tensors.iter().map(|s| s.as_str()).collect();
+
+    // Multi-layer positive sniff for the variant's `suffix`. Same
+    // rationale as the FP8 marker scan — a hybrid arch can omit the
+    // probed tensor at the hardcoded `last_layer` (Qwen3-Next's
+    // Qwen3-Coder checkpoint ignores layer 47's full-attention in
+    // its FP8 `ignore` list, so layer 47 ships dense `.weight` and
+    // lacks `.weight_scale`). Require at least one of the candidate
+    // layers to carry the expected suffix.
+    let positive_candidate_tensors: Vec<String> = fp8_candidate_layers
+        .iter()
+        .map(|l| format!("model.layers.{l}.{fp_leaf}.{suffix}"))
+        .collect();
+    let positive_candidate_tensor_refs: Vec<&str> =
+        positive_candidate_tensors.iter().map(|s| s.as_str()).collect();
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     // GGUF's on-disk loader (`GgufGpuWeights::load`) pre-shards
@@ -2056,7 +2097,7 @@ fn emit_fingerprint_check(
                         && shape[1] == #embed_hidden_lit => {}
                 _ => return false,
             }
-            if !gw.contains(#last_tensor) {
+            if ![ #(#positive_candidate_tensor_refs),* ].iter().any(|t| gw.contains(t)) {
                 return false;
             }
             if gw.contains(#one_past_tensor) {
@@ -2076,10 +2117,13 @@ fn emit_fingerprint_check(
             }
             // FP8 marker exclusion — reject dense/AWQ/GPTQ/CT/BNB4
             // fingerprints when the checkpoint ships FP8's
-            // `.weight_scale` sibling. The FP8 variant itself keys
-            // off `.weight_scale` as its positive suffix, so this
-            // exclusion runs only for non-FP8 variants.
-            if !#fp8_exclusion && gw.contains(#fp8_marker_tensor) {
+            // `.weight_scale` sibling at ANY of the candidate layers.
+            // The FP8 variant itself keys off `.weight_scale` as its
+            // positive suffix, so this exclusion runs only for non-FP8
+            // variants.
+            if !#fp8_exclusion && [
+                #(#fp8_marker_tensor_refs),*
+            ].iter().any(|t| gw.contains(t)) {
                 return false;
             }
             #qweight_shape_gate
@@ -3787,13 +3831,55 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             }
         }
         FieldLoad::Fp8Linear { prefixes } => {
+            use crate::tp_lowering::{ShardKind, shard_kind_for_dotted_prefix};
             if prefixes.len() == 1 {
                 let prefix = &prefixes[0];
+                let kind = shard_kind_for_dotted_prefix(prefix);
+                match (sharded, kind) {
+                    (true, ShardKind::ShardDim0) => quote! {
+                        let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                            ::ferrite_kernels::layers::Fp8Linear::load_sharded(
+                                gw,
+                                #prefix,
+                                0usize,
+                                tp_rank as usize,
+                                #tp_world_lit as usize,
+                                __fp8_dtype,
+                            )?
+                        );
+                    },
+                    (true, ShardKind::ShardDim1) => quote! {
+                        let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                            ::ferrite_kernels::layers::Fp8Linear::load_sharded(
+                                gw,
+                                #prefix,
+                                1usize,
+                                tp_rank as usize,
+                                #tp_world_lit as usize,
+                                __fp8_dtype,
+                            )?
+                        );
+                    },
+                    _ => quote! {
+                        let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
+                            ::ferrite_kernels::layers::Fp8Linear::load(
+                                gw,
+                                #prefix,
+                                __fp8_dtype,
+                            )?
+                        );
+                    },
+                }
+            } else if sharded {
+                // Fused column-parallel FP8 concat (fused QKV / gate_up).
+                // Row-parallel concat doesn't exist in any current arch.
                 quote! {
                     let #name = ::ferrite_kernels::layers::Fp8AnyLinear::Std(
-                        ::ferrite_kernels::layers::Fp8Linear::load(
+                        ::ferrite_kernels::layers::Fp8Linear::load_concat_sharded(
                             gw,
-                            #prefix,
+                            &[ #(#prefixes),* ],
+                            tp_rank as usize,
+                            #tp_world_lit as usize,
                             __fp8_dtype,
                         )?
                     );
@@ -4062,6 +4148,16 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             let norm_topk_prob = *norm_topk_prob;
+            // Same pattern as the dense linear shards elsewhere in this
+            // function: `tp_rank` is the runtime rank variable, `tp_world_lit`
+            // is the compile-time world-size literal. At tp=1 (`!sharded`)
+            // the generated call passes 0/1 explicitly — `Fp8SharedFusedMoELayer::load`
+            // short-circuits the sharding branches in that case.
+            let tp_call = if sharded {
+                quote! { tp_rank as usize, #tp_world_lit as usize }
+            } else {
+                quote! { 0usize, 1usize }
+            };
             quote! {
                 let #name = ::ferrite_kernels::layers_moe::Fp8SharedFusedMoELayer::load(
                     gw,
@@ -4073,6 +4169,7 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                     #hidden_size,
                     #norm_topk_prob,
                     __fp8_dtype,
+                    #tp_call,
                     stream,
                 )?;
             }
@@ -4525,9 +4622,47 @@ fn emit_layered_load_body(
                     vision_zero_prefix_ref,
                     decoder_zero_prefix_ref,
                 );
+                // The new TP-sharded variants from Phase 7b live in
+                // `ferrite-forward::loaders` (`load_layered_fp8_linear_sharded`
+                // / `load_layered_fp8_linear_concat_sharded`) but their callers
+                // assume the dec_root-less `layer_weight_path(layer, suffix)`
+                // path helper, while HEAD's unsharded loader takes an explicit
+                // `dec_root`. Reconciling those is follow-up work — for now we
+                // keep HEAD's tp=1 codegen and only wire the sharded helpers
+                // when `sharded` is on for a `ShardKind` we know about.
+                let kind = shard_kind_for_dotted_prefix(&prefixes[0]);
+                match (sharded, kind) {
+                    (true, ShardKind::ShardDim0) => quote! {
+                        ::ferrite_forward::load_layered_fp8_linear_sharded(
+                            gw, #n_lit, #suffix, 0usize,
+                            tp_rank as usize, #tp_world_lit as usize,
+                            __fp8_dtype,
+                        )?
+                    },
+                    (true, ShardKind::ShardDim1) => quote! {
+                        ::ferrite_forward::load_layered_fp8_linear_sharded(
+                            gw, #n_lit, #suffix, 1usize,
+                            tp_rank as usize, #tp_world_lit as usize,
+                            __fp8_dtype,
+                        )?
+                    },
+                    _ => quote! {
+                        ::ferrite_forward::load_layered_fp8_linear(
+                            gw, #n_lit, #dec_root_lit, #suffix, __fp8_dtype,
+                        )?
+                    },
+                }
+            } else if sharded {
+                let suffixes: Vec<&str> = prefixes
+                    .iter()
+                    .map(|p| layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref))
+                    .collect();
                 quote! {
-                    ::ferrite_forward::load_layered_fp8_linear(
-                        gw, #n_lit, #dec_root_lit, #suffix, __fp8_dtype,
+                    ::ferrite_forward::load_layered_fp8_linear_concat_sharded(
+                        gw, #n_lit,
+                        &[ #(#suffixes),* ],
+                        tp_rank as usize, #tp_world_lit as usize,
+                        __fp8_dtype,
                     )?
                 }
             } else {
@@ -4850,6 +4985,11 @@ fn emit_layered_load_body(
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             let norm_topk_prob = *norm_topk_prob;
+            let tp_call = if sharded {
+                quote! { tp_rank as usize, #tp_world_lit as usize }
+            } else {
+                quote! { 0usize, 1usize }
+            };
             quote! {
                 (0u32..#n_lit)
                     .map(|layer: u32| -> ::anyhow::Result<_> {
@@ -4863,6 +5003,7 @@ fn emit_layered_load_body(
                             #hidden_size,
                             #norm_topk_prob,
                             __fp8_dtype,
+                            #tp_call,
                             stream,
                         )
                     })

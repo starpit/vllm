@@ -441,6 +441,36 @@ pub fn load_layered_fp8_linear(
         .collect()
 }
 
+/// Tensor-parallel layered FP8 Linear load — dim 0 = column-parallel
+/// (q/k/v/gate/up), dim 1 = row-parallel (o/down). See
+/// [`ferrite_kernels::layers::Fp8Linear::load_sharded`] for the per-dim
+/// scale + bias semantics. `world == 1` yields byte-equivalent behavior
+/// with [`load_layered_fp8_linear`].
+#[cfg(feature = "cuda")]
+pub fn load_layered_fp8_linear_sharded(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffix: &str,
+    dim: usize,
+    rank: usize,
+    world: usize,
+    output_dtype: DType,
+) -> Result<Vec<Fp8AnyLinear>> {
+    (0..n_layers)
+        .map(|layer| {
+            Fp8Linear::load_sharded(
+                gw,
+                &layer_weight_path(layer, suffix),
+                dim,
+                rank,
+                world,
+                output_dtype,
+            )
+            .map(Fp8AnyLinear::Std)
+        })
+        .collect()
+}
+
 #[cfg(feature = "cuda")]
 pub fn load_layered_fp8_linear_concat(
     gw: &mut GpuWeights,
@@ -454,6 +484,28 @@ pub fn load_layered_fp8_linear_concat(
             let paths = concat_paths_for_layer(root, layer, suffixes);
             let refs = as_str_refs(&paths);
             Fp8Linear::load_concat(gw, &refs, output_dtype).map(Fp8AnyLinear::Std)
+        })
+        .collect()
+}
+
+/// Column-parallel sharded FP8 concat (fused QKV / gate_up). See
+/// [`ferrite_kernels::layers::Fp8Linear::load_concat_sharded`]. `world == 1`
+/// short-circuits to [`load_layered_fp8_linear_concat`].
+#[cfg(feature = "cuda")]
+pub fn load_layered_fp8_linear_concat_sharded(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    suffixes: &[&str],
+    rank: usize,
+    world: usize,
+    output_dtype: DType,
+) -> Result<Vec<Fp8AnyLinear>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(layer, suffixes);
+            let refs = as_str_refs(&paths);
+            Fp8Linear::load_concat_sharded(gw, &refs, rank, world, output_dtype)
+                .map(Fp8AnyLinear::Std)
         })
         .collect()
 }

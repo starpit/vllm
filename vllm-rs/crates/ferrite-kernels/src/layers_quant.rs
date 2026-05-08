@@ -1970,6 +1970,291 @@ impl Fp8Linear {
             output_dtype,
         })
     }
+
+    /// Tensor-parallel sharded `Fp8Linear` load from a serialized FP8 checkpoint.
+    ///
+    /// * `dim = 0` — column-parallel: shard weight along dim 0 (output features).
+    ///   Per-channel `weight_scale` shards along dim 0 too; per-tensor scale is
+    ///   replicated. Bias (if any) shards along dim 0.
+    /// * `dim = 1` — row-parallel: shard weight along dim 1 (input features).
+    ///   Per-channel `weight_scale` (indexed by output features, which aren't
+    ///   sharded) is REPLICATED unchanged; per-tensor scale is replicated. Bias
+    ///   is added once per output after the NCCL all-reduce, so it is kept on
+    ///   rank 0 only (matches Python's `RowParallelLinear`).
+    ///
+    /// Supports only pre-quantized FP8 checkpoints — the online BF16→FP8 path
+    /// is not exercised at tp>1 yet. `world == 1` short-circuits to
+    /// byte-equivalent behavior with [`Self::load`].
+    pub fn load_sharded(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        dim: usize,
+        rank: usize,
+        world: usize,
+        output_dtype: DType,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            dim < 2,
+            "Fp8Linear::load_sharded: dim must be 0 or 1, got {dim}"
+        );
+        if world <= 1 {
+            return Self::load(weights, prefix, output_dtype);
+        }
+
+        let weight_name = format!("{prefix}.weight");
+        let scale_name = format!("{prefix}.weight_scale");
+        let input_scale_name = format!("{prefix}.input_scale");
+        let bias_name = format!("{prefix}.bias");
+        let stream = weights.stream();
+
+        let (_, w_dtype) = weights
+            .tensor_info(&weight_name)
+            .ok_or_else(|| anyhow::anyhow!("Fp8Linear::load_sharded: weight not found: {weight_name}"))?;
+        anyhow::ensure!(
+            w_dtype == DType::Fp8E4m3,
+            "Fp8Linear::load_sharded: online-quant (BF16→FP8) sharded load not supported; \
+             got weight dtype {w_dtype}"
+        );
+
+        let weight = weights.take_shard(&weight_name, dim, rank, world)?;
+
+        // Scale: shape is [1] / [1,1] (per-tensor) or [N] / [N,1] (per-channel).
+        // Per-tensor stays replicated. Per-channel shards with the weight when
+        // column-parallel; stays full on row-parallel (hidden/output channels
+        // aren't sharded on row-parallel).
+        let (scale_shape, _) = weights
+            .tensor_info(&scale_name)
+            .ok_or_else(|| anyhow::anyhow!("Fp8Linear::load_sharded: scale not found: {scale_name}"))?;
+        let scale_numel: usize = scale_shape.iter().product();
+        let scale_is_per_channel = scale_numel > 1;
+        let raw_scale = if scale_is_per_channel && dim == 0 {
+            weights.take_shard(&scale_name, 0, rank, world)?
+        } else {
+            weights.take(&scale_name)?
+        };
+        let weight_scale = ensure_f32_scale(raw_scale, stream)?;
+
+        let input_scale = if weights.contains(&input_scale_name) {
+            let raw = weights.take(&input_scale_name)?;
+            Some(ensure_f32_scale(raw, stream)?)
+        } else {
+            None
+        };
+
+        let bias = if weights.contains(&bias_name) {
+            match dim {
+                0 => Some(weights.take_shard(&bias_name, 0, rank, world)?),
+                1 if rank == 0 => Some(weights.take(&bias_name)?),
+                // Row-parallel bias on non-rank-0: drop (the bias is added
+                // once on rank 0 after the NCCL all-reduce).
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(Fp8Linear {
+            weight,
+            weight_scale,
+            input_scale,
+            bias,
+            output_dtype,
+        })
+    }
+
+    /// Column-parallel sharded concat load — fuses multiple FP8 projections
+    /// (e.g. shared expert `gate_proj` + `up_proj`) and shards each source's
+    /// output dim along `world` before copying into one packed per-rank
+    /// `[(sum out_i) / world, in]` buffer.
+    ///
+    /// Per-shard scales are fused the same way as [`Self::load_concat`]: per-
+    /// channel scales concatenate along dim 0; per-tensor scales collapse to
+    /// the max and the branches re-quantize against it. Serialized FP8 only —
+    /// the online-quant branch is not wired for tp>1 yet. `world == 1`
+    /// short-circuits to [`Self::load_concat`].
+    pub fn load_concat_sharded(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        rank: usize,
+        world: usize,
+        output_dtype: DType,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !prefixes.is_empty(),
+            "Fp8Linear::load_concat_sharded: no prefixes"
+        );
+        if world <= 1 {
+            return Self::load_concat(weights, prefixes, output_dtype);
+        }
+        let stream = weights.stream();
+
+        // Probe first prefix for shared in_features + dtype.
+        let first_weight_name = format!("{}.weight", prefixes[0]);
+        let (first_shape, first_dtype) = weights
+            .tensor_info(&first_weight_name)
+            .ok_or_else(|| anyhow::anyhow!("FP8 fused weight not found: {first_weight_name}"))?;
+        anyhow::ensure!(
+            first_dtype == DType::Fp8E4m3,
+            "Fp8Linear::load_concat_sharded: online-quant sharded fuse not supported; \
+             got weight dtype {first_dtype}"
+        );
+        anyhow::ensure!(first_shape.len() == 2, "FP8 fused weight must be 2D");
+        let in_features = first_shape[1];
+
+        // Per-shard full + per-rank out dims.
+        let mut full_outs = Vec::with_capacity(prefixes.len());
+        let mut per_rank_outs = Vec::with_capacity(prefixes.len());
+        for p in prefixes {
+            let wname = format!("{p}.weight");
+            let (shape, dt) = weights
+                .tensor_info(&wname)
+                .ok_or_else(|| anyhow::anyhow!("FP8 fused weight not found: {wname}"))?;
+            anyhow::ensure!(
+                dt == DType::Fp8E4m3 && shape.len() == 2 && shape[1] == in_features,
+                "Fp8Linear::load_concat_sharded: `{wname}` shape/dtype mismatch \
+                 (shape={shape:?}, dtype={dt}, expected in={in_features} Fp8E4m3)"
+            );
+            anyhow::ensure!(
+                shape[0].is_multiple_of(world),
+                "Fp8Linear::load_concat_sharded: `{wname}` out dim {} not divisible by world {world}",
+                shape[0]
+            );
+            full_outs.push(shape[0]);
+            per_rank_outs.push(shape[0] / world);
+        }
+        let total_out_per_rank: usize = per_rank_outs.iter().sum();
+
+        let elem = DType::Fp8E4m3.size_bytes();
+        let total_bytes = total_out_per_rank * in_features * elem;
+        let fused_ptr = unsafe { driver::mem_alloc(total_bytes)? };
+
+        let mut offset = 0usize;
+        for (i, p) in prefixes.iter().enumerate() {
+            let wname = format!("{p}.weight");
+            let bytes = per_rank_outs[i] * in_features * elem;
+            unsafe {
+                weights.take_shard_into(&wname, 0, rank, world, fused_ptr.add(offset), stream)?;
+            }
+            offset += bytes;
+        }
+        let fused_weight = unsafe {
+            GpuTensor::new(fused_ptr, &[total_out_per_rank, in_features], DType::Fp8E4m3)
+        };
+
+        // Per-shard scales.
+        let first_scale_name = format!("{}.weight_scale", prefixes[0]);
+        let (first_scale_shape, _) = weights
+            .tensor_info(&first_scale_name)
+            .ok_or_else(|| anyhow::anyhow!("FP8 fused scale not found: {first_scale_name}"))?;
+        let is_per_channel = first_scale_shape.iter().product::<usize>() > 1;
+
+        let merged_scale = if is_per_channel {
+            // Per-channel: shard each branch's scale along dim 0, then concat.
+            let total_scale_bytes = total_out_per_rank * 4;
+            let scale_ptr = unsafe { driver::mem_alloc(total_scale_bytes)? };
+            let mut f32_offset = 0usize;
+            for (i, p) in prefixes.iter().enumerate() {
+                let scale_name = format!("{p}.weight_scale");
+                let raw = weights.take_shard(&scale_name, 0, rank, world)?;
+                let shard = ensure_f32_scale(raw, stream)?;
+                let shard_bytes = per_rank_outs[i] * 4;
+                unsafe {
+                    driver::memcpy_dtod_async(
+                        scale_ptr.add(f32_offset),
+                        shard.raw_ptr(),
+                        shard_bytes,
+                        stream,
+                    )?;
+                }
+                f32_offset += shard_bytes;
+            }
+            unsafe { GpuTensor::new(scale_ptr, &[total_out_per_rank], DType::F32) }
+        } else {
+            // Per-tensor: take max of branch scalars, re-quantize branches
+            // whose scale differs — same as unsharded path, but the row
+            // window for re-quantization is the per-rank out dim.
+            let mut shard_scales = Vec::with_capacity(prefixes.len());
+            let mut max_scale = 0.0f32;
+            for p in prefixes {
+                let scale_name = format!("{p}.weight_scale");
+                let scale_cpu = weights.take_to_cpu_f32(&scale_name)?;
+                let s = scale_cpu.first().copied().unwrap_or(1.0);
+                if s > max_scale {
+                    max_scale = s;
+                }
+                shard_scales.push(s);
+            }
+            let mut row_offset = 0usize;
+            for (i, &shard_scale) in shard_scales.iter().enumerate() {
+                if (shard_scale - max_scale).abs() > 1e-12 {
+                    unsafe {
+                        crate::kernels::fp8_requantize_weight_rows(
+                            fused_weight,
+                            in_features,
+                            row_offset,
+                            per_rank_outs[i],
+                            shard_scale,
+                            max_scale,
+                            stream,
+                        );
+                    }
+                }
+                row_offset += per_rank_outs[i];
+            }
+            let scale_ptr = unsafe { driver::mem_alloc(4)? };
+            unsafe {
+                driver::memcpy_htod_async(
+                    scale_ptr,
+                    &max_scale as *const f32 as *const u8,
+                    4,
+                    stream,
+                )?;
+            }
+            unsafe { GpuTensor::new(scale_ptr, &[1], DType::F32) }
+        };
+
+        // Input scale (replicated across branches).
+        let input_scale_name = format!("{}.input_scale", prefixes[0]);
+        let input_scale = if weights.contains(&input_scale_name) {
+            let raw = weights.take(&input_scale_name)?;
+            Some(ensure_f32_scale(raw, stream)?)
+        } else {
+            None
+        };
+
+        // Column-parallel bias: shard each branch's bias along dim 0, concat.
+        let first_bias_name = format!("{}.bias", prefixes[0]);
+        let bias = if weights.contains(&first_bias_name) {
+            let (_, bias_dtype) = weights
+                .tensor_info(&first_bias_name)
+                .ok_or_else(|| anyhow::anyhow!("FP8 fused bias metadata missing"))?;
+            let bias_elem = bias_dtype.size_bytes();
+            let total_bias_bytes: usize =
+                per_rank_outs.iter().map(|n| n * bias_elem).sum();
+            let bias_ptr = unsafe { driver::mem_alloc(total_bias_bytes)? };
+            let mut boff = 0usize;
+            for (i, p) in prefixes.iter().enumerate() {
+                let bn = format!("{p}.bias");
+                unsafe {
+                    weights.take_shard_into(&bn, 0, rank, world, bias_ptr.add(boff), stream)?;
+                }
+                boff += per_rank_outs[i] * bias_elem;
+            }
+            Some(unsafe {
+                GpuTensor::new(bias_ptr, &[total_out_per_rank], bias_dtype)
+            })
+        } else {
+            None
+        };
+
+        Ok(Fp8Linear {
+            weight: fused_weight,
+            weight_scale: merged_scale,
+            input_scale,
+            bias,
+            output_dtype,
+        })
+    }
 }
 
 impl Fp8BlockLinear {

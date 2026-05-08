@@ -9842,6 +9842,27 @@ impl Worker for FerriteWorker {
         let vocab = logits.dim(1) as u32;
         let total_n = logits.dim(0) as u32;
 
+        // DIAGNOSTIC: peek at EACH row of logits. Tells us which
+        // rows have real values vs zeros.
+        if std::env::var_os("VLLM_DUMP_LOGITS").is_some() {
+            let buf = logits.metal_buffer();
+            for row_idx in 0..total_n.min(25) {
+                let row = unsafe {
+                    std::slice::from_raw_parts(
+                        (buf.contents() as *const half::f16)
+                            .add(row_idx as usize * vocab as usize),
+                        vocab as usize,
+                    )
+                };
+                let nonzero = row.iter().filter(|&&v| v.to_f32() != 0.0).count();
+                let head: Vec<f32> = row.iter().take(4).map(|v| v.to_f32()).collect();
+                eprintln!(
+                    "[diag-logits] row={} nonzero={}/{} first4={:?}",
+                    row_idx, nonzero, vocab, head,
+                );
+            }
+        }
+
         // Argmax over `[total_n, vocab]` → `[total_n]` u32. We
         // post-gather per-request last-token rows host-side rather
         // than emit a per-row gather kernel; greedy bring-up.

@@ -190,6 +190,18 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             })?;
             println!();
 
+            // DIAGNOSTIC: print token IDs + finish reason so we can
+            // see what the model actually produced (vs garbage tokens
+            // or EOS).
+            if std::env::var_os("VLLM_PRINT_TOKEN_IDS").is_some() {
+                eprintln!(
+                    "[diag] token_ids={:?} text={:?} finish_reason={:?}",
+                    output.outputs[0].token_ids,
+                    output.outputs[0].text,
+                    output.outputs[0].finish_reason,
+                );
+            }
+
             if let Some(s) = stats {
                 s.print(output.outputs[0].token_ids.len());
             }

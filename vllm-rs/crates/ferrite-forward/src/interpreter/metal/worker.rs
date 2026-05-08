@@ -464,6 +464,25 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 r
             })
             .collect();
+        // DIAGNOSTIC: stamp marker bytes into every arena slot at the
+        // start of the bucket. If the kernels write to these slots,
+        // the marker is overwritten. If we still see the marker after
+        // step N, kernel N didn't write to that slot (or wrote to a
+        // different buffer).
+        if std::env::var_os("VLLM_STAMP_ARENA").is_some() {
+            for (i, buf) in self.arena.iter().enumerate() {
+                let len_bytes = buf.length() as usize;
+                unsafe {
+                    let p = buf.contents() as *mut u8;
+                    for off in 0..len_bytes {
+                        *p.add(off) = 0xAA; // marker
+                    }
+                }
+                let _ = i;
+            }
+            eprintln!("[stamp] stamped 0xAA across {} arena slots", self.arena.len());
+        }
+
         let bucket_start = std::time::Instant::now();
         for (idx, step) in baking.steps.iter().enumerate() {
             let step_start = std::time::Instant::now();
@@ -518,8 +537,35 @@ impl<W: CanonicalParams> MetalWorker<W> {
             let status = cb.status();
             let total = step_start.elapsed();
             let gpu_us = total.as_micros().saturating_sub(encoded_at.as_micros());
+            // DIAGNOSTIC: dump non-zero / marker counts + hex bytes
+            // of slot start. Find which step actually writes, and
+            // what values it writes.
+            let arena_summary = if std::env::var_os("VLLM_DUMP_ARENA_PER_STEP").is_some() {
+                let mut s = String::new();
+                for (i, buf) in self.arena.iter().enumerate() {
+                    let len_bytes = buf.length() as usize;
+                    let row0 = unsafe {
+                        std::slice::from_raw_parts(
+                            buf.contents() as *const u8,
+                            len_bytes,
+                        )
+                    };
+                    let nz = row0.iter().filter(|&&v| v != 0).count();
+                    let marker = row0.iter().filter(|&&v| v == 0xAA).count();
+                    // First 8 bytes hex.
+                    let head: Vec<String> =
+                        row0.iter().take(8).map(|b| format!("{:02x}", b)).collect();
+                    s.push_str(&format!(
+                        " s{i}=nz{nz}/marker{marker}/{len_bytes}/[{}]",
+                        head.join(""),
+                    ));
+                }
+                s
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[step {idx}] {kind} encode={}us gpu={}us total={}us status={:?}",
+                "[step {idx}] {kind} encode={}us gpu={}us total={}us status={:?}{arena_summary}",
                 encoded_at.as_micros(),
                 gpu_us,
                 total.as_micros(),
@@ -561,6 +607,21 @@ impl<W: CanonicalParams> MetalWorker<W> {
         use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
         let baking = &self.bucket_bakings[bucket];
         let direct = std::env::var_os("FERRITE_METAL_DIRECT_DISPATCH").is_some();
+
+        // Stamp marker into arena (same as per-step debug) for the
+        // diagnostic dump.
+        if std::env::var_os("VLLM_STAMP_ARENA").is_some() {
+            for buf in self.arena.iter() {
+                let len_bytes = buf.length() as usize;
+                unsafe {
+                    let p = buf.contents() as *mut u8;
+                    for off in 0..len_bytes {
+                        *p.add(off) = 0xAA;
+                    }
+                }
+            }
+        }
+
         for step in &baking.steps {
             let cb = queue.new_command_buffer();
             match step {
@@ -604,6 +665,30 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 return Err(WorkerError::WeightLookupFailed {
                     reason: "per-step commit failed",
                 });
+            }
+            // DIAGNOSTIC: per-step arena dump (works in silent/direct
+            // path too).
+            if std::env::var_os("VLLM_DUMP_ARENA_PER_STEP").is_some() {
+                let kind = match step {
+                    BucketStep::Icb { kernel, range, .. } => {
+                        format!("Icb {:?} {:?}", kernel, range)
+                    }
+                    BucketStep::Gemm { m, n, k, .. } => format!("Gemm m={m} n={n} k={k}"),
+                };
+                let mut s = String::new();
+                for (i, buf) in self.arena.iter().enumerate() {
+                    let len_bytes = buf.length() as usize;
+                    let row0 = unsafe {
+                        std::slice::from_raw_parts(
+                            buf.contents() as *const u8,
+                            len_bytes,
+                        )
+                    };
+                    let nz = row0.iter().filter(|&&v| v != 0).count();
+                    let marker = row0.iter().filter(|&&v| v == 0xAA).count();
+                    s.push_str(&format!(" s{i}=nz{nz}/marker{marker}"));
+                }
+                eprintln!("[silent] {kind}{s}");
             }
         }
         Ok(())

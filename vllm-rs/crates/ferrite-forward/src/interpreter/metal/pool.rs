@@ -562,6 +562,23 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
+        // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
+        // us where in the chain values transition from real to zero.
+        if std::env::var_os("VLLM_DUMP_ARENA").is_some() {
+            for slot in 0..guard.worker.arena.len() {
+                let buf = &guard.worker.arena[slot];
+                let len_bytes = buf.length() as usize;
+                let row0 = unsafe {
+                    std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
+                };
+                let nonzero_bytes = row0.iter().filter(|&&v| v != 0).count();
+                eprintln!(
+                    "[diag-arena] slot={:3} bytes={} nonzero_bytes={}/{}",
+                    slot, len_bytes, nonzero_bytes, len_bytes,
+                );
+            }
+        }
+
         Ok(with_output(&guard.worker, bucket_idx))
     }
 
@@ -614,7 +631,9 @@ fn write_runtime_inputs(
             eprintln!("[runtime] seq_used_k = {:?} (len={})", s, s.len());
         }
     }
-    if std::env::var("FERRITE_METAL_STEP_DEBUG").is_ok() {
+    if std::env::var("FERRITE_METAL_STEP_DEBUG").is_ok()
+        || std::env::var("FERRITE_METAL_TRACE").is_ok()
+    {
         if let Some(s) = inputs.block_table {
             eprintln!(
                 "[runtime] block_table[0..min(8,len)] = {:?} (len={})",
@@ -622,7 +641,12 @@ fn write_runtime_inputs(
                 s.len(),
             );
         }
-        eprintln!("[runtime] num_tokens = {}", inputs.num_tokens);
+        eprintln!(
+            "[runtime] num_tokens = {} input_ids[0..min(8,len)] = {:?} positions[0..min(8,len)] = {:?}",
+            inputs.num_tokens,
+            &inputs.input_ids[..inputs.input_ids.len().min(8)],
+            &inputs.positions[..inputs.positions.len().min(8)],
+        );
     }
     if let Some(s) = inputs.block_table {
         write_slice("block_table", &runtime.block_table, s)?;

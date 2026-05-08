@@ -415,7 +415,7 @@ fn lower_one<W: CanonicalParams>(
                 kernel: KernelId::AttentionViaCache,
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
-                    threads_per_threadgroup: (1024, 1, 1),
+                    threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {

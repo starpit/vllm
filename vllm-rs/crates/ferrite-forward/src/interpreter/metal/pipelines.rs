@@ -1072,6 +1072,185 @@ mod tests {
         }
     }
 
+    /// M=64 single-sequence prefill test, matching the runtime
+    /// bucket size and `cu_seqlens_q = [0, num_real_tokens]` shape.
+    /// Catches bugs where the kernel works at small M but breaks at
+    /// the actual prefill scale (4 Q-tiles, 32 heads).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_contiguous_matches_cpu_golden_m64_single_seq() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = TinyLlamaProbe::HEAD_DIM as usize;
+        let num_q = TinyLlamaProbe::NUM_Q_HEADS as usize;
+        let num_kv = TinyLlamaProbe::NUM_KV_HEADS as usize;
+        let tile_q: usize = TinyLlamaProbe::PREFILL_TILE_Q as usize;
+
+        // Single sequence, 23 real tokens, padded to bucket_m=64.
+        // cu_seqlens_q = [0, 23]; padding tokens (23..63) get
+        // in_range=false → output 0.
+        let real_tokens: usize = 23;
+        let bucket_m: usize = 64;
+        let cu_seqlens_q: Vec<u32> = vec![0, real_tokens as u32];
+
+        let pipeline = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::AttentionPrefillContiguous, bucket_m as u32)
+            .expect("attention_prefill pipeline");
+
+        // Q/K/V at the bucket size — only the first `real_tokens` rows
+        // matter; padding rows can hold anything (kernel masks them).
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_f16(&device, &q_data);
+        let k_buf = alloc_f16(&device, &k_data);
+        let v_buf = alloc_f16(&device, &v_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let output_buf = alloc_zero_f16(&device, bucket_m * num_q * head_dim);
+
+        let num_q_tiles = bucket_m.div_ceil(tile_q);
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&k_buf), 0);
+        enc.set_buffer(3, Some(&v_buf), 0);
+        enc.set_buffer(4, Some(&cu_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q_tiles as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Round-trip Q/K/V through f16 for the reference, but truncate
+        // to `real_tokens` rows — the cpu_golden's seq_starts shape
+        // matches the runtime's single-sequence layout.
+        let f16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+        };
+        let q_f16 = f16_round(&q_data);
+        let k_f16 = f16_round(&k_data);
+        let v_f16 = f16_round(&v_data);
+
+        let seq_starts: Vec<usize> = cu_seqlens_q.iter().map(|&v| v as usize).collect();
+        let mut output_cpu = vec![0.0_f32; bucket_m * num_q * head_dim];
+        // The cpu_golden expects only `total = real_tokens` rows, but
+        // we sized the output buffer for `bucket_m`. Run the reference
+        // on the truncated view; padding rows stay 0 (matches kernel).
+        let q_real = &q_f16[..real_tokens * num_q * head_dim];
+        let k_real = &k_f16[..real_tokens * num_kv * head_dim];
+        let v_real = &v_f16[..real_tokens * num_kv * head_dim];
+        let mut output_cpu_real = vec![0.0_f32; real_tokens * num_q * head_dim];
+        cpu_golden::attention_prefill(
+            q_real,
+            k_real,
+            v_real,
+            &mut output_cpu_real,
+            &seq_starts,
+            num_q,
+            num_kv,
+            head_dim,
+            TinyLlamaProbe::ATTN_SCALE,
+        );
+        output_cpu[..real_tokens * num_q * head_dim].copy_from_slice(&output_cpu_real);
+
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_f16(&output_buf, output_cpu.len());
+
+        // Sanity: row 0 and row 22's outputs should DIFFER (they see
+        // different K/V context — row 0 only sees position 0, row 22
+        // sees positions 0..22 with non-trivial softmax weights).
+        let head0 = 0usize;
+        let row0_off = (0 * num_q + head0) * head_dim;
+        let row22_off = (22 * num_q + head0) * head_dim;
+        let row0 = &output_metal[row0_off..row0_off + 4];
+        let row22 = &output_metal[row22_off..row22_off + 4];
+        assert_ne!(
+            row0, row22,
+            "row 0 == row 22 — attention collapsed"
+        );
+
+        let tol: f32 = 1e-2; // larger tol — fp16 accumulation over 23 K positions
+        for i in 0..real_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "attn_prefill_m64[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
     /// Small `CanonicalParams` probe with `Q_SIZE` (= K, hidden) and
     /// `INTERMEDIATE_SIZE` (= N, MLP intermediate) sized to multiples
     /// of the fused-MLP shader's 8-element tile. Used by

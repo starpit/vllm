@@ -271,45 +271,28 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
-        // ── Fused gate-up SwiGLU MLP ───────────────────────────────
-        // TODO(metal-fused-mlp): the bound shader
-        // `fused_gate_up_silu_mul_f16_specialized` ONLY does the
-        // post-GEMM elementwise step (`silu(gate)*up` over
-        // `gate_up [M, 2*intermediate]`). The Metal port carries no
-        // upstream Gemm here — `in_slot` is the post-rmsnorm hidden
-        // state `[M, hidden_size]`, `wt_fn` is the packed
-        // `[gate|up] LinearLayer` weight, but no kernel actually
-        // computes `gate_up = in @ wt^T`. Cuda's
-        // `Instruction::FusedGateUpSiluMul` (instr.rs:1040) calls
-        // `LinearLayer::forward` (cuBLAS) then `silu_and_mul_fused`;
-        // CUTLASS EVT fuses both into one launch.
+        // ── Fused gate-up SwiGLU MLP (GEMM + SwiGLU in one dispatch) ──
         //
-        // The fix is a real MPP-based fused kernel:
-        //   `fused_gate_up_silu_mul_gemm_f16_specialized` using
-        //   `mpp::tensor_ops::matmul2d` (Metal 4, requires
-        //   `MTLLanguageVersion::Version4_0` + the
-        //   `MetalPerformancePrimitives` framework header) running
-        //   two matmuls into cooperative_tensors over the gate and
-        //   up halves of the packed weight, applying silu*mul in
-        //   registers, storing `[M, intermediate_size]`. See
-        //   `project_metal_fused_mlp_kernel.md` for the design.
+        // Dispatches `fused_gate_up_silu_mul_gemm_f16_specialized`,
+        // which does `output = silu(input @ W_gate^T) * (input @ W_up^T)`
+        // in one pass with intermediates kept in
+        // simdgroup-matrix accumulators. Tile shape is 8×8 per
+        // threadgroup (one simdgroup, 32 threads).
         //
-        // Until that lands this dispatch reads garbage in `buffer(1)`
-        // (hidden state instead of gate_up) and the model produces
-        // garbage logits. Documented as a known correctness bug; the
-        // lowering arm is left structurally intact so the rest of
-        // the worker compiles.
+        // Bindings: (out, in, weight) at indices 0/1/2. The kernel
+        // splits the packed `[gate|up]` weight `[2*N, K]` internally —
+        // gate rows [0, N), up rows [N, 2N).
         I::FusedGateUpSiluMul(in_slot, out_slot, layer, wt_fn) => {
-            // Output is `[M, intermediate_size]`; tile shape mirrors
-            // Gemm but the kernel writes silu(gate)*up in one pass.
             let inter = W::INTERMEDIATE_SIZE as u32;
-            let tg_x = bucket_m.div_ceil(GEMM_TILE_M);
-            let tg_y = inter.div_ceil(GEMM_TILE_N);
+            // Threadgroup grid: ceil(N / 8) along x, ceil(M / 8) along y.
+            let tg_x = inter.div_ceil(MLP_TILE);
+            let tg_y = bucket_m.div_ceil(MLP_TILE);
             LoweredCommand {
                 kernel: KernelId::FusedGateUpSiluMul,
                 dispatch: DispatchShape {
                     threadgroups: (tg_x, tg_y, 1),
-                    threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
+                    // 32 threads = 1 simdgroup per threadgroup.
+                    threads_per_threadgroup: (32, 1, 1),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -553,3 +536,9 @@ const GEMM_TILE_N: u32 = 16;
 /// `PREFILL_TILE_Q` query tokens for one head; chosen to fit the
 /// hand-rolled tile shader's K-axis budget.
 const PREFILL_TILE_Q: u32 = 16;
+
+/// Output tile dim for the fused MLP kernel
+/// (`fused_gate_up_silu_mul_gemm_f16_specialized`). One simdgroup
+/// per threadgroup writes an 8×8 output tile. Match the shader's
+/// `TILE` constant.
+const MLP_TILE: u32 = 8;

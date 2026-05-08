@@ -535,6 +535,71 @@ The architectural split (extract `ferrite-forward-ir` regular crate, move CUDA i
 
 **Models with no Metal impl coverage (separate gap):** Mixtral, Qwen-MoE, Qwen3-MoE (Moe op), DeepSeek-V2/V3 (MlaSplit op), CommandR (Mean op). These won't compile under metal feature until the missing Metal impls are added. Out of scope for TinyLlama path.
 
+### Phase 5.H — Fused MLP kernel (pre-M4 path landed; M4+ path TODO)
+
+The pre-M4 implementation of `fused_gate_up_silu_mul_gemm_f16_specialized`
+landed using `simdgroup_matrix<half, 8, 8>` MMA tiles (Metal 2.3+,
+every Apple Silicon GPU we target). The kernel does GEMM + SwiGLU in
+one dispatch with intermediates kept in simdgroup-matrix accumulators —
+no device-memory round-trip. Bindings: `(out, in, weight)` at
+`(buffer 0, 1, 2)`. Function constants: `(M, N, K)` at
+`(function_constant 0, 1, 2)`.
+
+**M4+ HIGH-PRIORITY FOLLOWUPS** — do these once the pre-M4 path is
+correctness-clean on TinyLlama (`feedback_mpp_confirmed.md` confirms
+MetalPerformancePrimitives works on the user's machine):
+
+1. **MPP `matmul2d` variant.** Add a parallel kernel symbol
+   `fused_gate_up_silu_mul_gemm_f16_specialized_mpp` using
+   `mpp::tensor_ops::matmul2d<descriptor, execution_simdgroups<4>>`
+   with two `cooperative_tensor` accumulators (gate, up) and the
+   SwiGLU epilogue applied in registers via per-element access on
+   the cooperative_tensors (`cT.get_capacity()` / `cT.get_mask()`).
+   See Apple's worked examples in
+   `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/MetalPerformancePrimitives.framework/Versions/A/Headers/MPPTensorOpsMatMul2d.h`.
+   Verify whether `metal::tensor` kernel args can be CONSTRUCTED inside
+   the kernel from `device half*` + extents (so the worker's existing
+   buffer-binding contract is preserved); if not, the worker needs an
+   `MTLTensor` binding path. Tile sizes: M_TILE=64, N_TILE=32,
+   K_TILE=16 per Apple's example as a starting point; tune.
+
+2. **`MTLLanguageVersion::V4_0` plumbing.** `metal 0.29` (the version
+   in `Cargo.toml`) and `metal 0.33` both cap at `V3_1`; the Metal 4
+   enum value is `0x40000`. Either bump the `metal` crate to a
+   version that exposes `V4_0` (cargo search showed nothing newer
+   than 0.33 at audit time — verify when this work starts), or add
+   a small raw-`objc::msg_send!` shim in `SpecializedPipelineCache`
+   that calls `setLanguageVersion:` with the literal `0x40000_u64`
+   when compiling the MPP library. SCOPE THE V4_0 SETTING TO ONLY
+   the MPP library (or a parallel `fused_gate_up_silu_mul_mpp`
+   library) — globally bumping every shader library risks regressions
+   in shaders that compile cleanly at the M2.x default; audit each
+   shader after the bump if you go global.
+
+3. **Device-family pipeline picker.** `kernel_msl_names` in
+   `interpreter::metal::pipelines` currently returns one symbol
+   unconditionally. Add a device-family check at pipeline-cache
+   construction time (`MTLDevice::supportsFamily:` →
+   `MTLGPUFamilyApple9` for M4+, lower for older silicon) and route
+   to the MPP symbol on M4+ hardware, the simdgroup symbol elsewhere.
+   Lowering arm, worker, and binding contract stay identical for
+   both paths — only the symbol name and possibly the dispatch shape
+   change.
+
+4. **Perf comparison harness.** Once both kernels exist, add a bench
+   target that runs each at the TinyLlama-1.1B MLP shape
+   (M ∈ {1, 16, 128}, N=5632, K=2048) on M4+ hardware and prints
+   throughput / wall time. Validate the MPP path actually wins — if
+   it doesn't, keep simdgroup as the default even on M4+ and treat
+   the MPP path as known-no-win documentation.
+
+5. **Tile-size tuning for the pre-M4 simdgroup variant.** Current
+   kernel uses 8×8 single-simdgroup tiles per threadgroup. Standard
+   MLX-steel pattern is 32×32 with 4 simdgroups per threadgroup,
+   K_TILE=16, register-cached A/B fragments — significantly higher
+   compute throughput. Implement after TinyLlama correctness is
+   confirmed; gate behind a benchmark.
+
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward

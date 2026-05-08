@@ -24,6 +24,7 @@
 //! ## FusedGateUpSiluMul
 //! - `0`: `M` (uint)
 //! - `1`: `N`/`INTERMEDIATE_SIZE` (uint) — `W::INTERMEDIATE_SIZE`
+//! - `2`: `K`/`HIDDEN_SIZE` (uint)         — `W::Q_SIZE`
 //!
 //! ## Embed
 //! - `0`: `HIDDEN_SIZE` (uint) — `W::Q_SIZE`
@@ -95,7 +96,7 @@ fn kernel_msl_names(kernel: KernelId) -> Result<(&'static str, &'static str), Pi
         KernelId::FusedAddRmsNorm => ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized"),
         KernelId::FusedGateUpSiluMul => (
             "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_f16_specialized",
+            "fused_gate_up_silu_mul_gemm_f16_specialized",
         ),
         KernelId::RopeAppend => ("rope", "rope_append_f16_specialized"),
         KernelId::AttentionViaCache => ("attention", "attention_via_cache_f16_specialized"),
@@ -133,6 +134,7 @@ pub fn constants_for<W: CanonicalParams>(
         KernelId::FusedGateUpSiluMul => vec![
             ConstantValue::uint(0, bucket_m),
             ConstantValue::uint(1, W::INTERMEDIATE_SIZE as u32),
+            ConstantValue::uint(2, W::Q_SIZE as u32),
         ],
         KernelId::Embed => vec![
             ConstantValue::uint(0, bucket_m),
@@ -303,9 +305,10 @@ mod tests {
     fn fused_silu_bag_has_no_eps() {
         let bag =
             constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 64).expect("silu bag");
-        assert_eq!(bag.len(), 2);
+        assert_eq!(bag.len(), 3);
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[1], ConstantValue::uint(1, 5632));
+        assert_eq!(bag[2], ConstantValue::uint(2, 2048));
     }
 
     #[test]
@@ -1026,6 +1029,177 @@ mod tests {
             assert!(
                 diff < tol,
                 "out[{i}] metal={} cpu={} diff={}",
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// Small `CanonicalParams` probe with `Q_SIZE` (= K, hidden) and
+    /// `INTERMEDIATE_SIZE` (= N, MLP intermediate) sized to multiples
+    /// of the fused-MLP shader's 8-element tile. Used by
+    /// [`fused_mlp_matches_cpu_golden`].
+    struct MlpProbe;
+    impl CanonicalParams for MlpProbe {
+        const HEAD_DIM: u32 = 64;
+        const NUM_Q_HEADS: u32 = 1;
+        const NUM_KV_HEADS: u32 = 1;
+        const Q_SIZE: usize = 16;
+        const KV_SIZE: usize = 16;
+        const INTERMEDIATE_SIZE: usize = 16;
+        const ATTN_SCALE: f32 = 0.125;
+        const ATTN_SOFTCAP: f32 = 0.0;
+        const SLIDING_WINDOW: i32 = -1;
+        const KV_LORA_RANK: usize = 0;
+        const QK_NOPE_HEAD_DIM: usize = 0;
+        const QK_ROPE_HEAD_DIM: usize = 0;
+        const V_HEAD_DIM: usize = 0;
+        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
+        const QK_HEAD_DIM: usize = 0;
+        const MLA_ATTN_SCALE: f32 = 0.0;
+    }
+
+    /// Numerical-correctness check for
+    /// `fused_gate_up_silu_mul_gemm_f16_specialized`. Computes
+    /// `output = silu(input @ W_gate^T) * (input @ W_up^T)` with the
+    /// new fused kernel and compares against a CPU reference built
+    /// from `cpu_golden::gemm` + `cpu_golden::fused_gate_up_silu_mul`.
+    ///
+    /// Inputs/weights use small magnitudes (~0.3) so the K-inner-
+    /// product magnitudes stay well within f16 range — drift is
+    /// dominated by f16 round-tripping at 5e-3.
+    ///
+    /// Two cases:
+    /// - `m=16`: full 8×8 tiles on every axis (M=16, N=K=16).
+    ///   Multiple K-tiles exercises the inner accumulation loop;
+    ///   multiple M/N tiles exercises the threadgroup grid.
+    /// - `m=1`:  decode-shaped, partial M tile. Forces the
+    ///   threadgroup-scratch zero-pad path for the A fragment.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_mlp_matches_cpu_golden() {
+        for m in [16usize, 1usize] {
+            run_fused_mlp_check(m);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_fused_mlp_check(m: usize) {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let n: usize = MlpProbe::INTERMEDIATE_SIZE;
+        let k: usize = MlpProbe::Q_SIZE;
+        assert_eq!(n % 8, 0);
+        assert_eq!(k % 8, 0);
+
+        let pipeline = pipelines
+            .pipeline_for::<MlpProbe>(KernelId::FusedGateUpSiluMul, m as u32)
+            .expect("fused_mlp pipeline");
+
+        // Synthetic deterministic input [M, K] and packed weight
+        // [2*N, K]. Magnitudes ~0.3 so K=16 sums stay in [-5, 5].
+        let input_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+        let weight_data: Vec<f32> = (0..(2 * n) * k)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.3)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> =
+                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf =
+                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let input_buf = alloc_f16(&device, &input_data);
+        let weight_buf = alloc_f16(&device, &weight_data);
+        let output_buf = alloc_zero_f16(&device, m * n);
+
+        // Threadgroup grid: ceil(N/8) along x, ceil(M/8) along y.
+        // 32 threads = one simdgroup per threadgroup.
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
+            MTLSize::new(32, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // CPU reference: round-trip inputs/weights through f16 to
+        // match what the kernel actually sees.
+        let input_f16: Vec<f32> = input_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let weight_f16: Vec<f32> = weight_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+
+        let gate_w = &weight_f16[0..n * k];
+        let up_w = &weight_f16[n * k..2 * n * k];
+        let mut gate = vec![0.0_f32; m * n];
+        let mut up = vec![0.0_f32; m * n];
+        cpu_golden::gemm(&input_f16, gate_w, &mut gate, m, k, n);
+        cpu_golden::gemm(&input_f16, up_w, &mut up, m, k, n);
+        let mut output_cpu = vec![0.0_f32; m * n];
+        cpu_golden::fused_gate_up_silu_mul(&gate, &up, &mut output_cpu);
+
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_f16(&output_buf, output_cpu.len());
+
+        let tol: f32 = 5e-3;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "m={m}: out[{i}] metal={} cpu={} diff={}",
                 output_metal[i],
                 output_cpu[i],
                 diff

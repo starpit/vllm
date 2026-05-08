@@ -93,6 +93,17 @@ pub enum BucketStep {
         /// Restricting to just the kernel's bound buffers drops it to
         /// ~200us.
         step_resources: Vec<Buffer>,
+        /// Per-command bindings for direct (non-ICB) dispatch.
+        /// Outer Vec: one entry per command in `range`. Inner Vec:
+        /// (buffer, offset, binding_index) tuples for that command.
+        ///
+        /// Lets us bypass the ICB execution path (which we suspect of
+        /// adding ~3s overhead per AttentionViaCache call) by
+        /// dispatching the kernel directly via `setBuffer` +
+        /// `dispatchThreadgroups`.
+        direct_bindings: Vec<Vec<(Buffer, u64, u64)>>,
+        /// Per-command dispatch shape: `(threadgroups, threads_per_threadgroup)`.
+        direct_dispatch: Vec<(MTLSize, MTLSize)>,
     },
     Gemm {
         /// Activation buffer bound to MPS' `leftMatrix` (shape
@@ -459,7 +470,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             let cb = queue.new_command_buffer();
             let kind: String;
             match step {
-                BucketStep::Icb { pipeline, range, kernel, step_resources } => {
+                BucketStep::Icb { pipeline, range, kernel, step_resources, .. } => {
                     kind = format!("Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
                     let _ = step_resources; // see note below
@@ -535,6 +546,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
     /// Apple Silicon empirically gives ~10x faster wall-clock
     /// throughput than the batched single-cmdbuf `run_bucket` path.
     /// Gated behind `FERRITE_METAL_PER_STEP_CMDBUF=1`.
+    ///
+    /// When `FERRITE_METAL_DIRECT_DISPATCH=1` is also set, ICB
+    /// steps bypass the ICB entirely and dispatch via setBuffer +
+    /// dispatchThreadgroups directly (matching the golden test's
+    /// pattern). Diagnostic for whether ICB execution is the
+    /// AttentionViaCache bottleneck.
     pub fn run_bucket_per_step_silent(
         &self,
         bucket: usize,
@@ -543,13 +560,34 @@ impl<W: CanonicalParams> MetalWorker<W> {
     ) -> Result<(), WorkerError> {
         use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
         let baking = &self.bucket_bakings[bucket];
+        let direct = std::env::var_os("FERRITE_METAL_DIRECT_DISPATCH").is_some();
         for step in &baking.steps {
             let cb = queue.new_command_buffer();
             match step {
-                BucketStep::Icb { pipeline, range, .. } => {
+                BucketStep::Icb {
+                    pipeline,
+                    range,
+                    direct_bindings,
+                    direct_dispatch,
+                    ..
+                } => {
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pipeline);
-                    baking.icb.execute_on_encoder(enc, range.clone());
+                    if direct {
+                        // Direct dispatch path — bypasses the ICB.
+                        // For each command in the range, bind buffers
+                        // explicitly and dispatch.
+                        for (bindings, (tg, tpt)) in
+                            direct_bindings.iter().zip(direct_dispatch.iter())
+                        {
+                            for (buffer, offset, index) in bindings {
+                                enc.set_buffer(*index, Some(buffer), *offset);
+                            }
+                            enc.dispatch_thread_groups(*tg, *tpt);
+                        }
+                    } else {
+                        baking.icb.execute_on_encoder(enc, range.clone());
+                    }
                     enc.end_encoding();
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
@@ -683,15 +721,25 @@ fn bake_bucket<W: CanonicalParams>(
         let recorded_at = cmd_idx;
         let step_resources_for_cmd: Vec<Buffer> =
             bound_refs.iter().map(|(b, _, _)| (*b).clone()).collect();
+        let bindings_for_cmd: Vec<(Buffer, u64, u64)> = bound_refs
+            .iter()
+            .map(|(b, off, idx)| ((*b).clone(), *off, *idx))
+            .collect();
+        let dispatch_for_cmd = (
+            MTLSize::new(tg.width, tg.height, tg.depth),
+            MTLSize::new(tpt.width, tpt.height, tpt.depth),
+        );
         match steps.last_mut() {
             Some(BucketStep::Icb {
                 pipeline: prev,
                 range,
                 step_resources,
+                direct_bindings,
+                direct_dispatch,
                 ..
             }) if same_pipeline(prev, &pipeline) => {
                 range.end = recorded_at + 1;
-                // Coalesced ICB range — extend its resource set.
+                // Coalesced ICB range — extend its resource set + per-command bindings.
                 let mut seen: Vec<*const _> =
                     step_resources.iter().map(|b| b.as_ptr() as *const _).collect();
                 for buf in &step_resources_for_cmd {
@@ -701,6 +749,8 @@ fn bake_bucket<W: CanonicalParams>(
                         step_resources.push(buf.clone());
                     }
                 }
+                direct_bindings.push(bindings_for_cmd);
+                direct_dispatch.push(dispatch_for_cmd);
             }
             _ => {
                 steps.push(BucketStep::Icb {
@@ -708,6 +758,8 @@ fn bake_bucket<W: CanonicalParams>(
                     range: recorded_at..(recorded_at + 1),
                     kernel: cmd.kernel,
                     step_resources: step_resources_for_cmd,
+                    direct_bindings: vec![bindings_for_cmd],
+                    direct_dispatch: vec![dispatch_for_cmd],
                 });
             }
         }

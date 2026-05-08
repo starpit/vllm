@@ -6384,10 +6384,12 @@ impl Worker for FerriteWorker {
         // Allocate GDN state pool for Qwen3Next.
         if let Some(ref config) = self.qwen3_next_config {
             let dev = self.device.as_ref().unwrap();
+            let tp_size = self.config.tp_world_size.max(1);
             let gdn_pool = unsafe {
                 vllm_cuda::model::qwen3_next::make_gdn_state_pool(
                     config,
                     num_gpu_blocks,
+                    tp_size,
                     dev.compute_stream,
                 )
             }

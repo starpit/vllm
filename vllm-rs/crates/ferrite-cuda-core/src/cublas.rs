@@ -128,10 +128,15 @@ impl CublasHandle {
         // Bind to our non-default stream.
         check(sys::cublasSetStream_v2(handle, stream as _))?;
 
-        // Enable TF32 tensor cores (2x throughput for F32 on Ampere+).
+        // Use deterministic math — avoids non-deterministic TF32 reductions that
+        // cause different outputs across runs for the same inputs (observed on L40S
+        // with Qwen3-Next FP8+TP=2: temperature=0 greedy decoding produced different
+        // tokens on different server startups). CUBLAS_DEFAULT_MATH forces F32
+        // accumulation in tensor cores (same result as non-tensor-core path).
+        // OR-in DISALLOW_REDUCED_PRECISION_REDUCTION for extra insurance.
         check(sys::cublasSetMathMode(
             handle,
-            sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
+            sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
         ))?;
 
         // Allocate workspace from the caching allocator so it's part of the

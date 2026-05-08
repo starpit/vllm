@@ -1080,3 +1080,57 @@ The quick reproducer:
 # Expected (Python): '\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)'
 # Actual: non-deterministic garbage
 ```
+
+## 2026-05-08 — cuBLAS TF32 → DEFAULT_MATH: partial fix for non-determinism
+
+### Root cause found (partial)
+
+Changed `CublasHandle::new()` from `CUBLAS_TF32_TENSOR_OP_MATH` to
+`CUBLAS_DEFAULT_MATH`. TF32 tensor core operations can produce different results
+across runs due to non-deterministic reduction order in TF32 accumulation.
+
+**Before:** 3/3 fresh server runs produced wrong first token (` fib` — prompt
+echoing, score ~0.0 correctness).
+
+**After `CUBLAS_DEFAULT_MATH` + `CUBLAS_WORKSPACE_CONFIG=:4096:8`:**
+- 2/3 fresh server runs produce correct first token `\n`
+- 1/3 still produces ` fib` (residual non-determinism from CUTLASS FP8 GEMM)
+- Runs that get `\n` first generate indented Python code e.g.:
+  `'\n    fib = n\n    a = len(a) - 1\n'` — coherent (not correct fib, but Python!)
+
+### Remaining non-determinism source
+
+`CUBLAS_DEFAULT_MATH` fixes cuBLAS (used by BF16 GDN in/out projections, lm_head).
+CUTLASS FP8 GEMM (used for attention q/k/v/o proj, MoE gate/up/down) is
+separately non-deterministic. The 1-in-3 bad runs are from CUTLASS variation.
+
+CUTLASS fix options:
+1. Remove `--use_fast_math` from CUTLASS build flags in
+   `ferrite-cuda-builder/build.rs` → forces IEEE-correct math → 15-min rebuild
+2. Pin CUTLASS algorithm selection (hard, requires CUTLASS API changes)
+3. Accept residual non-determinism and test for output quality distribution
+
+### Reproducer
+
+```bash
+# On nick3 — now with CUBLAS_DEFAULT_MATH baked in, also add workspace config:
+CUBLAS_WORKSPACE_CONFIG=:4096:8 ./target/release/vllm serve \
+  unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+  --device cuda --tensor-parallel-size 2 \
+  --max-model-len 256 --gpu-memory-utilization 0.85
+```
+
+### Next session entry point
+
+Try removing `--use_fast_math` from the CUTLASS scaled_mm build in
+`ferrite-cuda-builder/build.rs`:
+
+```rust
+// In build_cutlass_scaled_mm():
+// Remove: .arg("--use_fast_math")
+```
+
+Sync `ferrite-cuda-builder/` to nick3 and let cudaforge recompile
+(~15 min). Test determinism again. If CUTLASS recompile makes it
+deterministic, then investigate why the model sometimes generates wrong
+tokens (coherence issue) even when deterministic.

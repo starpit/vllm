@@ -865,20 +865,31 @@ Reproducer state on nick3 (`/home/nickm/qwen3-next-fresh/vllm-rs`):
 
 Phase complete for code-completion use case. Known open issue:
 
-**Chat-template-formatted prompts give inconsistent output at FP8+TP=2.**
-English chat prompts (`why is the sky blue?` etc.) produce `!` (token 0)
-or `?` non-deterministically across runs even at temperature=0. Code prompts
-are stable. Root causes:
-1. FP8 quantization reduces precision for out-of-distribution (English chat)
-   activations.
-2. TP=2 NCCL all-reduce is non-associative — the final logit sum is not
-   bit-for-bit reproducible, causing argmax to flip between token `!` (0) and
-   `?` (30) which are almost exactly tied for these prompts.
+**Chat-template-formatted prompts produce `!!!!` (all-NaN logits) at FP8+TP=2.**
 
-This is a model quality / quantization accuracy limitation, not a Ferrite bug.
-The golden test suite covers code-completion only (coherence check) and passes.
-`vllm chat` is fully functional: OOM fixed, `--gpu-memory-utilization` flag
-wired, GDN slot allocator working.
+Root cause traced via FERRITE_DUMP:
+- All intermediate activations (embed → GDN → gated-attn → MoE, all 48 layers)
+  are FINITE and well-behaved for chat prompts.
+- `allgather.in` (lm_head GEMM output, pre-gather) is ALL NaN for T=12 chat
+  prompts on BOTH ranks.
+- Code prompts (T=4, no special tokens) have non-NaN lm_head output.
+- The NaN first appears in `allgather.in`, meaning the lm_head BF16 GEMM itself
+  produces NaN for the chat-prompt hidden state.
+
+Suspected mechanism: the FP8 attention + MoE computation for the 12-token chat
+prompt (including `<|im_start|>`, `<|im_end|>` special tokens at high vocab IDs
+in rank 1's shard) produces hidden state values that cause BF16 overflow
+(>65504) in some dimensions somewhere between layer 47 and the lm_head GEMM.
+After `ScalarOffsetRmsNorm`, individual dimensions could be as large as
+sqrt(2048) × typical_activation due to concentration, but the BF16 GEMM
+accumulation over 2048 terms with large weights might overflow.
+
+To fix: need to either clamp the hidden state before lm_head, use F32
+accumulation in the final GEMM, or investigate which layer first produces
+BF16 Inf (by adding bounds checks or using CUDA anomaly detection).
+
+NOT a GDN issue: GDN weights are BF16 in this checkpoint (not FP8), no
+dequantization needed there.
 
 Separately fixed: GDN state pool slot exhaustion (slot leak across requests)
 was causing `!!!!` on all requests after ~16. Committed as

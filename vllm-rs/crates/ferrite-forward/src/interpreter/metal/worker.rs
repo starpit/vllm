@@ -426,8 +426,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // command queue.
                     prev_step_resources = None;
                     encode_gemm_into_command_buffer(
-                        device, cmdbuf, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0,
-                        false, true, true,
+                        device,
+                        cmdbuf,
+                        &a.buffer,
+                        a.offset,
+                        &b.buffer,
+                        b.offset,
+                        &c.buffer,
+                        c.offset,
+                        *m,
+                        *n,
+                        *k,
+                        1.0,
+                        0.0,
+                        false,
+                        true,
+                        true,
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }
@@ -525,8 +539,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 BucketStep::Gemm { a, b, c, m, n, k } => {
                     kind = format!("Gemm m={m} n={n} k={k}");
                     encode_gemm_into_command_buffer(
-                        device, cb, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0, false,
-                        true, true,
+                        device,
+                        cb,
+                        &a.buffer,
+                        a.offset,
+                        &b.buffer,
+                        b.offset,
+                        &c.buffer,
+                        c.offset,
+                        *m,
+                        *n,
+                        *k,
+                        1.0,
+                        0.0,
+                        false,
+                        true,
+                        true,
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }
@@ -654,8 +682,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
                     encode_gemm_into_command_buffer(
-                        device, cb, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0, false,
-                        true, true,
+                        device,
+                        cb,
+                        &a.buffer,
+                        a.offset,
+                        &b.buffer,
+                        b.offset,
+                        &c.buffer,
+                        c.offset,
+                        *m,
+                        *n,
+                        *k,
+                        1.0,
+                        0.0,
+                        false,
+                        true,
+                        true,
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }

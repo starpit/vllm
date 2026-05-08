@@ -29,13 +29,26 @@ use std::sync::Arc;
 /// allocated per-call and retained by the command buffer until it
 /// completes — manual release would double-free, mirroring the
 /// existing `MetalGemm::execute` contract.
+/// Encode an MPS-backed GEMM into `cmdbuf`.
+///
+/// `a_offset` / `b_offset` / `c_offset` are byte offsets into the
+/// respective buffers — the matrix's logical "first byte" lives there.
+/// MPS' `MPSMatrix.initWithBuffer:offset:descriptor:` honors the
+/// offset; passing 0 unconditionally (as an earlier revision did)
+/// silently ignored the per-layer arena offsets and pointed every
+/// per-layer linear projection at the *same* slice (= layer 0's
+/// weight at offset 0 of the arena buffer). Symptom: model output
+/// invariant to per-layer weights.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_gemm_into_command_buffer(
     device: &DeviceRef,
     cmdbuf: &CommandBufferRef,
     a: &Buffer,
+    a_offset: u64,
     b: &Buffer,
+    b_offset: u64,
     c: &Buffer,
+    c_offset: u64,
     m: u32,
     n: u32,
     k: u32,
@@ -56,21 +69,21 @@ pub fn encode_gemm_into_command_buffer(
     let expected_b_size = (b_rows * b_cols * elem_size) as u64;
     let expected_c_size = (m * n * elem_size) as u64;
 
-    if a.length() < expected_a_size {
+    if a.length() < a_offset + expected_a_size {
         return Err(GemmError::InvalidDimensions(format!(
-            "A buffer too small: expected {expected_a_size}, got {}",
+            "A buffer too small: offset {a_offset} + expected {expected_a_size} > buf len {}",
             a.length()
         )));
     }
-    if b.length() < expected_b_size {
+    if b.length() < b_offset + expected_b_size {
         return Err(GemmError::InvalidDimensions(format!(
-            "B buffer too small: expected {expected_b_size}, got {}",
+            "B buffer too small: offset {b_offset} + expected {expected_b_size} > buf len {}",
             b.length()
         )));
     }
-    if c.length() < expected_c_size {
+    if c.length() < c_offset + expected_c_size {
         return Err(GemmError::InvalidDimensions(format!(
-            "C buffer too small: expected {expected_c_size}, got {}",
+            "C buffer too small: offset {c_offset} + expected {expected_c_size} > buf len {}",
             c.length()
         )));
     }
@@ -103,19 +116,19 @@ pub fn encode_gemm_into_command_buffer(
         let a_matrix: *mut Object = msg_send![class!(MPSMatrix), alloc];
         let a_matrix: *mut Object = msg_send![a_matrix,
             initWithBuffer: a.as_ptr()
-            offset: 0u64
+            offset: a_offset
             descriptor: a_desc
         ];
         let b_matrix: *mut Object = msg_send![class!(MPSMatrix), alloc];
         let b_matrix: *mut Object = msg_send![b_matrix,
             initWithBuffer: b.as_ptr()
-            offset: 0u64
+            offset: b_offset
             descriptor: b_desc
         ];
         let c_matrix: *mut Object = msg_send![class!(MPSMatrix), alloc];
         let c_matrix: *mut Object = msg_send![c_matrix,
             initWithBuffer: c.as_ptr()
-            offset: 0u64
+            offset: c_offset
             descriptor: c_desc
         ];
 

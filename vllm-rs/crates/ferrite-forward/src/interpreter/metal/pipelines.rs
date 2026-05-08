@@ -1761,7 +1761,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn fused_mlp_matches_cpu_golden() {
-        for m in [16usize, 1usize] {
+        for m in [64usize, 16usize, 1usize] {
             run_fused_mlp_check(m);
         }
     }

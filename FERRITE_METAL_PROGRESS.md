@@ -765,6 +765,77 @@ FusedGateUpSiluMul → down-Gemm. Plus Embed at start; final RmsNorm
    the fused MLP for M4+, larger-tile (32×32 / 4-simdgroup) tuning
    for the simdgroup variant.
 
+### Phase 5.J — Lowering correctness fixes (2026-05-08, HEAD `959824b0e`)
+
+Two distinct lowering bugs found and fixed; model now produces
+non-zero, row-distinct, per-layer-weighted output but still picks
+wrong tokens (e.g. `mathsf` → `Syst` repeated for `hi` prompt).
+
+#### Bug 1 — RmsNorm slot swap ✅ FIXED (`c35a7df35`)
+
+`lower_one`'s `Instruction::RmsNorm(out_slot, in_slot, ...)` match arm
+swapped names relative to the macro's emission order
+`(in_slot_idx, out_slot_idx, ...)` (which matches cuda's
+destructure at `instr.rs:689`). Rust's positional patterns silently
+bind by position, so the variable named `out_slot` held the input
+tile's slot and `in_slot` held the rmsnorm output's slot. Kernel
+ended up reading from a fresh 0xAA-stamped arena slot (the rmsnorm
+output's first invocation) and writing the result back over the
+upstream tile's buffer. End-to-end: every prefill row collapsed to
+the rmsnorm of the marker constant and `lm_head` produced identical
+logits across all 23 positions.
+
+Caught by `VLLM_DUMP_ARENA_PER_STEP=1` extended to print row 0 AND
+row 22 of every slot — the embed step produced row-distinct values,
+the next-step rmsnorm collapsed them. `FERRITE_METAL_BAKE_DEBUG=1`
+confirmed by showing the swapped buffer indices for binding 0/1.
+
+Tests added: `rmsnorm_matches_cpu_golden_m64` (M=64, separate
+buffers) and `rmsnorm_in_place_matches_cpu_golden_m64` (M=64, same
+buffer for in/out — runtime's actual coloring choice). Both pass at
+HEAD.
+
+#### Bug 2 — Loop unroller dropped layer_offset ✅ FIXED (`959824b0e`)
+
+`lower()`'s static loop unroller did not propagate the iteration
+index. Cuda's interpreter sets `ctx.layer_offset = iter` per
+iteration and every per-layer arm computes
+`let layer = ctx.layer_offset + layer;` (`instr.rs:689` and friends).
+The metal lowering had no such plumbing — the loop body's
+compile-time `layer` literal flowed straight into every iteration's
+`Binding::Weight { layer, .. }` and
+`RuntimeBindingKind::KvCache{K,V} { layer, .. }`. All 22 transformer
+layers ended up resolving to the loop's iter-0 baseline (= layer 1
+for Llama; layer 0 lives in the prelude) for *every* per-layer
+weight binding — norms, linear projections, RoPE caches,
+KV-cache slots.
+
+`FERRITE_METAL_BAKE_DEBUG=1` showed the symptom plainly: every layer
+referenced the same `(buf, off)` pairs across the loop. After the
+fix, weight offsets monotonically increase across the 22 layers.
+
+Fix: `lower_one(layer_offset: u32)` adds the iteration index to the
+variant's compile-time `layer` literal at every weight-binding /
+KV-cache-binding site. Loop body iters pass `iter as u32`;
+straight-line code passes `0`.
+
+#### Open: bug #3 — wrong token still ❌
+
+Even with bugs #1 and #2 fixed, `vllm chat ... --device metal --quick "hi"`
+samples token 24272 (`" Syst"`) instead of a real response, and
+decode keeps re-sampling 24272. Per-step dump looks healthy
+(residual stream grows monotonically, rows distinct, magnitudes
+sensible through layer 21). Logits at lm_head are row-distinct but
+small magnitude. Suspect list:
+- RoPE math (cos_sin loading or per-pair rotation)
+- Some kernel arithmetic at M=64
+- Weight-loading dtype (bf16-on-disk → fp16 cast)
+- `tie_word_embeddings` handling for `lm_head.weight`
+
+Next session: add per-step rmsnorm + RoPE goldens at runtime
+conditions, or compare residual stream snapshots against a
+PyTorch reference.
+
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
@@ -772,8 +843,9 @@ FusedGateUpSiluMul → down-Gemm. Plus Embed at start; final RmsNorm
 - Phase 5.F.3 + 5.F (residual) + 5.G + 5.6: 🔜 PLANNED - Per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
 - Phase 5.H: ⚠️ PARTIAL - simdgroup_matrix fused MLP landed; M4+ MPP variant + larger-tile tuning still TODO
 - Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch); lm_head logits all-zero (root cause = somewhere across the 22-layer chain, TBD)
-- 78 Phase 1-4 tests + 54 ferrite-forward metal lib tests passing
+- Phase 5.J: ⚠️ IN PROGRESS - two lowering bugs fixed (RmsNorm slot swap + loop layer_offset). Model produces row-distinct, per-layer-weighted output but argmax still wrong. Bug #3 TBD.
+- 78 Phase 1-4 tests + 56 ferrite-forward metal lib tests passing
 - `cargo build --bin vllm -Fmetal` ✓ on darwin
-- `vllm chat ... --device metal` runs end-to-end, produces empty/all-zero output
+- `vllm chat ... --device metal` runs end-to-end, produces row-distinct but wrong-token output
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land
 - Multi-Q-token attention kernels are correctness-first reference impls; FlashAttention-style blocking + perf tuning is Phase 5.6 work

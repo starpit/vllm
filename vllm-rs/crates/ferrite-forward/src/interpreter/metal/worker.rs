@@ -77,6 +77,11 @@ pub enum BucketStep {
         pipeline: ComputePipelineState,
         /// Commands `[start, end)` in the bucket's ICB.
         range: std::ops::Range<usize>,
+        /// `KernelId` of the first command in `range`. Diagnostic-only
+        /// (used by `run_bucket_per_step_debug` to label which kernel
+        /// is firing); coalesced ICB ranges share one pipeline so this
+        /// kernel id is constant across the range.
+        kernel: KernelId,
     },
     Gemm {
         /// Activation buffer bound to MPS' `leftMatrix` (shape
@@ -342,7 +347,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // when we need a new one.
         for step in &baking.steps {
             match step {
-                BucketStep::Icb { pipeline, range } => {
+                BucketStep::Icb { pipeline, range, .. } => {
                     let enc = match current {
                         Some(e) => e,
                         None => {
@@ -405,8 +410,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
         for (idx, step) in baking.steps.iter().enumerate() {
             let cb = queue.new_command_buffer();
             match step {
-                BucketStep::Icb { pipeline, range } => {
-                    eprintln!("[step {idx}] Icb range={:?}", range);
+                BucketStep::Icb { pipeline, range, kernel } => {
+                    eprintln!("[step {idx}] Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
                     let enc = cb.new_compute_command_encoder();
                     if !resource_refs.is_empty() {
@@ -555,6 +560,7 @@ fn bake_bucket<W: CanonicalParams>(
             Some(BucketStep::Icb {
                 pipeline: prev,
                 range,
+                ..
             }) if same_pipeline(prev, &pipeline) => {
                 range.end = recorded_at + 1;
             }
@@ -562,6 +568,7 @@ fn bake_bucket<W: CanonicalParams>(
                 steps.push(BucketStep::Icb {
                     pipeline,
                     range: recorded_at..(recorded_at + 1),
+                    kernel: cmd.kernel,
                 });
             }
         }

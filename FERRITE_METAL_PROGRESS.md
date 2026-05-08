@@ -600,12 +600,180 @@ MetalPerformancePrimitives works on the user's machine):
    compute throughput. Implement after TinyLlama correctness is
    confirmed; gate behind a benchmark.
 
+### Phase 5.I — Perf + correctness investigation (2026-05-08, HEAD `25e527b98`)
+
+End-to-end `vllm chat ... --device metal` now takes the full path
+through ICB execution and produces output, but the output is empty
+(garbage logits, every sampled token is `<unk>`/0). Per-token decode
+latency is 30–1000× off Apple-Silicon parity (MLX-LM gets ~100 tok/s
+on TinyLlama; we got ~3 s/token at the start of this session).
+
+This session moved the needle substantially on perf and uncovered
+the real correctness bug, but did not finish either thread. Three
+distinct issues are now isolated:
+
+#### 1. ICB execution is broken — kernels don't write to bound buffers ❌
+
+**Empirically**, `executeCommandsInBuffer:withRange:` on our ICB
+runs each kernel (status=Completed, real GPU time) but the kernels
+do not write to their declared output buffers. Reproduced with
+`VLLM_STAMP_ARENA=1` (fill arena with 0xAA) +
+`VLLM_DUMP_ARENA_PER_STEP=1` + `FERRITE_METAL_STEP_DEBUG=1`:
+
+```
+[step 0] Embed encode=319us gpu=1671us status=Completed
+  s0=nz16777216/marker16777216/16777216  ← 100% 0xAA, no writes
+  ...
+[step 2] Gemm m=64 n=2048 k=2048 status=Completed
+  s2=nz16776512/marker16520384/16777216  ← MPS Gemm DID overwrite ~256K bytes
+```
+
+So in the same cmdbuf, MPS Gemm writes correctly but our
+ICB-encoded compute kernels don't write at all. The bug is somewhere
+in `RecordingContext::record_compute_dispatch` →
+`IndirectComputeCommand::set_kernel_buffer` → ICB
+`executeCommandsInBuffer:withRange:` chain. ICB descriptor uses
+`inheritPipelineState=true` + `inheritBuffers=false`, which is the
+documented Apple Silicon-safe combo.
+
+**Workaround landed**: `FERRITE_METAL_DIRECT_DISPATCH=1` (with
+`FERRITE_METAL_PER_STEP_CMDBUF=1`) — bake-time bindings stored
+directly on `BucketStep::Icb.direct_bindings` /
+`direct_dispatch`; per-step path uses `setBuffer` +
+`dispatchThreadgroups` instead of `executeCommandsInBuffer`. With
+this the kernels DO write to their slots (verified via the
+stamp-and-dump diagnostic). Decode drops from ~3 s/token (ICB
+path) → ~95 ms/token (direct dispatch).
+
+The proper fix is to either (a) find the ICB binding bug, or (b)
+delete the ICB infrastructure on Metal entirely and dispatch
+directly (since it's faster anyway).
+
+#### 2. Final logits are exactly 0.0 across every row ❌
+
+`VLLM_DUMP_LOGITS=1` shows that `lm_head` writes to its output slot
+(slot 6 in the bucket=64 prefill arena), but every fp16 value in
+every row is exactly 0.0. argmax over zeros returns token id 0 →
+chat output is `[0, 0, 0, 0, 0]` → empty string.
+
+The chain has been verified non-zero through the FIRST few steps:
+- Embed writes 256 KB of real fp16 data to slot 0.
+- Q/K/V projections write 256 KB / 32 KB / 32 KB to slots 2/3/4.
+- RopeAppend, AttentionPrefillContiguous, FusedAddRmsNorm,
+  FusedGateUpSiluMul, down_proj all write expected sizes.
+- All 54 metal lib goldens pass.
+
+So individual kernels work. But by the time we reach `lm_head`
+(after 22 transformer layers + final RmsNorm), the input to lm_head
+is zero (or lm_head produces zero from a non-zero input — TBD).
+The previous session blamed this on the broken fused MLP kernel;
+that's been fixed (real GEMM + SwiGLU landed in `e13e2146c`) but
+the empty-output symptom persists. Root cause is now somewhere
+across the layer chain.
+
+Next session must bisect: which layer's hidden_state first becomes
+zero? Suggested approach: limit the macro to 1–2 layers (or write
+a custom synthetic forward) and probe slot contents after each
+layer's residual stream update.
+
+#### 3. Apple Silicon GPU power state cost ⚠️
+
+Even after correctness is fixed, decode latency at ~95 ms/forward
+is ~10× off MLX-LM's ~10 ms/forward. The difference is likely
+per-cmdbuf overhead (per-step path commits + waits per kernel — 223
+cmdbufs per forward) and Apple GPU power state ramping between
+cmdbufs. Once correctness lands and ICB is either fixed or replaced
+with direct dispatch in a single cmdbuf, this should close.
+
+#### What landed this session (commits e13e2146c → 25e527b98)
+
+| Commit | Summary |
+|---|---|
+| `e13e2146c` | Real fused MLP kernel: `simdgroup_matrix<half,8,8>` MMA tiles, GEMM + SwiGLU in one dispatch (replaces the kernel that only did SwiGLU on a buffer that didn't exist). |
+| `eb3b2ad0d` | Numerical goldens for rmsnorm + fused_add_rmsnorm. |
+| `9a36ea526` | Per-step debug prints `kernel=...` on each step + TinyLlama-shape fused MLP golden. |
+| `a746b1be6` | First-pass M=1 decode MLP fast path (simd_sum dot product). |
+| `237fe5020` | Replaced with MLX gemv port (BM=1, BN=8, SM=1, SN=32, TM=4, TN=4) for the M=1 decode MLP. |
+| `c5a189d17` | SIMD + rayon for weight-load f32↔f16/bf16 casts. |
+| `b6a950a09` | Paged-cache port of MLX sdpa_vector for AttentionViaCache (online softmax, BN=32 simdgroups split K, 1024 threads/group). Reverted as default after testing — see #2. |
+| `2f964110b` | Skip eager `useResources` (was the prior session's reported "batched cmdbuf hang" — actually a 100s+ Apple-internal residency stall, not a real hang). |
+| `f91d9e4f1` | `run_bucket_per_step_silent` (per-step cmdbuf, no eprintln); KV cache → StorageModePrivate; per-forward `FERRITE_METAL_TRACE` timing. |
+| `1e029c204` | Direct-dispatch path: `BucketStep::Icb.direct_bindings` + `direct_dispatch`; `FERRITE_METAL_DIRECT_DISPATCH=1` env var bypasses ICB. **30× speedup** at decode. |
+| `25e527b98` | Diagnostic env vars: `VLLM_PRINT_TOKEN_IDS`, `VLLM_DUMP_LOGITS`, `VLLM_DUMP_ARENA`, `VLLM_DUMP_ARENA_PER_STEP`, `VLLM_STAMP_ARENA`, `FERRITE_METAL_TRACE`. |
+
+#### Diagnostic env vars (active)
+
+Path-control:
+- `FERRITE_METAL_STEP_DEBUG=1` — per-step cmdbuf with full eprintln.
+  ICB path. Slow but full visibility.
+- `FERRITE_METAL_PER_STEP_CMDBUF=1` — per-step cmdbuf without
+  eprintln. ICB path by default; combine with
+  `FERRITE_METAL_DIRECT_DISPATCH=1` to bypass ICB.
+- `FERRITE_METAL_DIRECT_DISPATCH=1` — bypass ICB (use setBuffer +
+  dispatchThreadgroups). Only active under PER_STEP_CMDBUF.
+- `FERRITE_METAL_FORCE_USE_RESOURCES=1` — re-enables the eager
+  `useResources(all baked_resources)` call (debug only — costs
+  ~500ms per buffer × 220 buffers = full forward stalls).
+- `FERRITE_METAL_TRACE=1` — print `[forward bucket=N
+  num_tokens=M] encode/commit/wait` per forward.
+
+Diagnostic dumps (read CPU-visible MTLBuffer contents):
+- `VLLM_PRINT_TOKEN_IDS=1` — print sampled token_ids + finish_reason.
+- `VLLM_DUMP_LOGITS=1` — per-row non-zero counts + first 4 fp16
+  values of every logit row.
+- `VLLM_DUMP_ARENA=1` — per-slot non-zero byte counts after
+  pool.forward returns.
+- `VLLM_DUMP_ARENA_PER_STEP=1` — per-slot non-zero + 0xAA-marker
+  byte counts after EACH per-step cmdbuf (works in both per-step
+  paths).
+- `VLLM_STAMP_ARENA=1` — fill every arena slot with 0xAA before each
+  forward; combined with the per-step dump, shows exactly which
+  bytes each kernel wrote.
+
+#### Key shapes for TinyLlama-1.1B prefill bucket M=64
+
+7 arena slots, sized for max bucket M=4096:
+- slot 0: 16 MB (hidden_state, M*hidden_size*2 = 64*2048*2 = 256 KB used)
+- slot 1: 16 MB (post-residual hidden state, same shape)
+- slot 2: 16 MB (Q-proj output / attention output)
+- slot 3: 2 MB (K-proj output)
+- slot 4: 2 MB (V-proj output)
+- slot 5: 46 MB (FusedGateUpSiluMul output, M*intermediate_size*2 = 64*5632*2 = 720 KB used)
+- slot 6: 262 MB (lm_head output, M*vocab*2 = 64*32000*2 = 4 MB used)
+
+Per-step instruction sequence (per layer, ×22):
+RmsNorm → Q-Gemm → K-Gemm → V-Gemm → RopeAppend →
+AttentionPrefillContiguous → o-Gemm → FusedAddRmsNorm →
+FusedGateUpSiluMul → down-Gemm. Plus Embed at start; final RmsNorm
++ lm_head Gemm at end.
+
+#### Where to dig next
+
+1. **Bisect the all-zero logits**: limit the model to 1-2 layers
+   (modify the macro emission or write a synthetic forward), find
+   which layer's hidden_state first becomes zero, then which kernel
+   in that layer is responsible.
+
+2. **Fix or delete ICB**: ICB execute writes nothing. Either find
+   the binding bug (look at `set_kernel_buffer` plumbing,
+   `inheritBuffers=false` interaction, ICB `execute_on_encoder`)
+   or just delete the ICB infrastructure on Metal — direct dispatch
+   is faster anyway, and we no longer have a use case for the ICB
+   batching.
+
+3. **Phase 5.H follow-ups** still apply: MPP `matmul2d` variant of
+   the fused MLP for M4+, larger-tile (32×32 / 4-simdgroup) tuning
+   for the simdgroup variant.
+
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
 - Phase 5.F.1 + 5.F.2: ✅ COMPLETE - Build hygiene + cfg-gated impl pushes
 - Phase 5.F.3 + 5.F (residual) + 5.G + 5.6: 🔜 PLANNED - Per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
-- 78 Phase 1-4 tests + 18 ferrite-forward unit tests + 3 cache tests passing
-- `cargo check -p ferrite-forward --no-default-features --features metal` ✓ on darwin
+- Phase 5.H: ⚠️ PARTIAL - simdgroup_matrix fused MLP landed; M4+ MPP variant + larger-tile tuning still TODO
+- Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch); lm_head logits all-zero (root cause = somewhere across the 22-layer chain, TBD)
+- 78 Phase 1-4 tests + 54 ferrite-forward metal lib tests passing
+- `cargo build --bin vllm -Fmetal` ✓ on darwin
+- `vllm chat ... --device metal` runs end-to-end, produces empty/all-zero output
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land
 - Multi-Q-token attention kernels are correctness-first reference impls; FlashAttention-style blocking + perf tuning is Phase 5.6 work

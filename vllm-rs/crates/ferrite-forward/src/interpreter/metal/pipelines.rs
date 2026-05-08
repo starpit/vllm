@@ -1219,6 +1219,265 @@ mod tests {
         }
     }
 
+    /// Same as `rmsnorm_matches_cpu_golden` but at M=64 (the prefill
+    /// bucket size used at TinyLlama runtime). Distinguishes a "kernel
+    /// works at small M but breaks at large M" bug from a runtime
+    /// dispatch / binding bug.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rmsnorm_matches_cpu_golden_m64() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let m: usize = 64;
+        let hidden = TinyLlamaProbe::Q_SIZE;
+        let pipeline = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, m as u32)
+            .expect("rmsnorm pipeline");
+
+        // Per-row distinct: input[row, col] = sin((row*hidden + col)*k).
+        // Different rows have very different sums-of-squares.
+        let input_data: Vec<f32> = (0..m * hidden)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let weight_data: Vec<f32> = (0..hidden)
+            .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> =
+                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf =
+                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let input_buf = alloc_f16(&device, &input_data);
+        let weight_buf = alloc_f16(&device, &weight_data);
+        let output_buf = alloc_zero_f16(&device, m * hidden);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(m as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let input_f16: Vec<f32> = input_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let weight_f16: Vec<f32> = weight_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let mut output_cpu = vec![0.0_f32; m * hidden];
+        let eps = 1e-5_f32;
+        for row in 0..m {
+            let base = row * hidden;
+            cpu_golden::rmsnorm(
+                &input_f16[base..base + hidden],
+                &weight_f16,
+                &mut output_cpu[base..base + hidden],
+                eps,
+            );
+        }
+
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_f16(&output_buf, output_cpu.len());
+
+        // Sanity: row 0 and row 22 outputs should DIFFER (the inputs do).
+        let row0 = &output_metal[0..4];
+        let row22 = &output_metal[22 * hidden..22 * hidden + 4];
+        assert_ne!(
+            row0, row22,
+            "row 0 == row 22 — kernel produced identical output for distinct input rows"
+        );
+
+        let tol: f32 = 5e-3;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rmsnorm[{i}] (row {} col {}) metal={} cpu={} diff={}",
+                i / hidden,
+                i % hidden,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// Same as `rmsnorm_matches_cpu_golden_m64` but binds the SAME
+    /// buffer for input and output (the runtime's hot path: the macro
+    /// colors the embedding tile and the rmsnorm output tile to one
+    /// arena slot, so the kernel runs in-place on slot 0). If this
+    /// test passes but the runtime corrupts rows, the bug is in the
+    /// runtime's bindings / dispatch, not the kernel.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rmsnorm_in_place_matches_cpu_golden_m64() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let m: usize = 64;
+        let hidden = TinyLlamaProbe::Q_SIZE;
+        let pipeline = pipelines
+            .pipeline_for::<TinyLlamaProbe>(KernelId::RmsNorm, m as u32)
+            .expect("rmsnorm pipeline");
+
+        let input_data: Vec<f32> = (0..m * hidden)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let weight_data: Vec<f32> = (0..hidden)
+            .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> =
+                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf =
+                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+
+        // Single buffer used for both input and output. The CPU
+        // reference reads from a separate copy so the comparison stays
+        // valid after the kernel writes back.
+        let inout_buf = alloc_f16(&device, &input_data);
+        let weight_buf = alloc_f16(&device, &weight_data);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&inout_buf), 0); // OUT = same buffer
+        enc.set_buffer(1, Some(&inout_buf), 0); // IN  = same buffer
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(m as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let input_f16: Vec<f32> = input_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let weight_f16: Vec<f32> = weight_data
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let mut output_cpu = vec![0.0_f32; m * hidden];
+        let eps = 1e-5_f32;
+        for row in 0..m {
+            let base = row * hidden;
+            cpu_golden::rmsnorm(
+                &input_f16[base..base + hidden],
+                &weight_f16,
+                &mut output_cpu[base..base + hidden],
+                eps,
+            );
+        }
+
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_f16(&inout_buf, output_cpu.len());
+
+        let row0 = &output_metal[0..4];
+        let row22 = &output_metal[22 * hidden..22 * hidden + 4];
+        assert_ne!(
+            row0, row22,
+            "in-place rmsnorm: row 0 == row 22 — kernel corrupted distinct input rows"
+        );
+
+        let tol: f32 = 5e-3;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "in-place rmsnorm[{i}] (row {} col {}) metal={} cpu={} diff={}",
+                i / hidden,
+                i % hidden,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
     /// Numerical-correctness check for `fused_add_rmsnorm_f16_specialized`
     /// against `cpu_golden::fused_add_rmsnorm`. Verifies the in-place
     /// `residual += delta` step lands in buffer(0) and the

@@ -175,7 +175,11 @@ fn lower_one<W: CanonicalParams>(
         },
 
         // ── Standalone RMSNorm ─────────────────────────────────────
-        I::RmsNorm(out_slot, in_slot, layer, wt_fn) => LoweredCommand {
+        // Macro/cuda emit `Instruction::RmsNorm(in_slot, out_slot, ...)`
+        // (see `instr.rs:689`). An earlier `(out_slot, in_slot, ...)`
+        // pattern here silently swapped the names — the kernel read
+        // from a fresh slot and overwrote the upstream tile.
+        I::RmsNorm(in_slot, out_slot, layer, wt_fn) => LoweredCommand {
             kernel: KernelId::RmsNorm,
             // Per-token threadgroup; threads cooperate on the
             // hidden-size reduction inside.

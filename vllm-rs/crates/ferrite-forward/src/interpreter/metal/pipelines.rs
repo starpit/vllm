@@ -69,7 +69,7 @@ use ferrite_metal_kernels::specialized_pipeline_cache::{
 };
 use ferrite_metal_kernels::stream::MetalStreamError;
 
-use super::lowered::KernelId;
+use super::lowered::{KernelId, MetalDtype};
 
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
@@ -85,49 +85,79 @@ use super::lowered::KernelId;
 /// `&'static str` keys the cache was constructed with). Kernel name
 /// picks the actual `kernel void` symbol inside that library.
 ///
-/// We default to the f16 variants because that's what every model in
-/// the TinyLlama-class lineage uses; bf16 / vec4 specializations
-/// surface as additional `KernelId` variants when their cost is
-/// proven.
+/// `dtype` selects between the `_f16_specialized` / `_bf16_specialized`
+/// symbol variants in each shader. Llama-3.x ships bf16 on disk and
+/// cuda runs them natively in bf16; the metal backend follows suit
+/// on M3+ (native bf16 MMA). `MetalDtype::Int4` is reserved for the
+/// AWQ / GPTQ dequant path and is rejected here until that wiring
+/// lands — int4 weights need a different binding shape (packed u32s
+/// + group scales) so a single symbol picker can't transparently
+/// model it.
 fn kernel_msl_names(
     kernel: KernelId,
     bucket_m: u32,
+    dtype: MetalDtype,
 ) -> Result<(&'static str, &'static str), PipelineLookupError> {
-    Ok(match kernel {
-        KernelId::Embed => ("embed", "embed_f16_specialized"),
-        KernelId::RmsNorm => ("rmsnorm", "rmsnorm_f16_specialized"),
-        KernelId::FusedAddRmsNorm => ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized"),
-        // Two specialized variants: the decode (M=1) variant uses
-        // simd_sum dot products and avoids the simdgroup_matrix
-        // overhead that would otherwise dominate at one-row inputs.
-        // Prefill (M >= 2) uses the matrix variant.
-        KernelId::FusedGateUpSiluMul if bucket_m == 1 => (
+    if matches!(dtype, MetalDtype::Int4) {
+        return Err(PipelineLookupError::DtypeNotYetWired(kernel, dtype));
+    }
+    Ok(match (kernel, dtype) {
+        (KernelId::Embed, MetalDtype::F16) => ("embed", "embed_f16_specialized"),
+        (KernelId::Embed, MetalDtype::Bf16) => ("embed", "embed_bf16_specialized"),
+        (KernelId::RmsNorm, MetalDtype::F16) => ("rmsnorm", "rmsnorm_f16_specialized"),
+        (KernelId::RmsNorm, MetalDtype::Bf16) => ("rmsnorm", "rmsnorm_bf16_specialized"),
+        (KernelId::FusedAddRmsNorm, MetalDtype::F16) => {
+            ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized")
+        }
+        (KernelId::FusedAddRmsNorm, MetalDtype::Bf16) => {
+            ("fused_add_rmsnorm", "fused_add_rmsnorm_bf16_specialized")
+        }
+        // Two specialized variants per dtype: the decode (M=1) variant
+        // uses simd_sum dot products and avoids simdgroup_matrix
+        // overhead at one-row inputs. Prefill (M >= 2) uses the matrix
+        // variant.
+        (KernelId::FusedGateUpSiluMul, MetalDtype::F16) if bucket_m == 1 => (
             "fused_gate_up_silu_mul",
             "fused_gate_up_silu_mul_decode_f16_specialized",
         ),
-        KernelId::FusedGateUpSiluMul => (
+        (KernelId::FusedGateUpSiluMul, MetalDtype::F16) => (
             "fused_gate_up_silu_mul",
             "fused_gate_up_silu_mul_gemm_f16_specialized",
         ),
-        KernelId::RopeAppend => ("rope", "rope_append_f16_specialized"),
-        // CORRECTNESS DEBUG: revert to v1 to see if v2 is producing
-        // zeros in the production binding flow. v1 uses (head_dim, 1, 1)
-        // threads.
-        KernelId::AttentionViaCache => ("attention", "attention_via_cache_f16_specialized"),
-        KernelId::AttentionPrefillContiguous => {
+        (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) if bucket_m == 1 => (
+            "fused_gate_up_silu_mul",
+            "fused_gate_up_silu_mul_decode_bf16_specialized",
+        ),
+        (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) => (
+            "fused_gate_up_silu_mul",
+            "fused_gate_up_silu_mul_gemm_bf16_specialized",
+        ),
+        (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
+        (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
+        (KernelId::AttentionViaCache, MetalDtype::F16) => {
+            ("attention", "attention_via_cache_f16_specialized")
+        }
+        (KernelId::AttentionViaCache, MetalDtype::Bf16) => {
+            ("attention", "attention_via_cache_bf16_specialized")
+        }
+        (KernelId::AttentionPrefillContiguous, MetalDtype::F16) => {
             ("attention", "attention_prefill_contiguous_f16_specialized")
         }
-        KernelId::Add => ("elementwise", "residual_add_f16_specialized"),
-        KernelId::ScalarMul => ("elementwise", "scalar_mul_f16_specialized"),
-        // GEMM does not get a function-constant pipeline at this
-        // layer — Metal Performance Shaders' matmul2d is opaque.
-        // Surfaces as a hard error so the worker (5.C) routes GEMM
-        // through MPS rather than this cache.
-        KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
-        // Reshape is a metadata-only op and never reaches this layer
-        // (the lowering pass drops it). Defensive error in case a
-        // future caller forgets.
-        KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
+        (KernelId::AttentionPrefillContiguous, MetalDtype::Bf16) => {
+            ("attention", "attention_prefill_contiguous_bf16_specialized")
+        }
+        (KernelId::Add, MetalDtype::F16) => ("elementwise", "residual_add_f16_specialized"),
+        (KernelId::Add, MetalDtype::Bf16) => ("elementwise", "residual_add_bf16_specialized"),
+        (KernelId::ScalarMul, MetalDtype::F16) => ("elementwise", "scalar_mul_f16_specialized"),
+        (KernelId::ScalarMul, MetalDtype::Bf16) => ("elementwise", "scalar_mul_bf16_specialized"),
+        // GEMM is opaque (MPS-backed). Routed through the GEMM wrapper.
+        (KernelId::Gemm, _) => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
+        // Reshape is metadata-only.
+        (KernelId::Reshape, _) => {
+            return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape));
+        }
+        // Int4 was filtered out above.
+        (_, MetalDtype::Int4) => unreachable!("Int4 filtered at fn entry"),
     })
 }
 
@@ -209,16 +239,30 @@ impl SpecializedPipelines {
     }
 
     /// Return the specialized pipeline for `(kernel, bucket_m, W)`.
-    /// First call builds; subsequent calls hit the cache. Every
-    /// function constant the kernel consumes is read from `W::*`
-    /// (the macro-emitted `CanonicalParams` impl) so there is no
-    /// runtime extras struct to thread.
+    /// Defaults the dtype to [`MetalDtype::F16`] for backward
+    /// compatibility while the bf16 wiring lands across the worker /
+    /// macro-emission seams. New call sites should prefer
+    /// [`Self::pipeline_for_dtype`].
     pub fn pipeline_for<W: CanonicalParams>(
         &self,
         kernel: KernelId,
         bucket_m: u32,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
-        let (library, function) = kernel_msl_names(kernel, bucket_m)?;
+        self.pipeline_for_dtype::<W>(kernel, bucket_m, MetalDtype::F16)
+    }
+
+    /// Return the specialized pipeline for `(kernel, bucket_m, W,
+    /// dtype)`. First call builds; subsequent calls hit the cache.
+    /// Function constants read from `W::*` (the macro-emitted
+    /// `CanonicalParams` impl); dtype picks the symbol variant
+    /// (`_f16_specialized` vs `_bf16_specialized`).
+    pub fn pipeline_for_dtype<W: CanonicalParams>(
+        &self,
+        kernel: KernelId,
+        bucket_m: u32,
+        dtype: MetalDtype,
+    ) -> Result<ComputePipelineState, PipelineLookupError> {
+        let (library, function) = kernel_msl_names(kernel, bucket_m, dtype)?;
         let constants = constants_for::<W>(kernel, bucket_m)?;
         let key = PipelineKey::new(library, function, constants);
         self.cache
@@ -241,6 +285,11 @@ pub enum PipelineLookupError {
     /// `KernelId::Reshape` is metadata-only. Callers should drop it
     /// before reaching this layer; the lowering pass already does so.
     MetadataOnly(KernelId),
+    /// Caller asked for a dtype the pipeline cache can't resolve yet.
+    /// Currently used for `MetalDtype::Int4` — the AWQ / GPTQ dequant
+    /// path needs different binding shapes (packed u32 + group scales)
+    /// so a single symbol picker can't transparently model it.
+    DtypeNotYetWired(KernelId, MetalDtype),
     /// Cache build error (shader compile, function constant mismatch,
     /// pipeline state construction). The wrapped variant carries the
     /// underlying message verbatim.
@@ -257,6 +306,10 @@ impl std::fmt::Display for PipelineLookupError {
             Self::MetadataOnly(k) => write!(
                 f,
                 "specialized pipeline lookup: {k:?} is a metadata-only op (lowering should drop it)"
+            ),
+            Self::DtypeNotYetWired(k, d) => write!(
+                f,
+                "specialized pipeline lookup: kernel {k:?} dtype {d:?} not yet wired"
             ),
             Self::Build(e) => write!(f, "specialized pipeline build: {e}"),
         }
@@ -1391,6 +1444,147 @@ mod tests {
             assert!(
                 diff < tol,
                 "rmsnorm[{i}] metal={} cpu={} diff={}",
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// BF16 RmsNorm at M=64. Compiles `rmsnorm_bf16_specialized` via
+    /// the dtype-aware pipeline picker, dispatches against bf16 host
+    /// data, and compares to the bf16-round-tripped CPU reference.
+    /// First end-to-end exercise of the bf16 path on the metal
+    /// backend.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rmsnorm_bf16_matches_cpu_golden_m64() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let m: usize = 64;
+        let hidden = TinyLlamaProbe::Q_SIZE;
+        let pipeline = pipelines
+            .pipeline_for_dtype::<TinyLlamaProbe>(
+                KernelId::RmsNorm,
+                m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("rmsnorm bf16 pipeline");
+
+        let input_data: Vec<f32> = (0..m * hidden)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let weight_data: Vec<f32> = (0..hidden)
+            .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf16_data: Vec<half::bf16> =
+                data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf16_data.as_slice());
+            let buf =
+                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf16_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let input_buf = alloc_bf16(&device, &input_data);
+        let weight_buf = alloc_bf16(&device, &weight_data);
+        let output_buf = alloc_zero_bf16(&device, m * hidden);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(m as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // BF16-round-trip Q/K to match the kernel's input precision.
+        let input_bf16: Vec<f32> = input_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let weight_bf16: Vec<f32> = weight_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let mut output_cpu = vec![0.0_f32; m * hidden];
+        let eps = 1e-5_f32;
+        for row in 0..m {
+            let base = row * hidden;
+            cpu_golden::rmsnorm(
+                &input_bf16[base..base + hidden],
+                &weight_bf16,
+                &mut output_cpu[base..base + hidden],
+                eps,
+            );
+        }
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, output_cpu.len());
+
+        // Sanity: row 0 and row 22 should differ (input rows differ).
+        let row0 = &output_metal[0..4];
+        let row22 = &output_metal[22 * hidden..22 * hidden + 4];
+        assert_ne!(
+            row0, row22,
+            "bf16 rmsnorm: row 0 == row 22 — kernel collapsed distinct inputs"
+        );
+
+        // bf16 has 7-bit mantissa vs fp16's 10-bit; loosen tolerance
+        // to the bf16 ULP scale (~5e-3 for values near 1.0, scaling
+        // with magnitude). The cpu reference is bf16-round-tripped on
+        // input/weight but accumulates in f32, mirroring the kernel.
+        let tol: f32 = 1e-2;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rmsnorm_bf16[{i}] (row {} col {}) metal={} cpu={} diff={}",
+                i / hidden,
+                i % hidden,
                 output_metal[i],
                 output_cpu[i],
                 diff

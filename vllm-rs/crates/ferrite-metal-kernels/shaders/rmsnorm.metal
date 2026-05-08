@@ -101,6 +101,47 @@ kernel void rmsnorm_f16_specialized(
     }
 }
 
+/// BF16 specialized variant. Mirror of `rmsnorm_f16_specialized` with
+/// `device bfloat*` bindings — `bfloat` is a native MSL type since
+/// Metal 3.1, and Apple Silicon M3+ has hardware bf16 MMA. Function
+/// constants are the same indices; the runtime picks this symbol when
+/// the model's resolved dtype is bf16 (Llama-3.x ships bf16 on disk).
+kernel void rmsnorm_bf16_specialized(
+    device       bfloat* output [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    device const bfloat* weight [[buffer(2)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (gid >= RMSNORM_M) return;
+
+    threadgroup float shared_sum[1024];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
+        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
+
+    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
+        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+        float w   = float(weight[i]);
+        output[gid * RMSNORM_HIDDEN_SIZE + i] = bfloat((val / rms) * w);
+    }
+}
+
 /// BF16 variant (uses float16 as Metal doesn't have native bfloat16)
 kernel void rmsnorm_bf16(
     device const float* input [[buffer(0)]],

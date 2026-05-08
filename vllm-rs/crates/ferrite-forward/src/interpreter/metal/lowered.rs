@@ -71,6 +71,42 @@ pub enum KernelId {
     Reshape,
 }
 
+/// Element dtype the metal pipeline should pick. The shader source
+/// contains both `_f16_specialized` and `_bf16_specialized` symbols
+/// per kernel; this enum tells `kernel_msl_names` which to choose.
+///
+/// Llama-3.x ships bf16 on disk; the cuda backend runs them in bf16
+/// natively, and Apple Silicon (M3+) has hardware bf16 MMA. Casting
+/// to fp16 — which the metal backend did originally — clips
+/// exponent range and accumulates into nonsense output across deep
+/// layer chains (28 layers for Llama-3.2-3B).
+///
+/// `Int4` is a placeholder for the upcoming AWQ / GPTQ dequant path
+/// (group-wise int4 weights with bf16 scales / zeros). When that
+/// lands the dtype routes through this enum just like bf16 does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MetalDtype {
+    F16,
+    Bf16,
+    /// Reserved — int4 quantized weight path. Not yet wired through
+    /// `kernel_msl_names`; placed here so callers can already speak
+    /// in `MetalDtype` terms.
+    Int4,
+}
+
+impl MetalDtype {
+    /// `_f16_specialized` / `_bf16_specialized` infix used by every
+    /// dtype-parameterized shader symbol. Centralized so symbol naming
+    /// stays consistent across the on-path kernels.
+    pub fn symbol_infix(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::Int4 => "int4",
+        }
+    }
+}
+
 /// Per-axis dispatch grid: threadgroup count + threads per group.
 ///
 /// The lowering pass computes both from `(bucket M, kernel-specific

@@ -296,8 +296,10 @@ fn lower_one<W: CanonicalParams>(
         I::FusedGateUpSiluMul(in_slot, out_slot, layer, wt_fn) => {
             let inter = W::INTERMEDIATE_SIZE as u32;
             let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
-                // Decode: 8 outputs per threadgroup, 256 threads.
-                ((inter.div_ceil(MLP_TILE), 1, 1), (256, 1, 1))
+                // Decode (MLX gemv port): blockM = BM*SM*TM = 4
+                // outputs per threadgroup, 256 threads/group =
+                // BN*SN = 8 simdgroups × 32 lanes.
+                ((inter.div_ceil(MLP_DECODE_BLOCK_M), 1, 1), (256, 1, 1))
             } else {
                 // Prefill: 8x8 output tile, 32 threads.
                 let tg_x = inter.div_ceil(MLP_TILE);
@@ -558,3 +560,8 @@ const PREFILL_TILE_Q: u32 = 16;
 /// per threadgroup writes an 8×8 output tile. Match the shader's
 /// `TILE` constant.
 const MLP_TILE: u32 = 8;
+
+/// Output rows per threadgroup for the M=1 decode variant
+/// (`fused_gate_up_silu_mul_decode_f16_specialized`). Matches the
+/// MLX gemv port's `blockM = BM*SM*TM = 4`.
+const MLP_DECODE_BLOCK_M: u32 = 4;

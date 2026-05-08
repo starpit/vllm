@@ -6,6 +6,11 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
+// MLX's pragma helpers from `mlx/backend/metal/kernels/utils.h`.
+#ifndef MLX_MTL_PRAGMA_UNROLL
+#define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+#endif
+
 /// Fused Gate-Up-SiLU-Mul kernel for SwiGLU activation
 ///
 /// Pattern: silu(gate_proj(x)) * up_proj(x)
@@ -421,11 +426,21 @@ kernel void fused_gate_up_silu_mul_gemm_f16_specialized(
 // fused_gate_up_silu_mul_decode_f16_specialized
 // ============================================================================
 //
-// M=1 fast path. Drops simdgroup_matrix entirely — for a single
-// query row the MMA tile machinery is overhead, since 7/8 of every
-// loaded A fragment is zero-padded waste. Instead each threadgroup
-// computes 8 outputs via simd_sum dot products: one simdgroup per
-// output, 32 lanes accumulating K/32 partial products each.
+// M=1 fast path, fused gate+up SwiGLU. Direct port of MLX's
+// GEMVKernel from `mlx/backend/metal/kernels/gemv.metal`
+// (BM=1, BN=8, SM=1, SN=32, TM=4, TN=4) extended to compute
+// `output = silu(gate_w @ input) * (up_w @ input)` in one pass.
+//
+// Per-thread contract (matches MLX exactly):
+//   - Threadgroup: (BN*SN, BM*SM, 1) = (256, 1, 1) threads = 8
+//     simdgroups × 32 lanes.
+//   - Per threadgroup output: blockM = BM*SM*TM = 4 output rows.
+//   - Per threadgroup K chunk: blockN = BN*SN*TN = 1024 K-elements
+//     per main-loop iteration.
+//   - Each thread accumulates TM=4 outputs over the K dimension,
+//     reading TN=4 input + TN=4 gate-weight + TN=4 up-weight elements
+//     per inner iter. Threadgroup-memory reduction across BN
+//     simdgroups happens at the end.
 //
 // Bindings (must match the matrix variant exactly so the lowering
 // stays kernel-agnostic):
@@ -434,24 +449,20 @@ kernel void fused_gate_up_silu_mul_gemm_f16_specialized(
 //   buffer(2) = weight [2*N, K]   packed [gate; up]
 //
 // Function constants:
-//   0 = M (uint) — must be 1 for this kernel; defensive early-out
-//                  if M > 1 (lowering should never wire this kernel
-//                  for M>1, but the runtime cost is one branch).
-//   1 = N (uint) — INTERMEDIATE_SIZE
-//   2 = K (uint) — Q_SIZE / hidden_size
+//   3 = M (uint) — must be 1 for this kernel; defensive early-out.
+//   4 = N (uint) — INTERMEDIATE_SIZE.
+//   5 = K (uint) — Q_SIZE / hidden_size.
 //
-// Tile shape:
-//   - Threadgroup: 256 threads = 8 simdgroups × 32 lanes.
-//   - Output tile per threadgroup: 8 elements along N.
-//   - One simdgroup owns one output index.
+// Threadgroup grid: ((N + blockM - 1) / blockM, 1, 1) =
+// ((N + 3) / 4, 1, 1) for the 4-output blockM. For TinyLlama
+// N=5632 that's 1408 threadgroups; each threadgroup runs ~K/blockN
+// = K/1024 main-loop iterations (= 2 for K=2048) plus the simdgroup
+// reduction.
 //
-// Threadgroup grid: ((N + 7) / 8, 1, 1).
-// Threads per group: (256, 1, 1).
-//
-// No threadgroup-scratch staging, no per-K-iter barriers — every
-// device read is coalesced across the 32 lanes. Bandwidth-bound;
-// for TinyLlama K=2048 that's K/32 = 64 inner iterations per
-// (output, gate|up) pair = 128 inner iterations per output.
+// Empirically validated against the MLX reference; copy faithful to
+// the upstream kernel except for the fusion epilogue (silu(gate)*up
+// instead of writing both rows separately) and the function-constant
+// shape arguments instead of MLX's runtime constants.
 
 constant uint FUSED_MLP_DECODE_M [[function_constant(3)]];
 constant uint FUSED_MLP_DECODE_N [[function_constant(4)]];
@@ -460,38 +471,164 @@ constant uint FUSED_MLP_DECODE_K [[function_constant(5)]];
 kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     device       half* output  [[buffer(0)]],   // [1, N]
     device const half* input   [[buffer(1)]],   // [1, K]
-    device const half* weight  [[buffer(2)]],   // [2*N, K]
-    uint3 tgid    [[threadgroup_position_in_grid]],
-    uint  sg_id   [[simdgroup_index_in_threadgroup]],
-    uint  lane_id [[thread_index_in_simdgroup]])
+    device const half* weight  [[buffer(2)]],   // [2*N, K] packed [gate; up]
+    uint3 tid     [[threadgroup_position_in_grid]],
+    uint3 lid     [[thread_position_in_threadgroup]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
 {
     if (FUSED_MLP_DECODE_M != 1u) return;
 
+    // Compile-time params chosen from MLX's `instantiate_gemv_blocks`
+    // standard non-edge case: `instantiate_gemv(name, itype, 1, 8, 1, 32, 4, 4)`.
+    constexpr int BM = 1;
+    constexpr int BN = 8;
+    constexpr int SM = 1;
+    constexpr int SN = 32;
+    constexpr int TM = 4;
+    constexpr int TN = 4;
+    constexpr int threadsM = BM * SM;        // 1
+    constexpr int threadsN = BN * SN;        // 256
+    constexpr int blockM   = threadsM * TM;  // 4
+    constexpr int blockN   = threadsN * TN;  // 1024
+
     const uint N = FUSED_MLP_DECODE_N;
     const uint K = FUSED_MLP_DECODE_K;
+    const uint matrix_ld = K;
 
-    // Output index this simdgroup owns: tgid.x * 8 + sg_id.
-    const uint n = tgid.x * 8u + sg_id;
-    if (n >= N) return;
+    // Per-thread accumulators (TM outputs per thread).
+    thread float gate_result[TM] = {0};
+    thread float up_result  [TM] = {0};
+    thread half  in_buf [TN];
+    thread half  gate_buf[TN];
+    thread half  up_buf  [TN];
 
-    // Per-row weight pointers (gate row n, up row N+n).
-    device const half* w_gate = weight + n * K;
-    device const half* w_up   = weight + (N + n) * K;
+    const int thrM = SN != 32 ? int(simd_lid) / SN : 0;
+    const int thrN = SN != 32 ? int(simd_lid) % SN : int(simd_lid);
 
-    // Each lane sums K/32 elements (with K rarely a multiple of 32?
-    // for TinyLlama K=2048 it is; guard with `k < K` check anyway).
-    float gate_acc = 0.0f;
-    float up_acc   = 0.0f;
-    for (uint k = lane_id; k < K; k += 32u) {
-        const float a = float(input[k]);
-        gate_acc += a * float(w_gate[k]);
-        up_acc   += a * float(w_up[k]);
+    const int sgN = BN != 1 ? int(simd_gid) % BN : 0;
+    const int simdM = BN != 1 ? SM * (int(simd_gid) / BN) : SM * int(simd_gid);
+    const int simdN = BN != 1 ? SN * (int(simd_gid) % BN) : 0;
+
+    int bm = (simdM + thrM) * TM;
+    int bn = (simdN + thrN) * TN;
+
+    // Block position: which output rows this threadgroup is computing.
+    int out_row = int(tid.x) * blockM + bm;
+    if (out_row >= int(N)) return;
+
+    // Adjust the tail simdgroup so the last threadgroup's writes stay
+    // in bounds (matches MLX's edge handling).
+    const int N_int = int(N);
+    out_row = out_row + TM <= N_int ? out_row : N_int - TM;
+
+    // Pointer pair: gate row out_row, up row N + out_row.
+    device const half* gate_mat = weight + uint(out_row) * matrix_ld;
+    device const half* up_mat   = weight + (N + uint(out_row)) * matrix_ld;
+
+    // Loop over K in blocks of blockN = 1024.
+    const int K_int = int(K);
+    const int n_iter = K_int / blockN;
+    const int last_iter = blockN * n_iter;
+    const int leftover = K_int - last_iter;
+
+    for (int i = 0; i < n_iter; ++i) {
+        // Load TN input elements for this thread's K-slice.
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+            in_buf[tn] = input[bn + tn];
+        }
+
+        int mat_offset = 0;
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            // Load TN gate-weight + TN up-weight elements for row tm.
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_buf[tn] = gate_mat[mat_offset + bn + tn];
+                up_buf[tn]   = up_mat  [mat_offset + bn + tn];
+            }
+            // Accumulate.
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
+                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+            }
+            mat_offset += int(matrix_ld);
+        }
+
+        bn += blockN;
     }
-    gate_acc = simd_sum(gate_acc);
-    up_acc   = simd_sum(up_acc);
 
-    if (lane_id == 0u) {
-        const float silu_gate = gate_acc / (1.0f + exp(-gate_acc));
-        output[n] = half(silu_gate * up_acc);
+    if (leftover > 0) {
+        // Bounds-checked tail — copy MLX's load_safe pattern inline.
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+            in_buf[tn] = (bn + tn < K_int) ? input[bn + tn] : half(0);
+        }
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_buf[tn] = (bn + tn < K_int)
+                    ? gate_mat[tm * int(matrix_ld) + bn + tn]
+                    : half(0);
+                up_buf[tn] = (bn + tn < K_int)
+                    ? up_mat  [tm * int(matrix_ld) + bn + tn]
+                    : half(0);
+            }
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tn = 0; tn < TN; tn++) {
+                gate_result[tm] += float(gate_buf[tn]) * float(in_buf[tn]);
+                up_result[tm]   += float(up_buf[tn])   * float(in_buf[tn]);
+            }
+        }
+    }
+
+    // Simdgroup reduction (32-lane shuffle-down).
+    MLX_MTL_PRAGMA_UNROLL
+    for (int tm = 0; tm < TM; tm++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+            gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
+            up_result[tm]   += simd_shuffle_down(up_result[tm], sn);
+        }
+    }
+
+    // Threadgroup reduction across BN=8 simdgroups (only sgN=0 will
+    // hold the final partials and write outputs).
+    threadgroup float tgp_gate[BN * (blockM + TM)];
+    threadgroup float tgp_up  [BN * (blockM + TM)];
+
+    threadgroup float* gate_results = tgp_gate + sgN * (blockM + TM) + bm;
+    threadgroup float* up_results   = tgp_up   + sgN * (blockM + TM) + bm;
+    if (thrN == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            gate_results[tm] = gate_result[tm];
+            up_results[tm]   = up_result[tm];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgN == 0 && thrN == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int sgn = 1; sgn < BN; sgn++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+                gate_result[tm] += tgp_gate[sgn * (blockM + TM) + bm + tm];
+                up_result[tm]   += tgp_up  [sgn * (blockM + TM) + bm + tm];
+            }
+        }
+
+        // SwiGLU epilogue + write.
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+            const float g = gate_result[tm];
+            const float u = up_result[tm];
+            const float silu_g = g / (1.0f + exp(-g));
+            output[out_row + tm] = half(silu_g * u);
+        }
     }
 }
+

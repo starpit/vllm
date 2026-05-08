@@ -1419,7 +1419,7 @@ mod tests {
         let weight_buf = alloc_f16(&device, &weight_data);
         let output_buf = alloc_zero_f16(&device, m * n);
 
-        // M=1 → decode kernel dispatch shape.
+        // M=1 → decode kernel dispatch shape (MLX gemv port: blockM=4).
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
@@ -1427,7 +1427,7 @@ mod tests {
         enc.set_buffer(1, Some(&input_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
         enc.dispatch_thread_groups(
-            MTLSize::new((n as u64).div_ceil(8), 1, 1),
+            MTLSize::new((n as u64).div_ceil(4), 1, 1),
             MTLSize::new(256, 1, 1),
         );
         enc.end_encoding();
@@ -1574,7 +1574,7 @@ mod tests {
         // M>=2 → matrix kernel: 32 threads/group, 8x8 output tile.
         let (threadgroups, threads_per_threadgroup) = if m == 1 {
             (
-                MTLSize::new((n as u64).div_ceil(8), 1, 1),
+                MTLSize::new((n as u64).div_ceil(4), 1, 1),
                 MTLSize::new(256, 1, 1),
             )
         } else {

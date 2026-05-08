@@ -796,3 +796,73 @@ Source-of-truth pointers:
   already had the FP8-vs-BF16 elem-size mismatch; `load_sharded`
   mirrors the same convention (`elem = q_dtype.size_bytes()`) so the
   fix in (1) lands once and covers both paths.
+
+## 2026-05-08 — Phase 7d: FP8 gated-attention — model returns coherent output on TP=2
+
+Goal: fix CUDA_ERROR_ILLEGAL_ADDRESS in FA2 caused by BF16 cuBLAS GEMM
+reading FP8 bytes as garbage Q/K/V activations. Fully landed.
+
+What shipped:
+
+1. **`Fp8GatedAttentionLayer`** in `ferrite-kernels/src/layers_attn_gated.rs`:
+   - New struct holding `Fp8Linear qkv_proj` + `Fp8Linear o_proj` +
+     `bf16_fallback: Option<Qwen3NextGatedAttentionLayer>`.
+   - Single `load(gw, prefix, ..., tp_rank, tp_size, output_dtype, stream)`
+     that is uniformly TP-aware (world=1 short-circuits to non-TP inside
+     each `Fp8Linear::load_concat_sharded` / `load_sharded`).
+   - Runtime dtype probe on `q_proj.weight`: if BF16 (compressed-tensors
+     `ignore` list — layer 47 on unsloth), delegates to
+     `Qwen3NextGatedAttentionLayer::load_sharded` and parks dummies.
+     Same pattern as `Fp8SharedFusedMoELayer`'s `bf16_fallback`.
+   - `forward`: short-circuits to BF16 peer when `bf16_fallback.is_some()`;
+     else runs full FP8 path (gate-split, per-head Q/K RMSNorm, Q-only
+     partial RoPE, paged K/V write, FA2 with on-the-fly K rotation,
+     sigmoid output gate, FP8 o_proj). Byte-identical to the BF16 peer
+     logic, but `qkv_proj.forward` / `o_proj.forward` use `Fp8Linear`.
+   - `add_one_inplace` bumped to `pub(crate)` so the FP8 loader can reuse
+     it for Q/K norm weight initialization.
+
+2. **`Fp8Linear::dummy()`** in `ferrite-kernels/src/layers.rs`: dangling
+   sentinel, never read in practice (outer forward short-circuits).
+
+3. **`quantization.rs`**: `OpKind::GatedAttention` added to the
+   `reached_by_matmul` set so the FP8 storage format is resolved for
+   `self_attn[layer]` aggregate weight accessors on FP8 checkpoints.
+
+4. **`codegen.rs`**:
+   - `FieldLoad::Fp8GatedAttention` variant (same fields as `GatedAttention`).
+   - `is_fp8_gated_attention` type-string probe.
+   - Classification: `is_gated_attention || is_fp8_gated_attention` block
+     returns the right variant.
+   - `accessor_is_fp8_any`: `Fp8GatedAttentionLayer` registered so the
+     storage-vs-accessor consistency check passes at macro-expand time.
+   - Emit arms in both `emit_unindexed_let` and `emit_layered_load_body`;
+     both use `__fp8_dtype` prelude binding and thread `tp_rank/tp_size`.
+
+5. **`impl_lib.rs`**:
+   - `is_fp8_gated_attention()` predicate (mirrors `is_fp8_any_moe`).
+   - `Fp8GatedAttentionRefImpl`: claims `OpKind::GatedAttention` when FP8;
+     emits `Instruction::Fp8GatedAttention` with `rotary_cos_sin` accessor.
+   - `GatedAttentionRefImpl::matches`: early-returns `None` when FP8 (defer
+     to the new impl).
+
+6. **`instr.rs`**: `Instruction::Fp8GatedAttention` variant + eval arm
+   with post-forward `#[cfg(feature = "nccl")] all_reduce_inplace_promote`.
+
+7. **`info.rs`**: `Fp8GatedAttention` introspection arm.
+
+Reproducer state on nick3 (`/home/nickm/qwen3-next-fresh/vllm-rs`):
+
+```
+./target/release/vllm serve unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+  --device cuda --tensor-parallel-size 2 \
+  --max-model-len 256 --gpu-memory-utilization 0.85
+# → "Stack initialized with TP=2"
+# → server binds, routes register
+# First request: coherent Python output ✓
+# curl response: {"text":"n\n    a=0\n    b=0\n    if n<=0:..."}
+```
+
+Phase complete. No open follow-ups — model loads, serves, and returns
+coherent output at TP=2 on the unsloth Qwen3-Coder-Next-FP8-Dynamic
+checkpoint.

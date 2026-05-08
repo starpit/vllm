@@ -2,7 +2,6 @@
 // CUTLASS 2.x scaled_mm kernel instantiation for SM89 (Ada Lovelace / L40S).
 // Implements FP8 E4M3 GEMM with fused per-row/per-tensor scale epilogue.
 // Matches Python vLLM's cutlass_scaled_mm_sm89 exactly.
-// Built without --use_fast_math for deterministic FP8 GEMM output.
 
 #include "scaled_mm_c2x.cuh"
 #include "scaled_mm_c2x_sm89_fp8_dispatch.cuh"

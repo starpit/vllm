@@ -80,9 +80,7 @@ fn cuda_build() {
         .watch(vllm_watch.iter().map(|s| s.to_string()))
         .include_path("../../crates/vllm-cuda/csrc")
         .arg("-O3")
-        // No --use_fast_math: matches Python vLLM's CMakeLists.txt which does
-        // not set this flag globally. Avoids non-deterministic FMA in MoE
-        // topk_softmax / moe_sum reductions.
+        .arg("--use_fast_math")
         .arg("--expt-extended-lambda")
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
@@ -226,12 +224,7 @@ fn build_cutlass_scaled_mm(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .with_cutlass(Some(CUTLASS_COMMIT))
         .arg("-std=c++17")
         .arg("-O3")
-        // NOTE: --use_fast_math removed intentionally. It enables non-IEEE
-        // fused-multiply-add that makes CUTLASS FP8 GEMM non-deterministic
-        // across runs (different thread scheduling → different reduction order
-        // → different BF16 results → different argmax → wrong token).
-        // Perf impact: ~5-10% throughput reduction for FP8 GEMM; acceptable
-        // given that determinism is required for correct TP=2 inference.
+        .arg("--use_fast_math")
         .arg("--expt-relaxed-constexpr")
         .arg("--expt-extended-lambda")
         .arg("-Xcompiler")

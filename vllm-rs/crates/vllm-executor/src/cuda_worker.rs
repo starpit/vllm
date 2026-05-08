@@ -2783,13 +2783,23 @@ impl CudaWorker {
     /// state_indices: [num_seqs] i32 — slot index per sequence (= batch index).
     /// cu_seqlens: [num_seqs + 1] i32 — cumulative query lengths.
     fn build_gdn_tensors(
+        pool: &mut vllm_cuda::model::qwen3_next::GdnStatePool,
+        req_ids: &[String],
         meta: &vllm_model::AttentionMetadata,
         device: &mut GpuDevice,
     ) -> ExecutorResult<(OwnedTensor, OwnedTensor, usize)> {
         let num_seqs = meta.num_reqs;
+        debug_assert_eq!(req_ids.len(), num_seqs);
 
-        // State indices: sequence i uses slot i in the GDN state pool.
-        let state_indices: Vec<i32> = (0..num_seqs as i32).collect();
+        // Allocate a persistent slot for each request (idempotent for
+        // decode steps — returns the same slot already assigned at prefill).
+        let mut state_indices = Vec::with_capacity(num_seqs);
+        let stream = device.compute_stream;
+        for req_id in req_ids.iter().take(num_seqs) {
+            let slot = unsafe { pool.alloc_slot(req_id, stream) }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("GDN alloc_slot: {e}")))?;
+            state_indices.push(slot as i32);
+        }
         let gpu_state_indices = Self::h2d_i32(&state_indices, device)?;
 
         // cu_seqlens for GDN: same as attention cu_seqlens_q.
@@ -7097,6 +7107,10 @@ impl CudaWorker {
             self.mm_data_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
+            // Return the GDN recurrent state slot so it can be reused.
+            if let Some(pool) = self.gdn_state_pool.as_mut() {
+                pool.free_slot(req_id);
+            }
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
         }
@@ -8171,7 +8185,7 @@ impl CudaWorker {
         }
 
         // Deferred: take gdn_pool_ref now that piecewise path (which needs &mut self) is done.
-        let gdn_pool_ref = self.gdn_state_pool.as_ref();
+        let gdn_pool_ref = self.gdn_state_pool.as_mut();
 
         // -----------------------------------------------------------------------
         // Full CUDA Graph Path: Monolithic graph with fixed split-K
@@ -8734,21 +8748,20 @@ impl CudaWorker {
                     // and ferrite-loaded `qwen3_next` arches; the
                     // dispatch inside `forward_qwen3_next` routes
                     // accordingly.
-                    let gdn_pool = gdn_pool_ref.unwrap();
+                    let gdn_pool = gdn_pool_ref.unwrap(); // &mut GdnStatePool
                     let meta = &prepared.attn_meta;
+                    let req_ids: Vec<String> = prepared
+                        .req_inputs
+                        .iter()
+                        .take(meta.num_reqs)
+                        .map(|r| r.req_id.clone())
+                        .collect();
 
-                    // Clear GDN state for sequences in prefill (query_len > 1).
-                    for i in 0..meta.num_reqs {
-                        let qlen = meta.query_start_loc[i + 1] - meta.query_start_loc[i];
-                        if qlen > 1 {
-                            unsafe { gdn_pool.clear_slot(i, device.compute_stream) }.map_err(
-                                |e| ExecutorError::WorkerExecution(format!("GDN clear_slot: {e}")),
-                            )?;
-                        }
-                    }
-
+                    // `alloc_slot` is idempotent — it allocates a fresh
+                    // zeroed slot on first prefill and returns the same
+                    // slot on subsequent decode steps.
                     let (gdn_state_indices, gdn_cu_seqlens, num_seqs) =
-                        Self::build_gdn_tensors(meta, device)?;
+                        Self::build_gdn_tensors(gdn_pool, &req_ids, meta, device)?;
                     let logits = unsafe {
                         model.forward_qwen3_next(
                             gpu_input_ids.view(),

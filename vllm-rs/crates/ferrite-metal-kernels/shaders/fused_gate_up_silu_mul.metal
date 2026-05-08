@@ -416,3 +416,82 @@ kernel void fused_gate_up_silu_mul_gemm_f16_specialized(
         }
     }
 }
+
+// ============================================================================
+// fused_gate_up_silu_mul_decode_f16_specialized
+// ============================================================================
+//
+// M=1 fast path. Drops simdgroup_matrix entirely — for a single
+// query row the MMA tile machinery is overhead, since 7/8 of every
+// loaded A fragment is zero-padded waste. Instead each threadgroup
+// computes 8 outputs via simd_sum dot products: one simdgroup per
+// output, 32 lanes accumulating K/32 partial products each.
+//
+// Bindings (must match the matrix variant exactly so the lowering
+// stays kernel-agnostic):
+//   buffer(0) = output [1, N]
+//   buffer(1) = input  [1, K]
+//   buffer(2) = weight [2*N, K]   packed [gate; up]
+//
+// Function constants:
+//   0 = M (uint) — must be 1 for this kernel; defensive early-out
+//                  if M > 1 (lowering should never wire this kernel
+//                  for M>1, but the runtime cost is one branch).
+//   1 = N (uint) — INTERMEDIATE_SIZE
+//   2 = K (uint) — Q_SIZE / hidden_size
+//
+// Tile shape:
+//   - Threadgroup: 256 threads = 8 simdgroups × 32 lanes.
+//   - Output tile per threadgroup: 8 elements along N.
+//   - One simdgroup owns one output index.
+//
+// Threadgroup grid: ((N + 7) / 8, 1, 1).
+// Threads per group: (256, 1, 1).
+//
+// No threadgroup-scratch staging, no per-K-iter barriers — every
+// device read is coalesced across the 32 lanes. Bandwidth-bound;
+// for TinyLlama K=2048 that's K/32 = 64 inner iterations per
+// (output, gate|up) pair = 128 inner iterations per output.
+
+constant uint FUSED_MLP_DECODE_M [[function_constant(3)]];
+constant uint FUSED_MLP_DECODE_N [[function_constant(4)]];
+constant uint FUSED_MLP_DECODE_K [[function_constant(5)]];
+
+kernel void fused_gate_up_silu_mul_decode_f16_specialized(
+    device       half* output  [[buffer(0)]],   // [1, N]
+    device const half* input   [[buffer(1)]],   // [1, K]
+    device const half* weight  [[buffer(2)]],   // [2*N, K]
+    uint3 tgid    [[threadgroup_position_in_grid]],
+    uint  sg_id   [[simdgroup_index_in_threadgroup]],
+    uint  lane_id [[thread_index_in_simdgroup]])
+{
+    if (FUSED_MLP_DECODE_M != 1u) return;
+
+    const uint N = FUSED_MLP_DECODE_N;
+    const uint K = FUSED_MLP_DECODE_K;
+
+    // Output index this simdgroup owns: tgid.x * 8 + sg_id.
+    const uint n = tgid.x * 8u + sg_id;
+    if (n >= N) return;
+
+    // Per-row weight pointers (gate row n, up row N+n).
+    device const half* w_gate = weight + n * K;
+    device const half* w_up   = weight + (N + n) * K;
+
+    // Each lane sums K/32 elements (with K rarely a multiple of 32?
+    // for TinyLlama K=2048 it is; guard with `k < K` check anyway).
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+    for (uint k = lane_id; k < K; k += 32u) {
+        const float a = float(input[k]);
+        gate_acc += a * float(w_gate[k]);
+        up_acc   += a * float(w_up[k]);
+    }
+    gate_acc = simd_sum(gate_acc);
+    up_acc   = simd_sum(up_acc);
+
+    if (lane_id == 0u) {
+        const float silu_gate = gate_acc / (1.0f + exp(-gate_acc));
+        output[n] = half(silu_gate * up_acc);
+    }
+}

@@ -273,26 +273,42 @@ fn lower_one<W: CanonicalParams>(
 
         // ── Fused gate-up SwiGLU MLP (GEMM + SwiGLU in one dispatch) ──
         //
-        // Dispatches `fused_gate_up_silu_mul_gemm_f16_specialized`,
-        // which does `output = silu(input @ W_gate^T) * (input @ W_up^T)`
-        // in one pass with intermediates kept in
-        // simdgroup-matrix accumulators. Tile shape is 8×8 per
-        // threadgroup (one simdgroup, 32 threads).
+        // Two specialized variants behind `KernelId::FusedGateUpSiluMul`:
         //
-        // Bindings: (out, in, weight) at indices 0/1/2. The kernel
-        // splits the packed `[gate|up]` weight `[2*N, K]` internally —
-        // gate rows [0, N), up rows [N, 2N).
+        // - **Decode (`bucket_m == 1`)**: dispatches
+        //   `fused_gate_up_silu_mul_decode_f16_specialized`, which
+        //   uses simd_sum dot products. 256 threads/group =
+        //   8 simdgroups × 32 lanes; one simdgroup owns one output.
+        //   Threadgroup grid: `(ceil(N/8), 1, 1)` — 8 outputs/group.
+        //
+        // - **Prefill (`bucket_m >= 2`)**: dispatches
+        //   `fused_gate_up_silu_mul_gemm_f16_specialized`, which uses
+        //   `simdgroup_matrix<half, 8, 8>` MMA tiles. 32 threads =
+        //   one simdgroup per threadgroup, 8x8 output tile.
+        //   Threadgroup grid: `(ceil(N/8), ceil(M/8), 1)`.
+        //
+        // Bindings are identical for both variants: (out, in, weight)
+        // at indices 0/1/2. The kernel splits the packed `[gate|up]`
+        // weight `[2*N, K]` internally — gate rows [0, N), up rows
+        // [N, 2N). The pipeline picker in
+        // `interpreter::metal::pipelines::kernel_msl_names` chooses
+        // by `bucket_m`.
         I::FusedGateUpSiluMul(in_slot, out_slot, layer, wt_fn) => {
             let inter = W::INTERMEDIATE_SIZE as u32;
-            // Threadgroup grid: ceil(N / 8) along x, ceil(M / 8) along y.
-            let tg_x = inter.div_ceil(MLP_TILE);
-            let tg_y = bucket_m.div_ceil(MLP_TILE);
+            let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
+                // Decode: 8 outputs per threadgroup, 256 threads.
+                ((inter.div_ceil(MLP_TILE), 1, 1), (256, 1, 1))
+            } else {
+                // Prefill: 8x8 output tile, 32 threads.
+                let tg_x = inter.div_ceil(MLP_TILE);
+                let tg_y = bucket_m.div_ceil(MLP_TILE);
+                ((tg_x, tg_y, 1), (32, 1, 1))
+            };
             LoweredCommand {
                 kernel: KernelId::FusedGateUpSiluMul,
                 dispatch: DispatchShape {
-                    threadgroups: (tg_x, tg_y, 1),
-                    // 32 threads = 1 simdgroup per threadgroup.
-                    threads_per_threadgroup: (32, 1, 1),
+                    threadgroups,
+                    threads_per_threadgroup,
                 },
                 bindings: vec![
                     Binding::ArenaSlot {

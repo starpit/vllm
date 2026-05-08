@@ -89,11 +89,22 @@ use super::lowered::KernelId;
 /// the TinyLlama-class lineage uses; bf16 / vec4 specializations
 /// surface as additional `KernelId` variants when their cost is
 /// proven.
-fn kernel_msl_names(kernel: KernelId) -> Result<(&'static str, &'static str), PipelineLookupError> {
+fn kernel_msl_names(
+    kernel: KernelId,
+    bucket_m: u32,
+) -> Result<(&'static str, &'static str), PipelineLookupError> {
     Ok(match kernel {
         KernelId::Embed => ("embed", "embed_f16_specialized"),
         KernelId::RmsNorm => ("rmsnorm", "rmsnorm_f16_specialized"),
         KernelId::FusedAddRmsNorm => ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized"),
+        // Two specialized variants: the decode (M=1) variant uses
+        // simd_sum dot products and avoids the simdgroup_matrix
+        // overhead that would otherwise dominate at one-row inputs.
+        // Prefill (M >= 2) uses the matrix variant.
+        KernelId::FusedGateUpSiluMul if bucket_m == 1 => (
+            "fused_gate_up_silu_mul",
+            "fused_gate_up_silu_mul_decode_f16_specialized",
+        ),
         KernelId::FusedGateUpSiluMul => (
             "fused_gate_up_silu_mul",
             "fused_gate_up_silu_mul_gemm_f16_specialized",
@@ -130,6 +141,14 @@ pub fn constants_for<W: CanonicalParams>(
             ConstantValue::uint(0, bucket_m),
             ConstantValue::uint(1, W::Q_SIZE as u32),
             ConstantValue::float(2, W::RMS_NORM_EPS),
+        ],
+        // Decode (M=1) variant carries (M, N, K) at indices 3/4/5
+        // so the matrix variant's 0/1/2 don't clash in the shared
+        // library when both kernels are compiled together.
+        KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
+            ConstantValue::uint(3, bucket_m),
+            ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
+            ConstantValue::uint(5, W::Q_SIZE as u32),
         ],
         KernelId::FusedGateUpSiluMul => vec![
             ConstantValue::uint(0, bucket_m),
@@ -196,7 +215,7 @@ impl SpecializedPipelines {
         kernel: KernelId,
         bucket_m: u32,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
-        let (library, function) = kernel_msl_names(kernel)?;
+        let (library, function) = kernel_msl_names(kernel, bucket_m)?;
         let constants = constants_for::<W>(kernel, bucket_m)?;
         let key = PipelineKey::new(library, function, constants);
         self.cache
@@ -309,6 +328,19 @@ mod tests {
         assert_eq!(bag[0], ConstantValue::uint(0, 64));
         assert_eq!(bag[1], ConstantValue::uint(1, 5632));
         assert_eq!(bag[2], ConstantValue::uint(2, 2048));
+    }
+
+    #[test]
+    fn fused_silu_decode_bag_uses_indices_3_4_5() {
+        // bucket_m == 1 selects the decode kernel; constants live at
+        // indices 3, 4, 5 to avoid clashing with the matrix variant
+        // in the same library.
+        let bag =
+            constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 1).expect("silu decode bag");
+        assert_eq!(bag.len(), 3);
+        assert_eq!(bag[0], ConstantValue::uint(3, 1));
+        assert_eq!(bag[1], ConstantValue::uint(4, 5632));
+        assert_eq!(bag[2], ConstantValue::uint(5, 2048));
     }
 
     #[test]
@@ -1387,6 +1419,7 @@ mod tests {
         let weight_buf = alloc_f16(&device, &weight_data);
         let output_buf = alloc_zero_f16(&device, m * n);
 
+        // M=1 → decode kernel dispatch shape.
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
@@ -1394,8 +1427,8 @@ mod tests {
         enc.set_buffer(1, Some(&input_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
         enc.dispatch_thread_groups(
-            MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
-            MTLSize::new(32, 1, 1),
+            MTLSize::new((n as u64).div_ceil(8), 1, 1),
+            MTLSize::new(256, 1, 1),
         );
         enc.end_encoding();
         cb.commit();
@@ -1536,18 +1569,27 @@ mod tests {
         let weight_buf = alloc_f16(&device, &weight_data);
         let output_buf = alloc_zero_f16(&device, m * n);
 
-        // Threadgroup grid: ceil(N/8) along x, ceil(M/8) along y.
-        // 32 threads = one simdgroup per threadgroup.
+        // Dispatch shape depends on which kernel variant was picked.
+        // M=1 → decode kernel: 256 threads/group, 8 outputs/group.
+        // M>=2 → matrix kernel: 32 threads/group, 8x8 output tile.
+        let (threadgroups, threads_per_threadgroup) = if m == 1 {
+            (
+                MTLSize::new((n as u64).div_ceil(8), 1, 1),
+                MTLSize::new(256, 1, 1),
+            )
+        } else {
+            (
+                MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
+                MTLSize::new(32, 1, 1),
+            )
+        };
         let cb = queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(&output_buf), 0);
         enc.set_buffer(1, Some(&input_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
-        enc.dispatch_thread_groups(
-            MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
-            MTLSize::new(32, 1, 1),
-        );
+        enc.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();

@@ -441,6 +441,11 @@ pub struct ChatArgs {
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
 
+    /// Fraction of GPU memory to reserve for model weights + KV cache
+    /// (0.0–1.0, default 0.9). Lower this if you get OOM on large models.
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
     /// Disable CUDA graphs (use eager mode).
     #[arg(long)]
     pub enforce_eager: bool,

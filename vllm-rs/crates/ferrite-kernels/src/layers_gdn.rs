@@ -50,8 +50,10 @@ use crate::layers::Linear;
 /// - `conv_states`: `[num_slots * num_gdn_layers, conv_dim, kernel_size - 1]` (f32)
 /// - `ssm_states`:  `[num_slots * num_gdn_layers, num_v_heads * head_v_dim, head_k_dim]` (f32)
 ///
-/// Slots are indexed by request. When a request completes, its slot
-/// is freed (zeroed via [`GdnStatePool::clear_slot`]).
+/// The pool owns its slot allocator: each active request_id maps to one
+/// slot index. Call [`GdnStatePool::alloc_slot`] on first prefill and
+/// [`GdnStatePool::free_slot`] when the request finishes. Mirrors
+/// Python vLLM's `MambaCache` slot-allocator pattern.
 pub struct GdnStatePool {
     /// `[num_slots * num_gdn_layers, conv_dim, kernel_size - 1]` (f32 on GPU).
     pub conv_states: GpuTensor,
@@ -64,6 +66,10 @@ pub struct GdnStatePool {
     pub num_v_heads: usize,
     pub head_v_dim: usize,
     pub head_k_dim: usize,
+    /// request_id → slot index. Persistent across forward passes.
+    slot_map: std::collections::HashMap<String, usize>,
+    /// Available slot indices (free-list). Initially `[0..num_slots]`.
+    free_slots: Vec<usize>,
 }
 
 #[cfg(feature = "cuda")]
@@ -124,7 +130,39 @@ impl GdnStatePool {
             num_v_heads,
             head_v_dim,
             head_k_dim,
+            slot_map: std::collections::HashMap::new(),
+            free_slots: (0..num_slots).collect(),
         })
+    }
+
+    /// Allocate a slot for `req_id` if not already assigned, clear it
+    /// (so recycled state from a previous request can't leak), and
+    /// return the slot index. Panics if the pool is full — callers must
+    /// ensure `num_slots >= max_concurrent_requests`.
+    pub unsafe fn alloc_slot(&mut self, req_id: &str, stream: CUstream) -> Result<usize> {
+        if let Some(&slot) = self.slot_map.get(req_id) {
+            return Ok(slot);
+        }
+        let slot = self
+            .free_slots
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("GdnStatePool exhausted: all {num} slots in use — increase num_gpu_blocks or reduce max_concurrent_sequences", num = self.num_slots))?;
+        unsafe { self.clear_slot(slot, stream)? };
+        self.slot_map.insert(req_id.to_string(), slot);
+        Ok(slot)
+    }
+
+    /// Release the slot for `req_id`. No-op if the request isn't in the map.
+    pub fn free_slot(&mut self, req_id: &str) {
+        if let Some(slot) = self.slot_map.remove(req_id) {
+            self.free_slots.push(slot);
+        }
+    }
+
+    /// Look up the slot for an already-allocated request. Returns `None`
+    /// if the request isn't registered (shouldn't happen during forward).
+    pub fn get_slot(&self, req_id: &str) -> Option<usize> {
+        self.slot_map.get(req_id).copied()
     }
 
     /// Zero out all GDN state (conv + ssm) for a given slot.

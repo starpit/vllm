@@ -17,6 +17,7 @@ metal = ["dep:metal"]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
 metal = { version = "0.29", optional = true }
 half = { workspace = true }
+rayon = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
 serde_json = { workspace = true }

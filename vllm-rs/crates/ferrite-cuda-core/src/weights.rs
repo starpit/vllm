@@ -759,52 +759,108 @@ impl GpuWeights {
         let src = cpu_ref.data();
         let dst = self.cast_scratch.as_mut_ptr();
 
-        // Dispatch cast. The common case is F32 → BF16/F16.
+        // Dispatch cast. The common case is F32 → BF16/F16. Each
+        // float-pair path uses (1) the `half` crate's SIMD-accelerated
+        // `convert_from_f32_slice` / `convert_to_f32_slice` where
+        // available (NEON on aarch64, F16C on x86_64 with the right
+        // target features), and (2) rayon to parallelize across cores.
+        // The threshold below avoids rayon overhead on tiny tensors.
+        use half::slice::HalfFloatSliceExt;
+        use rayon::prelude::*;
+        const PAR_THRESHOLD: usize = 256 * 1024; // ~256K elements before splitting.
+
         match (cpu_ref.dtype, target) {
             (DType::F32, DType::BF16) => {
                 let src_f32 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_f32.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::bf16::from_f32(*s).to_bits();
+                let dst_bf16 = unsafe {
+                    std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel)
+                };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_f32
+                        .par_chunks(chunk)
+                        .zip(dst_bf16.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| d.convert_from_f32_slice(s));
+                } else {
+                    dst_bf16.convert_from_f32_slice(src_f32);
                 }
             }
             (DType::F32, DType::F16) => {
                 let src_f32 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_f32.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::f16::from_f32(*s).to_bits();
+                let dst_f16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_f32
+                        .par_chunks(chunk)
+                        .zip(dst_f16.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| d.convert_from_f32_slice(s));
+                } else {
+                    dst_f16.convert_from_f32_slice(src_f32);
                 }
             }
             (DType::F16, DType::BF16) => {
-                let src_u16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_u16.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
-                }
+                let src_f16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
+                let dst_bf16 = unsafe {
+                    std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel)
+                };
+                // Two-step: f16 → f32 (SIMD via convert_to_f32_slice) → bf16.
+                src_f16
+                    .par_chunks(PAR_THRESHOLD.max(1))
+                    .zip(dst_bf16.par_chunks_mut(PAR_THRESHOLD.max(1)))
+                    .for_each(|(s, d)| {
+                        let mut tmp = vec![0.0_f32; s.len()];
+                        s.convert_to_f32_slice(&mut tmp);
+                        d.convert_from_f32_slice(&tmp);
+                    });
             }
             (DType::BF16, DType::F16) => {
-                let src_u16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_u16.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
+                let src_bf16 = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel)
+                };
+                let dst_f16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
+                src_bf16
+                    .par_chunks(PAR_THRESHOLD.max(1))
+                    .zip(dst_f16.par_chunks_mut(PAR_THRESHOLD.max(1)))
+                    .for_each(|(s, d)| {
+                        let mut tmp = vec![0.0_f32; s.len()];
+                        s.convert_to_f32_slice(&mut tmp);
+                        d.convert_from_f32_slice(&tmp);
+                    });
+            }
+            (DType::BF16, DType::F32) => {
+                let src_bf16 = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel)
+                };
+                let dst_f32 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_bf16
+                        .par_chunks(chunk)
+                        .zip(dst_f32.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| s.convert_to_f32_slice(d));
+                } else {
+                    src_bf16.convert_to_f32_slice(dst_f32);
                 }
             }
-            (DType::BF16 | DType::F16, DType::F32) => {
-                let src_u16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-                let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
-                if cpu_ref.dtype == DType::BF16 {
-                    for (s, d) in src_u16.iter().zip(dst_f32.iter_mut()) {
-                        *d = half::bf16::from_bits(*s).to_f32();
-                    }
+            (DType::F16, DType::F32) => {
+                let src_f16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
+                let dst_f32 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_f16
+                        .par_chunks(chunk)
+                        .zip(dst_f32.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| s.convert_to_f32_slice(d));
                 } else {
-                    for (s, d) in src_u16.iter().zip(dst_f32.iter_mut()) {
-                        *d = half::f16::from_bits(*s).to_f32();
-                    }
+                    src_f16.convert_to_f32_slice(dst_f32);
                 }
             }
             _ => unreachable!("unhandled cast: {:?} → {:?}", cpu_ref.dtype, target),

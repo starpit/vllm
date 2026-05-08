@@ -999,3 +999,84 @@ git bisect start HEAD 38f901ba5
 # For each candidate commit: build on nick3, curl test
 # Good = "n\n    a=0..." in output, Bad = garbage
 ```
+
+## 2026-05-08 — Debugging session: non-determinism on first request from fresh server
+
+### The core finding
+
+Temperature=0 (fully deterministic greedy decoding) produces **different outputs
+on different fresh server restarts** for identical inputs. This is the symptom we
+need to fix. The non-determinism is not between requests on a running server
+(though that exists too from state issues) — it's in the very FIRST request.
+
+Three fresh server restarts, same prompt `def fib(n):`, `temperature=0`:
+```
+Run 1: ' fib(n): return (n) n(n) n(n) n(n)'
+Run 2: ' fib(n): fib(n) fib(n) fib(n) fib(n) fib'
+Run 3: '\n\n\n\n\n    return:\n        if fib\n        else:\n           '
+```
+
+Run 3 is somewhat coherent. Runs 1 and 2 echo the prompt (a classic sign of
+induction heads failing due to numerical errors).
+
+### Most likely cause: FP8 CUTLASS GEMM non-determinism
+
+CUTLASS FP8 GEMM is non-deterministic between CUDA runs because tensor core
+reduction order is not fixed. Dynamic FP8 quantization computes activation scales
+from `max(|x|)/448` — if x is slightly different (due to CUTLASS non-determinism),
+the scale changes, and the quantized tensor for the next layer changes. This
+**compounds over 48 layers** until the logit distribution is completely different.
+
+Python vLLM fixes this with **CUDA graphs for decode** (which capture a fixed
+execution path and make it deterministic). We disabled CUDA graphs for Qwen3-Next
+because of GDN recurrent state that's hard to capture. Without graphs, each run
+picks a different reduction order in each FP8 GEMM → different activations →
+different logits → different tokens.
+
+### What was ruled out this session
+
+- `nan_to_zero` before lm_head: wrong approach (reverted)
+- `take_merged_dim0_shard` for `in_proj_ba`: wrong — weight IS in grouped format,
+  simple `take_shard` is correct (reverted)
+- Embedding vocab sharding: correct
+- GDN intermediate values: finite, reasonable magnitude
+- KV attention path: structurally correct
+- NCCL stream ordering: uses `compute_stream` throughout, no race
+- The `in_proj_ba` B/A split: confirmed GROUPED layout; gdn_qkvz_split kernel
+  correctly handles grouped format
+- `conv1d` 3-block sharding: correct
+- `A_log`, `dt_bias` sharding: correct
+
+### What was added this session (committed as 36dd60fd8)
+
+- `dump_tile_check_finite`: full-scan finite check in FERRITE_DUMP
+  (previously first8/last8 could miss Inf in middle dims)
+- `nan_to_zero_bf16_inplace` CUDA kernel + Rust wrapper (unused, available as tool)
+- `dump_tile_check_finite` calls on FusedAddRmsNorm residual and
+  ScalarOffsetRmsNorm input/output
+
+### Next session entry point
+
+**Option A (most direct):** Force CUTLASS to use deterministic mode.
+Set `CUBLAS_WORKSPACE_CONFIG=:4096:8` env var and add
+`cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH)` or equivalent for CUTLASS.
+Test if non-determinism goes away. If yes, accept the (small) perf hit.
+
+**Option B:** Compare against Python vLLM on a machine where it can run
+(newer driver). Run both with `torch.use_deterministic_algorithms(True)` in
+Python to confirm whether Python has the same non-determinism.
+
+**Option C:** Run a smaller BF16 model (not Qwen3-Next FP8) at TP=2 to verify
+the TP=2 infrastructure (AllReduce, AllGather, weight sharding) is correct for
+a deterministic model. If a BF16 model gives coherent TP=2 output, the bug is
+FP8-specific. If BF16 also fails, there's a more fundamental TP=2 bug.
+
+The quick reproducer:
+```bash
+# On nick3
+./target/release/vllm serve unsloth/Qwen3-Coder-Next-FP8-Dynamic \
+  --device cuda --tensor-parallel-size 2 \
+  --max-model-len 256 --gpu-memory-utilization 0.85
+# Expected (Python): '\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)'
+# Actual: non-deterministic garbage
+```

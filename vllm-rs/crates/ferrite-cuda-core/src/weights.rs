@@ -1868,6 +1868,74 @@ impl GpuWeights {
         Ok(unsafe { GpuTensor::new(gpu_ptr, &shard_shape, dtype) })
     }
 
+    /// Shard a `[2*B, H]` weight that is stored as two equal-sized blocks (block 0
+    /// = rows 0..B, block 1 = rows B..2*B) and extract rank `rank`'s slice from
+    /// EACH block, then concatenate them.
+    ///
+    /// This matches Python's `MergedColumnParallelLinear(output_sizes=[B, B])`
+    /// sharding, where each rank gets `[block0_shard, block1_shard]` rather than
+    /// a simple contiguous dim-0 shard of the full tensor. The resulting tensor
+    /// has shape `[2*(B/world_size), H]` and preserves the original dtype.
+    ///
+    /// Use this for weights like `in_proj_ba.weight` (`[2*num_v_heads, hidden]`
+    /// in block layout `[B_all, A_all]`). A simple `take_shard(dim=0)` would give
+    /// all-B to rank 0 and all-A to rank 1, which is wrong.
+    pub fn take_merged_dim0_shard(
+        &mut self,
+        name: &str,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<GpuTensor> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+
+        anyhow::ensure!(
+            cpu_ref.shape.len() == 2,
+            "take_merged_dim0_shard: tensor {name} must be 2D, got {:?}",
+            cpu_ref.shape
+        );
+        let total_rows = cpu_ref.shape[0];
+        let hidden = cpu_ref.shape[1];
+        anyhow::ensure!(
+            total_rows % 2 == 0,
+            "take_merged_dim0_shard: {name} rows ({total_rows}) must be even"
+        );
+        let block_rows = total_rows / 2;
+        anyhow::ensure!(
+            block_rows % world_size == 0,
+            "take_merged_dim0_shard: {name} block_rows ({block_rows}) not divisible by world_size ({world_size})"
+        );
+        let shard_rows = block_rows / world_size;
+        let elem_bytes = cpu_ref.dtype.size_bytes();
+        let row_bytes = hidden * elem_bytes;
+        let shard_bytes = shard_rows * row_bytes;
+
+        let data = cpu_ref.data();
+        let b0_start = rank * shard_bytes;
+        let b1_start = block_rows * row_bytes + rank * shard_bytes;
+        let b0_slice = &data[b0_start..b0_start + shard_bytes];
+        let b1_slice = &data[b1_start..b1_start + shard_bytes];
+
+        let total_bytes = 2 * shard_bytes;
+        let gpu_ptr = unsafe { driver::mem_alloc(total_bytes)? };
+        self.gpu_allocs
+            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, total_bytes) });
+        unsafe {
+            driver::memcpy_htod_async(gpu_ptr, b0_slice.as_ptr(), shard_bytes, self.stream)?;
+            driver::memcpy_htod_async(
+                gpu_ptr.add(shard_bytes),
+                b1_slice.as_ptr(),
+                shard_bytes,
+                self.stream,
+            )?;
+        }
+
+        let out_shape = [2 * shard_rows, hidden];
+        Ok(unsafe { GpuTensor::new(gpu_ptr, &out_shape, cpu_ref.dtype) })
+    }
+
     /// Copy a shard of a tensor directly to an offset within an existing GPU buffer.
     ///
     /// Used for fused TP weight loading (e.g. QKV shards concatenated into one buffer).

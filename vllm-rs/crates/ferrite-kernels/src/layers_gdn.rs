@@ -424,13 +424,12 @@ impl Qwen3NextGdnLayer {
         )?;
         let in_proj_qkvz = Linear::new(qkvz_w, None);
 
-        // `in_proj_ba.weight` has grouped row layout
-        // `[num_k_heads, 2 * v_per_k]`; sharding dim 0 keeps the group
-        // structure intact (each rank owns `num_k_heads / tp_size`
-        // groups). Python's `MergedColumnParallelLinear(output_sizes=[num_v_heads]*2)`
-        // reaches the same per-rank shape because
-        // `2*num_v_heads = num_k_heads * 2*v_per_k` and both blocks
-        // shard with the same per-rank count.
+        // `in_proj_ba.weight` is [2*num_v_heads_full, hidden] in GROUPED layout:
+        // Each k-head group of 4 rows: [B_k_v0, B_k_v1, A_k_v0, A_k_v1].
+        // Simple dim-0 shard gives rank i the k-heads [i*nk/tp..(i+1)*nk/tp],
+        // which are contiguous groups in the grouped layout. Python's
+        // MergedColumnParallelLinear(output_sizes=[num_v_heads]*2) reaches the
+        // same per-rank weight for grouped storage.
         let ba_w = gw.take_shard(
             &format!("{prefix}.in_proj_ba.weight"),
             0,

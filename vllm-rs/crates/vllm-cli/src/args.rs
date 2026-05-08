@@ -448,6 +448,11 @@ pub struct ChatArgs {
     #[arg(long)]
     pub enforce_eager: bool,
 
+    /// Maximum concurrent sequences. Controls GDN recurrent-state pool
+    /// size on hybrid arches (Qwen3-Next). Lower = less GPU memory.
+    #[arg(long, default_value_t = 32)]
+    pub max_num_seqs: usize,
+
     /// Chat template override. Accepts either an inline Jinja string
     /// or a path to a `tokenizer_config.json` / `.jinja` file. Useful
     /// for GGUFs whose metadata lacks `tokenizer.chat_template`.

@@ -238,6 +238,7 @@ fn create_worker(
                 .parse()
                 .unwrap_or(CudaGraphMode::Auto),
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            max_num_seqs: config.max_num_seqs,
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
@@ -348,6 +349,7 @@ fn create_worker(
             // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
             // See PREFILL_DECODE_SPLIT.md for the full analysis.
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            max_num_seqs: config.max_num_seqs,
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
@@ -619,7 +621,7 @@ fn initialize_core(
             // Default 2048. Mixed batches use the unified eager path.
             // See PREFILL_DECODE_SPLIT.md for history.
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
-            max_num_seqs: config.max_num_seqs,
+                max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
             async_scheduling: Some(use_async_scheduling),
@@ -721,6 +723,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 device_id: rank as i32,
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+                max_num_seqs: config.max_num_seqs,
                 cuda_graph_sizes: config
                     .cuda_graph_config
                     .as_ref()
@@ -1184,6 +1187,7 @@ fn initialize_stack_multinode(
             device_id: 0,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            max_num_seqs: config.max_num_seqs,
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
@@ -1456,6 +1460,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         device_id: 0, // Each node has 1 GPU at device 0.
         enforce_eager: config.enforce_eager,
         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_seqs: config.max_num_seqs,
         cuda_graph_sizes: config
             .cuda_graph_config
             .as_ref()
@@ -1607,6 +1612,7 @@ fn initialize_stack_tp_pp(
                     device_id: global_rank as i32,
                     enforce_eager: config.enforce_eager,
                     max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_seqs: config.max_num_seqs,
                     cuda_graph_sizes: config
                         .cuda_graph_config
                         .as_ref()
@@ -1963,6 +1969,7 @@ fn initialize_stack_tp(
                 device_id: rank as i32,
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+                max_num_seqs: config.max_num_seqs,
                 cuda_graph_sizes: config
                     .cuda_graph_config
                     .as_ref()
@@ -2384,6 +2391,7 @@ fn initialize_stack_external(
             device_id: local_rank as i32,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+                max_num_seqs: config.max_num_seqs,
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()

@@ -102,6 +102,10 @@ pub struct FerriteWorkerConfig {
     pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
+    /// Maximum concurrent sequences — bounds the GDN recurrent-state pool
+    /// for hybrid arches (Qwen3-Next). Mirrors Python vLLM's
+    /// `MambaCache(max_batch_size=max_num_seqs)`.
+    pub max_num_seqs: usize,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
@@ -1859,6 +1863,11 @@ pub struct FerriteWorker {
     /// Qwen3Next config (cached for GDN state pool allocation).
     #[cfg(feature = "cuda")]
     qwen3_next_config: Option<vllm_cuda::model::qwen3_next::Qwen3NextConfig>,
+    /// Effective GDN slot count computed in determine_available_memory.
+    /// = min(config.max_num_seqs, what actually fits in available GPU memory).
+    #[cfg(feature = "cuda")]
+    gdn_effective_slots: usize,
+
     /// True when KV cache uses FP8 E4M3 quantization.
     #[cfg(feature = "cuda")]
     kv_cache_is_fp8: bool,
@@ -2158,6 +2167,7 @@ impl FerriteWorker {
             seeded_rngs: HashMap::new(),
             gdn_state_pool: None,
             qwen3_next_config: None,
+            gdn_effective_slots: 0,
             kv_cache_is_fp8,
             _calculate_kv_scales: calculate_kv_scales,
             _k_scale_constant: k_scale_constant,
@@ -6392,13 +6402,17 @@ impl Worker for FerriteWorker {
         self.kv_cache = Some(pool);
 
         // Allocate GDN state pool for Qwen3Next.
+        // Sized by max_num_seqs (from scheduler config). The KV budget already
+        // has the GDN reservation subtracted (done in determine_available_memory),
+        // so there is enough GPU memory for both. Mirrors Python vLLM's
+        // `MambaCache(max_batch_size=max_num_seqs)`.
         if let Some(ref config) = self.qwen3_next_config {
             let dev = self.device.as_ref().unwrap();
             let tp_size = self.config.tp_world_size.max(1);
             let gdn_pool = unsafe {
                 vllm_cuda::model::qwen3_next::make_gdn_state_pool(
                     config,
-                    num_gpu_blocks,
+                    self.gdn_effective_slots.max(1),
                     tp_size,
                     dev.compute_stream,
                 )
@@ -6446,12 +6460,40 @@ impl Worker for FerriteWorker {
             let weights_and_overhead = total.saturating_sub(free);
             let peak_activation_estimate = 512 * 1024 * 1024; // 512 MB conservative
             let utilization = self.config.gpu_memory_utilization;
-            let available = compute_available_kv_bytes(
+            let mut available = compute_available_kv_bytes(
                 total,
                 weights_and_overhead,
                 peak_activation_estimate,
                 utilization,
             );
+            // Subtract GDN state pool reservation so compute_num_blocks sees
+            // the correct KV budget. Mirrors Python vLLM: MambaCache is
+            // allocated during profiling, reducing the KV pool budget.
+            // Cap slots at what actually fits so we never OOM on large
+            // max_num_seqs values relative to available memory.
+            if let Some(ref config) = self.qwen3_next_config {
+                let tp = self.config.tp_world_size.max(1);
+                let num_gdn_layers = config.layer_types.iter()
+                    .filter(|t| t.as_str() == "linear_attention").count();
+                let conv_dim = config.conv_dim() / tp;
+                let state_len = config.linear_conv_kernel_dim.saturating_sub(1);
+                let num_v_heads = config.linear_num_value_heads / tp;
+                let bytes_per_slot = num_gdn_layers * (
+                    conv_dim * state_len * 4 +
+                    num_v_heads * config.linear_value_head_dim * config.linear_key_head_dim * 4
+                );
+                // Never allocate more GDN slots than fit in 50% of available.
+                // Leaves the other 50% for KV blocks. Users can tune via
+                // --max-num-seqs; this is the automatic safety cap.
+                let slots_that_fit = if bytes_per_slot > 0 {
+                    (available / 2) / bytes_per_slot
+                } else {
+                    self.config.max_num_seqs
+                };
+                let effective = self.config.max_num_seqs.min(slots_that_fit).max(1);
+                self.gdn_effective_slots = effective;
+                available = available.saturating_sub(bytes_per_slot * effective);
+            }
             info!(
                 "Memory estimate: total={:.1} GiB, weights+overhead={:.1} GiB, \
                  est_activations=512 MiB",

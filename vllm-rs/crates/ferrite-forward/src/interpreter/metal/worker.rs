@@ -622,7 +622,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             }
         }
 
-        for step in &baking.steps {
+        let dump_per_step = std::env::var_os("VLLM_DUMP_ARENA_PER_STEP").is_some();
+        for (idx, step) in baking.steps.iter().enumerate() {
             let cb = queue.new_command_buffer();
             match step {
                 BucketStep::Icb {
@@ -667,32 +668,97 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 });
             }
             // DIAGNOSTIC: per-step arena dump (works in silent/direct
-            // path too).
-            if std::env::var_os("VLLM_DUMP_ARENA_PER_STEP").is_some() {
+            // path too). Dumps non-zero / marker counts plus the first
+            // 4 fp16 values of every slot, so a bisection across layers
+            // can identify which step first produces all-zero output in
+            // a previously-non-zero slot.
+            if dump_per_step {
                 let kind = match step {
                     BucketStep::Icb { kernel, range, .. } => {
                         format!("Icb {:?} {:?}", kernel, range)
                     }
                     BucketStep::Gemm { m, n, k, .. } => format!("Gemm m={m} n={n} k={k}"),
                 };
+                // Per-slot row stride in bytes (TinyLlama specific —
+                // good enough for the bisection harness; mismatches
+                // just print a different "sample" rather than crashing).
+                // s0/s1/s2: hidden_size=2048 fp16 → 4096 B/row.
+                // s3/s4: head_dim*num_kv_heads=256 fp16 → 512 B/row.
+                // s5: intermediate_size=5632 fp16 → 11264 B/row.
+                // s6: vocab=32000 fp16 → 64000 B/row.
+                let row_strides: [usize; 7] = [4096, 4096, 4096, 512, 512, 11264, 64000];
                 let mut s = String::new();
                 for (i, buf) in self.arena.iter().enumerate() {
                     let len_bytes = buf.length() as usize;
-                    let row0 = unsafe {
+                    let bytes = unsafe {
                         std::slice::from_raw_parts(
                             buf.contents() as *const u8,
                             len_bytes,
                         )
                     };
-                    let nz = row0.iter().filter(|&&v| v != 0).count();
-                    let marker = row0.iter().filter(|&&v| v == 0xAA).count();
-                    s.push_str(&format!(" s{i}=nz{nz}/marker{marker}"));
+                    let nz = bytes.iter().filter(|&&v| v != 0).count();
+                    let marker = bytes.iter().filter(|&&v| v == 0xAA).count();
+                    let stride = row_strides.get(i).copied().unwrap_or(4096);
+                    // 4 fp16 values at row 0 and row 22, side by side.
+                    // Letting the reader see if rows 0 and 22 differ
+                    // exposes "all rows identical" bugs that a single-
+                    // row dump misses.
+                    let head_at = |row: usize| -> String {
+                        let base = row * stride;
+                        let parts: Vec<String> = (0..4)
+                            .map(|j| {
+                                let off = base + j * 2;
+                                if off + 1 >= len_bytes {
+                                    String::from("nan")
+                                } else {
+                                    let bits =
+                                        u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                                    format!("{:.3}", f16_bits_to_f32(bits))
+                                }
+                            })
+                            .collect();
+                        parts.join(",")
+                    };
+                    s.push_str(&format!(
+                        " s{i}=nz{nz}/m{marker}/r0[{}]/r22[{}]",
+                        head_at(0),
+                        head_at(22),
+                    ));
                 }
-                eprintln!("[silent] {kind}{s}");
+                eprintln!("[silent step={idx}] {kind}{s}");
             }
         }
         Ok(())
     }
+}
+
+/// IEEE-754 binary16 → binary32 decoder for the per-step diagnostic
+/// dump. `half` lives in `[dev-dependencies]` only; pulling it into
+/// the regular dep set just to print three decimal digits per slot
+/// is overkill, so this open-codes the conversion.
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut e: i32 = -14;
+            let mut m = mant;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3ff;
+            (sign << 31) | (((e + 127) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
 }
 
 /// Bake one bucket's ICB + execution plan.
@@ -814,6 +880,33 @@ fn bake_bucket<W: CanonicalParams>(
             MTLSize::new(tg.width, tg.height, tg.depth),
             MTLSize::new(tpt.width, tpt.height, tpt.depth),
         );
+        if std::env::var_os("FERRITE_METAL_BAKE_DEBUG").is_some() {
+            let bind_summary: Vec<String> = bindings_for_cmd
+                .iter()
+                .map(|(b, off, idx)| {
+                    format!(
+                        "(buf=0x{:x},len={},off={},idx={})",
+                        b.as_ptr() as usize,
+                        b.length(),
+                        off,
+                        idx,
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[bake bucket={} cmd={}] kernel={:?} tg=({},{},{}) tpt=({},{},{}) bindings=[{}]",
+                bucket_index,
+                cmd_idx,
+                cmd.kernel,
+                tg.width,
+                tg.height,
+                tg.depth,
+                tpt.width,
+                tpt.height,
+                tpt.depth,
+                bind_summary.join(","),
+            );
+        }
         match steps.last_mut() {
             Some(BucketStep::Icb {
                 pipeline: prev,

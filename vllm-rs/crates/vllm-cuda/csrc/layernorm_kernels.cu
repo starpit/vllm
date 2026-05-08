@@ -2,6 +2,7 @@
 // Fused RMS normalization CUDA kernel for vLLM Rust.
 //
 // Port of csrc/layernorm_kernels.cu from Python vLLM.
+// Note: libvllm_kernels.a now built without --use_fast_math.
 // One thread block per row (token). Each block cooperatively computes
 // the variance, then applies weight * x * rsqrt(variance + eps).
 //

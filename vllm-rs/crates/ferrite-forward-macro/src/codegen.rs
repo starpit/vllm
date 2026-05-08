@@ -251,6 +251,18 @@ enum FieldLoad {
         rms_norm_eps: f32,
         attn_output_gate: bool,
     },
+    /// FP8 peer of `GatedAttention`. Calls `Fp8GatedAttentionLayer::load`
+    /// which loads per-channel FP8 `qkv_proj` (fused over q/k/v_proj)
+    /// and `o_proj`, or delegates to the BF16 peer on compressed-tensors
+    /// `ignore`-listed layers (per-layer runtime dtype probe).
+    Fp8GatedAttention {
+        prefix: String,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rms_norm_eps: f32,
+        attn_output_gate: bool,
+    },
 }
 
 /// Emit the `GptqLayout` token stream that selects the loader's
@@ -425,6 +437,9 @@ fn plan_field_load(
     let is_gated_attention = ty.ends_with("::Qwen3NextGatedAttentionLayer")
         || ty == "Qwen3NextGatedAttentionLayer"
         || ty.ends_with("layers_attn_gated::Qwen3NextGatedAttentionLayer");
+    let is_fp8_gated_attention = ty.ends_with("::Fp8GatedAttentionLayer")
+        || ty == "Fp8GatedAttentionLayer"
+        || ty.ends_with("layers_attn_gated::Fp8GatedAttentionLayer");
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
@@ -893,11 +908,16 @@ fn plan_field_load(
         };
     }
 
-    if is_gated_attention {
+    if is_gated_attention || is_fp8_gated_attention {
+        let layer_ty = if is_fp8_gated_attention {
+            "Fp8GatedAttentionLayer"
+        } else {
+            "Qwen3NextGatedAttentionLayer"
+        };
         assert_eq!(
             prefixes.len(),
             1,
-            "Qwen3NextGatedAttentionLayer accessor `{}` with {} sources (expected 1 per layer)",
+            "{layer_ty} accessor `{}` with {} sources (expected 1 per layer)",
             accessor.name,
             prefixes.len(),
         );
@@ -922,6 +942,16 @@ fn plan_field_load(
             .get("attn_output_gate")
             .and_then(|x| x.as_bool())
             .unwrap_or(true);
+        if is_fp8_gated_attention {
+            return FieldLoad::Fp8GatedAttention {
+                prefix,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                rms_norm_eps,
+                attn_output_gate,
+            };
+        }
         return FieldLoad::GatedAttention {
             prefix,
             num_q_heads,
@@ -1915,7 +1945,10 @@ fn emit_weights_struct(
             || ty.ends_with("layers_moe::DeepSeekV2Fp8BlockMoELayer")
             || ty.ends_with("::Fp8SharedFusedMoELayer")
             || ty == "Fp8SharedFusedMoELayer"
-            || ty.ends_with("layers_moe::Fp8SharedFusedMoELayer");
+            || ty.ends_with("layers_moe::Fp8SharedFusedMoELayer")
+            || ty.ends_with("::Fp8GatedAttentionLayer")
+            || ty == "Fp8GatedAttentionLayer"
+            || ty.ends_with("layers_attn_gated::Fp8GatedAttentionLayer");
         for (wid, _idx) in &a.source_weights {
             let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
             let ok = matches!(
@@ -3543,6 +3576,46 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 }
             }
         }
+        FieldLoad::Fp8GatedAttention {
+            prefix,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rms_norm_eps,
+            attn_output_gate,
+        } => {
+            let num_q_heads = *num_q_heads;
+            let num_kv_heads = *num_kv_heads;
+            let head_dim = *head_dim;
+            let rms_norm_eps = *rms_norm_eps;
+            let attn_output_gate = *attn_output_gate;
+            // `Fp8GatedAttentionLayer::load` is uniformly tp-aware —
+            // (tp_size=1, tp_rank=0) short-circuits to byte-equivalent
+            // single-rank behavior inside each `Fp8Linear::load_*_sharded`.
+            let (tp_rank_expr, tp_size_expr) = if sharded {
+                (
+                    quote! { tp_rank as usize },
+                    quote! { #tp_world_lit as usize },
+                )
+            } else {
+                (quote! { 0usize }, quote! { 1usize })
+            };
+            quote! {
+                let #name = ::ferrite_kernels::layers_attn_gated::Fp8GatedAttentionLayer::load(
+                    gw,
+                    #prefix,
+                    #num_q_heads,
+                    #num_kv_heads,
+                    #head_dim,
+                    #rms_norm_eps,
+                    #attn_output_gate,
+                    #tp_rank_expr,
+                    #tp_size_expr,
+                    __fp8_dtype,
+                    stream,
+                )?;
+            }
+        }
     }
 }
 
@@ -4194,6 +4267,49 @@ fn emit_layered_load_body(plan: &FieldLoad, n_layers: u32, tp_world_size: u8) ->
                             #head_dim,
                             #rms_norm_eps,
                             #attn_output_gate,
+                            stream,
+                        )
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
+        FieldLoad::Fp8GatedAttention {
+            prefix,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rms_norm_eps,
+            attn_output_gate,
+        } => {
+            let p = layer_templated_prefix_expr(prefix);
+            let num_q_heads = *num_q_heads;
+            let num_kv_heads = *num_kv_heads;
+            let head_dim = *head_dim;
+            let rms_norm_eps = *rms_norm_eps;
+            let attn_output_gate = *attn_output_gate;
+            let (tp_rank_expr, tp_size_expr) = if sharded {
+                (
+                    quote! { tp_rank as usize },
+                    quote! { #tp_world_lit as usize },
+                )
+            } else {
+                (quote! { 0usize }, quote! { 1usize })
+            };
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        let _ = layer;
+                        ::ferrite_kernels::layers_attn_gated::Fp8GatedAttentionLayer::load(
+                            gw,
+                            &#p,
+                            #num_q_heads,
+                            #num_kv_heads,
+                            #head_dim,
+                            #rms_norm_eps,
+                            #attn_output_gate,
+                            #tp_rank_expr,
+                            #tp_size_expr,
+                            __fp8_dtype,
                             stream,
                         )
                     })

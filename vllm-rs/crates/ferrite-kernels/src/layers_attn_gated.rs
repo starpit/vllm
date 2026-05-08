@@ -34,7 +34,7 @@ use ferrite_cuda_core::weights::GpuWeights;
 use crate::attention_helpers;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::layers::Linear;
+use crate::layers::{Fp8Linear, Linear};
 
 /// Per-layer weights for Qwen3-Next full attention with output gating.
 pub struct Qwen3NextGatedAttentionLayer {
@@ -71,7 +71,7 @@ impl Qwen3NextGatedAttentionLayer {
     /// CPU-roundtrip — the QK-norm weight is `[head_dim]`, ~256
     /// elements at most, only run once per layer at load time.
     /// Mirrors `vllm_cuda::model::gemma2::add_one_to_weight`.
-    unsafe fn add_one_inplace(weight: &GpuTensor, stream: CUstream) -> Result<()> {
+    pub(crate) unsafe fn add_one_inplace(weight: &GpuTensor, stream: CUstream) -> Result<()> {
         let n = weight.dim(0);
         let nbytes = weight.size_bytes();
         let host = driver::mem_alloc_host(nbytes)?;
@@ -640,6 +640,414 @@ impl Qwen3NextGatedAttentionLayer {
         let result = self
             .o_proj
             .forward(attn_flat, &mut device.cublas, &mut device.caching);
+        drop(attn_output);
+        result
+    }
+}
+
+/// FP8 peer of [`Qwen3NextGatedAttentionLayer`]. Same forward graph
+/// (fused QKV → split → per-head Q/K RMSNorm → Q-only partial RoPE →
+/// paged K/V write → FA2 with on-the-fly K rotation → sigmoid output
+/// gate → o_proj), but `qkv_proj` and `o_proj` are per-channel FP8
+/// linears (`cutlass_scaled_mm` under the hood) instead of BF16
+/// cuBLAS.
+///
+/// Matches Python vLLM's `QKVParallelLinear(..., quant_config=quant_config)`
+/// dispatching into `CompressedTensorsW8A8Fp8.apply` for the unsloth
+/// `Qwen3-Coder-Next-FP8-Dynamic` checkpoint (per-channel FP8, no
+/// input scale — dynamic activation quantization).
+///
+/// A `bf16_fallback` slot carries a pre-built BF16 [`Qwen3NextGatedAttentionLayer`]
+/// for the compressed-tensors `ignore` list (layer 47 on unsloth). When
+/// `Some`, `forward` delegates to it entirely and the FP8 slots hold
+/// unreachable dummies. Mirrors [`crate::layers_moe::Fp8SharedFusedMoELayer`]'s
+/// runtime BF16-probe pattern.
+pub struct Fp8GatedAttentionLayer {
+    pub qkv_proj: Fp8Linear,
+    pub o_proj: Fp8Linear,
+    pub q_norm_weight: Option<GpuTensor>,
+    pub k_norm_weight: Option<GpuTensor>,
+    pub qk_norm_eps: f32,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub q_size: usize,
+    pub kv_size: usize,
+    pub true_q_size: usize,
+    pub scale: f32,
+    pub attn_output_gate: bool,
+    /// BF16 fallback for layers in the compressed-tensors `ignore` list.
+    /// When `Some`, `forward` delegates to it.
+    pub bf16_fallback: Option<Qwen3NextGatedAttentionLayer>,
+}
+
+impl Fp8GatedAttentionLayer {
+    /// Load an FP8-quantized gated-attention layer with optional BF16
+    /// fallback. Takes `tp_rank` / `tp_size` for tensor-parallel
+    /// sharding (world=1 short-circuits to the single-rank load inside
+    /// each `Fp8Linear::load_sharded` / `load_concat_sharded`).
+    ///
+    /// Sharding rules match Python `QKVParallelLinear` + `RowParallelLinear`:
+    /// - qkv_proj: column-parallel fused over `[q_proj, k_proj, v_proj]`.
+    /// - o_proj: row-parallel (dim=1). Bias on rank 0 only.
+    /// - q_norm / k_norm: `[head_dim]`, replicated with `+ 1.0` baked in.
+    ///
+    /// Runtime dtype probe: if `q_proj.weight` is not FP8 (compressed-
+    /// tensors `ignore` list), delegates the whole load to the BF16 peer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut GpuWeights,
+        prefix: &str,
+        num_q_heads_full: usize,
+        num_kv_heads_full: usize,
+        head_dim: usize,
+        qk_norm_eps: f32,
+        attn_output_gate: bool,
+        tp_rank: usize,
+        tp_size: usize,
+        output_dtype: DType,
+        stream: CUstream,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            tp_size >= 1 && tp_rank < tp_size,
+            "Fp8GatedAttentionLayer::load: invalid (tp_rank={tp_rank}, tp_size={tp_size})",
+        );
+        anyhow::ensure!(
+            num_q_heads_full.is_multiple_of(tp_size),
+            "Fp8GatedAttentionLayer::load: num_q_heads_full ({num_q_heads_full}) not divisible by tp_size ({tp_size})",
+        );
+        anyhow::ensure!(
+            num_kv_heads_full.is_multiple_of(tp_size),
+            "Fp8GatedAttentionLayer::load: num_kv_heads_full ({num_kv_heads_full}) not divisible by tp_size ({tp_size})",
+        );
+
+        let num_q_heads = num_q_heads_full / tp_size;
+        let num_kv_heads = num_kv_heads_full / tp_size;
+        let true_q_size = num_q_heads * head_dim;
+        let q_size = if attn_output_gate {
+            2 * true_q_size
+        } else {
+            true_q_size
+        };
+        let kv_size = num_kv_heads * head_dim;
+
+        // Full unsharded sizes for the packed-parent carve (no-op when
+        // the checkpoint ships separate q/k/v_proj, which is the unsloth
+        // case; kept so a fused `qkv_proj.weight` checkpoint still loads).
+        let true_q_size_full = num_q_heads_full * head_dim;
+        let q_size_full = if attn_output_gate {
+            2 * true_q_size_full
+        } else {
+            true_q_size_full
+        };
+        let kv_size_full = num_kv_heads_full * head_dim;
+
+        let _carved = gw.synthesize_packed_row_split_sizes(
+            &format!("{prefix}.qkv_proj"),
+            &[
+                ("q_proj", q_size_full),
+                ("k_proj", kv_size_full),
+                ("v_proj", kv_size_full),
+            ],
+        )?;
+
+        // BF16 fallback probe. MUST run BEFORE any `Fp8Linear::load*`
+        // consumes q_proj tensors, so the delegate can still find them.
+        let q_name = format!("{prefix}.q_proj.weight");
+        let (_, q_dtype) = gw
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("Fp8GatedAttentionLayer::load: weight not found: {q_name}"))?;
+        if q_dtype != DType::Fp8E4m3 {
+            let bf16 = Qwen3NextGatedAttentionLayer::load_sharded(
+                gw,
+                prefix,
+                num_q_heads_full,
+                num_kv_heads_full,
+                head_dim,
+                qk_norm_eps,
+                attn_output_gate,
+                tp_rank,
+                tp_size,
+                stream,
+            )?;
+            return Ok(Self {
+                qkv_proj: Fp8Linear::dummy(),
+                o_proj: Fp8Linear::dummy(),
+                q_norm_weight: None,
+                k_norm_weight: None,
+                qk_norm_eps,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                q_size,
+                kv_size,
+                true_q_size,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+                attn_output_gate,
+                bf16_fallback: Some(bf16),
+            });
+        }
+
+        // Fused column-parallel FP8 QKV. `Fp8Linear::load_concat_sharded`
+        // shards each of q/k/v_proj along dim 0 by tp_size, concatenates
+        // FP8 shards into one `[q_size + 2*kv_size, hidden]` buffer per
+        // rank, and concatenates per-channel weight_scale along dim 0 too.
+        let q_pfx = format!("{prefix}.q_proj");
+        let k_pfx = format!("{prefix}.k_proj");
+        let v_pfx = format!("{prefix}.v_proj");
+        let qkv_proj = Fp8Linear::load_concat_sharded(
+            gw,
+            &[q_pfx.as_str(), k_pfx.as_str(), v_pfx.as_str()],
+            tp_rank,
+            tp_size,
+            output_dtype,
+        )?;
+
+        // Row-parallel FP8 o_proj. Per-channel scale is indexed by the
+        // hidden output dim (not sharded on row-parallel) and stays
+        // replicated. Bias on rank 0 only.
+        let o_proj = Fp8Linear::load_sharded(
+            gw,
+            &format!("{prefix}.o_proj"),
+            1,
+            tp_rank,
+            tp_size,
+            output_dtype,
+        )?;
+
+        // Per-head Q/K RMSNorm: `[head_dim]`, replicated. `+ 1.0` baked
+        // in at load time (Gemma convention). Reuse the dense peer's
+        // add_one helper — same device, same dtype set, same math.
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let q_norm_weight = if gw.contains(&q_norm_name) {
+            let w = gw.take(&q_norm_name)?;
+            unsafe { Qwen3NextGatedAttentionLayer::add_one_inplace(&w, stream)? };
+            Some(w)
+        } else {
+            None
+        };
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let k_norm_weight = if gw.contains(&k_norm_name) {
+            let w = gw.take(&k_norm_name)?;
+            unsafe { Qwen3NextGatedAttentionLayer::add_one_inplace(&w, stream)? };
+            Some(w)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj,
+            o_proj,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            q_size,
+            kv_size,
+            true_q_size,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            attn_output_gate,
+            bf16_fallback: None,
+        })
+    }
+
+    /// Forward pass. Delegates to `bf16_fallback` when set; else runs
+    /// the FP8 analogue of [`Qwen3NextGatedAttentionLayer::forward`].
+    ///
+    /// # Safety
+    /// Same contract as the underlying kernel calls.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        layer_idx: usize,
+        cos_sin_cache: GpuTensor,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        if let Some(ref bf16) = self.bf16_fallback {
+            return bf16.forward(
+                hidden_states,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                layer_idx,
+                cos_sin_cache,
+                device,
+            );
+        }
+
+        let num_tokens = hidden_states.dim(0);
+        let stream = device.compute_stream;
+
+        // 1. Fused FP8 QKV projection.
+        let qkv = self.qkv_proj.forward(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+            stream,
+        );
+
+        // 2. Split into Q (with optional gate) + K + V tiles.
+        let q_heads_for_split = if self.attn_output_gate {
+            2 * self.num_q_heads
+        } else {
+            self.num_q_heads
+        };
+        let (q_with_gate, k, v) = kernels::split_qkv(
+            *qkv.view(),
+            self.q_size,
+            self.kv_size,
+            q_heads_for_split,
+            self.num_kv_heads,
+            self.head_dim,
+            &mut device.caching,
+            stream,
+        );
+        drop(qkv);
+
+        // 3. Separate Q from per-head interleaved gate (when enabled).
+        let (q, gate) = if self.attn_output_gate {
+            let q_tensor = *q_with_gate.view();
+            let elem_bytes = q_tensor.dtype().size_bytes();
+            let head_bytes = self.head_dim * elem_bytes;
+            let pair_bytes = 2 * head_bytes;
+            let src_token_bytes = self.num_q_heads * pair_bytes;
+            let dst_token_bytes = self.num_q_heads * head_bytes;
+            let actual_q = device.caching.alloc_tensor(
+                &[num_tokens, self.num_q_heads, self.head_dim],
+                q_tensor.dtype(),
+            );
+            let gate_tensor = device.caching.alloc_tensor(
+                &[num_tokens, self.num_q_heads, self.head_dim],
+                q_tensor.dtype(),
+            );
+            for t in 0..num_tokens {
+                let src_off = t * src_token_bytes;
+                let dst_off = t * dst_token_bytes;
+                for h in 0..self.num_q_heads {
+                    let src_pair = src_off + h * pair_bytes;
+                    let dst_head = dst_off + h * head_bytes;
+                    driver::memcpy_dtod_async(
+                        actual_q.as_gpu_tensor().raw_ptr().add(dst_head),
+                        q_tensor.raw_ptr().add(src_pair) as *const u8,
+                        head_bytes,
+                        stream,
+                    )
+                    .expect("Q head memcpy");
+                    driver::memcpy_dtod_async(
+                        gate_tensor.as_gpu_tensor().raw_ptr().add(dst_head),
+                        q_tensor.raw_ptr().add(src_pair + head_bytes) as *const u8,
+                        head_bytes,
+                        stream,
+                    )
+                    .expect("gate head memcpy");
+                }
+            }
+            drop(q_with_gate);
+            (actual_q, Some(gate_tensor))
+        } else {
+            (q_with_gate, None)
+        };
+
+        // 4. Per-head Q/K RMSNorm (Gemma `+1` convention).
+        if let (Some(q_norm_w), Some(k_norm_w)) = (self.q_norm_weight, self.k_norm_weight) {
+            kernels::qk_norm_inplace(
+                *q.view(),
+                *k.view(),
+                q_norm_w,
+                k_norm_w,
+                self.num_q_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.qk_norm_eps,
+                0.0,
+                0.0,
+                stream,
+            );
+        }
+
+        // 5. Q-only RoPE.
+        let q_flat = q
+            .view()
+            .reshape(&[num_tokens, self.num_q_heads * self.head_dim]);
+        kernels::rotary_embedding_q_only(
+            *q_flat,
+            *positions,
+            cos_sin_cache,
+            self.num_q_heads,
+            self.head_dim,
+            stream,
+        );
+
+        // 6. Write K/V to paged cache.
+        attention_helpers::write_kv_cache(
+            k.view(),
+            v.view(),
+            slot_mapping,
+            kv_cache,
+            layer_idx,
+            stream,
+        );
+
+        // 7. FA2 with on-the-fly K rotation.
+        let attn_output = attention_helpers::attention_standard(
+            q.view(),
+            k.view(),
+            v.view(),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            kv_cache,
+            layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            stream,
+            cos_sin_cache.raw_ptr() as *const u8,
+            cos_sin_cache.dim(1),
+            false,
+        );
+        drop(k);
+        drop(v);
+        drop(q);
+
+        // 8. Output gate.
+        if let Some(gate) = gate.as_ref() {
+            kernels::sigmoid_mul_inplace(
+                *attn_output.view(),
+                *gate.view(),
+                &mut device.caching,
+                stream,
+            );
+        }
+        drop(gate);
+
+        let attn_flat = attn_output.view().reshape(&[num_tokens, self.true_q_size]);
+
+        // 9. Output projection (FP8 row-parallel).
+        let result = self.o_proj.forward(
+            attn_flat,
+            &mut device.cublas,
+            &mut device.caching,
+            stream,
+        );
         drop(attn_output);
         result
     }

@@ -403,12 +403,19 @@ fn lower_one<W: CanonicalParams>(
             // 2D dispatch: (batch, num_q_heads). Each threadgroup
             // computes one head's attention output for one sequence.
             // `bucket_m == batch` for decode buckets.
+            //
+            // v2 kernel (paged-cache port of MLX sdpa_vector) uses
+            // 1024 threads/group = 32 simdgroups × 32 lanes. Each
+            // simdgroup processes 1/32 of the K axis with online
+            // softmax; no per-token threadgroup_barrier in the K
+            // loop. See `attention_via_cache_v2_f16_specialized` in
+            // `attention.metal`.
             let n_q_heads = W::NUM_Q_HEADS;
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
-                    threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
+                    threads_per_threadgroup: (1024, 1, 1),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {

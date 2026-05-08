@@ -407,11 +407,14 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 r
             })
             .collect();
+        let bucket_start = std::time::Instant::now();
         for (idx, step) in baking.steps.iter().enumerate() {
+            let step_start = std::time::Instant::now();
             let cb = queue.new_command_buffer();
+            let kind: String;
             match step {
                 BucketStep::Icb { pipeline, range, kernel } => {
-                    eprintln!("[step {idx}] Icb range={:?} kernel={:?}", range, kernel);
+                    kind = format!("Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
                     let enc = cb.new_compute_command_encoder();
                     if !resource_refs.is_empty() {
@@ -425,7 +428,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     enc.end_encoding();
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
-                    eprintln!("[step {idx}] Gemm m={m} n={n} k={k}");
+                    kind = format!("Gemm m={m} n={n} k={k}");
                     encode_gemm_into_command_buffer(
                         device, cb, &a.buffer, &b.buffer, &c.buffer, *m, *n, *k, 1.0, 0.0, false,
                         true, true,
@@ -433,16 +436,31 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     .map_err(WorkerError::GemmEncode)?;
                 }
             }
+            let encoded_at = step_start.elapsed();
             cb.commit();
             cb.wait_until_completed();
             let status = cb.status();
-            eprintln!("[step {idx}] status={:?}", status);
+            let total = step_start.elapsed();
+            let gpu_us = total.as_micros().saturating_sub(encoded_at.as_micros());
+            eprintln!(
+                "[step {idx}] {kind} encode={}us gpu={}us total={}us status={:?}",
+                encoded_at.as_micros(),
+                gpu_us,
+                total.as_micros(),
+                status,
+            );
             if status != MTLCommandBufferStatus::Completed {
                 return Err(WorkerError::WeightLookupFailed {
                     reason: "per-step commit failed (see eprintln above)",
                 });
             }
         }
+        eprintln!(
+            "[bucket {} steps={}] total={}ms",
+            baking.bucket_m,
+            baking.steps.len(),
+            bucket_start.elapsed().as_millis(),
+        );
         Ok(())
     }
 }

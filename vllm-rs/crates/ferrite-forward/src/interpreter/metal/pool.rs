@@ -576,6 +576,19 @@ fn write_runtime_inputs(
     }
     if let Some(s) = inputs.seq_used_k {
         write_slice("seq_used_k", &runtime.seq_used_k, s)?;
+        if std::env::var("FERRITE_METAL_STEP_DEBUG").is_ok() {
+            eprintln!("[runtime] seq_used_k = {:?} (len={})", s, s.len());
+        }
+    }
+    if std::env::var("FERRITE_METAL_STEP_DEBUG").is_ok() {
+        if let Some(s) = inputs.block_table {
+            eprintln!(
+                "[runtime] block_table[0..min(8,len)] = {:?} (len={})",
+                &s[..s.len().min(8)],
+                s.len(),
+            );
+        }
+        eprintln!("[runtime] num_tokens = {}", inputs.num_tokens);
     }
     if let Some(s) = inputs.block_table {
         write_slice("block_table", &runtime.block_table, s)?;

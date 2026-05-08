@@ -110,7 +110,13 @@ fn kernel_msl_names(
             "fused_gate_up_silu_mul_gemm_f16_specialized",
         ),
         KernelId::RopeAppend => ("rope", "rope_append_f16_specialized"),
-        KernelId::AttentionViaCache => ("attention", "attention_via_cache_f16_specialized"),
+        // v2 kernel: paged-cache adaptation of MLX's sdpa_vector.
+        // Online softmax, BN=32 simdgroups split the K-axis, no
+        // per-token threadgroup_barrier in the K loop. Same bindings
+        // and function-constant indices as v1; the worker dispatches
+        // (1024, 1, 1) threads per threadgroup instead of
+        // (head_dim, 1, 1) (see lowering.rs).
+        KernelId::AttentionViaCache => ("attention", "attention_via_cache_v2_f16_specialized"),
         KernelId::AttentionPrefillContiguous => {
             ("attention", "attention_prefill_contiguous_f16_specialized")
         }
@@ -841,9 +847,10 @@ mod tests {
         enc.set_buffer(3, Some(&block_table_buf), 0);
         enc.set_buffer(4, Some(&kv_k_buf), 0);
         enc.set_buffer(5, Some(&kv_v_buf), 0);
+        // v2 kernel uses 1024 threads/group (32 simdgroups × 32 lanes).
         enc.dispatch_thread_groups(
             MTLSize::new(batch as u64, num_q as u64, 1),
-            MTLSize::new(head_dim as u64, 1, 1),
+            MTLSize::new(1024, 1, 1),
         );
         enc.end_encoding();
         cb.commit();

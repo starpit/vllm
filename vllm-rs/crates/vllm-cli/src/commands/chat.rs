@@ -120,6 +120,14 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }
+    // VLLM_GPU_MEMORY_UTILIZATION env override: lets perf-debugging
+    // workflows shrink the KV cache without touching the API. Defaults
+    // to 0.9 (LLM builder default) when unset.
+    if let Ok(s) = std::env::var("VLLM_GPU_MEMORY_UTILIZATION") {
+        if let Ok(f) = s.parse::<f64>() {
+            builder = builder.gpu_memory_utilization(f);
+        }
+    }
     builder = builder.tensor_parallel_size(args.tensor_parallel_size);
     builder = builder.enforce_eager(args.enforce_eager);
     if let Some(ref tpl) = args.chat_template {

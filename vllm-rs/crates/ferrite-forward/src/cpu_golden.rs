@@ -367,7 +367,7 @@ pub fn rope_append(
 /// Paged-cache decode attention.
 ///
 /// Mirrors `Instruction::AttentionViaCache` (CUDA) and Metal
-/// `attention_via_cache_f16_specialized` (`shaders/attention.metal`).
+/// `attention_via_cache_v2_f16_specialized` (`shaders/attention.metal`).
 /// One Q token per sequence (`bucket_m == batch` for decode); reads K
 /// and V from the paged cache via the per-sequence `block_table` and
 /// `seq_used_k` length.

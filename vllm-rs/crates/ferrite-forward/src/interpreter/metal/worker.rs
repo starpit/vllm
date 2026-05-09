@@ -1807,7 +1807,7 @@ mod tests {
 
     /// Phase 5.C.4 smoke test: the worker bakes an AttentionViaCache
     /// command into a one-segment ICB. Verifies that the new
-    /// `attention_via_cache_f16_specialized` kernel resolves through
+    /// `attention_via_cache_v2_f16_specialized` kernel resolves through
     /// the specialized-pipeline cache and that the worker accepts the
     /// runtime bindings the lowering pass produces (Q + seq_used_k +
     /// block_table + per-layer kv_cache_k/v).

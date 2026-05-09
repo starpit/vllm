@@ -595,7 +595,7 @@ mod tests {
 
     /// Device-bound smoke test for the Phase 5.C.4 specialized
     /// attention shader rewrite. Verifies both
-    /// `attention_via_cache_f16_specialized` and
+    /// `attention_via_cache_v2_f16_specialized` and
     /// `attention_prefill_contiguous_f16_specialized` compile against
     /// `MTLFunctionConstantValues` carrying their respective bag, and
     /// that the cache returns the same handle on a repeat lookup.
@@ -1103,7 +1103,7 @@ mod tests {
 
     /// Reproduces the EXACT runtime binding pattern observed in
     /// `FERRITE_METAL_BAKE_DEBUG=1` for Llama-3.2-1B decode: the
-    /// `attention_via_cache_bf16_specialized` dispatch binds the SAME
+    /// `attention_via_cache_v2_bf16_specialized` dispatch binds the SAME
     /// MTLBuffer at index 0 (output) and index 1 (Q input). The
     /// existing 1B golden uses separate buffers; this one aliases
     /// them. The kernel claims to be safe under aliasing because Q is
@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     /// Phase 5.G.4a numerical-correctness check for
-    /// `attention_via_cache_f16_specialized` against
+    /// `attention_via_cache_v2_f16_specialized` against
     /// `cpu_golden::attention_via_cache`. Synthetic 2-sequence decode
     /// (batch = bucket_m = 2) with mixed cache lengths spanning one
     /// and two logical blocks; deterministic Q + paged K/V buffers

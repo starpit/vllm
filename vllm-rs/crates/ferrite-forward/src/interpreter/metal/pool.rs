@@ -790,11 +790,14 @@ fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), F
     // table's bounds, faulting the GPU and hanging the command
     // buffer in `wait_until_completed`.
     //
-    // Position 0 is always a valid index into cos_sin / slot_mapping
-    // / seq_used_k / block_table (every paged-cache structure has a
-    // 0-th block). So zero-padding makes padding lanes do well-defined
-    // no-op-equivalent work that doesn't leak into the actual-token
-    // output.
+    // Zero-pad is only correct for inputs whose `0`-th index is a valid
+    // no-op for the consuming kernel: positions[t]=0 ↦ row-0 of the
+    // cos_sin table; seq_used_k[s]=0 ↦ no kv tokens scanned;
+    // block_table[s][b]=0 ↦ readable physical block with whatever was
+    // already there. `slot_mapping` does NOT satisfy this — slot 0 is a
+    // valid storage location, so a padding-lane write to it corrupts
+    // real K/V data — and goes through `write_slot_mapping` (sentinel
+    // u32::MAX + early-out in rope_append) instead.
     //
     // Safety: shared-storage buffers expose `contents()` as a
     // host-visible pointer; we've bounds-checked the byte count

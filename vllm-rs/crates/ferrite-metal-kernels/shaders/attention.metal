@@ -1,159 +1,29 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Ferrite metal attention kernels — direct ports of MLX attention.
+//
+//   `attention_via_cache_v2_f16/bf16_specialized` —
+//       paged-cache adaptation of MLX `sdpa_vector` from
+//       `mlx/backend/metal/kernels/sdpa_vector.h`. Decode path.
+//   `attention_prefill_contiguous_f16/bf16_specialized` —
+//       LEGACY hand-written prefill SDPA. PENDING REPLACEMENT with
+//       MLX `steel/attn/` (full tiled SDPA). Currently produces
+//       MLX-equivalent output for short prefill + works in production,
+//       but is not a faithful MLX port.
+//
+// Function constant indices (must match `pipelines::constants_for`):
+//   0  ATTN_HEAD_DIM           uint
+//   1  ATTN_NUM_Q_HEADS        uint
+//   2  ATTN_NUM_KV_HEADS       uint
+//   3  ATTN_SCALE_FC           float
+//   4  ATTN_BLOCK_SIZE         uint   (AttentionViaCache only)
+//   5  ATTN_MAX_BLOCKS_PER_SEQ uint   (AttentionViaCache only)
+//   6  ATTN_PREFILL_TILE_Q     uint   (AttentionPrefillContiguous only)
+
 #include <metal_stdlib>
 using namespace metal;
 
-// Basic single-head attention kernel (Phase 4.1.1)
-// Simplified version without paging, quantization, or advanced features
-// Goal: Prove numerical correctness of Metal attention implementation
 
-struct AttentionParams {
-    uint seq_len;        // Length of key/value sequence
-    uint head_size;      // Dimension of each attention head (e.g., 64, 128)
-    float scale;         // Attention scale factor (1/sqrt(head_size))
-    uint block_size;     // KV cache block size (e.g., 16)
-};
-
-// Phase 4.1.1: Basic attention without paging
-// Input:  Q [head_size], K [seq_len, head_size], V [seq_len, head_size]
-// Output: O [head_size]
-// Algorithm:
-//   1. Compute attention scores: scores[i] = Q · K[i] * scale
-//   2. Softmax: weights[i] = exp(scores[i] - max) / sum(exp(scores - max))
-//   3. Weighted sum: O = sum(weights[i] * V[i])
-
-kernel void attention_single_head(
-    device const half* q [[buffer(0)]],           // [head_size]
-    device const half* k [[buffer(1)]],           // [seq_len, head_size]
-    device const half* v [[buffer(2)]],           // [seq_len, head_size]
-    device half* output [[buffer(3)]],            // [head_size]
-    constant AttentionParams& params [[buffer(4)]],
-    threadgroup float* shared_logits [[threadgroup(0)]],  // [seq_len]
-    uint tid [[thread_position_in_threadgroup]],
-    uint threadgroup_size [[threads_per_threadgroup]],
-    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
-    uint lane_id [[thread_index_in_simdgroup]]
-) {
-    const uint seq_len = params.seq_len;
-    const uint head_size = params.head_size;
-    const float scale = params.scale;
-    
-    // Step 1: Compute Q·K attention scores
-    // Each thread computes scores for multiple tokens
-    float max_logit = -INFINITY;
-    
-    for (uint token_idx = tid; token_idx < seq_len; token_idx += threadgroup_size) {
-        // Compute dot product: Q · K[token_idx]
-        float qk_dot = 0.0f;
-        for (uint i = 0; i < head_size; i++) {
-            qk_dot += float(q[i]) * float(k[token_idx * head_size + i]);
-        }
-        
-        float logit = qk_dot * scale;
-        shared_logits[token_idx] = logit;
-        max_logit = max(max_logit, logit);
-    }
-    
-    // Synchronize to ensure all logits are computed
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Step 2: Find global max logit (for numerical stability)
-    // Reduce within simdgroup (32 threads)
-    max_logit = simd_max(max_logit);
-    
-    // Reduce across simdgroups using threadgroup memory
-    threadgroup float simdgroup_maxes[32];  // Max 32 simdgroups per threadgroup
-    if (lane_id == 0) {
-        simdgroup_maxes[simdgroup_id] = max_logit;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Final reduction (only first simdgroup participates)
-    if (simdgroup_id == 0) {
-        float global_max = lane_id < (threadgroup_size / 32) ? simdgroup_maxes[lane_id] : -INFINITY;
-        global_max = simd_max(global_max);
-        if (lane_id == 0) {
-            simdgroup_maxes[0] = global_max;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float global_max_logit = simdgroup_maxes[0];
-    
-    // Step 3: Compute exp(logit - max) and sum
-    float exp_sum = 0.0f;
-    for (uint token_idx = tid; token_idx < seq_len; token_idx += threadgroup_size) {
-        float logit = shared_logits[token_idx];
-        float exp_val = exp(logit - global_max_logit);
-        shared_logits[token_idx] = exp_val;
-        exp_sum += exp_val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Step 4: Reduce exp_sum across threads
-    exp_sum = simd_sum(exp_sum);
-    
-    threadgroup float simdgroup_sums[32];
-    if (lane_id == 0) {
-        simdgroup_sums[simdgroup_id] = exp_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    if (simdgroup_id == 0) {
-        float global_sum = lane_id < (threadgroup_size / 32) ? simdgroup_sums[lane_id] : 0.0f;
-        global_sum = simd_sum(global_sum);
-        if (lane_id == 0) {
-            simdgroup_sums[0] = global_sum;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float global_exp_sum = simdgroup_sums[0];
-    
-    // Step 5: Normalize to get softmax weights
-    float inv_sum = 1.0f / (global_exp_sum + 1e-6f);
-    for (uint token_idx = tid; token_idx < seq_len; token_idx += threadgroup_size) {
-        shared_logits[token_idx] *= inv_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    // Step 6: Compute weighted sum: output = sum(softmax[i] * V[i])
-    // Each thread computes partial sums for different output dimensions
-    for (uint dim_idx = tid; dim_idx < head_size; dim_idx += threadgroup_size) {
-        float acc = 0.0f;
-        for (uint token_idx = 0; token_idx < seq_len; token_idx++) {
-            float weight = shared_logits[token_idx];
-            float value = float(v[token_idx * head_size + dim_idx]);
-            acc += weight * value;
-        }
-        output[dim_idx] = half(acc);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5.C.4: Specialized multi-Q-token attention kernels
-//
-// Function-constant bindings (must match `pipelines.rs`):
-//   0  HEAD_DIM            uint
-//   1  NUM_Q_HEADS         uint
-//   2  NUM_KV_HEADS        uint
-//   3  ATTN_SCALE          float
-//   4  BLOCK_SIZE          uint   (AttentionViaCache only)
-//   5  MAX_BLOCKS_PER_SEQ  uint   (AttentionViaCache only)
-//   6  PREFILL_TILE_Q      uint   (AttentionPrefillContiguous only)
-//
-// Per the MSL spec, a function-constant index must have consistent
-// type+name across a single compilation unit. The two kernels share
-// indices 0..3 (HEAD_DIM/NUM_Q_HEADS/NUM_KV_HEADS/ATTN_SCALE) and own
-// disjoint slots above that.
-//
-// Numerically-correct reference implementations: one threadgroup per
-// (token, head) for decode and per (Q-tile, head) for prefill, with
-// `HEAD_DIM` threads per group cooperating on dot products and the
-// output spread. Performance-tuning (FlashAttention-style blocking
-// over K, vectorized loads) is deferred to Phase 5.6 — these are
-// here to unblock end-to-end forward bring-up.
-//
-// Shared-logits buffer is fixed at 4096 floats (16KB) — the largest
-// `seq_used_k[seq]` we can handle without spilling. Production paths
-// will switch to incremental softmax; tracked in PHASE5_PLAN.md.
-// ---------------------------------------------------------------------------
 
 constant uint  ATTN_HEAD_DIM           [[function_constant(0)]];
 constant uint  ATTN_NUM_Q_HEADS        [[function_constant(1)]];
@@ -174,314 +44,6 @@ constant uint  ATTN_PREFILL_TILE_Q     [[function_constant(6)]];
 // this cap fall back to a larger-cap pipeline (TODO).
 #define ATTN_MAX_SHARED_LOGITS 256u
 
-/// Decode-bucket attention reading from a paged KV cache.
-///
-/// Layout assumed for K/V cache: `[num_blocks, num_kv_heads,
-/// BLOCK_SIZE, HEAD_DIM]` for both K and V. Produced by the
-/// `RopeAppend` writer; the worker binds one buffer per (layer, K|V).
-///
-/// Q is `[batch, num_q_heads, head_dim]`, output mirrors. `bucket_m
-/// == batch` for decode.
-///
-/// Dispatch: threadgroups (batch, num_q_heads, 1), threads
-/// (HEAD_DIM, 1, 1). One threadgroup per (seq, q_head). Threads
-/// cooperate over `head_dim` loads/stores.
-kernel void attention_via_cache_f16_specialized(
-    device       half* output      [[buffer(0)]],   // [batch, num_q_heads, head_dim]
-    device const half* q           [[buffer(1)]],   // [batch, num_q_heads, head_dim]
-    device const uint* seq_used_k  [[buffer(2)]],   // [batch]
-    device const uint* block_table [[buffer(3)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const half* k_cache     [[buffer(4)]],   // [num_blocks, num_kv_heads, BLOCK_SIZE, HEAD_DIM]
-    device const half* v_cache     [[buffer(5)]],   // same layout as k_cache
-    uint3  tg_pos  [[threadgroup_position_in_grid]],
-    uint3  tid     [[thread_position_in_threadgroup]],
-    uint   simd_id [[simdgroup_index_in_threadgroup]],
-    uint   lane_id [[thread_index_in_simdgroup]])
-{
-    const uint seq_idx     = tg_pos.x;            // batch index
-    const uint q_head_idx  = tg_pos.y;            // 0..NUM_Q_HEADS
-    const uint d           = tid.x;               // 0..HEAD_DIM
-    const uint head_dim    = ATTN_HEAD_DIM;
-    const uint num_q       = ATTN_NUM_Q_HEADS;
-    const uint num_kv      = ATTN_NUM_KV_HEADS;
-    const uint block_size  = ATTN_BLOCK_SIZE;
-    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
-    const float scale      = ATTN_SCALE_FC;
-    const uint group_ratio = num_q / num_kv;
-    const uint kv_head_idx = q_head_idx / group_ratio;
-
-    const uint kv_blk_stride  = num_kv * block_size * head_dim;
-    const uint kv_head_stride = block_size * head_dim;
-    const uint kv_tok_stride  = head_dim;
-
-    // Q row for this threadgroup (stride: num_q_heads * head_dim per token).
-    device const half* q_row =
-        q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       half* o_row =
-        output + (seq_idx * num_q + q_head_idx) * head_dim;
-    device const uint* row_block_table =
-        block_table + seq_idx * max_blocks;
-
-    threadgroup float shared_logits[ATTN_MAX_SHARED_LOGITS];
-    threadgroup float simd_scratch[32];
-
-    // Load Q vector into a register array via threadgroup memory so
-    // every thread can read every element in the dot-product loop.
-    threadgroup half q_local[1024];     // covers head_dim ≤ 1024
-    if (d < head_dim) {
-        q_local[d] = q_row[d];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint kv_len = seq_used_k[seq_idx];
-    const uint num_logical_blocks = (kv_len + block_size - 1) / block_size;
-
-    // Step 1: scores[token] = (Q · K[token]) * scale.
-    float max_logit = -INFINITY;
-    for (uint logical_block = 0; logical_block < num_logical_blocks; ++logical_block) {
-        const uint physical_block = row_block_table[logical_block];
-        device const half* k_block =
-            k_cache
-            + physical_block * kv_blk_stride
-            + kv_head_idx    * kv_head_stride;
-
-        // Each thread takes a stride of HEAD_DIM tokens through this
-        // block (one per `d`), but for simplicity we serialize the
-        // outer block_offset and parallelize the dot product across
-        // threads via simd_sum below.
-        for (uint block_offset = 0; block_offset < block_size; ++block_offset) {
-            const uint token_idx = logical_block * block_size + block_offset;
-            if (token_idx >= kv_len) break;
-            if (token_idx >= ATTN_MAX_SHARED_LOGITS) break;
-
-            device const half* k_vec = k_block + block_offset * kv_tok_stride;
-            // Each thread contributes its `d`-th product, then we
-            // simd-reduce across the head_dim threads.
-            float partial = 0.0f;
-            if (d < head_dim) {
-                partial = float(q_local[d]) * float(k_vec[d]);
-            }
-            float dot = simd_sum(partial);
-            // Lane 0 of each simdgroup writes its partial; cross-simd
-            // reduce afterwards. For HEAD_DIM ≤ 32 (one simdgroup)
-            // the simd_sum already produced the full dot.
-            if (head_dim > 32) {
-                if (lane_id == 0) simd_scratch[simd_id] = dot;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (simd_id == 0) {
-                    const uint num_simds = (head_dim + 31) / 32;
-                    float v = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
-                    v = simd_sum(v);
-                    if (lane_id == 0) simd_scratch[0] = v;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                dot = simd_scratch[0];
-            }
-            const float logit = dot * scale;
-            if (d == 0) shared_logits[token_idx] = logit;
-            max_logit = max(max_logit, logit);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Step 2: max-reduce across all threads in the threadgroup.
-    max_logit = simd_max(max_logit);
-    if (lane_id == 0) simd_scratch[simd_id] = max_logit;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_id == 0) {
-        const uint num_simds = (head_dim + 31) / 32;
-        float v = (lane_id < num_simds) ? simd_scratch[lane_id] : -INFINITY;
-        v = simd_max(v);
-        if (lane_id == 0) simd_scratch[0] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float global_max = simd_scratch[0];
-
-    // Step 3: exp(logit - max) + sum.
-    float exp_sum = 0.0f;
-    const uint clamped_kv = min(kv_len, ATTN_MAX_SHARED_LOGITS);
-    for (uint t = d; t < clamped_kv; t += head_dim) {
-        const float val = exp(shared_logits[t] - global_max);
-        shared_logits[t] = val;
-        exp_sum += val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    exp_sum = simd_sum(exp_sum);
-    if (lane_id == 0) simd_scratch[simd_id] = exp_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_id == 0) {
-        const uint num_simds = (head_dim + 31) / 32;
-        float v = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
-        v = simd_sum(v);
-        if (lane_id == 0) simd_scratch[0] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_sum = 1.0f / (simd_scratch[0] + 1e-6f);
-
-    // Step 4: weighted sum over V — each thread owns one `d` of the
-    // output, accumulating across all KV tokens.
-    if (d < head_dim) {
-        float acc = 0.0f;
-        for (uint logical_block = 0; logical_block < num_logical_blocks; ++logical_block) {
-            const uint physical_block = row_block_table[logical_block];
-            device const half* v_block =
-                v_cache
-                + physical_block * kv_blk_stride
-                + kv_head_idx    * kv_head_stride;
-            for (uint block_offset = 0; block_offset < block_size; ++block_offset) {
-                const uint token_idx = logical_block * block_size + block_offset;
-                if (token_idx >= kv_len) break;
-                if (token_idx >= ATTN_MAX_SHARED_LOGITS) break;
-                const float w = shared_logits[token_idx] * inv_sum;
-                const float v = float(v_block[block_offset * kv_tok_stride + d]);
-                acc += w * v;
-            }
-        }
-        o_row[d] = half(acc);
-    }
-}
-
-/// BF16 specialized variant of `attention_via_cache_f16_specialized`.
-/// Same dispatch shape, function constants, paged-cache layout.
-/// Bindings switch to `bfloat`; reductions stay in f32. Used by the
-/// decode-bucket lowering when the model's resolved dtype is bf16.
-kernel void attention_via_cache_bf16_specialized(
-    device       bfloat* output      [[buffer(0)]],
-    device const bfloat* q           [[buffer(1)]],
-    device const uint*   seq_used_k  [[buffer(2)]],
-    device const uint*   block_table [[buffer(3)]],
-    device const bfloat* k_cache     [[buffer(4)]],
-    device const bfloat* v_cache     [[buffer(5)]],
-    uint3  tg_pos  [[threadgroup_position_in_grid]],
-    uint3  tid     [[thread_position_in_threadgroup]],
-    uint   simd_id [[simdgroup_index_in_threadgroup]],
-    uint   lane_id [[thread_index_in_simdgroup]])
-{
-    const uint seq_idx     = tg_pos.x;
-    const uint q_head_idx  = tg_pos.y;
-    const uint d           = tid.x;
-    const uint head_dim    = ATTN_HEAD_DIM;
-    const uint num_q       = ATTN_NUM_Q_HEADS;
-    const uint num_kv      = ATTN_NUM_KV_HEADS;
-    const uint block_size  = ATTN_BLOCK_SIZE;
-    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
-    const float scale      = ATTN_SCALE_FC;
-    const uint group_ratio = num_q / num_kv;
-    const uint kv_head_idx = q_head_idx / group_ratio;
-
-    const uint kv_blk_stride  = num_kv * block_size * head_dim;
-    const uint kv_head_stride = block_size * head_dim;
-    const uint kv_tok_stride  = head_dim;
-
-    device const bfloat* q_row =
-        q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       bfloat* o_row =
-        output + (seq_idx * num_q + q_head_idx) * head_dim;
-    device const uint*   row_block_table =
-        block_table + seq_idx * max_blocks;
-
-    threadgroup float  shared_logits[ATTN_MAX_SHARED_LOGITS];
-    threadgroup float  simd_scratch[32];
-    threadgroup bfloat q_local[1024];
-
-    if (d < head_dim) {
-        q_local[d] = q_row[d];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const uint kv_len = seq_used_k[seq_idx];
-    const uint num_logical_blocks = (kv_len + block_size - 1) / block_size;
-
-    float max_logit = -INFINITY;
-    for (uint logical_block = 0; logical_block < num_logical_blocks; ++logical_block) {
-        const uint physical_block = row_block_table[logical_block];
-        device const bfloat* k_block =
-            k_cache
-            + physical_block * kv_blk_stride
-            + kv_head_idx    * kv_head_stride;
-        for (uint block_offset = 0; block_offset < block_size; ++block_offset) {
-            const uint token_idx = logical_block * block_size + block_offset;
-            if (token_idx >= kv_len) break;
-            if (token_idx >= ATTN_MAX_SHARED_LOGITS) break;
-            device const bfloat* k_vec = k_block + block_offset * kv_tok_stride;
-            float partial = 0.0f;
-            if (d < head_dim) {
-                partial = float(q_local[d]) * float(k_vec[d]);
-            }
-            float dot = simd_sum(partial);
-            if (head_dim > 32) {
-                if (lane_id == 0) simd_scratch[simd_id] = dot;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (simd_id == 0) {
-                    const uint num_simds = (head_dim + 31) / 32;
-                    float v = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
-                    v = simd_sum(v);
-                    if (lane_id == 0) simd_scratch[0] = v;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                dot = simd_scratch[0];
-            }
-            const float logit = dot * scale;
-            if (d == 0) shared_logits[token_idx] = logit;
-            max_logit = max(max_logit, logit);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    max_logit = simd_max(max_logit);
-    if (lane_id == 0) simd_scratch[simd_id] = max_logit;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_id == 0) {
-        const uint num_simds = (head_dim + 31) / 32;
-        float v = (lane_id < num_simds) ? simd_scratch[lane_id] : -INFINITY;
-        v = simd_max(v);
-        if (lane_id == 0) simd_scratch[0] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float global_max = simd_scratch[0];
-
-    float exp_sum = 0.0f;
-    const uint clamped_kv = min(kv_len, ATTN_MAX_SHARED_LOGITS);
-    for (uint t = d; t < clamped_kv; t += head_dim) {
-        const float val = exp(shared_logits[t] - global_max);
-        shared_logits[t] = val;
-        exp_sum += val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    exp_sum = simd_sum(exp_sum);
-    if (lane_id == 0) simd_scratch[simd_id] = exp_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_id == 0) {
-        const uint num_simds = (head_dim + 31) / 32;
-        float v = (lane_id < num_simds) ? simd_scratch[lane_id] : 0.0f;
-        v = simd_sum(v);
-        if (lane_id == 0) simd_scratch[0] = v;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_sum = 1.0f / (simd_scratch[0] + 1e-6f);
-
-    if (d < head_dim) {
-        float acc = 0.0f;
-        for (uint logical_block = 0; logical_block < num_logical_blocks; ++logical_block) {
-            const uint physical_block = row_block_table[logical_block];
-            device const bfloat* v_block =
-                v_cache
-                + physical_block * kv_blk_stride
-                + kv_head_idx    * kv_head_stride;
-            for (uint block_offset = 0; block_offset < block_size; ++block_offset) {
-                const uint token_idx = logical_block * block_size + block_offset;
-                if (token_idx >= kv_len) break;
-                if (token_idx >= ATTN_MAX_SHARED_LOGITS) break;
-                const float w = shared_logits[token_idx] * inv_sum;
-                const float v = float(v_block[block_offset * kv_tok_stride + d]);
-                acc += w * v;
-            }
-        }
-        o_row[d] = bfloat(acc);
-    }
-}
 
 /// Prefill-bucket attention over contiguous Q/K/V tiles.
 ///
@@ -678,6 +240,144 @@ kernel void attention_via_cache_v2_f16_specialized(
         device half* o_ptr = o_row + simd_gid * qk_per_thread;
         for (uint j = 0; j < qk_per_thread; ++j) {
             o_ptr[j] = half(o_reg[j]);
+        }
+    }
+}
+
+/// BF16 sibling of `attention_via_cache_v2_f16_specialized`. Same
+/// algorithm: paged-cache adaptation of MLX's `sdpa_vector` (online
+/// softmax + per-simdgroup K-axis split). Reads pre-rotated K from
+/// the cache (rope-on-write — `rope_append_bf16` rotates K and writes
+/// rotated K to the cache).
+///
+/// Constraint: HEAD_DIM must be a multiple of 32. Llama-3.2-1B
+/// (HEAD_DIM=64), Llama-3.2-3B (HEAD_DIM=128), and Qwen-class
+/// (HEAD_DIM=128) all satisfy.
+kernel void attention_via_cache_v2_bf16_specialized(
+    device       bfloat* output      [[buffer(0)]],   // [batch, num_q_heads, head_dim]
+    device const bfloat* q           [[buffer(1)]],   // [batch, num_q_heads, head_dim]
+    device const uint*   seq_used_k  [[buffer(2)]],   // [batch]
+    device const uint*   block_table [[buffer(3)]],   // [batch, MAX_BLOCKS_PER_SEQ]
+    device const bfloat* k_cache     [[buffer(4)]],
+    device const bfloat* v_cache     [[buffer(5)]],
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 32; // simdgroups per threadgroup
+    constexpr int BD = 32; // lanes per simdgroup
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const uint block_size  = ATTN_BLOCK_SIZE;
+    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
+    const float scale      = ATTN_SCALE_FC;
+
+    // Each lane handles `qk_per_thread` contiguous elements of head_dim.
+    const uint qk_per_thread = head_dim / uint(BD);
+
+    const uint seq_idx     = tg_pos.x;
+    const uint q_head_idx  = tg_pos.y;
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+    const uint kv_len      = seq_used_k[seq_idx];
+
+    const uint kv_blk_stride  = num_kv * block_size * head_dim;
+    const uint kv_head_stride = block_size * head_dim;
+    const uint kv_tok_stride  = head_dim;
+
+    thread U q_reg[8];
+    thread U o_reg[8];
+
+    threadgroup U tg_outputs[BN * BD];
+    threadgroup U tg_max[BN];
+    threadgroup U tg_sum[BN];
+
+    device const bfloat* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
+    device       bfloat* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    device const uint*   row_block_table = block_table + seq_idx * max_blocks;
+
+    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    // Initialize per-thread max with finite minimum (MLX uses
+    // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
+    // fast::exp doesn't handle -INFINITY safely so we avoid it.
+    U max_score = -FLT_MAX;
+    U sum_exp_score = 0;
+
+    // Online softmax over K axis. Each simdgroup `simd_gid` covers
+    // tokens at indices simd_gid, simd_gid+BN, simd_gid+2*BN, ...
+    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        const uint logical_block = i / block_size;
+        const uint physical_block = row_block_table[logical_block];
+        const uint token_in_block = i - logical_block * block_size;
+        device const bfloat* k_ptr =
+            k_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride
+            + token_in_block * kv_tok_stride
+            + simd_lid * qk_per_thread;
+        device const bfloat* v_ptr =
+            v_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride
+            + token_in_block * kv_tok_stride
+            + simd_lid * qk_per_thread;
+
+        U score = 0;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            score += q_reg[j] * U(k_ptr[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        // Match MLX `sdpa_vector`: fast::exp for both factor + exp_score.
+        U factor = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
+        }
+    }
+
+    // Combine per-simdgroup partials (online-softmax merge).
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U other_max = tg_max[simd_lid];
+    U global_max = simd_max(other_max);
+    U factor = metal::fast::exp(other_max - global_max);
+    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
+
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
+        U combined = simd_sum(val);
+        if (global_sum != 0) {
+            combined = combined / global_sum;
+        }
+        o_reg[j] = combined;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        device bfloat* o_ptr = o_row + simd_gid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_ptr[j] = bfloat(o_reg[j]);
         }
     }
 }

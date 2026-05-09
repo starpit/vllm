@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::classified::{OpKind, Program};
+use crate::classified::Program;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     AttentionPrefillContiguousImpl, AttentionViaCacheImpl, CostCtx, Handoff, Implementation,
@@ -30,8 +30,6 @@ use crate::target::{Backend, TargetProfile};
 pub struct MetalAttentionImpl {
     /// Kernel name for cost table lookup
     kernel_name: &'static str,
-    /// Data type (fp16 or bf16)
-    dtype: &'static str,
     /// Whether this is paged attention (uses block tables)
     is_paged: bool,
     /// Whether this is multi-head attention. Drives the
@@ -54,7 +52,6 @@ impl MetalAttentionImpl {
     pub fn new_basic_fp16() -> Self {
         Self {
             kernel_name: "attention_basic_f16",
-            dtype: "fp16",
             is_paged: false,
             is_multihead: false,
             is_optimized: false,
@@ -66,7 +63,6 @@ impl MetalAttentionImpl {
     pub fn new_paged_fp16() -> Self {
         Self {
             kernel_name: "attention_paged_f16",
-            dtype: "fp16",
             is_paged: true,
             is_multihead: false,
             is_optimized: false,
@@ -78,7 +74,6 @@ impl MetalAttentionImpl {
     pub fn new_multihead_fp16() -> Self {
         Self {
             kernel_name: "attention_multihead_f16",
-            dtype: "fp16",
             is_paged: true,
             is_multihead: true,
             is_optimized: false,
@@ -90,7 +85,6 @@ impl MetalAttentionImpl {
     pub fn new_multihead_optimized_fp16() -> Self {
         Self {
             kernel_name: "attention_multihead_optimized_f16",
-            dtype: "fp16",
             is_paged: true,
             is_multihead: true,
             is_optimized: true,
@@ -104,7 +98,6 @@ impl MetalAttentionImpl {
     pub fn new_sliding_paged_fp16() -> Self {
         Self {
             kernel_name: "sliding_attention_paged_f16",
-            dtype: "fp16",
             is_paged: true,
             is_multihead: false,
             is_optimized: false,
@@ -117,7 +110,6 @@ impl MetalAttentionImpl {
     pub fn new_sliding_multihead_optimized_fp16() -> Self {
         Self {
             kernel_name: "sliding_attention_multihead_optimized_f16",
-            dtype: "fp16",
             is_paged: true,
             is_multihead: true,
             is_optimized: true,

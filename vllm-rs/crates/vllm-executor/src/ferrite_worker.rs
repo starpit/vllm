@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 use vllm_common::SamplingParams;
+#[cfg(feature = "cuda")]
 use vllm_common::engine_io::EmbeddingData;
 use vllm_config::CudaGraphMode;
 use vllm_core::scheduler::output::SchedulerOutput;
@@ -71,7 +72,9 @@ use ferrite_cuda_core::weights::GpuWeights;
 use ferrite_cuda_core::{GpuDevice, GpuTensor, MetalAllocator, RawGpuMem, TensorView};
 
 use crate::error::{ExecutorError, ExecutorResult};
-use crate::input_batch::{InputBatch, PreparedInputs};
+use crate::input_batch::InputBatch;
+#[cfg(feature = "cuda")]
+use crate::input_batch::PreparedInputs;
 use crate::worker::Worker;
 
 // ---------------------------------------------------------------------------
@@ -1716,13 +1719,18 @@ pub struct FerriteWorker {
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
-    /// Resolved pooling strategy for embedding mode.
+    /// Resolved pooling strategy for embedding mode (cuda-only:
+    /// pooling-mode codepaths live in the `cuda` impl block).
+    #[cfg(feature = "cuda")]
     pooling_strategy: vllm_model::embedding::PoolingStrategy,
     /// Whether executing in pooling mode (--runner pooling).
+    #[cfg(feature = "cuda")]
     is_pooling: bool,
     /// True if batch composition changed this step (triggers BatchUpdate).
+    #[cfg(feature = "cuda")]
     batch_changed: bool,
     /// Ordered request IDs in the current batch (for pipeline update_state).
+    #[cfg(feature = "cuda")]
     batch_req_ids: Vec<String>,
     /// Per-request seeded RNGs for deterministic sampling.
     seeded_rngs: HashMap<String, rand::rngs::StdRng>,
@@ -1964,13 +1972,13 @@ fn resolve_model_path(config: &FerriteWorkerConfig) -> ExecutorResult<PathBuf> {
                         .map(|shard| {
                             let bar = multi.add(indicatif::ProgressBar::new(0));
                             s.spawn(move || {
-                                repo.download_with_progress(shard, bar).map(|_| ()).map_err(
-                                    |e| {
+                                repo.download_with_progress(shard, bar)
+                                    .map(|_| ())
+                                    .map_err(|e| {
                                         ExecutorError::WorkerInit(format!(
                                             "failed to download {shard}: {e}"
                                         ))
-                                    },
-                                )
+                                    })
                             })
                         })
                         .collect();
@@ -9300,11 +9308,6 @@ mod tests {
 #[cfg(feature = "metal")]
 impl FerriteWorker {
     pub fn new(config: FerriteWorkerConfig) -> Self {
-        let is_pooling = config.is_pooling;
-        let pooling_strategy = config
-            .pooling_strategy
-            .parse::<vllm_model::embedding::PoolingStrategy>()
-            .unwrap_or(vllm_model::embedding::PoolingStrategy::Last);
         Self {
             config,
             kv_cache: None,
@@ -9324,10 +9327,6 @@ impl FerriteWorker {
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
-            pooling_strategy,
-            is_pooling,
-            batch_changed: false,
-            batch_req_ids: Vec::new(),
             seeded_rngs: HashMap::new(),
             progress_callback: None,
             metal_device: None,
@@ -9411,10 +9410,7 @@ impl Worker for FerriteWorker {
         // weight allocated through the GpuWeights clone is reachable
         // via the GpuDevice clone — same `MTLBuffer`s, same offsets.
         let allocator = MetalAllocator::new((*device_arc).clone());
-        let gpu_device = GpuDevice::new(
-            device_arc.clone(),
-            std::sync::Arc::new(allocator.clone()),
-        );
+        let gpu_device = GpuDevice::new(device_arc.clone(), std::sync::Arc::new(allocator.clone()));
         let mut weights = GpuWeights::from_dir(&model_dir, allocator)
             .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
         info!(
@@ -9422,10 +9418,16 @@ impl Worker for FerriteWorker {
             weights.len()
         );
 
-        // Metal kernels are specialized on f16; force the upload path to
-        // cast F32 / BF16 source weights into f16. Mirrors cuda's
-        // `set_target_dtype` after-load step.
-        weights.set_target_dtype(GpuDType::F16);
+        // Metal backend default dtype is bf16 — matches the on-disk
+        // `torch_dtype: bfloat16` of every modern HF Llama / Qwen /
+        // Phi / Mistral checkpoint and the cuda backend's native
+        // dtype. Apple Silicon M3+ has hardware bf16 MMA; the metal
+        // shaders ship `_bf16_specialized` siblings for every
+        // on-path kernel and `MetalDtype::Bf16` is the default on
+        // `CanonicalParams::METAL_DTYPE`. F16-on-disk weights get
+        // cast up to bf16 here (lossy in the mantissa but matches
+        // the kernel's expected binding type).
+        weights.set_target_dtype(GpuDType::BF16);
 
         // Build HF fingerprint — same disambiguation surface cuda uses.
         let hf_fp = ferrite_forward::HfFingerprint {
@@ -9510,6 +9512,38 @@ impl Worker for FerriteWorker {
         // in 3.E forward half) and binds them into the per-bucket
         // `RuntimeBindings.kv_cache_k/v` Buffer slots.
         let mtl_device = device.device.clone();
+        // Mirror the model's resolved dtype so the KvCachePool's
+        // tensor labels match what the kernel reads. bf16 weights →
+        // bf16 cache; f16 weights → f16 cache. Byte size is the same
+        // (2 bytes/elt) so this is purely a metadata fix; the
+        // attention kernel binds the right `_bf16_specialized` /
+        // `_f16_specialized` variant via `model.metal_dtype()`.
+        let cache_dtype = match model.metal_dtype() {
+            ferrite_forward::interpreter::metal::MetalDtype::Bf16 => GpuDType::BF16,
+            ferrite_forward::interpreter::metal::MetalDtype::F16 => GpuDType::F16,
+            ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                return Err(ExecutorError::WorkerInit(
+                    "KV cache cannot be int4-quantized — must be bf16/f16".into(),
+                ));
+            }
+        };
+
+        // Hand newly-created KV cache buffers to the SHARED residency
+        // set the allocator already owns (the same set covers the
+        // weight arenas, every per-worker arena, and now KV). This is
+        // the layout MLX uses — one `MTLResidencySet` per device queue,
+        // not one per buffer category. Two residency sets per queue
+        // (the previous layout) produced non-deterministic decode
+        // output on Llama-3.2 even though every kernel passed its
+        // golden in isolation.
+        //
+        // KvCachePool buffers are StorageModePrivate (~7.8 GiB total
+        // for Llama-3.2-3B at 28 layers × 2 K/V × ~140 MiB), which
+        // is exactly the working-set Apple's lazy paging tracker
+        // drops out of residency under pressure. Without pinning,
+        // attention reads race against the pager.
+        let residency = device.allocator.residency().clone();
+
         let pool = unsafe {
             KvCachePool::new(
                 model.num_hidden_layers() as usize,
@@ -9517,22 +9551,28 @@ impl Worker for FerriteWorker {
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
-                GpuDType::F16,
+                cache_dtype,
                 |bytes| {
                     // KV cache is GPU-only (no CPU touches between
                     // forwards). StorageModePrivate avoids the
                     // unified-memory first-touch cost that
                     // StorageModeShared pays on each fresh cmdbuf
                     // (~3s/forward observed at TinyLlama).
-                    let buffer = mtl_device.new_buffer(
-                        bytes as u64,
-                        metal::MTLResourceOptions::StorageModePrivate,
-                    );
+                    let buffer = mtl_device
+                        .new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModePrivate);
+                    residency.insert(&buffer);
                     Ok(RawGpuMem::from_buffer(buffer))
                 },
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
+        residency.commit();
+        // Attach the shared residency set to the device's queue so
+        // every cmdbuf sees both arenas + KV-cache as wired. The
+        // pool's lazy attach in `forward()` re-attaches the same set
+        // (idempotent per (queue, set) pair) — it's safe but redundant
+        // once we've attached here.
+        residency.attach_to_queue(&device.queue);
 
         info!(
             "FerriteWorker(metal): KV cache initialized: {} layers × {} blocks × {} tokens",
@@ -9849,8 +9889,7 @@ impl Worker for FerriteWorker {
             for row_idx in 0..total_n.min(25) {
                 let row = unsafe {
                     std::slice::from_raw_parts(
-                        (buf.contents() as *const half::f16)
-                            .add(row_idx as usize * vocab as usize),
+                        (buf.contents() as *const half::f16).add(row_idx as usize * vocab as usize),
                         vocab as usize,
                     )
                 };
@@ -9870,18 +9909,83 @@ impl Worker for FerriteWorker {
             (total_n as u64).max(1) * 4,
             metal::MTLResourceOptions::StorageModeShared,
         );
-        ferrite_metal_kernels::argmax::dispatch_argmax_f16(
-            argmax_kernels,
-            &device_mut.queue,
-            logits.metal_buffer(),
-            &argmax_out,
-            total_n,
-            vocab,
-        )
-        .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_f16: {e:?}")))?;
+        match model.metal_dtype() {
+            ferrite_forward::interpreter::metal::MetalDtype::F16 => {
+                ferrite_metal_kernels::argmax::dispatch_argmax_f16(
+                    argmax_kernels,
+                    &device_mut.queue,
+                    logits.metal_buffer(),
+                    &argmax_out,
+                    total_n,
+                    vocab,
+                )
+                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_f16: {e:?}")))?;
+            }
+            ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
+                ferrite_metal_kernels::argmax::dispatch_argmax_bf16(
+                    argmax_kernels,
+                    &device_mut.queue,
+                    logits.metal_buffer(),
+                    &argmax_out,
+                    total_n,
+                    vocab,
+                )
+                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_bf16: {e:?}")))?;
+            }
+            ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                return Err(ExecutorError::WorkerExecution(
+                    "argmax: int4 dtype has no direct argmax kernel — \
+                     dequantize logits to f16/bf16 first"
+                        .into(),
+                ));
+            }
+        }
 
-        let argmax_slice: &[u32] =
-            unsafe { std::slice::from_raw_parts(argmax_out.contents() as *const u32, total_n as usize) };
+        let argmax_slice: &[u32] = unsafe {
+            std::slice::from_raw_parts(argmax_out.contents() as *const u32, total_n as usize)
+        };
+
+        // DIAGNOSTIC: dump first 8 logits + top-5 + the argmax for the
+        // last token of each request when VLLM_DUMP_LOGITS=1. Helps
+        // bisect whether the lm_head GEMM is producing sensible logits
+        // or garbage.
+        if std::env::var_os("VLLM_DUMP_LOGITS").is_some() {
+            fn bf16_bits_to_f32(bits: u16) -> f32 {
+                f32::from_bits((bits as u32) << 16)
+            }
+            let logits_bytes = logits.metal_buffer().contents() as *const u8;
+            let logits_len = logits.metal_buffer().length() as usize;
+            for row in 0..total_n.min(2) {
+                let base = row as usize * vocab as usize * 2;
+                if base + 16 > logits_len {
+                    continue;
+                }
+                let head: Vec<f32> = (0..8)
+                    .map(|j| {
+                        let off = base + j * 2;
+                        let bits = unsafe {
+                            u16::from_le_bytes([*logits_bytes.add(off), *logits_bytes.add(off + 1)])
+                        };
+                        bf16_bits_to_f32(bits)
+                    })
+                    .collect();
+                let mut top5: Vec<(usize, f32)> = (0..vocab as usize)
+                    .map(|j| {
+                        let off = base + j * 2;
+                        let bits = unsafe {
+                            u16::from_le_bytes([*logits_bytes.add(off), *logits_bytes.add(off + 1)])
+                        };
+                        (j, bf16_bits_to_f32(bits))
+                    })
+                    .collect();
+                top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                top5.truncate(5);
+                eprintln!(
+                    "[diag-logits] row={} argmax={} head={:?} top5={:?}",
+                    row, argmax_slice[row as usize], head, top5
+                );
+            }
+        }
 
         // ── 7. Build per-request sampled tokens + commit ─────────
         let mut sampled_token_ids: Vec<Vec<u32>> = Vec::with_capacity(num_reqs);

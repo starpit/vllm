@@ -54,12 +54,14 @@ pub const ARGMAX_DEFAULT_TG_SIZE: u64 = 256;
 pub struct ArgmaxKernels {
     /// `argmax_f16` pipeline. Reference-counted; clone is cheap.
     pub f16: ComputePipelineState,
+    /// `argmax_bf16` pipeline.
+    pub bf16: ComputePipelineState,
     _library: Library,
 }
 
 impl ArgmaxKernels {
-    /// Compile the argmax shader and resolve the `argmax_f16`
-    /// pipeline.
+    /// Compile the argmax shader and resolve both `argmax_f16` and
+    /// `argmax_bf16` pipelines.
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
         let source = include_str!("../shaders/argmax.metal");
         let library = device
@@ -75,8 +77,17 @@ impl ArgmaxKernels {
             .map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("argmax_f16 pipeline: {e:?}"))
             })?;
+        let bf16_fn = library.get_function("argmax_bf16", None).map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!("argmax_bf16 fn: {e:?}"))
+        })?;
+        let bf16 = device
+            .new_compute_pipeline_state_with_function(&bf16_fn)
+            .map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!("argmax_bf16 pipeline: {e:?}"))
+            })?;
         Ok(Self {
             f16,
+            bf16,
             _library: library,
         })
     }
@@ -176,6 +187,76 @@ pub fn dispatch_argmax_f16_with_tg_size(
         )));
     }
     let _ = enc as &ComputeCommandEncoderRef; // silence unused-borrow
+    Ok(())
+}
+
+/// BF16 counterpart to [`dispatch_argmax_f16`]. Identical contract
+/// — `[batch, vocab]` bf16 logits → `[batch]` u32 token ids — with
+/// the bf16 pipeline picked from the same `ArgmaxKernels`. Default
+/// `tg_size`.
+pub fn dispatch_argmax_bf16(
+    kernels: &ArgmaxKernels,
+    queue: &CommandQueue,
+    logits: &Buffer,
+    output: &Buffer,
+    batch: u32,
+    vocab: u32,
+) -> Result<(), MetalStreamError> {
+    if batch == 0 || vocab == 0 {
+        return Err(MetalStreamError::ShaderCompilationFailed(format!(
+            "dispatch_argmax_bf16: batch={batch} vocab={vocab}; both must be > 0"
+        )));
+    }
+    let tg_size: u64 = ARGMAX_DEFAULT_TG_SIZE;
+    let logits_bytes_needed = (batch as u64) * (vocab as u64) * 2;
+    if logits.length() < logits_bytes_needed {
+        return Err(MetalStreamError::ShaderCompilationFailed(format!(
+            "logits buffer too small: have {} bytes, need {logits_bytes_needed}",
+            logits.length()
+        )));
+    }
+    let output_bytes_needed = (batch as u64) * 4;
+    if output.length() < output_bytes_needed {
+        return Err(MetalStreamError::ShaderCompilationFailed(format!(
+            "output buffer too small: have {} bytes, need {output_bytes_needed}",
+            output.length()
+        )));
+    }
+    let cmdbuf = queue.new_command_buffer();
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&kernels.bf16);
+    enc.set_buffer(0, Some(logits), 0);
+    enc.set_buffer(1, Some(output), 0);
+    enc.set_bytes(
+        2,
+        std::mem::size_of::<u32>() as u64,
+        &batch as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &vocab as *const u32 as *const std::ffi::c_void,
+    );
+    let threadgroups = MTLSize {
+        width: batch as u64,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_tg = MTLSize {
+        width: tg_size,
+        height: 1,
+        depth: 1,
+    };
+    enc.dispatch_thread_groups(threadgroups, threads_per_tg);
+    enc.end_encoding();
+    cmdbuf.commit();
+    cmdbuf.wait_until_completed();
+    if cmdbuf.status() != metal::MTLCommandBufferStatus::Completed {
+        return Err(MetalStreamError::ShaderCompilationFailed(format!(
+            "argmax_bf16 dispatch finished with status {:?}",
+            cmdbuf.status()
+        )));
+    }
     Ok(())
 }
 

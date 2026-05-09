@@ -1,4 +1,4 @@
-use metal::{Buffer, CommandBufferRef, ComputeCommandEncoderRef, Device, MTLSize};
+use metal::{Buffer, ComputeCommandEncoderRef, Device, MTLSize};
 use std::sync::Arc;
 
 use crate::shader_cache::ShaderCache;
@@ -106,7 +106,7 @@ impl MetalActivation {
 
         // Calculate grid size
         let threadgroup_size = MTLSize::new(256, 1, 1);
-        let num_threadgroups = MTLSize::new(((n as u64 + 255) / 256), 1, 1);
+        let num_threadgroups = MTLSize::new((n as u64 + 255) / 256, 1, 1);
 
         // Dispatch
         encoder.dispatch_thread_groups(num_threadgroups, threadgroup_size);
@@ -148,7 +148,7 @@ impl MetalActivation {
 
         // Calculate grid size
         let threadgroup_size = MTLSize::new(256, 1, 1);
-        let num_threadgroups = MTLSize::new(((n as u64 + 255) / 256), 1, 1);
+        let num_threadgroups = MTLSize::new((n as u64 + 255) / 256, 1, 1);
 
         // Dispatch
         encoder.dispatch_thread_groups(num_threadgroups, threadgroup_size);

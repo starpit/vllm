@@ -28,7 +28,6 @@ pub enum RopeDataType {
 
 /// Metal RoPE kernel wrapper
 pub struct MetalRope {
-    device: Arc<MetalDevice>,
     shader_cache: Arc<ShaderCache>,
 }
 
@@ -36,10 +35,7 @@ impl MetalRope {
     /// Create a new MetalRope instance
     pub fn new(device: Arc<MetalDevice>) -> Result<Self, MetalStreamError> {
         let shader_cache = Arc::new(ShaderCache::new(device.device.clone())?);
-        Ok(Self {
-            device,
-            shader_cache,
-        })
+        Ok(Self { shader_cache })
     }
 
     /// Apply rotary position embedding to query and optionally key tensors

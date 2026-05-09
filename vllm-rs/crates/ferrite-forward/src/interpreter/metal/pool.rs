@@ -208,12 +208,28 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     /// `GpuTensor`s point into. The worker uses
     /// [`MetalAllocator::buffer_for`] to map a tensor's raw pointer
     /// back to `(&MTLBuffer, offset)` for encoder bindings.
+    ///
+    /// The allocator also owns the shared `MetalResidencySet` that
+    /// pins every weight / arena / KV-cache buffer as resident across
+    /// cmdbufs (so large Llama-3.2-class working sets don't race
+    /// against Apple's lazy paging and produce non-deterministic
+    /// decode output). The pool reads the set off the allocator and
+    /// (a) hands it to spawned workers so per-worker arena buffers
+    /// also get pinned, and (b) attaches it to the dispatch queue on
+    /// the first `forward()`.
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape<W>]>,
     arena_layout: Arc<ArenaLayout>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
+    /// Tracks whether the allocator's residency set has been attached
+    /// to a queue yet. Lazy-attached on the first `forward()` so the
+    /// pool builder doesn't need a `CommandQueue` (the queue lives on
+    /// `GpuDevice` and is passed in at forward time). `attach_to_queue`
+    /// is idempotent per (queue, set) pair so a second attach from
+    /// `ferrite_worker::initialize_cache` is harmless.
+    residency_attached: std::sync::atomic::AtomicBool,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
 }
@@ -246,6 +262,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         max_workers: usize,
     ) -> Result<Self, WorkerError> {
         assert!(max_workers >= 1, "max_workers must be >= 1");
+
+        // The shared `MetalResidencySet` lives on the allocator now —
+        // arena buffers are pinned automatically as `push_arena_locked`
+        // runs (in `MetalAllocator`), so the pool no longer manages
+        // residency creation or arena-hook wiring. Per-worker arena
+        // buffers (allocated outside the allocator, in `MetalWorker::new`)
+        // still need explicit insertion; that happens in `spawn_worker`
+        // below by reading `allocator.residency()`.
+
         let pool = Self {
             device,
             allocator,
@@ -254,6 +279,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             arena_layout: Arc::new(arena_layout),
             runtime_factory,
             max_workers,
+            residency_attached: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(PoolInner {
                 available: Vec::new(),
                 total_created: 0,
@@ -505,37 +531,48 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
     ) -> Result<R, ForwardError> {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+
+        // Lazily attach the allocator's residency set to the queue on
+        // the first forward — Metal's `addResidencySet` is idempotent
+        // per (queue, set) pair, but we still gate with an atomic
+        // bool so we don't flood the driver with duplicate calls
+        // across thousands of forwards. The pool only ever sees one
+        // queue (the one on `GpuDevice`), so wire-once-and-cache is
+        // safe here. `ferrite_worker::initialize_cache` may have
+        // already attached the same set when wiring KV-cache buffers;
+        // the second attach from here is a no-op in that case.
+        if !self
+            .residency_attached
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.allocator.residency().attach_to_queue(queue);
+        }
+
         let guard = self.checkout(weights)?;
         write_runtime_inputs(&guard.runtime, inputs)?;
 
+        // Default execution: per-step command buffer + direct dispatch
+        // (ICB bypass). Two reasons we make this the default:
+        //  1. The ICB execution path is currently broken for bf16 GEMM
+        //     — the kernel runs but produces stale/wrong outputs for
+        //     decode buckets. Symptom on Llama-3.2-3B: prefill emits a
+        //     coherent first token then decode collapses to repeated
+        //     special characters. Direct dispatch sidesteps the ICB
+        //     write bug entirely (matches every passing kernel golden).
+        //  2. Per-step cmdbufs are empirically ~10× faster than the
+        //     batched single-cmdbuf `run_bucket` on Apple Silicon.
+        //
+        // The env vars below stay as overrides for debugging:
+        //   `FERRITE_METAL_STEP_DEBUG=1` — per-step + eprintln dumps.
+        //   `FERRITE_METAL_USE_BATCHED_CMDBUF=1` — old `run_bucket`
+        //                                          batched path.
+        //   `FERRITE_METAL_NO_DIRECT_DISPATCH=1` — keep per-step but
+        //     drive ICB execution (broken for bf16; left for diagnosis).
         if std::env::var_os("FERRITE_METAL_STEP_DEBUG").is_some() {
-            // Per-step commit/wait to isolate which kernel hangs the
-            // GPU. Each `BucketStep` (ICB segment with one pipeline,
-            // or one MPS GEMM) gets its own command buffer so we can
-            // see exactly which one stalls. Slow — only enable when
-            // debugging.
             guard
                 .worker
                 .run_bucket_per_step_debug(bucket_idx, &self.device, queue)?;
-        } else if std::env::var_os("FERRITE_METAL_PER_STEP_CMDBUF").is_some() {
-            // Same per-step semantics but no eprintln — used to
-            // measure whether the per-cmdbuf isolation is what makes
-            // per-step debug fast. Each step is its own cmdbuf with
-            // its own commit + wait_until_completed.
-            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
-            let t0 = std::time::Instant::now();
-            guard
-                .worker
-                .run_bucket_per_step_silent(bucket_idx, &self.device, queue)?;
-            if trace {
-                eprintln!(
-                    "[forward bucket={} num_tokens={} per_step] total={:?}",
-                    bucket_idx,
-                    inputs.num_tokens,
-                    t0.elapsed(),
-                );
-            }
-        } else {
+        } else if std::env::var_os("FERRITE_METAL_USE_BATCHED_CMDBUF").is_some() {
             let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
             let t_pre = std::time::Instant::now();
             let cb = queue.new_command_buffer();
@@ -560,6 +597,23 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             if status != MTLCommandBufferStatus::Completed {
                 return Err(ForwardError::ExecutionFailed(status));
             }
+        } else {
+            // Production default: per-step + direct-dispatch path. The
+            // `run_bucket_per_step_silent` defaults `direct=true` and
+            // reads `FERRITE_METAL_DIRECT_DISPATCH=0` as the off-switch.
+            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+            let t0 = std::time::Instant::now();
+            guard
+                .worker
+                .run_bucket_per_step_silent(bucket_idx, &self.device, queue)?;
+            if trace {
+                eprintln!(
+                    "[forward bucket={} num_tokens={} per_step] total={:?}",
+                    bucket_idx,
+                    inputs.num_tokens,
+                    t0.elapsed(),
+                );
+            }
         }
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
@@ -568,9 +622,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             for slot in 0..guard.worker.arena.len() {
                 let buf = &guard.worker.arena[slot];
                 let len_bytes = buf.length() as usize;
-                let row0 = unsafe {
-                    std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
-                };
+                let row0 =
+                    unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes) };
                 let nonzero_bytes = row0.iter().filter(|&&v| v != 0).count();
                 eprintln!(
                     "[diag-arena] slot={:3} bytes={} nonzero_bytes={}/{}",
@@ -579,12 +632,39 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
+        // DIAGNOSTIC: dump first/last 4 bf16 values of every arena
+        // slot. Used to bisect where forward N's outputs diverge from
+        // forward N+1's across runs. Reads bytes directly as bf16.
+        if std::env::var_os("VLLM_DUMP_ARENA_BF16").is_some() {
+            fn bf16_bits_to_f32(bits: u16) -> f32 {
+                f32::from_bits((bits as u32) << 16)
+            }
+            for slot in 0..guard.worker.arena.len() {
+                let buf = &guard.worker.arena[slot];
+                let len_bytes = buf.length() as usize;
+                if len_bytes < 32 {
+                    continue;
+                }
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes) };
+                let head = (0..16)
+                    .map(|j| {
+                        let off = j * 2;
+                        let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                        format!("{:.4}", bf16_bits_to_f32(bits))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!("[diag-bf16] slot={:3} head=[{}]", slot, head);
+            }
+        }
+
         Ok(with_output(&guard.worker, bucket_idx))
     }
 
     fn spawn_worker(&self, weights: &W) -> Result<PooledWorker<W>, WorkerError> {
         let runtime = (self.runtime_factory)(&self.device);
-        let worker = MetalWorker::<W>::new(
+        let worker = MetalWorker::<W>::new_with_residency(
             self.device.clone(),
             &self.arena_layout,
             &self.bucket_tapes,
@@ -592,6 +672,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             weights,
             &self.allocator,
             &runtime,
+            Some(self.allocator.residency()),
         )?;
         Ok(PooledWorker { worker, runtime })
     }
@@ -620,7 +701,14 @@ fn write_runtime_inputs(
     write_slice("input_ids", &runtime.input_ids, inputs.input_ids)?;
     write_slice("positions", &runtime.positions, inputs.positions)?;
     if let Some(s) = inputs.slot_mapping {
-        write_slice("slot_mapping", &runtime.slot_mapping, s)?;
+        // Padding lanes get sentinel `u32::MAX` so the rope_append
+        // kernel can early-out before writing the paged K/V cache.
+        // Zero-fill would otherwise route every padding token's K
+        // projection into cache slot 0, overwriting the real K of
+        // position 0 (each padding token has positions[t]=0 and
+        // input_ids[t]=0, so they all write K_proj(token 0) to slot 0,
+        // racing with — and winning against — the real position-0 write).
+        write_slot_mapping(&runtime.slot_mapping, s)?;
     }
     if let Some(s) = inputs.cu_seqlens_q {
         write_slice("cu_seqlens_q", &runtime.cu_seqlens_q, s)?;
@@ -650,6 +738,33 @@ fn write_runtime_inputs(
     }
     if let Some(s) = inputs.block_table {
         write_slice("block_table", &runtime.block_table, s)?;
+    }
+    Ok(())
+}
+
+/// Write `src` into `buffer`, filling padding lanes with `u32::MAX`
+/// (the rope_append sentinel that means "skip cache write"). Mirrors
+/// `write_slice` except for the padding fill value.
+fn write_slot_mapping(buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> {
+    let bytes_needed = std::mem::size_of_val(src);
+    let bytes_available = buffer.length() as usize;
+    if bytes_needed > bytes_available {
+        return Err(ForwardError::BufferTooSmall {
+            kind: "slot_mapping",
+            bytes_needed,
+            bytes_available,
+        });
+    }
+    unsafe {
+        // 0xFF byte-fill = u32::MAX in every lane.
+        std::ptr::write_bytes(buffer.contents() as *mut u8, 0xFFu8, bytes_available);
+        if bytes_needed > 0 {
+            copy_nonoverlapping(
+                src.as_ptr() as *const u8,
+                buffer.contents() as *mut u8,
+                bytes_needed,
+            );
+        }
     }
     Ok(())
 }

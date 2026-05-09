@@ -17,7 +17,6 @@
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize};
 use std::sync::Arc;
 
-use crate::activation::DataType;
 use crate::device::MetalDevice;
 use crate::gemm::MetalGemm;
 

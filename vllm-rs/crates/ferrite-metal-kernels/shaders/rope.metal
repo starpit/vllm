@@ -325,7 +325,11 @@ kernel void rope_append_f16_specialized(
     threadgroup_barrier(mem_flags::mem_device);
 
     // Paged write: kv_cache layout [num_blocks, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM].
+    // Sentinel `0xFFFFFFFF` marks padding lanes (write_slot_mapping in
+    // pool.rs fills padding with u32::MAX) — skip the cache write so
+    // padding's K_proj(token 0) does not corrupt slot 0.
     const uint slot         = slot_mapping[t];
+    if (slot == 0xFFFFFFFFu) return;
     const uint block_id     = slot / block_sz;
     const uint block_offset = slot % block_sz;
     const uint kv_blk_stride  = num_kv * block_sz * head_dim;
@@ -408,7 +412,11 @@ kernel void rope_append_bf16_specialized(
     }
     threadgroup_barrier(mem_flags::mem_device);
 
+    // Sentinel `0xFFFFFFFF` marks padding lanes (write_slot_mapping in
+    // pool.rs fills padding with u32::MAX) — skip the cache write so
+    // padding's K_proj(token 0) does not corrupt slot 0.
     const uint slot         = slot_mapping[t];
+    if (slot == 0xFFFFFFFFu) return;
     const uint block_id     = slot / block_sz;
     const uint block_offset = slot % block_sz;
     const uint kv_blk_stride  = num_kv * block_sz * head_dim;

@@ -773,9 +773,8 @@ impl GpuWeights {
             (DType::F32, DType::BF16) => {
                 let src_f32 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-                let dst_bf16 = unsafe {
-                    std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel)
-                };
+                let dst_bf16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel) };
                 if numel >= PAR_THRESHOLD {
                     let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
                     src_f32
@@ -804,9 +803,8 @@ impl GpuWeights {
             (DType::F16, DType::BF16) => {
                 let src_f16 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
-                let dst_bf16 = unsafe {
-                    std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel)
-                };
+                let dst_bf16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel) };
                 // Two-step: f16 → f32 (SIMD via convert_to_f32_slice) → bf16.
                 src_f16
                     .par_chunks(PAR_THRESHOLD.max(1))
@@ -818,9 +816,8 @@ impl GpuWeights {
                     });
             }
             (DType::BF16, DType::F16) => {
-                let src_bf16 = unsafe {
-                    std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel)
-                };
+                let src_bf16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel) };
                 let dst_f16 =
                     unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
                 src_bf16
@@ -833,11 +830,9 @@ impl GpuWeights {
                     });
             }
             (DType::BF16, DType::F32) => {
-                let src_bf16 = unsafe {
-                    std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel)
-                };
-                let dst_f32 =
-                    unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+                let src_bf16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel) };
+                let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
                 if numel >= PAR_THRESHOLD {
                     let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
                     src_bf16
@@ -851,8 +846,7 @@ impl GpuWeights {
             (DType::F16, DType::F32) => {
                 let src_f16 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
-                let dst_f32 =
-                    unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+                let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
                 if numel >= PAR_THRESHOLD {
                     let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
                     src_f16

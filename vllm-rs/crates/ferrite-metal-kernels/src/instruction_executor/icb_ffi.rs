@@ -5,11 +5,9 @@
 //!
 //! The metal-rs crate doesn't expose ICB APIs, so we bind them directly via objc.
 
-use foreign_types::ForeignType;
 use metal::{Device, MTLSize};
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
-use std::ptr;
 
 /// MTLIndirectCommandType enum values
 #[repr(u64)]

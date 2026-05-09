@@ -6,7 +6,9 @@
 //! Wraps Metal activation function kernels (SiLU, GELU, FatReLU, etc.)
 //! to satisfy ferrite's Implementation trait.
 
-use crate::classified::{OpKind, Program};
+#[cfg(test)]
+use crate::classified::OpKind;
+use crate::classified::Program;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,
@@ -99,7 +101,9 @@ impl MetalActivationImpl {
         time_seconds * 1e6 // convert to microseconds
     }
 
-    /// Get the OpKind that this activation impl matches
+    /// Get the OpKind that this activation impl matches.
+    /// Test-only helper: production code uses `Implementation::claims`.
+    #[cfg(test)]
     fn matches_op_kind(&self) -> OpKind {
         match self.activation_type {
             ActivationType::Silu => OpKind::Silu,

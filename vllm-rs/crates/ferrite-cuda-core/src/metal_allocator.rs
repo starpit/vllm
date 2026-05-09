@@ -69,10 +69,27 @@ unsafe impl Sync for MetalArena {}
 /// weight pointer back to its `MTLBuffer`. Cloning the allocator is
 /// the only way to share state across owners that take it by value
 /// (`GpuWeights::from_dir(_, BackendAllocator)`).
+/// Hook fired immediately after a new arena `MTLBuffer` is created.
+/// Originally introduced so a higher-layer crate could drop the buffer
+/// into a `MTLResidencySet`; that responsibility now lives directly on
+/// the allocator (see [`MetalAllocator::residency`]) but the hook is
+/// retained as a generic post-allocation extension point in case
+/// something else wants to observe arena creation.
+pub type ArenaHook = Arc<dyn Fn(&Buffer) + Send + Sync>;
+
 pub struct MetalAllocator {
     device: Device,
     arenas: Arc<Mutex<Vec<MetalArena>>>,
     chunk_bytes: usize,
+    on_new_arena: Arc<Mutex<Option<ArenaHook>>>,
+    /// Single `MTLResidencySet` covering every arena allocated through
+    /// this allocator. Both the runtime worker pool (per-worker arena
+    /// buffers) and the KV-cache pool (private-mode cache buffers)
+    /// insert into the SAME set via [`Self::residency`], matching MLX's
+    /// "one residency set per device queue" layout. Inert (no-op) on
+    /// macOS < 15. Created in [`Self::new`] so existing arenas are
+    /// pinned automatically as they are pushed.
+    residency: ferrite_metal_kernels::residency::MetalResidencySet,
 }
 
 unsafe impl Send for MetalAllocator {}
@@ -84,18 +101,28 @@ impl Clone for MetalAllocator {
             device: self.device.clone(),
             arenas: Arc::clone(&self.arenas),
             chunk_bytes: self.chunk_bytes,
+            on_new_arena: Arc::clone(&self.on_new_arena),
+            // Cheap: `MetalResidencySet` is `Arc`-backed; cloning shares
+            // the underlying `MTLResidencySet*` so every clone of the
+            // allocator pins into the same set.
+            residency: self.residency.clone(),
         }
     }
 }
 
 impl MetalAllocator {
     /// Create an allocator on `device`. No buffer is allocated until
-    /// the first `alloc_and_copy_host` call.
+    /// the first `alloc_and_copy_host` call. The allocator's
+    /// [`Self::residency`] set is created eagerly so callers can pin
+    /// non-arena buffers (KV cache, etc.) into the same set.
     pub fn new(device: Device) -> Self {
+        let residency = ferrite_metal_kernels::residency::MetalResidencySet::new(&device);
         Self {
             device,
             arenas: Arc::new(Mutex::new(Vec::new())),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
+            on_new_arena: Arc::new(Mutex::new(None)),
+            residency,
         }
     }
 
@@ -103,11 +130,43 @@ impl MetalAllocator {
     /// want to exercise the multi-arena code path without uploading
     /// hundreds of megabytes.
     pub fn with_chunk_bytes(device: Device, chunk_bytes: usize) -> Self {
+        let residency = ferrite_metal_kernels::residency::MetalResidencySet::new(&device);
         Self {
             device,
             arenas: Arc::new(Mutex::new(Vec::new())),
             chunk_bytes,
+            on_new_arena: Arc::new(Mutex::new(None)),
+            residency,
         }
+    }
+
+    /// Shared residency set covering every arena allocated through
+    /// this allocator. Higher layers (the worker pool, the KV-cache
+    /// initializer) `insert` their non-arena buffers here and call
+    /// `attach_to_queue` once so every cmdbuf sees a single wired
+    /// set — this is what MLX does, and avoids the
+    /// two-residency-sets-per-queue layout that produced
+    /// non-deterministic decode output on Llama-3.2.
+    pub fn residency(&self) -> &ferrite_metal_kernels::residency::MetalResidencySet {
+        &self.residency
+    }
+
+    /// Install (or replace) the hook fired after every new arena
+    /// `MTLBuffer` allocation. Existing arenas are replayed through
+    /// the hook immediately so the caller doesn't have to track
+    /// initial state.
+    ///
+    /// Used by `ferrite-metal-kernels::residency` to wire arena
+    /// buffers into a `MTLResidencySet` (Metal 3 / macOS 15+) so they
+    /// stay resident across cmdbufs. Without that pinning, large
+    /// working sets (Llama-3.2-3B+) hit Apple's lazy paging path and
+    /// produce non-deterministic decode output.
+    pub fn set_arena_hook(&self, hook: ArenaHook) {
+        let arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
+        for arena in arenas.iter() {
+            (hook)(&arena.buffer);
+        }
+        *self.on_new_arena.lock().expect("arena hook mutex") = Some(hook);
     }
 
     /// The Metal device this allocator targets. Exposed so callers
@@ -140,7 +199,10 @@ impl MetalAllocator {
 
     /// Number of live arenas. Diagnostic.
     pub fn arena_count(&self) -> usize {
-        self.arenas.lock().expect("MetalAllocator arenas Mutex").len()
+        self.arenas
+            .lock()
+            .expect("MetalAllocator arenas Mutex")
+            .len()
     }
 
     /// Total bytes allocated across all arenas (sum of `used`).
@@ -162,6 +224,8 @@ impl MetalAllocator {
         arenas: &mut Vec<MetalArena>,
         chunk_bytes: usize,
         min_bytes: usize,
+        hook: &Arc<Mutex<Option<ArenaHook>>>,
+        residency: &ferrite_metal_kernels::residency::MetalResidencySet,
     ) -> Result<usize> {
         let capacity = min_bytes.max(chunk_bytes);
         let buffer = device.new_buffer(capacity as u64, MTLResourceOptions::StorageModeShared);
@@ -171,6 +235,18 @@ impl MetalAllocator {
                 "MetalAllocator: new_buffer({} bytes) returned null contents pointer",
                 capacity
             );
+        }
+        // Pin the new arena into the shared residency set so cmdbufs
+        // don't race against Apple's lazy paging once the working set
+        // crosses the implicit-residency tracker's threshold. Inert
+        // on macOS < 15 (set is null).
+        residency.insert(&buffer);
+        residency.commit();
+        // Then notify any external arena hook (kept as a generic
+        // post-allocation extension point — the residency insert
+        // itself no longer goes through this hook).
+        if let Some(cb) = hook.lock().expect("arena hook mutex").as_ref() {
+            (cb)(&buffer);
         }
         arenas.push(MetalArena {
             buffer,
@@ -189,19 +265,30 @@ impl DeviceAllocator for MetalAllocator {
         // pick any non-null sentinel so the GpuTensor isn't `is_null()`.
         if bytes == 0 {
             if arenas.is_empty() {
-                Self::push_arena_locked(&self.device, &mut arenas, self.chunk_bytes, 0)?;
+                Self::push_arena_locked(
+                    &self.device,
+                    &mut arenas,
+                    self.chunk_bytes,
+                    0,
+                    &self.on_new_arena,
+                    &self.residency,
+                )?;
             }
             return Ok(arenas[0].base);
         }
 
         // Find an arena with `bytes` free, or push a new one.
-        let idx = if let Some(idx) = arenas
-            .iter()
-            .rposition(|a| a.capacity - a.used >= bytes)
-        {
+        let idx = if let Some(idx) = arenas.iter().rposition(|a| a.capacity - a.used >= bytes) {
             idx
         } else {
-            Self::push_arena_locked(&self.device, &mut arenas, self.chunk_bytes, bytes)?
+            Self::push_arena_locked(
+                &self.device,
+                &mut arenas,
+                self.chunk_bytes,
+                bytes,
+                &self.on_new_arena,
+                &self.residency,
+            )?
         };
         let arena = &mut arenas[idx];
         let offset = arena.used;

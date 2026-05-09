@@ -5,7 +5,7 @@
 //!
 //! Elementwise subtraction: out = a - b
 
-use crate::classified::{OpKind, Program};
+use crate::classified::Program;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,

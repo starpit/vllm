@@ -21,15 +21,15 @@ use super::RecordingContext;
 /// # Returns
 /// `Ok(())` on success, `Err(String)` on failure
 pub fn record_attention(
-    ctx: &mut RecordingContext,
-    q_buffer: &metal::Buffer,
-    k_cache: &metal::Buffer,
-    v_cache: &metal::Buffer,
-    output_buffer: &metal::Buffer,
-    num_tokens: usize,
-    num_heads: usize,
-    head_dim: usize,
-    max_seq_len: usize,
+    _ctx: &mut RecordingContext,
+    _q_buffer: &metal::Buffer,
+    _k_cache: &metal::Buffer,
+    _v_cache: &metal::Buffer,
+    _output_buffer: &metal::Buffer,
+    _num_tokens: usize,
+    _num_heads: usize,
+    _head_dim: usize,
+    _max_seq_len: usize,
 ) -> Result<(), String> {
     // TODO: Implement attention ICB recording
     // Need to handle:

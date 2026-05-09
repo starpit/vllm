@@ -9,7 +9,7 @@
 use crate::{MetalDevice, MetalStream};
 use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{Buffer, CommandBufferRef, DeviceRef};
-use objc::runtime::{Object, BOOL, NO, YES};
+use objc::runtime::{Object, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::sync::Arc;
 
@@ -29,6 +29,49 @@ use std::sync::Arc;
 /// allocated per-call and retained by the command buffer until it
 /// completes — manual release would double-free, mirroring the
 /// existing `MetalGemm::execute` contract.
+/// Element dtype for the MPS-backed GEMM. The MPSMatrixDescriptor
+/// data-type values come from `MPSDataType` (Apple's
+/// `MPSCoreTypes.h`):
+///
+/// - `MPSDataTypeFloatBit = 0x10000000`
+/// - `MPSDataTypeFloat32  = MPSDataTypeFloatBit | 32 = 0x10000020`
+/// - `MPSDataTypeFloat16  = MPSDataTypeFloatBit | 16 = 0x10000010`
+/// - `MPSDataTypeAlternateEncodingBit = 0x80000000`
+/// - `MPSDataTypeBFloat16 = AlternateEncodingBit | Float16 = 0x90000010`
+///   (added in macOS 14; native MMA on Apple Silicon M3+).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmDtype {
+    F16,
+    F32,
+    Bf16,
+}
+
+impl GemmDtype {
+    /// `MPSDataType` enum value handed to
+    /// `MPSMatrixDescriptor.dataType`.
+    pub fn mps_data_type(self) -> u64 {
+        match self {
+            // MPSDataTypeFloat16 = 0x10000010
+            Self::F16 => 0x1000_0010,
+            // MPSDataTypeFloat32 = 0x10000020
+            Self::F32 => 0x1000_0020,
+            // MPSDataTypeBFloat16 = MPSDataTypeAlternateEncodingBit (0x80000000)
+            //                     | MPSDataTypeFloat16 (0x10000010)
+            //                     = 0x90000010
+            Self::Bf16 => 0x9000_0010,
+        }
+    }
+
+    /// Bytes per element. Used for buffer-size bounds checks and
+    /// MPSMatrixDescriptor row strides.
+    pub fn elem_size(self) -> u32 {
+        match self {
+            Self::F16 | Self::Bf16 => 2,
+            Self::F32 => 4,
+        }
+    }
+}
+
 /// Encode an MPS-backed GEMM into `cmdbuf`.
 ///
 /// `a_offset` / `b_offset` / `c_offset` are byte offsets into the
@@ -56,9 +99,9 @@ pub fn encode_gemm_into_command_buffer(
     beta: f32,
     transpose_a: bool,
     transpose_b: bool,
-    use_f16: bool,
+    dtype: GemmDtype,
 ) -> Result<(), GemmError> {
-    let elem_size = if use_f16 { 2 } else { 4 };
+    let elem_size = dtype.elem_size();
 
     let a_rows = if transpose_a { k } else { m };
     let a_cols = if transpose_a { m } else { k };
@@ -89,7 +132,7 @@ pub fn encode_gemm_into_command_buffer(
     }
 
     unsafe {
-        let data_type: u64 = if use_f16 { 268435472 } else { 268435488 };
+        let data_type: u64 = dtype.mps_data_type();
 
         let a_row_bytes = (a_cols * elem_size) as u64;
         let a_desc: *mut Object = msg_send![class!(MPSMatrixDescriptor),

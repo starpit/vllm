@@ -13,6 +13,7 @@ pub mod awq;
 pub mod device;
 pub mod fused_kernels;
 pub mod gemm;
+pub mod residency;
 pub mod rope;
 pub mod shader_cache;
 pub mod specialized_pipeline_cache;

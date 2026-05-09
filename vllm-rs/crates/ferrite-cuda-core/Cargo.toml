@@ -11,11 +11,20 @@ cuda = ["dep:cudarc"]
 nccl = ["cuda", "cudarc/nccl"]
 # Metal backend: pulls in metal-rs for the `MetalAllocator` impl of
 # `DeviceAllocator`. Mutually exclusive with `cuda` at build time.
-metal = ["dep:metal"]
+# `ferrite-metal-kernels` is needed for the `MetalResidencySet` wrapper
+# the allocator pins arena buffers into so Apple's lazy paging doesn't
+# inject non-deterministic stale-page reads on Llama-3.2-class working
+# sets. Lives in `ferrite-metal-kernels` (not here) because it only
+# matters once kernels are firing — but the allocator owns the set so
+# both the pool and the KV-cache wiring share a single residency
+# handle (MLX layout). No cycle: ferrite-metal-kernels has no
+# ferrite-cuda-core dep.
+metal = ["dep:metal", "dep:ferrite-metal-kernels"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
 metal = { version = "0.29", optional = true }
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
 half = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }

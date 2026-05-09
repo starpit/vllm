@@ -158,6 +158,7 @@ impl SpecializedPipelineCache {
                     "awq_dequantize",
                     include_str!("../shaders/awq_dequantize.metal"),
                 ),
+                ("gemm", include_str!("../shaders/gemm.metal")),
             ],
         )
     }

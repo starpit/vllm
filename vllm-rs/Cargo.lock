@@ -2067,6 +2067,7 @@ dependencies = [
  "cudarc",
  "dirs 6.0.0",
  "ferrite-gguf",
+ "ferrite-metal-kernels",
  "half",
  "inventory",
  "libc",

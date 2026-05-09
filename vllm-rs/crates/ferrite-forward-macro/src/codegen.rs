@@ -2227,7 +2227,7 @@ fn emit_weights_struct(
                 #max_pos,
                 #local_theta,
                 None,
-                ::ferrite_cuda_core::dtype::DType::BF16,
+                ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
             )?;
         }
     } else {
@@ -2492,6 +2492,16 @@ fn emit_weights_struct(
     // an explicit "unsupported under metal" rather than a hidden
     // runtime panic. Same scope decision as the per-arch metal feature
     // gates landed in 5.F.5.
+    //
+    // Cache dtype is `BF16` to match the rest of the metal stack:
+    // `CanonicalParams::METAL_DTYPE` defaults to bf16, the
+    // `rope_append_bf16_specialized` shader binds `cos_sin` as
+    // `device const bfloat*`, and Llama-3.x weights ship bf16 on
+    // disk. (The previous codegen pinned this at BF16 too but the
+    // kernel only had an `_f16_specialized` variant — bytes lined
+    // up but the binding type didn't, so cosines/sines were
+    // reinterpreted as fp16 and attention never aligned. Fixed by
+    // landing the bf16 shader sibling.)
     let rotary_load_metal: TokenStream = if uses_rotary {
         let head_dim = *model
             .bounds
@@ -2522,7 +2532,7 @@ fn emit_weights_struct(
                     #max_pos,
                     #rope_theta,
                     None,
-                    ::ferrite_cuda_core::dtype::DType::BF16,
+                    ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
                 )?;
             },
             (
@@ -2547,7 +2557,7 @@ fn emit_weights_struct(
                             high_freq_factor: #high_freq_factor,
                             original_max_position_embeddings: #orig,
                         }),
-                        ::ferrite_cuda_core::dtype::DType::BF16,
+                        ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
                     )?;
                 }
             }
@@ -2557,14 +2567,24 @@ fn emit_weights_struct(
             // Stub to a runtime panic so the build remains green for the
             // metal-supported subset; arches that hit this won't load
             // successfully under metal until the proper port lands.
+            //
+            // The panic lives inside an immediately-invoked closure so
+            // `rustc` doesn't propagate the `!` type through to the
+            // outer scope and warn `unreachable_code` on every line of
+            // generated code that follows the rotary load. Closure
+            // body has type `RotaryCache` (the never type coerces);
+            // the call-site sees a regular `RotaryCache` value.
             _ => quote! {
-                let rotary: ::ferrite_kernels::rotary::RotaryCache = ::core::unimplemented!(
-                    "metal: rotary scaling variant not yet supported \
-                     (LongRoPE / Yarn / partial-rotary). Land a metal \
-                     counterpart to RotaryCache::new_from_gpuweights for \
-                     this scaling family before enabling this model \
-                     under --features metal."
-                );
+                let rotary: ::ferrite_kernels::rotary::RotaryCache =
+                    (|| -> ::ferrite_kernels::rotary::RotaryCache {
+                        ::core::panic!(
+                            "metal: rotary scaling variant not yet supported \
+                             (LongRoPE / Yarn / partial-rotary). Land a metal \
+                             counterpart to RotaryCache::new_from_gpuweights for \
+                             this scaling family before enabling this model \
+                             under --features metal."
+                        )
+                    })();
             },
         }
     } else {
@@ -5516,11 +5536,19 @@ pub fn emit_model(
                     let buf = worker.arena[spec.terminal_slot as usize].clone();
                     let vocab = METAL_VOCAB_SIZE as usize;
                     let shape = [n, vocab];
-                    let bytes = n * vocab * 2; // f16
+                    let bytes = n * vocab * 2; // bf16/f16 — both 2 bytes
+                    let dtype = match <Weights as ::ferrite_forward::CanonicalParams>::METAL_DTYPE {
+                        ::ferrite_forward::interpreter::metal::MetalDtype::F16 =>
+                            ::ferrite_cuda_core::dtype::DType::F16,
+                        ::ferrite_forward::interpreter::metal::MetalDtype::Bf16 =>
+                            ::ferrite_cuda_core::dtype::DType::BF16,
+                        ::ferrite_forward::interpreter::metal::MetalDtype::Int4 =>
+                            ::core::unreachable!("Int4 has no logits dtype"),
+                    };
                     let inner = ::ferrite_cuda_core::tensor::GpuTensor::new(
                         buf.contents() as *mut u8,
                         &shape,
-                        ::ferrite_cuda_core::dtype::DType::F16,
+                        dtype,
                     );
                     ::ferrite_cuda_core::OwnedTensor::from_metal_buffer(inner, buf, bytes)
                 },

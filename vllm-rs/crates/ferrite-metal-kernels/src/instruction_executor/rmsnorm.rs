@@ -5,8 +5,6 @@
 
 use super::{dispatch_1d, RecordingContext};
 use crate::shader_cache::ShaderCache;
-use metal::{MTLResourceOptions, MTLSize};
-use std::sync::Arc;
 
 /// Record an RMSNorm kernel dispatch into the ICB.
 ///

@@ -24,14 +24,14 @@ use super::RecordingContext;
 /// # Returns
 /// `Ok(())` on success, `Err(String)` on failure
 pub fn record_gemm(
-    ctx: &mut RecordingContext,
-    input_buffer: &metal::Buffer,
-    weight_buffer: &metal::Buffer,
-    output_buffer: &metal::Buffer,
-    m: usize,
-    k: usize,
-    n: usize,
-    dtype: &str,
+    _ctx: &mut RecordingContext,
+    _input_buffer: &metal::Buffer,
+    _weight_buffer: &metal::Buffer,
+    _output_buffer: &metal::Buffer,
+    _m: usize,
+    _k: usize,
+    _n: usize,
+    _dtype: &str,
 ) -> Result<(), String> {
     // TODO: Implement MPS GEMM recording
     // MPS doesn't directly support ICB recording - need to investigate alternatives:

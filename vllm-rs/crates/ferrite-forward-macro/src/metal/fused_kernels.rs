@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::classified::{OpKind, Program};
+use crate::classified::Program;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, FusedAddRmsNormImpl, FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl, Handoff,

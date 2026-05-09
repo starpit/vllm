@@ -34,18 +34,3 @@ pub use crate::metal::fused_kernels::MetalFusedAddRmsNormImpl;
     note = "Use `crate::metal::MetalFusedGateUpSiluMulImpl` instead"
 )]
 pub use crate::metal::fused_kernels::MetalFusedGateUpSiluMulImpl;
-
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `crate::metal::MetalAttentionImpl` instead"
-)]
-pub use crate::metal::attention::MetalAttentionImpl;
-
-#[deprecated(
-    since = "0.1.0",
-    note = "Use `crate::metal::MetalActivationImpl` instead"
-)]
-pub use crate::metal::activation::MetalActivationImpl;
-
-#[deprecated(since = "0.1.0", note = "Use `crate::metal::MetalAwqImpl` instead")]
-pub use crate::metal::awq::MetalAwqImpl;

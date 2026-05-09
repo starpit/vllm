@@ -21,7 +21,7 @@ pub mod runtime;
 pub mod worker;
 
 pub use lowered::{
-    Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
+    Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 pub use lowering::{lower, lower_pair};

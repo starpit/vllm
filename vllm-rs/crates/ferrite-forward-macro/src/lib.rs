@@ -31,8 +31,6 @@ mod cfg;
 mod classified;
 mod classify;
 mod codegen;
-#[cfg(feature = "metal")]
-mod codegen_metal;
 mod concurrency;
 mod config;
 mod cost;
@@ -390,7 +388,10 @@ struct CompileMode {
     /// True for `#[forward]`, false for `#[vision_forward]`. Gates
     /// the post-Embed multimodal splice pass — that splice belongs
     /// on the decoder's text-side hidden states, not the encoder's
-    /// patch hidden states.
+    /// patch hidden states. Only consulted under `cuda` (the splice
+    /// pass is cuda-specific); declared cuda-only so non-cuda builds
+    /// don't carry a dead field.
+    #[cfg(feature = "cuda")]
     apply_mm_splice: bool,
     /// True for `#[forward]` (which fans out over `{1, 2, 4, 8}` at
     /// nccl-enabled), false for `#[vision_forward]` (always tp=1).
@@ -413,6 +414,7 @@ impl CompileMode {
     const DECODER: Self = Self {
         prelude: classified::Prelude::Decoder,
         apply_tp_lowering: true,
+        #[cfg(feature = "cuda")]
         apply_mm_splice: true,
         enable_tp_fanout: true,
         emit_arch_dispatch: true,
@@ -420,6 +422,7 @@ impl CompileMode {
     const VISION: Self = Self {
         prelude: classified::Prelude::Vision,
         apply_tp_lowering: false,
+        #[cfg(feature = "cuda")]
         apply_mm_splice: false,
         enable_tp_fanout: false,
         emit_arch_dispatch: false,

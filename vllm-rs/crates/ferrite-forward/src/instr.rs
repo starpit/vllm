@@ -154,6 +154,22 @@ pub trait CanonicalParams {
     /// `ROT_DIM` of `HEAD_DIM` get rotary applied (Qwen2-VL, GPT-J).
     /// Default equals `HEAD_DIM` (full rope, the common case).
     const ROT_DIM: u32 = Self::HEAD_DIM;
+
+    /// Element dtype the metal backend should run this canonical in.
+    /// Picks between the `_f16_specialized` / `_bf16_specialized`
+    /// shader symbols and matching MPS GEMM data type. Default
+    /// `MetalDtype::Bf16` matches every modern HF Llama / Qwen /
+    /// Phi / Mistral checkpoint (`torch_dtype: bfloat16` on disk)
+    /// and the cuda backend's native dtype. Per-canonical macro
+    /// overrides set this from the model config's `torch_dtype`.
+    ///
+    /// Pre-bf16-rollout default was `F16`; that path lost exponent
+    /// range over deep layer chains and produced incoherent outputs
+    /// on Llama-3.x. The default is `Bf16` now; arches that ship
+    /// fp16 on disk (rare) override.
+    #[cfg(feature = "metal")]
+    const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
+        crate::interpreter::metal::MetalDtype::Bf16;
 }
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.

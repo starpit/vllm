@@ -5,7 +5,7 @@
 //!
 //! Broadcast addition: out = input + bias (where bias is broadcast across batch/sequence dims)
 
-use crate::classified::{OpKind, Program};
+use crate::classified::Program;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, Resources, WeightAccessor,

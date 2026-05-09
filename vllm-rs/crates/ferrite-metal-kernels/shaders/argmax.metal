@@ -88,3 +88,56 @@ kernel void argmax_f16(
         output[gid] = shared_idx[0];
     }
 }
+
+/// BF16 variant of `argmax_f16`. Same dispatch, same reduction, same
+/// tie-break semantics; just reads `bfloat` logits instead of `half`.
+/// Used by the metal backend when the model's resolved dtype is bf16
+/// (default for Llama-3.x).
+kernel void argmax_bf16(
+    device const bfloat* logits   [[buffer(0)]],
+    device       uint*   output   [[buffer(1)]],
+    constant     uint&   batch    [[buffer(2)]],
+    constant     uint&   vocab    [[buffer(3)]],
+    uint  gid [[threadgroup_position_in_grid]],
+    uint  tid [[thread_position_in_threadgroup]],
+    uint  tg  [[threads_per_threadgroup]])
+{
+    if (gid >= batch) return;
+
+    threadgroup float shared_max[1024];
+    threadgroup uint  shared_idx[1024];
+
+    float local_max = -INFINITY;
+    uint  local_idx = 0;
+
+    device const bfloat* row = logits + uint(gid) * vocab;
+    for (uint i = tid; i < vocab; i += tg) {
+        float v = float(row[i]);
+        if (v > local_max || (v == local_max && i < local_idx)) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    shared_max[tid] = local_max;
+    shared_idx[tid] = local_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float a  = shared_max[tid];
+            float b  = shared_max[tid + stride];
+            uint  ai = shared_idx[tid];
+            uint  bi = shared_idx[tid + stride];
+            if (b > a || (b == a && bi < ai)) {
+                shared_max[tid] = b;
+                shared_idx[tid] = bi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        output[gid] = shared_idx[0];
+    }
+}

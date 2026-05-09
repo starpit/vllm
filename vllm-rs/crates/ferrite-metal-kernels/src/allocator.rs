@@ -138,8 +138,6 @@ struct BufferPool {
     total_bytes_allocated: usize,
     /// Maximum bytes to allocate before triggering memory pressure
     max_bytes: usize,
-    /// Maximum buffers to keep per size bucket
-    max_pooled_per_size: usize,
 }
 
 impl BufferPool {
@@ -160,7 +158,6 @@ impl BufferPool {
             pools,
             total_bytes_allocated: 0,
             max_bytes,
-            max_pooled_per_size,
         }
     }
 

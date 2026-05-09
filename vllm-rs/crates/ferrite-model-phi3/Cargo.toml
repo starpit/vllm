@@ -18,9 +18,12 @@ nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forwa
 # Metal backend on Apple Silicon. Phi-3 needs LongRoPE (su-scaling) which the
 # metal `RotaryCache::new_from_gpuweights` doesn't yet implement — the macro
 # emits `compile_error!` for that scaling family until a metal counterpart
-# lands. Re-enable this feature once `new_longrope_from_gpuweights` (and
-# `new_partial_longrope_from_gpuweights`) are added in a follow-up.
-# metal = ["ferrite-forward/metal"]
+# lands. Declared as an empty feature here so the `#[cfg(feature = "metal")]`
+# arms the `#[forward]` macro emits parse cleanly under `--check-cfg`; the
+# real wiring (`metal = ["ferrite-forward/metal"]`) gets restored once
+# `new_longrope_from_gpuweights` (and `new_partial_longrope_from_gpuweights`)
+# land in `ferrite-forward-macro/src/codegen.rs`.
+metal = []
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }

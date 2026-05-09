@@ -465,6 +465,17 @@ mod dispatcher {
         fn metal_arena_peak_bytes(&self) -> u64 {
             512 * 1024 * 1024
         }
+
+        /// Per-canonical metal dtype. The macro emits an override
+        /// returning `<Self as CanonicalParams>::METAL_DTYPE` so the
+        /// worker can route argmax / weight-loader / etc. between
+        /// the f16 and bf16 paths without monomorphizing on `W`.
+        /// Default `Bf16` matches the trait-level default and the
+        /// modern HF checkpoint dtype.
+        #[cfg(feature = "metal")]
+        fn metal_dtype(&self) -> crate::interpreter::metal::MetalDtype {
+            crate::interpreter::metal::MetalDtype::Bf16
+        }
     }
 
     /// Minimal HF-config view threaded into `try_load` so per-variant

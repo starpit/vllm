@@ -40,7 +40,7 @@
 
 use std::sync::Arc;
 
-use ferrite_metal_kernels::gemm::{GemmError, encode_gemm_into_command_buffer};
+use ferrite_metal_kernels::gemm::{GemmDtype, GemmError, encode_gemm_into_command_buffer};
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
 use ferrite_metal_kernels::metal::foreign_types::ForeignType;
 use ferrite_metal_kernels::metal::{
@@ -49,7 +49,7 @@ use ferrite_metal_kernels::metal::{
 };
 
 use super::lowered::{
-    Binding, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind, WeightTensor,
+    Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightBundleKind, WeightTensor,
 };
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
@@ -273,6 +273,34 @@ impl<W: CanonicalParams> MetalWorker<W> {
         allocator: &MetalAllocator,
         runtime: &RuntimeBindings,
     ) -> Result<Self, WorkerError> {
+        Self::new_with_residency(
+            device,
+            arena_layout,
+            bucket_tapes,
+            pipelines,
+            weights,
+            allocator,
+            runtime,
+            None,
+        )
+    }
+
+    /// Same as [`Self::new`] but accepts an optional `MetalResidencySet`
+    /// that worker-local arena slots get inserted into. Used by the
+    /// pool to pin every per-worker arena into the wired set so cmdbuf
+    /// dispatches don't race against Apple's lazy paging on
+    /// Llama-3.2-class working sets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_residency(
+        device: Arc<Device>,
+        arena_layout: &ArenaLayout,
+        bucket_tapes: &[LoweredMetalTape<W>],
+        pipelines: &SpecializedPipelines,
+        weights: &W,
+        allocator: &MetalAllocator,
+        runtime: &RuntimeBindings,
+        residency: Option<&ferrite_metal_kernels::residency::MetalResidencySet>,
+    ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
         // coloring). Every bucket of a given model shares the same
         // colored slot map, so checking the first bucket is enough.
@@ -292,9 +320,16 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // contents without staging copies. ICB-bound buffers
                 // are fine in shared on Apple silicon — the existing
                 // `MetalAllocator` uses the same mode.
-                device.new_buffer(size, MTLResourceOptions::StorageModeShared)
+                let buf = device.new_buffer(size, MTLResourceOptions::StorageModeShared);
+                if let Some(r) = residency {
+                    r.insert(&buf);
+                }
+                buf
             })
             .collect();
+        if let Some(r) = residency {
+            r.commit();
+        }
 
         let mut bucket_bakings = Vec::with_capacity(bucket_tapes.len());
         for (bucket_idx, tape) in bucket_tapes.iter().enumerate() {
@@ -387,7 +422,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let mut prev_step_resources: Option<Vec<&Buffer>> = None;
         for step in &baking.steps {
             match step {
-                BucketStep::Icb { pipeline, range, step_resources, .. } => {
+                BucketStep::Icb {
+                    pipeline,
+                    range,
+                    step_resources,
+                    ..
+                } => {
                     // End the encoder between every ICB step. Within
                     // one compute encoder Apple's `concurrentDispatchThreadgroups`
                     // (the only ICB dispatch primitive) makes
@@ -441,7 +481,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         0.0,
                         false,
                         true,
-                        true,
+                        gemm_dtype_for::<W>(),
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }
@@ -494,7 +534,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
                 let _ = i;
             }
-            eprintln!("[stamp] stamped 0xAA across {} arena slots", self.arena.len());
+            eprintln!(
+                "[stamp] stamped 0xAA across {} arena slots",
+                self.arena.len()
+            );
         }
 
         let bucket_start = std::time::Instant::now();
@@ -503,7 +546,13 @@ impl<W: CanonicalParams> MetalWorker<W> {
             let cb = queue.new_command_buffer();
             let kind: String;
             match step {
-                BucketStep::Icb { pipeline, range, kernel, step_resources, .. } => {
+                BucketStep::Icb {
+                    pipeline,
+                    range,
+                    kernel,
+                    step_resources,
+                    ..
+                } => {
                     kind = format!("Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
                     let _ = step_resources; // see note below
@@ -554,7 +603,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         0.0,
                         false,
                         true,
-                        true,
+                        gemm_dtype_for::<W>(),
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }
@@ -573,10 +622,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 for (i, buf) in self.arena.iter().enumerate() {
                     let len_bytes = buf.length() as usize;
                     let row0 = unsafe {
-                        std::slice::from_raw_parts(
-                            buf.contents() as *const u8,
-                            len_bytes,
-                        )
+                        std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
                     };
                     let nz = row0.iter().filter(|&&v| v != 0).count();
                     let marker = row0.iter().filter(|&&v| v == 0xAA).count();
@@ -632,9 +678,27 @@ impl<W: CanonicalParams> MetalWorker<W> {
         device: &Device,
         queue: &ferrite_metal_kernels::metal::CommandQueue,
     ) -> Result<(), WorkerError> {
+        // Default-on direct dispatch; the env var stays as an
+        // off-switch (`=0`) for diagnosing whether the broken ICB path
+        // is at fault. The historical mode (env-var must be set to "1"
+        // to enable) caused divergent output on Llama-3.2 because the
+        // pool's set_var setup happened too late for some forwards.
+        let direct = match std::env::var("FERRITE_METAL_DIRECT_DISPATCH").as_deref() {
+            Ok("0" | "false" | "no") => false,
+            _ => true,
+        };
+        self.run_bucket_per_step_silent_inner(bucket, device, queue, direct)
+    }
+
+    fn run_bucket_per_step_silent_inner(
+        &self,
+        bucket: usize,
+        device: &Device,
+        queue: &ferrite_metal_kernels::metal::CommandQueue,
+        direct: bool,
+    ) -> Result<(), WorkerError> {
         use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
         let baking = &self.bucket_bakings[bucket];
-        let direct = std::env::var_os("FERRITE_METAL_DIRECT_DISPATCH").is_some();
 
         // Stamp marker into arena (same as per-step debug) for the
         // diagnostic dump.
@@ -667,10 +731,24 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         // Direct dispatch path — bypasses the ICB.
                         // For each command in the range, bind buffers
                         // explicitly and dispatch.
+                        //
+                        // Even though `set_buffer` implicitly tracks
+                        // residency for the bound buffer, explicit
+                        // `use_resource` here makes the WRITE intent
+                        // visible to Apple's tracking. On Llama-3.2
+                        // shapes the pageable BFloat16 cache hit a
+                        // pattern where the kernel ran on a stale or
+                        // partially-paged buffer, producing
+                        // non-deterministic decode output. Explicit
+                        // residency closes that window.
                         for (bindings, (tg, tpt)) in
                             direct_bindings.iter().zip(direct_dispatch.iter())
                         {
                             for (buffer, offset, index) in bindings {
+                                enc.use_resource(
+                                    buffer,
+                                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                                );
                                 enc.set_buffer(*index, Some(buffer), *offset);
                             }
                             enc.dispatch_thread_groups(*tg, *tpt);
@@ -697,7 +775,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         0.0,
                         false,
                         true,
-                        true,
+                        gemm_dtype_for::<W>(),
                     )
                     .map_err(WorkerError::GemmEncode)?;
                 }
@@ -709,11 +787,73 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     reason: "per-step commit failed",
                 });
             }
-            // DIAGNOSTIC: per-step arena dump (works in silent/direct
-            // path too). Dumps non-zero / marker counts plus the first
-            // 4 fp16 values of every slot, so a bisection across layers
-            // can identify which step first produces all-zero output in
-            // a previously-non-zero slot.
+            // VLLM_DUMP_RESIDUAL_PER_LAYER: cheap layer-wise dump.
+            // Fires after Embed (initial residual = input embedding)
+            // AND after FusedAddRmsNorm steps (one per half-layer in
+            // Llama; the after-MLP one closes a layer). Reads the
+            // FIRST 8 bf16/f16 values of slot 0 (the residual
+            // stream). Cross-backend bisect tool: compare against
+            // MLX `[mlx-fb-layer={N}]` lines for the same forward.
+            if std::env::var_os("VLLM_DUMP_RESIDUAL_PER_LAYER").is_some()
+                && matches!(
+                    step,
+                    BucketStep::Icb {
+                        kernel: KernelId::FusedAddRmsNorm,
+                        ..
+                    } | BucketStep::Icb {
+                        kernel: KernelId::Embed,
+                        ..
+                    } | BucketStep::Icb {
+                        kernel: KernelId::RmsNorm,
+                        ..
+                    } | BucketStep::Icb {
+                        kernel: KernelId::AttentionViaCache,
+                        ..
+                    } | BucketStep::Icb {
+                        kernel: KernelId::RopeAppend,
+                        ..
+                    } | BucketStep::Icb {
+                        kernel: KernelId::Gemm,
+                        ..
+                    } | BucketStep::Gemm { .. }
+                )
+                && self.arena.len() >= 3
+            {
+                let kind = match step {
+                    BucketStep::Icb { kernel, .. } => format!("{:?}", kernel),
+                    _ => "?".to_string(),
+                };
+                let dump_one = |slot: usize| -> String {
+                    let buf = &self.arena[slot];
+                    let len_bytes = buf.length() as usize;
+                    if len_bytes < 16 {
+                        return String::new();
+                    }
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
+                    };
+                    let head: Vec<String> = (0..8)
+                        .map(|j| {
+                            let off = j * 2;
+                            let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                            let v = match W::METAL_DTYPE {
+                                crate::interpreter::metal::MetalDtype::Bf16 => {
+                                    bf16_bits_to_f32(bits)
+                                }
+                                _ => f16_bits_to_f32(bits),
+                            };
+                            format!("{:.4}", v)
+                        })
+                        .collect();
+                    head.join(",")
+                };
+                eprintln!(
+                    "[ferrite-residual step={idx} {kind}] s0=[{}] s1=[{}] s2=[{}]",
+                    dump_one(0),
+                    dump_one(1),
+                    dump_one(2),
+                );
+            }
             if dump_per_step {
                 let kind = match step {
                     BucketStep::Icb { kernel, range, .. } => {
@@ -733,10 +873,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 for (i, buf) in self.arena.iter().enumerate() {
                     let len_bytes = buf.length() as usize;
                     let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            buf.contents() as *const u8,
-                            len_bytes,
-                        )
+                        std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
                     };
                     let nz = bytes.iter().filter(|&&v| v != 0).count();
                     let marker = bytes.iter().filter(|&&v| v == 0xAA).count();
@@ -753,9 +890,14 @@ impl<W: CanonicalParams> MetalWorker<W> {
                                 if off + 1 >= len_bytes {
                                     String::from("nan")
                                 } else {
-                                    let bits =
-                                        u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-                                    format!("{:.3}", f16_bits_to_f32(bits))
+                                    let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                                    let v = match W::METAL_DTYPE {
+                                        crate::interpreter::metal::MetalDtype::Bf16 => {
+                                            bf16_bits_to_f32(bits)
+                                        }
+                                        _ => f16_bits_to_f32(bits),
+                                    };
+                                    format!("{:.3}", v)
                                 }
                             })
                             .collect();
@@ -772,6 +914,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
         }
         Ok(())
     }
+}
+
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
 }
 
 /// IEEE-754 binary16 → binary32 decoder for the per-step diagnostic
@@ -826,8 +972,23 @@ fn bake_bucket<W: CanonicalParams>(
     // command); GEMM steps don't consume slots but the slack is
     // cheap (a few bytes per slot) and keeps the index = command
     // index invariant.
-    let mut ctx = RecordingContext::new(device, tape.commands.len().max(1))
-        .map_err(WorkerError::Recording)?;
+    //
+    // `FERRITE_METAL_NO_ICB_BAKE=1` collapses the ICB to a single
+    // empty slot and skips the per-command `record_compute_dispatch`
+    // calls below. The direct-dispatch firing path doesn't touch the
+    // ICB (it reads `direct_bindings` / `direct_dispatch` off each
+    // `BucketStep::Icb`), so when direct dispatch is the production
+    // path the ICB allocation + per-command pointer-copy is just dead
+    // weight. Diagnostic knob for the Llama-3.2 decode-corruption bug
+    // — if the bug only reproduces with ICB recording enabled, that
+    // points at ICB-internal state interfering with direct dispatch.
+    let no_icb_bake = std::env::var_os("FERRITE_METAL_NO_ICB_BAKE").is_some();
+    let icb_capacity = if no_icb_bake {
+        1
+    } else {
+        tape.commands.len().max(1)
+    };
+    let mut ctx = RecordingContext::new(device, icb_capacity).map_err(WorkerError::Recording)?;
     let mut steps: Vec<BucketStep> = Vec::new();
     // Unique buffers referenced by ICB commands. Used at firing time
     // to satisfy the `inheritBuffers=false` residency contract via
@@ -858,6 +1019,22 @@ fn bake_bucket<W: CanonicalParams>(
                 allocator,
                 runtime,
             )?;
+            if std::env::var_os("FERRITE_METAL_BAKE_DEBUG").is_some() {
+                eprintln!(
+                    "[bake bucket={} cmd={}] Gemm m={} n={} k={} a=({:p},+{}) b=({:p},+{}) c=({:p},+{})",
+                    bucket_index,
+                    cmd_idx,
+                    dims.m,
+                    dims.n,
+                    dims.k,
+                    a.buffer.as_ptr(),
+                    a.offset,
+                    b.buffer.as_ptr(),
+                    b.offset,
+                    c.buffer.as_ptr(),
+                    c.offset,
+                );
+            }
             // Mark every GEMM-touched buffer resident on subsequent
             // ICB encoders even though MPS' own encoder doesn't fire
             // through our ICB. The surrounding `inheritBuffers=false`
@@ -888,22 +1065,112 @@ fn bake_bucket<W: CanonicalParams>(
                     c.offset,
                 );
             }
-            steps.push(BucketStep::Gemm {
-                a,
-                b,
-                c,
-                m: dims.m,
-                n: dims.n,
-                k: dims.k,
-            });
+            // f16 → MPS' `MPSMatrixMultiplication` (BucketStep::Gemm).
+            // bf16 → custom `gemm_bf16_specialized` kernel routed
+            // through the same per-step ICB plumbing as the other
+            // compute kernels. MPS doesn't accept BFloat16 (asserted
+            // at runtime), so we have to drive the hardware bf16 MMA
+            // ourselves via `simdgroup_bfloat8x8`.
+            match W::METAL_DTYPE {
+                MetalDtype::F16 => {
+                    steps.push(BucketStep::Gemm {
+                        a,
+                        b,
+                        c,
+                        m: dims.m,
+                        n: dims.n,
+                        k: dims.k,
+                    });
+                }
+                MetalDtype::Bf16 => {
+                    let pipeline = pipelines
+                        .pipeline_for_gemm_bf16(dims.m, dims.n, dims.k)
+                        .map_err(WorkerError::PipelineLookup)?;
+                    // gemm_bf16_specialized binding contract:
+                    //   buffer(0) = output, buffer(1) = input, buffer(2) = weight
+                    let bindings_for_cmd: Vec<(Buffer, u64, u64)> = vec![
+                        (c.buffer.clone(), c.offset, 0u64),
+                        (a.buffer.clone(), a.offset, 1u64),
+                        (b.buffer.clone(), b.offset, 2u64),
+                    ];
+                    // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups,
+                    // 32 threads (one simdgroup) per threadgroup.
+                    let dispatch_for_cmd = (
+                        MTLSize::new(((dims.n as u64) + 7) / 8, ((dims.m as u64) + 7) / 8, 1),
+                        MTLSize::new(32, 1, 1),
+                    );
+                    let step_resources_for_cmd: Vec<Buffer> =
+                        vec![c.buffer.clone(), a.buffer.clone(), b.buffer.clone()];
+                    // Record into the ICB at this slot too, so the
+                    // (currently-broken) ICB execution path could in
+                    // principle drive bf16 GEMMs once the ICB-write
+                    // bug is fixed. Direct dispatch is the production
+                    // path; this just keeps both surfaces in sync.
+                    let bound_refs: Vec<(&Buffer, u64, u64)> = bindings_for_cmd
+                        .iter()
+                        .map(|(buf, off, idx)| (buf, *off, *idx))
+                        .collect();
+                    let (tg, tpt) = (dispatch_for_cmd.0, dispatch_for_cmd.1);
+                    if !no_icb_bake {
+                        ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
+                    }
+                    let recorded_at = cmd_idx;
+                    match steps.last_mut() {
+                        Some(BucketStep::Icb {
+                            pipeline: prev,
+                            range,
+                            step_resources,
+                            direct_bindings,
+                            direct_dispatch,
+                            ..
+                        }) if same_pipeline(prev, &pipeline) => {
+                            range.end = recorded_at + 1;
+                            let mut seen: Vec<*const _> = step_resources
+                                .iter()
+                                .map(|b| b.as_ptr() as *const _)
+                                .collect();
+                            for buf in &step_resources_for_cmd {
+                                let p = buf.as_ptr() as *const _;
+                                if !seen.contains(&p) {
+                                    seen.push(p);
+                                    step_resources.push(buf.clone());
+                                }
+                            }
+                            direct_bindings.push(bindings_for_cmd);
+                            direct_dispatch.push(dispatch_for_cmd);
+                        }
+                        _ => {
+                            steps.push(BucketStep::Icb {
+                                pipeline,
+                                range: recorded_at..(recorded_at + 1),
+                                kernel: KernelId::Gemm,
+                                step_resources: step_resources_for_cmd,
+                                direct_bindings: vec![bindings_for_cmd],
+                                direct_dispatch: vec![dispatch_for_cmd],
+                            });
+                        }
+                    }
+                }
+                MetalDtype::Int4 => {
+                    return Err(WorkerError::PipelineLookup(
+                        super::pipelines::PipelineLookupError::DtypeNotYetWired(
+                            KernelId::Gemm,
+                            MetalDtype::Int4,
+                        ),
+                    ));
+                }
+            }
             continue;
         }
 
         // Every per-layer scalar (eps, attn_scale, paging strides)
         // is a `CanonicalParams` constant the macro emitted from the
-        // model config — no runtime extras to thread.
+        // model config — no runtime extras to thread. The dtype
+        // (`_f16_specialized` vs `_bf16_specialized`) comes from
+        // `W::METAL_DTYPE` which the macro sets per-canonical from
+        // the model config's `torch_dtype`.
         let pipeline = pipelines
-            .pipeline_for::<W>(cmd.kernel, tape.bucket_m)
+            .pipeline_for_dtype::<W>(cmd.kernel, tape.bucket_m, W::METAL_DTYPE)
             .map_err(WorkerError::PipelineLookup)?;
 
         let bound = resolve_bindings(
@@ -921,7 +1188,9 @@ fn bake_bucket<W: CanonicalParams>(
             record_resource(*b, &mut baked_seen, &mut baked_resources);
         }
         let (tg, tpt) = mtl_size_pair(cmd);
-        ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
+        if !no_icb_bake {
+            ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
+        }
 
         // Coalesce with the previous step iff (a) it's an ICB step
         // (a Gemm step forces an encoder boundary) and (b) its
@@ -977,8 +1246,10 @@ fn bake_bucket<W: CanonicalParams>(
             }) if same_pipeline(prev, &pipeline) => {
                 range.end = recorded_at + 1;
                 // Coalesced ICB range — extend its resource set + per-command bindings.
-                let mut seen: Vec<*const _> =
-                    step_resources.iter().map(|b| b.as_ptr() as *const _).collect();
+                let mut seen: Vec<*const _> = step_resources
+                    .iter()
+                    .map(|b| b.as_ptr() as *const _)
+                    .collect();
                 for buf in &step_resources_for_cmd {
                     let p = buf.as_ptr() as *const _;
                     if !seen.contains(&p) {
@@ -1160,6 +1431,22 @@ fn resolve_bindings<W: CanonicalParams>(
     Ok(out)
 }
 
+/// Map `W::METAL_DTYPE` (the dtype the rest of the metal stack speaks
+/// in) to the `GemmDtype` MPS expects. `Int4` doesn't have a direct
+/// MPS GEMM mapping — int4 weights need a separate dequantize-then-
+/// matmul shape, not a flat MPSMatrix dtype — so we panic here until
+/// the int4 routing lands.
+fn gemm_dtype_for<W: CanonicalParams>() -> GemmDtype {
+    match W::METAL_DTYPE {
+        super::lowered::MetalDtype::F16 => GemmDtype::F16,
+        super::lowered::MetalDtype::Bf16 => GemmDtype::Bf16,
+        super::lowered::MetalDtype::Int4 => panic!(
+            "MetalDtype::Int4 has no direct MPS GEMM dtype — int4 weights \
+             must route through the AWQ / GPTQ dequant kernel, not this Gemm step",
+        ),
+    }
+}
+
 fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand<W>) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as u64,
@@ -1218,6 +1505,12 @@ mod tests {
         const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
         const QK_HEAD_DIM: usize = 0;
         const MLA_ATTN_SCALE: f32 = 0.0;
+        // Pin the smoke tests to the f16 / MPS GEMM path. The
+        // `worker_routes_gemm_step` / `worker_interleaves_gemm_with_icb`
+        // tests below assert specifically on `BucketStep::Gemm`
+        // (the MPS branch). The bf16 / `BucketStep::Icb` GEMM
+        // routing has its own coverage in the e2e tests.
+        const METAL_DTYPE: MetalDtype = MetalDtype::F16;
     }
 
     // WtFn thunks for the three layer kinds the smoke tests use.

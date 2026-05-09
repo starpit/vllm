@@ -388,9 +388,7 @@ impl FusedMoELayer {
         _hidden_size: usize,
         _stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!(
-            "FusedMoELayer not supported on metal: port MoE GEMM + topk kernels first"
-        )
+        anyhow::bail!("FusedMoELayer not supported on metal: port MoE GEMM + topk kernels first")
     }
 }
 

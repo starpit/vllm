@@ -134,11 +134,16 @@ fn kernel_msl_names(
         ),
         (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
         (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
+        // v2 (online-softmax port of MLX `sdpa_vector`) is now the
+        // production picker for both dtypes. v1 (2-pass softmax with
+        // shared_logits[]) accumulated bf16 rounding error per layer
+        // on Llama-3.2 decode; v2 fixes that. Both v2 variants assume
+        // 1024 threads/group dispatch — see lowering.rs.
         (KernelId::AttentionViaCache, MetalDtype::F16) => {
-            ("attention", "attention_via_cache_f16_specialized")
+            ("attention", "attention_via_cache_v2_f16_specialized")
         }
         (KernelId::AttentionViaCache, MetalDtype::Bf16) => {
-            ("attention", "attention_via_cache_bf16_specialized")
+            ("attention", "attention_via_cache_v2_bf16_specialized")
         }
         (KernelId::AttentionPrefillContiguous, MetalDtype::F16) => {
             ("attention", "attention_prefill_contiguous_f16_specialized")
@@ -150,8 +155,15 @@ fn kernel_msl_names(
         (KernelId::Add, MetalDtype::Bf16) => ("elementwise", "residual_add_bf16_specialized"),
         (KernelId::ScalarMul, MetalDtype::F16) => ("elementwise", "scalar_mul_f16_specialized"),
         (KernelId::ScalarMul, MetalDtype::Bf16) => ("elementwise", "scalar_mul_bf16_specialized"),
-        // GEMM is opaque (MPS-backed). Routed through the GEMM wrapper.
-        (KernelId::Gemm, _) => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
+        // GEMM: f16 routes through MPS' `MPSMatrixMultiplication`
+        // (opaque to this cache). bf16 has no MPS path —
+        // `MPSMatrixMultiplication` rejects `MPSDataTypeBFloat16` at
+        // runtime — so we ship a custom `gemm_bf16_specialized`
+        // kernel using `simdgroup_bfloat8x8` MMA tiles.
+        (KernelId::Gemm, MetalDtype::F16) => {
+            return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
+        }
+        (KernelId::Gemm, MetalDtype::Bf16) => ("gemm", "gemm_bf16_specialized"),
         // Reshape is metadata-only.
         (KernelId::Reshape, _) => {
             return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape));
@@ -215,6 +227,14 @@ pub fn constants_for<W: CanonicalParams>(
             ConstantValue::uint(6, W::PREFILL_TILE_Q),
         ],
         KernelId::Add | KernelId::ScalarMul => Vec::new(),
+        // GEMM: only the bf16 (custom) path uses function constants.
+        // The f16 path goes through MPS and never queries this fn.
+        // The shape constants (M, N, K) come from the lowering pass'
+        // `gemm_dims`; we don't have those here, so the GEMM-side
+        // pipeline build is done out-of-band by the worker (which has
+        // `gemm_dims` in hand). This arm is unreachable for `Gemm`
+        // when the worker uses the dedicated builder; defensive error
+        // for any future caller that forgets.
         KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
         KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
     };
@@ -265,6 +285,33 @@ impl SpecializedPipelines {
         let (library, function) = kernel_msl_names(kernel, bucket_m, dtype)?;
         let constants = constants_for::<W>(kernel, bucket_m)?;
         let key = PipelineKey::new(library, function, constants);
+        self.cache
+            .get_or_build(&key)
+            .map_err(PipelineLookupError::Build)
+    }
+
+    /// Bf16 GEMM pipeline keyed on the dynamic `(M, N, K)` triple.
+    /// MPS' `MPSMatrixMultiplication` doesn't accept
+    /// `MPSDataTypeBFloat16`, so the bf16 path uses the custom
+    /// `gemm_bf16_specialized` kernel (uses `simdgroup_bfloat8x8`
+    /// MMA tiles, native on M3+). Shape goes through function
+    /// constants 0 / 1 / 2 = M / N / K.
+    ///
+    /// Caller supplies the dims directly (the lowering pass has them
+    /// on `LoweredCommand.gemm_dims`); they don't sit on
+    /// `CanonicalParams` since each GEMM step has its own shape.
+    pub fn pipeline_for_gemm_bf16(
+        &self,
+        m: u32,
+        n: u32,
+        k: u32,
+    ) -> Result<ComputePipelineState, PipelineLookupError> {
+        let constants = vec![
+            ConstantValue::uint(0, m),
+            ConstantValue::uint(1, n),
+            ConstantValue::uint(2, k),
+        ];
+        let key = PipelineKey::new("gemm", "gemm_bf16_specialized", constants);
         self.cache
             .get_or_build(&key)
             .map_err(PipelineLookupError::Build)
@@ -346,6 +393,89 @@ mod tests {
         const MLA_ATTN_SCALE: f32 = 0.0;
     }
 
+    /// Pure-CPU stub modelled on Llama-3.2-3B-Instruct. Exists only so
+    /// the bf16 attention-prefill golden can exercise HEAD_DIM=128
+    /// (the variant TinyLlamaProbe doesn't cover) before the runtime
+    /// hits the same shape on a 3-GiB checkpoint.
+    struct Llama32Probe;
+    impl CanonicalParams for Llama32Probe {
+        const HEAD_DIM: u32 = 128;
+        const NUM_Q_HEADS: u32 = 24;
+        const NUM_KV_HEADS: u32 = 8;
+        const Q_SIZE: usize = 3072;
+        const KV_SIZE: usize = 1024;
+        const INTERMEDIATE_SIZE: usize = 8192;
+        // 1 / sqrt(128) ≈ 0.08838834764831845
+        const ATTN_SCALE: f32 = 0.088388347;
+        const ATTN_SOFTCAP: f32 = 0.0;
+        const SLIDING_WINDOW: i32 = -1;
+        const KV_LORA_RANK: usize = 0;
+        const QK_NOPE_HEAD_DIM: usize = 0;
+        const QK_ROPE_HEAD_DIM: usize = 0;
+        const V_HEAD_DIM: usize = 0;
+        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
+        const QK_HEAD_DIM: usize = 0;
+        const MLA_ATTN_SCALE: f32 = 0.0;
+    }
+
+    /// Pure-CPU stub modelled on Llama-3.2-1B-Instruct. Same GQA
+    /// ratio as `Llama32Probe` (8 KV heads) but at HEAD_DIM=64 and
+    /// 32 Q heads — the exact decode shape the runtime hits on
+    /// Llama-3.2-1B (the working set the existing bf16 attention
+    /// golden never covers, since `Llama32Probe` is the 3B's shape).
+    /// Lets us pin down whether the bf16 attention_via_cache kernel
+    /// is correct at this specific (HEAD_DIM=64, GQA 4:1) shape.
+    struct Llama32_1BProbe;
+    impl CanonicalParams for Llama32_1BProbe {
+        const HEAD_DIM: u32 = 64;
+        const NUM_Q_HEADS: u32 = 32;
+        const NUM_KV_HEADS: u32 = 8;
+        const Q_SIZE: usize = 2048;
+        const KV_SIZE: usize = 512;
+        const INTERMEDIATE_SIZE: usize = 8192;
+        // 1 / sqrt(64) = 0.125
+        const ATTN_SCALE: f32 = 0.125;
+        const ATTN_SOFTCAP: f32 = 0.0;
+        const SLIDING_WINDOW: i32 = -1;
+        const KV_LORA_RANK: usize = 0;
+        const QK_NOPE_HEAD_DIM: usize = 0;
+        const QK_ROPE_HEAD_DIM: usize = 0;
+        const V_HEAD_DIM: usize = 0;
+        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
+        const QK_HEAD_DIM: usize = 0;
+        const MLA_ATTN_SCALE: f32 = 0.0;
+        #[cfg(feature = "metal")]
+        const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
+            crate::interpreter::metal::MetalDtype::Bf16;
+    }
+
+    /// Same as `Llama32Probe` but pinned to f16 so we can route the
+    /// f16 prefill kernel at HEAD_DIM=128. Isolates bf16-vs-f16
+    /// from HEAD_DIM=128-vs-HEAD_DIM=64 when debugging the
+    /// stale-shared-logits collapse seen with bf16+HEAD_DIM=128.
+    struct Llama32F16Probe;
+    impl CanonicalParams for Llama32F16Probe {
+        const HEAD_DIM: u32 = 128;
+        const NUM_Q_HEADS: u32 = 24;
+        const NUM_KV_HEADS: u32 = 8;
+        const Q_SIZE: usize = 3072;
+        const KV_SIZE: usize = 1024;
+        const INTERMEDIATE_SIZE: usize = 8192;
+        const ATTN_SCALE: f32 = 0.088388347;
+        const ATTN_SOFTCAP: f32 = 0.0;
+        const SLIDING_WINDOW: i32 = -1;
+        const KV_LORA_RANK: usize = 0;
+        const QK_NOPE_HEAD_DIM: usize = 0;
+        const QK_ROPE_HEAD_DIM: usize = 0;
+        const V_HEAD_DIM: usize = 0;
+        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
+        const QK_HEAD_DIM: usize = 0;
+        const MLA_ATTN_SCALE: f32 = 0.0;
+        #[cfg(feature = "metal")]
+        const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
+            crate::interpreter::metal::MetalDtype::F16;
+    }
+
     #[test]
     fn rmsnorm_constants_are_well_formed() {
         // `RMS_NORM_EPS` defaults to 1e-5 on `CanonicalParams`.
@@ -391,8 +521,8 @@ mod tests {
         // bucket_m == 1 selects the decode kernel; constants live at
         // indices 3, 4, 5 to avoid clashing with the matrix variant
         // in the same library.
-        let bag =
-            constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 1).expect("silu decode bag");
+        let bag = constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 1)
+            .expect("silu decode bag");
         assert_eq!(bag.len(), 3);
         assert_eq!(bag[0], ConstantValue::uint(3, 1));
         assert_eq!(bag[1], ConstantValue::uint(4, 5632));
@@ -759,6 +889,611 @@ mod tests {
         }
     }
 
+    /// HEAD_DIM=128 + bf16 rope_append golden — exercises the path
+    /// Llama-3.2 hits at every layer. The existing rope_append golden
+    /// only covers TinyLlama (HEAD_DIM=64, f16); decode KV-cache writes
+    /// at Llama-3.2 shapes have no other test until this one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rope_append_bf16_matches_cpu_golden_llama32() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let bucket_m: usize = 2;
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let half_dim = head_dim / 2;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+        let block_size: usize = Llama32Probe::BLOCK_SIZE as usize;
+        let num_blocks: usize = 4;
+        let max_pos: usize = 32;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::RopeAppend,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("rope_append bf16 pipeline");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.001).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.002).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| (i as f32) * 0.003)
+            .collect();
+
+        // cos_sin layout: [max_pos, head_dim] = [cos[half] | sin[half]]
+        // — matches what RotaryCache::new_from_gpuweights writes and
+        // what the bf16 shader reads.
+        let mut cos_sin_data = vec![0.0f32; max_pos * head_dim];
+        for pos in 0..max_pos {
+            for d in 0..half_dim {
+                let theta = (pos as f32) / 10000.0_f32.powf((d as f32) / (half_dim as f32));
+                cos_sin_data[pos * head_dim + d] = theta.cos();
+                cos_sin_data[pos * head_dim + half_dim + d] = theta.sin();
+            }
+        }
+
+        let positions = vec![5u32, 7];
+        let slot_mapping = vec![3u32, (block_size as u32) + 3];
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let k_buf = alloc_bf16(&device, &k_data);
+        let v_buf = alloc_bf16(&device, &v_data);
+        let cos_sin_buf = alloc_bf16(&device, &cos_sin_data);
+        let positions_buf = alloc_u32(&device, &positions);
+        let slot_buf = alloc_u32(&device, &slot_mapping);
+        let kv_k_buf = alloc_zero_bf16(&device, num_blocks * num_kv * block_size * head_dim);
+        let kv_v_buf = alloc_zero_bf16(&device, num_blocks * num_kv * block_size * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&cos_sin_buf), 0);
+        enc.set_buffer(4, Some(&positions_buf), 0);
+        enc.set_buffer(5, Some(&slot_buf), 0);
+        enc.set_buffer(6, Some(&kv_k_buf), 0);
+        enc.set_buffer(7, Some(&kv_v_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(bucket_m as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut cos_table = vec![0.0_f32; max_pos * head_dim];
+        let mut sin_table = vec![0.0_f32; max_pos * head_dim];
+        for pos in 0..max_pos {
+            for d in 0..half_dim {
+                cos_table[pos * head_dim + d] = cos_sin_data[pos * head_dim + d];
+                sin_table[pos * head_dim + d] = cos_sin_data[pos * head_dim + half_dim + d];
+            }
+        }
+
+        // Round-trip inputs through bf16 to match shader precision.
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_b = bf16_round(&q_data);
+        let k_b = bf16_round(&k_data);
+        let v_b = bf16_round(&v_data);
+        let cos_b = bf16_round(&cos_table);
+        let sin_b = bf16_round(&sin_table);
+
+        let mut q_out_cpu = vec![0.0_f32; q_data.len()];
+        let mut kv_k_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
+        let mut kv_v_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
+        cpu_golden::rope_append(
+            &q_b,
+            &k_b,
+            &v_b,
+            &positions,
+            &slot_mapping,
+            &cos_b,
+            &sin_b,
+            &mut q_out_cpu,
+            &mut kv_k_cpu,
+            &mut kv_v_cpu,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let q_metal = read_bf16(&q_buf, q_data.len());
+        let kv_k_metal = read_bf16(&kv_k_buf, kv_k_cpu.len());
+        let kv_v_metal = read_bf16(&kv_v_buf, kv_v_cpu.len());
+
+        let tol: f32 = 5e-2;
+        for i in 0..q_data.len() {
+            let diff = (q_metal[i] - q_out_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rope_append_bf16_l32 q[{i}] metal={} cpu={} diff={}",
+                q_metal[i],
+                q_out_cpu[i],
+                diff
+            );
+        }
+        for i in 0..kv_k_cpu.len() {
+            let diff = (kv_k_metal[i] - kv_k_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rope_append_bf16_l32 kv_k[{i}] metal={} cpu={} diff={}",
+                kv_k_metal[i],
+                kv_k_cpu[i],
+                diff
+            );
+        }
+        for i in 0..kv_v_cpu.len() {
+            let diff = (kv_v_metal[i] - kv_v_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rope_append_bf16_l32 kv_v[{i}] metal={} cpu={} diff={}",
+                kv_v_metal[i],
+                kv_v_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// Reproduces the EXACT runtime binding pattern observed in
+    /// `FERRITE_METAL_BAKE_DEBUG=1` for Llama-3.2-1B decode: the
+    /// `attention_via_cache_bf16_specialized` dispatch binds the SAME
+    /// MTLBuffer at index 0 (output) and index 1 (Q input). The
+    /// existing 1B golden uses separate buffers; this one aliases
+    /// them. The kernel claims to be safe under aliasing because Q is
+    /// loaded into `threadgroup q_local[]` before any writes to
+    /// `output`, but if there's a path where the threadgroup load
+    /// races against another threadgroup's write, the bug shows up
+    /// here and not in the unaliased golden.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_via_cache_bf16_with_aliased_q_output_llama32_1b() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let batch: usize = 1;
+        let head_dim = Llama32_1BProbe::HEAD_DIM as usize;
+        let num_q = Llama32_1BProbe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32_1BProbe::NUM_KV_HEADS as usize;
+        let block_size: usize = Llama32_1BProbe::BLOCK_SIZE as usize;
+        let max_blocks_per_seq: usize = Llama32_1BProbe::MAX_BLOCKS_PER_SEQ as usize;
+        let num_blocks: usize = 4;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32_1BProbe>(
+                KernelId::AttentionViaCache,
+                batch as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_via_cache bf16 pipeline (1B aliased)");
+
+        // Q has 32 heads × 64 head_dim = 2048 elements; the runtime's
+        // q-projection output buffer is sized [bucket_m, num_q,
+        // head_dim] = [1, 32, 64]. The aliased binding gives the
+        // ATTENTION output the SAME 2048-element layout.
+        let q_elems = batch * num_q * head_dim;
+
+        let seq_used_k: Vec<u32> = vec![37];
+        let mut block_table = vec![0u32; batch * max_blocks_per_seq];
+        block_table[0] = 0;
+        block_table[1] = 1;
+        block_table[2] = 2;
+
+        let q_data: Vec<f32> = (0..q_elems)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+            .collect();
+        let kv_cache_size = num_blocks * num_kv * block_size * head_dim;
+        let mut kv_k_data = vec![0.0_f32; kv_cache_size];
+        let mut kv_v_data = vec![0.0_f32; kv_cache_size];
+        for (live_block, kv_len) in [(0usize, 16usize), (1usize, 16usize), (2usize, 5usize)] {
+            for tok in 0..kv_len {
+                for kvh in 0..num_kv {
+                    for d in 0..head_dim {
+                        let idx = live_block * num_kv * block_size * head_dim
+                            + kvh * block_size * head_dim
+                            + tok * head_dim
+                            + d;
+                        let seed = (idx as f32) * 0.0017;
+                        kv_k_data[idx] = seed.sin() * 0.5;
+                        kv_v_data[idx] = seed.cos() * 0.5;
+                    }
+                }
+            }
+        }
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+
+        // Single shared buffer that holds Q on input and gets
+        // overwritten with attention output. This is what the runtime
+        // does (see FERRITE_METAL_BAKE_DEBUG output: idx=0 == idx=1
+        // for AttentionViaCache).
+        let qo_buf = alloc_bf16(&device, &q_data);
+        let seq_used_buf = alloc_u32(&device, &seq_used_k);
+        let block_table_buf = alloc_u32(&device, &block_table);
+        let kv_k_buf = alloc_bf16(&device, &kv_k_data);
+        let kv_v_buf = alloc_bf16(&device, &kv_v_data);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&qo_buf), 0); // output
+        enc.set_buffer(1, Some(&qo_buf), 0); // Q input — SAME buffer
+        enc.set_buffer(2, Some(&seq_used_buf), 0);
+        enc.set_buffer(3, Some(&block_table_buf), 0);
+        enc.set_buffer(4, Some(&kv_k_buf), 0);
+        enc.set_buffer(5, Some(&kv_v_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(batch as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_b = bf16_round(&q_data);
+        let kv_k_b = bf16_round(&kv_k_data);
+        let kv_v_b = bf16_round(&kv_v_data);
+
+        let mut output_cpu = vec![0.0_f32; q_elems];
+        cpu_golden::attention_via_cache(
+            &q_b,
+            &kv_k_b,
+            &kv_v_b,
+            &block_table,
+            &seq_used_k,
+            &mut output_cpu,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            Llama32_1BProbe::ATTN_SCALE,
+        );
+
+        let output_metal: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(qo_buf.contents() as *const bf16, q_elems) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect();
+
+        let tol: f32 = 5e-2;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "via_cache_bf16_aliased_qo[{i}] (head {} dim {}) metal={} cpu={} diff={}",
+                i / head_dim,
+                i % head_dim,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// rope_append golden at Llama-3.2-1B's EXACT decode-1 shape:
+    /// HEAD_DIM=64, 32 Q heads, 8 KV heads (GQA 4:1), bucket_m=1
+    /// (single decode token), position=36 (matches the runtime
+    /// trace's first-decode position on the "Hi" prompt). Fills the
+    /// gap between the existing rope_append golden (Llama-3.2-3B
+    /// shape, bucket_m=2, position 5/7) and the runtime call the
+    /// 1B failure case actually makes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rope_append_bf16_matches_cpu_golden_llama32_1b_decode() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let bucket_m: usize = 1;
+        let head_dim = Llama32_1BProbe::HEAD_DIM as usize;
+        let half_dim = head_dim / 2;
+        let num_q = Llama32_1BProbe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32_1BProbe::NUM_KV_HEADS as usize;
+        let block_size: usize = Llama32_1BProbe::BLOCK_SIZE as usize;
+        let num_blocks: usize = 4;
+        let max_pos: usize = 64;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32_1BProbe>(
+                KernelId::RopeAppend,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("rope_append bf16 pipeline (1B shape)");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.001).sin())
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.002).cos())
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| (i as f32) * 0.003)
+            .collect();
+
+        let mut cos_sin_data = vec![0.0f32; max_pos * head_dim];
+        for pos in 0..max_pos {
+            for d in 0..half_dim {
+                let theta = (pos as f32) / 10000.0_f32.powf((d as f32) / (half_dim as f32));
+                cos_sin_data[pos * head_dim + d] = theta.cos();
+                cos_sin_data[pos * head_dim + half_dim + d] = theta.sin();
+            }
+        }
+
+        // Position 36 — what the runtime feeds at decode-1 after a
+        // 36-token prefill (matches the FERRITE_METAL_TRACE log on
+        // the "Hi" prompt). Slot 36 = block 2, offset 4.
+        let positions = vec![36u32];
+        let slot_mapping = vec![(2u32) * (block_size as u32) + 4u32];
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let k_buf = alloc_bf16(&device, &k_data);
+        let v_buf = alloc_bf16(&device, &v_data);
+        let cos_sin_buf = alloc_bf16(&device, &cos_sin_data);
+        let positions_buf = alloc_u32(&device, &positions);
+        let slot_buf = alloc_u32(&device, &slot_mapping);
+        let kv_k_buf = alloc_zero_bf16(&device, num_blocks * num_kv * block_size * head_dim);
+        let kv_v_buf = alloc_zero_bf16(&device, num_blocks * num_kv * block_size * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&cos_sin_buf), 0);
+        enc.set_buffer(4, Some(&positions_buf), 0);
+        enc.set_buffer(5, Some(&slot_buf), 0);
+        enc.set_buffer(6, Some(&kv_k_buf), 0);
+        enc.set_buffer(7, Some(&kv_v_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(bucket_m as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut cos_table = vec![0.0_f32; max_pos * head_dim];
+        let mut sin_table = vec![0.0_f32; max_pos * head_dim];
+        for pos in 0..max_pos {
+            for d in 0..half_dim {
+                cos_table[pos * head_dim + d] = cos_sin_data[pos * head_dim + d];
+                sin_table[pos * head_dim + d] = cos_sin_data[pos * head_dim + half_dim + d];
+            }
+        }
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_b = bf16_round(&q_data);
+        let k_b = bf16_round(&k_data);
+        let v_b = bf16_round(&v_data);
+        let cos_b = bf16_round(&cos_table);
+        let sin_b = bf16_round(&sin_table);
+
+        let mut q_out_cpu = vec![0.0_f32; q_data.len()];
+        let mut kv_k_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
+        let mut kv_v_cpu = vec![0.0_f32; num_blocks * num_kv * block_size * head_dim];
+        cpu_golden::rope_append(
+            &q_b,
+            &k_b,
+            &v_b,
+            &positions,
+            &slot_mapping,
+            &cos_b,
+            &sin_b,
+            &mut q_out_cpu,
+            &mut kv_k_cpu,
+            &mut kv_v_cpu,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let q_metal = read_bf16(&q_buf, q_data.len());
+        let kv_k_metal = read_bf16(&kv_k_buf, kv_k_cpu.len());
+        let kv_v_metal = read_bf16(&kv_v_buf, kv_v_cpu.len());
+
+        let tol: f32 = 5e-2;
+        for i in 0..q_data.len() {
+            let diff = (q_metal[i] - q_out_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rope_append_bf16_l32_1b q[{i}] metal={} cpu={} diff={}",
+                q_metal[i],
+                q_out_cpu[i],
+                diff
+            );
+        }
+        for i in 0..kv_k_cpu.len() {
+            let diff = (kv_k_metal[i] - kv_k_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rope_append_bf16_l32_1b kv_k[{i}] metal={} cpu={} diff={}",
+                kv_k_metal[i],
+                kv_k_cpu[i],
+                diff
+            );
+        }
+        for i in 0..kv_v_cpu.len() {
+            let diff = (kv_v_metal[i] - kv_v_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "rope_append_bf16_l32_1b kv_v[{i}] metal={} cpu={} diff={}",
+                kv_v_metal[i],
+                kv_v_cpu[i],
+                diff
+            );
+        }
+    }
+
     /// Phase 5.G.4a numerical-correctness check for
     /// `attention_via_cache_f16_specialized` against
     /// `cpu_golden::attention_via_cache`. Synthetic 2-sequence decode
@@ -952,6 +1687,370 @@ mod tests {
             assert!(
                 diff < tol,
                 "out[{i}] metal={} cpu={} diff={}",
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// HEAD_DIM=128 + bf16 attention_via_cache golden — the runtime
+    /// path used at decode time on Llama-3.2 / Llama-3.1 8B / Qwen-7B.
+    /// Dispatches with the runtime's actual `(HEAD_DIM, 1, 1)`
+    /// thread-per-tg shape, not the test-only 1024-thread shape, so a
+    /// failure here means the kernel itself is wrong at HEAD_DIM=128.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_via_cache_bf16_matches_cpu_golden_llama32() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let batch: usize = 2;
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+        let block_size: usize = Llama32Probe::BLOCK_SIZE as usize;
+        let max_blocks_per_seq: usize = Llama32Probe::MAX_BLOCKS_PER_SEQ as usize;
+        let num_blocks: usize = 4;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::AttentionViaCache,
+                batch as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_via_cache bf16 pipeline");
+
+        let seq_used_k: Vec<u32> = vec![10, 17];
+        let mut block_table = vec![0u32; batch * max_blocks_per_seq];
+        block_table[0 * max_blocks_per_seq + 0] = 0;
+        block_table[1 * max_blocks_per_seq + 0] = 2;
+        block_table[1 * max_blocks_per_seq + 1] = 3;
+
+        let q_data: Vec<f32> = (0..batch * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+            .collect();
+        let kv_cache_size = num_blocks * num_kv * block_size * head_dim;
+        let mut kv_k_data = vec![0.0_f32; kv_cache_size];
+        let mut kv_v_data = vec![0.0_f32; kv_cache_size];
+        for (live_block, kv_len) in [(0usize, 10usize), (2usize, 16usize), (3usize, 1usize)] {
+            for tok in 0..kv_len {
+                for kvh in 0..num_kv {
+                    for d in 0..head_dim {
+                        let idx = live_block * num_kv * block_size * head_dim
+                            + kvh * block_size * head_dim
+                            + tok * head_dim
+                            + d;
+                        let seed = (idx as f32) * 0.0017;
+                        kv_k_data[idx] = seed.sin() * 0.5;
+                        kv_v_data[idx] = seed.cos() * 0.5;
+                    }
+                }
+            }
+        }
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let seq_used_buf = alloc_u32(&device, &seq_used_k);
+        let block_table_buf = alloc_u32(&device, &block_table);
+        let kv_k_buf = alloc_bf16(&device, &kv_k_data);
+        let kv_v_buf = alloc_bf16(&device, &kv_v_data);
+        let output_buf = alloc_zero_bf16(&device, batch * num_q * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&seq_used_buf), 0);
+        enc.set_buffer(3, Some(&block_table_buf), 0);
+        enc.set_buffer(4, Some(&kv_k_buf), 0);
+        enc.set_buffer(5, Some(&kv_v_buf), 0);
+        // Match the runtime's lowering: (HEAD_DIM, 1, 1) threads/tg.
+        enc.dispatch_thread_groups(
+            MTLSize::new(batch as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_b = bf16_round(&q_data);
+        let kv_k_b = bf16_round(&kv_k_data);
+        let kv_v_b = bf16_round(&kv_v_data);
+
+        let mut output_cpu = vec![0.0_f32; batch * num_q * head_dim];
+        cpu_golden::attention_via_cache(
+            &q_b,
+            &kv_k_b,
+            &kv_v_b,
+            &block_table,
+            &seq_used_k,
+            &mut output_cpu,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            Llama32Probe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, output_cpu.len());
+
+        let tol: f32 = 5e-2; // bf16 has 7-bit mantissa, more rounding noise than f16
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "via_cache_bf16_l32[{i}] (seq {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// bf16 attention_via_cache golden at Llama-3.2-1B's EXACT decode
+    /// shape: HEAD_DIM=64, 32 Q heads, 8 KV heads (GQA 4:1), batch=1.
+    /// The existing `attention_via_cache_bf16_matches_cpu_golden_llama32`
+    /// runs against the 3B's shape (HEAD_DIM=128, 24q/8kv, batch=2);
+    /// no golden so far has covered the 1B's shape, and the runtime
+    /// is broken on Llama-3.2-1B (decode collapses to repeated token 0
+    /// after the first decode token). This test answers: does the
+    /// kernel itself work at the 1B's GQA + HEAD_DIM=64 + batch=1
+    /// combination?
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_via_cache_bf16_matches_cpu_golden_llama32_1b_decode() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        // Llama-3.2-1B decode shape — batch=1 (single decode step).
+        let batch: usize = 1;
+        let head_dim = Llama32_1BProbe::HEAD_DIM as usize;
+        let num_q = Llama32_1BProbe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32_1BProbe::NUM_KV_HEADS as usize;
+        let block_size: usize = Llama32_1BProbe::BLOCK_SIZE as usize;
+        let max_blocks_per_seq: usize = Llama32_1BProbe::MAX_BLOCKS_PER_SEQ as usize;
+        let num_blocks: usize = 4;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32_1BProbe>(
+                KernelId::AttentionViaCache,
+                batch as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_via_cache bf16 pipeline (1B shape)");
+
+        // 37-token cache (matches the Llama-3.2-1B "Hi" prompt's actual
+        // decode-1 state: 36 prefill tokens + 1 decode-0 token already
+        // appended). Spans physical blocks 0..2 (block_size=16, so
+        // 37 → blocks 0,1,2 with 5 used in block 2).
+        let seq_used_k: Vec<u32> = vec![37];
+        let mut block_table = vec![0u32; batch * max_blocks_per_seq];
+        block_table[0] = 0;
+        block_table[1] = 1;
+        block_table[2] = 2;
+
+        let q_data: Vec<f32> = (0..batch * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.5)
+            .collect();
+        let kv_cache_size = num_blocks * num_kv * block_size * head_dim;
+        let mut kv_k_data = vec![0.0_f32; kv_cache_size];
+        let mut kv_v_data = vec![0.0_f32; kv_cache_size];
+        // Fill physical blocks 0,1,2 with deterministic data; block 3
+        // stays zero so an over-read into it shows up as drift.
+        for (live_block, kv_len) in [(0usize, 16usize), (1usize, 16usize), (2usize, 5usize)] {
+            for tok in 0..kv_len {
+                for kvh in 0..num_kv {
+                    for d in 0..head_dim {
+                        let idx = live_block * num_kv * block_size * head_dim
+                            + kvh * block_size * head_dim
+                            + tok * head_dim
+                            + d;
+                        let seed = (idx as f32) * 0.0017;
+                        kv_k_data[idx] = seed.sin() * 0.5;
+                        kv_v_data[idx] = seed.cos() * 0.5;
+                    }
+                }
+            }
+        }
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let seq_used_buf = alloc_u32(&device, &seq_used_k);
+        let block_table_buf = alloc_u32(&device, &block_table);
+        let kv_k_buf = alloc_bf16(&device, &kv_k_data);
+        let kv_v_buf = alloc_bf16(&device, &kv_v_data);
+        let output_buf = alloc_zero_bf16(&device, batch * num_q * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&seq_used_buf), 0);
+        enc.set_buffer(3, Some(&block_table_buf), 0);
+        enc.set_buffer(4, Some(&kv_k_buf), 0);
+        enc.set_buffer(5, Some(&kv_v_buf), 0);
+        // Match the runtime's lowering: (HEAD_DIM, 1, 1) threads/tg.
+        enc.dispatch_thread_groups(
+            MTLSize::new(batch as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_b = bf16_round(&q_data);
+        let kv_k_b = bf16_round(&kv_k_data);
+        let kv_v_b = bf16_round(&kv_v_data);
+
+        let mut output_cpu = vec![0.0_f32; batch * num_q * head_dim];
+        cpu_golden::attention_via_cache(
+            &q_b,
+            &kv_k_b,
+            &kv_v_b,
+            &block_table,
+            &seq_used_k,
+            &mut output_cpu,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            Llama32_1BProbe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, output_cpu.len());
+
+        let tol: f32 = 5e-2;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "via_cache_bf16_l32_1b[{i}] (head {} dim {}) metal={} cpu={} diff={}",
+                i / head_dim,
+                i % head_dim,
                 output_metal[i],
                 output_cpu[i],
                 diff
@@ -1239,7 +2338,9 @@ mod tests {
         // to `real_tokens` rows — the cpu_golden's seq_starts shape
         // matches the runtime's single-sequence layout.
         let f16_round = |data: &[f32]| -> Vec<f32> {
-            data.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect()
+            data.iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect()
         };
         let q_f16 = f16_round(&q_data);
         let k_f16 = f16_round(&k_data);
@@ -1283,10 +2384,7 @@ mod tests {
         let row22_off = (22 * num_q + head0) * head_dim;
         let row0 = &output_metal[row0_off..row0_off + 4];
         let row22 = &output_metal[row22_off..row22_off + 4];
-        assert_ne!(
-            row0, row22,
-            "row 0 == row 22 — attention collapsed"
-        );
+        assert_ne!(row0, row22, "row 0 == row 22 — attention collapsed");
 
         let tol: f32 = 1e-2; // larger tol — fp16 accumulation over 23 K positions
         for i in 0..real_tokens * num_q * head_dim {
@@ -1299,6 +2397,357 @@ mod tests {
                 i % head_dim,
                 output_metal[i],
                 output_cpu[i],
+                diff
+            );
+        }
+    }
+
+    /// HEAD_DIM=128 + f16 isolation test — drives the same
+    /// `attention_prefill_contiguous_f16_specialized` shader that
+    /// HEAD_DIM=64 already passes against, but at the larger head
+    /// dim. If this fails, the kernel itself has a HEAD_DIM=128
+    /// bug independent of bf16; if it passes, the bf16 variant has
+    /// a dtype-specific bug.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_contiguous_f16_matches_cpu_golden_head_dim_128() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = Llama32F16Probe::HEAD_DIM as usize;
+        let num_q = Llama32F16Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32F16Probe::NUM_KV_HEADS as usize;
+        let tile_q: usize = Llama32F16Probe::PREFILL_TILE_Q as usize;
+
+        let real_tokens: usize = 23;
+        let bucket_m: usize = 64;
+        let cu_seqlens_q: Vec<u32> = vec![0, real_tokens as u32];
+
+        let pipeline = pipelines
+            .pipeline_for::<Llama32F16Probe>(KernelId::AttentionPrefillContiguous, bucket_m as u32)
+            .expect("attention_prefill f16 pipeline");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_f16(&device, &q_data);
+        let k_buf = alloc_f16(&device, &k_data);
+        let v_buf = alloc_f16(&device, &v_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let output_buf = alloc_zero_f16(&device, bucket_m * num_q * head_dim);
+
+        let num_q_tiles = bucket_m.div_ceil(tile_q);
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&k_buf), 0);
+        enc.set_buffer(3, Some(&v_buf), 0);
+        enc.set_buffer(4, Some(&cu_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q_tiles as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let f16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter()
+                .map(|&v| half::f16::from_f32(v).to_f32())
+                .collect()
+        };
+        let q_f16 = f16_round(&q_data);
+        let k_f16 = f16_round(&k_data);
+        let v_f16 = f16_round(&v_data);
+
+        let seq_starts: Vec<usize> = cu_seqlens_q.iter().map(|&v| v as usize).collect();
+        let q_real = &q_f16[..real_tokens * num_q * head_dim];
+        let k_real = &k_f16[..real_tokens * num_kv * head_dim];
+        let v_real = &v_f16[..real_tokens * num_kv * head_dim];
+        let mut output_cpu_real = vec![0.0_f32; real_tokens * num_q * head_dim];
+        cpu_golden::attention_prefill(
+            q_real,
+            k_real,
+            v_real,
+            &mut output_cpu_real,
+            &seq_starts,
+            num_q,
+            num_kv,
+            head_dim,
+            Llama32F16Probe::ATTN_SCALE,
+        );
+
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_f16(&output_buf, bucket_m * num_q * head_dim);
+
+        eprintln!(
+            "f16 row 0 d=0..3: {:?}",
+            (0..4).map(|j| output_metal[j]).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "f16 row 1 d=0..3 (metal, cpu): {:?}",
+            (0..4)
+                .map(|j| (output_metal[24 * 128 + j], output_cpu_real[24 * 128 + j]))
+                .collect::<Vec<_>>()
+        );
+
+        let tol: f32 = 1e-2;
+        for i in 0..real_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu_real[i]).abs();
+            assert!(
+                diff < tol,
+                "f16 attn_prefill_l32[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu_real[i],
+                diff
+            );
+        }
+    }
+
+    /// HEAD_DIM=128 + bf16 prefill golden, mirroring the M=64 f16 test
+    /// at Llama-3.2-3B shapes. Catches HEAD_DIM=128-only bugs in
+    /// `attention_prefill_contiguous_bf16_specialized` — the f16 path
+    /// is goldenned at HEAD_DIM=64 (TinyLlama), so without this the
+    /// bf16/HEAD_DIM=128 surface only got tested through end-to-end
+    /// generation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_contiguous_bf16_matches_cpu_golden_llama32() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+        let tile_q: usize = Llama32Probe::PREFILL_TILE_Q as usize;
+
+        // 2 real tokens, padded to bucket_m=16. Minimal repro for the
+        // bf16 + HEAD_DIM=128 collapse — if row 1 still inherits
+        // row 0's softmax in this 2-token case, the kernel state-
+        // reset bug is independent of token count.
+        let real_tokens: usize = 2;
+        let bucket_m: usize = 16;
+        let cu_seqlens_q: Vec<u32> = vec![0, real_tokens as u32];
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::AttentionPrefillContiguous,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_prefill bf16 pipeline");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let k_buf = alloc_bf16(&device, &k_data);
+        let v_buf = alloc_bf16(&device, &v_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
+
+        let num_q_tiles = bucket_m.div_ceil(tile_q);
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&k_buf), 0);
+        enc.set_buffer(3, Some(&v_buf), 0);
+        enc.set_buffer(4, Some(&cu_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q_tiles as u64, num_q as u64, 1),
+            MTLSize::new(head_dim as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Round-trip Q/K/V through bf16 for the cpu reference.
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_bf = bf16_round(&q_data);
+        let k_bf = bf16_round(&k_data);
+        let v_bf = bf16_round(&v_data);
+
+        let seq_starts: Vec<usize> = cu_seqlens_q.iter().map(|&v| v as usize).collect();
+        let q_real = &q_bf[..real_tokens * num_q * head_dim];
+        let k_real = &k_bf[..real_tokens * num_kv * head_dim];
+        let v_real = &v_bf[..real_tokens * num_kv * head_dim];
+        let mut output_cpu_real = vec![0.0_f32; real_tokens * num_q * head_dim];
+        cpu_golden::attention_prefill(
+            q_real,
+            k_real,
+            v_real,
+            &mut output_cpu_real,
+            &seq_starts,
+            num_q,
+            num_kv,
+            head_dim,
+            Llama32Probe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, bucket_m * num_q * head_dim);
+
+        // Pre-assert dump: print row 0 / row 1 / row 22 head 0 dim
+        // 0..3 so a failure tells us where the kernel diverges. Row 0
+        // sees only K[0]; row 1 sees K[0..1]; row 22 sees K[0..22]. If
+        // row 0 is right but row 1 is wrong, the kernel state isn't
+        // reset between local_q iterations.
+        let snap = |row: usize| -> [(f32, f32); 4] {
+            let off = (row * num_q + 0) * head_dim;
+            let mut out = [(0.0, 0.0); 4];
+            for j in 0..4 {
+                out[j] = (output_metal[off + j], output_cpu_real[off + j]);
+            }
+            out
+        };
+        eprintln!("bf16 row 0 head 0 dim 0..3 (metal, cpu): {:?}", snap(0));
+        eprintln!("bf16 row 1 head 0 dim 0..3 (metal, cpu): {:?}", snap(1));
+
+        // bf16 has 7-bit mantissa (~3-4 decimal digits). Tolerance is
+        // larger than f16 by an order of magnitude.
+        let tol: f32 = 5e-2;
+        for i in 0..real_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu_real[i]).abs();
+            assert!(
+                diff < tol,
+                "attn_prefill_bf16_l32[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu_real[i],
                 diff
             );
         }
@@ -1368,11 +2817,9 @@ mod tests {
 
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -1401,10 +2848,7 @@ mod tests {
         enc.set_buffer(0, Some(&output_buf), 0);
         enc.set_buffer(1, Some(&input_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
-        enc.dispatch_thread_groups(
-            MTLSize::new(m as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -1479,11 +2923,7 @@ mod tests {
         let m: usize = 64;
         let hidden = TinyLlamaProbe::Q_SIZE;
         let pipeline = pipelines
-            .pipeline_for_dtype::<TinyLlamaProbe>(
-                KernelId::RmsNorm,
-                m as u32,
-                MetalDtype::Bf16,
-            )
+            .pipeline_for_dtype::<TinyLlamaProbe>(KernelId::RmsNorm, m as u32, MetalDtype::Bf16)
             .expect("rmsnorm bf16 pipeline");
 
         let input_data: Vec<f32> = (0..m * hidden)
@@ -1498,8 +2938,7 @@ mod tests {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf16_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf16_data.as_ptr() as *const u8,
@@ -1528,10 +2967,7 @@ mod tests {
         enc.set_buffer(0, Some(&output_buf), 0);
         enc.set_buffer(1, Some(&input_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
-        enc.dispatch_thread_groups(
-            MTLSize::new(m as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -1633,11 +3069,9 @@ mod tests {
 
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -1666,10 +3100,7 @@ mod tests {
         enc.set_buffer(0, Some(&output_buf), 0);
         enc.set_buffer(1, Some(&input_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
-        enc.dispatch_thread_groups(
-            MTLSize::new(m as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -1766,11 +3197,9 @@ mod tests {
 
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -1793,10 +3222,7 @@ mod tests {
         enc.set_buffer(0, Some(&inout_buf), 0); // OUT = same buffer
         enc.set_buffer(1, Some(&inout_buf), 0); // IN  = same buffer
         enc.set_buffer(2, Some(&weight_buf), 0);
-        enc.dispatch_thread_groups(
-            MTLSize::new(m as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -1900,11 +3326,9 @@ mod tests {
 
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -1925,10 +3349,7 @@ mod tests {
         enc.set_buffer(0, Some(&residual_buf), 0);
         enc.set_buffer(1, Some(&delta_buf), 0);
         enc.set_buffer(2, Some(&weight_buf), 0);
-        enc.dispatch_thread_groups(
-            MTLSize::new(m as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -1947,13 +3368,7 @@ mod tests {
             .map(|&v| half::f16::from_f32(v).to_f32())
             .collect();
         let eps = 1e-5_f32;
-        cpu_golden::fused_add_rmsnorm(
-            &mut residual_cpu,
-            &mut delta_cpu,
-            &weight_f16,
-            eps,
-            hidden,
-        );
+        cpu_golden::fused_add_rmsnorm(&mut residual_cpu, &mut delta_cpu, &weight_f16, eps, hidden);
 
         fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
             unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
@@ -2018,7 +3433,7 @@ mod tests {
 
         let m: usize = 1;
         let n: usize = TinyLlamaProbe::INTERMEDIATE_SIZE; // 5632
-        let k: usize = TinyLlamaProbe::Q_SIZE;            // 2048
+        let k: usize = TinyLlamaProbe::Q_SIZE; // 2048
 
         let pipeline = pipelines
             .pipeline_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, m as u32)
@@ -2035,11 +3450,9 @@ mod tests {
 
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -2122,6 +3535,131 @@ mod tests {
         eprintln!("fused_mlp_tinyllama_shape: max_abs_diff={max_diff}");
     }
 
+    /// Same as `fused_mlp_tinyllama_shape_matches_cpu_golden` but
+    /// drives the bf16 decode kernel at Llama-3.2-3B shapes (M=1,
+    /// N=8192, K=3072). This is the path the runtime hits at decode;
+    /// previously only goldenned at TinyLlama shape + f16.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_mlp_decode_bf16_matches_cpu_golden_llama32() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let m: usize = 1;
+        let n: usize = Llama32Probe::INTERMEDIATE_SIZE; // 8192
+        let k: usize = Llama32Probe::Q_SIZE; // 3072
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::FusedGateUpSiluMul,
+                m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("fused_mlp bf16 pipeline");
+
+        // Magnitudes ~0.05 so K=3072 sums stay within bf16 range.
+        let input_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.05)
+            .collect();
+        let weight_data: Vec<f32> = (0..(2 * n) * k)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.05)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let input_buf = alloc_bf16(&device, &input_data);
+        let weight_buf = alloc_bf16(&device, &weight_data);
+        let output_buf = alloc_zero_bf16(&device, m * n);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n as u64).div_ceil(4), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let input_b = bf16_round(&input_data);
+        let weight_b = bf16_round(&weight_data);
+        let gate_w = &weight_b[0..n * k];
+        let up_w = &weight_b[n * k..2 * n * k];
+        let mut gate = vec![0.0_f32; m * n];
+        let mut up = vec![0.0_f32; m * n];
+        cpu_golden::gemm(&input_b, gate_w, &mut gate, m, k, n);
+        cpu_golden::gemm(&input_b, up_w, &mut up, m, k, n);
+        let mut output_cpu = vec![0.0_f32; m * n];
+        cpu_golden::fused_gate_up_silu_mul(&gate, &up, &mut output_cpu);
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, output_cpu.len());
+
+        let tol: f32 = 8e-2;
+        let mut max_diff: f32 = 0.0;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < tol,
+                "fused_mlp_decode_bf16_l32[{i}] metal={} cpu={} diff={} max_so_far={}",
+                output_metal[i],
+                output_cpu[i],
+                diff,
+                max_diff
+            );
+        }
+        eprintln!("fused_mlp_decode_bf16_l32: max_abs_diff={max_diff}");
+    }
+
     /// Numerical-correctness check for
     /// `fused_gate_up_silu_mul_gemm_f16_specialized`. Computes
     /// `output = silu(input @ W_gate^T) * (input @ W_up^T)` with the
@@ -2143,6 +3681,144 @@ mod tests {
     fn fused_mlp_matches_cpu_golden() {
         for m in [64usize, 16usize, 1usize] {
             run_fused_mlp_check(m);
+        }
+    }
+
+    /// Generic bf16 GEMM golden at TinyLlama (M=64, N=2048, K=2048)
+    /// AND Llama-3.2-3B (M=64, N=3072, K=3072) shapes — confirms the
+    /// `gemm_bf16_specialized` kernel runs correctly across the range
+    /// of shapes the runtime drives. This is the kernel that replaces
+    /// MPS' `MPSMatrixMultiplication` for the bf16 path; MPS rejects
+    /// `MPSDataTypeBFloat16` at runtime.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemm_bf16_matches_cpu_golden() {
+        for (m, n, k) in [
+            (64usize, 2048usize, 2048usize), // TinyLlama Q/K/V/O shape K-side
+            (64usize, 3072usize, 3072usize), // Llama-3.2-3B Q/O shape
+            (64usize, 1024usize, 3072usize), // Llama-3.2-3B K/V shape
+            (64usize, 3072usize, 8192usize), // Llama-3.2-3B down-proj shape
+            // Decode shapes (M=1) — lm_head + per-layer projections.
+            (1usize, 128256usize, 3072usize), // Llama-3.2-3B lm_head/embed (tied)
+            (1usize, 3072usize, 3072usize),   // Llama-3.2-3B Q/O at decode
+            (1usize, 1024usize, 3072usize),   // Llama-3.2-3B K/V at decode
+            (1usize, 3072usize, 8192usize),   // Llama-3.2-3B down at decode
+            (1usize, 512usize, 2048usize),    // Llama-3.2-1B K/V at decode
+            (1usize, 2048usize, 8192usize),   // Llama-3.2-1B down at decode
+            (1usize, 128256usize, 2048usize), // Llama-3.2-1B lm_head at decode
+            (1usize, 2048usize, 2048usize),   // Llama-3.2-1B Q/O at decode (gap-fill)
+            (1usize, 8192usize, 2048usize),   // Llama-3.2-1B gate/up at decode (gap-fill)
+        ] {
+            run_gemm_bf16_check(m, n, k);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_gemm_bf16_check(m: usize, n: usize, k: usize) {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let pipeline = pipelines
+            .pipeline_for_gemm_bf16(m as u32, n as u32, k as u32)
+            .expect("gemm_bf16 pipeline");
+
+        let input_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+        let weight_data: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.3)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf16_data: Vec<half::bf16> =
+                data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf16_data.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf16_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<half::bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let input_buf = alloc_bf16(&device, &input_data);
+        let weight_buf = alloc_bf16(&device, &weight_data);
+        let output_buf = alloc_zero_bf16(&device, m * n);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
+            MTLSize::new(32, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let input_bf16: Vec<f32> = input_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let weight_bf16: Vec<f32> = weight_data
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect();
+        let mut output_cpu = vec![0.0_f32; m * n];
+        cpu_golden::gemm(&input_bf16, &weight_bf16, &mut output_cpu, m, k, n);
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, output_cpu.len());
+
+        // bf16 reduction over K up to 8192: looser tol than the
+        // matmul-into-f32 path strictly needs, but sized so a real
+        // numerical break would still trigger.
+        let tol: f32 = 5e-2;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "gemm_bf16 m={m} n={n} k={k} [{i}] (row {} col {}) metal={} cpu={} diff={}",
+                i / n,
+                i % n,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
         }
     }
 
@@ -2204,8 +3880,7 @@ mod tests {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf16_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf16_data.as_ptr() as *const u8,
@@ -2331,11 +4006,9 @@ mod tests {
 
         use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf =
-                device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,

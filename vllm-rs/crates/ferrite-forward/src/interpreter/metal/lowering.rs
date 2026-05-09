@@ -109,12 +109,9 @@ pub fn lower<W: CanonicalParams>(
                 // the weight lookups bake the right per-layer offset.
                 for iter in 0..count_usize {
                     for (offset, inst) in body.iter().enumerate() {
-                        if let Some(cmd) = lower_one(
-                            inst,
-                            body_start + offset,
-                            bucket_m,
-                            iter as u32,
-                        )? {
+                        if let Some(cmd) =
+                            lower_one(inst, body_start + offset, bucket_m, iter as u32)?
+                        {
                             commands.push(cmd);
                         }
                     }
@@ -403,11 +400,15 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 5,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheK { layer: *layer + layer_offset },
+                        kind: RuntimeBindingKind::KvCacheK {
+                            layer: *layer + layer_offset,
+                        },
                         binding_index: 6,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheV { layer: *layer + layer_offset },
+                        kind: RuntimeBindingKind::KvCacheV {
+                            layer: *layer + layer_offset,
+                        },
                         binding_index: 7,
                     },
                 ],
@@ -425,14 +426,16 @@ fn lower_one<W: CanonicalParams>(
             // 1024 threads/group = 32 simdgroups × 32 lanes. Each
             // simdgroup processes 1/32 of the K axis with online
             // softmax; no per-token threadgroup_barrier in the K
-            // loop. See `attention_via_cache_v2_f16_specialized` in
-            // `attention.metal`.
+            // loop. Production path now wires both f16 and bf16 to v2
+            // (the v1 2-pass-softmax kernel accumulated bf16 rounding
+            // error per layer on Llama-3.2 decode and produced
+            // degenerate output after the first decode token).
             let n_q_heads = W::NUM_Q_HEADS;
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
-                    threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
+                    threads_per_threadgroup: (1024, 1, 1),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -452,11 +455,15 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 3,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheK { layer: *layer + layer_offset },
+                        kind: RuntimeBindingKind::KvCacheK {
+                            layer: *layer + layer_offset,
+                        },
                         binding_index: 4,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheV { layer: *layer + layer_offset },
+                        kind: RuntimeBindingKind::KvCacheV {
+                            layer: *layer + layer_offset,
+                        },
                         binding_index: 5,
                     },
                 ],

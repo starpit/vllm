@@ -2237,8 +2237,10 @@ impl GpuWeights {
         // 50 MB tensor on Apple Silicon caps at ~9 GB/s, leaving
         // memory bandwidth on the floor (peak is ~50 GB/s system
         // wide). Splitting into 4 MB chunks across rayon's pool
-        // saturates bandwidth and cuts per-call cost roughly 3x
-        // for the gate_up pack hot path. SAFETY: `ptr` and `dst`
+        // saturates bandwidth and cuts per-call cost ~3x for the
+        // gate_up pack hot path. 16 MB tested ≈ 4 MB, so picking
+        // the smaller value to keep the threshold gate (next line)
+        // reasonable for medium tensors. SAFETY: `ptr` and `dst`
         // are valid for `size_bytes`; chunks are non-overlapping
         // by construction.
         const CHUNK: usize = 4 * 1024 * 1024;

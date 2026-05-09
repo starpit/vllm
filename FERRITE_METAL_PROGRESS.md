@@ -872,16 +872,82 @@ Suspect list (ordered by likelihood):
   uses `AttentionViaCache` which might mishandle stale KV.
   `--max-tokens 1` isolates prefill output.
 
+#### Bug 4 — bf16 K_proj race into KV slot 0 ✅ FIXED (`3658f2b34`)
+
+Closed by the bf16 backend landing on Llama-3.2-1B + Llama-3.2-3B.
+Prefill padding lanes raced K_proj(token 0) into KV slot 0; sentinel
+`u32::MAX` + rope_append early-out fixed it. Model now produces
+coherent text on TinyLlama, Llama-3.2-1B, and Llama-3.2-3B. See
+project memory `project_metal_bf16_fixed.md`.
+
+### Phase 5.K — Startup time (2026-05-09, 2.91s → 240ms)
+
+Closed the wall-clock gap to vllm-mlx (~300ms baseline) on
+Llama-3.2-3B. 16 commits between `79da7dbd0` and `f9ae0dfd5`.
+
+#### Final breakdown (warm cache, Llama-3.2-3B, 240ms total)
+
+| phase | time | notes |
+|---|---|---|
+| Metal device init | ~26ms | Apple driver init + new_command_queue; fundamental |
+| shard parse + register_mmap | ~1ms | madvise gated to cuda; zero-copy MTLBuffer wrap |
+| try_load | ~225ms | gate_up pack memcpy ~200ms (rayon-parallel chunked) |
+| ArgmaxKernels::new | <1ms | AoT shader |
+| KvCachePool::new | <1ms | residency.commit deferred to first forward |
+| (tokenizer load) | parallel | spawned in vllm-serve before worker.load_model |
+
+#### What landed
+
+| commit | win |
+|---|---|
+| `6328529c1` | AoT-compile shaders to `.metallib` at build time (xcrun metal) |
+| `a5dc95fbd` | zero-copy weight load via `newBufferWithBytesNoCopy` over mmap shards |
+| `8cd3bb8e0` | solver `startup_us` + amortized objective + `expected_calls_per_load` |
+| `c18e89385` | direct-write pack of fused-MLP weights (drop heap Vec intermediate) |
+| `91e58f611` | parallel tokenizer load in vllm-serve before `worker.load_model` |
+| `d63c8bd30` | parallel rope build + `hf_hub::Cache` short-circuit |
+| `2e8e17fd5` | metal RoPE cache clamped to runtime `max_model_len` |
+| `5ed9407e1` | consolidate `resolve_model_path` onto ferrite_worker |
+| `a8da1d6b9` | skip residency for mmap'd weight shards |
+| `d5a6330db` | gate `madvise(WILLNEED)` to cuda only (152ms on macOS for 5GB shard) |
+| `e545b54c8` | defer `residency.commit()` to first forward (123ms saved) |
+| `8f1e37c11` | parallel chunked memcpy in `take_into_metal` (rayon, 4 MB chunks) |
+
+Plus three diagnostic-log commits (`248cf4cef`, `199e7d5e3`,
+`d5a6330db` adds load_shard + init_cache phase splits) — kept in
+the worktree so the cycle keeps yielding numbers.
+
+#### Open: structural gate_up pack elimination
+
+The largest remaining startup chunk is the gate_up pack memcpy
+inside try_load (~200ms on Llama-3.2-3B even after rayon-parallel
+chunked memcpy). Solver-side path is in place
+(`MetalFusedGateUpSiluMulImpl::startup_us` declares the cost,
+amortized objective picks unpacked when N is small) but
+**`MetalMulImpl::matches` returns `None`** at
+`metal/mul.rs:69` — the unpacked composition (gate_gemm + up_gemm
++ silu + elementwise_mul) is structurally unpickable, so the DP
+must pick fused regardless of cost.
+
+To unblock: add `Instruction::ElementwiseMul` variant + lowering
+case + `KernelId::Mul` pipeline mapping (kernels already exist in
+`elementwise.metal`) + real `MetalMulImpl::matches`. Saves ~200ms
+— drops total startup to ~50ms (basically just Metal device init).
+
+See project memory `project_metal_unpacked_mlp_next.md` for the
+step-by-step.
+
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
 - Phase 5.F.1 + 5.F.2: ✅ COMPLETE - Build hygiene + cfg-gated impl pushes
 - Phase 5.F.3 + 5.F (residual) + 5.G + 5.6: 🔜 PLANNED - Per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
 - Phase 5.H: ⚠️ PARTIAL - simdgroup_matrix fused MLP landed; M4+ MPP variant + larger-tile tuning still TODO
-- Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch); lm_head logits all-zero (root cause = somewhere across the 22-layer chain, TBD)
-- Phase 5.J: ⚠️ IN PROGRESS - three bugs fixed (RmsNorm slot swap + loop layer_offset + MPS Gemm offset). Model output is now input-dependent. Bug #4 (still wrong tokens, loops on chat-template-like text) TBD.
-- 78 Phase 1-4 tests + 56 ferrite-forward metal lib tests passing
+- Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch)
+- Phase 5.J: ✅ COMPLETE - lowering correctness fixes (RmsNorm slot swap + loop layer_offset + MPS Gemm offset + bf16 KV slot-0 race)
+- Phase 5.K: ✅ COMPLETE - startup time 2.91s → 240ms warm; 1 structural follow-up (gate_up pack elimination) tracked in `project_metal_unpacked_mlp_next.md`
+- 78 Phase 1-4 tests + 68 ferrite-forward metal lib tests passing
 - `cargo build --bin vllm -Fmetal` ✓ on darwin
-- `vllm chat ... --device metal` runs end-to-end, produces input-dependent but still-wrong text
+- `vllm chat ... --device metal` runs end-to-end with coherent output on TinyLlama, Llama-3.2-1B, Llama-3.2-3B
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land
 - Multi-Q-token attention kernels are correctness-first reference impls; FlashAttention-style blocking + perf tuning is Phase 5.6 work

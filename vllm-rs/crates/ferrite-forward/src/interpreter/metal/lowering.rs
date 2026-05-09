@@ -472,37 +472,83 @@ fn lower_one<W: CanonicalParams>(
         }
 
         // ── Prefill-bucket attention (contiguous Q/K/V tiles) ──────
+        // FERRITE_METAL_PREFILL_KERNEL=sdpa flips to the faithful MLX
+        // sdpa_vector multi-Q port (`attention_prefill_sdpa_v2_*`).
+        // Default stays on the legacy hand-written kernel
+        // (`attention_prefill_contiguous_*`) until e2e smoke confirms
+        // sdpa parity. Both kernels share the same lowering source —
+        // `Instruction::AttentionPrefillContiguous` — and the worker
+        // selects between them via this env-var-gated dispatch.
         I::AttentionPrefillContiguous(q_slot, k_slot, v_slot, out_slot, _is_causal) => {
             let n_q_heads = W::NUM_Q_HEADS;
-            LoweredCommand {
-                kernel: KernelId::AttentionPrefillContiguous,
-                dispatch: DispatchShape {
-                    threadgroups: (bucket_m.div_ceil(PREFILL_TILE_Q), n_q_heads, 1),
-                    threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
-                },
-                bindings: vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
+            let use_sdpa = std::env::var("FERRITE_METAL_PREFILL_KERNEL")
+                .map(|v| v == "sdpa")
+                .unwrap_or(false);
+            if use_sdpa {
+                LoweredCommand {
+                    kernel: KernelId::AttentionPrefillSdpa,
+                    // 1 Q per TG; head on grid X (small, ≤ 32), Q on
+                    // grid Y. 1024 threads = 32 simdgroups × 32 lanes,
+                    // matching the decode kernel.
+                    dispatch: DispatchShape {
+                        threadgroups: (n_q_heads, bucket_m, 1),
+                        threads_per_threadgroup: (1024, 1, 1),
                     },
-                    Binding::ArenaSlot {
-                        slot: *q_slot,
-                        binding_index: 1,
+                    bindings: vec![
+                        Binding::ArenaSlot {
+                            slot: *out_slot,
+                            binding_index: 0,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *q_slot,
+                            binding_index: 1,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *k_slot,
+                            binding_index: 2,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *v_slot,
+                            binding_index: 3,
+                        },
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::CuSeqlensQ,
+                            binding_index: 4,
+                        },
+                    ],
+                    gemm_dims: None,
+                }
+            } else {
+                LoweredCommand {
+                    kernel: KernelId::AttentionPrefillContiguous,
+                    dispatch: DispatchShape {
+                        threadgroups: (bucket_m.div_ceil(PREFILL_TILE_Q), n_q_heads, 1),
+                        threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
                     },
-                    Binding::ArenaSlot {
-                        slot: *k_slot,
-                        binding_index: 2,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *v_slot,
-                        binding_index: 3,
-                    },
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::CuSeqlensQ,
-                        binding_index: 4,
-                    },
-                ],
-                gemm_dims: None,
+                    bindings: vec![
+                        Binding::ArenaSlot {
+                            slot: *out_slot,
+                            binding_index: 0,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *q_slot,
+                            binding_index: 1,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *k_slot,
+                            binding_index: 2,
+                        },
+                        Binding::ArenaSlot {
+                            slot: *v_slot,
+                            binding_index: 3,
+                        },
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::CuSeqlensQ,
+                            binding_index: 4,
+                        },
+                    ],
+                    gemm_dims: None,
+                }
             }
         }
 

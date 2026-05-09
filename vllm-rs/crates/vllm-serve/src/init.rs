@@ -497,6 +497,34 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Loading model");
     }
+
+    // Resolve the model dir up-front so we can load the tokenizer in
+    // parallel with the worker's heavy weight upload. `try_load_tokenizer`
+    // is the canonical loader (init.rs::try_load_tokenizer) and lives
+    // here in vllm-serve — workers shouldn't be re-implementing it.
+    // For cached models `resolve_model_path` is sub-ms; for HF download
+    // it does the download once, then `worker.load_model` re-resolves
+    // the same cached path (cheap). Returns `None` for `.gguf` sources
+    // (no sibling tokenizer.json) — that path falls through to the
+    // worker's `take_preloaded_tokenizer` (cuda/mlx GGUF builds the
+    // tokenizer from file metadata via `ferrite_gguf::gguf_tokenizer`,
+    // the only reason any worker still touches tokenizers).
+    let prefetched_model_dir = vllm_executor::gpu_worker_base::resolve_model_path(
+        &model_path,
+        config.hf_token.as_deref(),
+        config.gguf_file.as_deref(),
+    )
+    .ok();
+    let parallel_tokenizer_handle = prefetched_model_dir.as_ref().and_then(|dir| {
+        let tok_path = dir.join("tokenizer.json");
+        if !tok_path.exists() {
+            return None;
+        }
+        Some(std::thread::spawn(move || {
+            tokenizers::Tokenizer::from_file(&tok_path).ok()
+        }))
+    });
+
     let (mut worker, hf_config, model_dir, model_dtype) =
         create_worker(config, model_path, progress)?;
 
@@ -504,7 +532,9 @@ fn initialize_core(
         info!("Resolved model architecture: {}", arch);
     }
 
-    let preloaded_tokenizer = worker.take_preloaded_tokenizer();
+    let preloaded_tokenizer = worker
+        .take_preloaded_tokenizer()
+        .or_else(|| parallel_tokenizer_handle.and_then(|h| h.join().ok().flatten()));
 
     let max_model_len = config
         .max_model_len

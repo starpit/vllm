@@ -282,16 +282,15 @@ impl MetalAllocator {
             MTLResourceOptions::StorageModeShared,
             None,
         );
-        // Pin into the shared residency set, but **do not commit** —
-        // commit is the expensive step (Apple's residency tracker
-        // marks pages wired; on a 5 GB shard this was ~35ms per
-        // call). Per the residency.rs doc comment "batching multiple
-        // inserts before a single commit cuts down on driver chatter":
-        // we let the next commit() in the load chain (initialize_cache,
-        // which fires after every load_model) sweep the queued inserts
-        // along with the KV-cache buffers it adds. The mmap MTLBuffers
-        // aren't used until the first forward — well after init_cache.
-        self.residency.insert(&buffer);
+        // Note: we deliberately do NOT add the mmap MTLBuffer to the
+        // residency set. The reason residency exists (per residency.rs
+        // header) is `StorageModePrivate` KV cache + arena buffers
+        // that Apple's lazy paging tracker actively moves under
+        // pressure. mmap'd shards are `StorageModeShared` — backed by
+        // CPU mmap memory the OS doesn't relocate. Adding them costs
+        // 35-46ms in residency.commit() per shard with zero
+        // correctness benefit (cmdbufs that read these pages get
+        // them via the shared address space, no wiring needed).
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")

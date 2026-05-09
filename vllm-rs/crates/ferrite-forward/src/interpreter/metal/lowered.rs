@@ -58,6 +58,16 @@ pub enum KernelId {
     /// Prefill-bucket attention over contiguous Q/K/V tiles. Causal
     /// mask, per-sequence boundaries from `cu_seqlens_q`.
     AttentionPrefillContiguous,
+    /// Prefill-bucket attention via faithful MLX `sdpa_vector` port —
+    /// 1 Q per threadgroup, dispatch `(num_q_heads, total_q, 1)`,
+    /// online softmax + per-simdgroup K-axis split. Same algorithm as
+    /// the decode kernel (`AttentionViaCache`) extended to multi-Q
+    /// with causal mask + cu_seqlens_q lookup. Reads contiguous K/V
+    /// (in-forward tiles); paged variant is a follow-up. Replacement
+    /// target for the legacy hand-written `AttentionPrefillContiguous`
+    /// kernel — kept as a parallel `KernelId` for bisect during
+    /// rollout.
+    AttentionPrefillSdpa,
     /// Pure scalar broadcast multiply: `out = x * scale`.
     ScalarMul,
     /// Elementwise residual add: `lhs += rhs`. Output is the lhs slot

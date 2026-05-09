@@ -151,6 +151,16 @@ fn kernel_msl_names(
         (KernelId::AttentionPrefillContiguous, MetalDtype::Bf16) => {
             ("attention", "attention_prefill_contiguous_bf16_specialized")
         }
+        // Faithful MLX sdpa_vector multi-Q port — replacement target
+        // for the legacy hand-written AttentionPrefillContiguous.
+        // Wired in parallel for bisect; default lowering still picks
+        // legacy until goldens validate sdpa parity.
+        (KernelId::AttentionPrefillSdpa, MetalDtype::F16) => {
+            ("attention", "attention_prefill_sdpa_v2_f16_specialized")
+        }
+        (KernelId::AttentionPrefillSdpa, MetalDtype::Bf16) => {
+            ("attention", "attention_prefill_sdpa_v2_bf16_specialized")
+        }
         (KernelId::Add, MetalDtype::F16) => ("elementwise", "residual_add_f16_specialized"),
         (KernelId::Add, MetalDtype::Bf16) => ("elementwise", "residual_add_bf16_specialized"),
         (KernelId::ScalarMul, MetalDtype::F16) => ("elementwise", "scalar_mul_f16_specialized"),
@@ -225,6 +235,15 @@ pub fn constants_for<W: CanonicalParams>(
             ConstantValue::uint(2, W::NUM_KV_HEADS),
             ConstantValue::float(3, W::ATTN_SCALE),
             ConstantValue::uint(6, W::PREFILL_TILE_Q),
+        ],
+        // Sdpa prefill kernel uses 1 Q per TG (no PREFILL_TILE_Q
+        // dependence — multi-Q comes from grid Y), so the constants
+        // bag drops index 6.
+        KernelId::AttentionPrefillSdpa => vec![
+            ConstantValue::uint(0, W::HEAD_DIM),
+            ConstantValue::uint(1, W::NUM_Q_HEADS),
+            ConstantValue::uint(2, W::NUM_KV_HEADS),
+            ConstantValue::float(3, W::ATTN_SCALE),
         ],
         KernelId::Add | KernelId::ScalarMul => Vec::new(),
         // GEMM: only the bf16 (custom) path uses function constants.
@@ -2753,6 +2772,354 @@ mod tests {
                 output_metal[i],
                 output_cpu_real[i],
                 diff
+            );
+        }
+    }
+
+    /// Numerical-correctness check for
+    /// `attention_prefill_sdpa_v2_bf16_specialized` against
+    /// `cpu_golden::attention_prefill`. Mirrors the legacy
+    /// `attention_prefill_contiguous_bf16_matches_cpu_golden_llama32`
+    /// case (Llama-3.2-3B shapes: HEAD_DIM=128, 24 q heads / 8 kv
+    /// heads, 2 real tokens padded to bucket_m=16, single seq). If
+    /// the new kernel produces the same output as the contiguous one
+    /// up to bf16 noise, we can switch the lowering default.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_sdpa_bf16_matches_cpu_golden_llama32() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+
+        let real_tokens: usize = 2;
+        let bucket_m: usize = 16;
+        // Pad cu_seqlens_q with a trailing zero (and then some slack)
+        // so the kernel's batch-search loop reads sentinel zeros after
+        // the last real entry. Production allocates (max_m+1) u32s
+        // (codegen.rs `cu_seqlens_q: alloc((max_m + 1) * 4)`) so OOB
+        // reads always land in zero-init memory there. With a 2-entry
+        // buffer the OOB read of cu_seqlens_q[2] picked up adjacent
+        // memory under parallel test runs and tripped a false
+        // in_range=true on padding TGs.
+        let mut cu_seqlens_q: Vec<u32> = vec![0; bucket_m + 2];
+        cu_seqlens_q[1] = real_tokens as u32;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::AttentionPrefillSdpa,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_prefill_sdpa bf16 pipeline");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let k_buf = alloc_bf16(&device, &k_data);
+        let v_buf = alloc_bf16(&device, &v_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&k_buf), 0);
+        enc.set_buffer(3, Some(&v_buf), 0);
+        enc.set_buffer(4, Some(&cu_buf), 0);
+        // sdpa kernel dispatch: (num_q_heads, bucket_m, 1) threadgroups,
+        // (1024, 1, 1) threads = 32 simdgroups × 32 lanes. Q on grid Y
+        // matches MLX `sdpa_vector`'s natural shape and avoids the
+        // grid-X >= 1024 dispatch boundary that bit the gemm port.
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q as u64, bucket_m as u64, 1),
+            MTLSize::new(1024, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_bf = bf16_round(&q_data);
+        let k_bf = bf16_round(&k_data);
+        let v_bf = bf16_round(&v_data);
+
+        // Only the first 2 entries of cu_seqlens_q describe real
+        // sequences; the trailing zeros are sentinel padding for the
+        // kernel's batch-search loop. cpu_golden expects the trim.
+        let seq_starts: Vec<usize> = cu_seqlens_q[..2].iter().map(|&v| v as usize).collect();
+        let q_real = &q_bf[..real_tokens * num_q * head_dim];
+        let k_real = &k_bf[..real_tokens * num_kv * head_dim];
+        let v_real = &v_bf[..real_tokens * num_kv * head_dim];
+        let mut output_cpu_real = vec![0.0_f32; real_tokens * num_q * head_dim];
+        cpu_golden::attention_prefill(
+            q_real,
+            k_real,
+            v_real,
+            &mut output_cpu_real,
+            &seq_starts,
+            num_q,
+            num_kv,
+            head_dim,
+            Llama32Probe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, bucket_m * num_q * head_dim);
+
+        let tol: f32 = 5e-2;
+        for i in 0..real_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu_real[i]).abs();
+            assert!(
+                diff < tol,
+                "sdpa_prefill_bf16_l32[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu_real[i],
+                diff
+            );
+        }
+    }
+
+    /// M=64 single-sequence sdpa prefill, matching the runtime bucket
+    /// shape — 23 real tokens padded to 64 (Q dispatched on grid Y of
+    /// length 64). Catches grid-Y dispatch bugs at the production
+    /// scale that the M=16 case can't see.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_sdpa_bf16_matches_cpu_golden_m64_single_seq() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+
+        let real_tokens: usize = 23;
+        let bucket_m: usize = 64;
+        // Pad cu_seqlens_q with trailing zeros — see the M=16 sister
+        // test for the OOB-read rationale (production allocates
+        // (max_m+1) u32s, tests must mirror to avoid false in_range
+        // on padding TGs under parallel test runs).
+        let mut cu_seqlens_q: Vec<u32> = vec![0; bucket_m + 2];
+        cu_seqlens_q[1] = real_tokens as u32;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::AttentionPrefillSdpa,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_prefill_sdpa bf16 pipeline");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let k_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_data: Vec<f32> = (0..bucket_m * num_kv * head_dim)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let k_buf = alloc_bf16(&device, &k_data);
+        let v_buf = alloc_bf16(&device, &v_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&k_buf), 0);
+        enc.set_buffer(3, Some(&v_buf), 0);
+        enc.set_buffer(4, Some(&cu_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q as u64, bucket_m as u64, 1),
+            MTLSize::new(1024, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_bf = bf16_round(&q_data);
+        let k_bf = bf16_round(&k_data);
+        let v_bf = bf16_round(&v_data);
+
+        let seq_starts: Vec<usize> = cu_seqlens_q[..2].iter().map(|&v| v as usize).collect();
+        let q_real = &q_bf[..real_tokens * num_q * head_dim];
+        let k_real = &k_bf[..real_tokens * num_kv * head_dim];
+        let v_real = &v_bf[..real_tokens * num_kv * head_dim];
+        let mut output_cpu_real = vec![0.0_f32; real_tokens * num_q * head_dim];
+        cpu_golden::attention_prefill(
+            q_real,
+            k_real,
+            v_real,
+            &mut output_cpu_real,
+            &seq_starts,
+            num_q,
+            num_kv,
+            head_dim,
+            Llama32Probe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, bucket_m * num_q * head_dim);
+
+        let tol: f32 = 5e-2;
+        for i in 0..real_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu_real[i]).abs();
+            assert!(
+                diff < tol,
+                "sdpa_prefill_bf16_m64[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu_real[i],
+                diff
+            );
+        }
+
+        // Padding rows must be exactly 0 (kernel writes 0 for
+        // out-of-range Q tokens via the `in_range = false` branch).
+        for i in real_tokens * num_q * head_dim..bucket_m * num_q * head_dim {
+            assert_eq!(
+                output_metal[i], 0.0,
+                "sdpa_prefill padding row {} not zero (={})",
+                i / (num_q * head_dim),
+                output_metal[i]
             );
         }
     }

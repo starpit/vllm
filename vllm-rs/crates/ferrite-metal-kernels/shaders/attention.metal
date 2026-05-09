@@ -7,9 +7,18 @@
 //       `mlx/backend/metal/kernels/sdpa_vector.h`. Decode path.
 //   `attention_prefill_contiguous_f16/bf16_specialized` —
 //       LEGACY hand-written prefill SDPA. PENDING REPLACEMENT with
-//       MLX `steel/attn/` (full tiled SDPA). Currently produces
-//       MLX-equivalent output for short prefill + works in production,
-//       but is not a faithful MLX port.
+//       `attention_prefill_sdpa_v2_*` (faithful MLX `sdpa_vector`
+//       multi-Q port — same algorithm as the decode kernel,
+//       contiguous K/V access + causal mask + cu_seqlens_q lookup).
+//   `attention_prefill_sdpa_v2_f16/bf16_specialized` —
+//       Faithful MLX `sdpa_vector` port for prefill: 1 Q per
+//       threadgroup, dispatch `(num_q_heads, total_q, 1)` — Q on
+//       grid Y (sdpa_vector's natural shape) to keep grid X bounded
+//       by `num_q_heads`. Reads contiguous K/V from in-forward
+//       tiles indexed by `cu_seqlens_q`. Causal mask: K positions
+//       > q's position in sequence are skipped. Same online
+//       softmax + per-simdgroup combine as the decode kernel
+//       (`attention_via_cache_v2_*`).
 //
 // Function constant indices (must match `pipelines::constants_for`):
 //   0  ATTN_HEAD_DIM           uint
@@ -681,5 +690,324 @@ kernel void attention_prefill_contiguous_bf16_specialized(
             output[(global_q * num_q + q_head_idx) * head_dim + d] = bfloat(acc);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// attention_prefill_sdpa_v2 — faithful MLX sdpa_vector multi-Q port
+// ─────────────────────────────────────────────────────────────────────
+//
+// Structure mirrors `attention_via_cache_v2_*_specialized` (the decode
+// path). Differences vs decode:
+//
+//   1. K/V come from contiguous tiles `[total_kv, num_kv_heads,
+//      head_dim]`, not from `block_table`-indirected paged cache.
+//      Per-token offset is `(seq_start + i) * num_kv * head_dim +
+//      kv_head * head_dim` (vs paged decode's
+//      `physical_block * blk_stride + ...`).
+//   2. Multiple Q tokens via grid Y. Dispatch is `(num_q_heads,
+//      total_q, 1)` — head on X (small, ≤ 32) and Q on Y. Each
+//      threadgroup processes 1 Q token. Q-on-Y is MLX `sdpa_vector`'s
+//      natural shape (`tpg.y = q_seq_len`) and avoids grid-X >= 1024
+//      dispatch boundaries seen in the gemm port dead-end.
+//   3. cu_seqlens_q lookup per Q token to find its sequence and
+//      position-in-sequence — packed-batch friendly (variable-length
+//      sequences in one prefill).
+//   4. Causal mask in the K loop: a simdgroup whose K iteration index
+//      `i > q_pos_in_seq` skips entirely. (Simdgroup-uniform: `i` is
+//      derived from `simd_gid` which is uniform across the simdgroup,
+//      and `q_pos_in_seq` is uniform across the threadgroup.)
+//
+// Buffer bindings:
+//   buffer(0) = output       [total_q,  num_q_heads,  head_dim]
+//   buffer(1) = q            [total_q,  num_q_heads,  head_dim]
+//   buffer(2) = k            [total_kv, num_kv_heads, head_dim]
+//   buffer(3) = v            [total_kv, num_kv_heads, head_dim]
+//   buffer(4) = cu_seqlens_q [batch+1]
+//
+// Function constants 0..3: HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
+// ATTN_SCALE_FC. (No BLOCK_SIZE / MAX_BLOCKS_PER_SEQ — contiguous K/V
+// has no paging. No PREFILL_TILE_Q — sdpa_vector is canonically 1 Q
+// per TG.)
+//
+// Dispatch: threadgroups `(num_q_heads, total_q, 1)`, threads
+// `(1024, 1, 1)` = 32 simdgroups × 32 lanes (same as decode).
+//
+// Constraint: HEAD_DIM must be a multiple of 32 (qk_per_thread =
+// HEAD_DIM / 32). Llama-3.2 / Qwen / Mistral / Phi (HEAD_DIM ∈
+// {64, 96, 128, 256}) all satisfy.
+
+kernel void attention_prefill_sdpa_v2_f16_specialized(
+    device       half* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
+    device const half* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
+    device const half* k            [[buffer(2)]],   // [total_kv, num_kv_heads, head_dim]
+    device const half* v            [[buffer(3)]],   // [total_kv, num_kv_heads, head_dim]
+    device const uint* cu_seqlens_q [[buffer(4)]],   // [batch+1]
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const float scale      = ATTN_SCALE_FC;
+    const uint qk_per_thread = head_dim / uint(BD);
+
+    const uint q_head_idx  = tg_pos.x;            // 0..NUM_Q_HEADS
+    const uint global_q    = tg_pos.y;            // 0..total_q
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+
+    // Locate this Q token's sequence via cu_seqlens_q. Linear scan;
+    // batches are typically <= 32. Binary search is a perf follow-up.
+    uint seq_start = 0;
+    uint seq_end   = 0;
+    bool in_range  = false;
+    for (uint b = 0; b < 1024u; ++b) {
+        const uint lo = cu_seqlens_q[b];
+        const uint hi = cu_seqlens_q[b + 1];
+        if (global_q >= lo && global_q < hi) {
+            seq_start = lo;
+            seq_end   = hi;
+            in_range  = true;
+            break;
+        }
+        if (hi <= lo) break;       // sentinel: end of batch
+    }
+    if (!in_range) {
+        // Padding lane (global_q past the last sequence). Write zero
+        // to match the existing prefill kernel's padding behavior.
+        if (simd_lid == 0) {
+            device half* o_ptr =
+                output + (global_q * num_q + q_head_idx) * head_dim
+                       + simd_gid * qk_per_thread;
+            for (uint j = 0; j < qk_per_thread; ++j) o_ptr[j] = half(0);
+        }
+        return;
+    }
+
+    const uint q_pos_in_seq = global_q - seq_start;
+    const uint kv_len       = seq_end - seq_start;
+
+    // Per-thread Q + accumulators (qk_per_thread <= 8 for HEAD_DIM <= 256).
+    thread U q_reg[8];
+    thread U o_reg[8];
+
+    threadgroup U tg_outputs[BN * BD];
+    threadgroup U tg_max[BN];
+    threadgroup U tg_sum[BN];
+
+    device const half* q_row = q + (global_q * num_q + q_head_idx) * head_dim;
+    device       half* o_row = output + (global_q * num_q + q_head_idx) * head_dim;
+
+    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    U max_score = -FLT_MAX;
+    U sum_exp_score = 0;
+
+    // Online softmax. Each simdgroup `simd_gid` covers K tokens at
+    // indices simd_gid, simd_gid + BN, simd_gid + 2*BN, …
+    // Causal: skip K positions > q_pos_in_seq. Since `i` is uniform
+    // across the simdgroup (derived from simd_gid), the branch is
+    // simdgroup-uniform — simd_sum is called by all-or-none lanes.
+    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        if (i > q_pos_in_seq) continue;
+
+        const uint k_global = seq_start + i;
+        device const half* k_ptr =
+            k + (k_global * num_kv + kv_head_idx) * head_dim
+              + simd_lid * qk_per_thread;
+        device const half* v_ptr =
+            v + (k_global * num_kv + kv_head_idx) * head_dim
+              + simd_lid * qk_per_thread;
+
+        U score = 0;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            score += q_reg[j] * U(k_ptr[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
+        }
+    }
+
+    // Combine per-simdgroup partials (identical to decode kernel).
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U other_max = tg_max[simd_lid];
+    U global_max = simd_max(other_max);
+    U factor = metal::fast::exp(other_max - global_max);
+    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
+
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
+        U combined = simd_sum(val);
+        if (global_sum != 0) {
+            combined = combined / global_sum;
+        }
+        o_reg[j] = combined;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        device half* o_ptr = o_row + simd_gid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_ptr[j] = half(o_reg[j]);
+        }
+    }
+}
+
+/// BF16 sibling of `attention_prefill_sdpa_v2_f16_specialized`.
+/// Same algorithm; sole difference is the `bfloat`/`half` element
+/// type on the device pointers. f32 accumulator preserved.
+kernel void attention_prefill_sdpa_v2_bf16_specialized(
+    device       bfloat* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
+    device const bfloat* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
+    device const bfloat* k            [[buffer(2)]],   // [total_kv, num_kv_heads, head_dim]
+    device const bfloat* v            [[buffer(3)]],   // [total_kv, num_kv_heads, head_dim]
+    device const uint*   cu_seqlens_q [[buffer(4)]],   // [batch+1]
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const float scale      = ATTN_SCALE_FC;
+    const uint qk_per_thread = head_dim / uint(BD);
+
+    const uint q_head_idx  = tg_pos.x;
+    const uint global_q    = tg_pos.y;
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+
+    uint seq_start = 0;
+    uint seq_end   = 0;
+    bool in_range  = false;
+    for (uint b = 0; b < 1024u; ++b) {
+        const uint lo = cu_seqlens_q[b];
+        const uint hi = cu_seqlens_q[b + 1];
+        if (global_q >= lo && global_q < hi) {
+            seq_start = lo;
+            seq_end   = hi;
+            in_range  = true;
+            break;
+        }
+        if (hi <= lo) break;
+    }
+    if (!in_range) {
+        if (simd_lid == 0) {
+            device bfloat* o_ptr =
+                output + (global_q * num_q + q_head_idx) * head_dim
+                       + simd_gid * qk_per_thread;
+            for (uint j = 0; j < qk_per_thread; ++j) o_ptr[j] = bfloat(0);
+        }
+        return;
+    }
+
+    const uint q_pos_in_seq = global_q - seq_start;
+    const uint kv_len       = seq_end - seq_start;
+
+    thread U q_reg[8];
+    thread U o_reg[8];
+
+    threadgroup U tg_outputs[BN * BD];
+    threadgroup U tg_max[BN];
+    threadgroup U tg_sum[BN];
+
+    device const bfloat* q_row = q + (global_q * num_q + q_head_idx) * head_dim;
+    device       bfloat* o_row = output + (global_q * num_q + q_head_idx) * head_dim;
+
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    U max_score = -FLT_MAX;
+    U sum_exp_score = 0;
+
+    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        if (i > q_pos_in_seq) continue;
+
+        const uint k_global = seq_start + i;
+        device const bfloat* k_ptr =
+            k + (k_global * num_kv + kv_head_idx) * head_dim
+              + simd_lid * qk_per_thread;
+        device const bfloat* v_ptr =
+            v + (k_global * num_kv + kv_head_idx) * head_dim
+              + simd_lid * qk_per_thread;
+
+        U score = 0;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            score += q_reg[j] * U(k_ptr[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
+        }
+    }
+
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U other_max = tg_max[simd_lid];
+    U global_max = simd_max(other_max);
+    U factor = metal::fast::exp(other_max - global_max);
+    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
+
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
+        U combined = simd_sum(val);
+        if (global_sum != 0) {
+            combined = combined / global_sum;
+        }
+        o_reg[j] = combined;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        device bfloat* o_ptr = o_row + simd_gid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_ptr[j] = bfloat(o_reg[j]);
+        }
     }
 }

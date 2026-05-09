@@ -532,19 +532,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ) -> Result<R, ForwardError> {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
 
-        // Lazily attach the allocator's residency set to the queue on
-        // the first forward — Metal's `addResidencySet` is idempotent
-        // per (queue, set) pair, but we still gate with an atomic
-        // bool so we don't flood the driver with duplicate calls
-        // across thousands of forwards. The pool only ever sees one
-        // queue (the one on `GpuDevice`), so wire-once-and-cache is
-        // safe here. `ferrite_worker::initialize_cache` may have
-        // already attached the same set when wiring KV-cache buffers;
-        // the second attach from here is a no-op in that case.
+        // Lazily commit + attach the allocator's residency set on the
+        // first forward — both calls are idempotent per (queue, set),
+        // but we gate with an atomic bool to avoid flooding the
+        // driver with duplicate calls across thousands of forwards.
+        // The pool only ever sees one queue (the one on `GpuDevice`),
+        // so wire-once-and-cache is safe.
+        //
+        // commit() applies any inserts queued by `register_mmap` /
+        // arena push / `ferrite_worker::initialize_cache`'s KV-cache
+        // wiring (~125ms on Llama-3.2-3B's 4.7 GB KV pool). Done
+        // here rather than in init_cache so it overlaps with the
+        // pool build / first-dispatch encoding instead of blocking
+        // the engine init path.
         if !self
             .residency_attached
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
+            self.allocator.residency().commit();
             self.allocator.residency().attach_to_queue(queue);
         }
 

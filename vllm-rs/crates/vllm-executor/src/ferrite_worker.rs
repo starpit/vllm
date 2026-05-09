@@ -9625,20 +9625,17 @@ impl Worker for FerriteWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
-        let dt_pool = t_pool.elapsed();
-        let t_commit = std::time::Instant::now();
-        residency.commit();
         info!(
-            "FerriteWorker(metal): init_cache phases — KvCachePool::new(56 buffers) {:?}, residency.commit() {:?}",
-            dt_pool,
-            t_commit.elapsed(),
+            "FerriteWorker(metal): init_cache phases — KvCachePool::new(56 buffers) {:?} (residency.commit deferred to first forward)",
+            t_pool.elapsed(),
         );
         // Attach the shared residency set to the device's queue so
         // every cmdbuf sees both arenas + KV-cache as wired. The
-        // pool's lazy attach in `forward()` re-attaches the same set
-        // (idempotent per (queue, set) pair) — it's safe but redundant
-        // once we've attached here.
-        residency.attach_to_queue(&device.queue);
+        // pool's lazy attach in `forward()` will commit the queued
+        // KV inserts and attach the set on the first forward — moves
+        // ~125ms of residency.commit() out of the init path. Attach
+        // is idempotent per (queue, set) so the lazy path is safe
+        // even if some other call has already attached.
 
         info!(
             "FerriteWorker(metal): KV cache initialized: {} layers × {} blocks × {} tokens",

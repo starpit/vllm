@@ -1476,7 +1476,7 @@ mod tests {
         Binding, DispatchShape, LoweredCommand, RuntimeBindingKind, WeightBundleKind, WeightTensor,
     };
     use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
-    use ferrite_kernels::layers::{Embedding, Linear, LinearLayer, RmsNorm};
+    use ferrite_kernels::layers::{Linear, LinearLayer, RmsNorm};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
     use std::sync::Arc;
 
@@ -1486,7 +1486,6 @@ mod tests {
     struct TestWeights {
         rmsnorm_layer: RmsNorm,
         linear_layer: LinearLayer,
-        embedding_layer: Embedding,
     }
     impl CanonicalParams for TestWeights {
         const HEAD_DIM: u32 = 64;
@@ -1521,9 +1520,6 @@ mod tests {
     }
     fn linear_thunk(w: &TestWeights, _layer: u32) -> &LinearLayer {
         &w.linear_layer
-    }
-    fn _embedding_thunk(w: &TestWeights, _layer: u32) -> &Embedding {
-        &w.embedding_layer
     }
 
     /// Build a `TestWeights` + the `MetalAllocator` that owns its
@@ -1568,21 +1564,9 @@ mod tests {
             )
         };
 
-        // Embedding weight: [vocab=128, hidden=Q_SIZE] f16. Tiny vocab
-        // — embedding tests don't exercise vocab-size correctness.
-        let embedding_bytes = vec![0u8; 128 * TestWeights::Q_SIZE * 2];
-        let embedding_ptr = unsafe {
-            allocator
-                .alloc_and_copy_host(embedding_bytes.as_ptr(), embedding_bytes.len())
-                .expect("embedding tensor")
-        };
-        let embedding_tensor =
-            unsafe { GpuTensor::new(embedding_ptr, &[128, TestWeights::Q_SIZE], DType::F16) };
-
         let weights = Arc::new(TestWeights {
             rmsnorm_layer: RmsNorm::new(rmsnorm_tensor, 1e-5),
             linear_layer: LinearLayer::Dense(Linear::new(linear_tensor, None)),
-            embedding_layer: Embedding::new(embedding_tensor),
         });
         (weights, Arc::new(allocator))
     }

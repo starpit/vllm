@@ -1228,9 +1228,11 @@ mod tests {
         enc.set_buffer(3, Some(&block_table_buf), 0);
         enc.set_buffer(4, Some(&kv_k_buf), 0);
         enc.set_buffer(5, Some(&kv_v_buf), 0);
+        // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
+        // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatch_thread_groups(
             MTLSize::new(batch as u64, num_q as u64, 1),
-            MTLSize::new(head_dim as u64, 1, 1),
+            MTLSize::new(1024, 1, 1),
         );
         enc.end_encoding();
         cb.commit();
@@ -1815,10 +1817,11 @@ mod tests {
         enc.set_buffer(3, Some(&block_table_buf), 0);
         enc.set_buffer(4, Some(&kv_k_buf), 0);
         enc.set_buffer(5, Some(&kv_v_buf), 0);
-        // Match the runtime's lowering: (HEAD_DIM, 1, 1) threads/tg.
+        // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
+        // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatch_thread_groups(
             MTLSize::new(batch as u64, num_q as u64, 1),
-            MTLSize::new(head_dim as u64, 1, 1),
+            MTLSize::new(1024, 1, 1),
         );
         enc.end_encoding();
         cb.commit();
@@ -2003,10 +2006,11 @@ mod tests {
         enc.set_buffer(3, Some(&block_table_buf), 0);
         enc.set_buffer(4, Some(&kv_k_buf), 0);
         enc.set_buffer(5, Some(&kv_v_buf), 0);
-        // Match the runtime's lowering: (HEAD_DIM, 1, 1) threads/tg.
+        // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
+        // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatch_thread_groups(
             MTLSize::new(batch as u64, num_q as u64, 1),
-            MTLSize::new(head_dim as u64, 1, 1),
+            MTLSize::new(1024, 1, 1),
         );
         enc.end_encoding();
         cb.commit();

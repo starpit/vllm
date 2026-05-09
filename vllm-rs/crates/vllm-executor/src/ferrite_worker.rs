@@ -9602,6 +9602,7 @@ impl Worker for FerriteWorker {
         // attention reads race against the pager.
         let residency = device.allocator.residency().clone();
 
+        let t_pool = std::time::Instant::now();
         let pool = unsafe {
             KvCachePool::new(
                 model.num_hidden_layers() as usize,
@@ -9624,7 +9625,14 @@ impl Worker for FerriteWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
+        let dt_pool = t_pool.elapsed();
+        let t_commit = std::time::Instant::now();
         residency.commit();
+        info!(
+            "FerriteWorker(metal): init_cache phases — KvCachePool::new(56 buffers) {:?}, residency.commit() {:?}",
+            dt_pool,
+            t_commit.elapsed(),
+        );
         // Attach the shared residency set to the device's queue so
         // every cmdbuf sees both arenas + KV-cache as wired. The
         // pool's lazy attach in `forward()` re-attaches the same set

@@ -158,12 +158,24 @@ impl CpuTensorRef {
 /// This is a free function (not `&mut self`) so it can be called from parallel
 /// threads during multi-shard loading.
 fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)> {
+    let _t_total = std::time::Instant::now();
+    let _t_open = std::time::Instant::now();
     let file = std::fs::File::open(path)?;
     let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }?);
+    let _dt_open = _t_open.elapsed();
 
     // Tell the kernel to start paging in the entire shard from disk.
-    // This overlaps disk I/O with header parsing and subsequent shard loads.
-    #[cfg(unix)]
+    // Cuda backend wants the async readahead — overlaps disk I/O
+    // with header parsing and subsequent shard loads, and the H2D
+    // copy that follows reads from the mmap pages.
+    //
+    // Metal skips this: macOS's MADV_WILLNEED is **synchronous** for
+    // large ranges (measured 152ms for a 5GB shard, vs 30µs for the
+    // mmap itself). MLX doesn't call it either; the kernel's own
+    // demand-paging handles first-touch on the gate_up pack memcpy
+    // and shader bindings without measurable cost.
+    let _t_madv = std::time::Instant::now();
+    #[cfg(all(unix, feature = "cuda"))]
     unsafe {
         libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
@@ -177,10 +189,14 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
             libc::MADV_SEQUENTIAL,
         );
     }
+    let _dt_madv = _t_madv.elapsed();
 
     // Parse safetensors header to find tensor offsets.
+    let _t_des = std::time::Instant::now();
     let st = safetensors::SafeTensors::deserialize(&mmap)
         .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
+    let _dt_des = _t_des.elapsed();
+    let _t_iter = std::time::Instant::now();
 
     let mut tensors = HashMap::new();
     for name in st.names() {
@@ -208,9 +224,14 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
     }
 
     tracing::info!(
-        "Parsed shard {}: {} tensors (mmap + madvise WILLNEED)",
+        "Parsed shard {}: {} tensors in {:?} (open+mmap {:?}, madvise {:?}, deserialize {:?}, iterate {:?})",
         path.display(),
         tensors.len(),
+        _t_total.elapsed(),
+        _dt_open,
+        _dt_madv,
+        _dt_des,
+        _t_iter.elapsed(),
     );
 
     Ok((tensors, mmap))

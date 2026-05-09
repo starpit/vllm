@@ -472,18 +472,18 @@ fn lower_one<W: CanonicalParams>(
         }
 
         // ── Prefill-bucket attention (contiguous Q/K/V tiles) ──────
-        // FERRITE_METAL_PREFILL_KERNEL=sdpa flips to the faithful MLX
-        // sdpa_vector multi-Q port (`attention_prefill_sdpa_v2_*`).
-        // Default stays on the legacy hand-written kernel
-        // (`attention_prefill_contiguous_*`) until e2e smoke confirms
-        // sdpa parity. Both kernels share the same lowering source —
-        // `Instruction::AttentionPrefillContiguous` — and the worker
-        // selects between them via this env-var-gated dispatch.
+        // Default routes to the faithful MLX sdpa_vector multi-Q port
+        // (`attention_prefill_sdpa_v2_*`); validated bit-coherent with
+        // the legacy kernel on Llama-3.2-3B end-to-end. Set
+        // `FERRITE_METAL_PREFILL_KERNEL=legacy` for the legacy
+        // hand-written kernel (`attention_prefill_contiguous_*`) as a
+        // bisect / regression fallback. Both kernels stay compiled
+        // into the AoT metallib; the picker is per-tape-build.
         I::AttentionPrefillContiguous(q_slot, k_slot, v_slot, out_slot, _is_causal) => {
             let n_q_heads = W::NUM_Q_HEADS;
             let use_sdpa = std::env::var("FERRITE_METAL_PREFILL_KERNEL")
-                .map(|v| v == "sdpa")
-                .unwrap_or(false);
+                .map(|v| v != "legacy")
+                .unwrap_or(true);
             if use_sdpa {
                 LoweredCommand {
                     kernel: KernelId::AttentionPrefillSdpa,

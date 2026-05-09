@@ -161,6 +161,17 @@ fn kernel_msl_names(
         (KernelId::AttentionPrefillSdpa, MetalDtype::Bf16) => {
             ("attention", "attention_prefill_sdpa_v2_bf16_specialized")
         }
+        // Paged-cache variant — K/V via block_table (mirrors decode).
+        // Required for chunked prefill / prefix caching / mixed
+        // prefill+decode batches / multi-turn chat.
+        (KernelId::AttentionPrefillSdpaPaged, MetalDtype::F16) => (
+            "attention",
+            "attention_prefill_sdpa_v2_paged_f16_specialized",
+        ),
+        (KernelId::AttentionPrefillSdpaPaged, MetalDtype::Bf16) => (
+            "attention",
+            "attention_prefill_sdpa_v2_paged_bf16_specialized",
+        ),
         (KernelId::Add, MetalDtype::F16) => ("elementwise", "residual_add_f16_specialized"),
         (KernelId::Add, MetalDtype::Bf16) => ("elementwise", "residual_add_bf16_specialized"),
         (KernelId::ScalarMul, MetalDtype::F16) => ("elementwise", "scalar_mul_f16_specialized"),
@@ -244,6 +255,17 @@ pub fn constants_for<W: CanonicalParams>(
             ConstantValue::uint(1, W::NUM_Q_HEADS),
             ConstantValue::uint(2, W::NUM_KV_HEADS),
             ConstantValue::float(3, W::ATTN_SCALE),
+        ],
+        // Paged variant — same 0..3 base set as AttentionPrefillSdpa
+        // PLUS BLOCK_SIZE / MAX_BLOCKS_PER_SEQ at indices 4/5 (paging
+        // strides), matching AttentionViaCache.
+        KernelId::AttentionPrefillSdpaPaged => vec![
+            ConstantValue::uint(0, W::HEAD_DIM),
+            ConstantValue::uint(1, W::NUM_Q_HEADS),
+            ConstantValue::uint(2, W::NUM_KV_HEADS),
+            ConstantValue::float(3, W::ATTN_SCALE),
+            ConstantValue::uint(4, W::BLOCK_SIZE),
+            ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
         ],
         KernelId::Add | KernelId::ScalarMul => Vec::new(),
         // GEMM: only the bf16 (custom) path uses function constants.
@@ -3120,6 +3142,395 @@ mod tests {
                 "sdpa_prefill padding row {} not zero (={})",
                 i / (num_q * head_dim),
                 output_metal[i]
+            );
+        }
+    }
+
+    /// `attention_prefill_sdpa_v2_paged_bf16_specialized` against
+    /// `cpu_golden::attention_prefill_paged`. Llama-3.2-3B shapes
+    /// (HEAD_DIM=128, 24 q heads / 8 kv heads). Single sequence with a
+    /// 4-token prefix already in the paged cache and 2 new tokens
+    /// being prefilled (mimicking the chunked-prefill / prefix-cache
+    /// hit case the contiguous prefill kernel cannot handle).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_sdpa_paged_bf16_matches_cpu_golden_llama32() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+        let block_size = Llama32Probe::BLOCK_SIZE as usize;
+        let max_blocks_per_seq = Llama32Probe::MAX_BLOCKS_PER_SEQ as usize;
+
+        // Scenario: 1 sequence with 4 tokens of prefix already cached
+        // and 2 new tokens being prefilled in this step.
+        let prefix_len: usize = 4;
+        let new_tokens: usize = 2;
+        let total_kv: usize = prefix_len + new_tokens;     // 6
+        let bucket_m: usize = 16;                          // pad new Q to 16
+        let mut cu_seqlens_q: Vec<u32> = vec![0; bucket_m + 2];
+        cu_seqlens_q[1] = new_tokens as u32;
+        let seq_used_k: Vec<u32> = vec![total_kv as u32];
+
+        // Single physical block at index 0; rest of block_table is
+        // filler. (kv_len <= block_size, so only one block needed.)
+        assert!(total_kv <= block_size);
+        let mut block_table: Vec<u32> = vec![0; max_blocks_per_seq];
+        block_table[0] = 0;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::AttentionPrefillSdpaPaged,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_prefill_sdpa_paged bf16 pipeline");
+
+        // Q for the new tokens (the kernel only reads Q for
+        // global_q < cu_seqlens_q.last(); pad bucket lanes get zero
+        // out from the in_range branch).
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        // Cache holds K/V for ALL `total_kv` positions in the single
+        // block. Block layout: [num_blocks, num_kv_heads, BLOCK_SIZE,
+        // HEAD_DIM]. Tokens past `total_kv` in the block are unused
+        // (kernel never reads them — its loop bound is kv_len).
+        let cache_elts = 1 * num_kv * block_size * head_dim;
+        let k_cache_data: Vec<f32> = (0..cache_elts)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_cache_data: Vec<f32> = (0..cache_elts)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let seq_used_k_buf = alloc_u32(&device, &seq_used_k);
+        let block_table_buf = alloc_u32(&device, &block_table);
+        let k_cache_buf = alloc_bf16(&device, &k_cache_data);
+        let v_cache_buf = alloc_bf16(&device, &v_cache_data);
+        let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&cu_buf), 0);
+        enc.set_buffer(3, Some(&seq_used_k_buf), 0);
+        enc.set_buffer(4, Some(&block_table_buf), 0);
+        enc.set_buffer(5, Some(&k_cache_buf), 0);
+        enc.set_buffer(6, Some(&v_cache_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q as u64, bucket_m as u64, 1),
+            MTLSize::new(1024, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_bf = bf16_round(&q_data);
+        let k_cache_bf = bf16_round(&k_cache_data);
+        let v_cache_bf = bf16_round(&v_cache_data);
+
+        // Build the cpu reference output. The kernel only writes for
+        // global_q < new_tokens, so we only check those rows.
+        let mut output_cpu = vec![0.0_f32; bucket_m * num_q * head_dim];
+        cpu_golden::attention_prefill_paged(
+            &q_bf,
+            &k_cache_bf,
+            &v_cache_bf,
+            &mut output_cpu,
+            &cu_seqlens_q,
+            &seq_used_k,
+            &block_table,
+            num_q,
+            num_kv,
+            head_dim,
+            block_size,
+            max_blocks_per_seq,
+            Llama32Probe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, bucket_m * num_q * head_dim);
+
+        let tol: f32 = 5e-2;
+        for i in 0..new_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            assert!(
+                diff < tol,
+                "sdpa_paged_bf16_l32[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+
+        // Padding rows must be exactly 0 (kernel's in_range=false
+        // branch writes zero).
+        for i in new_tokens * num_q * head_dim..bucket_m * num_q * head_dim {
+            assert_eq!(
+                output_metal[i], 0.0,
+                "sdpa_paged padding row {} not zero (={})",
+                i / (num_q * head_dim),
+                output_metal[i]
+            );
+        }
+    }
+
+    /// Sanity check: when `prefix_len == 0`, the paged kernel must
+    /// produce the same output as the contiguous sdpa prefill kernel
+    /// (modulo the K/V layout — paged cache vs in-forward tile).
+    /// Catches regressions where the prefix-offset arithmetic
+    /// `q_abs_pos = (kv_len - new_q_for_seq) + q_pos_in_new` evaluates
+    /// to something other than `q_pos_in_new` when `prefix_len == 0`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attention_prefill_sdpa_paged_bf16_zero_prefix_matches_contiguous() {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use half::bf16;
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache =
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders");
+        let pipelines = SpecializedPipelines::new(std::sync::Arc::new(cache));
+
+        let head_dim = Llama32Probe::HEAD_DIM as usize;
+        let num_q = Llama32Probe::NUM_Q_HEADS as usize;
+        let num_kv = Llama32Probe::NUM_KV_HEADS as usize;
+        let block_size = Llama32Probe::BLOCK_SIZE as usize;
+        let max_blocks_per_seq = Llama32Probe::MAX_BLOCKS_PER_SEQ as usize;
+
+        // 0-prefix case: kv_len == new_tokens. Kernel should produce
+        // the same output as the contiguous prefill kernel given
+        // equivalent K/V data.
+        let prefix_len: usize = 0;
+        let new_tokens: usize = 3;
+        let total_kv: usize = prefix_len + new_tokens;     // 3
+        let bucket_m: usize = 16;
+        let mut cu_seqlens_q: Vec<u32> = vec![0; bucket_m + 2];
+        cu_seqlens_q[1] = new_tokens as u32;
+        let seq_used_k: Vec<u32> = vec![total_kv as u32];
+
+        assert!(total_kv <= block_size);
+        let mut block_table: Vec<u32> = vec![0; max_blocks_per_seq];
+        block_table[0] = 0;
+
+        let pipeline = pipelines
+            .pipeline_for_dtype::<Llama32Probe>(
+                KernelId::AttentionPrefillSdpaPaged,
+                bucket_m as u32,
+                MetalDtype::Bf16,
+            )
+            .expect("attention_prefill_sdpa_paged bf16 pipeline");
+
+        let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
+            .map(|i| ((i as f32) * 0.011).sin() * 0.5)
+            .collect();
+        let cache_elts = 1 * num_kv * block_size * head_dim;
+        let k_cache_data: Vec<f32> = (0..cache_elts)
+            .map(|i| ((i as f32) * 0.017).cos() * 0.5)
+            .collect();
+        let v_cache_data: Vec<f32> = (0..cache_elts)
+            .map(|i| ((i as f32) * 0.023).sin() * 0.5)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
+            let bytes = std::mem::size_of_val(data);
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
+            let bytes = (n * std::mem::size_of::<bf16>()).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let q_buf = alloc_bf16(&device, &q_data);
+        let cu_buf = alloc_u32(&device, &cu_seqlens_q);
+        let seq_used_k_buf = alloc_u32(&device, &seq_used_k);
+        let block_table_buf = alloc_u32(&device, &block_table);
+        let k_cache_buf = alloc_bf16(&device, &k_cache_data);
+        let v_cache_buf = alloc_bf16(&device, &v_cache_data);
+        let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&q_buf), 0);
+        enc.set_buffer(2, Some(&cu_buf), 0);
+        enc.set_buffer(3, Some(&seq_used_k_buf), 0);
+        enc.set_buffer(4, Some(&block_table_buf), 0);
+        enc.set_buffer(5, Some(&k_cache_buf), 0);
+        enc.set_buffer(6, Some(&v_cache_buf), 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_q as u64, bucket_m as u64, 1),
+            MTLSize::new(1024, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let bf16_round = |data: &[f32]| -> Vec<f32> {
+            data.iter().map(|&v| bf16::from_f32(v).to_f32()).collect()
+        };
+        let q_bf = bf16_round(&q_data);
+        let k_cache_bf = bf16_round(&k_cache_data);
+        let v_cache_bf = bf16_round(&v_cache_data);
+
+        // For the 0-prefix case, the cpu_golden contiguous prefill
+        // helper produces the same output IF we feed it the same
+        // K/V the cache holds for positions [0, new_tokens). Pull
+        // those out of the block-laid cache.
+        let mut k_contig = vec![0.0_f32; new_tokens * num_kv * head_dim];
+        let mut v_contig = vec![0.0_f32; new_tokens * num_kv * head_dim];
+        for t in 0..new_tokens {
+            for kv_h in 0..num_kv {
+                let cache_base = 0 * num_kv * block_size * head_dim
+                    + kv_h * block_size * head_dim
+                    + t * head_dim;
+                let contig_base = t * num_kv * head_dim + kv_h * head_dim;
+                for d in 0..head_dim {
+                    k_contig[contig_base + d] = k_cache_bf[cache_base + d];
+                    v_contig[contig_base + d] = v_cache_bf[cache_base + d];
+                }
+            }
+        }
+        let q_real = &q_bf[..new_tokens * num_q * head_dim];
+        let seq_starts: Vec<usize> = vec![0, new_tokens];
+        let mut output_cpu_real = vec![0.0_f32; new_tokens * num_q * head_dim];
+        cpu_golden::attention_prefill(
+            q_real,
+            &k_contig,
+            &v_contig,
+            &mut output_cpu_real,
+            &seq_starts,
+            num_q,
+            num_kv,
+            head_dim,
+            Llama32Probe::ATTN_SCALE,
+        );
+
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = read_bf16(&output_buf, bucket_m * num_q * head_dim);
+
+        let tol: f32 = 5e-2;
+        for i in 0..new_tokens * num_q * head_dim {
+            let diff = (output_metal[i] - output_cpu_real[i]).abs();
+            assert!(
+                diff < tol,
+                "paged-zero-prefix[{i}] (row {} head {} dim {}) metal={} cpu={} diff={}",
+                i / (num_q * head_dim),
+                (i / head_dim) % num_q,
+                i % head_dim,
+                output_metal[i],
+                output_cpu_real[i],
+                diff
             );
         }
     }

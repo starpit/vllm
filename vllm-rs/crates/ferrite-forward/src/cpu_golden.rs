@@ -587,6 +587,122 @@ pub fn attention_prefill(
     }
 }
 
+/// Paged-cache prefill attention (variable-length sequences with prior
+/// cached prefix).
+///
+/// Mirrors `attention_prefill_sdpa_v2_paged_{f16,bf16}_specialized`
+/// (`shaders/attention.metal`). Same per-Q causal SDPA as
+/// `attention_prefill` but K/V come from the paged cache via
+/// `block_table` (mirroring `attention_via_cache`'s decode access),
+/// and the K-axis covers the FULL `seq_used_k[seq]` rather than only
+/// the new tokens.
+///
+/// Layout conventions (must match the Metal shader):
+/// - `q`: `[total_q, num_q_heads, head_dim]` row-major.
+/// - `kv_cache_k`, `kv_cache_v`: `[num_blocks, num_kv_heads,
+///   block_size, head_dim]` row-major.
+/// - `block_table`: `[batch, max_blocks_per_seq]` row-major u32.
+/// - `seq_used_k`: `[batch]` u32 — TOTAL cached K per sequence
+///   (prefix + just-appended new tokens). Caller is responsible for
+///   running `RopeAppend` first so the new K is in cache before this
+///   attention call.
+/// - `cu_seqlens_q`: `[batch+1]` u32 — cumulative new-token boundaries.
+/// - `output`: `[total_q, num_q_heads, head_dim]` row-major.
+///
+/// The per-Q absolute K position is
+/// `q_abs_pos = (seq_used_k[seq] - new_q_for_seq) + q_pos_in_new`,
+/// where `new_q_for_seq = cu_seqlens_q[seq+1] - cu_seqlens_q[seq]` and
+/// `q_pos_in_new = global_q - cu_seqlens_q[seq]`. K positions
+/// `> q_abs_pos` are masked out (causal).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prefill_paged(
+    q: &[f32],
+    kv_cache_k: &[f32],
+    kv_cache_v: &[f32],
+    output: &mut [f32],
+    cu_seqlens_q: &[u32],
+    seq_used_k: &[u32],
+    block_table: &[u32],
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    attn_scale: f32,
+) {
+    let batch = seq_used_k.len();
+    assert!(cu_seqlens_q.len() >= batch + 1);
+    assert_eq!(block_table.len(), batch * max_blocks_per_seq);
+    let kv_block_stride = num_kv_heads * block_size * head_dim;
+    assert_eq!(kv_cache_k.len() % kv_block_stride, 0);
+    assert_eq!(kv_cache_v.len(), kv_cache_k.len());
+    let group_ratio = num_q_heads / num_kv_heads;
+
+    for seq in 0..batch {
+        let seq_start = cu_seqlens_q[seq] as usize;
+        let seq_end = cu_seqlens_q[seq + 1] as usize;
+        let new_q_for_seq = seq_end - seq_start;
+        if new_q_for_seq == 0 {
+            continue;
+        }
+        let kv_len = seq_used_k[seq] as usize;
+        let prefix_len = kv_len - new_q_for_seq;
+        let row_blocks =
+            &block_table[seq * max_blocks_per_seq..(seq + 1) * max_blocks_per_seq];
+
+        for q_pos_in_new in 0..new_q_for_seq {
+            let global_q = seq_start + q_pos_in_new;
+            let q_abs_pos = prefix_len + q_pos_in_new;
+            let attend_len = q_abs_pos + 1;
+
+            for h in 0..num_q_heads {
+                let kv_h = h / group_ratio;
+                let q_off = global_q * num_q_heads * head_dim + h * head_dim;
+
+                let mut scores = vec![0.0_f32; attend_len];
+                for t in 0..attend_len {
+                    let logical_block = t / block_size;
+                    let block_offset = t % block_size;
+                    let physical_block = row_blocks[logical_block] as usize;
+                    let k_base = physical_block * kv_block_stride
+                        + kv_h * block_size * head_dim
+                        + block_offset * head_dim;
+                    let mut dot = 0.0_f32;
+                    for d in 0..head_dim {
+                        dot += q[q_off + d] * kv_cache_k[k_base + d];
+                    }
+                    scores[t] = dot * attn_scale;
+                }
+
+                let max_score =
+                    scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0_f32;
+                for s in &mut scores {
+                    *s = (*s - max_score).exp();
+                    sum_exp += *s;
+                }
+                for s in &mut scores {
+                    *s /= sum_exp;
+                }
+
+                for d in 0..head_dim {
+                    let mut val = 0.0_f32;
+                    for t in 0..attend_len {
+                        let logical_block = t / block_size;
+                        let block_offset = t % block_size;
+                        let physical_block = row_blocks[logical_block] as usize;
+                        let v_base = physical_block * kv_block_stride
+                            + kv_h * block_size * head_dim
+                            + block_offset * head_dim;
+                        val += scores[t] * kv_cache_v[v_base + d];
+                    }
+                    output[q_off + d] = val;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

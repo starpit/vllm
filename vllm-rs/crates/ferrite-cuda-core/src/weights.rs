@@ -701,6 +701,12 @@ impl GpuWeights {
         for result in shard_results {
             let (shard_tensors, mmap) = result?;
             tensors.extend(shard_tensors);
+            // Register every shard's mmap with the allocator so
+            // metal `take()` can alias the safetensors pages directly
+            // (zero-copy weight load). No-op under cuda — only the
+            // `MetalAllocator` exposes `register_mmap`.
+            #[cfg(feature = "metal")]
+            allocator.register_mmap(Arc::clone(&mmap));
             mmaps.push(mmap);
         }
 
@@ -723,6 +729,10 @@ impl GpuWeights {
     fn load_shard(&mut self, path: &Path) -> Result<()> {
         let (shard_tensors, mmap) = load_shard_into_map(path)?;
         self.tensors.extend(shard_tensors);
+        // Register the mmap with the allocator so metal `take()` can
+        // alias the safetensors pages directly. No-op under cuda.
+        #[cfg(feature = "metal")]
+        self.allocator.register_mmap(Arc::clone(&mmap));
         self._mmaps.push(mmap);
         Ok(())
     }

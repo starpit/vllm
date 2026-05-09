@@ -57,6 +57,31 @@ struct MetalArena {
 unsafe impl Send for MetalArena {}
 unsafe impl Sync for MetalArena {}
 
+/// Zero-copy mmap region wrapped in an `MTLBuffer` via
+/// `newBufferWithBytesNoCopy`. Registered up-front by `register_mmap`
+/// (called once per safetensors shard), then consulted by
+/// [`MetalAllocator::alloc_and_copy_host`] to short-circuit the arena
+/// memcpy when the source pointer falls inside the mmap.
+///
+/// The `_mmap` `Arc` is what keeps the mapped pages alive — Metal's
+/// `newBufferWithBytesNoCopy` takes a deallocator block of `None`,
+/// meaning the buffer does NOT free the bytes; we own the lifetime.
+struct MmapRegion {
+    /// `mmap.as_ptr()` — page-aligned start of the mapped file.
+    base: *const u8,
+    /// File length (NOT the page-aligned virtual region length).
+    /// Bounds checks against this so a stray pointer past EOF doesn't
+    /// resolve to a buffer offset.
+    len: usize,
+    /// `MTLBuffer` aliasing `[base, base + page_align(len))`. Cheap
+    /// ObjC-retained handle — clones share the underlying buffer.
+    buffer: Buffer,
+    _mmap: Arc<memmap2::Mmap>,
+}
+
+unsafe impl Send for MmapRegion {}
+unsafe impl Sync for MmapRegion {}
+
 /// Metal-backed [`DeviceAllocator`]. Holds a `Device` handle and a
 /// shared `Vec<MetalArena>` — one per ~256 MB arena. Allocations are
 /// served from the current arena until full, then a new arena is
@@ -90,6 +115,14 @@ pub struct MetalAllocator {
     /// macOS < 15. Created in [`Self::new`] so existing arenas are
     /// pinned automatically as they are pushed.
     residency: ferrite_metal_kernels::residency::MetalResidencySet,
+    /// Zero-copy mmap regions registered via [`Self::register_mmap`].
+    /// Consulted before the bump arena in
+    /// [`Self::alloc_and_copy_host`] — if the source pointer falls
+    /// inside one of these regions, the upload is a no-op and we
+    /// return the source pointer unchanged. MLX uses the same trick
+    /// for safetensors-backed arrays; matches "memcpy-free weight
+    /// load" in the vllm-mlx startup path.
+    mmaps: Arc<Mutex<Vec<MmapRegion>>>,
 }
 
 unsafe impl Send for MetalAllocator {}
@@ -106,6 +139,7 @@ impl Clone for MetalAllocator {
             // the underlying `MTLResidencySet*` so every clone of the
             // allocator pins into the same set.
             residency: self.residency.clone(),
+            mmaps: Arc::clone(&self.mmaps),
         }
     }
 }
@@ -123,6 +157,7 @@ impl MetalAllocator {
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
+            mmaps: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -137,6 +172,7 @@ impl MetalAllocator {
             chunk_bytes,
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
+            mmaps: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -176,25 +212,105 @@ impl MetalAllocator {
         &self.device
     }
 
-    /// Look up the arena buffer containing `ptr` and return
+    /// Look up the buffer containing `ptr` and return
     /// `(buffer, offset)` suitable for `set_buffer(...)`. Returns
-    /// `None` if `ptr` is not within any arena (caller bug —
-    /// raw-pointer parameters never crossed this allocator).
+    /// `None` if `ptr` is not within any registered mmap region or
+    /// any arena (caller bug — raw-pointer parameters never crossed
+    /// this allocator).
+    ///
+    /// mmap regions are checked first because the zero-copy weight
+    /// path (registered via [`Self::register_mmap`]) puts every
+    /// safetensors-backed weight pointer into one of them. The arena
+    /// fallback covers cast-scratch slow-path uploads (F32→BF16) and
+    /// transient loader-allocated tensors (RotaryCache, etc.).
     ///
     /// Returns an owned `Buffer` (refcounted ObjC handle, cheap to
     /// clone) so the caller doesn't have to thread the allocator's
     /// `Mutex` lock guard through the dispatch pipeline.
     pub fn buffer_for(&self, ptr: *const u8) -> Option<(Buffer, u64)> {
+        let p = ptr as usize;
+        {
+            let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+            for region in mmaps.iter() {
+                let start = region.base as usize;
+                let end = start + region.len;
+                if p >= start && p < end {
+                    return Some((region.buffer.clone(), (p - start) as u64));
+                }
+            }
+        }
         let arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
         for arena in arenas.iter() {
             let start = arena.base as usize;
             let end = start + arena.used;
-            let p = ptr as usize;
             if p >= start && p < end {
                 return Some((arena.buffer.clone(), (p - start) as u64));
             }
         }
         None
+    }
+
+    /// Register a memory-mapped region (typically a safetensors
+    /// shard) as a zero-copy source for subsequent
+    /// `alloc_and_copy_host` calls. Wraps the mmap in an `MTLBuffer`
+    /// via `newBufferWithBytesNoCopy` (no deallocator — the caller's
+    /// `Arc<Mmap>` keeps the pages alive, stashed inside the region
+    /// here so a dropped `GpuWeights` doesn't pull the rug).
+    ///
+    /// Page-aligns the buffer length up; mmap over-maps to a page
+    /// boundary so the trailing bytes-past-EOF fall inside an
+    /// already-mapped page (zero-filled). `len` is the file length —
+    /// `buffer_for` bounds-checks against this so a stray pointer
+    /// past the end of the file doesn't resolve to a buffer offset.
+    ///
+    /// MLX uses the same trick for its safetensors loader; this is
+    /// the difference between vllm-mlx's ~300ms startup and the
+    /// 2.2 GB memcpy we used to do for Llama-3.2-1B.
+    pub fn register_mmap(&self, mmap: Arc<memmap2::Mmap>) {
+        let base = mmap.as_ptr();
+        let len = mmap.len();
+        if len == 0 {
+            return;
+        }
+        // SAFETY: `sysconf(_SC_PAGESIZE)` is documented to return a
+        // positive page size on every supported platform.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let buffer_len = (len + page_size - 1) & !(page_size - 1);
+        let buffer = self.device.new_buffer_with_bytes_no_copy(
+            base as *const std::ffi::c_void,
+            buffer_len as metal::NSUInteger,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        // Pin into the shared residency set — same treatment arenas
+        // get. Without this, Apple's lazy paging tracker can drop
+        // weight pages out from under in-flight cmdbufs once the
+        // working set crosses the implicit threshold.
+        self.residency.insert(&buffer);
+        self.residency.commit();
+        self.mmaps
+            .lock()
+            .expect("MetalAllocator mmaps Mutex")
+            .push(MmapRegion {
+                base,
+                len,
+                buffer,
+                _mmap: mmap,
+            });
+    }
+
+    /// Returns true iff `[src, src + bytes)` is fully contained in
+    /// any registered mmap region. Used by `alloc_and_copy_host` to
+    /// take the zero-copy path.
+    fn src_in_registered_mmap(&self, src: *const u8, bytes: usize) -> bool {
+        let p = src as usize;
+        let end = p.saturating_add(bytes);
+        let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+        mmaps.iter().any(|region| {
+            let r_start = region.base as usize;
+            let r_end = r_start + region.len;
+            p >= r_start && end <= r_end
+        })
     }
 
     /// Number of live arenas. Diagnostic.
@@ -260,6 +376,17 @@ impl MetalAllocator {
 
 impl DeviceAllocator for MetalAllocator {
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
+        // Zero-copy fast path: if `src_host` falls inside a registered
+        // mmap region (a safetensors shard mapped through
+        // `register_mmap`), we already have an `MTLBuffer` aliasing
+        // those pages. Skip the arena memcpy and hand the source
+        // pointer back unchanged — `buffer_for(ptr)` resolves it to
+        // the mmap region's buffer at the right offset. This is the
+        // path that closes the 2.2 GB-of-memcpy gap vs vllm-mlx for
+        // bf16/f16-on-disk weights with no cast.
+        if bytes > 0 && self.src_in_registered_mmap(src_host, bytes) {
+            return Ok(src_host as *mut u8);
+        }
         let mut arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
         // Zero-byte tensors are legal (e.g. an unused bias slot);
         // pick any non-null sentinel so the GpuTensor isn't `is_null()`.

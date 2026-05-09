@@ -344,6 +344,47 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         120.0
     }
 
+    fn startup_us(&self, _match_info: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // The fused MLP requires `[gate|up]` packed at load time —
+        // `required_weights` declares one accessor whose source list
+        // covers both `gate_proj.weight` and `up_proj.weight`, and
+        // `LinearLayer::load_dense_concat_packed` does mmap → heap
+        // Vec → arena MTLBuffer (two synchronous CPU memcpies of
+        // `2 × intermediate × hidden × elem_bytes`). On Apple Silicon
+        // the loader path runs at ~5 GB/s effective (allocator
+        // overhead dominates over peak memcpy), enough to be visible
+        // in init engine time on Llama-3.2-3B (~1s across 28 layers).
+        //
+        // Returning a positive cost here lets the solver weigh the
+        // packed fused impl against the unpacked alternative
+        // (separate gate gemm + up gemm + silu_and_mul) — the
+        // unpacked composition pays no startup but spends extra
+        // per-call dispatches. At metal's interactive default
+        // `expected_calls_per_load = 64`, the crossover lands where
+        // it should: chat workloads prefer unpacked; long batches
+        // prefer fused.
+        //
+        // Shape comes from the model's HF-config bounds rather than
+        // walking tile inputs because the per-tile pack cost is
+        // shape-independent of `num_tokens` (it's a load-time CPU
+        // memcpy, not a per-call dispatch). Per-tile — the layered
+        // loader instantiates this once per layer, and the solver
+        // sums across the per-layer tile assignments.
+        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0);
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0);
+        if intermediate == 0 || hidden == 0 {
+            return 0.0;
+        }
+        let elem_bytes: u64 = match self.dtype {
+            "fp16" | "bf16" => 2,
+            _ => 4,
+        };
+        let packed_bytes = 2 * intermediate * hidden * elem_bytes;
+        const PACK_BANDWIDTH_GBPS: f64 = 5.0;
+        let bytes_per_us = PACK_BANDWIDTH_GBPS * 1_000.0;
+        packed_bytes as f64 / bytes_per_us
+    }
+
     fn resources(&self, _m: &MatchInfo) -> Resources {
         Resources {
             shmem_bytes: 0, // Metal uses threadgroup memory

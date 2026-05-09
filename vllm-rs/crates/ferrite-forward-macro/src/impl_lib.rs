@@ -59,6 +59,15 @@ pub struct CostCtx<'a> {
     pub fuf: &'a Fuf,
     pub profile: &'a TargetProfile,
     pub bounds: &'a BTreeMap<String, u64>,
+    /// Expected number of `forward` calls per model load. Used to
+    /// amortize startup cost (e.g. CPU pack memcpy) against
+    /// per-call runtime. Solver objective: `startup + N × per_call`.
+    ///
+    /// Backend defaults assume different workload mixes — metal
+    /// targets interactive chat (one prefill + tens of decodes ≈ 64);
+    /// cuda targets batched serving (tens of thousands). Override at
+    /// build time with `FERRITE_EXPECTED_CALLS_PER_LOAD` for either.
+    pub expected_calls_per_load: u64,
 }
 
 /// Evaluate a `Dim` to a concrete integer using `bounds`. Free
@@ -115,6 +124,25 @@ impl CostCtx<'_> {
     /// sweep produces one Assignment per (num_tokens, sk_bucket).
     pub fn sk_bucket(&self) -> u64 {
         self.bounds.get("sk_bucket").copied().unwrap_or(0)
+    }
+
+    /// Default `expected_calls_per_load` for the given backend,
+    /// overridable at build time via the
+    /// `FERRITE_EXPECTED_CALLS_PER_LOAD` env var. Returns the env
+    /// value when present and parseable as a positive integer;
+    /// otherwise the backend default (metal=64 for interactive
+    /// chat, cuda=10000 for batched serving).
+    pub fn default_expected_calls_per_load(backend: crate::target::Backend) -> u64 {
+        if let Ok(s) = std::env::var("FERRITE_EXPECTED_CALLS_PER_LOAD")
+            && let Ok(n) = s.parse::<u64>()
+            && n > 0
+        {
+            return n;
+        }
+        match backend {
+            crate::target::Backend::Metal => 64,
+            crate::target::Backend::Cuda => 10_000,
+        }
     }
 }
 
@@ -513,6 +541,28 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// Predicted wall-clock cost in microseconds for one
     /// invocation of this impl on the given match.
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64;
+
+    /// One-time wall-clock cost paid at model load (microseconds)
+    /// when this impl is selected. Default `0.0` — most impls add
+    /// no load-time overhead beyond raw weight upload, which the
+    /// loader pays uniformly regardless of impl choice.
+    ///
+    /// Override on impls that introduce extra load work, typically
+    /// **packed weight accessors**: `required_weights` returns one
+    /// accessor with multiple `source_weights`, the loader CPU-
+    /// memcpys each component into a packed buffer. On metal that
+    /// memcpy is fully synchronous and shows up as a measurable
+    /// chunk of "init engine" time; cuda overlaps it with stream
+    /// DMA so the cost is effectively 0 there.
+    ///
+    /// The solver's objective is
+    /// `startup_us + ctx.expected_calls_per_load × cost_us`, so a
+    /// fused impl that saves T µs per call must save more than its
+    /// startup cost over the expected workload to win against an
+    /// unpacked alternative.
+    fn startup_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        0.0
+    }
 
     /// Per-CTA resource demand of this implementation.
     fn resources(&self, m: &MatchInfo) -> Resources;
@@ -17246,6 +17296,7 @@ mod tests {
             fuf: &fuf,
             profile: &profile,
             bounds: &bounds,
+            expected_calls_per_load: CostCtx::default_expected_calls_per_load(profile.backend),
         };
         let imp = FlashInferAttentionDecodeImpl {
             head_dim: 128,
@@ -17263,6 +17314,7 @@ mod tests {
             fuf: &fuf,
             profile: &profile,
             bounds: &bounds,
+            expected_calls_per_load: CostCtx::default_expected_calls_per_load(profile.backend),
         };
         let cost_bad = imp.cost_us(&mi, &ctx_bad);
         assert!(cost_bad.is_finite());
@@ -17279,6 +17331,7 @@ mod tests {
             fuf: &fuf,
             profile: &profile,
             bounds: &bounds,
+            expected_calls_per_load: CostCtx::default_expected_calls_per_load(profile.backend),
         };
         let cost_other_qk = imp.cost_us(&mi, &ctx_other_qk);
         assert_eq!(cost_other_qk, 6.5);
@@ -17751,6 +17804,7 @@ mod tests {
             fuf: &fuf,
             profile: &profile,
             bounds: &bounds,
+            expected_calls_per_load: CostCtx::default_expected_calls_per_load(profile.backend),
         };
 
         // Trio norm cost: MeanSubRmsNormImpl claims (Mean, Sub, RmsNorm)
@@ -17833,6 +17887,7 @@ mod tests {
             fuf: &fuf,
             profile: &profile,
             bounds: &bounds,
+            expected_calls_per_load: CostCtx::default_expected_calls_per_load(profile.backend),
         };
 
         let fused_us = imp.cost_us(&m, &ctx);

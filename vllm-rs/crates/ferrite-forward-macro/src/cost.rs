@@ -46,6 +46,7 @@ pub fn loop_cost_us(
         fuf,
         profile: target,
         bounds,
+        expected_calls_per_load: CostCtx::default_expected_calls_per_load(target.backend),
     };
 
     let mut total = 0.0_f64;

@@ -26,6 +26,7 @@ half = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }
 vllm-model = { path = "../vllm-model" }
 ferrite-gguf = { path = "../ferrite-gguf" }
 inventory = { workspace = true }

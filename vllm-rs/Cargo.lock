@@ -2143,6 +2143,7 @@ dependencies = [
  "ferrite-gguf",
  "half",
  "inventory",
+ "rayon",
  "serde_json",
  "tracing",
  "vllm-model",

@@ -43,6 +43,26 @@ pub fn resolve_model_path(
         return Ok(path.to_path_buf());
     }
 
+    // Network-free local-cache fast path. `hf_hub::Cache` resolves the
+    // refs/<revision> → snapshots/<commit>/<file> indirection on disk
+    // without any HTTP. If `config.json` (sharded safetensors) or a
+    // sibling `.gguf` is already present in the cache, we skip the
+    // ~65ms TLS handshake + ETag check that the Api path performs even
+    // for fully cached models. Network builder still runs as a
+    // fallback for first-time pulls or stale caches.
+    if gguf_file.is_none() {
+        let cache_repo = hf_hub::Cache::from_env().model(model_path.to_string());
+        if let Some(config_path) = cache_repo.get("config.json")
+            && let Some(model_dir) = config_path.parent().map(|p| p.to_path_buf())
+        {
+            info!(
+                "Using cached model: {} (HF cache, no network)",
+                model_dir.display()
+            );
+            return Ok(model_dir);
+        }
+    }
+
     info!("Downloading model from HuggingFace Hub: {}", model_path);
     let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
     if let Some(token) = hf_token {

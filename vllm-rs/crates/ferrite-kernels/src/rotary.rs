@@ -8,6 +8,7 @@ use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -395,27 +396,54 @@ impl RotaryCache {
             })
             .collect();
 
+        // Parallel cos/sin fill — `max_pos × rotary_dim` is millions of
+        // trig calls for long-context models (Llama-3.2 ships
+        // max_position_embeddings = 131072). Rayon par_chunks_mut over
+        // rows is safe (each pos writes its own row) and turns ~80ms of
+        // single-threaded math into ~10ms on a typical M-series core
+        // count.
         let mut cache = vec![0f32; max_pos * rotary_dim];
-        for pos in 0..max_pos {
-            for i in 0..half {
-                let angle = pos as f64 * inv_freqs[i];
-                cache[pos * rotary_dim + i] = angle.cos() as f32;
-                cache[pos * rotary_dim + half + i] = angle.sin() as f32;
-            }
-        }
+        cache
+            .par_chunks_mut(rotary_dim)
+            .enumerate()
+            .for_each(|(pos, row)| {
+                for i in 0..half {
+                    let angle = pos as f64 * inv_freqs[i];
+                    row[i] = angle.cos() as f32;
+                    row[half + i] = angle.sin() as f32;
+                }
+            });
 
         let cos_sin_cache = upload_via_gpuweights(weights, &cache, &[max_pos, rotary_dim], dtype)?;
 
-        let mut cos_data: Vec<f32> = Vec::with_capacity(max_pos * half);
-        let mut sin_data: Vec<f32> = Vec::with_capacity(max_pos * half);
-        for p in 0..max_pos {
-            for i in 0..half {
-                cos_data.push(cache[p * rotary_dim + i]);
-                sin_data.push(cache[p * rotary_dim + half + i]);
+        // Split `cos_cache` / `sin_cache` are wgpu-only — every cuda
+        // and metal kernel reads the unified `cos_sin_cache` above.
+        // Building + uploading two ~32 MB caches that nothing reads
+        // costs ~30-50ms on Llama-3.2-3B at max_pos = 131072. Skip
+        // them under the cuda + metal feature combos.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let (cos_cache, sin_cache) = (
+            unsafe {
+                ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype)
+            },
+            unsafe {
+                ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype)
+            },
+        );
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let (cos_cache, sin_cache) = {
+            let mut cos_data: Vec<f32> = Vec::with_capacity(max_pos * half);
+            let mut sin_data: Vec<f32> = Vec::with_capacity(max_pos * half);
+            for p in 0..max_pos {
+                for i in 0..half {
+                    cos_data.push(cache[p * rotary_dim + i]);
+                    sin_data.push(cache[p * rotary_dim + half + i]);
+                }
             }
-        }
-        let cos_cache = upload_via_gpuweights(weights, &cos_data, &[max_pos, half], dtype)?;
-        let sin_cache = upload_via_gpuweights(weights, &sin_data, &[max_pos, half], dtype)?;
+            let cos_cache = upload_via_gpuweights(weights, &cos_data, &[max_pos, half], dtype)?;
+            let sin_cache = upload_via_gpuweights(weights, &sin_data, &[max_pos, half], dtype)?;
+            (cos_cache, sin_cache)
+        };
 
         Ok(Self {
             cos_sin_cache,

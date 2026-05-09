@@ -1269,24 +1269,65 @@ impl LinearLayer {
 
         let total_out: usize = shapes_dtypes.iter().map(|(s, _)| s[0]).sum();
         let elem = dtype.size_bytes();
+        let total_bytes = total_out * hidden * elem;
 
-        // Pull each prefix's CPU bytes (consumes from `tensors` map),
-        // concat in order. `take_cpu` returns the on-disk dtype — we
-        // already validated uniformity above, so no per-source cast.
-        let mut packed: Vec<u8> = Vec::with_capacity(total_out * hidden * elem);
-        for p in prefixes {
-            let weight_name = format!("{p}.weight");
-            let (data, _shape, dt) = weights.take_cpu(&weight_name)?;
+        // Direct-write packing: pre-allocate the destination MTLBuffer
+        // and stream each source tensor's bytes straight into it. The
+        // older path went mmap → heap Vec → arena MTLBuffer (two
+        // memcpies, each ~100 MB/layer for Llama-3.2-3B's gate_up
+        // pack — the dominant chunk of init engine time after the
+        // zero-copy weight load fix).
+        //
+        // CUDA still uses `take_cpu` + heap `Vec` because its async
+        // H2D copy needs the bytes pinned, and the existing batched
+        // pinned-pool pipeline already handles the staging — there's
+        // no "second memcpy" to elide on cuda's path.
+        #[cfg(feature = "metal")]
+        let packed_weight = {
+            let dst = weights
+                .metal_allocator()
+                .alloc_uninit(total_bytes)
+                .map_err(|e| anyhow::anyhow!("alloc_uninit({total_bytes}) failed: {e}"))?;
+            let mut offset = 0usize;
+            for p in prefixes {
+                let weight_name = format!("{p}.weight");
+                let (written, _shape, dt) = unsafe {
+                    weights.take_into_metal(&weight_name, dst.add(offset))?
+                };
+                anyhow::ensure!(
+                    dt == dtype,
+                    "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
+                    weight_name,
+                    dt,
+                    dtype,
+                );
+                offset += written;
+            }
             anyhow::ensure!(
-                dt == dtype,
-                "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
-                weight_name,
-                dt,
-                dtype,
+                offset == total_bytes,
+                "load_dense_concat_packed: wrote {offset} bytes, expected {total_bytes}",
             );
-            packed.extend_from_slice(&data);
-        }
-        let packed_weight = weights.alloc_packed_from_host(&packed, &[total_out, hidden], dtype)?;
+            unsafe {
+                ferrite_cuda_core::GpuTensor::new(dst, &[total_out, hidden], dtype)
+            }
+        };
+        #[cfg(not(feature = "metal"))]
+        let packed_weight = {
+            let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+            for p in prefixes {
+                let weight_name = format!("{p}.weight");
+                let (data, _shape, dt) = weights.take_cpu(&weight_name)?;
+                anyhow::ensure!(
+                    dt == dtype,
+                    "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
+                    weight_name,
+                    dt,
+                    dtype,
+                );
+                packed.extend_from_slice(&data);
+            }
+            weights.alloc_packed_from_host(&packed, &[total_out, hidden], dtype)?
+        };
 
         // Biases: either all-or-none across the source set.
         let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();

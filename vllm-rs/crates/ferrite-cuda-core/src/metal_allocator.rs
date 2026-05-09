@@ -372,6 +372,52 @@ impl MetalAllocator {
         });
         Ok(arenas.len() - 1)
     }
+
+    /// Allocate `bytes` of arena space and return the destination
+    /// pointer **without copying anything**. Caller is responsible
+    /// for writing exactly `bytes` valid bytes before the buffer is
+    /// read.
+    ///
+    /// Used by the load path's pack-into-place optimization
+    /// (`load_dense_concat_packed`): instead of building a heap
+    /// `Vec<u8>` of concatenated tensor bytes and then memcpying
+    /// that Vec into an arena slot (two memcpies, ~3 GB at
+    /// 100 MB/layer × 28 layers for Llama-3.2-3B), the loader
+    /// pre-allocates the arena slot here and writes each component
+    /// directly into it (one memcpy total).
+    pub fn alloc_uninit(&self, bytes: usize) -> Result<*mut u8> {
+        let mut arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
+        if bytes == 0 {
+            if arenas.is_empty() {
+                Self::push_arena_locked(
+                    &self.device,
+                    &mut arenas,
+                    self.chunk_bytes,
+                    0,
+                    &self.on_new_arena,
+                    &self.residency,
+                )?;
+            }
+            return Ok(arenas[0].base);
+        }
+        let idx = if let Some(idx) = arenas.iter().rposition(|a| a.capacity - a.used >= bytes) {
+            idx
+        } else {
+            Self::push_arena_locked(
+                &self.device,
+                &mut arenas,
+                self.chunk_bytes,
+                bytes,
+                &self.on_new_arena,
+                &self.residency,
+            )?
+        };
+        let arena = &mut arenas[idx];
+        let offset = arena.used;
+        let dst = unsafe { arena.base.add(offset) };
+        arena.used = offset + bytes;
+        Ok(dst)
+    }
 }
 
 impl DeviceAllocator for MetalAllocator {

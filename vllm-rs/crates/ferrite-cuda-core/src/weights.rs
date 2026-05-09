@@ -2185,6 +2185,48 @@ impl GpuWeights {
         let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
         Ok((data, cpu_ref.shape, dtype))
     }
+
+    /// Metal-only: copy a tensor's bytes (cast-aware) directly into
+    /// `dst` without an intermediate `Vec<u8>`. Returns
+    /// `(bytes_written, shape, dtype)`.
+    ///
+    /// Companion to [`crate::MetalAllocator::alloc_uninit`]: lets
+    /// `load_dense_concat_packed` pre-allocate the packed
+    /// destination buffer once and stream each source tensor
+    /// directly into it (one memcpy from mmap → MTLBuffer instead
+    /// of two — mmap → heap Vec → MTLBuffer).
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of at least `cpu_ref.size_bytes`
+    /// (post-cast); the caller is responsible for sizing. The cast
+    /// scratch is shared across `take_*` calls, so callers must not
+    /// hold a borrow into it across this call's return.
+    #[cfg(feature = "metal")]
+    pub unsafe fn take_into_metal(
+        &mut self,
+        name: &str,
+        dst: *mut u8,
+    ) -> Result<(usize, Vec<usize>, DType)> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let (ptr, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+        // SAFETY: `ptr` is from mmap or `cast_scratch`, both alive
+        // for the duration of this call. `dst` is caller-validated.
+        unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size_bytes) };
+        Ok((size_bytes, cpu_ref.shape, dtype))
+    }
+
+    /// Metal-only: returns the underlying `MetalAllocator` so
+    /// loaders can call `alloc_uninit` directly. Kept narrow — the
+    /// `BackendAllocator` typedef is `MetalAllocator` under cfg(metal),
+    /// but the loader code lives in a backend-neutral crate
+    /// (`ferrite-kernels`) so this accessor is the cleanest seam.
+    #[cfg(feature = "metal")]
+    pub fn metal_allocator(&self) -> &crate::MetalAllocator {
+        &self.allocator
+    }
 }
 
 /// FERRITE_WEIGHT_DUMP=1: print first 8 elements of the shard plus first 8

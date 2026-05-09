@@ -9373,9 +9373,12 @@ impl Worker for FerriteWorker {
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
+        let _t_total = std::time::Instant::now();
+        let t_resolve = std::time::Instant::now();
         let model_dir = resolve_model_path(&self.config)?;
         info!(
-            "FerriteWorker(metal): loading model from {}",
+            "FerriteWorker(metal): resolved model dir in {:?} ({})",
+            t_resolve.elapsed(),
             model_dir.display()
         );
 
@@ -9388,10 +9391,14 @@ impl Worker for FerriteWorker {
             ));
         }
 
+        let t_cfg = std::time::Instant::now();
         let hf_config = HfModelConfig::from_path(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("config parse failed: {e}")))?;
         let arch = hf_config.architectures.first().cloned().unwrap_or_default();
-        info!("FerriteWorker(metal): architecture = {arch}");
+        info!(
+            "FerriteWorker(metal): parsed hf_config in {:?} (arch = {arch})",
+            t_cfg.elapsed()
+        );
 
         // Build the metal `GpuDevice` (device + queue + allocator). The
         // allocator goes inside `GpuWeights` (consumed by `from_dir`) and
@@ -9411,10 +9418,12 @@ impl Worker for FerriteWorker {
         // via the GpuDevice clone — same `MTLBuffer`s, same offsets.
         let allocator = MetalAllocator::new((*device_arc).clone());
         let gpu_device = GpuDevice::new(device_arc.clone(), std::sync::Arc::new(allocator.clone()));
+        let t_from_dir = std::time::Instant::now();
         let mut weights = GpuWeights::from_dir(&model_dir, allocator)
             .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
         info!(
-            "FerriteWorker(metal): parsed {} weight tensors",
+            "FerriteWorker(metal): GpuWeights::from_dir in {:?} ({} tensors)",
+            t_from_dir.elapsed(),
             weights.len()
         );
 
@@ -9452,6 +9461,7 @@ impl Worker for FerriteWorker {
         // Under cfg(metal), `CUstream = ()`; the per-canonical
         // `Weights::load` body ignores the stream parameter (uploads go
         // through the allocator inside `GpuWeights`).
+        let t_try_load = std::time::Instant::now();
         let model = ferrite_forward::try_load(
             &mut weights,
             (),
@@ -9465,7 +9475,8 @@ impl Worker for FerriteWorker {
         .ok_or_else(|| ExecutorError::ArchNotSupported(arch.clone()))?;
 
         info!(
-            "FerriteWorker(metal): loaded {} via ferrite-forward ({})",
+            "FerriteWorker(metal): try_load in {:?} ({} via ferrite-forward, {})",
+            t_try_load.elapsed(),
             arch,
             model.arch_name()
         );
@@ -9474,8 +9485,13 @@ impl Worker for FerriteWorker {
         // outside the per-bucket ICB, so it owns its own pipeline cache
         // here on the worker rather than living in the per-canonical
         // `MetalWorkerPool`.
+        let t_argmax = std::time::Instant::now();
         let argmax = ferrite_metal_kernels::argmax::ArgmaxKernels::new(&gpu_device.device)
             .map_err(|e| ExecutorError::WorkerInit(format!("argmax kernel compile: {e:?}")))?;
+        info!(
+            "FerriteWorker(metal): ArgmaxKernels::new in {:?}",
+            t_argmax.elapsed()
+        );
 
         self.gpu_device = Some(gpu_device);
         self.model = Some(model);

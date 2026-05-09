@@ -937,6 +937,75 @@ case + `KernelId::Mul` pipeline mapping (kernels already exist in
 See project memory `project_metal_unpacked_mlp_next.md` for the
 step-by-step.
 
+### Phase 5.L — Contiguous prefill: faithful MLX `sdpa_vector` port (2026-05-09 PM)
+
+Replaced the legacy hand-written
+`attention_prefill_contiguous_*_specialized` (flagged by
+`feedback_ferrite_metal_mlx_only.md` rule #2 as a violation of
+the MLX-port mandate) with a faithful port of MLX
+`sdpa_vector.h` extended to multi-Q via grid Y plus causal mask
+and `cu_seqlens_q` lookup. Same algorithm as our paged decode
+kernel `attention_via_cache_v2_*` — online softmax, 32 simdgroups
+× 32 lanes, per-simdgroup K-axis split, `metal::fast::exp`,
+`Limits<U>::finite_min` — but K/V from contiguous in-forward
+tiles instead of paged cache.
+
+#### Why grid Y (not grid X) for the Q axis
+
+MLX `sdpa_vector` uses `tpg.y = q_seq_len`. We follow the same
+shape: dispatch `(num_q_heads, total_q, 1)` threadgroups, 1024
+threads/group. Putting `total_q` on grid Y avoids the
+deterministic >=1024 grid-X dispatch boundary that ate the
+prior steel/gemm port (see project memory
+`project_metal_gemm_port_dead_end.md`); for Llama-3.2-3B the
+prefill bucket points are M ∈ {8, 64, 512, 4096}, so grid Y
+does reach 4096 — and the kernel runs there cleanly, while
+grid X stays bounded by `num_q_heads ≤ 32`.
+
+#### What landed
+
+| commit | piece |
+|---|---|
+| `2da1a7aee` | new `attention_prefill_sdpa_v2_{f16,bf16}_specialized` kernel symbols + `KernelId::AttentionPrefillSdpa` + pipeline mapping + `constants_for` arm + 2 cpu_golden tests (M=16 2-token, M=64 23-token, both Llama-3.2-3B shape) |
+| `13e19fa9d` | env-var-gated lowering switch (`FERRITE_METAL_PREFILL_KERNEL=sdpa` opt-in; default still legacy at this commit) |
+| `538008058` | flip the default to sdpa; `=legacy` is now the bisect fallback escape hatch |
+
+#### Validation
+
+- 70/70 ferrite-forward metal lib tests pass (was 68/68; +2 sdpa
+  goldens). Suite covers parallel test execution — found and
+  fixed a test-only OOB read on `cu_seqlens_q` past its 2-entry
+  vec (production allocates `(max_m+1) * 4` bytes, tests now
+  pad to mirror).
+- e2e bit-coherent on Llama-3.2-3B for `vllm chat ... --device
+  metal -q "..."`:
+  - `"hi"` → `"How can I assist you today?"`
+  - `"why is the sky blue?"` → identical Rayleigh-scattering
+    response paragraph-for-paragraph between sdpa and legacy.
+  - `"What is 17 times 23?"` → `"17 × 23 = 391."` in both modes.
+- GPU-dispatch-confirmed (not just AOT lowering selection):
+  ran with a temporary `FERRITE_METAL_TRACE_KERNEL=1` env var
+  in `run_bucket_per_step_silent_inner`; observed 28
+  `KernelId::AttentionPrefillSdpa` dispatches per chat (one
+  per layer, per prefill bucket step). Diagnostic was
+  reverted; verification is recorded in project memory.
+
+#### Open follow-ups
+
+1. **Drop the legacy kernel** after one cycle — once the env-var
+   fallback hasn't been needed in production, delete
+   `attention_prefill_contiguous_*_specialized` from
+   `attention.metal`, drop `KernelId::AttentionPrefillContiguous`
+   + its pipeline mapping + the env-var branch in lowering.
+2. **Paged variant of `attention_prefill_sdpa_v2`.** Same kernel
+   with `block_table`-indirected K/V access (mirroring
+   `attention_via_cache_v2_*`'s paged decode). Enables chunked
+   prefill / prefix caching across requests. New
+   `Instruction::AttentionPrefillPaged` variant + lowering.
+   Per-Q causal-mask formula needs the absolute-position
+   adjustment `q_abs = (seqused_k[seq] - new_q_for_seq) +
+   (global_q - cu_seqlens_q[seq])` for non-zero cached prefix.
+
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
@@ -946,7 +1015,8 @@ step-by-step.
 - Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch)
 - Phase 5.J: ✅ COMPLETE - lowering correctness fixes (RmsNorm slot swap + loop layer_offset + MPS Gemm offset + bf16 KV slot-0 race)
 - Phase 5.K: ✅ COMPLETE - startup time 2.91s → 240ms warm; 1 structural follow-up (gate_up pack elimination) tracked in `project_metal_unpacked_mlp_next.md`
-- 78 Phase 1-4 tests + 68 ferrite-forward metal lib tests passing
+- Phase 5.L: ✅ COMPLETE - contiguous prefill replaced by MLX `sdpa_vector` multi-Q port; legacy kept one cycle as bisect fallback (`FERRITE_METAL_PREFILL_KERNEL=legacy`); paged variant tracked as follow-up
+- 78 Phase 1-4 tests + 70 ferrite-forward metal lib tests passing
 - `cargo build --bin vllm -Fmetal` ✓ on darwin
 - `vllm chat ... --device metal` runs end-to-end with coherent output on TinyLlama, Llama-3.2-1B, Llama-3.2-3B
 - Feature gates in `layers.rs`/`layers_moe.rs` are scaffolding — revert when parallel Metal weight types land

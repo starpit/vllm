@@ -272,27 +272,26 @@ impl MetalAllocator {
         if len == 0 {
             return;
         }
-        let t0 = std::time::Instant::now();
         // SAFETY: `sysconf(_SC_PAGESIZE)` is documented to return a
         // positive page size on every supported platform.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let buffer_len = (len + page_size - 1) & !(page_size - 1);
-        let t_buf = std::time::Instant::now();
         let buffer = self.device.new_buffer_with_bytes_no_copy(
             base as *const std::ffi::c_void,
             buffer_len as metal::NSUInteger,
             MTLResourceOptions::StorageModeShared,
             None,
         );
-        let dt_buf = t_buf.elapsed();
-        // Pin into the shared residency set — same treatment arenas
-        // get. Without this, Apple's lazy paging tracker can drop
-        // weight pages out from under in-flight cmdbufs once the
-        // working set crosses the implicit threshold.
-        let t_res = std::time::Instant::now();
+        // Pin into the shared residency set, but **do not commit** —
+        // commit is the expensive step (Apple's residency tracker
+        // marks pages wired; on a 5 GB shard this was ~35ms per
+        // call). Per the residency.rs doc comment "batching multiple
+        // inserts before a single commit cuts down on driver chatter":
+        // we let the next commit() in the load chain (initialize_cache,
+        // which fires after every load_model) sweep the queued inserts
+        // along with the KV-cache buffers it adds. The mmap MTLBuffers
+        // aren't used until the first forward — well after init_cache.
         self.residency.insert(&buffer);
-        self.residency.commit();
-        let dt_res = t_res.elapsed();
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")
@@ -302,13 +301,6 @@ impl MetalAllocator {
                 buffer,
                 _mmap: mmap,
             });
-        tracing::info!(
-            "MetalAllocator::register_mmap({} MiB) in {:?} (new_buffer_with_bytes_no_copy {:?}, residency insert+commit {:?})",
-            len / (1024 * 1024),
-            t0.elapsed(),
-            dt_buf,
-            dt_res,
-        );
     }
 
     /// Returns true iff `[src, src + bytes)` is fully contained in
@@ -367,9 +359,11 @@ impl MetalAllocator {
         // Pin the new arena into the shared residency set so cmdbufs
         // don't race against Apple's lazy paging once the working set
         // crosses the implicit-residency tracker's threshold. Inert
-        // on macOS < 15 (set is null).
+        // on macOS < 15 (set is null). `commit()` is deferred — see
+        // `register_mmap`'s comment on why per-call commits are
+        // expensive; the next `commit()` in the load chain (typically
+        // `initialize_cache`) sweeps every queued insert.
         residency.insert(&buffer);
-        residency.commit();
         // Then notify any external arena hook (kept as a generic
         // post-allocation extension point — the residency insert
         // itself no longer goes through this hook).

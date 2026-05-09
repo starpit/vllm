@@ -14,8 +14,8 @@ libm = "0.2"
 [dev-dependencies]
 criterion = "0.5"
 
-[build-dependencies]
-cc = "1.0"
+# build.rs uses only `xcrun` via std::process::Command — no crate
+# dependencies needed.
 
 [[bench]]
 name = "attention_benchmark"

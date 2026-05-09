@@ -23,6 +23,13 @@ use std::sync::Mutex;
 
 use crate::stream::MetalStreamError;
 
+/// AoT-compiled metallib bytes for one shader file. Sources are the
+/// `.metal` files under `shaders/`, compiled via `build.rs` (see that
+/// file for the pipeline). The runtime path is `new_library_with_data`
+/// rather than `new_library_with_source` — the MSL→AIR frontend cost
+/// moves to build time.
+type MetallibBytes = &'static [u8];
+
 /// Type tag for a function-constant value. Restricted to the two MSL
 /// scalar types our shaders use today; expand as new shapes arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -109,11 +116,38 @@ pub struct SpecializedPipelineCache {
 }
 
 impl SpecializedPipelineCache {
-    /// Compile every Metal shader source the cache knows about. The
-    /// argument list is `(library_name, source)`; library names are
-    /// the same `&'static str` callers pass in `PipelineKey` so the
-    /// hashmap lookup is identity-cheap.
-    pub fn new(device: Device, sources: &[(&'static str, &str)]) -> Result<Self, MetalStreamError> {
+    /// Load every precompiled `.metallib` the cache knows about. The
+    /// argument list is `(library_name, metallib_bytes)`; library
+    /// names are the same `&'static str` callers pass in `PipelineKey`
+    /// so the hashmap lookup is identity-cheap.
+    pub fn new(
+        device: Device,
+        libraries_in: &[(&'static str, MetallibBytes)],
+    ) -> Result<Self, MetalStreamError> {
+        let mut libraries = HashMap::with_capacity(libraries_in.len());
+        for (name, bytes) in libraries_in {
+            let lib = device.new_library_with_data(bytes).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!("load library `{name}`: {e:?}"))
+            })?;
+            libraries.insert(*name, lib);
+        }
+        Ok(Self {
+            device,
+            libraries,
+            pipelines: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Test-only constructor that JIT-compiles MSL sources at
+    /// runtime via `new_library_with_source`. Production uses
+    /// [`Self::new`] with AoT-built `.metallib` bytes; this exists
+    /// for unit tests that exercise inline probe shaders without
+    /// shipping a `build.rs` rule for them.
+    #[cfg(test)]
+    pub(crate) fn from_sources(
+        device: Device,
+        sources: &[(&'static str, &str)],
+    ) -> Result<Self, MetalStreamError> {
         let mut libraries = HashMap::with_capacity(sources.len());
         for (name, source) in sources {
             let opts = metal::CompileOptions::new();
@@ -140,25 +174,19 @@ impl SpecializedPipelineCache {
         Self::new(
             device,
             &[
-                ("rmsnorm", include_str!("../shaders/rmsnorm.metal")),
-                (
-                    "fused_add_rmsnorm",
-                    include_str!("../shaders/fused_add_rmsnorm.metal"),
-                ),
+                ("rmsnorm", crate::embedded_metallib!("rmsnorm")),
+                ("fused_add_rmsnorm", crate::embedded_metallib!("fused_add_rmsnorm")),
                 (
                     "fused_gate_up_silu_mul",
-                    include_str!("../shaders/fused_gate_up_silu_mul.metal"),
+                    crate::embedded_metallib!("fused_gate_up_silu_mul"),
                 ),
-                ("attention", include_str!("../shaders/attention.metal")),
-                ("rope", include_str!("../shaders/rope.metal")),
-                ("embed", include_str!("../shaders/embed.metal")),
-                ("activation", include_str!("../shaders/activation.metal")),
-                ("elementwise", include_str!("../shaders/elementwise.metal")),
-                (
-                    "awq_dequantize",
-                    include_str!("../shaders/awq_dequantize.metal"),
-                ),
-                ("gemm", include_str!("../shaders/gemm.metal")),
+                ("attention", crate::embedded_metallib!("attention")),
+                ("rope", crate::embedded_metallib!("rope")),
+                ("embed", crate::embedded_metallib!("embed")),
+                ("activation", crate::embedded_metallib!("activation")),
+                ("elementwise", crate::embedded_metallib!("elementwise")),
+                ("awq_dequantize", crate::embedded_metallib!("awq_dequantize")),
+                ("gemm", crate::embedded_metallib!("gemm")),
             ],
         )
     }
@@ -284,7 +312,7 @@ kernel void probe_const(
             eprintln!("skipping: no Metal device");
             return;
         };
-        let cache = SpecializedPipelineCache::new(device, &[("probe", PROBE_SHADER)])
+        let cache = SpecializedPipelineCache::from_sources(device, &[("probe", PROBE_SHADER)])
             .expect("compile probe library");
 
         // Two distinct constant bags → two distinct pipelines.
@@ -316,7 +344,7 @@ kernel void probe_const(
             eprintln!("skipping: no Metal device");
             return;
         };
-        let cache = SpecializedPipelineCache::new(device, &[("probe", PROBE_SHADER)])
+        let cache = SpecializedPipelineCache::from_sources(device, &[("probe", PROBE_SHADER)])
             .expect("compile probe library");
         let bogus = PipelineKey::new("not_compiled", "kernel", vec![]);
         let err = cache.get_or_build(&bogus).unwrap_err();
@@ -330,7 +358,7 @@ kernel void probe_const(
             eprintln!("skipping: no Metal device");
             return;
         };
-        let cache = SpecializedPipelineCache::new(device, &[("probe", PROBE_SHADER)])
+        let cache = SpecializedPipelineCache::from_sources(device, &[("probe", PROBE_SHADER)])
             .expect("compile probe library");
         let bogus = PipelineKey::new("probe", "nonexistent_kernel", vec![]);
         let err = cache.get_or_build(&bogus).unwrap_err();

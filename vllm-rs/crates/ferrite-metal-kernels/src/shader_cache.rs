@@ -3,7 +3,7 @@
 
 //! Shader compilation and caching infrastructure.
 
-use metal::{CompileOptions, ComputePipelineState, Device, Library};
+use metal::{ComputePipelineState, Device, Library};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -17,70 +17,37 @@ pub struct ShaderCache {
 }
 
 impl ShaderCache {
-    /// Create a new shader cache with all shader libraries
+    /// Create a new shader cache with all shader libraries.
+    ///
+    /// Loads precompiled `.metallib` blobs produced by `build.rs`
+    /// (one per source `.metal` file under `shaders/`) via
+    /// `new_library_with_data`. Replaces the previous
+    /// `new_library_with_source` path that JIT-compiled MSL on every
+    /// process start.
     pub fn new(device: Device) -> Result<Self, MetalStreamError> {
         let mut libraries = HashMap::new();
-
-        // Compile activation.metal
-        let activation_source = include_str!("../shaders/activation.metal");
-        let activation_lib = device
-            .new_library_with_source(activation_source, &CompileOptions::new())
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("activation.metal: {:?}", e))
+        for (name, bytes) in [
+            ("activation", &crate::embedded_metallib!("activation")[..]),
+            ("rope", &crate::embedded_metallib!("rope")[..]),
+            ("rmsnorm", &crate::embedded_metallib!("rmsnorm")[..]),
+            (
+                "fused_add_rmsnorm",
+                &crate::embedded_metallib!("fused_add_rmsnorm")[..],
+            ),
+            (
+                "fused_gate_up_silu_mul",
+                &crate::embedded_metallib!("fused_gate_up_silu_mul")[..],
+            ),
+            (
+                "awq_dequantize",
+                &crate::embedded_metallib!("awq_dequantize")[..],
+            ),
+        ] {
+            let lib = device.new_library_with_data(bytes).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e:?}"))
             })?;
-        libraries.insert("activation".to_string(), activation_lib);
-
-        // Compile rope.metal
-        let rope_source = include_str!("../shaders/rope.metal");
-        let rope_lib = device
-            .new_library_with_source(rope_source, &CompileOptions::new())
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("rope.metal: {:?}", e))
-            })?;
-        libraries.insert("rope".to_string(), rope_lib);
-
-        // Compile rmsnorm.metal
-        let rmsnorm_source = include_str!("../shaders/rmsnorm.metal");
-        let rmsnorm_lib = device
-            .new_library_with_source(rmsnorm_source, &CompileOptions::new())
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("rmsnorm.metal: {:?}", e))
-            })?;
-        libraries.insert("rmsnorm".to_string(), rmsnorm_lib);
-
-        // Compile fused_add_rmsnorm.metal
-        let fused_add_rmsnorm_source = include_str!("../shaders/fused_add_rmsnorm.metal");
-        let fused_add_rmsnorm_lib = device
-            .new_library_with_source(fused_add_rmsnorm_source, &CompileOptions::new())
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "fused_add_rmsnorm.metal: {:?}",
-                    e
-                ))
-            })?;
-        libraries.insert("fused_add_rmsnorm".to_string(), fused_add_rmsnorm_lib);
-
-        // Compile fused_gate_up_silu_mul.metal
-        let fused_swiglu_source = include_str!("../shaders/fused_gate_up_silu_mul.metal");
-        let fused_swiglu_lib = device
-            .new_library_with_source(fused_swiglu_source, &CompileOptions::new())
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "fused_gate_up_silu_mul.metal: {:?}",
-                    e
-                ))
-            })?;
-        libraries.insert("fused_gate_up_silu_mul".to_string(), fused_swiglu_lib);
-
-        // Compile awq_dequantize.metal
-        let awq_source = include_str!("../shaders/awq_dequantize.metal");
-        let awq_lib = device
-            .new_library_with_source(awq_source, &CompileOptions::new())
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("awq_dequantize.metal: {:?}", e))
-            })?;
-        libraries.insert("awq_dequantize".to_string(), awq_lib);
-
+            libraries.insert(name.to_string(), lib);
+        }
         Ok(Self {
             device,
             libraries,

@@ -33,8 +33,8 @@
 //! immediately on return.
 
 use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    Library, MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device, Library,
+    MTLResourceOptions, MTLSize,
 };
 
 use crate::stream::MetalStreamError;
@@ -63,11 +63,10 @@ impl ArgmaxKernels {
     /// Compile the argmax shader and resolve both `argmax_f16` and
     /// `argmax_bf16` pipelines.
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let source = include_str!("../shaders/argmax.metal");
         let library = device
-            .new_library_with_source(source, &CompileOptions::new())
+            .new_library_with_data(crate::embedded_metallib!("argmax"))
             .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("argmax.metal: {e:?}"))
+                MetalStreamError::ShaderCompilationFailed(format!("load `argmax.metallib`: {e:?}"))
             })?;
         let f16_fn = library.get_function("argmax_f16", None).map_err(|e| {
             MetalStreamError::ShaderCompilationFailed(format!("argmax_f16 fn: {e:?}"))

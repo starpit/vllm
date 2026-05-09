@@ -30,6 +30,19 @@ pub mod instruction_executor;
 
 use metal::{Device, MTLResourceOptions};
 
+/// Embed a precompiled `.metallib` produced by `build.rs` from
+/// `shaders/<name>.metal`. Returns a `&'static [u8]` suitable for
+/// `Device::new_library_with_data`. Replaces the runtime-MSL-compile
+/// path that called `Device::new_library_with_source(include_str!…)`
+/// — the AoT version skips the MSL→AIR frontend on every process
+/// start.
+#[macro_export]
+macro_rules! embedded_metallib {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".metallib"))
+    };
+}
+
 pub use allocator::{AllocatorError, MetalAllocator, PooledBuffer};
 pub use device::{detect_device, MetalDevice};
 pub use stream::{wait_for_completion, MetalStream, MetalStreamError};

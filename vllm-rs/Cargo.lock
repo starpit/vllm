@@ -2171,7 +2171,6 @@ dependencies = [
 name = "ferrite-metal-kernels"
 version = "0.1.0"
 dependencies = [
- "cc",
  "criterion",
  "ferrite-metal-targets",
  "foreign-types 0.5.0",

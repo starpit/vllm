@@ -148,12 +148,16 @@ kernel void attention_via_cache_v2_f16_specialized(
     device       half* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
     device const uint* row_block_table = block_table + seq_idx * max_blocks;
 
+    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
     for (uint i = 0; i < qk_per_thread; ++i) {
         q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
         o_reg[i] = 0;
     }
 
-    U max_score = -INFINITY;
+    // Initialize per-thread max with finite minimum (MLX uses
+    // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
+    // fast::exp doesn't handle -INFINITY safely so we avoid it.
+    U max_score = -FLT_MAX;
     U sum_exp_score = 0;
 
     // For each key, simdgroup `simd_gid` handles tokens at indices
@@ -185,10 +189,11 @@ kernel void attention_via_cache_v2_f16_specialized(
         }
         score = simd_sum(score);
 
-        // Online softmax update.
+        // Online softmax update. Match MLX `sdpa_vector`: fast::exp
+        // for both factor + exp_score.
         U new_max = max(max_score, score);
-        U factor = exp(max_score - new_max);
-        U exp_score = exp(score - new_max);
+        U factor = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
 
         max_score = new_max;
         sum_exp_score = sum_exp_score * factor + exp_score;
@@ -214,7 +219,7 @@ kernel void attention_via_cache_v2_f16_specialized(
     // and (factor-rescaled) global sum_exp.
     U other_max = tg_max[simd_lid];
     U global_max = simd_max(other_max);
-    U factor = exp(other_max - global_max);
+    U factor = metal::fast::exp(other_max - global_max);
     U global_sum = simd_sum(tg_sum[simd_lid] * factor);
 
     // Combine output partials. Each simdgroup wrote o_reg[j] for

@@ -8,173 +8,18 @@
 //! Mirrors Python vLLM's `Worker` class which handles shared GPU plumbing
 //! while delegating model-specific execution to `GPUModelRunner`.
 
-use std::path::{Path, PathBuf};
-
+#[cfg(feature = "cuda")]
+use crate::error::{ExecutorError, ExecutorResult};
+#[cfg(feature = "cuda")]
 use tracing::info;
 
-use crate::error::{ExecutorError, ExecutorResult};
-
 // ---------------------------------------------------------------------------
-// Model path resolution
-// ---------------------------------------------------------------------------
-
-/// Resolve a model identifier to a local path.
-///
-/// Handles three cases:
-/// 1. Local `.gguf` file path → returns as-is
-/// 2. Local directory → returns as-is
-/// 3. HuggingFace Hub model ID → downloads and returns cache path
-///
-/// Extracted from `FerriteWorker::resolve_model_path` for reuse across backends.
-pub fn resolve_model_path(
-    model_path: &str,
-    hf_token: Option<&str>,
-    gguf_file: Option<&str>,
-) -> ExecutorResult<PathBuf> {
-    let path = Path::new(model_path);
-
-    // Local .gguf file.
-    if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
-        return Ok(path.to_path_buf());
-    }
-
-    // Local directory.
-    if path.is_dir() {
-        return Ok(path.to_path_buf());
-    }
-
-    // Network-free local-cache fast path. `hf_hub::Cache` resolves the
-    // refs/<revision> → snapshots/<commit>/<file> indirection on disk
-    // without any HTTP. If `config.json` (sharded safetensors) or a
-    // sibling `.gguf` is already present in the cache, we skip the
-    // ~65ms TLS handshake + ETag check that the Api path performs even
-    // for fully cached models. Network builder still runs as a
-    // fallback for first-time pulls or stale caches.
-    if gguf_file.is_none() {
-        let cache_repo = hf_hub::Cache::from_env().model(model_path.to_string());
-        if let Some(config_path) = cache_repo.get("config.json")
-            && let Some(model_dir) = config_path.parent().map(|p| p.to_path_buf())
-        {
-            info!(
-                "Using cached model: {} (HF cache, no network)",
-                model_dir.display()
-            );
-            return Ok(model_dir);
-        }
-    }
-
-    info!("Downloading model from HuggingFace Hub: {}", model_path);
-    let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
-    if let Some(token) = hf_token {
-        builder = builder.with_token(Some(token.to_string()));
-    }
-    let api = builder
-        .build()
-        .map_err(|e| ExecutorError::WorkerInit(format!("failed to build HF API: {e}")))?;
-    let repo = api.model(model_path.to_string());
-
-    // GGUF download: explicit filename or auto-detect from repo.
-    let gguf_filename = gguf_file.map(String::from).or_else(|| {
-        if !model_path.to_ascii_uppercase().contains("GGUF") {
-            return None;
-        }
-        let info = repo.info().ok()?;
-        let mut gguf_files: Vec<_> = info
-            .siblings
-            .iter()
-            .filter(|s| s.rfilename.ends_with(".gguf"))
-            .collect();
-        if gguf_files.is_empty() {
-            return None;
-        }
-        for pattern in &["Q4_K_M", "Q4_K_S", "Q4_K", "Q4_0", "Q8_0"] {
-            if let Some(f) = gguf_files.iter().find(|s| s.rfilename.contains(pattern)) {
-                return Some(f.rfilename.clone());
-            }
-        }
-        gguf_files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
-        Some(gguf_files[0].rfilename.clone())
-    });
-    if let Some(ref gguf_file) = gguf_filename {
-        info!("Downloading GGUF file: {gguf_file}");
-        let gguf_path = repo.get(gguf_file).map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to download GGUF {gguf_file}: {e}"))
-        })?;
-        let _ = repo.get("tokenizer.json");
-        let _ = repo.get("tokenizer_config.json");
-        return Ok(gguf_path);
-    }
-
-    let config_path = repo
-        .get("config.json")
-        .map_err(|e| ExecutorError::WorkerInit(format!("failed to download config.json: {e}")))?;
-    let model_dir = config_path.parent().unwrap().to_path_buf();
-
-    let _ = repo.get("tokenizer.json");
-    let _ = repo.get("tokenizer_config.json");
-
-    // Download weight files.
-    if repo.get("model.safetensors").is_ok() {
-        return Ok(model_dir);
-    }
-    if let Ok(index_path) = repo.get("model.safetensors.index.json") {
-        let index = vllm_model::weight::SafeTensorsIndex::from_file(&index_path)
-            .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse index: {e}")))?;
-        let sorted_shards = index.shard_files();
-        let total = sorted_shards.len();
-
-        let needed: Vec<&String> = sorted_shards
-            .iter()
-            .filter(|s| !model_dir.join(s).exists())
-            .collect();
-
-        if needed.is_empty() {
-            info!("All {total} shard files already cached");
-        } else {
-            info!(
-                "Downloading {} of {total} shard files (up to 8 in parallel)",
-                needed.len()
-            );
-
-            let multi = indicatif::MultiProgress::new();
-            const MAX_PARALLEL: usize = 8;
-            let repo = &repo;
-            let multi = &multi;
-
-            for chunk in needed.chunks(MAX_PARALLEL) {
-                let results: Vec<ExecutorResult<()>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunk
-                        .iter()
-                        .map(|shard| {
-                            let bar = multi.add(indicatif::ProgressBar::new(0));
-                            s.spawn(move || {
-                                repo.download_with_progress(shard, bar)
-                                    .map(|_| ())
-                                    .map_err(|e| {
-                                        ExecutorError::WorkerInit(format!(
-                                            "failed to download {shard}: {e}"
-                                        ))
-                                    })
-                            })
-                        })
-                        .collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                for result in results {
-                    result?;
-                }
-            }
-        }
-        return Ok(model_dir);
-    }
-
-    Err(ExecutorError::WorkerInit(format!(
-        "no safetensors weights found for {model_path}"
-    )))
-}
-
-// ---------------------------------------------------------------------------
-// LlamaConfig parsing from HuggingFace config.json
+// Model path resolution lives on `ferrite_worker::resolve_model_path` —
+// this module previously held a copy that diverged. Both copies have
+// been consolidated onto the ferrite_worker version (the one with
+// parallel shard download + GGUF auto-detect + HF-Cache short-circuit).
+// `vllm-serve` and the worker `load_model` bodies all call into the
+// canonical version directly.
 // ---------------------------------------------------------------------------
 
 /// Parse a `LlamaConfig` from a HuggingFace `config.json`.

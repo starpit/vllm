@@ -1867,12 +1867,31 @@ unsafe impl Send for FerriteWorker {}
 /// - A directory containing safetensors + config.json (normal path)
 /// - A `.gguf` file path (GGUF path — load_model detects this)
 ///
-/// Backend-neutral: pure host I/O against `FerriteWorkerConfig`. Lifted
-/// out of the cuda-only impl so the metal `load_model` body can share
-/// the same HF-Hub plumbing without duplicating the download logic.
+/// Resolve a model identifier to a local path. Single canonical
+/// implementation shared by every Worker `load_model` body and by
+/// vllm-serve's parallel-tokenizer hoist.
+///
+/// Three cases:
+/// 1. Local `.gguf` file path → returns as-is.
+/// 2. Local directory → returns as-is.
+/// 3. HuggingFace Hub model ID:
+///    - First check `hf_hub::Cache` (network-free on-disk lookup).
+///      Skips the ~100ms TLS handshake + ETag probe the Api path runs
+///      even for fully cached models. MLX doesn't pay this cost.
+///    - On cache miss, fall through to the Api path: download
+///      config.json + tokenizer + safetensors shards (parallel, up
+///      to 8 concurrent), or auto-detect a `.gguf` for GGUF repos.
+///
+/// Used to live duplicated in `gpu_worker_base.rs`; consolidated
+/// here so the Hub plumbing (parallel shard download with progress
+/// bars, GGUF auto-detect, etc.) has one home.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-fn resolve_model_path(config: &FerriteWorkerConfig) -> ExecutorResult<PathBuf> {
-    let path = Path::new(&config.model_path);
+pub fn resolve_model_path(
+    model_path: &str,
+    hf_token: Option<&str>,
+    gguf_file: Option<&str>,
+) -> ExecutorResult<PathBuf> {
+    let path = Path::new(model_path);
 
     // Local .gguf file.
     if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
@@ -1884,23 +1903,39 @@ fn resolve_model_path(config: &FerriteWorkerConfig) -> ExecutorResult<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    info!(
-        "Downloading model from HuggingFace Hub: {}",
-        config.model_path
-    );
+    // Network-free local-cache fast path. `hf_hub::Cache` resolves
+    // refs/<revision> → snapshots/<commit>/<file> on disk without
+    // any HTTP. If `config.json` is already there, the model has
+    // been pulled before; return its dir directly. The `Api` path
+    // would otherwise burn ~100ms on a TLS handshake + ETag probe
+    // for a model we already have locally.
+    if gguf_file.is_none() {
+        let cache_repo = hf_hub::Cache::from_env().model(model_path.to_string());
+        if let Some(config_path) = cache_repo.get("config.json")
+            && let Some(model_dir) = config_path.parent().map(|p| p.to_path_buf())
+        {
+            info!(
+                "Using cached model: {} (HF cache, no network)",
+                model_dir.display()
+            );
+            return Ok(model_dir);
+        }
+    }
+
+    info!("Downloading model from HuggingFace Hub: {model_path}");
     let mut builder = hf_hub::api::sync::ApiBuilder::from_env();
-    if let Some(ref token) = config.hf_token {
-        builder = builder.with_token(Some(token.clone()));
+    if let Some(token) = hf_token {
+        builder = builder.with_token(Some(token.to_string()));
     }
     let api = builder
         .build()
         .map_err(|e| ExecutorError::WorkerInit(format!("failed to build HF API: {e}")))?;
-    let repo = api.model(config.model_path.clone());
+    let repo = api.model(model_path.to_string());
 
     // GGUF download: explicit filename or auto-detect from repo.
-    let gguf_filename = config.gguf_file.clone().or_else(|| {
+    let gguf_filename = gguf_file.map(String::from).or_else(|| {
         // Auto-detect: if model name looks like a GGUF repo, find smallest Q4_K_M file.
-        if !config.model_path.to_ascii_uppercase().contains("GGUF") {
+        if !model_path.to_ascii_uppercase().contains("GGUF") {
             return None;
         }
         let info = repo.info().ok()?;
@@ -1993,8 +2028,7 @@ fn resolve_model_path(config: &FerriteWorkerConfig) -> ExecutorResult<PathBuf> {
     }
 
     Err(ExecutorError::WorkerInit(format!(
-        "no safetensors weights found for {}",
-        config.model_path
+        "no safetensors weights found for {model_path}"
     )))
 }
 
@@ -5152,7 +5186,11 @@ impl Worker for FerriteWorker {
         }
 
         // 1. Resolve model directory (or GGUF file path).
-        let model_dir = resolve_model_path(&self.config)?;
+        let model_dir = resolve_model_path(
+            &self.config.model_path,
+            self.config.hf_token.as_deref(),
+            self.config.gguf_file.as_deref(),
+        )?;
         info!("FerriteWorker: loading model from {}", model_dir.display());
 
         let device = self
@@ -9375,7 +9413,11 @@ impl Worker for FerriteWorker {
     fn load_model(&mut self) -> ExecutorResult<()> {
         let _t_total = std::time::Instant::now();
         let t_resolve = std::time::Instant::now();
-        let model_dir = resolve_model_path(&self.config)?;
+        let model_dir = resolve_model_path(
+            &self.config.model_path,
+            self.config.hf_token.as_deref(),
+            self.config.gguf_file.as_deref(),
+        )?;
         info!(
             "FerriteWorker(metal): resolved model dir in {:?} ({})",
             t_resolve.elapsed(),

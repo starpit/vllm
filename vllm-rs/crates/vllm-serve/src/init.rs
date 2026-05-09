@@ -509,7 +509,7 @@ fn initialize_core(
     // worker's `take_preloaded_tokenizer` (cuda/mlx GGUF builds the
     // tokenizer from file metadata via `ferrite_gguf::gguf_tokenizer`,
     // the only reason any worker still touches tokenizers).
-    let prefetched_model_dir = vllm_executor::gpu_worker_base::resolve_model_path(
+    let prefetched_model_dir = vllm_executor::ferrite_worker::resolve_model_path(
         &model_path,
         config.hf_token.as_deref(),
         config.gguf_file.as_deref(),

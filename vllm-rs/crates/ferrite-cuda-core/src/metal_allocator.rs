@@ -272,22 +272,27 @@ impl MetalAllocator {
         if len == 0 {
             return;
         }
+        let t0 = std::time::Instant::now();
         // SAFETY: `sysconf(_SC_PAGESIZE)` is documented to return a
         // positive page size on every supported platform.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let buffer_len = (len + page_size - 1) & !(page_size - 1);
+        let t_buf = std::time::Instant::now();
         let buffer = self.device.new_buffer_with_bytes_no_copy(
             base as *const std::ffi::c_void,
             buffer_len as metal::NSUInteger,
             MTLResourceOptions::StorageModeShared,
             None,
         );
+        let dt_buf = t_buf.elapsed();
         // Pin into the shared residency set — same treatment arenas
         // get. Without this, Apple's lazy paging tracker can drop
         // weight pages out from under in-flight cmdbufs once the
         // working set crosses the implicit threshold.
+        let t_res = std::time::Instant::now();
         self.residency.insert(&buffer);
         self.residency.commit();
+        let dt_res = t_res.elapsed();
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")
@@ -297,6 +302,13 @@ impl MetalAllocator {
                 buffer,
                 _mmap: mmap,
             });
+        tracing::info!(
+            "MetalAllocator::register_mmap({} MiB) in {:?} (new_buffer_with_bytes_no_copy {:?}, residency insert+commit {:?})",
+            len / (1024 * 1024),
+            t0.elapsed(),
+            dt_buf,
+            dt_res,
+        );
     }
 
     /// Returns true iff `[src, src + bytes)` is fully contained in

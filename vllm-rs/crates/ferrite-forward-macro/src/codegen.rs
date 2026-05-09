@@ -2524,12 +2524,22 @@ fn emit_weights_struct(
             .copied()
             .filter(|&f| (f - 1.0).abs() > 1e-9);
         let scaling = model.rope_scaling.clone();
+        // Clamp the rotary cache size to the runtime `max_model_len`
+        // rather than the model's compile-time `max_position_embeddings`.
+        // For Llama-3.2 (max_position_embeddings = 131072) under chat
+        // workloads with the default 4-8K context, the unclamped path
+        // precomputed 16-32× more cos/sin pairs than any request can
+        // possibly index — pure waste of CPU + upload bandwidth.
+        // `max_model_len` is the function argument; the .min(...) caps
+        // it at the model's hard limit so a misconfigured larger value
+        // doesn't run past the rope shape.
         match (partial, scaling) {
             (None, None) => quote! {
+                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
                 let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
                     gw,
                     #head_dim,
-                    #max_pos,
+                    rope_max_pos,
                     #rope_theta,
                     None,
                     ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
@@ -2546,10 +2556,11 @@ fn emit_weights_struct(
             ) => {
                 let orig = original_max_position_embeddings as usize;
                 quote! {
+                    let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
                     let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
                         gw,
                         #head_dim,
-                        #max_pos,
+                        rope_max_pos,
                         #rope_theta,
                         Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
                             factor: #factor,

@@ -747,7 +747,7 @@ mod tests {
         let slot_mapping = vec![3u32, (block_size as u32) + 3];
 
         // Buffer helpers.
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -795,14 +795,14 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: (bucket_m as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
             MTLSize { width: (head_dim as u64) as usize, height: (1) as usize, depth: (1) as usize },
@@ -952,7 +952,7 @@ mod tests {
         let positions = vec![5u32, 7];
         let slot_mapping = vec![3u32, (block_size as u32) + 3];
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -999,14 +999,14 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: (bucket_m as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
             MTLSize { width: (head_dim as u64) as usize, height: (1) as usize, depth: (1) as usize },
@@ -1178,7 +1178,7 @@ mod tests {
             }
         }
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -1218,12 +1218,12 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 0); // output
-        enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 1); // Q input — SAME buffer
-        enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 0); } // output
+        unsafe { enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 1); } // Q input — SAME buffer
+        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
         // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
         // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -1348,7 +1348,7 @@ mod tests {
         let positions = vec![36u32];
         let slot_mapping = vec![(2u32) * (block_size as u32) + 4u32];
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -1395,14 +1395,14 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: (bucket_m as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
             MTLSize { width: (head_dim as u64) as usize, height: (1) as usize, depth: (1) as usize },
@@ -1578,7 +1578,7 @@ mod tests {
         }
 
         // Buffer helpers (mirror rope_append_matches_cpu_golden).
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -1624,12 +1624,12 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
         // v2 kernel uses 1024 threads/group (32 simdgroups × 32 lanes).
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: (batch as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
@@ -1762,7 +1762,7 @@ mod tests {
             }
         }
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -1807,12 +1807,12 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
         // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
         // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -1951,7 +1951,7 @@ mod tests {
             }
         }
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -1996,12 +1996,12 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
         // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
         // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatchThreadgroups_threadsPerThreadgroup(
@@ -2133,7 +2133,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.023).sin() * 0.5)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -2179,13 +2179,13 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5);
-        enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: (num_q as u64) as usize, height: (bucket_m as u64) as usize, depth: (1) as usize },
             MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
@@ -2322,7 +2322,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.023).sin() * 0.5)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -2368,13 +2368,13 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2);
-        enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3);
-        enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4);
-        enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5);
-        enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: (num_q as u64) as usize, height: (bucket_m as u64) as usize, depth: (1) as usize },
             MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
@@ -2509,7 +2509,7 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -2539,9 +2539,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
         enc.endEncoding();
         cb.commit();
@@ -2627,7 +2627,7 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
@@ -2658,9 +2658,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
         enc.endEncoding();
         cb.commit();
@@ -2761,7 +2761,7 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -2791,9 +2791,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
         enc.endEncoding();
         cb.commit();
@@ -2889,7 +2889,7 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -2913,9 +2913,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 0); // OUT = same buffer
-        enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 1); // IN  = same buffer
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 0); } // OUT = same buffer
+        unsafe { enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 1); } // IN  = same buffer
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
         enc.endEncoding();
         cb.commit();
@@ -3018,7 +3018,7 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.019).sin() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -3040,9 +3040,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&residual_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&delta_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&residual_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&delta_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
         enc.endEncoding();
         cb.commit();
@@ -3142,7 +3142,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -3173,9 +3173,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: ((n as u64).div_ceil(4)) as usize, height: (1) as usize, depth: (1) as usize },
             MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize },
@@ -3274,7 +3274,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
@@ -3304,9 +3304,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: ((n as u64).div_ceil(4)) as usize, height: (1) as usize, depth: (1) as usize },
             MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize },
@@ -3437,7 +3437,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.3)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
@@ -3468,9 +3468,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: ((n as u64).div_ceil(8)) as usize, height: ((m as u64).div_ceil(8)) as usize, depth: (1) as usize },
             MTLSize { width: (32) as usize, height: (1) as usize, depth: (1) as usize },
@@ -3569,7 +3569,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.3)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
@@ -3614,9 +3614,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
         enc.endEncoding();
         cb.commit();
@@ -3701,7 +3701,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.3)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
@@ -3748,9 +3748,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
         enc.endEncoding();
         cb.commit();
@@ -3879,7 +3879,7 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.3)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
 
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
@@ -3942,9 +3942,9 @@ mod tests {
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
-        enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
-        enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
+        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
         enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
         enc.endEncoding();
         cb.commit();

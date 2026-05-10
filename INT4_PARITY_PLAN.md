@@ -17,7 +17,11 @@
 | P2 — kernel + cpu_golden parity | ✅ done | `42fececd8` | `quantized_dequantize.metal` + `cpu_golden::affine_dequantize_b4_*`; bit-exact ≤ 1 ULP |
 | P2 — E2E (Llama-3.2-1B-4bit coherent) | ✅ done | `c2ba7c459` | Load-time CPU dequant in lieu of forward-time `AffineDequantizeThenGemm`; see deviation note below |
 | P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ✅ kernels | `93eb4a846` | Three faithful ports + cpu-parity tests; forward-time swap deferred to P3-P4 integration |
-| P4 — prefill GEMM transpose=true | ✅ kernels | tbd | `qmm_t` + `qmm_t_splitk` ports + dispatcher (`pick_qmm_t_kernel` + split_k heuristic) + cpu-parity tests for aligned / unaligned / splitk; macro flip to forward-time `AffineQmm` lands in the next integration commit |
+| P4 — prefill GEMM transpose=true | ✅ kernels | `49a51e485` | `qmm_t` + `qmm_t_splitk` ports + dispatcher (`pick_qmm_t_kernel` + split_k heuristic) + cpu-parity tests for aligned / unaligned / splitk |
+| P3-P4 C1 — function-constant refactor (ICB readiness) | ✅ done | `cd6eb49ba` | qmv/qmm_t K/N/M moved to `[[function_constant(N)]]` + `ShaderCache::get_pipeline_specialized` + `ConstantValue::Int` variant; standalone parity tests preserved |
+| P3-P4 C2 — `Instruction::AffineQmm` + `lower_one` | ✅ done | tbd | Variant + cuda unreachable arm + lowering arm (qmv quad/fast/generic + qmm_t Standard) + 3 lowering-shape unit tests; SplitK still C3 |
+| P3-P4 C3 — splitk reduce kernel + AffineQmmTSplitK wiring | pending | — | New `reduce_sum_axis0_*` kernel + `lower_one` switches to SplitK when `pick_qmm_t_kernel` says so |
+| P3-P4 C4 — solver Impl + macro flip + FUF revert + Llama-1B verify | pending | — | `MetalAffineQmmImpl` + `SiluMulImpl` (FusedGateUpSiluMul rejects Affine) + macro flips `LinearAffine` to `load_affine_quant` + revert `fuf.rs` Affine→Dense downgrade |
 | P5 — transpose=false (`qmm_n` / `qvm` / `qvm_split_k`) | pending | — | |
 | P6 — quantized embedding lookup | pending | — | P2 dequants the embedding at load; P6 lifts to forward-time gather + dequant |
 | P7 — NAX (M4+) | pending | — | |

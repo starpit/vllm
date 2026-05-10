@@ -28,6 +28,10 @@
 //! so the model author knows which arm to add next.
 
 use crate::{CanonicalParams, Instruction};
+use ferrite_metal_kernels::quantized::{
+    DequantDtype, QmmTKernel, QmvKernel, pick_qmv_kernel, qmm_t_dispatch_shape,
+    qmm_t_kernel_static_name, qmv_dispatch_shape, qmv_kernel_static_name,
+};
 use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
 use super::lowered::{
@@ -327,6 +331,87 @@ fn lower_one<W: CanonicalParams>(
                     n: *n,
                     k: *k,
                 }),
+            }
+        }
+
+        // ── MLX-affine int4 matmul (qmv + qmm_t) ──────────────────
+        //
+        // `Instruction::AffineQmm` covers every per-Linear shape on a
+        // metal-quantized model. The dispatcher rule mirrors MLX
+        // `quantized.cpp:1387 QuantizedMatmul::eval_gpu`:
+        //   * `bucket_m < vector_limit` → matvec (qmv_quad / qmv_fast /
+        //     qmv) per `dispatch_qmv` (`:1365`) — D∈{64,128} pow2-bits
+        //     wins quad, then N%8==0 ∧ K%512==0 wins fast, else generic.
+        //   * `bucket_m ≥ vector_limit` → matmul (qmm_t for transpose=true).
+        //     SplitK is a sibling of qmm_t Standard for B==1; lands in
+        //     C3 alongside its downstream sum-reduce.
+        //
+        // `vector_limit` rides on the Instruction so the macro can bake
+        // it from `get_qmv_batch_limit(K, N, arch_gen)` — see the
+        // declaration on `Instruction::AffineQmm`.
+        //
+        // Bindings match the kernel signatures in `quantized_qmv.metal`
+        // and `quantized_qmm.metal`:
+        //   buffer(0) packed weight   buffer(1) scales   buffer(2) biases
+        //   buffer(3) x activations   buffer(4) y output
+        // K / N (and M for qmm_t) ride as function constants 0/1(/2)
+        // post the C1 refactor; the dispatcher never sets them as
+        // setBytes — required for ICB recording.
+        I::AffineQmm(in_slot, out_slot, layer, wt_fn, n, k, group_size, bits, vector_limit) => {
+            let dtype = dequant_dtype_for::<W>();
+            let n_v = *n;
+            let k_v = *k;
+            let bits_v = *bits;
+            let gs = *group_size;
+            let vl = *vector_limit;
+
+            if bucket_m < vl {
+                // Matvec branch (decode-shape).
+                let kernel = pick_qmv_kernel(n_v, k_v, bits_v);
+                let (tg, tpg) = qmv_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                let kernel_id = match kernel {
+                    QmvKernel::Quad { .. } => KernelId::AffineQmvQuad,
+                    QmvKernel::Fast => KernelId::AffineQmvFast,
+                    QmvKernel::Generic => KernelId::AffineQmv,
+                };
+                LoweredCommand {
+                    kernel: kernel_id,
+                    library: "quantized_qmv",
+                    function: qmv_kernel_static_name(kernel, dtype, bits_v, gs),
+                    constants: vec![
+                        ConstantValue::int(0, k_v as i32),
+                        ConstantValue::int(1, n_v as i32),
+                    ],
+                    dispatch: DispatchShape {
+                        threadgroups: tg,
+                        threads_per_threadgroup: tpg,
+                    },
+                    bindings: affine_qmm_bindings(*in_slot, *out_slot, *layer + layer_offset, *wt_fn),
+                    gemm_dims: None,
+                }
+            } else {
+                // Matmul branch (prefill-shape). Standard only — SplitK
+                // lands in C3 together with the sum-reduce kernel its
+                // [split_k, M, N] intermediate needs.
+                let kernel = QmmTKernel::Standard;
+                let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                let aligned_n = n_v.is_multiple_of(32);
+                LoweredCommand {
+                    kernel: KernelId::AffineQmmT,
+                    library: "quantized_qmm",
+                    function: qmm_t_kernel_static_name(kernel, dtype, bits_v, gs, aligned_n),
+                    constants: vec![
+                        ConstantValue::int(0, k_v as i32),
+                        ConstantValue::int(1, n_v as i32),
+                        ConstantValue::int(2, bucket_m as i32),
+                    ],
+                    dispatch: DispatchShape {
+                        threadgroups: tg,
+                        threads_per_threadgroup: tpg,
+                    },
+                    bindings: affine_qmm_bindings(*in_slot, *out_slot, *layer + layer_offset, *wt_fn),
+                    gemm_dims: None,
+                }
             }
         }
 
@@ -798,5 +883,241 @@ fn pick_specialized_symbol(
         MetalDtype::Int4 => {
             panic!("metal lowering: Int4 dtype not yet wired through kernel symbol picker")
         }
+    }
+}
+
+/// Convert the lowering-side dtype enum to the kernel-dispatcher one.
+/// `MetalDtype` is the lowering vocabulary; `DequantDtype` is what
+/// `quantized.rs` speaks (and what `qmv_kernel_static_name` /
+/// `qmm_t_kernel_static_name` consume). Same two cases either way —
+/// the duplicate enum exists because the kernel-dispatcher crate
+/// can't depend on lowering types.
+fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
+    match W::METAL_DTYPE {
+        MetalDtype::F16 => DequantDtype::F16,
+        MetalDtype::Bf16 => DequantDtype::Bf16,
+        MetalDtype::Int4 => panic!(
+            "metal lowering: Instruction::AffineQmm requires W::METAL_DTYPE \
+             ∈ {{F16, Bf16}} (the activation dtype); got Int4"
+        ),
+    }
+}
+
+/// Bindings shared by every `Instruction::AffineQmm` lowering — the
+/// qmv and qmm_t kernels both bind buffers 0..4 in the same order:
+/// (packed weight, scales, biases, x in, y out). Worker resolves
+/// the `Affine*` `WeightTensor` arms via `LinearLayer::AffineQuant`
+/// (`worker.rs:1414`).
+fn affine_qmm_bindings<W: CanonicalParams>(
+    in_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    wt_fn: crate::WtFn<W, ferrite_kernels::layers::LinearLayer>,
+) -> Vec<Binding<W>> {
+    vec![
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer(wt_fn),
+            which: WeightTensor::Weight,
+            layer,
+            binding_index: 0,
+        },
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer(wt_fn),
+            which: WeightTensor::AffineScales,
+            layer,
+            binding_index: 1,
+        },
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer(wt_fn),
+            which: WeightTensor::AffineBiases,
+            layer,
+            binding_index: 2,
+        },
+        Binding::ArenaSlot {
+            slot: in_slot,
+            binding_index: 3,
+        },
+        Binding::ArenaSlot {
+            slot: out_slot,
+            binding_index: 4,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Instruction;
+
+    /// Minimal `CanonicalParams` impl for lowering-shape tests. No
+    /// kernel actually runs — `lower_one` just inspects the variant
+    /// fields and `W::METAL_DTYPE`. Pinned to bf16 to match the
+    /// canonical Llama-3.x configuration the macro emits.
+    struct TestParams;
+    impl CanonicalParams for TestParams {
+        const HEAD_DIM: u32 = 64;
+        const NUM_Q_HEADS: u32 = 32;
+        const NUM_KV_HEADS: u32 = 4;
+        const Q_SIZE: usize = 2048;
+        const KV_SIZE: usize = 256;
+        const INTERMEDIATE_SIZE: usize = 8192;
+        const ATTN_SCALE: f32 = 0.125;
+        const ATTN_SOFTCAP: f32 = 0.0;
+        const SLIDING_WINDOW: i32 = -1;
+        const KV_LORA_RANK: usize = 0;
+        const QK_NOPE_HEAD_DIM: usize = 0;
+        const QK_ROPE_HEAD_DIM: usize = 0;
+        const V_HEAD_DIM: usize = 0;
+        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
+        const QK_HEAD_DIM: usize = 0;
+        const MLA_ATTN_SCALE: f32 = 0.0;
+        const METAL_DTYPE: MetalDtype = MetalDtype::Bf16;
+    }
+
+    /// `WtFn` stub. The lowering pass stores this pointer in the
+    /// `Binding::Weight` payload but never calls it (resolution
+    /// happens at worker bake time); a panic body keeps the type
+    /// signature honest without forcing the test to construct a
+    /// real `LinearLayer::AffineQuant` (which would need a Metal
+    /// device for the `Buffer` allocations).
+    fn affine_quant_stub(
+        _w: &TestParams,
+        _layer: u32,
+    ) -> &ferrite_kernels::layers::LinearLayer {
+        panic!("affine_quant_stub: lowering tests must not invoke wt_fn");
+    }
+
+    /// At `bucket_m < vector_limit` we should land in the qmv branch
+    /// and pick `qmv_fast` for the Llama-1B q_proj shape (N=2048,
+    /// K=2048, gs=64, bits=4). N % 8 == 0 && K % 512 == 0 → fast,
+    /// not generic; K ∉ {64,128} → not quad.
+    #[test]
+    fn affine_qmm_lowers_to_qmv_fast_at_decode_bucket() {
+        let inst: Instruction<TestParams> = Instruction::AffineQmm(
+            /*in_slot=*/ 7,
+            /*out_slot=*/ 11,
+            /*layer=*/ 3,
+            affine_quant_stub,
+            /*n=*/ 2048,
+            /*k=*/ 2048,
+            /*group_size=*/ 64,
+            /*bits=*/ 4,
+            /*vector_limit=*/ 18,
+        );
+        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 1, /*layer_offset=*/ 5)
+            .expect("lower")
+            .expect("non-metadata");
+        assert_eq!(cmd.kernel, KernelId::AffineQmvFast);
+        assert_eq!(cmd.library, "quantized_qmv");
+        assert_eq!(cmd.function, "affine_qmv_fast_bf16_gs_64_b_4_batch_0");
+        assert_eq!(
+            cmd.constants,
+            vec![ConstantValue::int(0, 2048), ConstantValue::int(1, 2048)],
+        );
+        // qmv_fast grid: (M, ceil(N/8), B); group: (32, 2, 1).
+        assert_eq!(cmd.dispatch.threadgroups, (1, 2048 / 8, 1));
+        assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 1));
+        // 5 bindings: weight (idx 0), scales (1), biases (2), in (3), out (4).
+        assert_eq!(cmd.bindings.len(), 5);
+        // The `layer` baked into the bindings = inst.layer + layer_offset.
+        match &cmd.bindings[0] {
+            Binding::Weight {
+                which,
+                layer,
+                binding_index,
+                ..
+            } => {
+                assert_eq!(*which, WeightTensor::Weight);
+                assert_eq!(*layer, 8);
+                assert_eq!(*binding_index, 0);
+            }
+            _ => panic!("bindings[0]: expected Weight"),
+        }
+        match &cmd.bindings[1] {
+            Binding::Weight { which, .. } => assert_eq!(*which, WeightTensor::AffineScales),
+            _ => panic!("bindings[1]: expected AffineScales Weight"),
+        }
+        match &cmd.bindings[2] {
+            Binding::Weight { which, .. } => assert_eq!(*which, WeightTensor::AffineBiases),
+            _ => panic!("bindings[2]: expected AffineBiases Weight"),
+        }
+        match &cmd.bindings[3] {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
+                assert_eq!(*slot, 7);
+                assert_eq!(*binding_index, 3);
+            }
+            _ => panic!("bindings[3]: expected in_slot ArenaSlot"),
+        }
+        match &cmd.bindings[4] {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
+                assert_eq!(*slot, 11);
+                assert_eq!(*binding_index, 4);
+            }
+            _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
+        }
+        assert!(cmd.gemm_dims.is_none());
+    }
+
+    /// At `bucket_m >= vector_limit` we land on the qmm_t Standard
+    /// path (SplitK is C3). aligned_N=true since N=2048 % 32 == 0.
+    #[test]
+    fn affine_qmm_lowers_to_qmm_t_at_prefill_bucket() {
+        let inst: Instruction<TestParams> = Instruction::AffineQmm(
+            /*in_slot=*/ 7,
+            /*out_slot=*/ 11,
+            /*layer=*/ 3,
+            affine_quant_stub,
+            /*n=*/ 2048,
+            /*k=*/ 2048,
+            /*group_size=*/ 64,
+            /*bits=*/ 4,
+            /*vector_limit=*/ 18,
+        );
+        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
+            .expect("lower")
+            .expect("non-metadata");
+        assert_eq!(cmd.kernel, KernelId::AffineQmmT);
+        assert_eq!(cmd.library, "quantized_qmm");
+        assert_eq!(cmd.function, "affine_qmm_t_bf16_gs_64_b_4_alN_true_batch_0");
+        assert_eq!(
+            cmd.constants,
+            vec![
+                ConstantValue::int(0, 2048),
+                ConstantValue::int(1, 2048),
+                ConstantValue::int(2, 64),
+            ],
+        );
+        // qmm_t grid: (ceil(N/32), ceil(M/32), B); group: (32, 2, 2).
+        assert_eq!(cmd.dispatch.threadgroups, (2048 / 32, 64 / 32, 1));
+        assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 2));
+        assert_eq!(cmd.bindings.len(), 5);
+        assert!(cmd.gemm_dims.is_none());
+    }
+
+    /// Unaligned-N Llama-1B-style lm_head (N=128256 — 128256 % 32 = 0
+    /// so this is actually aligned). Use a synthetic shape for the
+    /// unaligned branch: N=2050 → N % 32 = 2 → alN=false.
+    #[test]
+    fn affine_qmm_qmm_t_unaligned_n_picks_unaligned_kernel() {
+        let inst: Instruction<TestParams> = Instruction::AffineQmm(
+            7, 11, 0, affine_quant_stub,
+            /*n=*/ 2050,
+            /*k=*/ 2048,
+            /*group_size=*/ 64,
+            /*bits=*/ 4,
+            /*vector_limit=*/ 18,
+        );
+        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
+            .expect("lower")
+            .expect("non-metadata");
+        assert_eq!(cmd.function, "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0");
+        // Ceil-div on N: 2050.div_ceil(32) = 65.
+        assert_eq!(cmd.dispatch.threadgroups, (65, 64 / 32, 1));
     }
 }

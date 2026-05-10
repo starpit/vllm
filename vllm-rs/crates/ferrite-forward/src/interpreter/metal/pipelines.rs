@@ -291,6 +291,28 @@ mod tests {
             (KernelId::Reshape, _) => {
                 return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape));
             }
+            // AffineQmv* / AffineQmmT* aren't exercised through this
+            // synthetic-instruction-stream test helper — production
+            // pipeline lookup goes through `pipeline_for_command(cmd)`
+            // which keys on `cmd.library` / `cmd.function` directly
+            // (the lowering pass bakes both via `qmv_kernel_static_name`
+            // / `qmm_t_kernel_static_name`). When the AffineQmm path
+            // wants helper coverage in this module, add arms that return
+            // `("quantized_qmv", qmv_kernel_static_name(...))` etc.
+            (
+                KernelId::AffineQmvQuad
+                | KernelId::AffineQmvFast
+                | KernelId::AffineQmv
+                | KernelId::AffineQmmT
+                | KernelId::AffineQmmTSplitK,
+                _,
+            ) => {
+                unreachable!(
+                    "kernel_msl_names: Affine* kernels not wired into the synthetic \
+                     test helper — see comment above; production lookup uses \
+                     `pipeline_for_command(cmd)` directly"
+                );
+            }
             (_, MetalDtype::Int4) => unreachable!("Int4 filtered at fn entry"),
         })
     }
@@ -337,6 +359,20 @@ mod tests {
             KernelId::Add | KernelId::ScalarMul => Vec::new(),
             KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
             KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
+            KernelId::AffineQmvQuad
+            | KernelId::AffineQmvFast
+            | KernelId::AffineQmv
+            | KernelId::AffineQmmT
+            | KernelId::AffineQmmTSplitK => {
+                // See `kernel_msl_names` for the matching gap — this
+                // helper isn't wired for the Affine* path. Production
+                // constants come from the lowering pass directly via
+                // `cmd.constants`.
+                unreachable!(
+                    "constants_for: Affine* kernels not wired into the synthetic \
+                     test helper — production constants ride on the LoweredCommand"
+                );
+            }
         };
         Ok(cv)
     }

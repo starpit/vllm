@@ -570,6 +570,23 @@ pub enum Instruction<W> {
     Fp8FusedGateUpGeluMul(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
     Fp8FusedQkvRopeCache(u32, u32, u32, WtFn<W, Fp8AnyLinear>, CosSinFn<W>),
     Fp8FusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, Fp8AnyLinear>, CosSinFn<W>),
+    /// MLX-affine int4 matmul (transpose=true). Metal-only. The
+    /// `LinearLayer` resolved by `wt_fn` must be `AffineQuant` —
+    /// `lower_one` reads the quant accessors (packed weight, scales,
+    /// per-group affine biases, optional fp linear bias) through the
+    /// `WeightTensor::Affine*` arms in the worker resolver.
+    ///
+    /// Tuple fields: `(in_slot, out_slot, layer, wt_fn, n, k,
+    /// group_size, bits, vector_limit)`. `vector_limit` is the
+    /// matvec/matmul boundary from `get_qmv_batch_limit(K, N,
+    /// arch_gen)` (mirrors MLX `quantized.cpp:84`); the macro bakes
+    /// it at codegen time so `lower_one` can compare against
+    /// `bucket_m` without reaching for the target profile. M < limit
+    /// → qmv (decode-matvec); M ≥ limit → qmm_t (prefill-matmul,
+    /// SplitK heuristic deferred to C3).
+    ///
+    /// CUDA eval is `unreachable!` — emit only on the metal forward.
+    AffineQmm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
     /// Re-run the next `body_len` instructions `count` times.
     Loop(u32, u32),
     /// `tiles[dst] = Some(View(src))`.
@@ -2963,6 +2980,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[q_out_slot as usize] = Some(TileEntry::Owned(q));
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
+            }
+            Instruction::AffineQmm(..) => {
+                unreachable!(
+                    "Instruction::AffineQmm is metal-only — the macro must \
+                     not emit it on the cuda forward (Affine weights stay \
+                     in StorageFormat::Dense on cuda by the FUF downgrade)"
+                );
             }
             Instruction::Loop(_, _) => {
                 unreachable!("Instruction::Loop should be handled by run(), not eval()");

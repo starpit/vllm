@@ -264,6 +264,63 @@ pub fn qmv_kernel_name(
     }
 }
 
+/// `&'static str` view of [`qmv_kernel_name`] for the lowering pass.
+/// `LoweredCommand::function` is `&'static str`, so the macro-emit
+/// path can't allocate a `String` here. Covers the non-batched (B=1)
+/// instantiations only (`batch_0`); MoE batched=1 lands with P13.
+///
+/// Big match arm rather than `format!`+`Box::leak` so every name is
+/// visible in code review and matches a real entry in the qmv
+/// `INST_QMV_BATCHED` / `INST_QMV_QUAD` instantiation table at
+/// `shaders/quantized_qmv.metal`.
+pub fn qmv_kernel_static_name(
+    kernel: QmvKernel,
+    dtype: DequantDtype,
+    bits: u32,
+    group_size: u32,
+) -> &'static str {
+    debug_assert_eq!(bits, 4, "qmv_kernel_static_name: only bits=4 is wired");
+    use DequantDtype::*;
+    match (kernel, dtype, group_size) {
+        // ── qmv_quad: D∈{64,128} × dtype × gs ─────────────────────
+        (QmvKernel::Quad { d: 64 }, F16, 32) => "affine_qmv_quad_f16_gs_32_b_4_d_64_batch_0",
+        (QmvKernel::Quad { d: 64 }, F16, 64) => "affine_qmv_quad_f16_gs_64_b_4_d_64_batch_0",
+        (QmvKernel::Quad { d: 64 }, F16, 128) => "affine_qmv_quad_f16_gs_128_b_4_d_64_batch_0",
+        (QmvKernel::Quad { d: 64 }, Bf16, 32) => "affine_qmv_quad_bf16_gs_32_b_4_d_64_batch_0",
+        (QmvKernel::Quad { d: 64 }, Bf16, 64) => "affine_qmv_quad_bf16_gs_64_b_4_d_64_batch_0",
+        (QmvKernel::Quad { d: 64 }, Bf16, 128) => "affine_qmv_quad_bf16_gs_128_b_4_d_64_batch_0",
+        (QmvKernel::Quad { d: 128 }, F16, 32) => "affine_qmv_quad_f16_gs_32_b_4_d_128_batch_0",
+        (QmvKernel::Quad { d: 128 }, F16, 64) => "affine_qmv_quad_f16_gs_64_b_4_d_128_batch_0",
+        (QmvKernel::Quad { d: 128 }, F16, 128) => "affine_qmv_quad_f16_gs_128_b_4_d_128_batch_0",
+        (QmvKernel::Quad { d: 128 }, Bf16, 32) => "affine_qmv_quad_bf16_gs_32_b_4_d_128_batch_0",
+        (QmvKernel::Quad { d: 128 }, Bf16, 64) => "affine_qmv_quad_bf16_gs_64_b_4_d_128_batch_0",
+        (QmvKernel::Quad { d: 128 }, Bf16, 128) => "affine_qmv_quad_bf16_gs_128_b_4_d_128_batch_0",
+        // ── qmv_fast ──────────────────────────────────────────────
+        (QmvKernel::Fast, F16, 32) => "affine_qmv_fast_f16_gs_32_b_4_batch_0",
+        (QmvKernel::Fast, F16, 64) => "affine_qmv_fast_f16_gs_64_b_4_batch_0",
+        (QmvKernel::Fast, F16, 128) => "affine_qmv_fast_f16_gs_128_b_4_batch_0",
+        (QmvKernel::Fast, Bf16, 32) => "affine_qmv_fast_bf16_gs_32_b_4_batch_0",
+        (QmvKernel::Fast, Bf16, 64) => "affine_qmv_fast_bf16_gs_64_b_4_batch_0",
+        (QmvKernel::Fast, Bf16, 128) => "affine_qmv_fast_bf16_gs_128_b_4_batch_0",
+        // ── qmv generic fallback ──────────────────────────────────
+        (QmvKernel::Generic, F16, 32) => "affine_qmv_f16_gs_32_b_4_batch_0",
+        (QmvKernel::Generic, F16, 64) => "affine_qmv_f16_gs_64_b_4_batch_0",
+        (QmvKernel::Generic, F16, 128) => "affine_qmv_f16_gs_128_b_4_batch_0",
+        (QmvKernel::Generic, Bf16, 32) => "affine_qmv_bf16_gs_32_b_4_batch_0",
+        (QmvKernel::Generic, Bf16, 64) => "affine_qmv_bf16_gs_64_b_4_batch_0",
+        (QmvKernel::Generic, Bf16, 128) => "affine_qmv_bf16_gs_128_b_4_batch_0",
+        // ── Quad with non-{64,128} D — picker should never produce ─
+        (QmvKernel::Quad { d }, _, _) => panic!(
+            "qmv_kernel_static_name: QmvKernel::Quad with unsupported D={d} \
+             — only 64 and 128 instantiated (see INST_QMV_QUAD in quantized_qmv.metal)"
+        ),
+        (_, _, gs) => panic!(
+            "qmv_kernel_static_name: unsupported group_size={gs} \
+             — only 32, 64, 128 instantiated"
+        ),
+    }
+}
+
 /// MLX-affine int4 decode-matvec dispatcher. Wraps the
 /// `quantized_qmv` metallib's `affine_qmv_quad / fast / generic`
 /// kernels. One pipeline per `(kernel_name)` is built lazily inside the
@@ -543,6 +600,54 @@ pub fn qmm_t_kernel_name(
         ),
         QmmTKernel::SplitK { .. } => format!(
             "affine_qmm_t_splitk_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}",
+        ),
+    }
+}
+
+/// `&'static str` view of [`qmm_t_kernel_name`] for the lowering pass
+/// — see [`qmv_kernel_static_name`] for the analogous discussion.
+/// `LoweredCommand::function` is `&'static str`; the table below
+/// enumerates every entry the `INST_QMM_ALL` macro produces in
+/// `shaders/quantized_qmm.metal`.
+pub fn qmm_t_kernel_static_name(
+    kernel: QmmTKernel,
+    dtype: DequantDtype,
+    bits: u32,
+    group_size: u32,
+    aligned_n: bool,
+) -> &'static str {
+    debug_assert_eq!(bits, 4, "qmm_t_kernel_static_name: only bits=4 is wired");
+    use DequantDtype::*;
+    match (kernel, dtype, group_size, aligned_n) {
+        // ── qmm_t Standard ────────────────────────────────────────
+        (QmmTKernel::Standard, F16, 32, true) => "affine_qmm_t_f16_gs_32_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, F16, 32, false) => "affine_qmm_t_f16_gs_32_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, F16, 64, true) => "affine_qmm_t_f16_gs_64_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, F16, 64, false) => "affine_qmm_t_f16_gs_64_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, F16, 128, true) => "affine_qmm_t_f16_gs_128_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, F16, 128, false) => "affine_qmm_t_f16_gs_128_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, 32, true) => "affine_qmm_t_bf16_gs_32_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, Bf16, 32, false) => "affine_qmm_t_bf16_gs_32_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, 64, true) => "affine_qmm_t_bf16_gs_64_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, Bf16, 64, false) => "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, 128, true) => "affine_qmm_t_bf16_gs_128_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, Bf16, 128, false) => "affine_qmm_t_bf16_gs_128_b_4_alN_false_batch_0",
+        // ── qmm_t SplitK ──────────────────────────────────────────
+        (QmmTKernel::SplitK { .. }, F16, 32, true) => "affine_qmm_t_splitk_f16_gs_32_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, F16, 32, false) => "affine_qmm_t_splitk_f16_gs_32_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, F16, 64, true) => "affine_qmm_t_splitk_f16_gs_64_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, F16, 64, false) => "affine_qmm_t_splitk_f16_gs_64_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, F16, 128, true) => "affine_qmm_t_splitk_f16_gs_128_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, F16, 128, false) => "affine_qmm_t_splitk_f16_gs_128_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, Bf16, 32, true) => "affine_qmm_t_splitk_bf16_gs_32_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, Bf16, 32, false) => "affine_qmm_t_splitk_bf16_gs_32_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, Bf16, 64, true) => "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, Bf16, 64, false) => "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, Bf16, 128, true) => "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, Bf16, 128, false) => "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_false",
+        (_, _, gs, _) => panic!(
+            "qmm_t_kernel_static_name: unsupported group_size={gs} \
+             — only 32, 64, 128 instantiated"
         ),
     }
 }

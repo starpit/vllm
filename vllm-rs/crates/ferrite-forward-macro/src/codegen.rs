@@ -3395,14 +3395,14 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // GGUF fallback — affine and ggml are disjoint storage
             // formats.
             //
-            // INT4 P2 slow-reference path: CPU-dequantize at load,
-            // store as BF16 Dense. P3 will flip back to
-            // `load_affine_quant` (which keeps the packed / scales /
-            // biases on device for forward-time qmv dispatch).
+            // INT4 P3/P4 forward-time path (post-C4b): keeps the
+            // packed / scales / biases on device so the solver's
+            // `MetalAffineQmmImpl` can drive qmv (decode) / qmm_t
+            // (prefill) kernels per `Instruction::AffineQmm`.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
-                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_dequant_as_dense(
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_quant(
                     gw,
                     #prefix,
                     #gs_lit,
@@ -5200,7 +5200,12 @@ pub fn emit_model(
                 // Eval body lives in `ferrite_forward::Instruction::eval`
                 // — `arch_opcodes` keeps the shape registration for
                 // `emit_bucket_static_slice`'s shape-checking pass.
+                // `extra_opcode_shapes` covers storage-polymorphic
+                // impls (see the comment in `lower_bucket`).
                 arch_opcodes.register(term_imp.opcode_shape());
+                for extra in term_imp.extra_opcode_shapes() {
+                    arch_opcodes.register(extra);
+                }
                 crate::interpreter_codegen::LoweredBucket {
                     instances: term_emits,
                     num_slots,

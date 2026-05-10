@@ -924,8 +924,15 @@ pub fn lower_bucket(
             // Eval bodies live in `ferrite_forward::Instruction::eval`
             // — register only the shape, used for static-slice
             // emission and `apply_loop_compression`'s per-variant
-            // iter-index field discovery.
+            // iter-index field discovery. `extra_opcode_shapes`
+            // covers storage-polymorphic impls that fan out a
+            // multi-variant mix (e.g. metal int4's decomposed q-MLP
+            // emits `AffineQmm`/`SiluMul` from the same Impl whose
+            // primary `opcode_shape` is `FusedGateUpSiluMul`).
             arch_opcodes.register(imp.opcode_shape());
+            for extra in imp.extra_opcode_shapes() {
+                arch_opcodes.register(extra);
+            }
             instances.extend(emits);
         }
     }

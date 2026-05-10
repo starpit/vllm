@@ -7,13 +7,19 @@
 
 use std::collections::BTreeMap;
 
-use crate::classified::Program;
-use crate::fuf::{Fuf, TileId};
+use quote::quote;
+
+use crate::classified::{OpKind, Program};
+use crate::codegen::split_base_layer;
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     CostCtx, FusedAddRmsNormImpl, FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl, Handoff,
     Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap,
-    WeightAccessor, WorkloadConstraint, default_required_weights,
+    WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights, first_tile_input,
+    first_weight_ref, gemm_nk_from_fuf, weight_storage_of,
 };
+use crate::metal::affine_qmm::{affine_qmm_opcode_shape, affine_qmm_vector_limit};
+use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
 
 /// Adapter that wraps Metal Fused Add+RMSNorm to satisfy ferrite's Implementation trait.
@@ -304,16 +310,70 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
-        // Defer to the canonical CUDA matcher's 4-tile (Gemm, Gemm,
-        // Silu/Gelu, Mul) claim shape — seeding on the gate Gemm and
-        // walking forward. The Metal impl's prior 1-or-2-tile claim
-        // missed the Gemms, breaking the fused weight accessor that
-        // `required_weights` (and hence `fan_out`) depend on.
+        // GELU variant has no affine decomposition path today —
+        // delegate to the canonical Dense-only CUDA matcher.
         if self.is_gelu {
-            FusedGateUpGeluMulImpl.matches(fuf, seed, profile)
-        } else {
-            FusedGateUpSiluMulImpl.matches(fuf, seed, profile)
+            return FusedGateUpGeluMulImpl.matches(fuf, seed, profile);
         }
+        // SiLU variant: same 4-tile `(Gemm, Gemm, Silu, Mul)` claim
+        // as the CUDA matcher, but accept Dense (existing fused
+        // kernel) AND MLX-affine (decomposed q-MLP — fan_out emits
+        // `AffineQmm` + `AffineQmm` + `SiluMul`). The CUDA matcher's
+        // storage gate at `impl_lib.rs:2971` is restricted to Dense,
+        // so the walk has to live here for the Affine path.
+        let gate_gemm = fuf.get(seed);
+        if gate_gemm.op != OpKind::Gemm {
+            return None;
+        }
+        let gate_storage = weight_storage_of(gate_gemm);
+        let gate_is_dense = matches!(gate_storage, Some(StorageFormat::Dense));
+        let gate_is_affine = matches!(gate_storage, Some(StorageFormat::Affine { .. }));
+        if !gate_is_dense && !gate_is_affine {
+            return None;
+        }
+
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
+        let silu_id = silu_node.id;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, silu_id))?;
+        let mul_id = mul_node.id;
+
+        let up_gemm_id = mul_node.inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
+            _ => None,
+        })?;
+        let up_gemm = fuf.get(up_gemm_id);
+        if up_gemm.op != OpKind::Gemm {
+            return None;
+        }
+        // Storage must agree between gate & up — mixed quant on a
+        // single MLP isn't a real checkpoint shape, and fanout would
+        // pick a single decomposition mode.
+        let up_storage = weight_storage_of(up_gemm);
+        let up_is_dense = matches!(up_storage, Some(StorageFormat::Dense));
+        let up_is_affine = matches!(up_storage, Some(StorageFormat::Affine { .. }));
+        if gate_is_dense != up_is_dense || gate_is_affine != up_is_affine {
+            return None;
+        }
+        if first_tile_input(gate_gemm)? != first_tile_input(up_gemm)? {
+            return None;
+        }
+
+        let mut claimed = [seed, up_gemm_id, silu_id, mul_id];
+        claimed.sort();
+        let claimed = claimed.to_vec();
+
+        let activation_tile = first_tile_input(gate_gemm)?.0;
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_inputs: vec![activation_tile],
+            boundary_outputs: vec![mul_id],
+        })
     }
 
     fn cost_us(&self, match_info: &MatchInfo, ctx: &CostCtx) -> f64 {
@@ -419,17 +479,24 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         fuf: &Fuf,
         program: &Program,
     ) -> Vec<WeightAccessor> {
-        // The fused MLP needs ONE accessor whose source aggregates
-        // both the gate_proj and up_proj weight refs (the loader packs
-        // them into a single `[gate|up]` LinearLayer at runtime).
-        // Delegate to the CUDA impls' override — the default
-        // per-tile-input accessor would emit two separate accessors
-        // and the kernel would fail to find a packed weight at runtime.
         if self.is_gelu {
-            FusedGateUpGeluMulImpl.required_weights(claimed_tiles, fuf, program)
-        } else {
-            FusedGateUpSiluMulImpl.required_weights(claimed_tiles, fuf, program)
+            return FusedGateUpGeluMulImpl.required_weights(claimed_tiles, fuf, program);
         }
+        // SiLU: storage-polymorphic accessor shape.
+        //   * Dense → one fused accessor whose source aggregates
+        //     gate_proj + up_proj weight refs (the loader concats
+        //     them into a single `[gate|up]` LinearLayer at load
+        //     time — the existing CUDA path).
+        //   * Affine → two single-source accessors. Codegen's
+        //     `linear_field_load` resolver sees each as
+        //     `FieldLoad::LinearAffine` and emits a separate
+        //     `LinearLayer::load_affine_quant` per source so the
+        //     decomposed `AffineQmm` instructions emitted in
+        //     `fan_out` can each address their own Linear.
+        if storage_of_first_gemm(claimed_tiles, fuf).is_affine() {
+            return default_required_weights(claimed_tiles, fuf, program);
+        }
+        FusedGateUpSiluMulImpl.required_weights(claimed_tiles, fuf, program)
     }
 
     fn opcode_shape(&self) -> OpcodeShape {
@@ -439,6 +506,23 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
             FusedGateUpSiluMulImpl.opcode_shape()
         }
     }
+
+    fn extra_opcode_shapes(&self) -> Vec<OpcodeShape> {
+        if self.is_gelu {
+            // No affine GELU decomposition path today.
+            return Vec::new();
+        }
+        // SiLU: the Affine path fans out into `AffineQmm` ×2 +
+        // `SiluMul`. Register both shapes here so the per-bucket
+        // static-slice validator typechecks them regardless of
+        // whether `MetalAffineQmmImpl` claimed any standalone Gemm
+        // in this model (e.g., an MoE-only arch with no standalone
+        // q/k/v/o/down_proj). `AffineQmm` shape must match
+        // `MetalAffineQmmImpl::opcode_shape` bit-exactly — they
+        // come from the same helper to enforce that.
+        vec![affine_qmm_opcode_shape(), silu_mul_opcode_shape()]
+    }
+
     fn fan_out(
         &self,
         m: &MatchInfo,
@@ -448,11 +532,201 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
         if self.is_gelu {
-            FusedGateUpGeluMulImpl.fan_out(m, fuf, program, bounds, slots)
-        } else {
-            FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots)
+            return FusedGateUpGeluMulImpl.fan_out(m, fuf, program, bounds, slots);
+        }
+        // Discriminate Dense (single fused emit) vs Affine
+        // (decomposed `AffineQmm` + `AffineQmm` + `SiluMul`) on the
+        // gate Gemm's weight storage. `matches()` already enforces
+        // gate/up agreement, so inspecting one suffices.
+        if !storage_of_first_gemm(&m.claimed_tiles, fuf).is_affine() {
+            return FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots);
+        }
+        Some(affine_decomposed_fan_out(m, fuf, program, bounds, slots))
+    }
+}
+
+/// Compact descriptor of the gate-Gemm's storage format used by the
+/// SiLU variant's `required_weights` and `fan_out` to discriminate
+/// Dense (fused emit) from MLX-affine (decomposed emit).
+#[derive(Clone, Copy, Debug)]
+enum GateStorage {
+    Dense,
+    Affine,
+    Other,
+}
+
+impl GateStorage {
+    fn is_affine(self) -> bool {
+        matches!(self, GateStorage::Affine)
+    }
+}
+
+fn storage_of_first_gemm(claimed_tiles: &[TileId], fuf: &Fuf) -> GateStorage {
+    for &t in claimed_tiles {
+        let n = fuf.get(t);
+        if n.op == OpKind::Gemm {
+            return match weight_storage_of(n) {
+                Some(StorageFormat::Dense) => GateStorage::Dense,
+                Some(StorageFormat::Affine { .. }) => GateStorage::Affine,
+                _ => GateStorage::Other,
+            };
         }
     }
+    GateStorage::Other
+}
+
+/// `Instruction::SiluMul` variant shape: `(gate_slot, up_slot, out_slot)`.
+/// Three u32s — the lowering arm in `lower_one` at
+/// `interpreter/metal/lowering.rs` consumes exactly these three slots
+/// into the `silu_mul_<dtype>` kernel's three buffer bindings.
+fn silu_mul_opcode_shape() -> OpcodeShape {
+    OpcodeShape::new(
+        "SiluMul",
+        vec![
+            ("gate_slot", syn::parse_quote!(u32)),
+            ("up_slot", syn::parse_quote!(u32)),
+            ("out_slot", syn::parse_quote!(u32)),
+        ],
+    )
+}
+
+/// Build the three-instruction decomposition (AffineQmm gate, AffineQmm
+/// up, SiluMul) used when the fused gate-up SiLU MLP claim's Gemms
+/// have MLX-affine storage. Mirrors plan P12 branch (i): the macro
+/// composes existing primitives instead of taking a hand-rolled
+/// fused-quant-MLP kernel (which would violate
+/// `feedback_no_handcoded_fusion`).
+fn affine_decomposed_fan_out(
+    m: &MatchInfo,
+    fuf: &Fuf,
+    program: &Program,
+    bounds: &BTreeMap<String, u64>,
+    slots: &SlotMap,
+) -> Vec<OpInstance> {
+    let silu_id = *m
+        .claimed_tiles
+        .iter()
+        .find(|t| fuf.get(**t).op == OpKind::Silu)
+        .expect("MetalFusedGateUpSiluMul(Affine): claim contains Silu");
+    let mul_id = *m
+        .claimed_tiles
+        .iter()
+        .find(|t| fuf.get(**t).op == OpKind::Mul)
+        .expect("MetalFusedGateUpSiluMul(Affine): claim contains Mul");
+    let gate_id = match fuf.get(silu_id).inputs.first() {
+        Some(FufInput::Tile { id, .. }) => *id,
+        other => panic!(
+            "MetalFusedGateUpSiluMul(Affine): Silu's first input must be a Tile (got {other:?})"
+        ),
+    };
+    let up_id = fuf
+        .get(mul_id)
+        .inputs
+        .iter()
+        .find_map(|i| match i {
+            FufInput::Tile { id, .. } if *id != silu_id => Some(*id),
+            _ => None,
+        })
+        .expect("MetalFusedGateUpSiluMul(Affine): Mul's non-Silu Tile input must be the up Gemm");
+
+    let gate_node = fuf.get(gate_id);
+    let up_node = fuf.get(up_id);
+    let (in_id, in_slot) = match gate_node.inputs.first() {
+        Some(FufInput::Tile { id, slot }) => (*id, *slot),
+        other => panic!(
+            "MetalFusedGateUpSiluMul(Affine): gate Gemm's first input must be a Tile (got {other:?})"
+        ),
+    };
+    let in_slot_idx = slots.of(in_id, in_slot);
+    let gate_out_idx = slots.of(gate_id, 0);
+    let up_out_idx = slots.of(up_id, 0);
+    let final_out_idx = slots.of(mul_id, 0);
+
+    let gate_wref = first_weight_ref(gate_node)
+        .expect("MetalFusedGateUpSiluMul(Affine): gate Gemm has no weight ref");
+    let up_wref = first_weight_ref(up_node)
+        .expect("MetalFusedGateUpSiluMul(Affine): up Gemm has no weight ref");
+
+    // Resolve accessor names by matching `source_weights` back to the
+    // per-Gemm weight ref. `required_weights` for Affine returns the
+    // default (per-weight) accessor list, so each accessor has one
+    // source — matching is just `source_weights == [wref]`.
+    let accessors = default_required_weights(&m.claimed_tiles, fuf, program);
+    let gate_acc = accessors
+        .iter()
+        .find(|a| a.source_weights == vec![gate_wref])
+        .expect("MetalFusedGateUpSiluMul(Affine): gate accessor missing from required_weights");
+    let up_acc = accessors
+        .iter()
+        .find(|a| a.source_weights == vec![up_wref])
+        .expect("MetalFusedGateUpSiluMul(Affine): up accessor missing from required_weights");
+
+    let (gate_base, gate_layer) = split_base_layer(&gate_acc.name.to_string());
+    let gate_layer_lit = gate_layer.unwrap_or(0) as u32;
+    let gate_base_ident = syn::Ident::new(&gate_base, proc_macro2::Span::call_site());
+    let (up_base, up_layer) = split_base_layer(&up_acc.name.to_string());
+    let up_layer_lit = up_layer.unwrap_or(0) as u32;
+    let up_base_ident = syn::Ident::new(&up_base, proc_macro2::Span::call_site());
+
+    let (gate_n, gate_k) = gemm_nk_from_fuf(fuf, gate_node, bounds)
+        .expect("MetalFusedGateUpSiluMul(Affine): gate (N, K) must resolve from FUF + bounds");
+    let (up_n, up_k) = gemm_nk_from_fuf(fuf, up_node, bounds)
+        .expect("MetalFusedGateUpSiluMul(Affine): up (N, K) must resolve from FUF + bounds");
+    let (gate_gs, gate_bits) = match weight_storage_of(gate_node) {
+        Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
+        other => panic!(
+            "MetalFusedGateUpSiluMul(Affine) fan_out: gate Gemm storage isn't Affine ({other:?})"
+        ),
+    };
+    let (up_gs, up_bits) = match weight_storage_of(up_node) {
+        Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
+        other => panic!(
+            "MetalFusedGateUpSiluMul(Affine) fan_out: up Gemm storage isn't Affine ({other:?})"
+        ),
+    };
+    let gate_vl = affine_qmm_vector_limit(gate_k, gate_n);
+    let up_vl = affine_qmm_vector_limit(up_k, up_n);
+
+    let affine_qmm_ident = || syn::Ident::new("AffineQmm", proc_macro2::Span::call_site());
+    let silu_mul_ident = || syn::Ident::new("SiluMul", proc_macro2::Span::call_site());
+
+    let gate_inst = OpInstance::new(
+        affine_qmm_ident(),
+        vec![
+            quote! { #in_slot_idx },
+            quote! { #gate_out_idx },
+            quote! { #gate_layer_lit },
+            quote! { Weights::#gate_base_ident },
+            quote! { #gate_n },
+            quote! { #gate_k },
+            quote! { #gate_gs },
+            quote! { #gate_bits },
+            quote! { #gate_vl },
+        ],
+    );
+    let up_inst = OpInstance::new(
+        affine_qmm_ident(),
+        vec![
+            quote! { #in_slot_idx },
+            quote! { #up_out_idx },
+            quote! { #up_layer_lit },
+            quote! { Weights::#up_base_ident },
+            quote! { #up_n },
+            quote! { #up_k },
+            quote! { #up_gs },
+            quote! { #up_bits },
+            quote! { #up_vl },
+        ],
+    );
+    let silu_mul_inst = OpInstance::new(
+        silu_mul_ident(),
+        vec![
+            quote! { #gate_out_idx },
+            quote! { #up_out_idx },
+            quote! { #final_out_idx },
+        ],
+    );
+    vec![gate_inst, up_inst, silu_mul_inst]
 }
 
 #[cfg(all(test, feature = "metal"))]

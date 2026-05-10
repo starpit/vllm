@@ -1039,12 +1039,16 @@ fn compile_common(
                         Some(3)
                     } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
                     {
                         // Metal GEMM is currently routed through MPS
-                        // matmul2d (see ferrite-metal-kernels::gemm).
-                        // Treated as a cutlass-equivalent for class
-                        // accounting — same "specialized matmul tile"
-                        // shape from the cost-model's perspective.
+                        // matmul2d (see ferrite-metal-kernels::gemm);
+                        // metal int4 GEMM routes through the
+                        // qmv/qmm_t kernels (see ferrite-metal-kernels::
+                        // quantized). Both treated as cutlass-equivalent
+                        // for class accounting — same "specialized
+                        // matmul tile" shape from the cost-model's
+                        // perspective.
                         Some(4) // cutlass
                     } else if NON_GEMM_NAMES.contains(&name) {
                         Some(6) // non-gemm

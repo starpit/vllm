@@ -12,7 +12,9 @@ use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, GemmRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
     OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
+    weight_storage_of,
 };
+use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
 
 /// Adapter that wraps Metal GEMM (via MPS) to satisfy ferrite's Implementation trait.
@@ -73,6 +75,12 @@ impl Implementation for MetalGemmImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let node = fuf.get(seed);
         if node.op != OpKind::Gemm {
+            return None;
+        }
+        // MLX-affine int4 weights are claimed by `MetalAffineQmmImpl`
+        // (forward-time qmv/qmm_t dispatch). MetalGemmImpl serves the
+        // Dense path only — bail on Affine so the affine impl wins.
+        if matches!(weight_storage_of(node), Some(StorageFormat::Affine { .. })) {
             return None;
         }
 

@@ -125,32 +125,9 @@ impl Fuf {
             for input in &node.inputs {
                 if let FufInput::Weight { id, .. } = input {
                     cache.entry(*id).or_insert_with(|| {
-                        let fmt = crate::quantization::storage_format_for_weight(
+                        crate::quantization::storage_format_for_weight(
                             program, self, *id, model,
-                        );
-                        // INT4 P2: MLX-affine weights get CPU-dequanted to BF16
-                        // at load time on Metal (see `LinearLayer::
-                        // load_affine_dequant_as_dense`). The solver runs
-                        // against the materialized Dense LinearLayer, so the
-                        // FUF stores Dense for affine here even though codegen's
-                        // FieldLoad planner sees Affine (and emits the
-                        // affine-dequant loader). The codegen path calls
-                        // `storage_format_for_weight` directly — it isn't
-                        // affected by this downgrade.
-                        //
-                        // Without this, every fuser that gates on
-                        // `weight_storage_of == Dense`
-                        // (`FusedGateUpSiluMul`, `FusedAddRmsNormGemm`, …)
-                        // rejects affine-quant weights and the solver
-                        // explodes with `no Impl matched tile <silu>` on
-                        // every mlx-community 4bit Llama / Qwen / Gemma /
-                        // Mistral / DeepSeek-V3 variant.
-                        #[cfg(feature = "metal")]
-                        let fmt = match fmt {
-                            StorageFormat::Affine { .. } => StorageFormat::Dense,
-                            other => other,
-                        };
-                        fmt
+                        )
                     });
                 }
             }

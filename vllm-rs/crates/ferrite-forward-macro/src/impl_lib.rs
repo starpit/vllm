@@ -691,6 +691,21 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         OpcodeShape::unmigrated(self.name())
     }
 
+    /// Additional opcode shapes this Impl's `fan_out` may emit
+    /// beyond the primary `opcode_shape()`. Default empty.
+    ///
+    /// Used by storage-polymorphic Impls that fan out to different
+    /// opcode mixes depending on weight format. `MetalFusedGateUp-
+    /// SiluMulImpl` is the motivating example: Dense → single
+    /// `FusedGateUpSiluMul`; MLX-affine → decomposed
+    /// `(AffineQmm, AffineQmm, SiluMul)`. The codegen registration
+    /// loop calls `opcode_shape()` AND `extra_opcode_shapes()` and
+    /// registers all of them so the per-bucket static-slice
+    /// validator can typecheck every variant fan_out emits.
+    fn extra_opcode_shapes(&self) -> Vec<OpcodeShape> {
+        Vec::new()
+    }
+
     /// One [`OpInstance`] per kernel call this Impl makes at this
     /// (variant × workload-point). Field-value tokens are positional,
     /// matching the order of fields in `opcode_shape().fields`.
@@ -978,7 +993,7 @@ fn shape_elems(ctx: &CostCtx, shape: &Shape) -> u64 {
         .unwrap_or(0)
 }
 
-fn single_tile_match(fuf: &Fuf, seed: TileId, op: OpKind) -> Option<MatchInfo> {
+pub(crate) fn single_tile_match(fuf: &Fuf, seed: TileId, op: OpKind) -> Option<MatchInfo> {
     if fuf.get(seed).op != op {
         return None;
     }
@@ -1073,7 +1088,7 @@ fn cost_embed(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     elementwise_cost(m, ctx)
 }
 
-fn cost_gemm(m: &MatchInfo, ctx: &CostCtx) -> f64 {
+pub(crate) fn cost_gemm(m: &MatchInfo, ctx: &CostCtx) -> f64 {
     // 2*M*N*K FLOPs, compute-bound on tensor cores.
     let node = ctx.fuf.get(m.claimed_tiles[0]);
     let inputs: Vec<_> = node
@@ -1879,6 +1894,11 @@ pub fn starter_library() -> ImplementationLibrary {
         // Metal GEMM implementations - only match Metal targets
         lib.push(Box::new(crate::metal_bridge::MetalGemmImpl::new_fp16()));
         lib.push(Box::new(crate::metal_bridge::MetalGemmImpl::new_fp32()));
+        // Metal MLX-affine int4 GEMM — fires on `StorageFormat::Affine`
+        // (mlx-community 4bit checkpoints). `MetalGemmImpl::matches`
+        // rejects Affine so these win on the quantized path.
+        lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_fp16()));
+        lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_bf16()));
         // Metal Fused Add+RMSNorm implementations - only match Metal targets
         lib.push(Box::new(
             crate::metal_bridge::MetalFusedAddRmsNormImpl::new_fp16(),
@@ -2884,7 +2904,7 @@ pub struct FusedGateUpSiluMulImpl;
 /// `None`. Dense and quant-aware impls alike read this to decide
 /// whether the kernel they emit (cuBLAS / cutlass vs. Marlin) can
 /// legally consume the weight's storage.
-fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
+pub(crate) fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
     node.inputs.iter().find_map(|i| match i {
         FufInput::Weight { storage, .. } => Some(storage),
         _ => None,
@@ -2894,7 +2914,7 @@ fn weight_storage_of(node: &FufNode) -> Option<&StorageFormat> {
 /// Return the `(TileId, slot)` of a node's first `FufInput::Tile`
 /// input. For Gemm this identifies the activation (the weight input
 /// is a `FufInput::Weight`).
-fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8)> {
+pub(crate) fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8)> {
     node.inputs.iter().find_map(|i| match i {
         FufInput::Tile { id, slot } => Some((*id, *slot)),
         _ => None,
@@ -2904,7 +2924,7 @@ fn first_tile_input(node: &crate::fuf::FufNode) -> Option<(TileId, u8)> {
 /// The `WeightId` + concrete index read by the first weight-typed
 /// input of a tile. For Gemm the weight is in slot 1 of the DSL's
 /// call; we don't care about position, just "which weight flows in".
-fn first_weight_ref(node: &crate::fuf::FufNode) -> Option<(WeightId, Option<u64>)> {
+pub(crate) fn first_weight_ref(node: &crate::fuf::FufNode) -> Option<(WeightId, Option<u64>)> {
     node.inputs.iter().find_map(|i| match i {
         FufInput::Weight { id, index, .. } => Some((*id, *index)),
         _ => None,
@@ -3198,7 +3218,7 @@ impl Implementation for FusedGateUpSiluMulImpl {
 }
 
 /// Whether `node` consumes the output of `producer` via any Tile input.
-fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
+pub(crate) fn consumes_tile(node: &crate::fuf::FufNode, producer: TileId) -> bool {
     node.inputs
         .iter()
         .any(|i| matches!(i, FufInput::Tile { id, .. } if *id == producer))
@@ -9775,7 +9795,7 @@ fn gemm_mnk(ctx: &CostCtx, node: &crate::fuf::FufNode) -> Option<(u32, u32, u32)
 /// input's last dim (in_features). Available to `fan_out` impls so
 /// they can bake weight shape into the emitted `Instruction` for the
 /// runtime shape-assert that guards against loader/codegen drift.
-fn gemm_nk_from_fuf(
+pub(crate) fn gemm_nk_from_fuf(
     fuf: &Fuf,
     node: &crate::fuf::FufNode,
     bounds: &BTreeMap<String, u64>,

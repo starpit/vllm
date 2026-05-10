@@ -8,6 +8,7 @@
 
 pub mod activation;
 pub mod add;
+pub mod affine_qmm;
 pub mod attention;
 pub mod bias_add;
 pub mod embed;
@@ -24,6 +25,7 @@ pub mod sub;
 // Re-export the main implementation types
 pub use activation::MetalActivationImpl;
 pub use add::MetalAddImpl;
+pub use affine_qmm::MetalAffineQmmImpl;
 pub use attention::MetalAttentionImpl;
 pub use bias_add::MetalBiasAddImpl;
 pub use embed::MetalEmbedImpl;

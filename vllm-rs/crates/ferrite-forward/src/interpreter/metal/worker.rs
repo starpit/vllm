@@ -1413,11 +1413,56 @@ fn resolve_weight<W: CanonicalParams>(
         WeightBundleKind::Embedding(wtfn) => (wtfn)(weights, layer).weight,
         WeightBundleKind::LinearLayer(wtfn) => {
             let l = (wtfn)(weights, layer);
-            match which {
-                WeightTensor::Weight => l.dense_weight(),
-                WeightTensor::Bias => l.dense_bias().ok_or(WorkerError::WeightLookupFailed {
-                    reason: "LinearLayer bias requested but not present",
-                })?,
+            match (which, l) {
+                // Dense path
+                (WeightTensor::Weight, ferrite_kernels::layers::LinearLayer::Dense(_)) => {
+                    l.dense_weight()
+                }
+                (WeightTensor::Bias, ferrite_kernels::layers::LinearLayer::Dense(_)) => {
+                    l.dense_bias().ok_or(WorkerError::WeightLookupFailed {
+                        reason: "LinearLayer bias requested but not present",
+                    })?
+                }
+                // MLX-affine path: distinct accessors per tensor role.
+                #[cfg(feature = "metal")]
+                (WeightTensor::Weight, ferrite_kernels::layers::LinearLayer::AffineQuant(_)) => {
+                    l.affine_weight()
+                }
+                #[cfg(feature = "metal")]
+                (
+                    WeightTensor::AffineScales,
+                    ferrite_kernels::layers::LinearLayer::AffineQuant(_),
+                ) => l.affine_scales(),
+                #[cfg(feature = "metal")]
+                (
+                    WeightTensor::AffineBiases,
+                    ferrite_kernels::layers::LinearLayer::AffineQuant(_),
+                ) => l.affine_biases(),
+                #[cfg(feature = "metal")]
+                (
+                    WeightTensor::AffineLinearBias,
+                    ferrite_kernels::layers::LinearLayer::AffineQuant(_),
+                ) => l
+                    .affine_linear_bias()
+                    .ok_or(WorkerError::WeightLookupFailed {
+                        reason: "AffineQuant linear_bias requested but not present",
+                    })?,
+                // Mismatch: affine WeightTensor on a Dense layer (or vice versa),
+                // or any quant arm we don't expect to reach the Metal worker.
+                (WeightTensor::AffineScales, _)
+                | (WeightTensor::AffineBiases, _)
+                | (WeightTensor::AffineLinearBias, _) => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "AffineScales/AffineBiases/AffineLinearBias requested \
+                                 but LinearLayer is not AffineQuant",
+                    });
+                }
+                (WeightTensor::Weight | WeightTensor::Bias, _) => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "LinearLayer arm not reachable on the Metal worker — \
+                                 macro should only emit Dense or AffineQuant on metal",
+                    });
+                }
             }
         }
         WeightBundleKind::CosSin(cosfn) => (cosfn)(weights, layer),

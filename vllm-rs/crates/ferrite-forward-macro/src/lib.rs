@@ -255,6 +255,9 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
             }
         }
         Some(crate::quantization::QuantMethod::Ggml) => "q:ggml".to_string(),
+        Some(crate::quantization::QuantMethod::Affine { bits, group_size }) => {
+            format!("q:affine-b{bits}-g{group_size}")
+        }
     }
 }
 

@@ -9,7 +9,6 @@
 pub mod activation;
 pub mod add;
 pub mod attention;
-pub mod awq;
 pub mod bias_add;
 pub mod embed;
 pub mod fused_kernels;
@@ -26,7 +25,6 @@ pub mod sub;
 pub use activation::MetalActivationImpl;
 pub use add::MetalAddImpl;
 pub use attention::MetalAttentionImpl;
-pub use awq::MetalAwqImpl;
 pub use bias_add::MetalBiasAddImpl;
 pub use embed::MetalEmbedImpl;
 pub use mul::MetalMulImpl;

@@ -187,6 +187,30 @@ pub fn load_layered_linear_dense(
         .collect()
 }
 
+/// MLX-affine int4 layered linear load (Metal-only). Reads the
+/// `<root>.<layer>.<suffix>.{weight,scales,biases,bias?}` triple per
+/// decoder layer.
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_affine_quant(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffix: &str,
+    group_size: u32,
+    bits: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            LinearLayer::load_affine_quant(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                group_size,
+                bits,
+            )
+        })
+        .collect()
+}
+
 /// Tensor-parallel layered dense Linear load. See
 /// [`ferrite_kernels::layers::Linear::load_sharded`] for the per-
 /// dim bias semantics. Used by codegen at tp>1: column-parallel

@@ -1930,9 +1930,6 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(
             crate::metal::MetalActivationImpl::new_fatrelu_fp16(),
         ));
-        // Metal AWQ implementations - only match Metal targets
-        lib.push(Box::new(crate::metal::MetalAwqImpl::new_fp16_g128()));
-        lib.push(Box::new(crate::metal::MetalAwqImpl::new_bf16_g128()));
         // Metal core operations - only match Metal targets
         lib.push(Box::new(crate::metal::MetalReshapeImpl::new()));
         lib.push(Box::new(crate::metal::MetalAddImpl::new_fp16()));

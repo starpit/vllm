@@ -728,10 +728,99 @@ impl Fp8Linear {
 }
 
 // ---------------------------------------------------------------------------
-// LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, or Fp8)
+// AffineQuantLinear (MLX-native int4 affine — Metal-only)
 // ---------------------------------------------------------------------------
 
-/// Unified linear layer — dense (cuBLAS), Marlin INT4, GGML quantized, BNB 4-bit, or FP8.
+/// MLX-native affine INT4 quantized linear layer (Metal backend only).
+///
+/// Storage layout matches `mlx-community/*-4bit` checkpoints exactly:
+/// weights packed `[N, K / pack_factor]` U32 (`pack_factor = 32 / bits =
+/// 8` for bits=4); per-group affine offset (`scales`, `biases`) stored
+/// `[N, K / group_size]` F16. Activation dtype is bf16 or f16 per
+/// `torch_dtype`. The kernel reads scales/biases as `T_scale = half`
+/// and casts to float in registers — see `INT4_PARITY_PROBES.md` §7.
+///
+/// "biases" here is MLX's per-group affine offset, NOT the linear-layer
+/// bias. The optional fp linear-layer bias (when models like Phi-3 / some
+/// Qwen2 variants ship it) lives in `linear_bias` separately.
+///
+/// No `forward()` method on this type — Metal forwards go through the
+/// macro-emitted `Instruction<W>` stream and dispatch via the worker
+/// resolver, not direct method calls.
+#[cfg(feature = "metal")]
+pub struct AffineQuantLinear {
+    /// Packed 4-bit weights, shape `[N, K / pack_factor]`, dtype `U32`.
+    pub weight: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group scales, shape `[N, K / group_size]`, dtype `F16`.
+    pub scales: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group affine offsets ("biases" in MLX terminology — NOT the
+    /// linear-layer bias). Shape `[N, K / group_size]`, dtype `F16`.
+    pub affine_biases: ferrite_cuda_core::tensor::GpuTensor,
+    /// Optional fp linear-layer bias `[N]` (when present in the
+    /// safetensors as `<prefix>.bias`; absent on Llama-3.2 family).
+    pub linear_bias: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    pub in_features: usize,
+    pub out_features: usize,
+    pub group_size: u32,
+    pub bits: u32,
+}
+
+#[cfg(feature = "metal")]
+impl AffineQuantLinear {
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
+    /// (`U32`, `[N, K/pack_factor]`), `<prefix>.scales` (`F16`,
+    /// `[N, K/group_size]`), `<prefix>.biases` (`F16`, same shape),
+    /// and optional `<prefix>.bias` (model dtype, `[N]`).
+    ///
+    /// `group_size` and `bits` come from the model's
+    /// `quantization_config` (parsed at compile time by the macro);
+    /// `in_features` / `out_features` are derived from the weight
+    /// tensor's shape.
+    pub fn load(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+        let scales = weights.take(&format!("{prefix}.scales"))?;
+        let affine_biases = weights.take(&format!("{prefix}.biases"))?;
+        let bias_name = format!("{prefix}.bias");
+        let linear_bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        let pack_factor = (32 / bits) as usize;
+        let out_features = weight.dim(0);
+        let in_features = weight.dim(1) * pack_factor;
+        Ok(Self {
+            weight,
+            scales,
+            affine_biases,
+            linear_bias,
+            in_features,
+            out_features,
+            group_size,
+            bits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, Fp8, AffineQuant)
+// ---------------------------------------------------------------------------
+
+/// Unified linear layer — dense (cuBLAS), Marlin INT4, GGML quantized,
+/// BNB 4-bit, FP8, or MLX-affine INT4 (Metal-only).
 ///
 /// Models use this everywhere they currently use `Linear`. The factory decides
 /// at load time which variant to create based on weight format.
@@ -752,6 +841,11 @@ pub enum LinearLayer {
     Bnb4bit(Box<Bnb4bitLinear>),
     Fp8(Box<Fp8Linear>),
     Fp8Block(Box<Fp8BlockLinear>),
+    /// MLX-native int4 affine quantization (Metal-only). The CUDA
+    /// stack uses Marlin/AWQ/GPTQ/Bnb/Fp8 instead — affine is exclusive
+    /// to the Metal backend.
+    #[cfg(feature = "metal")]
+    AffineQuant(Box<AffineQuantLinear>),
 }
 
 impl LinearLayer {
@@ -886,6 +980,11 @@ impl LinearLayer {
             Self::Bnb4bit(_) => panic!("dense_weight() called on Bnb4bit LinearLayer"),
             Self::Fp8(_) => panic!("dense_weight() called on Fp8 LinearLayer"),
             Self::Fp8Block(_) => panic!("dense_weight() called on Fp8Block LinearLayer"),
+            #[cfg(feature = "metal")]
+            Self::AffineQuant(_) => panic!(
+                "dense_weight() called on AffineQuant LinearLayer — \
+                 use affine_weight() / affine_scales() / affine_biases() instead"
+            ),
         }
     }
 
@@ -923,6 +1022,8 @@ impl LinearLayer {
             Self::Fp8(l) => l.out_features(),
             #[cfg(feature = "cuda")]
             Self::Fp8Block(l) => l.out_features(),
+            #[cfg(feature = "metal")]
+            Self::AffineQuant(l) => l.out_features(),
             #[cfg(not(feature = "cuda"))]
             _ => panic!("out_features: non-Dense LinearLayer not supported on this backend"),
         }
@@ -943,8 +1044,69 @@ impl LinearLayer {
             Self::Fp8(l) => l.in_features(),
             #[cfg(feature = "cuda")]
             Self::Fp8Block(l) => l.in_features(),
+            #[cfg(feature = "metal")]
+            Self::AffineQuant(l) => l.in_features(),
             #[cfg(not(feature = "cuda"))]
             _ => panic!("in_features: non-Dense LinearLayer not supported on this backend"),
+        }
+    }
+
+    /// Access the affine-quantized packed weight tensor (`[N, K / pack_factor]`
+    /// U32). Panics on every other LinearLayer arm — affine accessors
+    /// are gated to Metal builds and Affine layers.
+    #[cfg(feature = "metal")]
+    pub fn affine_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::AffineQuant(l) => l.weight,
+            _ => panic!("affine_weight() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    /// Per-group scales (`[N, K / group_size]` F16). See `affine_weight`.
+    #[cfg(feature = "metal")]
+    pub fn affine_scales(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::AffineQuant(l) => l.scales,
+            _ => panic!("affine_scales() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    /// Per-group affine offsets (MLX-terminology "biases" — NOT the
+    /// linear-layer bias). `[N, K / group_size]` F16. See `affine_weight`.
+    #[cfg(feature = "metal")]
+    pub fn affine_biases(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::AffineQuant(l) => l.affine_biases,
+            _ => panic!("affine_biases() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    /// Optional fp linear-layer bias on an affine-quantized layer
+    /// (distinct from the per-group affine offsets). `[N]` in the
+    /// model's activation dtype. Most mlx-community 4bit checkpoints
+    /// don't have one (Llama-3.2 family has neither attention_bias nor
+    /// mlp_bias); some Phi-3 / Qwen2 variants do.
+    #[cfg(feature = "metal")]
+    pub fn affine_linear_bias(&self) -> Option<ferrite_cuda_core::tensor::GpuTensor> {
+        match self {
+            Self::AffineQuant(l) => l.linear_bias,
+            _ => panic!("affine_linear_bias() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn affine_group_size(&self) -> u32 {
+        match self {
+            Self::AffineQuant(l) => l.group_size,
+            _ => panic!("affine_group_size() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn affine_bits(&self) -> u32 {
+        match self {
+            Self::AffineQuant(l) => l.bits,
+            _ => panic!("affine_bits() called on non-AffineQuant LinearLayer"),
         }
     }
 
@@ -973,6 +1135,22 @@ impl LinearLayer {
         weights.transpose_2d_in_place(key)?;
         let weight = weights.take(key)?;
         Ok(Self::Dense(Linear::new(weight, None)))
+    }
+
+    /// Load an MLX-affine int4 quantized linear layer (Metal-only).
+    /// Reads `<prefix>.weight` + `<prefix>.scales` + `<prefix>.biases`
+    /// (and optional `<prefix>.bias`) from the safetensors. Wraps
+    /// `AffineQuantLinear::load`.
+    #[cfg(feature = "metal")]
+    pub fn load_affine_quant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        Ok(Self::AffineQuant(Box::new(AffineQuantLinear::load(
+            weights, prefix, group_size, bits,
+        )?)))
     }
 
     /// Load a linear layer that may be either dense (safetensors) or
@@ -1291,9 +1469,8 @@ impl LinearLayer {
             let mut offset = 0usize;
             for p in prefixes {
                 let weight_name = format!("{p}.weight");
-                let (written, _shape, dt) = unsafe {
-                    weights.take_into_metal(&weight_name, dst.add(offset))?
-                };
+                let (written, _shape, dt) =
+                    unsafe { weights.take_into_metal(&weight_name, dst.add(offset))? };
                 anyhow::ensure!(
                     dt == dtype,
                     "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
@@ -1307,9 +1484,7 @@ impl LinearLayer {
                 offset == total_bytes,
                 "load_dense_concat_packed: wrote {offset} bytes, expected {total_bytes}",
             );
-            unsafe {
-                ferrite_cuda_core::GpuTensor::new(dst, &[total_out, hidden], dtype)
-            }
+            unsafe { ferrite_cuda_core::GpuTensor::new(dst, &[total_out, hidden], dtype) }
         };
         #[cfg(not(feature = "metal"))]
         let packed_weight = {

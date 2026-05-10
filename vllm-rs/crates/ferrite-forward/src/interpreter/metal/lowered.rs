@@ -209,17 +209,35 @@ pub enum WeightBundleKind<W: CanonicalParams> {
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding
-/// references. Most bundles have a single weight tensor (`Weight`).
+/// references. Most bundles have a single weight tensor (`Weight`);
+/// MLX-affine `LinearLayer::AffineQuant` carries four (packed weight,
+/// per-group scales, per-group affine offsets, optional fp linear bias).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightTensor {
     /// The bundle's primary weight (`RmsNorm.weight`,
     /// `LinearLayer::Dense(Linear { weight, .. })`,
+    /// `LinearLayer::AffineQuant(AffineQuantLinear { weight, .. })`
+    /// — the U32 packed weights, in the affine case —
     /// `Embedding.weight`).
     Weight,
     /// The bundle's bias, if present (`Linear.bias`,
     /// `LayerNorm.bias`). The worker treats absent bias as
     /// `LoweringError::MissingBias` if a binding asks for it.
     Bias,
+    /// Per-group scales on an MLX-affine LinearLayer
+    /// (`AffineQuantLinear.scales`, `[N, K / group_size]` F16).
+    /// Only valid against `LinearLayer::AffineQuant`.
+    AffineScales,
+    /// Per-group affine offsets on an MLX-affine LinearLayer
+    /// (`AffineQuantLinear.affine_biases`, `[N, K / group_size]` F16).
+    /// MLX terminology calls these "biases" — they are NOT the
+    /// linear-layer bias. Only valid against `LinearLayer::AffineQuant`.
+    AffineBiases,
+    /// Optional fp linear-layer bias on an MLX-affine LinearLayer
+    /// (`AffineQuantLinear.linear_bias`, `[N]` in activation dtype).
+    /// Worker reports `MissingBias` if the layer's `linear_bias` is
+    /// `None`. Only valid against `LinearLayer::AffineQuant`.
+    AffineLinearBias,
 }
 
 /// Categories of buffers the worker rebinds per forward call.

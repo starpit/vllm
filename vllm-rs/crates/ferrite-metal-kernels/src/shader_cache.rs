@@ -121,7 +121,7 @@ pub(crate) fn load_library_from_bytes(
     device: &Device,
     bytes: &'static [u8],
 ) -> Result<Library, String> {
-    let data = DispatchData::from(bytes);
+    let data = DispatchData::from_static_bytes(bytes);
     device
         .newLibraryWithData_error(&data)
         .map_err(|e| format!("newLibraryWithData failed: {:?}", e))

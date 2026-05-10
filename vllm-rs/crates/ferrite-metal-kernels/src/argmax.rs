@@ -7,8 +7,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputePipelineState,
-    MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
+    MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -122,8 +123,8 @@ pub fn dispatch_argmax_f16_with_tg_size(
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
     })?;
     enc.setComputePipelineState(&kernels.f16);
-    enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
-    enc.setBuffer_offset_atIndex(Some(output), 0, 1);
+    unsafe { enc.setBuffer_offset_atIndex(Some(logits), 0, 0); }
+    unsafe { enc.setBuffer_offset_atIndex(Some(output), 0, 1); }
     unsafe {
         enc.setBytes_length_atIndex(
             NonNull::new(&batch as *const u32 as *mut c_void).unwrap(),
@@ -194,8 +195,8 @@ pub fn dispatch_argmax_bf16(
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
     })?;
     enc.setComputePipelineState(&kernels.bf16);
-    enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
-    enc.setBuffer_offset_atIndex(Some(output), 0, 1);
+    unsafe { enc.setBuffer_offset_atIndex(Some(logits), 0, 0); }
+    unsafe { enc.setBuffer_offset_atIndex(Some(output), 0, 1); }
     unsafe {
         enc.setBytes_length_atIndex(
             NonNull::new(&batch as *const u32 as *mut c_void).unwrap(),

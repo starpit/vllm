@@ -1,7 +1,8 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLDevice, MTLResourceOptions, MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -71,8 +72,8 @@ impl MetalActivation {
         let pipeline = self.shader_cache.get_pipeline(&kernel_name)?;
 
         encoder.setComputePipelineState(&pipeline);
-        encoder.setBuffer_offset_atIndex(Some(output), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(input), 0, 1);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 0); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(input), 0, 1); }
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -118,8 +119,8 @@ impl MetalActivation {
         let pipeline = self.shader_cache.get_pipeline("silu_vec4_f16")?;
 
         encoder.setComputePipelineState(&pipeline);
-        encoder.setBuffer_offset_atIndex(Some(output), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(input), 0, 1);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 0); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(input), 0, 1); }
 
         unsafe {
             encoder.setBytes_length_atIndex(

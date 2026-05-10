@@ -2,45 +2,64 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Fused kernel implementations for memory-bandwidth optimization.
-//!
-//! These kernels combine multiple operations to eliminate intermediate
-//! memory round-trips, which is critical on Apple Silicon's memory-bound
-//! architecture.
 
-use metal::{Buffer, Device, Library, MTLResourceOptions, MTLSize};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+};
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::{MetalDevice, MetalStream, MetalStreamError};
 
-/// Fused Add + RMSNorm implementation
-///
-/// Computes: output = rmsnorm(input + residual, weight, eps)
-///
-/// This fusion eliminates one memory round-trip by computing the residual
-/// add and normalization in a single pass.
+pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
+
 pub struct FusedAddRmsNorm {
     device: Arc<MetalDevice>,
-    pipeline_f16: metal::ComputePipelineState,
-    pipeline_bf16: metal::ComputePipelineState,
-    pipeline_f16_vec4: metal::ComputePipelineState,
+    pipeline_f16: ComputePipelineState,
+    pipeline_bf16: ComputePipelineState,
+    pipeline_f16_vec4: ComputePipelineState,
+}
+
+fn compile_library(device: &Device, source: &str) -> Result<Library, MetalStreamError> {
+    let opts = objc2_metal::MTLCompileOptions::new();
+    let ns_source = NSString::from_str(source);
+    device
+        .newLibraryWithSource_options_error(&ns_source, Some(&opts))
+        .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{e:?}")))
+}
+
+fn compile_pipeline(
+    device: &Device,
+    library: &Library,
+    name: &str,
+) -> Result<ComputePipelineState, MetalStreamError> {
+    let ns_name = NSString::from_str(name);
+    let function = library
+        .newFunctionWithName(&ns_name)
+        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed(format!("missing fn {name}")))?;
+    device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{e:?}")))
 }
 
 impl FusedAddRmsNorm {
     pub fn new(device: Arc<MetalDevice>) -> Result<Self, MetalStreamError> {
-        let library = device
-            .device
-            .new_library_with_source(
-                include_str!("../shaders/fused_add_rmsnorm.metal"),
-                &metal::CompileOptions::new(),
-            )
-            .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{:?}", e)))?;
-
-        let pipeline_f16 =
-            Self::create_pipeline(&device.device, &library, "fused_add_rmsnorm_f16")?;
-        let pipeline_bf16 =
-            Self::create_pipeline(&device.device, &library, "fused_add_rmsnorm_bf16")?;
+        let library = compile_library(
+            &device.device,
+            include_str!("../shaders/fused_add_rmsnorm.metal"),
+        )?;
+        let pipeline_f16 = compile_pipeline(&device.device, &library, "fused_add_rmsnorm_f16")?;
+        let pipeline_bf16 = compile_pipeline(&device.device, &library, "fused_add_rmsnorm_bf16")?;
         let pipeline_f16_vec4 =
-            Self::create_pipeline(&device.device, &library, "fused_add_rmsnorm_f16_vec4")?;
+            compile_pipeline(&device.device, &library, "fused_add_rmsnorm_f16_vec4")?;
 
         Ok(Self {
             device,
@@ -50,33 +69,6 @@ impl FusedAddRmsNorm {
         })
     }
 
-    fn create_pipeline(
-        device: &Device,
-        library: &Library,
-        name: &str,
-    ) -> Result<metal::ComputePipelineState, MetalStreamError> {
-        let function = library
-            .get_function(name, None)
-            .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{:?}", e)))?;
-
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| MetalStreamError::ShaderCompilationFailed(e))
-    }
-
-    /// Execute fused add + rmsnorm
-    ///
-    /// # Arguments
-    /// * `stream` - Metal stream for command encoding
-    /// * `input` - Input tensor [M, N]
-    /// * `residual` - Residual tensor [M, N]
-    /// * `weight` - RMSNorm weight [N]
-    /// * `output` - Output tensor [M, N]
-    /// * `residual_out` - Optional output for (input + residual) [M, N]
-    /// * `m` - Batch size
-    /// * `n` - Hidden size
-    /// * `eps` - Epsilon for numerical stability
-    /// * `use_f16` - Use FP16 (true) or BF16 (false)
     pub fn execute(
         &self,
         stream: &mut MetalStream,
@@ -90,9 +82,11 @@ impl FusedAddRmsNorm {
         eps: f32,
         use_f16: bool,
     ) -> Result<(), MetalStreamError> {
-        let encoder = stream.get_command_buffer()?.new_compute_command_encoder();
+        let cmd_buf = stream.get_command_buffer()?;
+        let encoder = cmd_buf.computeCommandEncoder().ok_or_else(|| {
+            MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
+        })?;
 
-        // Choose pipeline based on dtype and vectorization
         let pipeline = if use_f16 && n % 4 == 0 {
             &self.pipeline_f16_vec4
         } else if use_f16 {
@@ -101,144 +95,116 @@ impl FusedAddRmsNorm {
             &self.pipeline_bf16
         };
 
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(input), 0);
-        encoder.set_buffer(1, Some(residual), 0);
-        encoder.set_buffer(2, Some(weight), 0);
-        encoder.set_buffer(3, Some(output), 0);
+        encoder.setComputePipelineState(pipeline);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(input), 0, 0); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(residual), 0, 1); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(weight), 0, 2); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 3); }
 
         if let Some(res_out) = residual_out {
-            encoder.set_buffer(4, Some(res_out), 0);
+            unsafe { encoder.setBuffer_offset_atIndex(Some(res_out), 0, 4); }
         }
 
-        // Create constant buffers for scalar parameters
         let n_param = if n % 4 == 0 && use_f16 { n / 4 } else { n };
 
-        let m_buffer = self.device.device.new_buffer_with_data(
-            &m as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&m as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&n_param as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&eps as *const f32 as *mut c_void).unwrap(),
+                std::mem::size_of::<f32>(),
+                7,
+            );
+        }
 
-        let n_buffer = self.device.device.new_buffer_with_data(
-            &n_param as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let threadgroup_size = (n_param as usize).min(1024);
+        let grid_size = MTLSize {
+            width: m as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: threadgroup_size,
+            height: 1,
+            depth: 1,
+        };
 
-        let eps_buffer = self.device.device.new_buffer_with_data(
-            &eps as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        encoder.set_buffer(5, Some(&m_buffer), 0);
-        encoder.set_buffer(6, Some(&n_buffer), 0);
-        encoder.set_buffer(7, Some(&eps_buffer), 0);
-
-        // Dispatch: M threadgroups, each with min(N, 1024) threads
-        let threadgroup_size = n_param.min(1024);
-        let grid_size = MTLSize::new(m as u64, 1, 1);
-        let threadgroup = MTLSize::new(threadgroup_size as u64, 1, 1);
-
-        encoder.dispatch_thread_groups(grid_size, threadgroup);
-        encoder.end_encoding();
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup);
+        encoder.endEncoding();
 
         stream.commit()?;
         Ok(())
     }
 }
 
-/// Fused Gate-Up-SiLU-Mul implementation (SwiGLU)
-///
-/// Computes: output = silu(gate) * up
-/// Where: silu(x) = x * sigmoid(x)
-///
-/// Supports two input modes:
-/// 1. Separate gate and up tensors
-/// 2. Concatenated gate_up tensor [M, 2*N]
 pub struct FusedGateUpSiluMul {
     device: Arc<MetalDevice>,
-    pipeline_f16: metal::ComputePipelineState,
-    pipeline_f16_concat: metal::ComputePipelineState,
-    pipeline_bf16: metal::ComputePipelineState,
-    pipeline_bf16_concat: metal::ComputePipelineState,
-    pipeline_f16_vec4: metal::ComputePipelineState,
-    pipeline_f16_concat_vec4: metal::ComputePipelineState,
-    pipeline_gelu_f16: metal::ComputePipelineState,
-    pipeline_gelu_exact_f16: metal::ComputePipelineState,
+    pipeline_f16: ComputePipelineState,
+    pipeline_f16_concat: ComputePipelineState,
+    pipeline_bf16: ComputePipelineState,
+    pipeline_bf16_concat: ComputePipelineState,
+    pipeline_f16_vec4: ComputePipelineState,
+    pipeline_f16_concat_vec4: ComputePipelineState,
+    pipeline_gelu_f16: ComputePipelineState,
+    pipeline_gelu_exact_f16: ComputePipelineState,
 }
 
 impl FusedGateUpSiluMul {
     pub fn new(device: Arc<MetalDevice>) -> Result<Self, MetalStreamError> {
-        let library = device
-            .device
-            .new_library_with_source(
-                include_str!("../shaders/fused_gate_up_silu_mul.metal"),
-                &metal::CompileOptions::new(),
-            )
-            .map_err(|e| MetalStreamError::ShaderCompilationFailed(e))?;
+        let library = compile_library(
+            &device.device,
+            include_str!("../shaders/fused_gate_up_silu_mul.metal"),
+        )?;
 
         Ok(Self {
             device: device.clone(),
-            pipeline_f16: Self::create_pipeline(
-                &device.device,
-                &library,
-                "fused_gate_up_silu_mul_f16",
-            )?,
-            pipeline_f16_concat: Self::create_pipeline(
+            pipeline_f16: compile_pipeline(&device.device, &library, "fused_gate_up_silu_mul_f16")?,
+            pipeline_f16_concat: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_silu_mul_concat_f16",
             )?,
-            pipeline_bf16: Self::create_pipeline(
+            pipeline_bf16: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_silu_mul_bf16",
             )?,
-            pipeline_bf16_concat: Self::create_pipeline(
+            pipeline_bf16_concat: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_silu_mul_concat_bf16",
             )?,
-            pipeline_f16_vec4: Self::create_pipeline(
+            pipeline_f16_vec4: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_silu_mul_f16_vec4",
             )?,
-            pipeline_f16_concat_vec4: Self::create_pipeline(
+            pipeline_f16_concat_vec4: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_silu_mul_concat_f16_vec4",
             )?,
-            pipeline_gelu_f16: Self::create_pipeline(
+            pipeline_gelu_f16: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_gelu_mul_f16",
             )?,
-            pipeline_gelu_exact_f16: Self::create_pipeline(
+            pipeline_gelu_exact_f16: compile_pipeline(
                 &device.device,
                 &library,
                 "fused_gate_up_gelu_mul_f16",
-            )?, // Use approx for both
+            )?,
         })
     }
 
-    fn create_pipeline(
-        device: &Device,
-        library: &Library,
-        name: &str,
-    ) -> Result<metal::ComputePipelineState, MetalStreamError> {
-        let function = library
-            .get_function(name, None)
-            .map_err(|e| MetalStreamError::ShaderCompilationFailed(e))?;
-
-        device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| MetalStreamError::ShaderCompilationFailed(e))
-    }
-
-    /// Execute with separate gate and up tensors
     pub fn execute_separate(
         &self,
         stream: &mut MetalStream,
@@ -249,7 +215,10 @@ impl FusedGateUpSiluMul {
         n: u32,
         use_f16: bool,
     ) -> Result<(), MetalStreamError> {
-        let encoder = stream.get_command_buffer()?.new_compute_command_encoder();
+        let cmd_buf = stream.get_command_buffer()?;
+        let encoder = cmd_buf.computeCommandEncoder().ok_or_else(|| {
+            MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
+        })?;
 
         let pipeline = if use_f16 && n % 4 == 0 {
             &self.pipeline_f16_vec4
@@ -259,40 +228,45 @@ impl FusedGateUpSiluMul {
             &self.pipeline_bf16
         };
 
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(gate_out), 0);
-        encoder.set_buffer(1, Some(up_out), 0);
-        encoder.set_buffer(2, Some(output), 0);
+        encoder.setComputePipelineState(pipeline);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(gate_out), 0, 0); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 2); }
 
         let n_param = if n % 4 == 0 && use_f16 { n / 4 } else { n };
 
-        let m_buffer = self.device.device.new_buffer_with_data(
-            &m as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&m as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&n_param as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+        }
+
+        let threadgroup_size = (n as usize).min(1024);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: m as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threadgroup_size,
+                height: 1,
+                depth: 1,
+            },
         );
-
-        let n_buffer = self.device.device.new_buffer_with_data(
-            &n_param as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        encoder.set_buffer(3, Some(&m_buffer), 0);
-        encoder.set_buffer(4, Some(&n_buffer), 0);
-
-        let threadgroup_size = n.min(1024);
-        let grid_size = MTLSize::new(m as u64, 1, 1);
-        let threadgroup = MTLSize::new(threadgroup_size as u64, 1, 1);
-
-        encoder.dispatch_thread_groups(grid_size, threadgroup);
-        encoder.end_encoding();
+        encoder.endEncoding();
 
         stream.commit()?;
         Ok(())
     }
 
-    /// Execute with concatenated gate_up tensor [M, 2*N]
     pub fn execute_concat(
         &self,
         stream: &mut MetalStream,
@@ -302,7 +276,10 @@ impl FusedGateUpSiluMul {
         n: u32,
         use_f16: bool,
     ) -> Result<(), MetalStreamError> {
-        let encoder = stream.get_command_buffer()?.new_compute_command_encoder();
+        let cmd_buf = stream.get_command_buffer()?;
+        let encoder = cmd_buf.computeCommandEncoder().ok_or_else(|| {
+            MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
+        })?;
 
         let pipeline = if use_f16 && n % 4 == 0 {
             &self.pipeline_f16_concat_vec4
@@ -312,39 +289,44 @@ impl FusedGateUpSiluMul {
             &self.pipeline_bf16_concat
         };
 
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(gate_up), 0);
-        encoder.set_buffer(1, Some(output), 0);
+        encoder.setComputePipelineState(pipeline);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(gate_up), 0, 0); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 1); }
 
         let n_param = if n % 4 == 0 && use_f16 { n / 4 } else { n };
 
-        let m_buffer = self.device.device.new_buffer_with_data(
-            &m as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&m as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&n_param as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let threadgroup_size = (n as usize).min(1024);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: m as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threadgroup_size,
+                height: 1,
+                depth: 1,
+            },
         );
-
-        let n_buffer = self.device.device.new_buffer_with_data(
-            &n_param as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        encoder.set_buffer(2, Some(&m_buffer), 0);
-        encoder.set_buffer(3, Some(&n_buffer), 0);
-
-        let threadgroup_size = n.min(1024);
-        let grid_size = MTLSize::new(m as u64, 1, 1);
-        let threadgroup = MTLSize::new(threadgroup_size as u64, 1, 1);
-
-        encoder.dispatch_thread_groups(grid_size, threadgroup);
-        encoder.end_encoding();
+        encoder.endEncoding();
 
         stream.commit()?;
         Ok(())
     }
 
-    /// Execute with GELU activation (for Gemma models)
     pub fn execute_gelu(
         &self,
         stream: &mut MetalStream,
@@ -355,7 +337,10 @@ impl FusedGateUpSiluMul {
         n: u32,
         exact: bool,
     ) -> Result<(), MetalStreamError> {
-        let encoder = stream.get_command_buffer()?.new_compute_command_encoder();
+        let cmd_buf = stream.get_command_buffer()?;
+        let encoder = cmd_buf.computeCommandEncoder().ok_or_else(|| {
+            MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
+        })?;
 
         let pipeline = if exact {
             &self.pipeline_gelu_exact_f16
@@ -363,32 +348,38 @@ impl FusedGateUpSiluMul {
             &self.pipeline_gelu_f16
         };
 
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(gate_out), 0);
-        encoder.set_buffer(1, Some(up_out), 0);
-        encoder.set_buffer(2, Some(output), 0);
+        encoder.setComputePipelineState(pipeline);
+        unsafe { encoder.setBuffer_offset_atIndex(Some(gate_out), 0, 0); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1); }
+        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 2); }
 
-        let m_buffer = self.device.device.new_buffer_with_data(
-            &m as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&m as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&n as *const u32 as *mut c_void).unwrap(),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+        }
+
+        let threadgroup_size = (n as usize).min(1024);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: m as usize,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threadgroup_size,
+                height: 1,
+                depth: 1,
+            },
         );
-
-        let n_buffer = self.device.device.new_buffer_with_data(
-            &n as *const u32 as *const _,
-            std::mem::size_of::<u32>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        encoder.set_buffer(3, Some(&m_buffer), 0);
-        encoder.set_buffer(4, Some(&n_buffer), 0);
-
-        let threadgroup_size = n.min(1024);
-        let grid_size = MTLSize::new(m as u64, 1, 1);
-        let threadgroup = MTLSize::new(threadgroup_size as u64, 1, 1);
-
-        encoder.dispatch_thread_groups(grid_size, threadgroup);
-        encoder.end_encoding();
+        encoder.endEncoding();
 
         stream.commit()?;
         Ok(())

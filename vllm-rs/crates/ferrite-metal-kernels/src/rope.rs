@@ -3,7 +3,9 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLDevice, MTLSize,
+};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -79,13 +81,13 @@ impl MetalRope {
             let key_offset = token_idx * num_kv_heads * head_size;
             let cache_offset = position * rot_dim;
 
-            encoder.setBuffer_offset_atIndex(Some(query), query_offset * 2, 0);
+            unsafe { encoder.setBuffer_offset_atIndex(Some(query), query_offset * 2, 0); }
             if let Some(key_buf) = key {
-                encoder.setBuffer_offset_atIndex(Some(key_buf), key_offset * 2, 1);
+                unsafe { encoder.setBuffer_offset_atIndex(Some(key_buf), key_offset * 2, 1); }
             } else {
-                encoder.setBuffer_offset_atIndex(None, 0, 1);
+                unsafe { encoder.setBuffer_offset_atIndex(None, 0, 1); }
             }
-            encoder.setBuffer_offset_atIndex(Some(cos_sin_cache), cache_offset * 2, 2);
+            unsafe { encoder.setBuffer_offset_atIndex(Some(cos_sin_cache), cache_offset * 2, 2); }
 
             unsafe {
                 encoder.setBytes_length_atIndex(

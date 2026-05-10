@@ -783,6 +783,25 @@ impl<W: CanonicalParams> MetalWorker<W> {
             cb.commit();
             cb.wait_until_completed();
             if cb.status() != MTLCommandBufferStatus::Completed {
+                // DIAGNOSTIC (transient): surface step idx + kernel +
+                // bucket so the panic root cause is identifiable from
+                // chat logs. Drop once root cause is fixed.
+                let kind = match step {
+                    BucketStep::Icb { kernel, range, .. } => {
+                        format!("Icb(kernel={kernel:?}, range={range:?})")
+                    }
+                    BucketStep::Gemm { m, n, k, .. } => {
+                        format!("Gemm(m={m}, n={n}, k={k})")
+                    }
+                };
+                eprintln!(
+                    "[ferrite-metal] per-step commit failed: bucket_m={} step_idx={}/{} step={} status={:?}",
+                    baking.bucket_m,
+                    idx,
+                    baking.steps.len(),
+                    kind,
+                    cb.status(),
+                );
                 return Err(WorkerError::WeightLookupFailed {
                     reason: "per-step commit failed",
                 });

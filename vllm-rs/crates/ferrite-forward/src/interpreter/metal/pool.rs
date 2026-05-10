@@ -151,7 +151,14 @@ impl From<WorkerError> for PoolBuildError {
 /// can stay non-generic over the closure type — there's exactly one
 /// runtime layout per (model, max bucket) and the factory captures
 /// it once at pool construction.
-pub type RuntimeFactory = Arc<dyn Fn(&Device) -> RuntimeBindings + Send + Sync>;
+// Note: the `+ Send + Sync` markers metal-rs's `Buffer`/`Device` carried
+// implicitly aren't present on `objc2-metal`'s
+// `Retained<ProtocolObject<dyn MTL*>>` (the protocol traits aren't
+// `Send`/`Sync`). We invoke the factory on the same thread that owns
+// the pool's device handle, so cross-thread bound is unnecessary —
+// dropping it lets the macro-emitted closures capture `Vec<Buffer>`
+// without manual newtype wrappers around every objc2 retained handle.
+pub type RuntimeFactory = Arc<dyn Fn(&Device) -> RuntimeBindings>;
 
 /// One unit the pool hands out: a worker plus its private
 /// [`RuntimeBindings`].
@@ -236,6 +243,15 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
 }
+
+// `Retained<ProtocolObject<dyn MTL*>>` from objc2 isn't auto-Send/Sync
+// because the protocol traits don't carry the markers; metal-rs bolted
+// them on with `unsafe impl Send` on its own newtypes. The MTL retain/
+// release / lifecycle ops are documented thread-safe and the worker
+// pool spawns workers across threads, so we re-add the markers on the
+// pool itself (and downstream worker types).
+unsafe impl<W: CanonicalParams + Send + Sync> Send for MetalWorkerPool<W> {}
+unsafe impl<W: CanonicalParams + Send + Sync> Sync for MetalWorkerPool<W> {}
 
 struct PoolInner<W: CanonicalParams> {
     /// Workers ready to be handed out. `pop()` order is FIFO-ish

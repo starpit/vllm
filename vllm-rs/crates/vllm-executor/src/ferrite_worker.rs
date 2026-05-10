@@ -70,6 +70,8 @@ use vllm_cuda::weights::GpuWeights;
 use ferrite_cuda_core::weights::GpuWeights;
 #[cfg(feature = "metal")]
 use ferrite_cuda_core::{GpuDevice, GpuTensor, MetalAllocator, RawGpuMem, TensorView};
+#[cfg(feature = "metal")]
+use ::objc2_metal::{MTLBuffer as _, MTLDevice as _};
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::input_batch::InputBatch;
@@ -9618,7 +9620,8 @@ impl Worker for FerriteWorker {
                     // StorageModeShared pays on each fresh cmdbuf
                     // (~3s/forward observed at TinyLlama).
                     let buffer = mtl_device
-                        .new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModePrivate);
+                        .newBufferWithLength_options(bytes, ::objc2_metal::MTLResourceOptions::StorageModePrivate)
+                        .expect("newBufferWithLength_options returned nil");
                     residency.insert(&buffer);
                     Ok(RawGpuMem::from_buffer(buffer))
                 },
@@ -9669,8 +9672,8 @@ impl Worker for FerriteWorker {
             .metal_device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
-        let total = metal_device.device.recommended_max_working_set_size() as usize;
-        let weights_and_overhead = metal_device.device.current_allocated_size() as usize;
+        let total = metal_device.device.recommendedMaxWorkingSetSize() as usize;
+        let weights_and_overhead = metal_device.device.currentAllocatedSize() as usize;
         let arena_peak = self
             .model
             .as_ref()
@@ -9831,24 +9834,23 @@ impl Worker for FerriteWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerExecution("gpu_device not initialized".into()))?;
         let mtl_device = device_buf.device.clone();
-        let alloc_u32 = |data: &[u32]| -> metal::Buffer {
-            // `new_buffer` rejects zero-length allocations. Single-byte
-            // floor keeps the call safe; the macro-emitted forward
-            // checks `numel()` before reading, so empty buffers are
-            // never dereferenced.
-            let bytes = ((data.len().max(1)) * 4) as u64;
-            let buf = mtl_device.new_buffer(bytes, metal::MTLResourceOptions::StorageModeShared);
-            if !data.is_empty() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        buf.contents() as *mut u32,
-                        data.len(),
-                    );
+        let alloc_u32 =
+            |data: &[u32]| -> ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>> {
+                let bytes = (data.len().max(1)) * 4;
+                let buf = mtl_device
+                    .newBufferWithLength_options(bytes, ::objc2_metal::MTLResourceOptions::StorageModeShared)
+                    .expect("newBufferWithLength_options returned nil");
+                if !data.is_empty() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr(),
+                            buf.contents().as_ptr() as *mut u32,
+                            data.len(),
+                        );
+                    }
                 }
-            }
-            buf
-        };
+                buf
+            };
 
         let buf_input_ids = alloc_u32(&input_ids_u32);
         let buf_positions = alloc_u32(&positions_u32);
@@ -9864,42 +9866,42 @@ impl Worker for FerriteWorker {
         let dtype_u32 = ferrite_cuda_core::dtype::DType::U32;
         let view_input_ids = unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_input_ids.contents() as *mut u8,
+                buf_input_ids.contents().as_ptr() as *mut u8,
                 &[num_tokens.max(1)],
                 dtype_u32,
             ))
         };
         let view_positions = unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_positions.contents() as *mut u8,
+                buf_positions.contents().as_ptr() as *mut u8,
                 &[num_tokens.max(1)],
                 dtype_u32,
             ))
         };
         let view_slot_mapping = unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_slot_mapping.contents() as *mut u8,
+                buf_slot_mapping.contents().as_ptr() as *mut u8,
                 &[num_tokens.max(1)],
                 dtype_u32,
             ))
         };
         let view_cu_seqlens = unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_cu_seqlens.contents() as *mut u8,
+                buf_cu_seqlens.contents().as_ptr() as *mut u8,
                 &[cu_seqlens_u32.len().max(1)],
                 dtype_u32,
             ))
         };
         let view_seqused_k = unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_seqused_k.contents() as *mut u8,
+                buf_seqused_k.contents().as_ptr() as *mut u8,
                 &[seqused_k_u32.len().max(1)],
                 dtype_u32,
             ))
         };
         let view_block_table = unsafe {
             TensorView::from_raw(GpuTensor::new(
-                buf_block_table.contents() as *mut u8,
+                buf_block_table.contents().as_ptr() as *mut u8,
                 &[num_reqs.max(1), max_blocks_eff],
                 dtype_u32,
             ))
@@ -9952,7 +9954,7 @@ impl Worker for FerriteWorker {
             for row_idx in 0..total_n.min(25) {
                 let row = unsafe {
                     std::slice::from_raw_parts(
-                        (buf.contents() as *const half::f16).add(row_idx as usize * vocab as usize),
+                        (buf.contents().as_ptr() as *const half::f16).add(row_idx as usize * vocab as usize),
                         vocab as usize,
                     )
                 };
@@ -9968,10 +9970,12 @@ impl Worker for FerriteWorker {
         // Argmax over `[total_n, vocab]` → `[total_n]` u32. We
         // post-gather per-request last-token rows host-side rather
         // than emit a per-row gather kernel; greedy bring-up.
-        let argmax_out = mtl_device.new_buffer(
-            (total_n as u64).max(1) * 4,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let argmax_out = mtl_device
+            .newBufferWithLength_options(
+                (total_n as usize).max(1) * 4,
+                ::objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+            .expect("newBufferWithLength_options returned nil");
         match model.metal_dtype() {
             ferrite_forward::interpreter::metal::MetalDtype::F16 => {
                 ferrite_metal_kernels::argmax::dispatch_argmax_f16(
@@ -10005,7 +10009,7 @@ impl Worker for FerriteWorker {
         }
 
         let argmax_slice: &[u32] = unsafe {
-            std::slice::from_raw_parts(argmax_out.contents() as *const u32, total_n as usize)
+            std::slice::from_raw_parts(argmax_out.contents().as_ptr() as *const u32, total_n as usize)
         };
 
         // DIAGNOSTIC: dump first 8 logits + top-5 + the argmax for the
@@ -10016,7 +10020,7 @@ impl Worker for FerriteWorker {
             fn bf16_bits_to_f32(bits: u16) -> f32 {
                 f32::from_bits((bits as u32) << 16)
             }
-            let logits_bytes = logits.metal_buffer().contents() as *const u8;
+            let logits_bytes = logits.metal_buffer().contents().as_ptr() as *const u8;
             let logits_len = logits.metal_buffer().length() as usize;
             for row in 0..total_n.min(2) {
                 let base = row as usize * vocab as usize * 2;

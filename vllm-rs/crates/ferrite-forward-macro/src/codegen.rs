@@ -5438,10 +5438,12 @@ pub fn emit_model(
                             <Weights as ::ferrite_forward::CanonicalParams>::MAX_BLOCKS_PER_SEQ
                                 as u64;
                         let alloc = |bytes: u64| {
-                            dev.new_buffer(
-                                bytes.max(16),
+                            use ::ferrite_forward::interpreter::metal::__re::MTLDevice as _;
+                            dev.newBufferWithLength_options(
+                                bytes.max(16) as usize,
                                 MTLResourceOptions::StorageModeShared,
                             )
+                            .expect("newBufferWithLength_options returned nil")
                         };
                         ::ferrite_forward::interpreter::metal::RuntimeBindings {
                             input_ids: alloc(max_m * 4),
@@ -5556,8 +5558,9 @@ pub fn emit_model(
                         ::ferrite_forward::interpreter::metal::MetalDtype::Int4 =>
                             ::core::unreachable!("Int4 has no logits dtype"),
                     };
+                    use ::ferrite_forward::interpreter::metal::__re::MTLBuffer as _;
                     let inner = ::ferrite_cuda_core::tensor::GpuTensor::new(
-                        buf.contents() as *mut u8,
+                        buf.contents().as_ptr() as *mut u8,
                         &shape,
                         dtype,
                     );

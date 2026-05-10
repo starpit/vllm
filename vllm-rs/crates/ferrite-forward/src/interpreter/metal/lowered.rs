@@ -81,6 +81,19 @@ pub enum KernelId {
     /// shape registers in the dispatcher.
     /// (Present in this enum for symmetry / future zero-copy ops.)
     Reshape,
+    /// MLX-affine int4 decode matvec, K∈{64,128} ∧ pow2 bits.
+    /// Maps to `affine_qmv_quad_<dtype>_gs_<gs>_b_4_d_<K>_batch_<batched>`
+    /// in `quantized_qmv.metallib`. Faithful port of MLX's
+    /// `affine_qmv_quad` (`quantized.h:1444`).
+    AffineQmvQuad,
+    /// MLX-affine int4 decode matvec, `N % 8 == 0 ∧ K % 512 == 0`.
+    /// Maps to `affine_qmv_fast_<dtype>_gs_<gs>_b_4_batch_<batched>`.
+    /// Faithful port of MLX's `affine_qmv_fast` (`quantized.h:1496`).
+    AffineQmvFast,
+    /// MLX-affine int4 decode matvec, generic shape fallback.
+    /// Maps to `affine_qmv_<dtype>_gs_<gs>_b_4_batch_<batched>`.
+    /// Faithful port of MLX's `affine_qmv` (`quantized.h:1548`).
+    AffineQmv,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source

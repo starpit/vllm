@@ -44,6 +44,10 @@ impl ShaderCache {
                 "quantized_dequantize",
                 &crate::embedded_metallib!("quantized_dequantize")[..],
             ),
+            (
+                "quantized_qmv",
+                &crate::embedded_metallib!("quantized_qmv")[..],
+            ),
         ] {
             let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e}"))
@@ -76,6 +80,10 @@ impl ShaderCache {
             self.libraries.get("fused_gate_up_silu_mul")
         } else if name.starts_with("affine_dequantize_") {
             self.libraries.get("quantized_dequantize")
+        } else if name.starts_with("affine_qmv_") {
+            // Also matches `affine_qmv_quad_*` and `affine_qmv_fast_*`
+            // by prefix.
+            self.libraries.get("quantized_qmv")
         } else {
             self.libraries.get("activation")
         }

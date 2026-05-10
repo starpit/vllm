@@ -16,8 +16,8 @@
 | P1 — plumbing (`LinearLayer::AffineQuant` + macro emit) | ✅ done | `4bf6f7ba8` | Plumbed but unreachable until P2 |
 | P2 — kernel + cpu_golden parity | ✅ done | `42fececd8` | `quantized_dequantize.metal` + `cpu_golden::affine_dequantize_b4_*`; bit-exact ≤ 1 ULP |
 | P2 — E2E (Llama-3.2-1B-4bit coherent) | ✅ done | `c2ba7c459` | Load-time CPU dequant in lieu of forward-time `AffineDequantizeThenGemm`; see deviation note below |
-| P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ⏳ next | — | Replaces the P2 load-time fallback |
-| P4 — prefill GEMM transpose=true | pending | — | |
+| P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ✅ kernels | tbd | Three faithful ports + cpu-parity tests; forward-time swap deferred to P3-P4 integration (prefill needs `qmm_t`) |
+| P4 — prefill GEMM transpose=true | ⏳ next | — | Required to flip macro from load-time dequant to forward-time `AffineQmm`; lands together with P3 wiring |
 | P5 — transpose=false (`qmm_n` / `qvm` / `qvm_split_k`) | pending | — | |
 | P6 — quantized embedding lookup | pending | — | P2 dequants the embedding at load; P6 lifts to forward-time gather + dequant |
 | P7 — NAX (M4+) | pending | — | |
@@ -41,10 +41,27 @@ materializes the same math into a BF16 Dense `LinearLayer` at load
 time — every fuser in the metal solver matches as if the model were
 plain BF16. Same correctness gate, simpler infra, ~2 GB extra arena
 on Llama-3.2-1B (fits with headroom on 24 GiB; 3B not yet validated
-under this scheme). P3's qmv kernels replace the fallback; the
-macro flips back to `LinearLayer::load_affine_quant` (still wired
-from P1) and the FUF storage-format downgrade in
-`fuf.rs::annotate_storage_formats` reverts.
+under this scheme). The forward-time swap waits on P4 because every
+Llama Linear sees prefill (M >= vector_limit, routes to qmm_t) AND
+decode (M=1, routes to qmv) — flipping the macro before P4 lands
+would break prefill. P3 ships the qmv kernels + standalone parity
+tests; the macro flip + FUF revert + Instruction::AffineQmm wiring
+land in the P3-P4 integration commit once `qmm_t` arrives.
+
+**P3 kernel landing.** `quantized_qmv.metal` ports MLX's `affine_qmv_quad`
+(`quantized.h:1444`), `affine_qmv_fast` (`:1496`), and `affine_qmv`
+(`:1548`) verbatim, including the `load_vector` / `qdot` / `qdot_safe`
+helpers (`:28-392`) and `adjust_matrix_offsets` (`:1351-1387`).
+Instantiation grid: bits=4 × gs∈{32,64,128} × dtype∈{f16, bf16} ×
+batched∈{0,1} (qmv_fast / qmv) plus D∈{64, 128} (qmv_quad) — 48
+exported symbols. `MetalAffineQmv` dispatcher in
+`ferrite-metal-kernels::quantized` mirrors `dispatch_qmv`
+(`quantized.cpp:1365`) + the inner `qmv_fast`/`qmv` pick (`:259`).
+`KernelId::AffineQmv{Quad,Fast,}` enum variants land for
+diagnostics. `tests/quantized_qmv_test.rs` exercises all three
+kernels against a CPU reference (dequantize-then-matmul); the noise
+floor is bounded by `sqrt(K) × bf16_eps × max_per_elem_magnitude`
+with a 4× safety factor.
 
 **Mandate.** 100% parity with MLX's int4 (`affine` mode) quantization across every kernel, every model class (dense + MoE), every backend variant (standard + NAX/M4+). No omitted kernels, no skipped models. Sequencing prioritizes; nothing is dropped. The only out-of-scope item is `fp_quantized.metal` (NVFP4 / MXFP8 / MXFP4) — this is *production* in MLX (`jit_kernels.cpp:861`), not experimental, but it's a different mode with different weight layouts, captured as Phase 17 (parallel parity track).
 

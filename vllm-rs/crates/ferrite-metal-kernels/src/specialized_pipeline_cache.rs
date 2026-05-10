@@ -162,6 +162,10 @@ impl SpecializedPipelineCache {
                     "quantized_dequantize",
                     crate::embedded_metallib!("quantized_dequantize"),
                 ),
+                (
+                    "quantized_qmv",
+                    crate::embedded_metallib!("quantized_qmv"),
+                ),
                 ("gemm", crate::embedded_metallib!("gemm")),
             ],
         )

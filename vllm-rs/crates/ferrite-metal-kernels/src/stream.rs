@@ -14,9 +14,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLDevice,
-};
+use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice};
 
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;

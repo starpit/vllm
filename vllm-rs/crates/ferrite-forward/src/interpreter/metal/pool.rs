@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::interpreter::metal::__re::{
     Buffer, CommandQueue, Device, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice,
+    MTLCommandQueue,
 };
 
 use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
@@ -849,7 +849,7 @@ mod tests {
     };
     use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
     use ferrite_kernels::layers::RmsNorm;
-    use crate::interpreter::metal::__re::{Buffer, MTLBuffer, MTLDevice, MTLResourceOptions};
+    use crate::interpreter::metal::__re::{Buffer, MTLDevice, MTLResourceOptions};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;

@@ -59,7 +59,7 @@
 use std::sync::Arc;
 
 use crate::CanonicalParams;
-use crate::interpreter::metal::__re::{ComputePipelineState, MTLBuffer};
+use crate::interpreter::metal::__re::ComputePipelineState;
 use ferrite_metal_kernels::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
@@ -464,33 +464,6 @@ mod tests {
         #[cfg(feature = "metal")]
         const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
             crate::interpreter::metal::MetalDtype::Bf16;
-    }
-
-    /// Same as `Llama32Probe` but pinned to f16 so we can route the
-    /// f16 prefill kernel at HEAD_DIM=128. Isolates bf16-vs-f16
-    /// from HEAD_DIM=128-vs-HEAD_DIM=64 when debugging the
-    /// stale-shared-logits collapse seen with bf16+HEAD_DIM=128.
-    struct Llama32F16Probe;
-    impl CanonicalParams for Llama32F16Probe {
-        const HEAD_DIM: u32 = 128;
-        const NUM_Q_HEADS: u32 = 24;
-        const NUM_KV_HEADS: u32 = 8;
-        const Q_SIZE: usize = 3072;
-        const KV_SIZE: usize = 1024;
-        const INTERMEDIATE_SIZE: usize = 8192;
-        const ATTN_SCALE: f32 = 0.088388347;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
-        const KV_LORA_RANK: usize = 0;
-        const QK_NOPE_HEAD_DIM: usize = 0;
-        const QK_ROPE_HEAD_DIM: usize = 0;
-        const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
-        const QK_HEAD_DIM: usize = 0;
-        const MLA_ATTN_SCALE: f32 = 0.0;
-        #[cfg(feature = "metal")]
-        const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
-            crate::interpreter::metal::MetalDtype::F16;
     }
 
     #[test]

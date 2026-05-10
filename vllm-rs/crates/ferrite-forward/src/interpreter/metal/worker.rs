@@ -43,9 +43,9 @@ use std::sync::Arc;
 use ferrite_metal_kernels::gemm::{GemmDtype, GemmError, encode_gemm_into_command_buffer};
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
 use crate::interpreter::metal::__re::{
-    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLBuffer,
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice,
-    MTLResourceOptions, MTLSize,
+    Buffer, CommandBufferRef, ComputePipelineState, Device, MTLBuffer, MTLCommandBuffer,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions,
+    MTLSize,
 };
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;

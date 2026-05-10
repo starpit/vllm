@@ -9,7 +9,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, ProtocolObject};
-use objc2::{class, msg_send, sel};
+use objc2::{class, msg_send};
 use objc2_foundation::NSRange;
 use objc2_metal::{MTLDevice, MTLSize};
 

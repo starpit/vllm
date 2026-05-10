@@ -1,9 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLDevice, MTLResourceOptions, MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLDevice, MTLSize};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -45,17 +42,13 @@ impl DataType {
 
 /// Metal activation function executor
 pub struct MetalActivation {
-    device: Device,
     shader_cache: Arc<ShaderCache>,
 }
 
 impl MetalActivation {
     pub fn new(device: Device) -> Result<Self, MetalStreamError> {
-        let shader_cache = Arc::new(ShaderCache::new(device.clone())?);
-        Ok(Self {
-            device,
-            shader_cache,
-        })
+        let shader_cache = Arc::new(ShaderCache::new(device)?);
+        Ok(Self { shader_cache })
     }
 
     pub fn execute(

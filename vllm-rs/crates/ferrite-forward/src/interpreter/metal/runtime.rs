@@ -19,7 +19,7 @@
 
 #![cfg(feature = "metal")]
 
-use crate::interpreter::metal::__re::{Buffer, MTLBuffer};
+use crate::interpreter::metal::__re::Buffer;
 
 use super::lowered::RuntimeBindingKind;
 

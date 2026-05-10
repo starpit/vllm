@@ -8,7 +8,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -22,7 +22,6 @@ pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 
 pub struct FusedAddRmsNorm {
-    device: Arc<MetalDevice>,
     pipeline_f16: ComputePipelineState,
     pipeline_bf16: ComputePipelineState,
     pipeline_f16_vec4: ComputePipelineState,
@@ -62,7 +61,6 @@ impl FusedAddRmsNorm {
             compile_pipeline(&device.device, &library, "fused_add_rmsnorm_f16_vec4")?;
 
         Ok(Self {
-            device,
             pipeline_f16,
             pipeline_bf16,
             pipeline_f16_vec4,
@@ -146,7 +144,6 @@ impl FusedAddRmsNorm {
 }
 
 pub struct FusedGateUpSiluMul {
-    device: Arc<MetalDevice>,
     pipeline_f16: ComputePipelineState,
     pipeline_f16_concat: ComputePipelineState,
     pipeline_bf16: ComputePipelineState,
@@ -165,7 +162,6 @@ impl FusedGateUpSiluMul {
         )?;
 
         Ok(Self {
-            device: device.clone(),
             pipeline_f16: compile_pipeline(&device.device, &library, "fused_gate_up_silu_mul_f16")?,
             pipeline_f16_concat: compile_pipeline(
                 &device.device,

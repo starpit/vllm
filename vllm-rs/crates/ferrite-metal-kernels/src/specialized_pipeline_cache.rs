@@ -10,7 +10,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunction,
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDataType, MTLDevice,
     MTLFunctionConstantValues, MTLLibrary, MTLPipelineOption,
 };
 use std::collections::HashMap;
@@ -213,20 +213,19 @@ impl SpecializedPipelineCache {
         let descriptor = MTLComputePipelineDescriptor::new();
         descriptor.setComputeFunction(Some(&function));
         descriptor.setSupportIndirectCommandBuffers(true);
-        let pipeline = unsafe {
-            self.device
-                .newComputePipelineStateWithDescriptor_options_reflection_error(
-                    &descriptor,
-                    MTLPipelineOption::None,
-                    None,
-                )
-        }
-        .map_err(|e| {
-            MetalStreamError::ShaderCompilationFailed(format!(
-                "build pipeline `{}`: {e:?}",
-                key.kernel_name,
-            ))
-        })?;
+        let pipeline = self
+            .device
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &descriptor,
+                MTLPipelineOption::None,
+                None,
+            )
+            .map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "build pipeline `{}`: {e:?}",
+                    key.kernel_name,
+                ))
+            })?;
 
         let mut map = self.pipelines.lock().unwrap();
         Ok(map.entry(key.clone()).or_insert(pipeline).clone())

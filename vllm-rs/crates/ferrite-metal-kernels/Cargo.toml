@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-metal = "0.29"
-objc = "0.2"
-foreign-types = "0.5"
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["dispatch2"] }
+objc2-foundation = "0.3"
+dispatch2 = "0.3"
 ferrite-metal-targets = { path = "../ferrite-metal-targets" }
 half = "2.3"
 libm = "0.2"

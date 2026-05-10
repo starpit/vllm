@@ -3,11 +3,19 @@
 
 //! Shader compilation and caching infrastructure.
 
-use metal::{ComputePipelineState, Device, Library};
+use dispatch2::DispatchData;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::stream::MetalStreamError;
+
+pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
+pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 /// Cache for compiled Metal shaders
 pub struct ShaderCache {
@@ -18,12 +26,6 @@ pub struct ShaderCache {
 
 impl ShaderCache {
     /// Create a new shader cache with all shader libraries.
-    ///
-    /// Loads precompiled `.metallib` blobs produced by `build.rs`
-    /// (one per source `.metal` file under `shaders/`) via
-    /// `new_library_with_data`. Replaces the previous
-    /// `new_library_with_source` path that JIT-compiled MSL on every
-    /// process start.
     pub fn new(device: Device) -> Result<Self, MetalStreamError> {
         let mut libraries = HashMap::new();
         for (name, bytes) in [
@@ -43,8 +45,8 @@ impl ShaderCache {
                 &crate::embedded_metallib!("awq_dequantize")[..],
             ),
         ] {
-            let lib = device.new_library_with_data(bytes).map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e:?}"))
+            let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e}"))
             })?;
             libraries.insert(name.to_string(), lib);
         }
@@ -57,7 +59,6 @@ impl ShaderCache {
 
     /// Get or compile a pipeline for a given kernel name
     pub fn get_pipeline(&self, name: &str) -> Result<ComputePipelineState, MetalStreamError> {
-        // Check cache first
         {
             let pipelines = self.pipelines.lock().unwrap();
             if let Some(pipeline) = pipelines.get(name) {
@@ -65,7 +66,6 @@ impl ShaderCache {
             }
         }
 
-        // Determine which library contains this kernel
         let library = if name.starts_with("rope_") {
             self.libraries.get("rope")
         } else if name.starts_with("rmsnorm_") {
@@ -86,25 +86,24 @@ impl ShaderCache {
             ))
         })?;
 
-        // Compile pipeline
-        let function = library.get_function(name, None).map_err(|e| {
+        let ns_name = NSString::from_str(name);
+        let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
             MetalStreamError::ShaderCompilationFailed(format!(
-                "Failed to get function '{}': {:?}",
-                name, e
+                "Failed to get function '{}'",
+                name
             ))
         })?;
 
         let pipeline = self
             .device
-            .new_compute_pipeline_state_with_function(&function)
+            .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!(
-                    "Failed to create pipeline for '{}': {}",
+                    "Failed to create pipeline for '{}': {:?}",
                     name, e
                 ))
             })?;
 
-        // Cache pipeline
         {
             let mut pipelines = self.pipelines.lock().unwrap();
             pipelines.insert(name.to_string(), pipeline.clone());
@@ -112,4 +111,18 @@ impl ShaderCache {
 
         Ok(pipeline)
     }
+}
+
+/// Wrap a static byte slice as a `dispatch_data_t` and load it as a Metal
+/// library. The bytes typically come from `include_bytes!` so we keep the
+/// destructor as no-op (default behavior of `DispatchData::from`'s
+/// implementation copies into a managed buffer).
+pub(crate) fn load_library_from_bytes(
+    device: &Device,
+    bytes: &'static [u8],
+) -> Result<Library, String> {
+    let data = DispatchData::from(bytes);
+    device
+        .newLibraryWithData_error(&data)
+        .map_err(|e| format!("newLibraryWithData failed: {:?}", e))
 }

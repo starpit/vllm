@@ -4,19 +4,24 @@
 //! Metal device detection and management.
 
 use ferrite_metal_targets::MetalTargetProfile;
-use metal::Device;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+
+pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 /// Wrapper around Metal device with target profile
 #[derive(Clone)]
 pub struct MetalDevice {
     pub device: Device,
     pub profile: MetalTargetProfile,
-    pub queue: metal::CommandQueue,
+    pub queue: CommandQueue,
 }
 
 impl MetalDevice {
     pub fn new(device: Device, profile: MetalTargetProfile) -> Self {
-        let queue = device.new_command_queue();
+        let queue = device.newCommandQueue().expect("newCommandQueue returned nil");
         Self {
             device,
             profile,
@@ -27,10 +32,10 @@ impl MetalDevice {
 
 /// Detect the current Metal device and return appropriate profile
 pub fn detect_device() -> Option<MetalDevice> {
-    let device = Device::system_default()?;
+    let device = MTLCreateSystemDefaultDevice()?;
 
     // Detect architecture from device name
-    let name = device.name();
+    let name = device.name().to_string();
     let profile = if name.contains("M1") {
         ferrite_metal_targets::M1_8CORE
     } else if name.contains("M2") {

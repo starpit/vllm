@@ -19,23 +19,18 @@ pub mod shader_cache;
 pub mod specialized_pipeline_cache;
 pub mod stream;
 
-/// Re-export of the upstream `metal` crate so downstream callers
-/// (notably `ferrite-forward::interpreter::metal::pipelines`) can
-/// reach Metal types without taking their own `metal` dependency
-/// — the version stays pinned here.
-pub use metal;
-
 // Instruction recording for ICB execution
 pub mod instruction_executor;
 
-use metal::{Device, MTLResourceOptions};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 /// Embed a precompiled `.metallib` produced by `build.rs` from
 /// `shaders/<name>.metal`. Returns a `&'static [u8]` suitable for
-/// `Device::new_library_with_data`. Replaces the runtime-MSL-compile
-/// path that called `Device::new_library_with_source(include_str!…)`
-/// — the AoT version skips the MSL→AIR frontend on every process
-/// start.
+/// `device.newLibraryWithData_error`. Replaces the runtime-MSL-compile
+/// path that called `newLibraryWithSource:options:error:` —
+/// the AoT version skips the MSL→AIR frontend on every process start.
 #[macro_export]
 macro_rules! embedded_metallib {
     ($name:literal) => {
@@ -49,25 +44,27 @@ pub use stream::{wait_for_completion, MetalStream, MetalStreamError};
 
 /// Metal buffer wrapper with automatic memory management
 pub struct MetalBuffer {
-    buffer: metal::Buffer,
+    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     size: usize,
 }
 
 impl MetalBuffer {
-    pub fn new(device: &Device, size: usize) -> Self {
-        let buffer = device.new_buffer(size as u64, MTLResourceOptions::StorageModeShared);
+    pub fn new(device: &Retained<ProtocolObject<dyn MTLDevice>>, size: usize) -> Self {
+        let buffer = device
+            .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+            .expect("newBufferWithLength returned nil");
         Self { buffer, size }
     }
 
     pub fn as_ptr(&self) -> *mut std::ffi::c_void {
-        self.buffer.contents()
+        self.buffer.contents().as_ptr()
     }
 
     pub fn size(&self) -> usize {
         self.size
     }
 
-    pub fn metal_buffer(&self) -> &metal::Buffer {
+    pub fn metal_buffer(&self) -> &Retained<ProtocolObject<dyn MTLBuffer>> {
         &self.buffer
     }
 }

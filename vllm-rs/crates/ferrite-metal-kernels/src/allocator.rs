@@ -12,9 +12,14 @@
 //! This is the Metal analog of CUDA's memory allocator, adapted for
 //! Metal's unified memory architecture on Apple Silicon.
 
-use metal::{Buffer, Device, MTLResourceOptions};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
 /// Minimum buffer alignment (256 bytes for Metal)
 const MIN_ALIGNMENT: usize = 256;
@@ -58,7 +63,6 @@ impl std::fmt::Display for AllocatorError {
 impl std::error::Error for AllocatorError {}
 
 /// A pooled Metal buffer that returns to the pool when dropped
-#[derive(Debug)]
 pub struct PooledBuffer {
     buffer: Buffer,
     size: usize,
@@ -78,13 +82,12 @@ impl PooledBuffer {
 
     /// Get raw pointer to buffer contents
     pub fn contents(&self) -> *mut std::ffi::c_void {
-        self.buffer.contents()
+        self.buffer.contents().as_ptr()
     }
 }
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        // Return buffer to pool
         if let Ok(mut pool) = self.pool.lock() {
             pool.return_buffer(self.size, self.buffer.clone());
         }
@@ -92,13 +95,9 @@ impl Drop for PooledBuffer {
 }
 
 /// Buffer pool for a specific size bucket
-#[derive(Debug)]
 struct SizePool {
-    /// Available buffers in this pool
     buffers: Vec<Buffer>,
-    /// Total number of buffers allocated (including in-use)
     total_allocated: usize,
-    /// Maximum number of buffers to keep in pool
     max_pooled: usize,
 }
 
@@ -119,7 +118,6 @@ impl SizePool {
         if self.buffers.len() < self.max_pooled {
             self.buffers.push(buffer);
         }
-        // Otherwise drop the buffer (let it deallocate)
     }
 
     fn clear(&mut self) {
@@ -128,25 +126,18 @@ impl SizePool {
 }
 
 /// Metal buffer allocator with pooling (internal, wrapped by MetalAllocator)
-#[derive(Debug)]
 struct BufferPool {
-    /// Metal device
     device: Device,
-    /// Size-bucketed buffer pools
     pools: HashMap<usize, SizePool>,
-    /// Total bytes allocated (including in-use buffers)
     total_bytes_allocated: usize,
-    /// Maximum bytes to allocate before triggering memory pressure
     max_bytes: usize,
 }
 
 impl BufferPool {
-    /// Create a new buffer pool with default settings
     fn new(device: &Device) -> Self {
-        Self::with_limits(device, 4 * 1024 * 1024 * 1024, 16) // 4GB max, 16 buffers per size
+        Self::with_limits(device, 4 * 1024 * 1024 * 1024, 16)
     }
 
-    /// Create a new buffer pool with custom limits
     fn with_limits(device: &Device, max_bytes: usize, max_pooled_per_size: usize) -> Self {
         let mut pools = HashMap::new();
         for &size in SIZE_BUCKETS {
@@ -161,10 +152,6 @@ impl BufferPool {
         }
     }
 
-    /// Allocate a buffer of the given size
-    ///
-    /// Returns a pooled buffer that will be returned to the pool when dropped.
-    /// The actual allocated size may be larger than requested due to bucketing.
     fn allocate(
         &mut self,
         size: usize,
@@ -174,31 +161,21 @@ impl BufferPool {
             return Err(AllocatorError::InvalidSize(size));
         }
 
-        // Round up to alignment
         let aligned_size = (size + MIN_ALIGNMENT - 1) & !(MIN_ALIGNMENT - 1);
 
-        // Find the appropriate size bucket
         let bucket_size = SIZE_BUCKETS
             .iter()
             .find(|&&s| s >= aligned_size)
             .copied()
-            .unwrap_or_else(|| {
-                // For sizes larger than largest bucket, round up to next alignment
-                (aligned_size + MIN_ALIGNMENT - 1) & !(MIN_ALIGNMENT - 1)
-            });
+            .unwrap_or_else(|| (aligned_size + MIN_ALIGNMENT - 1) & !(MIN_ALIGNMENT - 1));
 
-        // Check memory pressure
         if self.total_bytes_allocated + bucket_size > self.max_bytes {
-            // Try to free some memory
             self.evict_lru();
-
-            // Check again
             if self.total_bytes_allocated + bucket_size > self.max_bytes {
                 return Err(AllocatorError::MemoryPressure);
             }
         }
 
-        // Try to get from pool
         let buffer = if let Some(pool) = self.pools.get_mut(&bucket_size) {
             pool.get()
         } else {
@@ -208,12 +185,11 @@ impl BufferPool {
         let buffer = match buffer {
             Some(buf) => buf,
             None => {
-                // Allocate new buffer
                 let buf = self
                     .device
-                    .new_buffer(bucket_size as u64, MTLResourceOptions::StorageModeShared);
+                    .newBufferWithLength_options(bucket_size, MTLResourceOptions::StorageModeShared)
+                    .ok_or(AllocatorError::AllocationFailed(bucket_size))?;
 
-                // Update pool stats
                 if let Some(pool) = self.pools.get_mut(&bucket_size) {
                     pool.total_allocated += 1;
                 }
@@ -230,17 +206,13 @@ impl BufferPool {
         })
     }
 
-    /// Return a buffer to the pool
     fn return_buffer(&mut self, size: usize, buffer: Buffer) {
         if let Some(pool) = self.pools.get_mut(&size) {
             pool.return_buffer(buffer);
         }
     }
 
-    /// Evict least recently used buffers to free memory
     fn evict_lru(&mut self) {
-        // Simple strategy: clear all pools
-        // A more sophisticated implementation would track LRU per buffer
         for pool in self.pools.values_mut() {
             let freed = pool.buffers.len() * pool.buffers.capacity();
             pool.clear();
@@ -248,19 +220,16 @@ impl BufferPool {
         }
     }
 
-    /// Clear all pooled buffers
     fn clear(&mut self) {
         for pool in self.pools.values_mut() {
             pool.clear();
         }
     }
 
-    /// Get total bytes currently allocated (including in-use buffers)
     fn total_bytes_allocated(&self) -> usize {
         self.total_bytes_allocated
     }
 
-    /// Get number of buffers in pool (available for reuse)
     fn pooled_buffer_count(&self) -> usize {
         self.pools.values().map(|p| p.buffers.len()).sum()
     }
@@ -272,14 +241,12 @@ pub struct MetalAllocator {
 }
 
 impl MetalAllocator {
-    /// Create a new allocator
     pub fn new(device: &Device) -> Self {
         Self {
             pool: Arc::new(Mutex::new(BufferPool::new(device))),
         }
     }
 
-    /// Create a new allocator with custom limits
     pub fn with_limits(device: &Device, max_bytes: usize, max_pooled_per_size: usize) -> Self {
         Self {
             pool: Arc::new(Mutex::new(BufferPool::with_limits(
@@ -290,7 +257,6 @@ impl MetalAllocator {
         }
     }
 
-    /// Allocate a buffer
     pub fn allocate(&self, size: usize) -> Result<PooledBuffer, AllocatorError> {
         let pool_ref = Arc::clone(&self.pool);
         self.pool
@@ -299,14 +265,12 @@ impl MetalAllocator {
             .allocate(size, pool_ref)
     }
 
-    /// Clear all pooled buffers
     pub fn clear(&self) {
         if let Ok(mut pool) = self.pool.lock() {
             pool.clear();
         }
     }
 
-    /// Get statistics
     pub fn stats(&self) -> Option<(usize, usize)> {
         self.pool
             .lock()
@@ -346,12 +310,10 @@ mod tests {
         let device = detect_device().expect("Metal device required");
         let allocator = MetalAllocator::new(&device.device);
 
-        // Allocate and drop a buffer
         {
             let _buffer = allocator.allocate(1024).expect("Should allocate");
         }
 
-        // Should have one buffer in pool now
         if let Some((_, count)) = allocator.stats() {
             assert!(count > 0, "Buffer should be returned to pool");
         }
@@ -362,17 +324,14 @@ mod tests {
         let device = detect_device().expect("Metal device required");
         let allocator = MetalAllocator::new(&device.device);
 
-        // Allocate various sizes
         let buffer1 = allocator.allocate(100).expect("Should allocate");
         let buffer2 = allocator.allocate(1000).expect("Should allocate");
         let buffer3 = allocator.allocate(10000).expect("Should allocate");
 
-        // All should be rounded up to bucket sizes
         assert!(buffer1.size() >= 100);
         assert!(buffer2.size() >= 1000);
         assert!(buffer3.size() >= 10000);
 
-        // Should be aligned
         assert_eq!(buffer1.size() % MIN_ALIGNMENT, 0);
         assert_eq!(buffer2.size() % MIN_ALIGNMENT, 0);
         assert_eq!(buffer3.size() % MIN_ALIGNMENT, 0);
@@ -383,15 +342,12 @@ mod tests {
         let device = detect_device().expect("Metal device required");
         let allocator = MetalAllocator::new(&device.device);
 
-        // Allocate and drop some buffers
         for _ in 0..5 {
             let _buffer = allocator.allocate(1024).expect("Should allocate");
         }
 
-        // Clear the pool
         allocator.clear();
 
-        // Pool should be empty
         if let Some((_, count)) = allocator.stats() {
             assert_eq!(count, 0, "Pool should be empty after clear");
         }

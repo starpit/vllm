@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 ferrite-metal-kernels = { path = "../ferrite-metal-kernels" }
 ferrite-metal-targets = { path = "../ferrite-metal-targets" }
-metal = "0.29"
-objc = "0.2"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
 core-foundation = "0.10"

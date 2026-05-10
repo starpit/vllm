@@ -12,7 +12,16 @@
 //! This is the Metal analog of CUDA streams - a sequential execution context
 //! for GPU work.
 
-use metal::{CommandQueue, Device, MTLCommandBufferStatus};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLDevice,
+};
+
+pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+pub type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
+pub type CommandBufferRef = ProtocolObject<dyn MTLCommandBuffer>;
 
 /// Error types for Metal stream operations
 #[derive(Debug, Clone)]
@@ -48,38 +57,23 @@ impl std::error::Error for MetalStreamError {}
 /// Each stream has its own command queue and maintains a pool of command buffers
 /// for reuse. Command buffers are executed sequentially within a stream, but
 /// multiple streams can execute concurrently.
-///
-/// # Example
-/// ```rust,ignore
-/// let device = detect_device().unwrap();
-/// let stream = MetalStream::new(&device.device);
-///
-/// // Execute work on the stream
-/// stream.with_command_buffer(|cmd_buf| {
-///     let encoder = cmd_buf.new_compute_command_encoder();
-///     // ... encode work ...
-///     encoder.end_encoding();
-///     Ok(())
-/// })?;
-///
-/// // Wait for completion
-/// stream.synchronize()?;
-/// ```
 pub struct MetalStream {
     /// Metal command queue for this stream
     queue: CommandQueue,
     /// Device reference
     device: Device,
     /// Current command buffer (if any)
-    current_buffer: Option<metal::CommandBuffer>,
+    current_buffer: Option<CommandBuffer>,
     /// Last committed command buffer (for synchronization)
-    last_committed: Option<metal::CommandBuffer>,
+    last_committed: Option<CommandBuffer>,
 }
 
 impl MetalStream {
     /// Create a new MetalStream with its own command queue.
     pub fn new(device: &Device) -> Self {
-        let queue = device.new_command_queue();
+        let queue = device
+            .newCommandQueue()
+            .expect("newCommandQueue returned nil");
         Self {
             queue,
             device: device.clone(),
@@ -92,10 +86,13 @@ impl MetalStream {
     ///
     /// If a command buffer is already active, returns it. Otherwise creates
     /// a new one from the queue.
-    pub fn get_command_buffer(&mut self) -> Result<&metal::CommandBuffer, MetalStreamError> {
+    pub fn get_command_buffer(&mut self) -> Result<&CommandBuffer, MetalStreamError> {
         if self.current_buffer.is_none() {
-            let cmd_buf = self.queue.new_command_buffer();
-            self.current_buffer = Some(cmd_buf.to_owned());
+            let cmd_buf = self
+                .queue
+                .commandBuffer()
+                .ok_or(MetalStreamError::CommandBufferCreationFailed)?;
+            self.current_buffer = Some(cmd_buf);
         }
 
         self.current_buffer
@@ -106,14 +103,14 @@ impl MetalStream {
     /// Execute a closure with a command buffer, then commit it.
     ///
     /// This is the primary way to submit work to the stream. The closure
-    /// receives a mutable reference to the command buffer and should encode
-    /// all work before returning.
+    /// receives a reference to the command buffer and should encode all work
+    /// before returning.
     ///
     /// The command buffer is automatically committed after the closure returns.
     /// Use `synchronize()` to wait for completion.
     pub fn with_command_buffer<F>(&mut self, f: F) -> Result<(), MetalStreamError>
     where
-        F: FnOnce(&metal::CommandBuffer) -> Result<(), MetalStreamError>,
+        F: FnOnce(&CommandBuffer) -> Result<(), MetalStreamError>,
     {
         let cmd_buf = self.get_command_buffer()?;
         f(cmd_buf)?;
@@ -138,9 +135,8 @@ impl MetalStream {
     /// This is a blocking call that waits for the most recently committed
     /// command buffer to finish execution.
     pub fn synchronize(&mut self) -> Result<(), MetalStreamError> {
-        if let Some(cmd_buf) = &self.last_committed {
-            wait_for_completion(cmd_buf)?;
-            self.last_committed = None;
+        if let Some(cmd_buf) = self.last_committed.take() {
+            wait_for_completion(&cmd_buf)?;
         }
         Ok(())
     }
@@ -162,8 +158,8 @@ impl MetalStream {
 }
 
 /// Helper to wait for a command buffer to complete and check for errors.
-pub fn wait_for_completion(cmd_buf: &metal::CommandBufferRef) -> Result<(), MetalStreamError> {
-    cmd_buf.wait_until_completed();
+pub fn wait_for_completion(cmd_buf: &CommandBufferRef) -> Result<(), MetalStreamError> {
+    cmd_buf.waitUntilCompleted();
 
     match cmd_buf.status() {
         MTLCommandBufferStatus::Completed => Ok(()),
@@ -194,13 +190,11 @@ mod tests {
         let device = detect_device().expect("Metal device required");
         let mut stream = MetalStream::new(&device.device);
 
-        // Get a command buffer
         let _cmd_buf = stream
             .get_command_buffer()
             .expect("Should create command buffer");
         assert!(!stream.is_idle());
 
-        // Commit it
         stream.commit().expect("Should commit");
         assert!(stream.is_idle());
     }
@@ -210,12 +204,12 @@ mod tests {
         let device = detect_device().expect("Metal device required");
         let mut stream = MetalStream::new(&device.device);
 
-        // Execute work with command buffer
         stream
             .with_command_buffer(|cmd_buf| {
-                // Create a simple encoder to verify the command buffer works
-                let encoder = cmd_buf.new_compute_command_encoder();
-                encoder.end_encoding();
+                let encoder = cmd_buf
+                    .computeCommandEncoder()
+                    .expect("computeCommandEncoder");
+                encoder.endEncoding();
                 Ok(())
             })
             .expect("Should execute successfully");
@@ -230,8 +224,10 @@ mod tests {
 
         stream
             .with_command_buffer(|cmd_buf| {
-                let encoder = cmd_buf.new_compute_command_encoder();
-                encoder.end_encoding();
+                let encoder = cmd_buf
+                    .computeCommandEncoder()
+                    .expect("computeCommandEncoder");
+                encoder.endEncoding();
                 Ok(())
             })
             .expect("Should execute");
@@ -242,16 +238,19 @@ mod tests {
     #[test]
     fn test_wait_for_completion() {
         let device = detect_device().expect("Metal device required");
-        let queue = device.device.new_command_queue();
-        let cmd_buf = queue.new_command_buffer();
+        let queue = device
+            .device
+            .newCommandQueue()
+            .expect("newCommandQueue");
+        let cmd_buf = queue.commandBuffer().expect("commandBuffer");
 
-        // Create a simple encoder
-        let encoder = cmd_buf.new_compute_command_encoder();
-        encoder.end_encoding();
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder");
+        encoder.endEncoding();
 
         cmd_buf.commit();
 
-        // Wait for completion - cmd_buf is already &CommandBufferRef
-        wait_for_completion(cmd_buf).expect("Should complete successfully");
+        wait_for_completion(&cmd_buf).expect("Should complete successfully");
     }
 }

@@ -25,7 +25,7 @@ pub use lowered::{
     RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 pub use lowering::{lower, lower_pair};
-pub use pipelines::{PipelineLookupError, SpecializedPipelines, constants_for};
+pub use pipelines::{PipelineLookupError, SpecializedPipelines};
 
 #[cfg(feature = "metal")]
 pub use forward::{ForwardError, ForwardInputs};
@@ -51,9 +51,9 @@ pub mod __re {
     use ::objc2::runtime::ProtocolObject;
     pub use ::objc2_metal::{
         MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-        MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDataType,
-        MTLDevice, MTLFunction, MTLFunctionConstantValues, MTLLibrary, MTLPipelineOption,
-        MTLResourceOptions, MTLSize,
+        MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState,
+        MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues, MTLLibrary,
+        MTLPipelineOption, MTLResourceOptions, MTLSize,
     };
     pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
     pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;

@@ -65,196 +65,24 @@ use ferrite_metal_kernels::specialized_pipeline_cache::{
 };
 use ferrite_metal_kernels::stream::MetalStreamError;
 
-use super::lowered::{KernelId, MetalDtype};
+use super::lowered::{KernelId, LoweredCommand, MetalDtype};
 
 // `KernelExtras` and friends used to live here. Every field has been
 // promoted to a `CanonicalParams` constant (`RMS_NORM_EPS`,
 // `BLOCK_SIZE`, `MAX_BLOCKS_PER_SEQ`, `PREFILL_TILE_Q`, `ROT_DIM`)
 // because the macro reads them from the model JSON at compile time
-// and emits the per-canonical impl. `constants_for::<W>` reads
-// directly from `W::*`; no runtime extras struct, no
-// `MetalModelMeta::kernel_extras_for` callback, no plumbing.
-
-/// Library-and-function name pair for a [`KernelId`].
-///
-/// Library name picks the compiled MSL source file (matches the
-/// `&'static str` keys the cache was constructed with). Kernel name
-/// picks the actual `kernel void` symbol inside that library.
-///
-/// `dtype` selects between the `_f16_specialized` / `_bf16_specialized`
-/// symbol variants in each shader. Llama-3.x ships bf16 on disk and
-/// cuda runs them natively in bf16; the metal backend follows suit
-/// on M3+ (native bf16 MMA). `MetalDtype::Int4` is reserved for the
-/// AWQ / GPTQ dequant path and is rejected here until that wiring
-/// lands — int4 weights need a different binding shape (packed u32s
-/// + group scales) so a single symbol picker can't transparently
-/// model it.
-fn kernel_msl_names(
-    kernel: KernelId,
-    bucket_m: u32,
-    dtype: MetalDtype,
-) -> Result<(&'static str, &'static str), PipelineLookupError> {
-    if matches!(dtype, MetalDtype::Int4) {
-        return Err(PipelineLookupError::DtypeNotYetWired(kernel, dtype));
-    }
-    Ok(match (kernel, dtype) {
-        (KernelId::Embed, MetalDtype::F16) => ("embed", "embed_f16_specialized"),
-        (KernelId::Embed, MetalDtype::Bf16) => ("embed", "embed_bf16_specialized"),
-        (KernelId::RmsNorm, MetalDtype::F16) => ("rmsnorm", "rmsnorm_f16_specialized"),
-        (KernelId::RmsNorm, MetalDtype::Bf16) => ("rmsnorm", "rmsnorm_bf16_specialized"),
-        (KernelId::FusedAddRmsNorm, MetalDtype::F16) => {
-            ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized")
-        }
-        (KernelId::FusedAddRmsNorm, MetalDtype::Bf16) => {
-            ("fused_add_rmsnorm", "fused_add_rmsnorm_bf16_specialized")
-        }
-        // Two specialized variants per dtype:
-        // - **Decode (M=1)**: `..._decode_*_specialized` — port of MLX
-        //   gemv with simd_sum dot products; avoids `simdgroup_matrix`
-        //   overhead on one-row inputs.
-        // - **Prefill (M >= 2)**: `..._gemm_steel_*_specialized` —
-        //   MLX-steel-pattern fused GEMM at BM=BN=32, WM=WN=2, BK=16
-        //   (4 simdgroups × 32 lanes × 4 frags per accumulator gate +
-        //   up).
-        (KernelId::FusedGateUpSiluMul, MetalDtype::F16) if bucket_m == 1 => (
-            "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_decode_f16_specialized",
-        ),
-        (KernelId::FusedGateUpSiluMul, MetalDtype::F16) => (
-            "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
-        ),
-        (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) if bucket_m == 1 => (
-            "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_decode_bf16_specialized",
-        ),
-        (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) => (
-            "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
-        ),
-        (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
-        (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
-        // v2 (online-softmax port of MLX `sdpa_vector`) is now the
-        // production picker for both dtypes. v1 (2-pass softmax with
-        // shared_logits[]) accumulated bf16 rounding error per layer
-        // on Llama-3.2 decode; v2 fixes that. Both v2 variants assume
-        // 1024 threads/group dispatch — see lowering.rs.
-        (KernelId::AttentionViaCache, MetalDtype::F16) => {
-            ("attention", "attention_via_cache_v2_f16_specialized")
-        }
-        (KernelId::AttentionViaCache, MetalDtype::Bf16) => {
-            ("attention", "attention_via_cache_v2_bf16_specialized")
-        }
-        // Paged-cache variant — K/V via block_table (mirrors decode).
-        // Required for chunked prefill / prefix caching / mixed
-        // prefill+decode batches / multi-turn chat.
-        (KernelId::AttentionPrefillSdpaPaged, MetalDtype::F16) => (
-            "attention",
-            "attention_prefill_sdpa_v2_paged_f16_specialized",
-        ),
-        (KernelId::AttentionPrefillSdpaPaged, MetalDtype::Bf16) => (
-            "attention",
-            "attention_prefill_sdpa_v2_paged_bf16_specialized",
-        ),
-        (KernelId::Add, MetalDtype::F16) => ("elementwise", "residual_add_f16_specialized"),
-        (KernelId::Add, MetalDtype::Bf16) => ("elementwise", "residual_add_bf16_specialized"),
-        (KernelId::ScalarMul, MetalDtype::F16) => ("elementwise", "scalar_mul_f16_specialized"),
-        (KernelId::ScalarMul, MetalDtype::Bf16) => ("elementwise", "scalar_mul_bf16_specialized"),
-        // GEMM: f16 routes through MPS' `MPSMatrixMultiplication`
-        // (opaque to this cache). bf16 has no MPS path —
-        // `MPSMatrixMultiplication` rejects `MPSDataTypeBFloat16` at
-        // runtime — so we ship a custom `gemm_bf16_specialized`
-        // kernel using `simdgroup_bfloat8x8` MMA tiles.
-        (KernelId::Gemm, MetalDtype::F16) => {
-            return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
-        }
-        (KernelId::Gemm, MetalDtype::Bf16) => ("gemm", "gemm_bf16_specialized"),
-        // Reshape is metadata-only.
-        (KernelId::Reshape, _) => {
-            return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape));
-        }
-        // Int4 was filtered out above.
-        (_, MetalDtype::Int4) => unreachable!("Int4 filtered at fn entry"),
-    })
-}
-
-/// Build the function-constant bag for `kernel` from `W` and the
-/// bucket M. Every per-layer scalar (eps, attn_scale, paging
-/// strides) is a `CanonicalParams` constant the macro emitted from
-/// the model config — there are no runtime "extras" to thread.
-pub fn constants_for<W: CanonicalParams>(
-    kernel: KernelId,
-    bucket_m: u32,
-) -> Result<Vec<ConstantValue>, PipelineLookupError> {
-    let cv = match kernel {
-        KernelId::RmsNorm | KernelId::FusedAddRmsNorm => vec![
-            ConstantValue::uint(0, bucket_m),
-            ConstantValue::uint(1, W::Q_SIZE as u32),
-            ConstantValue::float(2, W::RMS_NORM_EPS),
-        ],
-        // Two specialized variants share the metallib; each binds a
-        // distinct function-constant slot triple to avoid collision
-        // when the library is loaded:
-        //   3/4/5 → M=1 decode variant
-        //   6/7/8 → MLX-steel matrix variant (production for M >= 2)
-        // (slots 0/1/2 are unused — they keyed the retired legacy
-        //  8×8 single-simdgroup variant.)
-        KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
-            ConstantValue::uint(3, bucket_m),
-            ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
-            ConstantValue::uint(5, W::Q_SIZE as u32),
-        ],
-        KernelId::FusedGateUpSiluMul => vec![
-            ConstantValue::uint(6, bucket_m),
-            ConstantValue::uint(7, W::INTERMEDIATE_SIZE as u32),
-            ConstantValue::uint(8, W::Q_SIZE as u32),
-        ],
-        KernelId::Embed => vec![
-            ConstantValue::uint(0, bucket_m),
-            ConstantValue::uint(1, W::Q_SIZE as u32),
-        ],
-        KernelId::RopeAppend => vec![
-            ConstantValue::uint(0, W::HEAD_DIM),
-            ConstantValue::uint(1, W::NUM_Q_HEADS),
-            ConstantValue::uint(2, W::NUM_KV_HEADS),
-            ConstantValue::uint(3, W::ROT_DIM),
-            ConstantValue::uint(4, W::BLOCK_SIZE),
-        ],
-        KernelId::AttentionViaCache => vec![
-            ConstantValue::uint(0, W::HEAD_DIM),
-            ConstantValue::uint(1, W::NUM_Q_HEADS),
-            ConstantValue::uint(2, W::NUM_KV_HEADS),
-            ConstantValue::float(3, W::ATTN_SCALE),
-            ConstantValue::uint(4, W::BLOCK_SIZE),
-            ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
-        ],
-        // Paged prefill kernel — same 0..3 base set as the decode
-        // kernel (`AttentionViaCache`) PLUS BLOCK_SIZE /
-        // MAX_BLOCKS_PER_SEQ at indices 4/5 (paging strides). The
-        // kernel uses 1 Q per TG (no PREFILL_TILE_Q dependence —
-        // multi-Q comes from grid Y), mirroring decode.
-        KernelId::AttentionPrefillSdpaPaged => vec![
-            ConstantValue::uint(0, W::HEAD_DIM),
-            ConstantValue::uint(1, W::NUM_Q_HEADS),
-            ConstantValue::uint(2, W::NUM_KV_HEADS),
-            ConstantValue::float(3, W::ATTN_SCALE),
-            ConstantValue::uint(4, W::BLOCK_SIZE),
-            ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
-        ],
-        KernelId::Add | KernelId::ScalarMul => Vec::new(),
-        // GEMM: only the bf16 (custom) path uses function constants.
-        // The f16 path goes through MPS and never queries this fn.
-        // The shape constants (M, N, K) come from the lowering pass'
-        // `gemm_dims`; we don't have those here, so the GEMM-side
-        // pipeline build is done out-of-band by the worker (which has
-        // `gemm_dims` in hand). This arm is unreachable for `Gemm`
-        // when the worker uses the dedicated builder; defensive error
-        // for any future caller that forgets.
-        KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
-        KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
-    };
-    Ok(cv)
-}
+// and emits the per-canonical impl. The lowering pass reads from
+// `W::*` directly when populating `LoweredCommand::constants`, so
+// production code never needs a runtime kernel→constants match.
+//
+// The legacy `kernel_msl_names` / `constants_for` runtime match
+// tables, which used to dispatch from `(KernelId, dtype, bucket_m)`
+// to `(library, function, constants)` as a separate hop after the
+// lowering pass had already picked a `KernelId`, are gone — the
+// lowering arms in `lowering.rs` now bake those choices into
+// `LoweredCommand` directly. Test-only stand-ins live in the
+// `tests` module below; new kernels add one arm in `lower_one`,
+// no second match table to keep in sync.
 
 /// High-level wrapper around [`SpecializedPipelineCache`] that knows
 /// the function-constant index layout for every [`KernelId`].
@@ -273,33 +101,29 @@ impl SpecializedPipelines {
         Self { cache }
     }
 
-    /// Return the specialized pipeline for `(kernel, bucket_m, W)`.
-    /// Defaults the dtype to [`MetalDtype::F16`] for backward
-    /// compatibility while the bf16 wiring lands across the worker /
-    /// macro-emission seams. New call sites should prefer
-    /// [`Self::pipeline_for_dtype`].
-    pub fn pipeline_for<W: CanonicalParams>(
+    /// Return the specialized pipeline a [`LoweredCommand`] names
+    /// directly. The lowering pass already baked `library` /
+    /// `function` / `constants` from `W` + `bucket_m` + `dtype`, so
+    /// this layer is a thin pass-through to
+    /// [`SpecializedPipelineCache::get_or_build`].
+    ///
+    /// Returns [`PipelineLookupError::OpaqueKernel`] for
+    /// `KernelId::Gemm`: that kernel is opaque to this picker — f16
+    /// goes through MPS' `MPSMatrixMultiplication`, bf16 has its own
+    /// dims-keyed builder ([`Self::pipeline_for_gemm_bf16`]). The
+    /// worker special-cases GEMM upfront and never reaches this
+    /// method for those commands; the explicit error guards against
+    /// a future caller that forgets.
+    ///
+    /// [`SpecializedPipelineCache::get_or_build`]: ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::get_or_build
+    pub fn pipeline_for_command<W: CanonicalParams>(
         &self,
-        kernel: KernelId,
-        bucket_m: u32,
+        cmd: &LoweredCommand<W>,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
-        self.pipeline_for_dtype::<W>(kernel, bucket_m, MetalDtype::F16)
-    }
-
-    /// Return the specialized pipeline for `(kernel, bucket_m, W,
-    /// dtype)`. First call builds; subsequent calls hit the cache.
-    /// Function constants read from `W::*` (the macro-emitted
-    /// `CanonicalParams` impl); dtype picks the symbol variant
-    /// (`_f16_specialized` vs `_bf16_specialized`).
-    pub fn pipeline_for_dtype<W: CanonicalParams>(
-        &self,
-        kernel: KernelId,
-        bucket_m: u32,
-        dtype: MetalDtype,
-    ) -> Result<ComputePipelineState, PipelineLookupError> {
-        let (library, function) = kernel_msl_names(kernel, bucket_m, dtype)?;
-        let constants = constants_for::<W>(kernel, bucket_m)?;
-        let key = PipelineKey::new(library, function, constants);
+        if matches!(cmd.kernel, KernelId::Gemm) {
+            return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
+        }
+        let key = PipelineKey::new(cmd.library, cmd.function, cmd.constants.clone());
         self.cache
             .get_or_build(&key)
             .map_err(PipelineLookupError::Build)
@@ -385,9 +209,169 @@ mod tests {
     use super::*;
     use crate::CanonicalParams;
 
+    // ── Test-only kernel→symbol/constants mapping ─────────────────
+    //
+    // The production lowering pass picks `library` / `function` /
+    // `constants` per-instruction in `lower_one()` and bakes them
+    // into the `LoweredCommand` directly, so production no longer
+    // needs a runtime `(KernelId, dtype) → ...` match. These helpers
+    // exist solely to let the device-bound goldens below request a
+    // pipeline by `(KernelId, bucket_m, dtype)` without standing up
+    // a synthetic instruction stream + lowering pass for each test.
+    //
+    // They are NOT a parallel source of truth — they redundantly
+    // encode the same kernel symbol layout as the lowering arms,
+    // and a divergence shows up immediately as a "no library /
+    // unknown function" error on the next test run. New kernels do
+    // not need entries here; without one the tests just won't
+    // exercise that kernel's pipeline build (which is fine — the
+    // production smoke test on a real model already does).
+
+    fn kernel_msl_names(
+        kernel: KernelId,
+        bucket_m: u32,
+        dtype: MetalDtype,
+    ) -> Result<(&'static str, &'static str), PipelineLookupError> {
+        if matches!(dtype, MetalDtype::Int4) {
+            return Err(PipelineLookupError::DtypeNotYetWired(kernel, dtype));
+        }
+        Ok(match (kernel, dtype) {
+            (KernelId::Embed, MetalDtype::F16) => ("embed", "embed_f16_specialized"),
+            (KernelId::Embed, MetalDtype::Bf16) => ("embed", "embed_bf16_specialized"),
+            (KernelId::RmsNorm, MetalDtype::F16) => ("rmsnorm", "rmsnorm_f16_specialized"),
+            (KernelId::RmsNorm, MetalDtype::Bf16) => ("rmsnorm", "rmsnorm_bf16_specialized"),
+            (KernelId::FusedAddRmsNorm, MetalDtype::F16) => {
+                ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized")
+            }
+            (KernelId::FusedAddRmsNorm, MetalDtype::Bf16) => {
+                ("fused_add_rmsnorm", "fused_add_rmsnorm_bf16_specialized")
+            }
+            (KernelId::FusedGateUpSiluMul, MetalDtype::F16) if bucket_m == 1 => (
+                "fused_gate_up_silu_mul",
+                "fused_gate_up_silu_mul_decode_f16_specialized",
+            ),
+            (KernelId::FusedGateUpSiluMul, MetalDtype::F16) => (
+                "fused_gate_up_silu_mul",
+                "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
+            ),
+            (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) if bucket_m == 1 => (
+                "fused_gate_up_silu_mul",
+                "fused_gate_up_silu_mul_decode_bf16_specialized",
+            ),
+            (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) => (
+                "fused_gate_up_silu_mul",
+                "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
+            ),
+            (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
+            (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
+            (KernelId::AttentionViaCache, MetalDtype::F16) => {
+                ("attention", "attention_via_cache_v2_f16_specialized")
+            }
+            (KernelId::AttentionViaCache, MetalDtype::Bf16) => {
+                ("attention", "attention_via_cache_v2_bf16_specialized")
+            }
+            (KernelId::AttentionPrefillSdpaPaged, MetalDtype::F16) => (
+                "attention",
+                "attention_prefill_sdpa_v2_paged_f16_specialized",
+            ),
+            (KernelId::AttentionPrefillSdpaPaged, MetalDtype::Bf16) => (
+                "attention",
+                "attention_prefill_sdpa_v2_paged_bf16_specialized",
+            ),
+            (KernelId::Add, MetalDtype::F16) => ("elementwise", "residual_add_f16_specialized"),
+            (KernelId::Add, MetalDtype::Bf16) => ("elementwise", "residual_add_bf16_specialized"),
+            (KernelId::ScalarMul, MetalDtype::F16) => ("elementwise", "scalar_mul_f16_specialized"),
+            (KernelId::ScalarMul, MetalDtype::Bf16) => {
+                ("elementwise", "scalar_mul_bf16_specialized")
+            }
+            (KernelId::Gemm, MetalDtype::F16) => {
+                return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
+            }
+            (KernelId::Gemm, MetalDtype::Bf16) => ("gemm", "gemm_bf16_specialized"),
+            (KernelId::Reshape, _) => {
+                return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape));
+            }
+            (_, MetalDtype::Int4) => unreachable!("Int4 filtered at fn entry"),
+        })
+    }
+
+    fn constants_for<W: CanonicalParams>(
+        kernel: KernelId,
+        bucket_m: u32,
+    ) -> Result<Vec<ConstantValue>, PipelineLookupError> {
+        let cv = match kernel {
+            KernelId::RmsNorm | KernelId::FusedAddRmsNorm => vec![
+                ConstantValue::uint(0, bucket_m),
+                ConstantValue::uint(1, W::Q_SIZE as u32),
+                ConstantValue::float(2, W::RMS_NORM_EPS),
+            ],
+            KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
+                ConstantValue::uint(3, bucket_m),
+                ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
+                ConstantValue::uint(5, W::Q_SIZE as u32),
+            ],
+            KernelId::FusedGateUpSiluMul => vec![
+                ConstantValue::uint(6, bucket_m),
+                ConstantValue::uint(7, W::INTERMEDIATE_SIZE as u32),
+                ConstantValue::uint(8, W::Q_SIZE as u32),
+            ],
+            KernelId::Embed => vec![
+                ConstantValue::uint(0, bucket_m),
+                ConstantValue::uint(1, W::Q_SIZE as u32),
+            ],
+            KernelId::RopeAppend => vec![
+                ConstantValue::uint(0, W::HEAD_DIM),
+                ConstantValue::uint(1, W::NUM_Q_HEADS),
+                ConstantValue::uint(2, W::NUM_KV_HEADS),
+                ConstantValue::uint(3, W::ROT_DIM),
+                ConstantValue::uint(4, W::BLOCK_SIZE),
+            ],
+            KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => vec![
+                ConstantValue::uint(0, W::HEAD_DIM),
+                ConstantValue::uint(1, W::NUM_Q_HEADS),
+                ConstantValue::uint(2, W::NUM_KV_HEADS),
+                ConstantValue::float(3, W::ATTN_SCALE),
+                ConstantValue::uint(4, W::BLOCK_SIZE),
+                ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
+            ],
+            KernelId::Add | KernelId::ScalarMul => Vec::new(),
+            KernelId::Gemm => return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm)),
+            KernelId::Reshape => return Err(PipelineLookupError::MetadataOnly(KernelId::Reshape)),
+        };
+        Ok(cv)
+    }
+
+    impl SpecializedPipelines {
+        // Test-only: build the pipeline from `(kernel, bucket_m, W)`
+        // by going through the test-side symbol/constants helpers.
+        // Defaults dtype to F16 — bf16 callers should use
+        // [`Self::pipeline_for_dtype`] instead.
+        fn pipeline_for<W: CanonicalParams>(
+            &self,
+            kernel: KernelId,
+            bucket_m: u32,
+        ) -> Result<ComputePipelineState, PipelineLookupError> {
+            self.pipeline_for_dtype::<W>(kernel, bucket_m, MetalDtype::F16)
+        }
+
+        fn pipeline_for_dtype<W: CanonicalParams>(
+            &self,
+            kernel: KernelId,
+            bucket_m: u32,
+            dtype: MetalDtype,
+        ) -> Result<ComputePipelineState, PipelineLookupError> {
+            let (library, function) = kernel_msl_names(kernel, bucket_m, dtype)?;
+            let constants = constants_for::<W>(kernel, bucket_m)?;
+            let key = PipelineKey::new(library, function, constants);
+            self.cache
+                .get_or_build(&key)
+                .map_err(PipelineLookupError::Build)
+        }
+    }
+
     /// Pure-CPU stub of `CanonicalParams` modelled on TinyLlama-1.1B.
-    /// Lets us exercise [`constants_for`] without standing up a Metal
-    /// device or a real model variant.
+    /// Lets us exercise the test-side `constants_for` helper without
+    /// standing up a Metal device or a real model variant.
     struct TinyLlamaProbe;
     impl CanonicalParams for TinyLlamaProbe {
         const HEAD_DIM: u32 = 64;
@@ -650,9 +634,9 @@ mod tests {
     /// `rope_append_f16_specialized` kernel against
     /// `cpu_golden::rope_append`. Allocates synthetic Q/K/V/cos_sin/
     /// positions/slot_mapping/kv_cache buffers, dispatches the
-    /// specialized kernel directly (no ICB/worker — just the pipeline
-    /// + a fresh compute encoder), reads back the f16 outputs, and
-    /// asserts max-abs error < 5e-3 vs the cpu_golden ref.
+    /// specialized kernel directly (no ICB/worker — just the
+    /// pipeline plus a fresh compute encoder), reads back the f16
+    /// outputs, and asserts max-abs error < 5e-3 vs the cpu_golden ref.
     ///
     /// 5e-3 tolerance covers f16 round-tripping (3 ULP at typical
     /// Q magnitudes) plus the MSL `half(...)` rounding mode, which
@@ -661,7 +645,9 @@ mod tests {
     #[test]
     fn rope_append_matches_cpu_golden() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -718,11 +704,18 @@ mod tests {
         let slot_mapping = vec![3u32, (block_size as u32) + 3];
 
         // Buffer helpers.
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -734,7 +727,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -746,7 +744,12 @@ mod tests {
         }
         fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -764,19 +767,45 @@ mod tests {
 
         // Encode + dispatch.
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (bucket_m as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (head_dim as u64) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (bucket_m as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: (head_dim as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -864,7 +893,9 @@ mod tests {
     #[test]
     fn rope_append_bf16_matches_cpu_golden_llama32() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -923,11 +954,18 @@ mod tests {
         let positions = vec![5u32, 7];
         let slot_mapping = vec![3u32, (block_size as u32) + 3];
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -939,7 +977,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -951,7 +994,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -968,19 +1016,45 @@ mod tests {
         let kv_v_buf = alloc_zero_bf16(&device, num_blocks * num_kv * block_size * head_dim);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (bucket_m as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (head_dim as u64) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (bucket_m as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: (head_dim as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1082,7 +1156,9 @@ mod tests {
     #[test]
     fn attention_via_cache_bf16_with_aliased_q_output_llama32_1b() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -1149,11 +1225,18 @@ mod tests {
             }
         }
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -1165,7 +1248,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -1187,19 +1275,41 @@ mod tests {
         let kv_v_buf = alloc_bf16(&device, &kv_v_data);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 0); } // output
-        unsafe { enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 1); } // Q input — SAME buffer
-        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 0);
+        } // output
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&qo_buf), 0, 1);
+        } // Q input — SAME buffer
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        }
         // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
         // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (batch as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (batch as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 1024_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1228,11 +1338,12 @@ mod tests {
             Llama32_1BProbe::ATTN_SCALE,
         );
 
-        let output_metal: Vec<f32> =
-            unsafe { std::slice::from_raw_parts(qo_buf.contents().as_ptr() as *const bf16, q_elems) }
-                .iter()
-                .map(|&v| v.to_f32())
-                .collect();
+        let output_metal: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(qo_buf.contents().as_ptr() as *const bf16, q_elems)
+        }
+        .iter()
+        .map(|&v| v.to_f32())
+        .collect();
 
         let tol: f32 = 5e-2;
         for i in 0..output_cpu.len() {
@@ -1260,7 +1371,9 @@ mod tests {
     #[test]
     fn rope_append_bf16_matches_cpu_golden_llama32_1b_decode() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -1319,11 +1432,18 @@ mod tests {
         let positions = vec![36u32];
         let slot_mapping = vec![(2u32) * (block_size as u32) + 4u32];
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -1335,7 +1455,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -1347,7 +1472,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -1364,19 +1494,45 @@ mod tests {
         let kv_v_buf = alloc_zero_bf16(&device, num_blocks * num_kv * block_size * head_dim);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&k_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&v_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&cos_sin_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&positions_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&slot_buf), 0, 5);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 6);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 7);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (bucket_m as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (head_dim as u64) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (bucket_m as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: (head_dim as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1477,7 +1633,9 @@ mod tests {
     #[test]
     fn attention_via_cache_matches_cpu_golden() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -1514,9 +1672,10 @@ mod tests {
         // owning physical block 0, seq 1 owning physical blocks 2,3.
         let seq_used_k: Vec<u32> = vec![10, 17];
         let mut block_table = vec![0u32; batch * max_blocks_per_seq];
-        block_table[0 * max_blocks_per_seq + 0] = 0;
-        block_table[1 * max_blocks_per_seq + 0] = 2;
-        block_table[1 * max_blocks_per_seq + 1] = 3;
+        // Layout: block_table[seq * max_blocks_per_seq + logical_block].
+        block_table[0] = 0;
+        block_table[max_blocks_per_seq] = 2;
+        block_table[max_blocks_per_seq + 1] = 3;
 
         // Synthetic deterministic Q + K/V cache. Q and K must be
         // small enough that the unscaled dot products fit in f16
@@ -1549,11 +1708,18 @@ mod tests {
         }
 
         // Buffer helpers (mirror rope_append_matches_cpu_golden).
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -1565,7 +1731,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -1577,7 +1748,12 @@ mod tests {
         }
         fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -1593,18 +1769,40 @@ mod tests {
 
         // Encode + dispatch.
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        }
         // v2 kernel uses 1024 threads/group (32 simdgroups × 32 lanes).
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (batch as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (batch as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 1024_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1672,7 +1870,9 @@ mod tests {
     #[test]
     fn attention_via_cache_bf16_matches_cpu_golden_llama32() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -1707,9 +1907,10 @@ mod tests {
 
         let seq_used_k: Vec<u32> = vec![10, 17];
         let mut block_table = vec![0u32; batch * max_blocks_per_seq];
-        block_table[0 * max_blocks_per_seq + 0] = 0;
-        block_table[1 * max_blocks_per_seq + 0] = 2;
-        block_table[1 * max_blocks_per_seq + 1] = 3;
+        // Layout: block_table[seq * max_blocks_per_seq + logical_block].
+        block_table[0] = 0;
+        block_table[max_blocks_per_seq] = 2;
+        block_table[max_blocks_per_seq + 1] = 3;
 
         let q_data: Vec<f32> = (0..batch * num_q * head_dim)
             .map(|i| ((i as f32) * 0.013).sin() * 0.5)
@@ -1733,11 +1934,18 @@ mod tests {
             }
         }
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -1749,7 +1957,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -1761,7 +1974,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -1776,19 +1994,41 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, batch * num_q * head_dim);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        }
         // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
         // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (batch as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (batch as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 1024_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -1854,7 +2094,9 @@ mod tests {
     #[test]
     fn attention_via_cache_bf16_matches_cpu_golden_llama32_1b_decode() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -1922,11 +2164,18 @@ mod tests {
             }
         }
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -1938,7 +2187,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -1950,7 +2204,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -1965,19 +2224,41 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, batch * num_q * head_dim);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&seq_used_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_k_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&kv_v_buf), 0, 5);
+        }
         // v2 sdpa_vector port requires (1024, 1, 1) = 32 simdgroups × 32
         // lanes; matches lowering.rs:438 for AttentionViaCache.
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (batch as u64) as usize, height: (num_q as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (batch as u64) as usize,
+                height: (num_q as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 1024_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -2039,7 +2320,9 @@ mod tests {
     #[test]
     fn attention_prefill_sdpa_paged_bf16_matches_cpu_golden_llama32() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -2066,8 +2349,8 @@ mod tests {
         // and 2 new tokens being prefilled in this step.
         let prefix_len: usize = 4;
         let new_tokens: usize = 2;
-        let total_kv: usize = prefix_len + new_tokens;     // 6
-        let bucket_m: usize = 16;                          // pad new Q to 16
+        let total_kv: usize = prefix_len + new_tokens; // 6
+        let bucket_m: usize = 16; // pad new Q to 16
         let mut cu_seqlens_q: Vec<u32> = vec![0; bucket_m + 2];
         cu_seqlens_q[1] = new_tokens as u32;
         let seq_used_k: Vec<u32> = vec![total_kv as u32];
@@ -2096,7 +2379,7 @@ mod tests {
         // block. Block layout: [num_blocks, num_kv_heads, BLOCK_SIZE,
         // HEAD_DIM]. Tokens past `total_kv` in the block are unused
         // (kernel never reads them — its loop bound is kv_len).
-        let cache_elts = 1 * num_kv * block_size * head_dim;
+        let cache_elts = num_kv * block_size * head_dim;
         let k_cache_data: Vec<f32> = (0..cache_elts)
             .map(|i| ((i as f32) * 0.017).cos() * 0.5)
             .collect();
@@ -2104,11 +2387,18 @@ mod tests {
             .map(|i| ((i as f32) * 0.023).sin() * 0.5)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -2120,7 +2410,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -2132,7 +2427,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -2148,18 +2448,42 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (num_q as u64) as usize, height: (bucket_m as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (num_q as u64) as usize,
+                height: (bucket_m as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 1024_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -2216,12 +2540,18 @@ mod tests {
 
         // Padding rows must be exactly 0 (kernel's in_range=false
         // branch writes zero).
-        for i in new_tokens * num_q * head_dim..bucket_m * num_q * head_dim {
+        for (i, &val) in output_metal
+            .iter()
+            .enumerate()
+            .take(bucket_m * num_q * head_dim)
+            .skip(new_tokens * num_q * head_dim)
+        {
             assert_eq!(
-                output_metal[i], 0.0,
+                val,
+                0.0,
                 "sdpa_paged padding row {} not zero (={})",
                 i / (num_q * head_dim),
-                output_metal[i]
+                val
             );
         }
     }
@@ -2236,7 +2566,9 @@ mod tests {
     #[test]
     fn attention_prefill_sdpa_paged_bf16_zero_prefix_matches_contiguous() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -2264,7 +2596,7 @@ mod tests {
         // equivalent K/V data.
         let prefix_len: usize = 0;
         let new_tokens: usize = 3;
-        let total_kv: usize = prefix_len + new_tokens;     // 3
+        let total_kv: usize = prefix_len + new_tokens; // 3
         let bucket_m: usize = 16;
         let mut cu_seqlens_q: Vec<u32> = vec![0; bucket_m + 2];
         cu_seqlens_q[1] = new_tokens as u32;
@@ -2285,7 +2617,7 @@ mod tests {
         let q_data: Vec<f32> = (0..bucket_m * num_q * head_dim)
             .map(|i| ((i as f32) * 0.011).sin() * 0.5)
             .collect();
-        let cache_elts = 1 * num_kv * block_size * head_dim;
+        let cache_elts = num_kv * block_size * head_dim;
         let k_cache_data: Vec<f32> = (0..cache_elts)
             .map(|i| ((i as f32) * 0.017).cos() * 0.5)
             .collect();
@@ -2293,11 +2625,18 @@ mod tests {
             .map(|i| ((i as f32) * 0.023).sin() * 0.5)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -2309,7 +2648,12 @@ mod tests {
         }
         fn alloc_u32(device: &Device, data: &[u32]) -> Buffer {
             let bytes = std::mem::size_of_val(data);
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr() as *const u8,
@@ -2321,7 +2665,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -2337,18 +2686,42 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, bucket_m * num_q * head_dim);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&q_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&cu_buf), 0, 2);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&seq_used_k_buf), 0, 3);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&block_table_buf), 0, 4);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&k_cache_buf), 0, 5);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&v_cache_buf), 0, 6);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: (num_q as u64) as usize, height: (bucket_m as u64) as usize, depth: (1) as usize },
-            MTLSize { width: (1024) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: (num_q as u64) as usize,
+                height: (bucket_m as u64) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 1024_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -2369,14 +2742,14 @@ mod tests {
         let mut v_contig = vec![0.0_f32; new_tokens * num_kv * head_dim];
         for t in 0..new_tokens {
             for kv_h in 0..num_kv {
-                let cache_base = 0 * num_kv * block_size * head_dim
-                    + kv_h * block_size * head_dim
-                    + t * head_dim;
+                // Logical block 0 of seq 0 — `block * num_kv * block_size * head_dim`
+                // is therefore zero and dropped.
+                let cache_base = kv_h * block_size * head_dim + t * head_dim;
                 let contig_base = t * num_kv * head_dim + kv_h * head_dim;
-                for d in 0..head_dim {
-                    k_contig[contig_base + d] = k_cache_bf[cache_base + d];
-                    v_contig[contig_base + d] = v_cache_bf[cache_base + d];
-                }
+                k_contig[contig_base..contig_base + head_dim]
+                    .copy_from_slice(&k_cache_bf[cache_base..cache_base + head_dim]);
+                v_contig[contig_base..contig_base + head_dim]
+                    .copy_from_slice(&v_cache_bf[cache_base..cache_base + head_dim]);
             }
         }
         let q_real = &q_bf[..new_tokens * num_q * head_dim];
@@ -2427,7 +2800,9 @@ mod tests {
     #[test]
     fn rmsnorm_matches_cpu_golden() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -2456,11 +2831,18 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -2472,7 +2854,12 @@ mod tests {
         }
         fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -2484,12 +2871,31 @@ mod tests {
         let output_buf = alloc_zero_f16(&device, m * hidden);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (m as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+        );
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
@@ -2545,7 +2951,9 @@ mod tests {
     #[test]
     fn rmsnorm_bf16_matches_cpu_golden_m64() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -2574,12 +2982,19 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf16_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf16_data.as_ptr() as *const u8,
@@ -2591,7 +3006,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -2603,12 +3023,31 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, m * hidden);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (m as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+        );
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
@@ -2677,7 +3116,9 @@ mod tests {
     #[test]
     fn rmsnorm_matches_cpu_golden_m64() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -2708,11 +3149,18 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -2724,7 +3172,12 @@ mod tests {
         }
         fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -2736,12 +3189,31 @@ mod tests {
         let output_buf = alloc_zero_f16(&device, m * hidden);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (m as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+        );
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
@@ -2807,7 +3279,9 @@ mod tests {
     #[test]
     fn rmsnorm_in_place_matches_cpu_golden_m64() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -2836,11 +3310,18 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.017).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -2858,12 +3339,31 @@ mod tests {
         let weight_buf = alloc_f16(&device, &weight_data);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 0); } // OUT = same buffer
-        unsafe { enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 1); } // IN  = same buffer
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 0);
+        } // OUT = same buffer
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&inout_buf), 0, 1);
+        } // IN  = same buffer
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (m as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+        );
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
@@ -2934,7 +3434,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn run_fused_add_rmsnorm_check(m: usize) {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -2965,11 +3467,18 @@ mod tests {
             .map(|i| 1.0 + ((i as f32) * 0.019).sin() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -2985,12 +3494,31 @@ mod tests {
         let weight_buf = alloc_f16(&device, &weight_data);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&residual_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&delta_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
-        enc.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: (m as u64) as usize, height: (1) as usize, depth: (1) as usize }, MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize });
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&residual_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&delta_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: (m as u64) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+        );
         enc.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
@@ -3054,7 +3582,9 @@ mod tests {
     #[test]
     fn fused_mlp_tinyllama_shape_matches_cpu_golden() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -3087,11 +3617,18 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -3103,7 +3640,12 @@ mod tests {
         }
         fn alloc_zero_f16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::f16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -3116,14 +3658,30 @@ mod tests {
 
         // M=1 → decode kernel dispatch shape (MLX gemv port: blockM=4).
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: ((n as u64).div_ceil(4)) as usize, height: (1) as usize, depth: (1) as usize },
-            MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: ((n as u64).div_ceil(4)) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -3182,7 +3740,9 @@ mod tests {
     #[test]
     fn fused_mlp_decode_bf16_matches_cpu_golden_llama32() {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
         use half::bf16;
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
@@ -3219,11 +3779,18 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.05)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf: Vec<bf16> = data.iter().map(|&v| bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf.as_ptr() as *const u8,
@@ -3235,7 +3802,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -3247,14 +3819,30 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, m * n);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: ((n as u64).div_ceil(4)) as usize, height: (1) as usize, depth: (1) as usize },
-            MTLSize { width: (256) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: ((n as u64).div_ceil(4)) as usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 256_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -3331,7 +3919,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn run_gemm_bf16_check(m: usize, n: usize, k: usize) {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+        };
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -3358,12 +3948,19 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.3)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
         fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf16_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf16_data.as_ptr() as *const u8,
@@ -3375,7 +3972,12 @@ mod tests {
         }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::bf16>()).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -3387,14 +3989,30 @@ mod tests {
         let output_buf = alloc_zero_bf16(&device, m * n);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize { width: ((n as u64).div_ceil(8)) as usize, height: ((m as u64).div_ceil(8)) as usize, depth: (1) as usize },
-            MTLSize { width: (32) as usize, height: (1) as usize, depth: (1) as usize },
+            MTLSize {
+                width: ((n as u64).div_ceil(8)) as usize,
+                height: ((m as u64).div_ceil(8)) as usize,
+                depth: 1_usize,
+            },
+            MTLSize {
+                width: 32_usize,
+                height: 1_usize,
+                depth: 1_usize,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -3467,10 +4085,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn run_fused_mlp_steel_check(m: usize, dtype: MetalDtype) {
         use crate::cpu_golden;
-        use crate::interpreter::metal::__re::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize};
-        use ferrite_metal_kernels::specialized_pipeline_cache::{
-            ConstantValue, PipelineKey,
+        use crate::interpreter::metal::__re::{
+            MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
         };
+        use ferrite_metal_kernels::specialized_pipeline_cache::{ConstantValue, PipelineKey};
 
         let Some(device_info) = ferrite_metal_kernels::detect_device() else {
             eprintln!("skipping: no Metal device");
@@ -3519,12 +4137,19 @@ mod tests {
             .map(|i| ((i as f32) * 0.019).cos() * 0.3)
             .collect();
 
-        use crate::interpreter::metal::__re::{Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions};
+        use crate::interpreter::metal::__re::{
+            Buffer, Device, MTLBuffer, MTLDevice, MTLResourceOptions,
+        };
 
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
             let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     half_data.as_ptr() as *const u8,
@@ -3538,7 +4163,12 @@ mod tests {
             let bf16_data: Vec<half::bf16> =
                 data.iter().map(|&v| half::bf16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(bf16_data.as_slice());
-            let buf = device.newBufferWithLength_options(bytes.max(1) as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bf16_data.as_ptr() as *const u8,
@@ -3550,7 +4180,12 @@ mod tests {
         }
         fn alloc_zero(device: &Device, n_elems: usize, elem_bytes: usize) -> Buffer {
             let bytes = (n_elems * elem_bytes).max(1);
-            let buf = device.newBufferWithLength_options(bytes as u64 as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer");
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
             unsafe {
                 std::ptr::write_bytes(buf.contents().as_ptr() as *mut u8, 0, bytes);
             }
@@ -3576,15 +4211,31 @@ mod tests {
         let output_buf = alloc_zero(&device, m * n, elem_bytes);
 
         // Steel dispatch: 32×32 output tile, 4 simdgroups × 32 lanes.
-        let threadgroups = MTLSize { width: ((n as u64).div_ceil(32)) as usize, height: ((m as u64).div_ceil(32)) as usize, depth: (1) as usize };
-        let threads_per_threadgroup = MTLSize { width: (128) as usize, height: (1) as usize, depth: (1) as usize };
+        let threadgroups = MTLSize {
+            width: ((n as u64).div_ceil(32)) as usize,
+            height: ((m as u64).div_ceil(32)) as usize,
+            depth: 1_usize,
+        };
+        let threads_per_threadgroup = MTLSize {
+            width: 128_usize,
+            height: 1_usize,
+            depth: 1_usize,
+        };
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+        let enc = cb
+            .computeCommandEncoder()
+            .expect("computeCommandEncoder returned nil");
         enc.setComputePipelineState(&pipeline);
-        unsafe { enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1); }
-        unsafe { enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2); }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&output_buf), 0, 0);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&input_buf), 0, 1);
+        }
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&weight_buf), 0, 2);
+        }
         enc.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
         enc.endEncoding();
         cb.commit();

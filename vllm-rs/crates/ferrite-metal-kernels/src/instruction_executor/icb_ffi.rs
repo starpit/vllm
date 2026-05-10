@@ -32,6 +32,12 @@ pub struct IndirectCommandBufferDescriptor {
     descriptor: *mut AnyObject,
 }
 
+impl Default for IndirectCommandBufferDescriptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndirectCommandBufferDescriptor {
     pub fn new() -> Self {
         unsafe {

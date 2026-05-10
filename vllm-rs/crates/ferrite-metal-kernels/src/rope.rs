@@ -115,7 +115,7 @@ impl MetalRope {
             let embed_dim = rot_dim / 2;
             let total_threads = num_heads.max(num_kv_heads) * embed_dim;
             let threadgroup_size = 256.min(total_threads);
-            let threadgroups = (total_threads + threadgroup_size - 1) / threadgroup_size;
+            let threadgroups = total_threads.div_ceil(threadgroup_size);
 
             encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {

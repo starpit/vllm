@@ -116,8 +116,8 @@ impl Implementation for MetalAwqImpl {
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
 
-        if let Some(dims) = dims {
-            if dims.len() >= 2 {
+        if let Some(dims) = dims
+            && dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
 
@@ -129,7 +129,6 @@ impl Implementation for MetalAwqImpl {
                 // Fall back to analytical model
                 return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
             }
-        }
 
         // Fallback: conservative estimate
         200.0

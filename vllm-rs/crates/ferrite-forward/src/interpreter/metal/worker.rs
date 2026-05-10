@@ -40,8 +40,6 @@
 
 use std::sync::Arc;
 
-use ferrite_metal_kernels::gemm::{GemmDtype, GemmError, encode_gemm_into_command_buffer};
-use ferrite_metal_kernels::instruction_executor::RecordingContext;
 use crate::interpreter::metal::__re::{
     Buffer, CommandBufferRef, ComputePipelineState, Device, MTLBuffer, MTLCommandBuffer,
     MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLResourceOptions,
@@ -50,6 +48,8 @@ use crate::interpreter::metal::__re::{
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 use ::objc2_metal::{MTLResource, MTLResourceUsage};
+use ferrite_metal_kernels::gemm::{GemmDtype, GemmError, encode_gemm_into_command_buffer};
+use ferrite_metal_kernels::instruction_executor::RecordingContext;
 type ResourceRef = ProtocolObject<dyn MTLResource>;
 
 use super::lowered::{
@@ -325,7 +325,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // are fine in shared on Apple silicon — the existing
                 // `MetalAllocator` uses the same mode.
                 let buf = device
-                    .newBufferWithLength_options(size as usize, MTLResourceOptions::StorageModeShared)
+                    .newBufferWithLength_options(
+                        size as usize,
+                        MTLResourceOptions::StorageModeShared,
+                    )
                     .expect("newBufferWithLength_options returned nil");
                 if let Some(r) = residency {
                     r.insert(&buf);
@@ -450,7 +453,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     }
                     let _ = step_resources; // reserved for finer-grained barrier later
                     let _ = &prev_step_resources;
-                    let enc = cmdbuf.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+                    let enc = cmdbuf
+                        .computeCommandEncoder()
+                        .expect("computeCommandEncoder returned nil");
                     if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok()
                         && !resource_refs.is_empty()
                     {
@@ -533,7 +538,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // different buffer).
         if std::env::var_os("VLLM_STAMP_ARENA").is_some() {
             for (i, buf) in self.arena.iter().enumerate() {
-                let len_bytes = buf.length() as usize;
+                let len_bytes = buf.length();
                 unsafe {
                     let p = buf.contents().as_ptr() as *mut u8;
                     for off in 0..len_bytes {
@@ -564,7 +569,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     kind = format!("Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
                     let _ = step_resources; // see note below
-                    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+                    let enc = cb
+                        .computeCommandEncoder()
+                        .expect("computeCommandEncoder returned nil");
                     // SKIP useResources by default in the per-step
                     // path. Empirically on Apple Silicon (M-series, 16GB
                     // unified memory), `useResources` does eager
@@ -625,7 +632,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             let arena_summary = if std::env::var_os("VLLM_DUMP_ARENA_PER_STEP").is_some() {
                 let mut s = String::new();
                 for (i, buf) in self.arena.iter().enumerate() {
-                    let len_bytes = buf.length() as usize;
+                    let len_bytes = buf.length();
                     let row0 = unsafe {
                         std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
                     };
@@ -688,10 +695,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // is at fault. The historical mode (env-var must be set to "1"
         // to enable) caused divergent output on Llama-3.2 because the
         // pool's set_var setup happened too late for some forwards.
-        let direct = match std::env::var("FERRITE_METAL_DIRECT_DISPATCH").as_deref() {
-            Ok("0" | "false" | "no") => false,
-            _ => true,
-        };
+        let direct = !matches!(
+            std::env::var("FERRITE_METAL_DIRECT_DISPATCH").as_deref(),
+            Ok("0" | "false" | "no")
+        );
         self.run_bucket_per_step_silent_inner(bucket, device, queue, direct)
     }
 
@@ -709,7 +716,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // diagnostic dump.
         if std::env::var_os("VLLM_STAMP_ARENA").is_some() {
             for buf in self.arena.iter() {
-                let len_bytes = buf.length() as usize;
+                let len_bytes = buf.length();
                 unsafe {
                     let p = buf.contents().as_ptr() as *mut u8;
                     for off in 0..len_bytes {
@@ -730,7 +737,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     direct_dispatch,
                     ..
                 } => {
-                    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+                    let enc = cb
+                        .computeCommandEncoder()
+                        .expect("computeCommandEncoder returned nil");
                     enc.setComputePipelineState(pipeline);
                     if direct {
                         // Direct dispatch path — bypasses the ICB.
@@ -755,7 +764,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                                 // Currently relying on the queue-attached
                                 // residency set for residency.
                                 unsafe {
-                                                    enc.setBuffer_offset_atIndex(
+                                    enc.setBuffer_offset_atIndex(
                                         Some(buffer),
                                         *offset as usize,
                                         *index as usize,
@@ -855,7 +864,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 };
                 let dump_one = |slot: usize| -> String {
                     let buf = &self.arena[slot];
-                    let len_bytes = buf.length() as usize;
+                    let len_bytes = buf.length();
                     if len_bytes < 16 {
                         return String::new();
                     }
@@ -901,7 +910,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 let row_strides: [usize; 7] = [4096, 4096, 4096, 512, 512, 11264, 64000];
                 let mut s = String::new();
                 for (i, buf) in self.arena.iter().enumerate() {
-                    let len_bytes = buf.length() as usize;
+                    let len_bytes = buf.length();
                     let bytes = unsafe {
                         std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
                     };
@@ -1027,7 +1036,7 @@ fn bake_bucket<W: CanonicalParams>(
     let mut baked_resources: Vec<Buffer> = Vec::new();
     let mut baked_seen: Vec<*const _> = Vec::new();
     let record_resource = |buf: &Buffer, seen: &mut Vec<*const _>, out: &mut Vec<Buffer>| {
-        let ptr = Retained::as_ptr(&buf) as *const _;
+        let ptr = Retained::as_ptr(buf) as *const _;
         if !seen.contains(&ptr) {
             seen.push(ptr);
             out.push(buf.clone());
@@ -1126,8 +1135,16 @@ fn bake_bucket<W: CanonicalParams>(
                     // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups,
                     // 32 threads (one simdgroup) per threadgroup.
                     let dispatch_for_cmd = (
-                        MTLSize { width: (((dims.n as u64) + 7) / 8) as usize, height: (((dims.m as u64) + 7) / 8) as usize, depth: (1) as usize },
-                        MTLSize { width: (32) as usize, height: (1) as usize, depth: (1) as usize },
+                        MTLSize {
+                            width: (dims.n as u64).div_ceil(8) as usize,
+                            height: (dims.m as u64).div_ceil(8) as usize,
+                            depth: 1_usize,
+                        },
+                        MTLSize {
+                            width: 32_usize,
+                            height: 1_usize,
+                            depth: 1_usize,
+                        },
                     );
                     let step_resources_for_cmd: Vec<Buffer> =
                         vec![c.buffer.clone(), a.buffer.clone(), b.buffer.clone()];
@@ -1160,7 +1177,7 @@ fn bake_bucket<W: CanonicalParams>(
                                 .map(|b| Retained::as_ptr(b) as *const _)
                                 .collect();
                             for buf in &step_resources_for_cmd {
-                                let p = Retained::as_ptr(&buf) as *const _;
+                                let p = Retained::as_ptr(buf) as *const _;
                                 if !seen.contains(&p) {
                                     seen.push(p);
                                     step_resources.push(buf.clone());
@@ -1193,14 +1210,13 @@ fn bake_bucket<W: CanonicalParams>(
             continue;
         }
 
-        // Every per-layer scalar (eps, attn_scale, paging strides)
-        // is a `CanonicalParams` constant the macro emitted from the
-        // model config — no runtime extras to thread. The dtype
-        // (`_f16_specialized` vs `_bf16_specialized`) comes from
-        // `W::METAL_DTYPE` which the macro sets per-canonical from
-        // the model config's `torch_dtype`.
+        // The lowering pass baked `library` / `function` / `constants`
+        // into the command directly — every per-layer scalar (eps,
+        // attn_scale, paging strides) and the `W::METAL_DTYPE`-driven
+        // symbol picks happen at lowering time, so this layer is a
+        // thin cache lookup.
         let pipeline = pipelines
-            .pipeline_for_dtype::<W>(cmd.kernel, tape.bucket_m, W::METAL_DTYPE)
+            .pipeline_for_command(cmd)
             .map_err(WorkerError::PipelineLookup)?;
 
         let bound = resolve_bindings(
@@ -1215,7 +1231,7 @@ fn bake_bucket<W: CanonicalParams>(
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
         for (b, _, _) in &bound_refs {
-            record_resource(*b, &mut baked_seen, &mut baked_resources);
+            record_resource(b, &mut baked_seen, &mut baked_resources);
         }
         let (tg, tpt) = mtl_size_pair(cmd);
         if !no_icb_bake {
@@ -1235,8 +1251,16 @@ fn bake_bucket<W: CanonicalParams>(
             .map(|(b, off, idx)| ((*b).clone(), *off, *idx))
             .collect();
         let dispatch_for_cmd = (
-            MTLSize { width: (tg.width) as usize, height: (tg.height) as usize, depth: (tg.depth) as usize },
-            MTLSize { width: (tpt.width) as usize, height: (tpt.height) as usize, depth: (tpt.depth) as usize },
+            MTLSize {
+                width: (tg.width),
+                height: (tg.height),
+                depth: (tg.depth),
+            },
+            MTLSize {
+                width: (tpt.width),
+                height: (tpt.height),
+                depth: (tpt.depth),
+            },
         );
         if std::env::var_os("FERRITE_METAL_BAKE_DEBUG").is_some() {
             let bind_summary: Vec<String> = bindings_for_cmd
@@ -1281,7 +1305,7 @@ fn bake_bucket<W: CanonicalParams>(
                     .map(|b| Retained::as_ptr(b) as *const _)
                     .collect();
                 for buf in &step_resources_for_cmd {
-                    let p = Retained::as_ptr(&buf) as *const _;
+                    let p = Retained::as_ptr(buf) as *const _;
                     if !seen.contains(&p) {
                         seen.push(p);
                         step_resources.push(buf.clone());
@@ -1495,7 +1519,10 @@ fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand<W>) -> (MTLSize, MTLSi
 /// pipelines for the same `(kernel, bucket, extras)` tuple are
 /// pointer-equal, so this is the right test for segment coalescing.
 fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
-    std::ptr::eq(Retained::as_ptr(a) as *const _, Retained::as_ptr(b) as *const _)
+    std::ptr::eq(
+        Retained::as_ptr(a) as *const _,
+        Retained::as_ptr(b) as *const _,
+    )
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1507,7 +1534,9 @@ mod tests {
     };
     use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
     use ferrite_kernels::layers::{Linear, LinearLayer, RmsNorm};
-    use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
+    use ferrite_metal_kernels::specialized_pipeline_cache::{
+        ConstantValue, SpecializedPipelineCache,
+    };
     use std::sync::Arc;
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
@@ -1603,7 +1632,10 @@ mod tests {
 
     fn alloc_buffer(device: &Device, bytes: u64) -> Buffer {
         device
-            .newBufferWithLength_options(bytes.max(1) as usize, MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(
+                bytes.max(1) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
             .expect("newBufferWithLength_options returned nil")
     }
 
@@ -1627,6 +1659,13 @@ mod tests {
     fn build_synthetic_tape(bucket_m: u32) -> LoweredMetalTape<TestWeights> {
         let rmsnorm = LoweredCommand {
             kernel: KernelId::RmsNorm,
+            library: "rmsnorm",
+            function: "rmsnorm_f16_specialized",
+            constants: vec![
+                ConstantValue::uint(0, bucket_m),
+                ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
+                ConstantValue::float(2, <TestWeights as CanonicalParams>::RMS_NORM_EPS),
+            ],
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -1651,6 +1690,13 @@ mod tests {
         };
         let fused_add_rmsnorm = LoweredCommand {
             kernel: KernelId::FusedAddRmsNorm,
+            library: "fused_add_rmsnorm",
+            function: "fused_add_rmsnorm_f16_specialized",
+            constants: vec![
+                ConstantValue::uint(0, bucket_m),
+                ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
+                ConstantValue::float(2, <TestWeights as CanonicalParams>::RMS_NORM_EPS),
+            ],
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -1696,6 +1742,9 @@ mod tests {
         fn clone_for_test(&self) -> LoweredCommand<TestWeights> {
             LoweredCommand {
                 kernel: self.kernel,
+                library: self.library,
+                function: self.function,
+                constants: self.constants.clone(),
                 dispatch: self.dispatch,
                 bindings: self
                     .bindings
@@ -1864,6 +1913,16 @@ mod tests {
         // (batch=1, num_q_heads heads).
         let attn = LoweredCommand {
             kernel: KernelId::AttentionViaCache,
+            library: "attention",
+            function: "attention_via_cache_v2_f16_specialized",
+            constants: vec![
+                ConstantValue::uint(0, TestWeights::HEAD_DIM),
+                ConstantValue::uint(1, TestWeights::NUM_Q_HEADS),
+                ConstantValue::uint(2, TestWeights::NUM_KV_HEADS),
+                ConstantValue::float(3, TestWeights::ATTN_SCALE),
+                ConstantValue::uint(4, TestWeights::BLOCK_SIZE),
+                ConstantValue::uint(5, TestWeights::MAX_BLOCKS_PER_SEQ),
+            ],
             dispatch: DispatchShape {
                 threadgroups: (1, TestWeights::NUM_Q_HEADS, 1),
                 threads_per_threadgroup: (TestWeights::HEAD_DIM, 1, 1),
@@ -1926,6 +1985,11 @@ mod tests {
     fn build_gemm_command(bucket_m: u32, n: u32, k: u32) -> LoweredCommand<TestWeights> {
         LoweredCommand {
             kernel: KernelId::Gemm,
+            // GEMM is opaque to the unified pipeline picker — see the
+            // matching note in `lowering.rs` for the production GEMM arm.
+            library: "",
+            function: "",
+            constants: Vec::new(),
             dispatch: DispatchShape {
                 threadgroups: (bucket_m.div_ceil(16), n.div_ceil(16), 1),
                 threads_per_threadgroup: (16, 16, 1),
@@ -2022,6 +2086,13 @@ mod tests {
 
         let rmsnorm_pre = LoweredCommand {
             kernel: KernelId::RmsNorm,
+            library: "rmsnorm",
+            function: "rmsnorm_f16_specialized",
+            constants: vec![
+                ConstantValue::uint(0, 1),
+                ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
+                ConstantValue::float(2, <TestWeights as CanonicalParams>::RMS_NORM_EPS),
+            ],
             dispatch: DispatchShape {
                 threadgroups: (1, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -2046,6 +2117,9 @@ mod tests {
         };
         let rmsnorm_post = LoweredCommand {
             kernel: KernelId::RmsNorm,
+            library: rmsnorm_pre.library,
+            function: rmsnorm_pre.function,
+            constants: rmsnorm_pre.constants.clone(),
             dispatch: rmsnorm_pre.dispatch,
             bindings: rmsnorm_pre
                 .bindings

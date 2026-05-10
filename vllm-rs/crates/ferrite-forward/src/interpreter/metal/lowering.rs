@@ -28,10 +28,11 @@
 //! so the model author knows which arm to add next.
 
 use crate::{CanonicalParams, Instruction};
+use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
 use super::lowered::{
     Binding, DispatchShape, GemmDims, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
-    RuntimeBindingKind, WeightBundleKind, WeightTensor,
+    MetalDtype, RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 
 /// Lower one bucket's `(backbone ++ lm_head)` instruction stream.
@@ -163,6 +164,16 @@ fn lower_one<W: CanonicalParams>(
         // ── Token embedding ────────────────────────────────────────
         I::Embed(out_slot, wt_fn) => LoweredCommand {
             kernel: KernelId::Embed,
+            library: "embed",
+            function: pick_specialized_symbol(
+                "embed_f16_specialized",
+                "embed_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            constants: vec![
+                ConstantValue::uint(0, bucket_m),
+                ConstantValue::uint(1, W::Q_SIZE as u32),
+            ],
             // 1D dispatch over the `bucket_m` tokens; one thread per
             // token gathers a row from `embed_tokens.weight`.
             dispatch: DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP),
@@ -195,6 +206,17 @@ fn lower_one<W: CanonicalParams>(
         // from a fresh slot and overwrote the upstream tile.
         I::RmsNorm(in_slot, out_slot, layer, wt_fn) => LoweredCommand {
             kernel: KernelId::RmsNorm,
+            library: "rmsnorm",
+            function: pick_specialized_symbol(
+                "rmsnorm_f16_specialized",
+                "rmsnorm_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            constants: vec![
+                ConstantValue::uint(0, bucket_m),
+                ConstantValue::uint(1, W::Q_SIZE as u32),
+                ConstantValue::float(2, W::RMS_NORM_EPS),
+            ],
             // Per-token threadgroup; threads cooperate on the
             // hidden-size reduction inside.
             dispatch: DispatchShape {
@@ -224,6 +246,17 @@ fn lower_one<W: CanonicalParams>(
         I::FusedAddRmsNorm(delta_slot, residual_slot, layer, wt_fn) => {
             LoweredCommand {
                 kernel: KernelId::FusedAddRmsNorm,
+                library: "fused_add_rmsnorm",
+                function: pick_specialized_symbol(
+                    "fused_add_rmsnorm_f16_specialized",
+                    "fused_add_rmsnorm_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                constants: vec![
+                    ConstantValue::uint(0, bucket_m),
+                    ConstantValue::uint(1, W::Q_SIZE as u32),
+                    ConstantValue::float(2, W::RMS_NORM_EPS),
+                ],
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
@@ -261,6 +294,14 @@ fn lower_one<W: CanonicalParams>(
             let tg_y = (*n).div_ceil(GEMM_TILE_N);
             LoweredCommand {
                 kernel: KernelId::Gemm,
+                // GEMM is opaque to `pipeline_for_command` — f16 takes the
+                // MPS branch, bf16 has its own dims-keyed builder
+                // (`pipeline_for_gemm_bf16`). Empty library/function +
+                // empty constants signal the worker to route GEMM commands
+                // through the special-case path instead.
+                library: "",
+                function: "",
+                constants: Vec::new(),
                 dispatch: DispatchShape {
                     threadgroups: (tg_x, tg_y, 1),
                     threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
@@ -310,9 +351,8 @@ fn lower_one<W: CanonicalParams>(
         // Bindings are identical for both variants: (out, in, weight)
         // at indices 0/1/2. The kernel splits the packed `[gate|up]`
         // weight `[2*N, K]` internally — gate rows [0, N), up rows
-        // [N, 2N). The pipeline picker in
-        // `interpreter::metal::pipelines::kernel_msl_names` chooses
-        // by `bucket_m`.
+        // [N, 2N). The decode-vs-steel symbol pick happens inline
+        // below against `bucket_m`.
         I::FusedGateUpSiluMul(in_slot, out_slot, layer, wt_fn) => {
             let inter = W::INTERMEDIATE_SIZE as u32;
             let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
@@ -327,8 +367,43 @@ fn lower_one<W: CanonicalParams>(
                 let tg_y = bucket_m.div_ceil(MLP_STEEL_TILE);
                 ((tg_x, tg_y, 1), (MLP_STEEL_THREADS, 1, 1))
             };
+            // Two specialized variants share `fused_gate_up_silu_mul.metallib`;
+            // each binds a distinct constant-slot triple to avoid clashing
+            // when the library is loaded:
+            //   3/4/5 → M=1 decode kernel (gemv with simd_sum)
+            //   6/7/8 → MLX-steel matrix kernel (production for M >= 2)
+            // (slots 0/1/2 keyed the retired legacy 8×8 kernel.)
+            let function = if bucket_m == 1 {
+                pick_specialized_symbol(
+                    "fused_gate_up_silu_mul_decode_f16_specialized",
+                    "fused_gate_up_silu_mul_decode_bf16_specialized",
+                    W::METAL_DTYPE,
+                )
+            } else {
+                pick_specialized_symbol(
+                    "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
+                    "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
+                    W::METAL_DTYPE,
+                )
+            };
+            let constants = if bucket_m == 1 {
+                vec![
+                    ConstantValue::uint(3, bucket_m),
+                    ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
+                    ConstantValue::uint(5, W::Q_SIZE as u32),
+                ]
+            } else {
+                vec![
+                    ConstantValue::uint(6, bucket_m),
+                    ConstantValue::uint(7, W::INTERMEDIATE_SIZE as u32),
+                    ConstantValue::uint(8, W::Q_SIZE as u32),
+                ]
+            };
             LoweredCommand {
                 kernel: KernelId::FusedGateUpSiluMul,
+                library: "fused_gate_up_silu_mul",
+                function,
+                constants,
                 dispatch: DispatchShape {
                     threadgroups,
                     threads_per_threadgroup,
@@ -371,6 +446,19 @@ fn lower_one<W: CanonicalParams>(
             let n_q_heads = W::NUM_Q_HEADS;
             LoweredCommand {
                 kernel: KernelId::RopeAppend,
+                library: "rope",
+                function: pick_specialized_symbol(
+                    "rope_append_f16_specialized",
+                    "rope_append_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                constants: vec![
+                    ConstantValue::uint(0, W::HEAD_DIM),
+                    ConstantValue::uint(1, W::NUM_Q_HEADS),
+                    ConstantValue::uint(2, W::NUM_KV_HEADS),
+                    ConstantValue::uint(3, W::ROT_DIM),
+                    ConstantValue::uint(4, W::BLOCK_SIZE),
+                ],
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
@@ -440,6 +528,20 @@ fn lower_one<W: CanonicalParams>(
             let n_q_heads = W::NUM_Q_HEADS;
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
+                library: "attention",
+                function: pick_specialized_symbol(
+                    "attention_via_cache_v2_f16_specialized",
+                    "attention_via_cache_v2_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                constants: vec![
+                    ConstantValue::uint(0, W::HEAD_DIM),
+                    ConstantValue::uint(1, W::NUM_Q_HEADS),
+                    ConstantValue::uint(2, W::NUM_KV_HEADS),
+                    ConstantValue::float(3, W::ATTN_SCALE),
+                    ConstantValue::uint(4, W::BLOCK_SIZE),
+                    ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
+                ],
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (1024, 1, 1),
@@ -511,6 +613,24 @@ fn lower_one<W: CanonicalParams>(
             let n_q_heads = W::NUM_Q_HEADS;
             LoweredCommand {
                 kernel: KernelId::AttentionPrefillSdpaPaged,
+                library: "attention",
+                function: pick_specialized_symbol(
+                    "attention_prefill_sdpa_v2_paged_f16_specialized",
+                    "attention_prefill_sdpa_v2_paged_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                // Same 0..5 layout as `AttentionViaCache` (the decode
+                // kernel sibling). The prefill variant differs only in
+                // dispatch and per-Q causal-mask bookkeeping; constants
+                // are identical.
+                constants: vec![
+                    ConstantValue::uint(0, W::HEAD_DIM),
+                    ConstantValue::uint(1, W::NUM_Q_HEADS),
+                    ConstantValue::uint(2, W::NUM_KV_HEADS),
+                    ConstantValue::float(3, W::ATTN_SCALE),
+                    ConstantValue::uint(4, W::BLOCK_SIZE),
+                    ConstantValue::uint(5, W::MAX_BLOCKS_PER_SEQ),
+                ],
                 dispatch: DispatchShape {
                     threadgroups: (n_q_heads, bucket_m, 1),
                     threads_per_threadgroup: (1024, 1, 1),
@@ -556,6 +676,15 @@ fn lower_one<W: CanonicalParams>(
         // ── Plain residual add ─────────────────────────────────────
         I::Add(delta_slot, residual_slot) => LoweredCommand {
             kernel: KernelId::Add,
+            library: "elementwise",
+            function: pick_specialized_symbol(
+                "residual_add_f16_specialized",
+                "residual_add_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            // Token-parallel kernel reads element count from dispatch
+            // shape; no function constants.
+            constants: Vec::new(),
             // Token-parallel; reduction is per-element so the
             // dispatch covers `M * hidden_size` elements.
             dispatch: DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP),
@@ -575,6 +704,13 @@ fn lower_one<W: CanonicalParams>(
         // ── Scalar-multiply broadcast ──────────────────────────────
         I::ScalarMul(in_slot, out_slot, _scale) => LoweredCommand {
             kernel: KernelId::ScalarMul,
+            library: "elementwise",
+            function: pick_specialized_symbol(
+                "scalar_mul_f16_specialized",
+                "scalar_mul_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            constants: Vec::new(),
             dispatch: DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP),
             bindings: vec![
                 Binding::ArenaSlot {
@@ -642,3 +778,25 @@ const MLP_STEEL_THREADS: u32 = 128;
 /// (`fused_gate_up_silu_mul_decode_*_specialized`). Matches the
 /// MLX gemv port's `blockM = BM*SM*TM = 4`.
 const MLP_DECODE_BLOCK_M: u32 = 4;
+
+/// Pick the f16-or-bf16 specialization for a kernel that follows the
+/// `<base>_<dtype>_specialized` naming convention. Centralizes the
+/// `Int4`-not-yet-wired panic so each lowering arm spells out only
+/// the two symbol names it owns.
+fn pick_specialized_symbol(
+    f16_symbol: &'static str,
+    bf16_symbol: &'static str,
+    dtype: MetalDtype,
+) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => f16_symbol,
+        MetalDtype::Bf16 => bf16_symbol,
+        // AWQ/GPTQ dequant kernels have a different binding contract
+        // (packed u32 weights + group scales) so a single dtype
+        // substitution can't model them — surfaced as a panic for
+        // clarity since `W::METAL_DTYPE = Int4` is unreachable today.
+        MetalDtype::Int4 => {
+            panic!("metal lowering: Int4 dtype not yet wired through kernel symbol picker")
+        }
+    }
+}

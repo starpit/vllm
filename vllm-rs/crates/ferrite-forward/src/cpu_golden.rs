@@ -357,9 +357,8 @@ pub fn rope_append(
                 kv_cache_k[cache_base + half_dim + d] = x1 * c + x0 * s;
             }
             // V: copy un-rotated.
-            for d in 0..head_dim {
-                kv_cache_v[cache_base + d] = v_in[kv_base + d];
-            }
+            kv_cache_v[cache_base..cache_base + head_dim]
+                .copy_from_slice(&v_in[kv_base..kv_base + head_dim]);
         }
     }
 }
@@ -631,7 +630,7 @@ pub fn attention_prefill_paged(
     attn_scale: f32,
 ) {
     let batch = seq_used_k.len();
-    assert!(cu_seqlens_q.len() >= batch + 1);
+    assert!(cu_seqlens_q.len() > batch);
     assert_eq!(block_table.len(), batch * max_blocks_per_seq);
     let kv_block_stride = num_kv_heads * block_size * head_dim;
     assert_eq!(kv_cache_k.len() % kv_block_stride, 0);
@@ -647,8 +646,7 @@ pub fn attention_prefill_paged(
         }
         let kv_len = seq_used_k[seq] as usize;
         let prefix_len = kv_len - new_q_for_seq;
-        let row_blocks =
-            &block_table[seq * max_blocks_per_seq..(seq + 1) * max_blocks_per_seq];
+        let row_blocks = &block_table[seq * max_blocks_per_seq..(seq + 1) * max_blocks_per_seq];
 
         for q_pos_in_new in 0..new_q_for_seq {
             let global_q = seq_start + q_pos_in_new;
@@ -674,8 +672,7 @@ pub fn attention_prefill_paged(
                     scores[t] = dot * attn_scale;
                 }
 
-                let max_score =
-                    scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum_exp = 0.0_f32;
                 for s in &mut scores {
                     *s = (*s - max_score).exp();
@@ -905,7 +902,7 @@ mod tests {
         let sin_table = vec![1.0_f32, 0.0];
 
         let mut q_out = vec![0.0; 2];
-        let mut kv_cache_k = vec![0.0; 1 * 1 * 1 * 2]; // 1 block, 1 kv_head, block_size=1, head_dim=2
+        let mut kv_cache_k = vec![0.0; 2]; // 1 block, 1 kv_head, block_size=1, head_dim=2
         let mut kv_cache_v = vec![0.0; 2];
 
         rope_append(
@@ -966,7 +963,9 @@ mod tests {
         for t in 0..kv_len {
             let logical = t / block_size;
             let off = t % block_size;
-            let dst = logical * block_stride + 0 * block_size * head_dim + off * head_dim;
+            // kv_head = 0 in this single-head test fixture, so the
+            // `kv_head * block_size * head_dim` term is dropped.
+            let dst = logical * block_stride + off * head_dim;
             kv_cache_k[dst..dst + head_dim]
                 .copy_from_slice(&k_contig[t * head_dim..(t + 1) * head_dim]);
             kv_cache_v[dst..dst + head_dim]

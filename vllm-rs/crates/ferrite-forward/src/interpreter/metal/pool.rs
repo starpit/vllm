@@ -645,9 +645,10 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if std::env::var_os("VLLM_DUMP_ARENA").is_some() {
             for slot in 0..guard.worker.arena.len() {
                 let buf = &guard.worker.arena[slot];
-                let len_bytes = buf.length() as usize;
-                let row0 =
-                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes) };
+                let len_bytes = buf.length();
+                let row0 = unsafe {
+                    std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
+                };
                 let nonzero_bytes = row0.iter().filter(|&&v| v != 0).count();
                 eprintln!(
                     "[diag-arena] slot={:3} bytes={} nonzero_bytes={}/{}",
@@ -665,12 +666,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
             for slot in 0..guard.worker.arena.len() {
                 let buf = &guard.worker.arena[slot];
-                let len_bytes = buf.length() as usize;
+                let len_bytes = buf.length();
                 if len_bytes < 32 {
                     continue;
                 }
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes) };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
+                };
                 let head = (0..16)
                     .map(|j| {
                         let off = j * 2;
@@ -771,7 +773,7 @@ fn write_runtime_inputs(
 /// `write_slice` except for the padding fill value.
 fn write_slot_mapping(buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> {
     let bytes_needed = std::mem::size_of_val(src);
-    let bytes_available = buffer.length() as usize;
+    let bytes_available = buffer.length();
     if bytes_needed > bytes_available {
         return Err(ForwardError::BufferTooSmall {
             kind: "slot_mapping",
@@ -781,7 +783,11 @@ fn write_slot_mapping(buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> 
     }
     unsafe {
         // 0xFF byte-fill = u32::MAX in every lane.
-        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0xFFu8, bytes_available);
+        std::ptr::write_bytes(
+            buffer.contents().as_ptr() as *mut u8,
+            0xFFu8,
+            bytes_available,
+        );
         if bytes_needed > 0 {
             copy_nonoverlapping(
                 src.as_ptr() as *const u8,
@@ -795,7 +801,7 @@ fn write_slot_mapping(buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> 
 
 fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> {
     let bytes_needed = std::mem::size_of_val(src);
-    let bytes_available = buffer.length() as usize;
+    let bytes_available = buffer.length();
     if bytes_needed > bytes_available {
         return Err(ForwardError::BufferTooSmall {
             kind,
@@ -843,13 +849,13 @@ fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), F
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::interpreter::metal::__re::{Buffer, MTLDevice, MTLResourceOptions};
     use crate::interpreter::metal::lowered::{
         Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, WeightBundleKind,
         WeightTensor,
     };
     use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
     use ferrite_kernels::layers::RmsNorm;
-    use crate::interpreter::metal::__re::{Buffer, MTLDevice, MTLResourceOptions};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -904,7 +910,12 @@ mod tests {
     }
 
     fn alloc(device: &Device, bytes: u64) -> Buffer {
-        device.newBufferWithLength_options(bytes.max(1) as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer")
+        device
+            .newBufferWithLength_options(
+                bytes.max(1) as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .expect("newBuffer")
     }
 
     fn empty_runtime(device: &Device, num_layers: usize) -> RuntimeBindings {
@@ -926,6 +937,19 @@ mod tests {
     fn synthetic_tape(bucket_m: u32) -> LoweredMetalTape<TestWeights> {
         let cmd = LoweredCommand {
             kernel: KernelId::RmsNorm,
+            library: "rmsnorm",
+            function: "rmsnorm_f16_specialized",
+            constants: vec![
+                ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue::uint(0, bucket_m),
+                ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue::uint(
+                    1,
+                    <TestWeights as crate::CanonicalParams>::Q_SIZE as u32,
+                ),
+                ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue::float(
+                    2,
+                    <TestWeights as crate::CanonicalParams>::RMS_NORM_EPS,
+                ),
+            ],
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
@@ -1022,7 +1046,7 @@ mod tests {
         assert_eq!(pool.current_size(), 3, "grew to cap");
         assert_eq!(pool.available(), 0);
         // try_checkout at cap returns None, not Some(Err).
-        assert!(matches!(pool.try_checkout(&w), None));
+        assert!(pool.try_checkout(&w).is_none());
         drop(g1);
         drop(g2);
         drop(g3);
@@ -1318,8 +1342,7 @@ mod tests {
         };
         let err = pool
             .forward(&w, &queue, &inputs, |_, _| ())
-            .err()
-            .expect("zero-token forward rejected");
+            .expect_err("zero-token forward rejected");
         assert!(matches!(err, ForwardError::ZeroTokens));
         // Worker was never checked out — pool stays at the eager 1.
         assert_eq!(pool.available(), 1);
@@ -1379,8 +1402,7 @@ mod tests {
         };
         let err = pool
             .forward(&w, &queue, &inputs, |_, _| ())
-            .err()
-            .expect("oversized slice rejected");
+            .expect_err("oversized slice rejected");
         match err {
             ForwardError::BufferTooSmall {
                 kind: "input_ids",

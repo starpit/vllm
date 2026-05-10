@@ -92,7 +92,7 @@ impl MetalActivation {
             depth: 1,
         };
         let num_threadgroups = MTLSize {
-            width: ((n as usize) + 255) / 256,
+            width: (n as usize).div_ceil(256),
             height: 1,
             depth: 1,
         };
@@ -129,7 +129,7 @@ impl MetalActivation {
             depth: 1,
         };
         let num_threadgroups = MTLSize {
-            width: ((n as usize) + 255) / 256,
+            width: (n as usize).div_ceil(256),
             height: 1,
             depth: 1,
         };

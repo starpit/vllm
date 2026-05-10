@@ -92,8 +92,8 @@ impl Implementation for MetalGemmImpl {
         let output_shape = &node.outputs[0];
         let output_dims = ctx.eval_shape(output_shape);
 
-        if let Some(output_dims) = output_dims {
-            if output_dims.len() >= 2 {
+        if let Some(output_dims) = output_dims
+            && output_dims.len() >= 2 {
                 let m = output_dims[0] as u32;
                 let n = output_dims[1] as u32;
 
@@ -113,7 +113,6 @@ impl Implementation for MetalGemmImpl {
                     return self.analytical_cost_us(m, n, k, ctx.profile.peak_tflops_fp16);
                 }
             }
-        }
 
         // Fallback: conservative estimate (assume medium-sized GEMM)
         500.0

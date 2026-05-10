@@ -79,7 +79,7 @@ impl MetalAwq {
         num_in_channels: usize,
         num_out_channels: usize,
     ) -> Result<Buffer, AwqError> {
-        if num_out_channels % 8 != 0 {
+        if !num_out_channels.is_multiple_of(8) {
             return Err(AwqError::InvalidDimensions(
                 "num_out_channels must be multiple of 8".to_string(),
             ));
@@ -137,12 +137,12 @@ impl MetalAwq {
         num_in_channels: usize,
         num_out_channels: usize,
     ) -> Result<Buffer, AwqError> {
-        if num_out_channels % 8 != 0 {
+        if !num_out_channels.is_multiple_of(8) {
             return Err(AwqError::InvalidDimensions(
                 "num_out_channels must be multiple of 8".to_string(),
             ));
         }
-        if num_in_channels % group_size as usize != 0 {
+        if !num_in_channels.is_multiple_of(group_size as usize) {
             return Err(AwqError::InvalidDimensions(
                 "num_in_channels must be multiple of group_size".to_string(),
             ));
@@ -263,12 +263,12 @@ impl MetalAwq {
         num_in_channels: usize,
         num_out_channels: usize,
     ) -> Result<Buffer, AwqError> {
-        if num_out_channels % 8 != 0 {
+        if !num_out_channels.is_multiple_of(8) {
             return Err(AwqError::InvalidDimensions(
                 "num_out_channels must be multiple of 8".to_string(),
             ));
         }
-        if num_in_channels % group_size as usize != 0 {
+        if !num_in_channels.is_multiple_of(group_size as usize) {
             return Err(AwqError::InvalidDimensions(
                 "num_in_channels must be multiple of group_size".to_string(),
             ));

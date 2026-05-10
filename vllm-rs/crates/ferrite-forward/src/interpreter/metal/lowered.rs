@@ -16,6 +16,7 @@
 //! the per-bucket ICB is fully baked).
 
 use crate::CanonicalParams;
+use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
 ///
@@ -84,7 +85,9 @@ pub enum KernelId {
 
 /// Element dtype the metal pipeline should pick. The shader source
 /// contains both `_f16_specialized` and `_bf16_specialized` symbols
-/// per kernel; this enum tells `kernel_msl_names` which to choose.
+/// per kernel; the lowering arms in `lowering::lower_one` consult
+/// `W::METAL_DTYPE` to pick the right symbol when populating
+/// [`LoweredCommand::function`].
 ///
 /// Llama-3.x ships bf16 on disk; the cuda backend runs them in bf16
 /// natively, and Apple Silicon (M3+) has hardware bf16 MMA. Casting
@@ -100,8 +103,8 @@ pub enum MetalDtype {
     F16,
     Bf16,
     /// Reserved — int4 quantized weight path. Not yet wired through
-    /// `kernel_msl_names`; placed here so callers can already speak
-    /// in `MetalDtype` terms.
+    /// the lowering kernel-symbol pickers; placed here so callers
+    /// can already speak in `MetalDtype` terms.
     Int4,
 }
 
@@ -254,8 +257,36 @@ pub enum RuntimeBindingKind {
 ///
 /// All bindings are by-slot/by-thunk references (no raw buffer
 /// pointers) so this struct is shareable across workers via `Arc`.
+///
+/// `library` / `function` / `constants` together identify the exact
+/// `MTLComputePipelineState` the worker should bind. The lowering
+/// pass picks them per-kernel from `W` + bucket_m + dtype; the worker
+/// just hashes them into a [`PipelineKey`] and queries the cache.
+/// `KernelId` lingers for diagnostics (logs, debug formatting,
+/// `BucketStep::Icb { kernel, .. }`) and for the GEMM special-case
+/// the worker still routes around (`KernelId::Gemm` is opaque to
+/// `pipeline_for_command` — f16 goes to MPS, bf16 has its own
+/// dims-keyed builder).
+///
+/// [`PipelineKey`]: ferrite_metal_kernels::specialized_pipeline_cache::PipelineKey
 pub struct LoweredCommand<W: CanonicalParams> {
     pub kernel: KernelId,
+    /// Compiled-metallib name the kernel symbol lives in (matches the
+    /// `&'static str` keys [`SpecializedPipelineCache::with_standard_shaders`]
+    /// registers). Empty for `KernelId::Gemm` (no entry; routed
+    /// out-of-band).
+    ///
+    /// [`SpecializedPipelineCache::with_standard_shaders`]: ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders
+    pub library: &'static str,
+    /// MSL `kernel void` symbol the pipeline binds. Empty for
+    /// `KernelId::Gemm`.
+    pub function: &'static str,
+    /// `[[function_constant(N)]]` bag the pipeline specializes on.
+    /// Pre-baked at lowering time from `W::*` + bucket_m so the worker
+    /// never reaches back into `CanonicalParams`. Empty Vec is valid
+    /// (e.g. `Add`, `ScalarMul`); empty constants AND empty function
+    /// name signals "this is the opaque GEMM path."
+    pub constants: Vec<ConstantValue>,
     pub dispatch: DispatchShape,
     pub bindings: Vec<Binding<W>>,
     /// Dense-GEMM dimensions when `kernel == KernelId::Gemm`; `None`

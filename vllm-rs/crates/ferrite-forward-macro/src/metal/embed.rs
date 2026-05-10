@@ -92,8 +92,8 @@ impl Implementation for MetalEmbedImpl {
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
 
-        if let Some(dims) = dims {
-            if dims.len() == 2 {
+        if let Some(dims) = dims
+            && dims.len() == 2 {
                 let num_tokens = dims[0] as u32;
                 let hidden_size = dims[1] as u32;
 
@@ -118,7 +118,6 @@ impl Implementation for MetalEmbedImpl {
                     ctx.profile.memory_bandwidth_gbps,
                 );
             }
-        }
 
         // Fallback: conservative estimate
         10.0

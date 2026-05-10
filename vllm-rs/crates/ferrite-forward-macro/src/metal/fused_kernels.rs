@@ -107,8 +107,8 @@ impl Implementation for MetalFusedAddRmsNormImpl {
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
 
-        if let Some(dims) = dims {
-            if dims.len() >= 2 {
+        if let Some(dims) = dims
+            && dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
 
@@ -144,7 +144,6 @@ impl Implementation for MetalFusedAddRmsNormImpl {
                     has_residual_out,
                 );
             }
-        }
 
         // Fallback: conservative estimate
         150.0
@@ -325,8 +324,8 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         let shape = &node.outputs[0];
         let dims = ctx.eval_shape(shape);
 
-        if let Some(dims) = dims {
-            if dims.len() >= 2 {
+        if let Some(dims) = dims
+            && dims.len() >= 2 {
                 let m = dims[0] as u32;
                 let n = dims[1] as u32;
 
@@ -338,7 +337,6 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
                 // Fall back to analytical model
                 return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
             }
-        }
 
         // Fallback: conservative estimate
         120.0

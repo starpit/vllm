@@ -116,7 +116,7 @@ impl RecordingContext {
 }
 
 pub fn dispatch_1d(total_threads: usize, threads_per_group: usize) -> (MTLSize, MTLSize) {
-    let num_groups = (total_threads + threads_per_group - 1) / threads_per_group;
+    let num_groups = total_threads.div_ceil(threads_per_group);
     (
         MTLSize {
             width: num_groups,
@@ -137,8 +137,8 @@ pub fn dispatch_2d(
     tile_width: usize,
     tile_height: usize,
 ) -> (MTLSize, MTLSize) {
-    let groups_x = (width + tile_width - 1) / tile_width;
-    let groups_y = (height + tile_height - 1) / tile_height;
+    let groups_x = width.div_ceil(tile_width);
+    let groups_y = height.div_ceil(tile_height);
     (
         MTLSize {
             width: groups_x,

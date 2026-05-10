@@ -85,7 +85,7 @@ impl FusedAddRmsNorm {
             MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
         })?;
 
-        let pipeline = if use_f16 && n % 4 == 0 {
+        let pipeline = if use_f16 && n.is_multiple_of(4) {
             &self.pipeline_f16_vec4
         } else if use_f16 {
             &self.pipeline_f16
@@ -103,7 +103,7 @@ impl FusedAddRmsNorm {
             unsafe { encoder.setBuffer_offset_atIndex(Some(res_out), 0, 4); }
         }
 
-        let n_param = if n % 4 == 0 && use_f16 { n / 4 } else { n };
+        let n_param = if n.is_multiple_of(4) && use_f16 { n / 4 } else { n };
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -216,7 +216,7 @@ impl FusedGateUpSiluMul {
             MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
         })?;
 
-        let pipeline = if use_f16 && n % 4 == 0 {
+        let pipeline = if use_f16 && n.is_multiple_of(4) {
             &self.pipeline_f16_vec4
         } else if use_f16 {
             &self.pipeline_f16
@@ -229,7 +229,7 @@ impl FusedGateUpSiluMul {
         unsafe { encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1); }
         unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 2); }
 
-        let n_param = if n % 4 == 0 && use_f16 { n / 4 } else { n };
+        let n_param = if n.is_multiple_of(4) && use_f16 { n / 4 } else { n };
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -277,7 +277,7 @@ impl FusedGateUpSiluMul {
             MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
         })?;
 
-        let pipeline = if use_f16 && n % 4 == 0 {
+        let pipeline = if use_f16 && n.is_multiple_of(4) {
             &self.pipeline_f16_concat_vec4
         } else if use_f16 {
             &self.pipeline_f16_concat
@@ -289,7 +289,7 @@ impl FusedGateUpSiluMul {
         unsafe { encoder.setBuffer_offset_atIndex(Some(gate_up), 0, 0); }
         unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 1); }
 
-        let n_param = if n % 4 == 0 && use_f16 { n / 4 } else { n };
+        let n_param = if n.is_multiple_of(4) && use_f16 { n / 4 } else { n };
 
         unsafe {
             encoder.setBytes_length_atIndex(

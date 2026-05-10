@@ -8,6 +8,44 @@
 > - All sampled mlx-community 4bit checkpoints use uniform `gs=64, bits=4`
 > - Embedding is quantized in every checkpoint sampled (with one exception: Gemma-3-MM language_model embedding stored fp)
 
+## Status (2026-05-10)
+
+| Phase | State | Commit | Notes |
+|---|---|---|---|
+| P0 — verification + probes | ✅ done | `a798db0d3` | `INT4_PARITY_PROBES.md` |
+| P1 — plumbing (`LinearLayer::AffineQuant` + macro emit) | ✅ done | `4bf6f7ba8` | Plumbed but unreachable until P2 |
+| P2 — kernel + cpu_golden parity | ✅ done | `42fececd8` | `quantized_dequantize.metal` + `cpu_golden::affine_dequantize_b4_*`; bit-exact ≤ 1 ULP |
+| P2 — E2E (Llama-3.2-1B-4bit coherent) | ✅ done | `c2ba7c459` | Load-time CPU dequant in lieu of forward-time `AffineDequantizeThenGemm`; see deviation note below |
+| P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ⏳ next | — | Replaces the P2 load-time fallback |
+| P4 — prefill GEMM transpose=true | pending | — | |
+| P5 — transpose=false (`qmm_n` / `qvm` / `qvm_split_k`) | pending | — | |
+| P6 — quantized embedding lookup | pending | — | P2 dequants the embedding at load; P6 lifts to forward-time gather + dequant |
+| P7 — NAX (M4+) | pending | — | |
+| P8 — pipeline cache key extension | pending | — | |
+| P9 — cpu_golden q4 reference + per-model 4bit goldens | partial | — | `affine_dequantize_b4_*` landed in P2; per-model goldens pending |
+| P10 — Llama-3.2-1B/3B 4bit E2E | partial | `c2ba7c459` | 1B coherent on the load-time fallback; 3B + token-stream A/B vs `mlx_lm.generate` pending |
+| P11 — mixed-quant loader | pending | — | |
+| P12 — q-MLP composition | pending | — | Branch (i) recommended; defer (ii) until pipelines.rs Phase 2 |
+| P13 — MoE | pending | — | |
+| P14 — NAX MoE | pending | — | |
+| P15 — long-prompt / long-decode under q4 | pending | — | Intersects `project_metal_long_decode_panic` |
+| P16 — A/B vs MLX + perf gate | pending | — | |
+| P17 — FP-quant mode (mxfp4 / mxfp8 / nvfp4) | pending | — | Parallel parity track |
+
+**P2 deviation worth carrying forward.** The plan called for forward-time
+`Instruction::AffineDequantizeThenGemm` with a per-Linear scratch arena
+slot. Load-time CPU dequant ships in `c2ba7c459` instead: the kernel
+landing (`42fececd8`) proves the affine math against `cpu_golden::
+affine_dequantize_b4_*` (≤ 1 ULP) in isolation, and the load path
+materializes the same math into a BF16 Dense `LinearLayer` at load
+time — every fuser in the metal solver matches as if the model were
+plain BF16. Same correctness gate, simpler infra, ~2 GB extra arena
+on Llama-3.2-1B (fits with headroom on 24 GiB; 3B not yet validated
+under this scheme). P3's qmv kernels replace the fallback; the
+macro flips back to `LinearLayer::load_affine_quant` (still wired
+from P1) and the FUF storage-format downgrade in
+`fuf.rs::annotate_storage_formats` reverts.
+
 **Mandate.** 100% parity with MLX's int4 (`affine` mode) quantization across every kernel, every model class (dense + MoE), every backend variant (standard + NAX/M4+). No omitted kernels, no skipped models. Sequencing prioritizes; nothing is dropped. The only out-of-scope item is `fp_quantized.metal` (NVFP4 / MXFP8 / MXFP4) — this is *production* in MLX (`jit_kernels.cpp:861`), not experimental, but it's a different mode with different weight layouts, captured as Phase 17 (parallel parity track).
 
 **Hard rules carried in** (memories):

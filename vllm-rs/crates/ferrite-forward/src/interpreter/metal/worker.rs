@@ -42,11 +42,15 @@ use std::sync::Arc;
 
 use ferrite_metal_kernels::gemm::{GemmDtype, GemmError, encode_gemm_into_command_buffer};
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
-use ferrite_metal_kernels::metal::foreign_types::ForeignType;
-use ferrite_metal_kernels::metal::{
-    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLResourceOptions, MTLResourceUsage, MTLSize, ResourceRef,
+use crate::interpreter::metal::__re::{
+    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLBuffer,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice,
+    MTLResourceOptions, MTLSize,
 };
+use ::objc2::rc::Retained;
+use ::objc2::runtime::ProtocolObject;
+use ::objc2_metal::{MTLResource, MTLResourceUsage};
+type ResourceRef = ProtocolObject<dyn MTLResource>;
 
 use super::lowered::{
     Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightBundleKind, WeightTensor,
@@ -320,7 +324,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // contents without staging copies. ICB-bound buffers
                 // are fine in shared on Apple silicon — the existing
                 // `MetalAllocator` uses the same mode.
-                let buf = device.new_buffer(size, MTLResourceOptions::StorageModeShared);
+                let buf = device
+                    .newBufferWithLength_options(size as usize, MTLResourceOptions::StorageModeShared)
+                    .expect("newBufferWithLength_options returned nil");
                 if let Some(r) = residency {
                     r.insert(&buf);
                 }
@@ -388,7 +394,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // foreign_types deref chain. Spelled out here because
                 // the closure return type isn't pinned by `Vec::iter()`
                 // alone.
-                let r: &ResourceRef = b;
+                let r: &ResourceRef = unsafe { &*(Retained::as_ptr(b) as *const ResourceRef) };
                 r
             })
             .collect();
@@ -396,11 +402,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // doesn't open an empty one. `current` is `Some` only while
         // an encoder is live — every Gemm step ends it, every Icb
         // step opens it on demand.
-        let mut current: Option<&ComputeCommandEncoderRef> = None;
+        let mut current: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> = None;
         // Storage for the live encoder. `metal-rs` returns a
         // `&ComputeCommandEncoderRef` borrowed from the cmd buffer;
         // there's no owned wrapper, so we keep the active one in a
-        // local `Option` and re-fetch via `cmdbuf.new_compute_command_encoder()`
+        // local `Option` and re-fetch via `cmdbuf.computeCommandEncoder().expect("computeCommandEncoder returned nil")`
         // when we need a new one.
         // Track the previous ICB step's resources so we can insert a
         // memory barrier between dependent ICB commands inside the
@@ -440,26 +446,28 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // correct RAW dependencies. Cost is ~us per
                     // encoder boundary.
                     if let Some(enc) = current.take() {
-                        enc.end_encoding();
+                        enc.endEncoding();
                     }
                     let _ = step_resources; // reserved for finer-grained barrier later
                     let _ = &prev_step_resources;
-                    let enc = cmdbuf.new_compute_command_encoder();
+                    let enc = cmdbuf.computeCommandEncoder().expect("computeCommandEncoder returned nil");
                     if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok()
                         && !resource_refs.is_empty()
                     {
-                        enc.use_resources(
-                            &resource_refs,
-                            MTLResourceUsage::Read | MTLResourceUsage::Write,
-                        );
+                        // TODO(objc2-migration): port useResources optimization
+                        // path to `useResources_count_usage` once we wire the
+                        // raw NonNull array build-up. Diagnostic path only —
+                        // runtime correctness comes from the residency set.
+                        let _ = &resource_refs;
+                        let _ = MTLResourceUsage::Read | MTLResourceUsage::Write;
                     }
-                    enc.set_compute_pipeline_state(pipeline);
-                    baking.icb.execute_on_encoder(enc, range.clone());
+                    enc.setComputePipelineState(pipeline);
+                    baking.icb.execute_on_encoder(&enc, range.clone());
                     current = Some(enc);
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
                     if let Some(enc) = current.take() {
-                        enc.end_encoding();
+                        enc.endEncoding();
                     }
                     // Encoder boundary clears the prev-resources tracking;
                     // ordering across encoders is provided by Apple's
@@ -488,7 +496,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             }
         }
         if let Some(enc) = current.take() {
-            enc.end_encoding();
+            enc.endEncoding();
         }
         Ok(())
     }
@@ -503,9 +511,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         device: &Device,
-        queue: &ferrite_metal_kernels::metal::CommandQueue,
+        queue: &crate::interpreter::metal::__re::CommandQueue,
     ) -> Result<(), WorkerError> {
-        use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
+        use crate::interpreter::metal::__re::MTLCommandBufferStatus;
         let baking = &self.bucket_bakings[bucket];
         // Bucket-wide resource pool (used as fallback / for diagnostic
         // only). The per-step path now uses each step's own
@@ -514,7 +522,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             .baked_resources
             .iter()
             .map(|b| {
-                let r: &ResourceRef = b;
+                let r: &ResourceRef = unsafe { &*(Retained::as_ptr(b) as *const ResourceRef) };
                 r
             })
             .collect();
@@ -527,7 +535,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             for (i, buf) in self.arena.iter().enumerate() {
                 let len_bytes = buf.length() as usize;
                 unsafe {
-                    let p = buf.contents() as *mut u8;
+                    let p = buf.contents().as_ptr() as *mut u8;
                     for off in 0..len_bytes {
                         *p.add(off) = 0xAA; // marker
                     }
@@ -543,7 +551,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let bucket_start = std::time::Instant::now();
         for (idx, step) in baking.steps.iter().enumerate() {
             let step_start = std::time::Instant::now();
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().expect("commandBuffer returned nil");
             let kind: String;
             match step {
                 BucketStep::Icb {
@@ -556,7 +564,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     kind = format!("Icb range={:?} kernel={:?}", range, kernel);
                     let _ = pipeline; // pipeline.label() can't be safely formatted (NSString may be nil)
                     let _ = step_resources; // see note below
-                    let enc = cb.new_compute_command_encoder();
+                    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
                     // SKIP useResources by default in the per-step
                     // path. Empirically on Apple Silicon (M-series, 16GB
                     // unified memory), `useResources` does eager
@@ -572,24 +580,21 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // Set FERRITE_METAL_FORCE_USE_RESOURCES=1 to
                     // re-enable the original behavior for debugging.
                     if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok() {
-                        let step_refs: Vec<&ResourceRef> =
-                            step_resources.iter().map(|b| b as &ResourceRef).collect();
-                        if !step_refs.is_empty() {
-                            enc.use_resources(
-                                &step_refs,
-                                MTLResourceUsage::Read | MTLResourceUsage::Write,
-                            );
-                        }
+                        // TODO(objc2-migration): port useResources optimization
+                        // path. Diagnostic path only — runtime correctness
+                        // comes from the residency set wired on the queue.
+                        let _ = &step_resources;
+                        let _ = MTLResourceUsage::Read | MTLResourceUsage::Write;
                     }
-                    enc.set_compute_pipeline_state(pipeline);
-                    baking.icb.execute_on_encoder(enc, range.clone());
-                    enc.end_encoding();
+                    enc.setComputePipelineState(pipeline);
+                    baking.icb.execute_on_encoder(&enc, range.clone());
+                    enc.endEncoding();
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
                     kind = format!("Gemm m={m} n={n} k={k}");
                     encode_gemm_into_command_buffer(
                         device,
-                        cb,
+                        &cb,
                         &a.buffer,
                         a.offset,
                         &b.buffer,
@@ -610,7 +615,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             }
             let encoded_at = step_start.elapsed();
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             let status = cb.status();
             let total = step_start.elapsed();
             let gpu_us = total.as_micros().saturating_sub(encoded_at.as_micros());
@@ -622,7 +627,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 for (i, buf) in self.arena.iter().enumerate() {
                     let len_bytes = buf.length() as usize;
                     let row0 = unsafe {
-                        std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
+                        std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
                     };
                     let nz = row0.iter().filter(|&&v| v != 0).count();
                     let marker = row0.iter().filter(|&&v| v == 0xAA).count();
@@ -676,7 +681,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         device: &Device,
-        queue: &ferrite_metal_kernels::metal::CommandQueue,
+        queue: &crate::interpreter::metal::__re::CommandQueue,
     ) -> Result<(), WorkerError> {
         // Default-on direct dispatch; the env var stays as an
         // off-switch (`=0`) for diagnosing whether the broken ICB path
@@ -694,10 +699,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         device: &Device,
-        queue: &ferrite_metal_kernels::metal::CommandQueue,
+        queue: &crate::interpreter::metal::__re::CommandQueue,
         direct: bool,
     ) -> Result<(), WorkerError> {
-        use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
+        use crate::interpreter::metal::__re::MTLCommandBufferStatus;
         let baking = &self.bucket_bakings[bucket];
 
         // Stamp marker into arena (same as per-step debug) for the
@@ -706,7 +711,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             for buf in self.arena.iter() {
                 let len_bytes = buf.length() as usize;
                 unsafe {
-                    let p = buf.contents() as *mut u8;
+                    let p = buf.contents().as_ptr() as *mut u8;
                     for off in 0..len_bytes {
                         *p.add(off) = 0xAA;
                     }
@@ -716,7 +721,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
 
         let dump_per_step = std::env::var_os("VLLM_DUMP_ARENA_PER_STEP").is_some();
         for (idx, step) in baking.steps.iter().enumerate() {
-            let cb = queue.new_command_buffer();
+            let cb = queue.commandBuffer().expect("commandBuffer returned nil");
             match step {
                 BucketStep::Icb {
                     pipeline,
@@ -725,8 +730,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     direct_dispatch,
                     ..
                 } => {
-                    let enc = cb.new_compute_command_encoder();
-                    enc.set_compute_pipeline_state(pipeline);
+                    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder returned nil");
+                    enc.setComputePipelineState(pipeline);
                     if direct {
                         // Direct dispatch path — bypasses the ICB.
                         // For each command in the range, bind buffers
@@ -745,23 +750,29 @@ impl<W: CanonicalParams> MetalWorker<W> {
                             direct_bindings.iter().zip(direct_dispatch.iter())
                         {
                             for (buffer, offset, index) in bindings {
-                                enc.use_resource(
-                                    buffer,
-                                    MTLResourceUsage::Read | MTLResourceUsage::Write,
-                                );
-                                enc.set_buffer(*index, Some(buffer), *offset);
+                                // TODO(objc2-migration): re-enable
+                                // useResource_usage explicit-residency path.
+                                // Currently relying on the queue-attached
+                                // residency set for residency.
+                                unsafe {
+                                                    enc.setBuffer_offset_atIndex(
+                                        Some(buffer),
+                                        *offset as usize,
+                                        *index as usize,
+                                    );
+                                }
                             }
-                            enc.dispatch_thread_groups(*tg, *tpt);
+                            enc.dispatchThreadgroups_threadsPerThreadgroup(*tg, *tpt);
                         }
                     } else {
-                        baking.icb.execute_on_encoder(enc, range.clone());
+                        baking.icb.execute_on_encoder(&enc, range.clone());
                     }
-                    enc.end_encoding();
+                    enc.endEncoding();
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
                     encode_gemm_into_command_buffer(
                         device,
-                        cb,
+                        &cb,
                         &a.buffer,
                         a.offset,
                         &b.buffer,
@@ -781,7 +792,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
             }
             cb.commit();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             if cb.status() != MTLCommandBufferStatus::Completed {
                 // DIAGNOSTIC (transient): surface step idx + kernel +
                 // bucket so the panic root cause is identifiable from
@@ -849,7 +860,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         return String::new();
                     }
                     let bytes = unsafe {
-                        std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
+                        std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
                     };
                     let head: Vec<String> = (0..8)
                         .map(|j| {
@@ -892,7 +903,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 for (i, buf) in self.arena.iter().enumerate() {
                     let len_bytes = buf.length() as usize;
                     let bytes = unsafe {
-                        std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes)
+                        std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes)
                     };
                     let nz = bytes.iter().filter(|&&v| v != 0).count();
                     let marker = bytes.iter().filter(|&&v| v == 0xAA).count();
@@ -1016,7 +1027,7 @@ fn bake_bucket<W: CanonicalParams>(
     let mut baked_resources: Vec<Buffer> = Vec::new();
     let mut baked_seen: Vec<*const _> = Vec::new();
     let record_resource = |buf: &Buffer, seen: &mut Vec<*const _>, out: &mut Vec<Buffer>| {
-        let ptr = buf.as_ptr() as *const _;
+        let ptr = Retained::as_ptr(&buf) as *const _;
         if !seen.contains(&ptr) {
             seen.push(ptr);
             out.push(buf.clone());
@@ -1046,11 +1057,11 @@ fn bake_bucket<W: CanonicalParams>(
                     dims.m,
                     dims.n,
                     dims.k,
-                    a.buffer.as_ptr(),
+                    Retained::as_ptr(&a.buffer) as *mut std::ffi::c_void,
                     a.offset,
-                    b.buffer.as_ptr(),
+                    Retained::as_ptr(&b.buffer) as *mut std::ffi::c_void,
                     b.offset,
-                    c.buffer.as_ptr(),
+                    Retained::as_ptr(&c.buffer) as *mut std::ffi::c_void,
                     c.offset,
                 );
             }
@@ -1076,11 +1087,11 @@ fn bake_bucket<W: CanonicalParams>(
                     dims.m,
                     dims.n,
                     dims.k,
-                    a.buffer.as_ptr() as usize,
+                    Retained::as_ptr(&a.buffer) as *const _ as usize,
                     a.offset,
-                    b.buffer.as_ptr() as usize,
+                    Retained::as_ptr(&b.buffer) as *const _ as usize,
                     b.offset,
-                    c.buffer.as_ptr() as usize,
+                    Retained::as_ptr(&c.buffer) as *const _ as usize,
                     c.offset,
                 );
             }
@@ -1115,8 +1126,8 @@ fn bake_bucket<W: CanonicalParams>(
                     // Dispatch: (ceil(N/8), ceil(M/8), 1) threadgroups,
                     // 32 threads (one simdgroup) per threadgroup.
                     let dispatch_for_cmd = (
-                        MTLSize::new(((dims.n as u64) + 7) / 8, ((dims.m as u64) + 7) / 8, 1),
-                        MTLSize::new(32, 1, 1),
+                        MTLSize { width: (((dims.n as u64) + 7) / 8) as usize, height: (((dims.m as u64) + 7) / 8) as usize, depth: (1) as usize },
+                        MTLSize { width: (32) as usize, height: (1) as usize, depth: (1) as usize },
                     );
                     let step_resources_for_cmd: Vec<Buffer> =
                         vec![c.buffer.clone(), a.buffer.clone(), b.buffer.clone()];
@@ -1146,10 +1157,10 @@ fn bake_bucket<W: CanonicalParams>(
                             range.end = recorded_at + 1;
                             let mut seen: Vec<*const _> = step_resources
                                 .iter()
-                                .map(|b| b.as_ptr() as *const _)
+                                .map(|b| Retained::as_ptr(b) as *const _)
                                 .collect();
                             for buf in &step_resources_for_cmd {
-                                let p = buf.as_ptr() as *const _;
+                                let p = Retained::as_ptr(&buf) as *const _;
                                 if !seen.contains(&p) {
                                     seen.push(p);
                                     step_resources.push(buf.clone());
@@ -1224,8 +1235,8 @@ fn bake_bucket<W: CanonicalParams>(
             .map(|(b, off, idx)| ((*b).clone(), *off, *idx))
             .collect();
         let dispatch_for_cmd = (
-            MTLSize::new(tg.width, tg.height, tg.depth),
-            MTLSize::new(tpt.width, tpt.height, tpt.depth),
+            MTLSize { width: (tg.width) as usize, height: (tg.height) as usize, depth: (tg.depth) as usize },
+            MTLSize { width: (tpt.width) as usize, height: (tpt.height) as usize, depth: (tpt.depth) as usize },
         );
         if std::env::var_os("FERRITE_METAL_BAKE_DEBUG").is_some() {
             let bind_summary: Vec<String> = bindings_for_cmd
@@ -1233,7 +1244,7 @@ fn bake_bucket<W: CanonicalParams>(
                 .map(|(b, off, idx)| {
                     format!(
                         "(buf=0x{:x},len={},off={},idx={})",
-                        b.as_ptr() as usize,
+                        Retained::as_ptr(b) as *const _ as usize,
                         b.length(),
                         off,
                         idx,
@@ -1267,10 +1278,10 @@ fn bake_bucket<W: CanonicalParams>(
                 // Coalesced ICB range — extend its resource set + per-command bindings.
                 let mut seen: Vec<*const _> = step_resources
                     .iter()
-                    .map(|b| b.as_ptr() as *const _)
+                    .map(|b| Retained::as_ptr(b) as *const _)
                     .collect();
                 for buf in &step_resources_for_cmd {
-                    let p = buf.as_ptr() as *const _;
+                    let p = Retained::as_ptr(&buf) as *const _;
                     if !seen.contains(&p) {
                         seen.push(p);
                         step_resources.push(buf.clone());
@@ -1468,14 +1479,14 @@ fn gemm_dtype_for<W: CanonicalParams>() -> GemmDtype {
 
 fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand<W>) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
-        width: cmd.dispatch.threadgroups.0 as u64,
-        height: cmd.dispatch.threadgroups.1 as u64,
-        depth: cmd.dispatch.threadgroups.2 as u64,
+        width: cmd.dispatch.threadgroups.0 as usize,
+        height: cmd.dispatch.threadgroups.1 as usize,
+        depth: cmd.dispatch.threadgroups.2 as usize,
     };
     let tpt = MTLSize {
-        width: cmd.dispatch.threads_per_threadgroup.0 as u64,
-        height: cmd.dispatch.threads_per_threadgroup.1 as u64,
-        depth: cmd.dispatch.threads_per_threadgroup.2 as u64,
+        width: cmd.dispatch.threads_per_threadgroup.0 as usize,
+        height: cmd.dispatch.threads_per_threadgroup.1 as usize,
+        depth: cmd.dispatch.threads_per_threadgroup.2 as usize,
     };
     (tg, tpt)
 }
@@ -1484,7 +1495,7 @@ fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand<W>) -> (MTLSize, MTLSi
 /// pipelines for the same `(kernel, bucket, extras)` tuple are
 /// pointer-equal, so this is the right test for segment coalescing.
 fn same_pipeline(a: &ComputePipelineState, b: &ComputePipelineState) -> bool {
-    std::ptr::eq(a.as_ptr() as *const _, b.as_ptr() as *const _)
+    std::ptr::eq(Retained::as_ptr(a) as *const _, Retained::as_ptr(b) as *const _)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1591,7 +1602,9 @@ mod tests {
     }
 
     fn alloc_buffer(device: &Device, bytes: u64) -> Buffer {
-        device.new_buffer(bytes.max(1), MTLResourceOptions::StorageModeShared)
+        device
+            .newBufferWithLength_options(bytes.max(1) as usize, MTLResourceOptions::StorageModeShared)
+            .expect("newBufferWithLength_options returned nil")
     }
 
     fn empty_runtime(device: &Device, num_layers: usize) -> RuntimeBindings {

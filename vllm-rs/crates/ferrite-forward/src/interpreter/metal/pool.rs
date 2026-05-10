@@ -24,7 +24,10 @@
 use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Condvar, Mutex};
 
-use ferrite_metal_kernels::metal::{Buffer, CommandQueue, Device, MTLCommandBufferStatus};
+use crate::interpreter::metal::__re::{
+    Buffer, CommandQueue, Device, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
+    MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice,
+};
 
 use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
 
@@ -580,12 +583,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         } else if std::env::var_os("FERRITE_METAL_USE_BATCHED_CMDBUF").is_some() {
             let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
             let t_pre = std::time::Instant::now();
-            let cb = queue.new_command_buffer();
-            guard.worker.run_bucket(bucket_idx, &self.device, cb)?;
+            let cb = queue.commandBuffer().expect("commandBuffer returned nil");
+            guard.worker.run_bucket(bucket_idx, &self.device, &cb)?;
             let encoded = t_pre.elapsed();
             cb.commit();
             let committed = t_pre.elapsed();
-            cb.wait_until_completed();
+            cb.waitUntilCompleted();
             let waited = t_pre.elapsed();
             let status = cb.status();
             if trace {
@@ -628,7 +631,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 let buf = &guard.worker.arena[slot];
                 let len_bytes = buf.length() as usize;
                 let row0 =
-                    unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes) };
+                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes) };
                 let nonzero_bytes = row0.iter().filter(|&&v| v != 0).count();
                 eprintln!(
                     "[diag-arena] slot={:3} bytes={} nonzero_bytes={}/{}",
@@ -651,7 +654,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     continue;
                 }
                 let bytes =
-                    unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, len_bytes) };
+                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len_bytes) };
                 let head = (0..16)
                     .map(|j| {
                         let off = j * 2;
@@ -762,11 +765,11 @@ fn write_slot_mapping(buffer: &Buffer, src: &[u32]) -> Result<(), ForwardError> 
     }
     unsafe {
         // 0xFF byte-fill = u32::MAX in every lane.
-        std::ptr::write_bytes(buffer.contents() as *mut u8, 0xFFu8, bytes_available);
+        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0xFFu8, bytes_available);
         if bytes_needed > 0 {
             copy_nonoverlapping(
                 src.as_ptr() as *const u8,
-                buffer.contents() as *mut u8,
+                buffer.contents().as_ptr() as *mut u8,
                 bytes_needed,
             );
         }
@@ -809,11 +812,11 @@ fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), F
     // against `length()` above; src and dst don't overlap (src is a
     // Rust slice in CPU memory).
     unsafe {
-        std::ptr::write_bytes(buffer.contents() as *mut u8, 0u8, bytes_available);
+        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0u8, bytes_available);
         if bytes_needed > 0 {
             copy_nonoverlapping(
                 src.as_ptr() as *const u8,
-                buffer.contents() as *mut u8,
+                buffer.contents().as_ptr() as *mut u8,
                 bytes_needed,
             );
         }
@@ -830,7 +833,7 @@ mod tests {
     };
     use ferrite_cuda_core::{DType, DeviceAllocator, GpuTensor};
     use ferrite_kernels::layers::RmsNorm;
-    use ferrite_metal_kernels::metal::{Buffer, MTLResourceOptions};
+    use crate::interpreter::metal::__re::{Buffer, MTLBuffer, MTLDevice, MTLResourceOptions};
     use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -885,7 +888,7 @@ mod tests {
     }
 
     fn alloc(device: &Device, bytes: u64) -> Buffer {
-        device.new_buffer(bytes.max(1), MTLResourceOptions::StorageModeShared)
+        device.newBufferWithLength_options(bytes.max(1) as usize, MTLResourceOptions::StorageModeShared).expect("newBuffer")
     }
 
     fn empty_runtime(device: &Device, num_layers: usize) -> RuntimeBindings {
@@ -1255,7 +1258,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let queue = pool.device().new_command_queue();
+        let queue = pool.device().newCommandQueue().expect("newCommandQueue");
         let inputs = ForwardInputs {
             num_tokens: 1,
             input_ids: &[0u32],
@@ -1287,7 +1290,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let queue = pool.device().new_command_queue();
+        let queue = pool.device().newCommandQueue().expect("newCommandQueue");
         let inputs = ForwardInputs {
             num_tokens: 0,
             input_ids: &[],
@@ -1312,7 +1315,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let queue = pool.device().new_command_queue();
+        let queue = pool.device().newCommandQueue().expect("newCommandQueue");
         let big = vec![0u32; 9];
         let inputs = ForwardInputs {
             num_tokens: 9,
@@ -1346,7 +1349,7 @@ mod tests {
             eprintln!("skipping: no Metal device");
             return;
         };
-        let queue = pool.device().new_command_queue();
+        let queue = pool.device().newCommandQueue().expect("newCommandQueue");
         // 5 × u32 = 20 bytes; runtime input_ids buffer is 16 bytes.
         let too_big = [0u32, 0u32, 0u32, 0u32, 0u32];
         let inputs = ForwardInputs {

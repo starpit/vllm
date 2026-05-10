@@ -18,7 +18,7 @@
 
 #![cfg(feature = "metal")]
 
-use ferrite_metal_kernels::metal::MTLCommandBufferStatus;
+use crate::interpreter::metal::__re::MTLCommandBufferStatus;
 
 use super::worker::WorkerError;
 

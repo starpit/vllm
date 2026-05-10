@@ -19,7 +19,7 @@
 
 #![cfg(feature = "metal")]
 
-use ferrite_metal_kernels::metal::Buffer;
+use crate::interpreter::metal::__re::{Buffer, MTLBuffer};
 
 use super::lowered::RuntimeBindingKind;
 

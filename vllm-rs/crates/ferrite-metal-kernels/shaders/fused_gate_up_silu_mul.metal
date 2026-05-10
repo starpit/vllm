@@ -910,3 +910,429 @@ kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
     }
 }
 
+// ============================================================================
+// fused_gate_up_silu_mul_gemm_steel_{f16,bf16}_specialized
+// ============================================================================
+//
+// Higher-throughput variant of the matrix-path fused MLP kernel.
+// 32x32 output tile, 4 simdgroups per threadgroup (WM=2, WN=2),
+// BK=16. Two `simdgroup_float8x8` accumulator tiles per simdgroup
+// for gate and up, one shared SwiGLU epilogue, register-cached A/B
+// fragments. Direct adaptation of the MLX `steel/gemm/` pattern
+// (BlockMMA + BlockLoader at BM=BN=32, BK=16, WM=WN=2) inlined to
+// avoid vendoring the full MLX header tree (cf. prior dead-end on
+// the generic-gemm port at lm_head shapes — the MLP shapes
+// (N <= 8192, grid_x <= 256) stay well under any 1024-tg-per-axis
+// concern).
+//
+// Bindings (must match the lowering in
+// `interpreter::metal::lowering::lower_one`):
+//   buffer(0) = output  [M, N]            silu(gate) * up
+//   buffer(1) = input   [M, K]            post-rmsnorm hidden
+//   buffer(2) = weight  [2*N, K]          packed [gate; up]
+//
+// Function constants (distinct from the 8x8 variant's 0/1/2 + the
+// decode variant's 3/4/5 so the same library can host all three
+// kernels without colliding):
+//   6 = M     (uint) — bucket_m
+//   7 = N     (uint) — INTERMEDIATE_SIZE (per-side; 2N is gate+up width)
+//   8 = K     (uint) — Q_SIZE  (hidden_size)
+//
+// Threadgroup grid: (ceil(N/32), ceil(M/32), 1)
+// Threads per group: (128, 1, 1)  — 4 simdgroups × 32 lanes
+//
+// Tile layout per simdgroup:
+//   sgM = simdgroup_id / WN ∈ {0, 1}; sgN = simdgroup_id % WN ∈ {0, 1}.
+//   Each simdgroup owns rows [sgM*16, sgM*16 + 16) along M and cols
+//   [sgN*16, sgN*16 + 16) along N. Within that 16×16 region the four
+//   8×8 frags are contiguous: frag (i, j) at rows [i*8, i*8+8) cols
+//   [j*8, j*8+8), with TM=TN=2.
+//
+// Loads:
+//   Each threadgroup-pass reads one 32×16 A-tile and two 32×16 B-tiles
+//   (gate + up) into threadgroup memory. With 128 threads × 4 halves
+//   per thread = 512 halves = exactly 32×16, one round-trip. Vector
+//   loads (half4 / bfloat4) keep per-thread issue at one device
+//   transaction each. Per-row padding `STEEL_PAD = 8` halves keeps
+//   the fragment loads off-bank.
+//
+// Edge handling:
+//   M tail (M % 32 != 0) handled via per-row guard in the A loader
+//   plus a guarded per-cell store in the epilogue. N tail handled
+//   symmetrically on the B-side. K is assumed to be a multiple of
+//   BK=16 — true for every model we ship today (Q_SIZE ∈ {2048, 3072,
+//   …, 8192} are all multiples of 16). If a future model breaks
+//   that, add a K-tail load_safe equivalent à la steel/gemm.h.
+
+constant uint FUSED_MLP_STEEL_M [[function_constant(6)]];
+constant uint FUSED_MLP_STEEL_N [[function_constant(7)]];
+constant uint FUSED_MLP_STEEL_K [[function_constant(8)]];
+
+#define STEEL_BM   32
+#define STEEL_BN   32
+#define STEEL_BK   16
+#define STEEL_WM   2
+#define STEEL_WN   2
+#define STEEL_TM   2   // BM / (8 * WM)
+#define STEEL_TN   2   // BN / (8 * WN)
+#define STEEL_KFR  2   // BK / 8
+#define STEEL_TGP  128 // WM * WN * 32
+#define STEEL_PAD  8
+#define STEEL_ALD  24  // BK + PAD
+#define STEEL_BLD  24  // BK + PAD
+
+inline float silu_steel(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+kernel void fused_gate_up_silu_mul_gemm_steel_f16_specialized(
+    device       half* output  [[buffer(0)]],   // [M, N]
+    device const half* input   [[buffer(1)]],   // [M, K]
+    device const half* weight  [[buffer(2)]],   // [2*N, K]
+    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint  simd_lane_id  [[thread_index_in_simdgroup]],
+    uint3 tgid          [[threadgroup_position_in_grid]],
+    uint3 tid3          [[thread_position_in_threadgroup]])
+{
+    (void)tid3;
+    const uint M = FUSED_MLP_STEEL_M;
+    const uint N = FUSED_MLP_STEEL_N;
+    const uint K = FUSED_MLP_STEEL_K;
+
+    const uint c_row = tgid.y * STEEL_BM;
+    const uint c_col = tgid.x * STEEL_BN;
+    if (c_row >= M || c_col >= N) return;
+
+    threadgroup half As[STEEL_BM * STEEL_ALD];
+    threadgroup half Bs_gate[STEEL_BN * STEEL_BLD];
+    threadgroup half Bs_up  [STEEL_BN * STEEL_BLD];
+
+    // Per-thread BlockLoader-equivalent indices.  Each thread reads
+    // N_READS = (BM*BK)/TGP = 32*16/128 = 4 halves per pass; TCOLS =
+    // BK/N_READS = 4 → bj walks 0,4,8,12; TROWS = TGP/TCOLS = 32 ==
+    // BM, so the whole 32×16 tile is staged in a single round.
+    constexpr int N_READS = (STEEL_BM * STEEL_BK) / STEEL_TGP;  // 4
+    constexpr int TCOLS = STEEL_BK / N_READS;                    // 4
+
+    const uint thread_idx = simd_group_id * 32u + simd_lane_id;  // [0, 128)
+    const uint bi = thread_idx / uint(TCOLS);                    // [0, 32)
+    const uint bj = uint(N_READS) * (thread_idx % uint(TCOLS));  // 0,4,8,12
+
+    const int sgM = int(simd_group_id) / STEEL_WN;
+    const int sgN = int(simd_group_id) % STEEL_WN;
+
+    // Per-tile valid extents (M / N tail handling).
+    const uint m_tile = (c_row + STEEL_BM <= M) ? uint(STEEL_BM) : (M - c_row);
+    const uint n_tile = (c_col + STEEL_BN <= N) ? uint(STEEL_BN) : (N - c_col);
+    const bool m_full = (m_tile == STEEL_BM);
+    const bool n_full = (n_tile == STEEL_BN);
+
+    simdgroup_float8x8 acc_gate[STEEL_TM][STEEL_TN];
+    simdgroup_float8x8 acc_up  [STEEL_TM][STEEL_TN];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int i = 0; i < STEEL_TM; ++i) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int j = 0; j < STEEL_TN; ++j) {
+            acc_gate[i][j] = simdgroup_float8x8(0.0f);
+            acc_up  [i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    device const half* A_src  = input  + (c_row + bi) * K + bj;
+    device const half* Bg_src = weight + (c_col + bi) * K + bj;
+    device const half* Bu_src = weight + (N + c_col + bi) * K + bj;
+
+    threadgroup half* As_dst = As      + bi * STEEL_ALD + bj;
+    threadgroup half* Bg_dst = Bs_gate + bi * STEEL_BLD + bj;
+    threadgroup half* Bu_dst = Bs_up   + bi * STEEL_BLD + bj;
+
+    const uint k_iter_count = K / uint(STEEL_BK);
+
+    for (uint kk = 0; kk < k_iter_count; ++kk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Cooperative load of one 32×16 tile per buffer. Guarded
+        // loads gate the *dereference*, not just the stored value,
+        // so the device read itself never goes OOB on M / N tails.
+        if (m_full) {
+            *((threadgroup half4*)As_dst) = *((const device half4*)A_src);
+        } else if (bi < m_tile) {
+            *((threadgroup half4*)As_dst) = *((const device half4*)A_src);
+        } else {
+            *((threadgroup half4*)As_dst) = half4(0);
+        }
+        if (n_full) {
+            *((threadgroup half4*)Bg_dst) = *((const device half4*)Bg_src);
+            *((threadgroup half4*)Bu_dst) = *((const device half4*)Bu_src);
+        } else if (bi < n_tile) {
+            *((threadgroup half4*)Bg_dst) = *((const device half4*)Bg_src);
+            *((threadgroup half4*)Bu_dst) = *((const device half4*)Bu_src);
+        } else {
+            *((threadgroup half4*)Bg_dst) = half4(0);
+            *((threadgroup half4*)Bu_dst) = half4(0);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // K-fragment loop: BK=16 → 2 8-wide K-frags per BK iter.
+        MLX_MTL_PRAGMA_UNROLL
+        for (int kf = 0; kf < STEEL_KFR; ++kf) {
+            simdgroup_half8x8 A_frag[STEEL_TM];
+            MLX_MTL_PRAGMA_UNROLL
+            for (int i = 0; i < STEEL_TM; ++i) {
+                threadgroup const half* a_ptr =
+                    As + (sgM * 16 + i * 8) * STEEL_ALD + kf * 8;
+                simdgroup_load(A_frag[i], a_ptr, STEEL_ALD);
+            }
+
+            simdgroup_half8x8 Bg_frag[STEEL_TN];
+            simdgroup_half8x8 Bu_frag[STEEL_TN];
+            MLX_MTL_PRAGMA_UNROLL
+            for (int j = 0; j < STEEL_TN; ++j) {
+                int n_off = sgN * 16 + j * 8;
+                threadgroup const half* bg_ptr =
+                    Bs_gate + n_off * STEEL_BLD + kf * 8;
+                threadgroup const half* bu_ptr =
+                    Bs_up   + n_off * STEEL_BLD + kf * 8;
+                simdgroup_load(Bg_frag[j], bg_ptr, STEEL_BLD,
+                               ulong2(0, 0), /*transpose*/ true);
+                simdgroup_load(Bu_frag[j], bu_ptr, STEEL_BLD,
+                               ulong2(0, 0), /*transpose*/ true);
+            }
+
+            MLX_MTL_PRAGMA_UNROLL
+            for (int i = 0; i < STEEL_TM; ++i) {
+                MLX_MTL_PRAGMA_UNROLL
+                for (int j = 0; j < STEEL_TN; ++j) {
+                    simdgroup_multiply_accumulate(
+                        acc_gate[i][j], A_frag[i], Bg_frag[j], acc_gate[i][j]);
+                    simdgroup_multiply_accumulate(
+                        acc_up  [i][j], A_frag[i], Bu_frag[j], acc_up  [i][j]);
+                }
+            }
+        }
+
+        A_src  += STEEL_BK;
+        Bg_src += STEEL_BK;
+        Bu_src += STEEL_BK;
+    }
+
+    // Epilogue: store gate + up accumulators to threadgroup scratch,
+    // apply silu(g)*u per cell, then write the live region of the
+    // 32×32 output tile to device memory.
+    threadgroup float gate_scratch[STEEL_BM * STEEL_BN];
+    threadgroup float up_scratch  [STEEL_BM * STEEL_BN];
+    threadgroup half  c_scratch   [STEEL_BM * STEEL_BN];
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int i = 0; i < STEEL_TM; ++i) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int j = 0; j < STEEL_TN; ++j) {
+            int row_base = sgM * 16 + i * 8;
+            int col_base = sgN * 16 + j * 8;
+            simdgroup_store(acc_gate[i][j],
+                            gate_scratch + row_base * STEEL_BN + col_base,
+                            STEEL_BN);
+            simdgroup_store(acc_up[i][j],
+                            up_scratch + row_base * STEEL_BN + col_base,
+                            STEEL_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 32×32 = 1024 cells / 128 threads = 8 cells / thread.
+    for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
+        float g = gate_scratch[t];
+        float u = up_scratch[t];
+        c_scratch[t] = half(silu_steel(g) * u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (m_full && n_full) {
+        for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
+            uint r = t / uint(STEEL_BN);
+            uint c = t % uint(STEEL_BN);
+            output[(c_row + r) * N + (c_col + c)] = c_scratch[t];
+        }
+    } else {
+        for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
+            uint r = t / uint(STEEL_BN);
+            uint c = t % uint(STEEL_BN);
+            if (r < m_tile && c < n_tile) {
+                output[(c_row + r) * N + (c_col + c)] = c_scratch[t];
+            }
+        }
+    }
+}
+
+/// BF16 mirror of `fused_gate_up_silu_mul_gemm_steel_f16_specialized`.
+/// `simdgroup_bfloat8x8` MMA tiles (Metal 3.1+, native on M3+).
+/// Accumulators stay `simdgroup_float8x8` — bf16→f32 accumulation is
+/// the standard pattern for matmul kernels and matches CUDA's bf16 GEMM.
+kernel void fused_gate_up_silu_mul_gemm_steel_bf16_specialized(
+    device       bfloat* output  [[buffer(0)]],
+    device const bfloat* input   [[buffer(1)]],
+    device const bfloat* weight  [[buffer(2)]],
+    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint  simd_lane_id  [[thread_index_in_simdgroup]],
+    uint3 tgid          [[threadgroup_position_in_grid]],
+    uint3 tid3          [[thread_position_in_threadgroup]])
+{
+    (void)tid3;
+    const uint M = FUSED_MLP_STEEL_M;
+    const uint N = FUSED_MLP_STEEL_N;
+    const uint K = FUSED_MLP_STEEL_K;
+
+    const uint c_row = tgid.y * STEEL_BM;
+    const uint c_col = tgid.x * STEEL_BN;
+    if (c_row >= M || c_col >= N) return;
+
+    threadgroup bfloat As[STEEL_BM * STEEL_ALD];
+    threadgroup bfloat Bs_gate[STEEL_BN * STEEL_BLD];
+    threadgroup bfloat Bs_up  [STEEL_BN * STEEL_BLD];
+
+    constexpr int N_READS = (STEEL_BM * STEEL_BK) / STEEL_TGP;
+    constexpr int TCOLS = STEEL_BK / N_READS;
+
+    const uint thread_idx = simd_group_id * 32u + simd_lane_id;
+    const uint bi = thread_idx / uint(TCOLS);
+    const uint bj = uint(N_READS) * (thread_idx % uint(TCOLS));
+
+    const int sgM = int(simd_group_id) / STEEL_WN;
+    const int sgN = int(simd_group_id) % STEEL_WN;
+
+    const uint m_tile = (c_row + STEEL_BM <= M) ? uint(STEEL_BM) : (M - c_row);
+    const uint n_tile = (c_col + STEEL_BN <= N) ? uint(STEEL_BN) : (N - c_col);
+    const bool m_full = (m_tile == STEEL_BM);
+    const bool n_full = (n_tile == STEEL_BN);
+
+    simdgroup_float8x8 acc_gate[STEEL_TM][STEEL_TN];
+    simdgroup_float8x8 acc_up  [STEEL_TM][STEEL_TN];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int i = 0; i < STEEL_TM; ++i) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int j = 0; j < STEEL_TN; ++j) {
+            acc_gate[i][j] = simdgroup_float8x8(0.0f);
+            acc_up  [i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    device const bfloat* A_src  = input  + (c_row + bi) * K + bj;
+    device const bfloat* Bg_src = weight + (c_col + bi) * K + bj;
+    device const bfloat* Bu_src = weight + (N + c_col + bi) * K + bj;
+
+    threadgroup bfloat* As_dst = As      + bi * STEEL_ALD + bj;
+    threadgroup bfloat* Bg_dst = Bs_gate + bi * STEEL_BLD + bj;
+    threadgroup bfloat* Bu_dst = Bs_up   + bi * STEEL_BLD + bj;
+
+    const uint k_iter_count = K / uint(STEEL_BK);
+
+    for (uint kk = 0; kk < k_iter_count; ++kk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (m_full) {
+            *((threadgroup bfloat4*)As_dst) = *((const device bfloat4*)A_src);
+        } else if (bi < m_tile) {
+            *((threadgroup bfloat4*)As_dst) = *((const device bfloat4*)A_src);
+        } else {
+            *((threadgroup bfloat4*)As_dst) = bfloat4(0);
+        }
+        if (n_full) {
+            *((threadgroup bfloat4*)Bg_dst) = *((const device bfloat4*)Bg_src);
+            *((threadgroup bfloat4*)Bu_dst) = *((const device bfloat4*)Bu_src);
+        } else if (bi < n_tile) {
+            *((threadgroup bfloat4*)Bg_dst) = *((const device bfloat4*)Bg_src);
+            *((threadgroup bfloat4*)Bu_dst) = *((const device bfloat4*)Bu_src);
+        } else {
+            *((threadgroup bfloat4*)Bg_dst) = bfloat4(0);
+            *((threadgroup bfloat4*)Bu_dst) = bfloat4(0);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        MLX_MTL_PRAGMA_UNROLL
+        for (int kf = 0; kf < STEEL_KFR; ++kf) {
+            simdgroup_bfloat8x8 A_frag[STEEL_TM];
+            MLX_MTL_PRAGMA_UNROLL
+            for (int i = 0; i < STEEL_TM; ++i) {
+                threadgroup const bfloat* a_ptr =
+                    As + (sgM * 16 + i * 8) * STEEL_ALD + kf * 8;
+                simdgroup_load(A_frag[i], a_ptr, STEEL_ALD);
+            }
+
+            simdgroup_bfloat8x8 Bg_frag[STEEL_TN];
+            simdgroup_bfloat8x8 Bu_frag[STEEL_TN];
+            MLX_MTL_PRAGMA_UNROLL
+            for (int j = 0; j < STEEL_TN; ++j) {
+                int n_off = sgN * 16 + j * 8;
+                threadgroup const bfloat* bg_ptr =
+                    Bs_gate + n_off * STEEL_BLD + kf * 8;
+                threadgroup const bfloat* bu_ptr =
+                    Bs_up   + n_off * STEEL_BLD + kf * 8;
+                simdgroup_load(Bg_frag[j], bg_ptr, STEEL_BLD,
+                               ulong2(0, 0), true);
+                simdgroup_load(Bu_frag[j], bu_ptr, STEEL_BLD,
+                               ulong2(0, 0), true);
+            }
+
+            MLX_MTL_PRAGMA_UNROLL
+            for (int i = 0; i < STEEL_TM; ++i) {
+                MLX_MTL_PRAGMA_UNROLL
+                for (int j = 0; j < STEEL_TN; ++j) {
+                    simdgroup_multiply_accumulate(
+                        acc_gate[i][j], A_frag[i], Bg_frag[j], acc_gate[i][j]);
+                    simdgroup_multiply_accumulate(
+                        acc_up  [i][j], A_frag[i], Bu_frag[j], acc_up  [i][j]);
+                }
+            }
+        }
+
+        A_src  += STEEL_BK;
+        Bg_src += STEEL_BK;
+        Bu_src += STEEL_BK;
+    }
+
+    threadgroup float  gate_scratch[STEEL_BM * STEEL_BN];
+    threadgroup float  up_scratch  [STEEL_BM * STEEL_BN];
+    threadgroup bfloat c_scratch   [STEEL_BM * STEEL_BN];
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int i = 0; i < STEEL_TM; ++i) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int j = 0; j < STEEL_TN; ++j) {
+            int row_base = sgM * 16 + i * 8;
+            int col_base = sgN * 16 + j * 8;
+            simdgroup_store(acc_gate[i][j],
+                            gate_scratch + row_base * STEEL_BN + col_base,
+                            STEEL_BN);
+            simdgroup_store(acc_up[i][j],
+                            up_scratch + row_base * STEEL_BN + col_base,
+                            STEEL_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
+        float g = gate_scratch[t];
+        float u = up_scratch[t];
+        c_scratch[t] = bfloat(silu_steel(g) * u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (m_full && n_full) {
+        for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
+            uint r = t / uint(STEEL_BN);
+            uint c = t % uint(STEEL_BN);
+            output[(c_row + r) * N + (c_col + c)] = c_scratch[t];
+        }
+    } else {
+        for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
+            uint r = t / uint(STEEL_BN);
+            uint c = t % uint(STEEL_BN);
+            if (r < m_tile && c < n_tile) {
+                output[(c_row + r) * N + (c_col + c)] = c_scratch[t];
+            }
+        }
+    }
+}
+

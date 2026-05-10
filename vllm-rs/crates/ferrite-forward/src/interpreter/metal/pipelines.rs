@@ -108,17 +108,22 @@ fn kernel_msl_names(
         (KernelId::FusedAddRmsNorm, MetalDtype::Bf16) => {
             ("fused_add_rmsnorm", "fused_add_rmsnorm_bf16_specialized")
         }
-        // Two specialized variants per dtype: the decode (M=1) variant
-        // uses simd_sum dot products and avoids simdgroup_matrix
-        // overhead at one-row inputs. Prefill (M >= 2) uses the matrix
-        // variant.
+        // Two specialized variants per dtype:
+        // - **Decode (M=1)**: `..._decode_*_specialized` — port of MLX
+        //   gemv with simd_sum dot products; avoids `simdgroup_matrix`
+        //   overhead on one-row inputs.
+        // - **Prefill (M >= 2)**: `..._gemm_steel_*_specialized` —
+        //   MLX-steel-pattern fused GEMM at BM=BN=32, WM=WN=2, BK=16
+        //   (4 simdgroups × 32 lanes × 4 frags per accumulator gate +
+        //   up). Replaced the 8×8 single-simdgroup variant on
+        //   2026-05-10 (item 5 of the Phase 5.H follow-up list).
         (KernelId::FusedGateUpSiluMul, MetalDtype::F16) if bucket_m == 1 => (
             "fused_gate_up_silu_mul",
             "fused_gate_up_silu_mul_decode_f16_specialized",
         ),
         (KernelId::FusedGateUpSiluMul, MetalDtype::F16) => (
             "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_gemm_f16_specialized",
+            "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
         ),
         (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) if bucket_m == 1 => (
             "fused_gate_up_silu_mul",
@@ -126,7 +131,7 @@ fn kernel_msl_names(
         ),
         (KernelId::FusedGateUpSiluMul, MetalDtype::Bf16) => (
             "fused_gate_up_silu_mul",
-            "fused_gate_up_silu_mul_gemm_bf16_specialized",
+            "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
         ),
         (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
         (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
@@ -188,18 +193,23 @@ pub fn constants_for<W: CanonicalParams>(
             ConstantValue::uint(1, W::Q_SIZE as u32),
             ConstantValue::float(2, W::RMS_NORM_EPS),
         ],
-        // Decode (M=1) variant carries (M, N, K) at indices 3/4/5
-        // so the matrix variant's 0/1/2 don't clash in the shared
-        // library when both kernels are compiled together.
+        // Three specialized variants share the metallib; each binds a
+        // distinct function-constant slot triple to avoid collision
+        // when the library is loaded:
+        //   0/1/2 → legacy 8×8 matrix variant (no longer dispatched
+        //           but kept compiled until the cleanup commit drops
+        //           the symbol)
+        //   3/4/5 → M=1 decode variant
+        //   6/7/8 → MLX-steel matrix variant (production for M >= 2)
         KernelId::FusedGateUpSiluMul if bucket_m == 1 => vec![
             ConstantValue::uint(3, bucket_m),
             ConstantValue::uint(4, W::INTERMEDIATE_SIZE as u32),
             ConstantValue::uint(5, W::Q_SIZE as u32),
         ],
         KernelId::FusedGateUpSiluMul => vec![
-            ConstantValue::uint(0, bucket_m),
-            ConstantValue::uint(1, W::INTERMEDIATE_SIZE as u32),
-            ConstantValue::uint(2, W::Q_SIZE as u32),
+            ConstantValue::uint(6, bucket_m),
+            ConstantValue::uint(7, W::INTERMEDIATE_SIZE as u32),
+            ConstantValue::uint(8, W::Q_SIZE as u32),
         ],
         KernelId::Embed => vec![
             ConstantValue::uint(0, bucket_m),
@@ -506,12 +516,16 @@ mod tests {
 
     #[test]
     fn fused_silu_bag_has_no_eps() {
+        // bucket_m >= 2 selects the MLX-steel matrix variant; the
+        // shape constants live at indices 6/7/8 to avoid clashing
+        // with both the legacy 8×8 kernel (0/1/2) and the M=1 decode
+        // kernel (3/4/5) when the same library hosts all three.
         let bag =
             constants_for::<TinyLlamaProbe>(KernelId::FusedGateUpSiluMul, 64).expect("silu bag");
         assert_eq!(bag.len(), 3);
-        assert_eq!(bag[0], ConstantValue::uint(0, 64));
-        assert_eq!(bag[1], ConstantValue::uint(1, 5632));
-        assert_eq!(bag[2], ConstantValue::uint(2, 2048));
+        assert_eq!(bag[0], ConstantValue::uint(6, 64));
+        assert_eq!(bag[1], ConstantValue::uint(7, 5632));
+        assert_eq!(bag[2], ConstantValue::uint(8, 2048));
     }
 
     #[test]
@@ -3583,6 +3597,9 @@ mod tests {
         let weight_buf = alloc_bf16(&device, &weight_data);
         let output_buf = alloc_zero_bf16(&device, m * n);
 
+        // Dispatch shape mirrors the production picker:
+        //   M=1   → decode kernel (256 threads, 4 outputs/group).
+        //   M>=2  → MLX-steel matrix kernel (128 threads, 32×32 tile).
         let (threadgroups, threads_per_threadgroup) = if m == 1 {
             (
                 MTLSize::new((n as u64).div_ceil(4), 1, 1),
@@ -3590,8 +3607,8 @@ mod tests {
             )
         } else {
             (
-                MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
-                MTLSize::new(32, 1, 1),
+                MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
+                MTLSize::new(128, 1, 1),
             )
         };
         let cb = queue.new_command_buffer();
@@ -3714,6 +3731,9 @@ mod tests {
         // Dispatch shape depends on which kernel variant was picked.
         // M=1 → decode kernel: 256 threads/group, 8 outputs/group.
         // M>=2 → matrix kernel: 32 threads/group, 8x8 output tile.
+        // Dispatch shape mirrors the production picker:
+        //   M=1   → decode kernel (256 threads, 4 outputs/group).
+        //   M>=2  → MLX-steel matrix kernel (128 threads, 32×32 tile).
         let (threadgroups, threads_per_threadgroup) = if m == 1 {
             (
                 MTLSize::new((n as u64).div_ceil(4), 1, 1),
@@ -3721,8 +3741,8 @@ mod tests {
             )
         } else {
             (
-                MTLSize::new((n as u64).div_ceil(8), (m as u64).div_ceil(8), 1),
-                MTLSize::new(32, 1, 1),
+                MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
+                MTLSize::new(128, 1, 1),
             )
         };
         let cb = queue.new_command_buffer();
@@ -3775,5 +3795,237 @@ mod tests {
                 diff
             );
         }
+    }
+
+    /// Numerical-correctness check for
+    /// `fused_gate_up_silu_mul_gemm_steel_{f16,bf16}_specialized` —
+    /// the higher-throughput MLP matrix kernel (BM=BN=32, WM=WN=2,
+    /// BK=16; 4 simdgroups per threadgroup with two
+    /// `simdgroup_*8x8` accumulator tiles for gate + up).
+    ///
+    /// Uses TinyLlamaProbe MLP shape (N=5632, K=2048) so we exercise
+    /// the real K-iter count (128 BK-iters) and a non-trivial N grid
+    /// (176 tiles). M sweeps full + tail cases:
+    /// `{2, 8, 16, 32, 33, 64, 128}` — `33` forces the M-tail bound
+    /// check, the others all hit at multiples of 32 / 8.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_mlp_steel_f16_matches_cpu_golden() {
+        for m in [2usize, 8, 16, 32, 33, 64, 128] {
+            run_fused_mlp_steel_check(m, MetalDtype::F16);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fused_mlp_steel_bf16_matches_cpu_golden() {
+        for m in [2usize, 8, 16, 32, 33, 64, 128] {
+            run_fused_mlp_steel_check(m, MetalDtype::Bf16);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_fused_mlp_steel_check(m: usize, dtype: MetalDtype) {
+        use crate::cpu_golden;
+        use ferrite_metal_kernels::metal::MTLSize;
+        use ferrite_metal_kernels::specialized_pipeline_cache::{
+            ConstantValue, PipelineKey,
+        };
+
+        let Some(device_info) = ferrite_metal_kernels::detect_device() else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device_info.device.clone();
+        let queue = device.new_command_queue();
+
+        let cache = std::sync::Arc::new(
+            ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::with_standard_shaders(
+                device.clone(),
+            )
+            .expect("compile standard shaders"),
+        );
+
+        let n: usize = TinyLlamaProbe::INTERMEDIATE_SIZE;
+        let k: usize = TinyLlamaProbe::Q_SIZE;
+        // BK=16; the kernel asserts no K-tail. TinyLlama-class K is
+        // already a multiple of 16, but assert here so a future
+        // model-shape change surfaces clearly.
+        assert_eq!(k % 16, 0);
+
+        let symbol = match dtype {
+            MetalDtype::F16 => "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
+            MetalDtype::Bf16 => "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
+            MetalDtype::Int4 => unreachable!("int4 not exercised by this test"),
+        };
+        let key = PipelineKey::new(
+            "fused_gate_up_silu_mul",
+            symbol,
+            vec![
+                ConstantValue::uint(6, m as u32),
+                ConstantValue::uint(7, n as u32),
+                ConstantValue::uint(8, k as u32),
+            ],
+        );
+        let pipeline = cache
+            .get_or_build(&key)
+            .expect("fused_mlp steel pipeline build");
+
+        // Synthetic deterministic input + packed [gate; up] weight.
+        let input_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.013).sin() * 0.3)
+            .collect();
+        let weight_data: Vec<f32> = (0..(2 * n) * k)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.3)
+            .collect();
+
+        use ferrite_metal_kernels::metal::{Buffer, Device, MTLResourceOptions};
+
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_bf16(device: &Device, data: &[f32]) -> Buffer {
+            let bf16_data: Vec<half::bf16> =
+                data.iter().map(|&v| half::bf16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(bf16_data.as_slice());
+            let buf = device.new_buffer(bytes.max(1) as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bf16_data.as_ptr() as *const u8,
+                    buf.contents() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
+        fn alloc_zero(device: &Device, n_elems: usize, elem_bytes: usize) -> Buffer {
+            let bytes = (n_elems * elem_bytes).max(1);
+            let buf = device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, bytes);
+            }
+            buf
+        }
+
+        let elem_bytes = match dtype {
+            MetalDtype::F16 => std::mem::size_of::<half::f16>(),
+            MetalDtype::Bf16 => std::mem::size_of::<half::bf16>(),
+            MetalDtype::Int4 => unreachable!(),
+        };
+        let (input_buf, weight_buf) = match dtype {
+            MetalDtype::F16 => (
+                alloc_f16(&device, &input_data),
+                alloc_f16(&device, &weight_data),
+            ),
+            MetalDtype::Bf16 => (
+                alloc_bf16(&device, &input_data),
+                alloc_bf16(&device, &weight_data),
+            ),
+            MetalDtype::Int4 => unreachable!(),
+        };
+        let output_buf = alloc_zero(&device, m * n, elem_bytes);
+
+        // Steel dispatch: 32×32 output tile, 4 simdgroups × 32 lanes.
+        let threadgroups = MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1);
+        let threads_per_threadgroup = MTLSize::new(128, 1, 1);
+
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(&output_buf), 0);
+        enc.set_buffer(1, Some(&input_buf), 0);
+        enc.set_buffer(2, Some(&weight_buf), 0);
+        enc.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // CPU reference: round-trip inputs/weights through the
+        // matching dtype to match what the kernel sees.
+        let (input_round, weight_round): (Vec<f32>, Vec<f32>) = match dtype {
+            MetalDtype::F16 => (
+                input_data
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v).to_f32())
+                    .collect(),
+                weight_data
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v).to_f32())
+                    .collect(),
+            ),
+            MetalDtype::Bf16 => (
+                input_data
+                    .iter()
+                    .map(|&v| half::bf16::from_f32(v).to_f32())
+                    .collect(),
+                weight_data
+                    .iter()
+                    .map(|&v| half::bf16::from_f32(v).to_f32())
+                    .collect(),
+            ),
+            MetalDtype::Int4 => unreachable!(),
+        };
+        let gate_w = &weight_round[0..n * k];
+        let up_w = &weight_round[n * k..2 * n * k];
+        let mut gate = vec![0.0_f32; m * n];
+        let mut up = vec![0.0_f32; m * n];
+        cpu_golden::gemm(&input_round, gate_w, &mut gate, m, k, n);
+        cpu_golden::gemm(&input_round, up_w, &mut up, m, k, n);
+        let mut output_cpu = vec![0.0_f32; m * n];
+        cpu_golden::fused_gate_up_silu_mul(&gate, &up, &mut output_cpu);
+
+        fn read_f16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::f16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        fn read_bf16(buf: &Buffer, n: usize) -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(buf.contents() as *const half::bf16, n) }
+                .iter()
+                .map(|&v| v.to_f32())
+                .collect()
+        }
+        let output_metal = match dtype {
+            MetalDtype::F16 => read_f16(&output_buf, output_cpu.len()),
+            MetalDtype::Bf16 => read_bf16(&output_buf, output_cpu.len()),
+            MetalDtype::Int4 => unreachable!(),
+        };
+
+        // K=2048 reduction; bf16 has 7-bit mantissa → larger drift
+        // than f16's 10-bit. Pick tolerances generous enough for
+        // K-deep accumulation but tight enough to flag a real bug.
+        let tol: f32 = match dtype {
+            MetalDtype::F16 => 5e-2,
+            MetalDtype::Bf16 => 1e-1,
+            MetalDtype::Int4 => unreachable!(),
+        };
+        let mut max_diff: f32 = 0.0;
+        for i in 0..output_cpu.len() {
+            let diff = (output_metal[i] - output_cpu[i]).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            assert!(
+                diff < tol,
+                "fused_mlp_steel m={m} dtype={dtype:?} [{i}] (row {} col {}) metal={} cpu={} diff={}",
+                i / n,
+                i % n,
+                output_metal[i],
+                output_cpu[i],
+                diff
+            );
+        }
+        eprintln!("fused_mlp_steel m={m} dtype={dtype:?} max_abs_diff={max_diff}");
     }
 }

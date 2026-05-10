@@ -294,16 +294,18 @@ fn lower_one<W: CanonicalParams>(
         // Two specialized variants behind `KernelId::FusedGateUpSiluMul`:
         //
         // - **Decode (`bucket_m == 1`)**: dispatches
-        //   `fused_gate_up_silu_mul_decode_f16_specialized`, which
-        //   uses simd_sum dot products. 256 threads/group =
-        //   8 simdgroups × 32 lanes; one simdgroup owns one output.
-        //   Threadgroup grid: `(ceil(N/8), 1, 1)` — 8 outputs/group.
+        //   `fused_gate_up_silu_mul_decode_*_specialized`, which uses
+        //   simd_sum dot products. 256 threads/group = 8 simdgroups
+        //   × 32 lanes; one simdgroup owns one output. Threadgroup
+        //   grid: `(ceil(N/4), 1, 1)` — `MLP_DECODE_BLOCK_M = 4`
+        //   outputs per group.
         //
         // - **Prefill (`bucket_m >= 2`)**: dispatches
-        //   `fused_gate_up_silu_mul_gemm_f16_specialized`, which uses
-        //   `simdgroup_matrix<half, 8, 8>` MMA tiles. 32 threads =
-        //   one simdgroup per threadgroup, 8x8 output tile.
-        //   Threadgroup grid: `(ceil(N/8), ceil(M/8), 1)`.
+        //   `fused_gate_up_silu_mul_gemm_steel_*_specialized` (MLX-
+        //   steel pattern, BM=BN=32, BK=16, WM=WN=2). 128
+        //   threads/group = 4 simdgroups; each simdgroup carries
+        //   2×2 = 4 `simdgroup_*8x8` accumulator frags per gate / up.
+        //   Threadgroup grid: `(ceil(N/32), ceil(M/32), 1)`.
         //
         // Bindings are identical for both variants: (out, in, weight)
         // at indices 0/1/2. The kernel splits the packed `[gate|up]`
@@ -319,10 +321,11 @@ fn lower_one<W: CanonicalParams>(
                 // BN*SN = 8 simdgroups × 32 lanes.
                 ((inter.div_ceil(MLP_DECODE_BLOCK_M), 1, 1), (256, 1, 1))
             } else {
-                // Prefill: 8x8 output tile, 32 threads.
-                let tg_x = inter.div_ceil(MLP_TILE);
-                let tg_y = bucket_m.div_ceil(MLP_TILE);
-                ((tg_x, tg_y, 1), (32, 1, 1))
+                // Prefill (MLX-steel matrix variant): 32×32 output
+                // tile, 128 threads = 4 simdgroups × 32 lanes.
+                let tg_x = inter.div_ceil(MLP_STEEL_TILE);
+                let tg_y = bucket_m.div_ceil(MLP_STEEL_TILE);
+                ((tg_x, tg_y, 1), (MLP_STEEL_THREADS, 1, 1))
             };
             LoweredCommand {
                 kernel: KernelId::FusedGateUpSiluMul,
@@ -625,13 +628,17 @@ const THREADS_PER_GROUP: u32 = 256;
 const GEMM_TILE_M: u32 = 16;
 const GEMM_TILE_N: u32 = 16;
 
-/// Output tile dim for the fused MLP kernel
-/// (`fused_gate_up_silu_mul_gemm_f16_specialized`). One simdgroup
-/// per threadgroup writes an 8×8 output tile. Match the shader's
-/// `TILE` constant.
-const MLP_TILE: u32 = 8;
+/// Output tile dim for the prefill matrix variant
+/// (`fused_gate_up_silu_mul_gemm_steel_*_specialized`). 4 simdgroups
+/// per threadgroup × WM*WN = 2*2 placement → 32×32 output tile.
+/// Matches `STEEL_BM`/`STEEL_BN` in `shaders/fused_gate_up_silu_mul.metal`.
+const MLP_STEEL_TILE: u32 = 32;
+
+/// Threads per threadgroup for the steel matrix variant.
+/// `WM * WN * 32 = 2 * 2 * 32 = 128`.
+const MLP_STEEL_THREADS: u32 = 128;
 
 /// Output rows per threadgroup for the M=1 decode variant
-/// (`fused_gate_up_silu_mul_decode_f16_specialized`). Matches the
+/// (`fused_gate_up_silu_mul_decode_*_specialized`). Matches the
 /// MLX gemv port's `blockM = BM*SM*TM = 4`.
 const MLP_DECODE_BLOCK_M: u32 = 4;

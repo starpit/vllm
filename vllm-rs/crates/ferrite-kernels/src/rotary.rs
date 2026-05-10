@@ -423,12 +423,8 @@ impl RotaryCache {
         // them under the cuda + metal feature combos.
         #[cfg(any(feature = "cuda", feature = "metal"))]
         let (cos_cache, sin_cache) = (
-            unsafe {
-                ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype)
-            },
-            unsafe {
-                ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype)
-            },
+            unsafe { ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
+            unsafe { ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
         );
         #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let (cos_cache, sin_cache) = {

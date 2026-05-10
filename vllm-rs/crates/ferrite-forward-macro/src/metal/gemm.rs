@@ -93,26 +93,27 @@ impl Implementation for MetalGemmImpl {
         let output_dims = ctx.eval_shape(output_shape);
 
         if let Some(output_dims) = output_dims
-            && output_dims.len() >= 2 {
-                let m = output_dims[0] as u32;
-                let n = output_dims[1] as u32;
+            && output_dims.len() >= 2
+        {
+            let m = output_dims[0] as u32;
+            let n = output_dims[1] as u32;
 
-                // Get K from weight shape
-                // Weight input is typically the second input (after activation)
-                if node.inputs.len() >= 2 {
-                    // For GEMM, the weight input provides K dimension
-                    // We'll use a conservative estimate if we can't determine K
-                    let k = 2048u32; // Conservative default for typical transformer dimensions
+            // Get K from weight shape
+            // Weight input is typically the second input (after activation)
+            if node.inputs.len() >= 2 {
+                // For GEMM, the weight input provides K dimension
+                // We'll use a conservative estimate if we can't determine K
+                let k = 2048u32; // Conservative default for typical transformer dimensions
 
-                    // Try empirical cost first
-                    if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, k) {
-                        return cost;
-                    }
-
-                    // Fall back to analytical model
-                    return self.analytical_cost_us(m, n, k, ctx.profile.peak_tflops_fp16);
+                // Try empirical cost first
+                if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, k) {
+                    return cost;
                 }
+
+                // Fall back to analytical model
+                return self.analytical_cost_us(m, n, k, ctx.profile.peak_tflops_fp16);
             }
+        }
 
         // Fallback: conservative estimate (assume medium-sized GEMM)
         500.0

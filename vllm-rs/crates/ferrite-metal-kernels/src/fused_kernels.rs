@@ -94,16 +94,30 @@ impl FusedAddRmsNorm {
         };
 
         encoder.setComputePipelineState(pipeline);
-        unsafe { encoder.setBuffer_offset_atIndex(Some(input), 0, 0); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(residual), 0, 1); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(weight), 0, 2); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 3); }
-
-        if let Some(res_out) = residual_out {
-            unsafe { encoder.setBuffer_offset_atIndex(Some(res_out), 0, 4); }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(residual), 0, 1);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(weight), 0, 2);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 3);
         }
 
-        let n_param = if n.is_multiple_of(4) && use_f16 { n / 4 } else { n };
+        if let Some(res_out) = residual_out {
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(res_out), 0, 4);
+            }
+        }
+
+        let n_param = if n.is_multiple_of(4) && use_f16 {
+            n / 4
+        } else {
+            n
+        };
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -225,11 +239,21 @@ impl FusedGateUpSiluMul {
         };
 
         encoder.setComputePipelineState(pipeline);
-        unsafe { encoder.setBuffer_offset_atIndex(Some(gate_out), 0, 0); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 2); }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(gate_out), 0, 0);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        }
 
-        let n_param = if n.is_multiple_of(4) && use_f16 { n / 4 } else { n };
+        let n_param = if n.is_multiple_of(4) && use_f16 {
+            n / 4
+        } else {
+            n
+        };
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -286,10 +310,18 @@ impl FusedGateUpSiluMul {
         };
 
         encoder.setComputePipelineState(pipeline);
-        unsafe { encoder.setBuffer_offset_atIndex(Some(gate_up), 0, 0); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 1); }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(gate_up), 0, 0);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        }
 
-        let n_param = if n.is_multiple_of(4) && use_f16 { n / 4 } else { n };
+        let n_param = if n.is_multiple_of(4) && use_f16 {
+            n / 4
+        } else {
+            n
+        };
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -345,9 +377,15 @@ impl FusedGateUpSiluMul {
         };
 
         encoder.setComputePipelineState(pipeline);
-        unsafe { encoder.setBuffer_offset_atIndex(Some(gate_out), 0, 0); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 2); }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(gate_out), 0, 0);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(up_out), 0, 1);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        }
 
         unsafe {
             encoder.setBytes_length_atIndex(

@@ -108,42 +108,43 @@ impl Implementation for MetalFusedAddRmsNormImpl {
         let dims = ctx.eval_shape(shape);
 
         if let Some(dims) = dims
-            && dims.len() >= 2 {
-                let m = dims[0] as u32;
-                let n = dims[1] as u32;
+            && dims.len() >= 2
+        {
+            let m = dims[0] as u32;
+            let n = dims[1] as u32;
 
-                // Check if Add has multiple consumers (indicates residual_out needed)
-                let add_tile = match_info.claimed_tiles[0];
-                let has_residual_out = ctx
-                    .fuf
-                    .nodes
-                    .iter()
-                    .filter(|node| {
-                        node.inputs.iter().any(|input| {
-                            if let crate::fuf::FufInput::Tile { id, slot: _ } = input {
-                                id == &add_tile
-                            } else {
-                                false
-                            }
-                        })
+            // Check if Add has multiple consumers (indicates residual_out needed)
+            let add_tile = match_info.claimed_tiles[0];
+            let has_residual_out = ctx
+                .fuf
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.inputs.iter().any(|input| {
+                        if let crate::fuf::FufInput::Tile { id, slot: _ } = input {
+                            id == &add_tile
+                        } else {
+                            false
+                        }
                     })
-                    .count()
-                    > 1;
+                })
+                .count()
+                > 1;
 
-                // Try empirical cost first
-                let k = if has_residual_out { 1 } else { 0 };
-                if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, k) {
-                    return cost;
-                }
-
-                // Fall back to analytical model
-                return self.analytical_cost_us(
-                    m,
-                    n,
-                    ctx.profile.memory_bandwidth_gbps,
-                    has_residual_out,
-                );
+            // Try empirical cost first
+            let k = if has_residual_out { 1 } else { 0 };
+            if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, k) {
+                return cost;
             }
+
+            // Fall back to analytical model
+            return self.analytical_cost_us(
+                m,
+                n,
+                ctx.profile.memory_bandwidth_gbps,
+                has_residual_out,
+            );
+        }
 
         // Fallback: conservative estimate
         150.0
@@ -325,18 +326,19 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         let dims = ctx.eval_shape(shape);
 
         if let Some(dims) = dims
-            && dims.len() >= 2 {
-                let m = dims[0] as u32;
-                let n = dims[1] as u32;
+            && dims.len() >= 2
+        {
+            let m = dims[0] as u32;
+            let n = dims[1] as u32;
 
-                // Try empirical cost first
-                if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
-                    return cost;
-                }
-
-                // Fall back to analytical model
-                return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
+            // Try empirical cost first
+            if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
+                return cost;
             }
+
+            // Fall back to analytical model
+            return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
+        }
 
         // Fallback: conservative estimate
         120.0

@@ -236,10 +236,7 @@ mod tests {
     #[test]
     fn test_wait_for_completion() {
         let device = detect_device().expect("Metal device required");
-        let queue = device
-            .device
-            .newCommandQueue()
-            .expect("newCommandQueue");
+        let queue = device.device.newCommandQueue().expect("newCommandQueue");
         let cmd_buf = queue.commandBuffer().expect("commandBuffer");
 
         let encoder = cmd_buf

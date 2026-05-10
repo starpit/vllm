@@ -145,7 +145,10 @@ impl SpecializedPipelineCache {
             device,
             &[
                 ("rmsnorm", crate::embedded_metallib!("rmsnorm")),
-                ("fused_add_rmsnorm", crate::embedded_metallib!("fused_add_rmsnorm")),
+                (
+                    "fused_add_rmsnorm",
+                    crate::embedded_metallib!("fused_add_rmsnorm"),
+                ),
                 (
                     "fused_gate_up_silu_mul",
                     crate::embedded_metallib!("fused_gate_up_silu_mul"),
@@ -155,7 +158,10 @@ impl SpecializedPipelineCache {
                 ("embed", crate::embedded_metallib!("embed")),
                 ("activation", crate::embedded_metallib!("activation")),
                 ("elementwise", crate::embedded_metallib!("elementwise")),
-                ("awq_dequantize", crate::embedded_metallib!("awq_dequantize")),
+                (
+                    "awq_dequantize",
+                    crate::embedded_metallib!("awq_dequantize"),
+                ),
                 ("gemm", crate::embedded_metallib!("gemm")),
             ],
         )

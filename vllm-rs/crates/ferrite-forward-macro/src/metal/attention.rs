@@ -218,35 +218,36 @@ impl Implementation for MetalAttentionImpl {
         let dims = ctx.eval_shape(shape);
 
         if let Some(dims) = dims
-            && dims.len() >= 2 {
-                let num_heads = dims[0] as u32;
-                let head_size = dims[1] as u32;
+            && dims.len() >= 2
+        {
+            let num_heads = dims[0] as u32;
+            let head_size = dims[1] as u32;
 
-                // Get sequence length from bounds (context_len or similar)
-                let seq_len = ctx
-                    .bounds
-                    .get("context_len")
-                    .or_else(|| ctx.bounds.get("max_seq_len"))
-                    .copied()
-                    .unwrap_or(2048) as u32;
+            // Get sequence length from bounds (context_len or similar)
+            let seq_len = ctx
+                .bounds
+                .get("context_len")
+                .or_else(|| ctx.bounds.get("max_seq_len"))
+                .copied()
+                .unwrap_or(2048) as u32;
 
-                // Try empirical cost first
-                if let Some(cost) =
-                    ctx.profile
-                        .cost_us_for(self.kernel_name, num_heads, head_size, seq_len)
-                {
-                    return cost;
-                }
-
-                // Fall back to analytical model
-                return self.analytical_cost_us(
-                    num_heads,
-                    head_size,
-                    seq_len,
-                    ctx.profile.memory_bandwidth_gbps,
-                    ctx.profile.peak_tflops_fp16,
-                );
+            // Try empirical cost first
+            if let Some(cost) =
+                ctx.profile
+                    .cost_us_for(self.kernel_name, num_heads, head_size, seq_len)
+            {
+                return cost;
             }
+
+            // Fall back to analytical model
+            return self.analytical_cost_us(
+                num_heads,
+                head_size,
+                seq_len,
+                ctx.profile.memory_bandwidth_gbps,
+                ctx.profile.peak_tflops_fp16,
+            );
+        }
 
         // Fallback: conservative estimate (attention is expensive)
         1000.0

@@ -211,7 +211,11 @@ impl MetalGemm {
         transpose_b: bool,
         use_f16: bool,
     ) -> Result<(), GemmError> {
-        let dtype = if use_f16 { GemmDtype::F16 } else { GemmDtype::F32 };
+        let dtype = if use_f16 {
+            GemmDtype::F16
+        } else {
+            GemmDtype::F32
+        };
         let cmd_buf = stream
             .get_command_buffer()
             .map_err(|e| GemmError::ExecutionFailed(format!("{:?}", e)))?;
@@ -256,7 +260,11 @@ impl MetalGemm {
         transpose_b: bool,
         use_f16: bool,
     ) -> Result<(), GemmError> {
-        let dtype = if use_f16 { GemmDtype::F16 } else { GemmDtype::F32 };
+        let dtype = if use_f16 {
+            GemmDtype::F16
+        } else {
+            GemmDtype::F32
+        };
         let elem_size = dtype.elem_size();
 
         let a_rows = if transpose_a { k } else { m };

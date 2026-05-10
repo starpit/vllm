@@ -114,8 +114,7 @@ impl MetalResidencySet {
 /// on any failure (device family check fails, descriptor alloc
 /// fails, `newResidencySet:error:` returns nil).
 unsafe fn try_create_residency_set(device: &Device) -> *mut AnyObject {
-    let device_ptr: *mut AnyObject =
-        Retained::as_ptr(device) as *const AnyObject as *mut AnyObject;
+    let device_ptr: *mut AnyObject = Retained::as_ptr(device) as *const AnyObject as *mut AnyObject;
 
     // Probe for `newResidencySetWithDescriptor:error:` selector. The
     // selector exists on macOS 15+ runtimes; on older systems

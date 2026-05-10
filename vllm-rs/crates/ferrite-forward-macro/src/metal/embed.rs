@@ -93,31 +93,32 @@ impl Implementation for MetalEmbedImpl {
         let dims = ctx.eval_shape(shape);
 
         if let Some(dims) = dims
-            && dims.len() == 2 {
-                let num_tokens = dims[0] as u32;
-                let hidden_size = dims[1] as u32;
+            && dims.len() == 2
+        {
+            let num_tokens = dims[0] as u32;
+            let hidden_size = dims[1] as u32;
 
-                // Try empirical cost first
-                let kernel_name = match self.dtype {
-                    "fp16" => "embed_f16",
-                    "bf16" => "embed_bf16",
-                    _ => "embed_f16",
-                };
+            // Try empirical cost first
+            let kernel_name = match self.dtype {
+                "fp16" => "embed_f16",
+                "bf16" => "embed_bf16",
+                _ => "embed_f16",
+            };
 
-                if let Some(cost) = ctx
-                    .profile
-                    .cost_us_for(kernel_name, num_tokens, hidden_size, 0)
-                {
-                    return cost;
-                }
-
-                // Fall back to analytical model
-                return self.analytical_cost_us(
-                    num_tokens,
-                    hidden_size,
-                    ctx.profile.memory_bandwidth_gbps,
-                );
+            if let Some(cost) = ctx
+                .profile
+                .cost_us_for(kernel_name, num_tokens, hidden_size, 0)
+            {
+                return cost;
             }
+
+            // Fall back to analytical model
+            return self.analytical_cost_us(
+                num_tokens,
+                hidden_size,
+                ctx.profile.memory_bandwidth_gbps,
+            );
+        }
 
         // Fallback: conservative estimate
         10.0

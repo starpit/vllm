@@ -33,8 +33,8 @@ pub struct ArgmaxKernels {
 
 impl ArgmaxKernels {
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library =
-            load_library_from_bytes(device, crate::embedded_metallib!("argmax")).map_err(|e| {
+        let library = load_library_from_bytes(device, crate::embedded_metallib!("argmax"))
+            .map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `argmax.metallib`: {e}"))
             })?;
         let f16 = build_pipeline(device, &library, "argmax_f16")?;
@@ -53,14 +53,12 @@ fn build_pipeline(
     name: &str,
 ) -> Result<ComputePipelineState, MetalStreamError> {
     let ns_name = NSString::from_str(name);
-    let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
-        MetalStreamError::ShaderCompilationFailed(format!("{name} fn missing"))
-    })?;
+    let function = library
+        .newFunctionWithName(&ns_name)
+        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed(format!("{name} fn missing")))?;
     device
         .newComputePipelineStateWithFunction_error(&function)
-        .map_err(|e| {
-            MetalStreamError::ShaderCompilationFailed(format!("{name} pipeline: {e:?}"))
-        })
+        .map_err(|e| MetalStreamError::ShaderCompilationFailed(format!("{name} pipeline: {e:?}")))
 }
 
 pub fn dispatch_argmax_f16(
@@ -123,8 +121,12 @@ pub fn dispatch_argmax_f16_with_tg_size(
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
     })?;
     enc.setComputePipelineState(&kernels.f16);
-    unsafe { enc.setBuffer_offset_atIndex(Some(logits), 0, 0); }
-    unsafe { enc.setBuffer_offset_atIndex(Some(output), 0, 1); }
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
+    }
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(output), 0, 1);
+    }
     unsafe {
         enc.setBytes_length_atIndex(
             NonNull::new(&batch as *const u32 as *mut c_void).unwrap(),
@@ -195,8 +197,12 @@ pub fn dispatch_argmax_bf16(
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder returned nil".into())
     })?;
     enc.setComputePipelineState(&kernels.bf16);
-    unsafe { enc.setBuffer_offset_atIndex(Some(logits), 0, 0); }
-    unsafe { enc.setBuffer_offset_atIndex(Some(output), 0, 1); }
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(logits), 0, 0);
+    }
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(output), 0, 1);
+    }
     unsafe {
         enc.setBytes_length_atIndex(
             NonNull::new(&batch as *const u32 as *mut c_void).unwrap(),

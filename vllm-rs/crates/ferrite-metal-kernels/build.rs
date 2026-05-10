@@ -49,7 +49,14 @@ fn main() {
         // MSL → AIR. `-O3` and `-frecord-sources=flat` so debug
         // captures retain source mapping; matches what MLX ships.
         let status = Command::new("xcrun")
-            .args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat", "-c"])
+            .args([
+                "-sdk",
+                "macosx",
+                "metal",
+                "-O3",
+                "-frecord-sources=flat",
+                "-c",
+            ])
             .arg(shader)
             .arg("-o")
             .arg(&air)

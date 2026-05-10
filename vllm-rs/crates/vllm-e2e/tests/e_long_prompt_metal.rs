@@ -167,7 +167,10 @@ async fn long_prompt_metal_multi_turn_continuation_completes() {
         "{}{}\n{}",
         turn1,
         resp1.choices[0].text,
-        build_prompt(2500, "Q: Reflecting on the above, what one word answers the question? A:"),
+        build_prompt(
+            2500,
+            "Q: Reflecting on the above, what one word answers the question? A:"
+        ),
     );
     let resp2 = client
         .completion(&greedy_completion(&turn2, 16))

@@ -19,9 +19,9 @@ mod test_icb_execution;
 mod test_direct_vs_icb;
 
 use icb_ffi::{IndirectCommandBuffer, IndirectCommandBufferDescriptor, MTLIndirectCommandType};
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::msg_send;
 use objc2_foundation::NSRange;
 use objc2_metal::{
     MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLSize,

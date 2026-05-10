@@ -25,7 +25,9 @@ pub struct GpuDevice {
 
 impl GpuDevice {
     pub fn new(device: Arc<Device>, allocator: Arc<MetalAllocator>) -> Self {
-        let queue = device.newCommandQueue().expect("newCommandQueue returned nil");
+        let queue = device
+            .newCommandQueue()
+            .expect("newCommandQueue returned nil");
         Self {
             device,
             queue,

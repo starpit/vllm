@@ -100,10 +100,7 @@ impl MetalTargetProfile {
                 .map_err(|e| format!("Invalid cost: {}", e))?;
 
             let entry = CostEntry { m, n, k, cost_us };
-            self.cost_table
-                .entry(kernel)
-                .or_default()
-                .push(entry);
+            self.cost_table.entry(kernel).or_default().push(entry);
         }
 
         Ok(())

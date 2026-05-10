@@ -81,13 +81,21 @@ impl MetalRope {
             let key_offset = token_idx * num_kv_heads * head_size;
             let cache_offset = position * rot_dim;
 
-            unsafe { encoder.setBuffer_offset_atIndex(Some(query), query_offset * 2, 0); }
-            if let Some(key_buf) = key {
-                unsafe { encoder.setBuffer_offset_atIndex(Some(key_buf), key_offset * 2, 1); }
-            } else {
-                unsafe { encoder.setBuffer_offset_atIndex(None, 0, 1); }
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(query), query_offset * 2, 0);
             }
-            unsafe { encoder.setBuffer_offset_atIndex(Some(cos_sin_cache), cache_offset * 2, 2); }
+            if let Some(key_buf) = key {
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(key_buf), key_offset * 2, 1);
+                }
+            } else {
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(None, 0, 1);
+                }
+            }
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(cos_sin_cache), cache_offset * 2, 2);
+            }
 
             unsafe {
                 encoder.setBytes_length_atIndex(

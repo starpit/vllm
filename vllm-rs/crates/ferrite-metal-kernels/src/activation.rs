@@ -65,8 +65,12 @@ impl MetalActivation {
         let pipeline = self.shader_cache.get_pipeline(&kernel_name)?;
 
         encoder.setComputePipelineState(&pipeline);
-        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 0); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(input), 0, 1); }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 0);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 1);
+        }
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -112,8 +116,12 @@ impl MetalActivation {
         let pipeline = self.shader_cache.get_pipeline("silu_vec4_f16")?;
 
         encoder.setComputePipelineState(&pipeline);
-        unsafe { encoder.setBuffer_offset_atIndex(Some(output), 0, 0); }
-        unsafe { encoder.setBuffer_offset_atIndex(Some(input), 0, 1); }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 0);
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 1);
+        }
 
         unsafe {
             encoder.setBytes_length_atIndex(
@@ -190,10 +198,7 @@ mod tests {
 
         let output_buffer = device
             .device
-            .newBufferWithLength_options(
-                (n as usize) * 2,
-                MTLResourceOptions::StorageModeShared,
-            )
+            .newBufferWithLength_options((n as usize) * 2, MTLResourceOptions::StorageModeShared)
             .expect("buffer alloc");
 
         let command_buffer = device.queue.commandBuffer().expect("command buffer");

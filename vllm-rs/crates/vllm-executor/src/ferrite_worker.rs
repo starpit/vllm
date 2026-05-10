@@ -67,11 +67,11 @@ use vllm_cuda::weights::GpuWeights;
 // is the metal-side `BackendAllocator`; `RawGpuMem::from_buffer` wraps
 // `metal::Buffer` for `KvCachePool::new`.
 #[cfg(feature = "metal")]
+use ::objc2_metal::{MTLBuffer as _, MTLDevice as _};
+#[cfg(feature = "metal")]
 use ferrite_cuda_core::weights::GpuWeights;
 #[cfg(feature = "metal")]
 use ferrite_cuda_core::{GpuDevice, GpuTensor, MetalAllocator, RawGpuMem, TensorView};
-#[cfg(feature = "metal")]
-use ::objc2_metal::{MTLBuffer as _, MTLDevice as _};
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::input_batch::InputBatch;
@@ -9620,7 +9620,10 @@ impl Worker for FerriteWorker {
                     // StorageModeShared pays on each fresh cmdbuf
                     // (~3s/forward observed at TinyLlama).
                     let buffer = mtl_device
-                        .newBufferWithLength_options(bytes, ::objc2_metal::MTLResourceOptions::StorageModePrivate)
+                        .newBufferWithLength_options(
+                            bytes,
+                            ::objc2_metal::MTLResourceOptions::StorageModePrivate,
+                        )
                         .expect("newBufferWithLength_options returned nil");
                     residency.insert(&buffer);
                     Ok(RawGpuMem::from_buffer(buffer))
@@ -9834,23 +9837,27 @@ impl Worker for FerriteWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerExecution("gpu_device not initialized".into()))?;
         let mtl_device = device_buf.device.clone();
-        let alloc_u32 =
-            |data: &[u32]| -> ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>> {
-                let bytes = (data.len().max(1)) * 4;
-                let buf = mtl_device
-                    .newBufferWithLength_options(bytes, ::objc2_metal::MTLResourceOptions::StorageModeShared)
-                    .expect("newBufferWithLength_options returned nil");
-                if !data.is_empty() {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            data.as_ptr(),
-                            buf.contents().as_ptr() as *mut u32,
-                            data.len(),
-                        );
-                    }
+        let alloc_u32 = |data: &[u32]| -> ::objc2::rc::Retained<
+            ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+        > {
+            let bytes = (data.len().max(1)) * 4;
+            let buf = mtl_device
+                .newBufferWithLength_options(
+                    bytes,
+                    ::objc2_metal::MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBufferWithLength_options returned nil");
+            if !data.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        buf.contents().as_ptr() as *mut u32,
+                        data.len(),
+                    );
                 }
-                buf
-            };
+            }
+            buf
+        };
 
         let buf_input_ids = alloc_u32(&input_ids_u32);
         let buf_positions = alloc_u32(&positions_u32);
@@ -9954,7 +9961,8 @@ impl Worker for FerriteWorker {
             for row_idx in 0..total_n.min(25) {
                 let row = unsafe {
                     std::slice::from_raw_parts(
-                        (buf.contents().as_ptr() as *const half::f16).add(row_idx as usize * vocab as usize),
+                        (buf.contents().as_ptr() as *const half::f16)
+                            .add(row_idx as usize * vocab as usize),
                         vocab as usize,
                     )
                 };
@@ -10009,7 +10017,10 @@ impl Worker for FerriteWorker {
         }
 
         let argmax_slice: &[u32] = unsafe {
-            std::slice::from_raw_parts(argmax_out.contents().as_ptr() as *const u32, total_n as usize)
+            std::slice::from_raw_parts(
+                argmax_out.contents().as_ptr() as *const u32,
+                total_n as usize,
+            )
         };
 
         // DIAGNOSTIC: dump first 8 logits + top-5 + the argmax for the

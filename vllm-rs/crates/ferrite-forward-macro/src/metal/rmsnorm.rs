@@ -99,18 +99,19 @@ impl Implementation for MetalRmsNormImpl {
         let dims = ctx.eval_shape(shape);
 
         if let Some(dims) = dims
-            && dims.len() >= 2 {
-                let m = dims[0] as u32;
-                let n = dims[1] as u32;
+            && dims.len() >= 2
+        {
+            let m = dims[0] as u32;
+            let n = dims[1] as u32;
 
-                // Try empirical cost first
-                if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
-                    return cost;
-                }
-
-                // Fall back to analytical model
-                return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
+            // Try empirical cost first
+            if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
+                return cost;
             }
+
+            // Fall back to analytical model
+            return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
+        }
 
         // Fallback: conservative estimate
         100.0

@@ -21,7 +21,9 @@ pub struct MetalDevice {
 
 impl MetalDevice {
     pub fn new(device: Device, profile: MetalTargetProfile) -> Self {
-        let queue = device.newCommandQueue().expect("newCommandQueue returned nil");
+        let queue = device
+            .newCommandQueue()
+            .expect("newCommandQueue returned nil");
         Self {
             device,
             profile,

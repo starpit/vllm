@@ -88,10 +88,7 @@ impl ShaderCache {
 
         let ns_name = NSString::from_str(name);
         let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
-            MetalStreamError::ShaderCompilationFailed(format!(
-                "Failed to get function '{}'",
-                name
-            ))
+            MetalStreamError::ShaderCompilationFailed(format!("Failed to get function '{}'", name))
         })?;
 
         let pipeline = self

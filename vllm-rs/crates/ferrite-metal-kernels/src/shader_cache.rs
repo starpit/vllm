@@ -41,8 +41,8 @@ impl ShaderCache {
                 &crate::embedded_metallib!("fused_gate_up_silu_mul")[..],
             ),
             (
-                "awq_dequantize",
-                &crate::embedded_metallib!("awq_dequantize")[..],
+                "quantized_dequantize",
+                &crate::embedded_metallib!("quantized_dequantize")[..],
             ),
         ] {
             let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
@@ -74,8 +74,8 @@ impl ShaderCache {
             self.libraries.get("fused_add_rmsnorm")
         } else if name.starts_with("fused_gate_up_silu_mul_") {
             self.libraries.get("fused_gate_up_silu_mul")
-        } else if name.starts_with("awq_") {
-            self.libraries.get("awq_dequantize")
+        } else if name.starts_with("affine_dequantize_") {
+            self.libraries.get("quantized_dequantize")
         } else {
             self.libraries.get("activation")
         }

@@ -60,11 +60,10 @@ clap = { workspace = true, optional = true }
 ureq = { version = "2", optional = true, features = ["tls"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-# Used by metal interpreter tests for f32 ↔ f16 conversion when
-# allocating + reading back Metal buffers in numerical-correctness
-# checks (Phase 5.G.3 onward).
+# `half::f16` / `half::bf16` are part of the `cpu_golden::affine_dequantize_b4_*`
+# public surface (Metal int4 reference path); also used by metal interpreter
+# tests for f32 ↔ f16 conversion when allocating + reading back Metal buffers
+# in numerical-correctness checks.
 half = { workspace = true }
 
 [[bin]]

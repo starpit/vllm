@@ -25,7 +25,3 @@ harness = false
 [[bench]]
 name = "fused_kernels_benchmark"
 harness = false
-
-[[bench]]
-name = "awq_benchmark"
-harness = false

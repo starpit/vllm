@@ -159,8 +159,8 @@ impl SpecializedPipelineCache {
                 ("activation", crate::embedded_metallib!("activation")),
                 ("elementwise", crate::embedded_metallib!("elementwise")),
                 (
-                    "awq_dequantize",
-                    crate::embedded_metallib!("awq_dequantize"),
+                    "quantized_dequantize",
+                    crate::embedded_metallib!("quantized_dequantize"),
                 ),
                 ("gemm", crate::embedded_metallib!("gemm")),
             ],

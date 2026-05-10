@@ -700,6 +700,91 @@ pub fn attention_prefill_paged(
     }
 }
 
+/// MLX-affine int4 dequantization — half-precision reference.
+///
+/// Faithful CPU port of the Metal `affine_dequantize` kernel
+/// (`mlx/backend/metal/kernels/quantized.h:2536`) for the bits=4 case.
+/// Layout matches the on-disk safetensors for `mlx-community/*-4bit`:
+///
+/// - `packed`: `[n_bytes]` packed nibbles. Two output elements per byte
+///   (low nibble → `out[oindex]`, high nibble → `out[oindex + 1]`).
+///   Equivalent to the `[N, K/8]` U32 weight tensor reinterpreted as
+///   `[N * K / 2]` bytes (`pack_factor = 32 / bits = 8` u32-packing, or
+///   `8 / bits = 2` bytes-packing). `n_bytes = N * K / 2`.
+/// - `scales` / `biases`: `[N * K / group_size]` per-group scale + affine
+///   offset, each stored as half-precision. MLX terminology: "biases"
+///   means the per-group affine offset, NOT a linear-layer bias.
+/// - `output`: `[N * K]` half-precision. Caller sizes per `packed.len()
+///   * 2 == output.len()`.
+///
+/// The kernel emits a hardware fp16/bf16 FMA for `scale * d + bias` — one
+/// rounding at the end. We mirror by promoting to f32 for the multiply +
+/// add (exact at these magnitudes: scale fits in f32 mantissa, `d ∈ [0,
+/// 15]` is exact, the sum fits trivially) and rounding to the target
+/// dtype once. Doing `(scale * f16(d)) + bias` with the `half` crate's
+/// per-op rounding drifts ~4 ULPs vs the kernel — bit-exact parity
+/// requires modelling FMA single-rounding here.
+pub fn affine_dequantize_b4_f16(
+    packed: &[u8],
+    scales: &[half::f16],
+    biases: &[half::f16],
+    output: &mut [half::f16],
+    group_size: usize,
+) {
+    let pack_factor: usize = 2;
+    assert_eq!(output.len(), packed.len() * pack_factor);
+    assert_eq!(
+        output.len() % group_size,
+        0,
+        "output length {} not divisible by group_size {group_size}",
+        output.len(),
+    );
+    assert_eq!(scales.len(), output.len() / group_size);
+    assert_eq!(biases.len(), output.len() / group_size);
+
+    for (offset, &byte) in packed.iter().enumerate() {
+        let oindex = offset * pack_factor;
+        let gindex = oindex / group_size;
+        let scale = scales[gindex].to_f32();
+        let bias = biases[gindex].to_f32();
+        let lo = (byte & 0x0f) as f32;
+        let hi = ((byte >> 4) & 0x0f) as f32;
+        output[oindex] = half::f16::from_f32(scale * lo + bias);
+        output[oindex + 1] = half::f16::from_f32(scale * hi + bias);
+    }
+}
+
+/// BFloat16 sibling of [`affine_dequantize_b4_f16`].
+pub fn affine_dequantize_b4_bf16(
+    packed: &[u8],
+    scales: &[half::bf16],
+    biases: &[half::bf16],
+    output: &mut [half::bf16],
+    group_size: usize,
+) {
+    let pack_factor: usize = 2;
+    assert_eq!(output.len(), packed.len() * pack_factor);
+    assert_eq!(
+        output.len() % group_size,
+        0,
+        "output length {} not divisible by group_size {group_size}",
+        output.len(),
+    );
+    assert_eq!(scales.len(), output.len() / group_size);
+    assert_eq!(biases.len(), output.len() / group_size);
+
+    for (offset, &byte) in packed.iter().enumerate() {
+        let oindex = offset * pack_factor;
+        let gindex = oindex / group_size;
+        let scale = scales[gindex].to_f32();
+        let bias = biases[gindex].to_f32();
+        let lo = (byte & 0x0f) as f32;
+        let hi = ((byte >> 4) & 0x0f) as f32;
+        output[oindex] = half::bf16::from_f32(scale * lo + bias);
+        output[oindex + 1] = half::bf16::from_f32(scale * hi + bias);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

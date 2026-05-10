@@ -12,6 +12,7 @@ pub mod argmax;
 pub mod device;
 pub mod fused_kernels;
 pub mod gemm;
+pub mod quantized;
 pub mod residency;
 pub mod rope;
 pub mod shader_cache;

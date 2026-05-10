@@ -71,6 +71,7 @@ impl ShaderCache {
                 "quantized_splitk_reduce",
                 &crate::embedded_metallib!("quantized_splitk_reduce")[..],
             ),
+            ("silu_mul", &crate::embedded_metallib!("silu_mul")[..]),
         ] {
             let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e}"))
@@ -106,6 +107,8 @@ impl ShaderCache {
             self.libraries.get("quantized_qmv")
         } else if name.starts_with("splitk_reduce_") {
             self.libraries.get("quantized_splitk_reduce")
+        } else if name.starts_with("silu_mul") {
+            self.libraries.get("silu_mul")
         } else {
             self.libraries.get("activation")
         };

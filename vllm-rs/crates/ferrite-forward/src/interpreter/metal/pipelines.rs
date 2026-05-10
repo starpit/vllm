@@ -304,12 +304,14 @@ mod tests {
                 | KernelId::AffineQmvFast
                 | KernelId::AffineQmv
                 | KernelId::AffineQmmT
-                | KernelId::AffineQmmTSplitK,
+                | KernelId::AffineQmmTSplitK
+                | KernelId::SiluMul
+                | KernelId::SplitKReduceSum,
                 _,
             ) => {
                 unreachable!(
-                    "kernel_msl_names: Affine* kernels not wired into the synthetic \
-                     test helper — see comment above; production lookup uses \
+                    "kernel_msl_names: Affine*/SiluMul/SplitKReduceSum not wired into the \
+                     synthetic test helper — see comment above; production lookup uses \
                      `pipeline_for_command(cmd)` directly"
                 );
             }
@@ -363,14 +365,16 @@ mod tests {
             | KernelId::AffineQmvFast
             | KernelId::AffineQmv
             | KernelId::AffineQmmT
-            | KernelId::AffineQmmTSplitK => {
+            | KernelId::AffineQmmTSplitK
+            | KernelId::SiluMul
+            | KernelId::SplitKReduceSum => {
                 // See `kernel_msl_names` for the matching gap — this
-                // helper isn't wired for the Affine* path. Production
-                // constants come from the lowering pass directly via
-                // `cmd.constants`.
+                // helper isn't wired for the Affine*/SiluMul/SplitKReduce
+                // path. Production constants come from the lowering pass
+                // directly via `cmd.constants`.
                 unreachable!(
-                    "constants_for: Affine* kernels not wired into the synthetic \
-                     test helper — production constants ride on the LoweredCommand"
+                    "constants_for: Affine*/SiluMul/SplitKReduceSum not wired into the \
+                     synthetic test helper — production constants ride on the LoweredCommand"
                 );
             }
         };

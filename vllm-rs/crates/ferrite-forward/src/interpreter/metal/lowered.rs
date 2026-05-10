@@ -107,6 +107,17 @@ pub enum KernelId {
     /// emitted by the lowering pass (mirroring
     /// `quantized.cpp:861 strided_reduce_general_dispatch`).
     AffineQmmTSplitK,
+    /// Fused `silu(gate) * up` for the decomposed q-MLP path. The
+    /// macro emits this after a pair of `AffineQmm` GEMMs when the
+    /// gate/up Linears are MLX-affine quantized (plan P12 branch
+    /// (i)). Maps to `silu_mul_<dtype>` in `silu_mul.metallib`.
+    SiluMul,
+    /// Sum-along-axis-0 reduce for the `[split_k, M, N]` intermediate
+    /// `AffineQmmTSplitK` produces. Maps to
+    /// `splitk_reduce_sum_<dtype>` in `quantized_splitk_reduce.metallib`.
+    /// Lowered alongside `AffineQmmTSplitK` so the worker sees
+    /// (qmm_t_splitk → scratch, reduce → out) as adjacent commands.
+    SplitKReduceSum,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source

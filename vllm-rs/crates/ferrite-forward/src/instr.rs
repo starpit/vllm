@@ -587,6 +587,19 @@ pub enum Instruction<W> {
     ///
     /// CUDA eval is `unreachable!` — emit only on the metal forward.
     AffineQmm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
+    /// path (plan P12 branch (i)). The macro emits this after a pair
+    /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
+    /// MLX-affine quantized — `MetalFusedGateUpSiluMulImpl::fan_out`
+    /// produces (AffineQmm, AffineQmm, SiluMul) in that case rather
+    /// than a single fused `FusedGateUpSiluMul` (which assumes Dense
+    /// storage).
+    ///
+    /// Tuple fields: `(gate_slot, up_slot, out_slot)`. Both inputs
+    /// must be `[M, intermediate_size]` in the activation dtype;
+    /// output is the same shape. CUDA eval is `unreachable!` —
+    /// metal-only (CUDA's q-MLP routes through Marlin/Bnb/etc).
+    SiluMul(u32, u32, u32),
     /// Re-run the next `body_len` instructions `count` times.
     Loop(u32, u32),
     /// `tiles[dst] = Some(View(src))`.
@@ -2986,6 +2999,13 @@ impl<W: CanonicalParams> Instruction<W> {
                     "Instruction::AffineQmm is metal-only — the macro must \
                      not emit it on the cuda forward (Affine weights stay \
                      in StorageFormat::Dense on cuda by the FUF downgrade)"
+                );
+            }
+            Instruction::SiluMul(..) => {
+                unreachable!(
+                    "Instruction::SiluMul is metal-only — emitted by the \
+                     decomposed q-MLP path on Affine; cuda's q-MLP routes \
+                     through Marlin/Bnb/Fp8/etc fused kernels"
                 );
             }
             Instruction::Loop(_, _) => {

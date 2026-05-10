@@ -194,6 +194,7 @@ impl SpecializedPipelineCache {
                     "quantized_splitk_reduce",
                     crate::embedded_metallib!("quantized_splitk_reduce"),
                 ),
+                ("silu_mul", crate::embedded_metallib!("silu_mul")),
                 ("gemm", crate::embedded_metallib!("gemm")),
             ],
         )

@@ -415,6 +415,47 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Fused silu(gate) * up for the decomposed q-MLP path ───
+        //
+        // C4 will start emitting `(AffineQmm gate, AffineQmm up,
+        // SiluMul)` from the macro when both gate_proj and up_proj
+        // are MLX-affine quantized — `MetalFusedGateUpSiluMulImpl`
+        // currently rejects non-Dense storage. SiluMul is the
+        // elementwise tail of that decomposition; the gate / up
+        // arena slots hold the two AffineQmm outputs and SiluMul
+        // writes `silu(gate) * up` into out_slot.
+        I::SiluMul(gate_slot, up_slot, out_slot) => {
+            let dtype = dequant_dtype_for::<W>();
+            let n = bucket_m * (W::INTERMEDIATE_SIZE as u32);
+            LoweredCommand {
+                kernel: KernelId::SiluMul,
+                library: "silu_mul",
+                function: silu_mul_static_name(dtype),
+                constants: vec![ConstantValue::uint(0, n)],
+                // 1D dispatch over M * intermediate_size output elements,
+                // one thread per element. Threadgroup width clamped to
+                // the pipeline's max at execute time would be cleaner;
+                // for now match the elementwise convention used by
+                // `KernelId::Add` / `KernelId::ScalarMul`.
+                dispatch: DispatchShape::dispatch_1d(n, THREADS_PER_GROUP),
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *gate_slot,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *up_slot,
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Fused gate-up SwiGLU MLP (GEMM + SwiGLU in one dispatch) ──
         //
         // Two specialized variants behind `KernelId::FusedGateUpSiluMul`:
@@ -886,6 +927,16 @@ fn pick_specialized_symbol(
     }
 }
 
+/// Static `&'static str` for the `silu_mul_<dtype>` symbol exported
+/// by `silu_mul.metal`. Same `&'static str` constraint as the qmv /
+/// qmm name helpers — `LoweredCommand::function` can't allocate.
+fn silu_mul_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "silu_mul_f16",
+        DequantDtype::Bf16 => "silu_mul_bf16",
+    }
+}
+
 /// Convert the lowering-side dtype enum to the kernel-dispatcher one.
 /// `MetalDtype` is the lowering vocabulary; `DequantDtype` is what
 /// `quantized.rs` speaks (and what `qmv_kernel_static_name` /
@@ -1097,6 +1148,56 @@ mod tests {
         assert_eq!(cmd.dispatch.threadgroups, (2048 / 32, 64 / 32, 1));
         assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 2));
         assert_eq!(cmd.bindings.len(), 5);
+        assert!(cmd.gemm_dims.is_none());
+    }
+
+    /// SiluMul lowers to a 1D dispatch over `bucket_m * intermediate_size`
+    /// elements with three ArenaSlot bindings (out, gate, up). Function
+    /// constant 0 holds the total element count.
+    #[test]
+    fn silu_mul_lowers_with_three_arena_bindings_and_n_constant() {
+        let inst: Instruction<TestParams> =
+            Instruction::SiluMul(/*gate=*/ 5, /*up=*/ 6, /*out=*/ 7);
+        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
+            .expect("lower")
+            .expect("non-metadata");
+        assert_eq!(cmd.kernel, KernelId::SiluMul);
+        assert_eq!(cmd.library, "silu_mul");
+        assert_eq!(cmd.function, "silu_mul_bf16");
+        // n = bucket_m * INTERMEDIATE_SIZE = 64 * 8192.
+        let n_expected = 64 * (TestParams::INTERMEDIATE_SIZE as u32);
+        assert_eq!(cmd.constants, vec![ConstantValue::uint(0, n_expected)]);
+        assert_eq!(cmd.bindings.len(), 3);
+        match &cmd.bindings[0] {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
+                assert_eq!(*slot, 7);
+                assert_eq!(*binding_index, 0);
+            }
+            _ => panic!("bindings[0]: expected out_slot ArenaSlot"),
+        }
+        match &cmd.bindings[1] {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
+                assert_eq!(*slot, 5);
+                assert_eq!(*binding_index, 1);
+            }
+            _ => panic!("bindings[1]: expected gate_slot ArenaSlot"),
+        }
+        match &cmd.bindings[2] {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
+                assert_eq!(*slot, 6);
+                assert_eq!(*binding_index, 2);
+            }
+            _ => panic!("bindings[2]: expected up_slot ArenaSlot"),
+        }
         assert!(cmd.gemm_dims.is_none());
     }
 

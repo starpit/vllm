@@ -67,6 +67,10 @@ impl ShaderCache {
                 "quantized_qmm",
                 &crate::embedded_metallib!("quantized_qmm")[..],
             ),
+            (
+                "quantized_splitk_reduce",
+                &crate::embedded_metallib!("quantized_splitk_reduce")[..],
+            ),
         ] {
             let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e}"))
@@ -100,6 +104,8 @@ impl ShaderCache {
             // Also matches `affine_qmv_quad_*` and `affine_qmv_fast_*`
             // by prefix.
             self.libraries.get("quantized_qmv")
+        } else if name.starts_with("splitk_reduce_") {
+            self.libraries.get("quantized_splitk_reduce")
         } else {
             self.libraries.get("activation")
         };

@@ -789,6 +789,117 @@ impl MetalAffineQmmT {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// SplitK reduce dispatcher — port of MLX's
+// `strided_reduce_general_dispatch` invocation at
+// `quantized.cpp:861`. Reduces the [split_k, M, N] intermediate
+// `affine_qmm_t_splitk` produces down to the final [M, N] output by
+// summing along axis 0.
+//
+// Backed by `splitk_reduce_sum_<dtype>` in
+// `shaders/quantized_splitk_reduce.metal`. Function constants 0/1/2
+// hold (M, N, split_k) — same `[[function_constant(N)]]` pattern
+// used by qmv/qmm_t for ICB readiness.
+// ─────────────────────────────────────────────────────────────────
+
+/// Format the splitk-reduce kernel symbol. Matches the
+/// `INST_REDUCE` macros in `shaders/quantized_splitk_reduce.metal`.
+pub fn splitk_reduce_kernel_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "splitk_reduce_sum_f16",
+        DequantDtype::Bf16 => "splitk_reduce_sum_bf16",
+    }
+}
+
+/// Sum-along-axis-0 reduce for the qmm_t_splitk intermediate.
+/// Caller supplies a `[split_k, M, N]` input and a `[M, N]` output;
+/// the kernel walks one thread per output element and sums the
+/// `split_k` partitions in float, matching the float accumulator
+/// inside `qmm_t_impl_inline` so the SplitK + reduce composition
+/// agrees with the equivalent `qmm_t` Standard run within the
+/// summation-order noise floor.
+pub struct MetalSplitKReduce {
+    shader_cache: Arc<ShaderCache>,
+}
+
+impl MetalSplitKReduce {
+    pub fn new(device: Device) -> Result<Self, MetalStreamError> {
+        Ok(Self {
+            shader_cache: Arc::new(ShaderCache::new(device)?),
+        })
+    }
+
+    pub fn with_shader_cache(shader_cache: Arc<ShaderCache>) -> Self {
+        Self { shader_cache }
+    }
+
+    /// Dispatch `splitk_reduce_sum_<dtype>` against an open
+    /// ComputeCommandEncoder. Caller owns the encoder + commit.
+    ///
+    /// - `intermediate`: `[split_k * M * N]` flat buffer in `dtype`
+    ///   (the qmm_t_splitk output). Layout `[split_k, M, N]`
+    ///   row-contiguous.
+    /// - `output`: `[M * N]` flat buffer in `dtype`. Caller is
+    ///   responsible for sizing both buffers correctly.
+    /// - `m`, `n`, `split_k`: must be > 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        intermediate: &Buffer,
+        output: &Buffer,
+        m: u32,
+        n: u32,
+        split_k: u32,
+        dtype: DequantDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<(), MetalStreamError> {
+        if m == 0 || n == 0 || split_k == 0 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "splitk_reduce_sum: M, N, split_k all must be > 0 (got M={m}, N={n}, split_k={split_k})"
+            )));
+        }
+        let constants = [
+            ConstantValue::uint(0, m),
+            ConstantValue::uint(1, n),
+            ConstantValue::uint(2, split_k),
+        ];
+        let kernel_name = splitk_reduce_kernel_static_name(dtype);
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(kernel_name, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+
+        // SAFETY: buffer pointers are valid `Retained` objects;
+        // `setBuffer:offset:atIndex:` only borrows them.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(intermediate), 0, 1);
+        }
+
+        // 1D dispatch over M*N output elements.
+        let nthreads = m as u64 * n as u64;
+        if nthreads > u32::MAX as u64 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "splitk_reduce_sum: nthreads={nthreads} exceeds u32 (M={m}, N={n})"
+            )));
+        }
+        let max_tpg = pipeline.maxTotalThreadsPerThreadgroup() as u64;
+        let threads_per_threadgroup_x = nthreads.min(max_tpg);
+        let threads_per_threadgroup = MTLSize {
+            width: threads_per_threadgroup_x as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroups = MTLSize {
+            width: (nthreads as usize).div_ceil(threads_per_threadgroup_x as usize),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

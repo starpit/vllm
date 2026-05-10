@@ -18,15 +18,11 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use ferrite_metal_kernels::device::detect_device;
-use ferrite_metal_kernels::quantized::{
-    pick_qmv_kernel, DequantDtype, MetalAffineQmv, QmvKernel,
-};
+use ferrite_metal_kernels::quantized::{pick_qmv_kernel, DequantDtype, MetalAffineQmv, QmvKernel};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions,
-};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -169,9 +165,8 @@ fn run_qmv_bf16(
     let biases_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(biases.as_ptr() as *const u8, std::mem::size_of_val(biases))
     };
-    let x_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x))
-    };
+    let x_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x)) };
     let scales_buf = buffer_from_bytes(&device, scales_bytes);
     let biases_buf = buffer_from_bytes(&device, biases_bytes);
     let x_buf = buffer_from_bytes(&device, x_bytes);
@@ -272,7 +267,8 @@ fn affine_qmv_quad_b4_bf16_matches_cpu_reference() {
     let n = 64;
     let k = 128;
     for &group_size in &[32usize, 64, 128] {
-        let (packed, scales, biases, x) = make_inputs_bf16(0xCAFE_u64 ^ group_size as u64, n, k, m, group_size);
+        let (packed, scales, biases, x) =
+            make_inputs_bf16(0xCAFE_u64 ^ group_size as u64, n, k, m, group_size);
         let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
         let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 
@@ -297,7 +293,8 @@ fn affine_qmv_fast_b4_bf16_matches_cpu_reference() {
     let n = 64;
     let k = 512;
     for &group_size in &[32usize, 64, 128] {
-        let (packed, scales, biases, x) = make_inputs_bf16(0xBEEF_u64 ^ group_size as u64, n, k, m, group_size);
+        let (packed, scales, biases, x) =
+            make_inputs_bf16(0xBEEF_u64 ^ group_size as u64, n, k, m, group_size);
         let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
         let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 
@@ -324,7 +321,8 @@ fn affine_qmv_generic_b4_bf16_matches_cpu_reference() {
     let n = 12;
     let k = 384;
     for &group_size in &[32usize, 64, 128] {
-        let (packed, scales, biases, x) = make_inputs_bf16(0xFACE_u64 ^ group_size as u64, n, k, m, group_size);
+        let (packed, scales, biases, x) =
+            make_inputs_bf16(0xFACE_u64 ^ group_size as u64, n, k, m, group_size);
         let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
         let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 

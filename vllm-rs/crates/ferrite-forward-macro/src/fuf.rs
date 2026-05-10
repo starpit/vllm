@@ -125,8 +125,9 @@ impl Fuf {
             for input in &node.inputs {
                 if let FufInput::Weight { id, .. } = input {
                     cache.entry(*id).or_insert_with(|| {
-                        let fmt =
-                            crate::quantization::storage_format_for_weight(program, self, *id, model);
+                        let fmt = crate::quantization::storage_format_for_weight(
+                            program, self, *id, model,
+                        );
                         // INT4 P2: MLX-affine weights get CPU-dequanted to BF16
                         // at load time on Metal (see `LinearLayer::
                         // load_affine_dequant_as_dense`). The solver runs

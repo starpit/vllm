@@ -1394,9 +1394,8 @@ impl GpuWeights {
         // `cpu_golden::affine_dequantize_b4_*` in ferrite-forward.
         let mut out_bytes = vec![0u8; n * k * 2];
         let gs = group_size as usize;
-        let out_halves = unsafe {
-            std::slice::from_raw_parts_mut(out_bytes.as_mut_ptr() as *mut u16, n * k)
-        };
+        let out_halves =
+            unsafe { std::slice::from_raw_parts_mut(out_bytes.as_mut_ptr() as *mut u16, n * k) };
         for (offset, &byte) in w_bytes.iter().enumerate() {
             let oindex = offset * 2;
             let gindex = oindex / gs;

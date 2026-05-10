@@ -15,9 +15,7 @@ use ferrite_metal_kernels::quantized::{DequantDtype, MetalAffineDequantize};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions,
-};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -208,10 +206,7 @@ fn run_kernel_f16(
     let n_out = n * k;
     let out_buf = zeroed_buffer(&device, n_out * std::mem::size_of::<half::f16>());
 
-    let cmd_buf = stream
-        .get_command_buffer()
-        .expect("command buffer")
-        .clone();
+    let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
     let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
     dequant
         .execute(
@@ -257,10 +252,7 @@ fn run_kernel_bf16(
     let n_out = n * k;
     let out_buf = zeroed_buffer(&device, n_out * std::mem::size_of::<half::bf16>());
 
-    let cmd_buf = stream
-        .get_command_buffer()
-        .expect("command buffer")
-        .clone();
+    let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
     let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
     dequant
         .execute(

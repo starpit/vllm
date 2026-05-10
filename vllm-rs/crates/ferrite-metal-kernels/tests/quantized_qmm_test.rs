@@ -26,9 +26,7 @@ use ferrite_metal_kernels::quantized::{
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions,
-};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -167,9 +165,8 @@ fn run_qmm_t_bf16(
     let biases_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(biases.as_ptr() as *const u8, std::mem::size_of_val(biases))
     };
-    let x_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x))
-    };
+    let x_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x)) };
     let scales_buf = buffer_from_bytes(&device, scales_bytes);
     let biases_buf = buffer_from_bytes(&device, biases_bytes);
     let x_buf = buffer_from_bytes(&device, x_bytes);
@@ -210,10 +207,8 @@ fn run_qmm_t_bf16(
     // the divergence cleanly rather than silently masking it.
     match (actual_kernel, expected_kernel) {
         (QmmTKernel::Standard, QmmTKernel::Standard) => {}
-        (
-            QmmTKernel::SplitK { split_k: a, .. },
-            QmmTKernel::SplitK { split_k: e, .. },
-        ) if a == e => {}
+        (QmmTKernel::SplitK { split_k: a, .. }, QmmTKernel::SplitK { split_k: e, .. })
+            if a == e => {}
         _ => panic!(
             "dispatcher picked {:?}, expected {:?}",
             actual_kernel, expected_kernel
@@ -314,8 +309,7 @@ fn affine_qmm_t_aligned_b4_bf16_matches_cpu_reference() {
         expected_kernel,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmm_t aligned gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
@@ -361,8 +355,7 @@ fn affine_qmm_t_unaligned_b4_bf16_matches_cpu_reference() {
         expected_kernel,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmm_t unaligned gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
@@ -410,8 +403,7 @@ fn affine_qmm_t_splitk_b4_bf16_matches_cpu_reference() {
     // we then sum 32 bf16 partials into a final bf16. Worst-case
     // total noise per cell is `sqrt(split_k) * bf16_eps * |partial|`
     // additional, on top of the per-partial noise.
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     // SplitK gives bigger noise budgets: ~2× looser to cover the
     // post-kernel bf16 sum we emulate in CPU.
     let allowed = allowed * 2.0;

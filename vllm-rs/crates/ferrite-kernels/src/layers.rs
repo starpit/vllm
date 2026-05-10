@@ -11,10 +11,10 @@
 // so they compile on every backend (including Metal on macOS). Methods that
 // invoke CUDA kernels are gated below.
 use anyhow::Result;
-use ferrite_cuda_core::tensor::GpuTensor;
-use ferrite_cuda_core::weights::GpuWeights;
 #[cfg(feature = "metal")]
 use ferrite_cuda_core::DType;
+use ferrite_cuda_core::tensor::GpuTensor;
+use ferrite_cuda_core::weights::GpuWeights;
 
 #[cfg(feature = "cuda")]
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
@@ -1180,8 +1180,7 @@ impl LinearLayer {
         group_size: u32,
         bits: u32,
     ) -> Result<Self> {
-        let weight =
-            weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
+        let weight = weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
         let bias_name = format!("{prefix}.bias");
         let bias = if weights.contains(&bias_name) {
             Some(weights.take(&bias_name)?)
@@ -1212,8 +1211,8 @@ impl LinearLayer {
         group_size: u32,
         bits: u32,
     ) -> Result<Self> {
-        let weight = weights
-            .take_affine_dequant_b4_concat(prefixes, group_size, bits, DType::BF16)?;
+        let weight =
+            weights.take_affine_dequant_b4_concat(prefixes, group_size, bits, DType::BF16)?;
         Ok(Self::Dense(Linear::new(weight, None)))
     }
 
@@ -2172,8 +2171,7 @@ impl Embedding {
         group_size: u32,
         bits: u32,
     ) -> Result<Self> {
-        let weight =
-            weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
+        let weight = weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
         Ok(Self::new(weight))
     }
 

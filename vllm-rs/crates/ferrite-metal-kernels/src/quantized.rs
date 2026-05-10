@@ -117,7 +117,7 @@ impl MetalAffineDequantize {
         // packs_per_int = 8 / bits = 2 for bits=4. nthreads = total output
         // element count / packs_per_int = output bytes / 2.
         let packs_per_int: u64 = 2;
-        if out_n_elements % packs_per_int != 0 {
+        if !out_n_elements.is_multiple_of(packs_per_int) {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
                 "affine_dequantize: out_n_elements={out_n_elements} not divisible by \
                  packs_per_int={packs_per_int} (bits={bits})"
@@ -212,7 +212,7 @@ pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
     let pow2_bits = bits != 0 && (bits & (bits - 1)) == 0;
     if (k == 64 || k == 128) && pow2_bits {
         QmvKernel::Quad { d: k }
-    } else if n % 8 == 0 && k % 512 == 0 {
+    } else if n.is_multiple_of(8) && k.is_multiple_of(512) {
         QmvKernel::Fast
     } else {
         QmvKernel::Generic
@@ -227,7 +227,12 @@ pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
 ///
 /// `qmv` / `qmv_fast`: `bn = 8`, `bk = 32`, group `(bk=32, 2, 1)` —
 /// 2 simdgroups (`quantized.cpp:251-254`).
-pub fn qmv_dispatch_shape(kernel: QmvKernel, m: u32, n: u32, b: u32) -> ((u32, u32, u32), (u32, u32, u32)) {
+pub fn qmv_dispatch_shape(
+    kernel: QmvKernel,
+    m: u32,
+    n: u32,
+    b: u32,
+) -> ((u32, u32, u32), (u32, u32, u32)) {
     match kernel {
         QmvKernel::Quad { .. } => {
             let bn: u32 = 64;
@@ -252,12 +257,12 @@ pub fn qmv_kernel_name(
     let dtype = dtype.symbol_infix();
     let batch = if batched { 1 } else { 0 };
     match kernel {
-        QmvKernel::Quad { d } => format!(
-            "affine_qmv_quad_{dtype}_gs_{group_size}_b_{bits}_d_{d}_batch_{batch}",
-        ),
-        QmvKernel::Fast => format!(
-            "affine_qmv_fast_{dtype}_gs_{group_size}_b_{bits}_batch_{batch}",
-        ),
+        QmvKernel::Quad { d } => {
+            format!("affine_qmv_quad_{dtype}_gs_{group_size}_b_{bits}_d_{d}_batch_{batch}",)
+        }
+        QmvKernel::Fast => {
+            format!("affine_qmv_fast_{dtype}_gs_{group_size}_b_{bits}_batch_{batch}",)
+        }
         QmvKernel::Generic => {
             format!("affine_qmv_{dtype}_gs_{group_size}_b_{bits}_batch_{batch}",)
         }
@@ -511,10 +516,7 @@ pub enum QmmTKernel {
     /// when `B == 1` and a non-trivial split_k is feasible (the
     /// `qmm_splitk` heuristic at `quantized.cpp:788-805` targets
     /// ~512 threadgroups; falls back to `Standard` if split_k ≤ 1).
-    SplitK {
-        split_k: u32,
-        k_partition_size: u32,
-    },
+    SplitK { split_k: u32, k_partition_size: u32 },
 }
 
 /// Compute the splitk plan per MLX `qmm_splitk` (`quantized.cpp:788-805`):
@@ -536,7 +538,7 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
         return 1;
     }
     split_k = split_k.min(group_cap);
-    while split_k > 1 && (k % (split_k * group_size) != 0) {
+    while split_k > 1 && !k.is_multiple_of(split_k * group_size) {
         split_k -= 1;
     }
     split_k
@@ -595,12 +597,12 @@ pub fn qmm_t_kernel_name(
     let dtype = dtype.symbol_infix();
     let aln = if aligned_n { "true" } else { "false" };
     match kernel {
-        QmmTKernel::Standard => format!(
-            "affine_qmm_t_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}_batch_0",
-        ),
-        QmmTKernel::SplitK { .. } => format!(
-            "affine_qmm_t_splitk_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}",
-        ),
+        QmmTKernel::Standard => {
+            format!("affine_qmm_t_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}_batch_0",)
+        }
+        QmmTKernel::SplitK { .. } => {
+            format!("affine_qmm_t_splitk_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}",)
+        }
     }
 }
 
@@ -631,20 +633,42 @@ pub fn qmm_t_kernel_static_name(
         (QmmTKernel::Standard, Bf16, 64, true) => "affine_qmm_t_bf16_gs_64_b_4_alN_true_batch_0",
         (QmmTKernel::Standard, Bf16, 64, false) => "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0",
         (QmmTKernel::Standard, Bf16, 128, true) => "affine_qmm_t_bf16_gs_128_b_4_alN_true_batch_0",
-        (QmmTKernel::Standard, Bf16, 128, false) => "affine_qmm_t_bf16_gs_128_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, 128, false) => {
+            "affine_qmm_t_bf16_gs_128_b_4_alN_false_batch_0"
+        }
         // ── qmm_t SplitK ──────────────────────────────────────────
         (QmmTKernel::SplitK { .. }, F16, 32, true) => "affine_qmm_t_splitk_f16_gs_32_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, F16, 32, false) => "affine_qmm_t_splitk_f16_gs_32_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, F16, 32, false) => {
+            "affine_qmm_t_splitk_f16_gs_32_b_4_alN_false"
+        }
         (QmmTKernel::SplitK { .. }, F16, 64, true) => "affine_qmm_t_splitk_f16_gs_64_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, F16, 64, false) => "affine_qmm_t_splitk_f16_gs_64_b_4_alN_false",
-        (QmmTKernel::SplitK { .. }, F16, 128, true) => "affine_qmm_t_splitk_f16_gs_128_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, F16, 128, false) => "affine_qmm_t_splitk_f16_gs_128_b_4_alN_false",
-        (QmmTKernel::SplitK { .. }, Bf16, 32, true) => "affine_qmm_t_splitk_bf16_gs_32_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, Bf16, 32, false) => "affine_qmm_t_splitk_bf16_gs_32_b_4_alN_false",
-        (QmmTKernel::SplitK { .. }, Bf16, 64, true) => "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, Bf16, 64, false) => "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_false",
-        (QmmTKernel::SplitK { .. }, Bf16, 128, true) => "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, Bf16, 128, false) => "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, F16, 64, false) => {
+            "affine_qmm_t_splitk_f16_gs_64_b_4_alN_false"
+        }
+        (QmmTKernel::SplitK { .. }, F16, 128, true) => {
+            "affine_qmm_t_splitk_f16_gs_128_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, F16, 128, false) => {
+            "affine_qmm_t_splitk_f16_gs_128_b_4_alN_false"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, 32, true) => {
+            "affine_qmm_t_splitk_bf16_gs_32_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, 32, false) => {
+            "affine_qmm_t_splitk_bf16_gs_32_b_4_alN_false"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, 64, true) => {
+            "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, 64, false) => {
+            "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_false"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, 128, true) => {
+            "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, 128, false) => {
+            "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_false"
+        }
         (_, _, gs, _) => panic!(
             "qmm_t_kernel_static_name: unsupported group_size={gs} \
              — only 32, 64, 128 instantiated"
@@ -724,13 +748,13 @@ impl MetalAffineQmmT {
                 "affine_qmm_t: batched=1 (B={b}) not yet wired (B=1 in P4)"
             )));
         }
-        if k % group_size != 0 {
+        if !k.is_multiple_of(group_size) {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
                 "affine_qmm_t: K={k} not divisible by group_size={group_size}"
             )));
         }
 
-        let aligned_n = n % 32 == 0;
+        let aligned_n = n.is_multiple_of(32);
         let kernel = pick_qmm_t_kernel(m, n, k, b, group_size);
         let kernel_name = qmm_t_kernel_name(kernel, dtype, group_size, bits, aligned_n);
         // K / N / M (and `k_partition_size` for splitk) ride as
@@ -908,14 +932,8 @@ mod tests {
     #[test]
     fn qmv_kernel_pick_matches_mlx_dispatch_qmv() {
         // K==64 + pow2 bits → quad
-        assert_eq!(
-            pick_qmv_kernel(2048, 64, 4),
-            QmvKernel::Quad { d: 64 }
-        );
-        assert_eq!(
-            pick_qmv_kernel(2048, 128, 4),
-            QmvKernel::Quad { d: 128 }
-        );
+        assert_eq!(pick_qmv_kernel(2048, 64, 4), QmvKernel::Quad { d: 64 });
+        assert_eq!(pick_qmv_kernel(2048, 128, 4), QmvKernel::Quad { d: 128 });
         // K==96 → fast/generic, not quad
         assert_eq!(pick_qmv_kernel(2048, 96, 4), QmvKernel::Generic);
         // bits=3 (not power of 2) at K=64 → not quad
@@ -968,7 +986,13 @@ mod tests {
             "affine_qmv_f16_gs_32_b_4_batch_1"
         );
         assert_eq!(
-            qmv_kernel_name(QmvKernel::Quad { d: 128 }, DequantDtype::Bf16, 128, 4, false),
+            qmv_kernel_name(
+                QmvKernel::Quad { d: 128 },
+                DequantDtype::Bf16,
+                128,
+                4,
+                false
+            ),
             "affine_qmv_quad_bf16_gs_128_b_4_d_128_batch_0"
         );
     }
@@ -1038,8 +1062,7 @@ mod tests {
     #[test]
     fn qmm_t_dispatch_shape_matches_mlx_grid_dims() {
         // Standard: grid (ceil(N/32), ceil(M/32), B); group (32, 2, 2).
-        let ((tx, ty, tz), (gx, gy, gz)) =
-            qmm_t_dispatch_shape(QmmTKernel::Standard, 64, 2048, 1);
+        let ((tx, ty, tz), (gx, gy, gz)) = qmm_t_dispatch_shape(QmmTKernel::Standard, 64, 2048, 1);
         assert_eq!((tx, ty, tz), (64, 2, 1));
         assert_eq!((gx, gy, gz), (32, 2, 2));
 

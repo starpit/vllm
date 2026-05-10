@@ -24,9 +24,7 @@ use ferrite_metal_kernels::quantized::{DequantDtype, MetalSplitKReduce};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions,
-};
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice, MTLResourceOptions};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -119,16 +117,23 @@ fn splitk_reduce_sum_bf16_matches_cpu_reference() {
     let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
     let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
     reduce
-        .execute(&in_buf, &out_buf, m, n, split_k, DequantDtype::Bf16, &encoder)
+        .execute(
+            &in_buf,
+            &out_buf,
+            m,
+            n,
+            split_k,
+            DequantDtype::Bf16,
+            &encoder,
+        )
         .expect("splitk_reduce dispatch");
     encoder.endEncoding();
     stream.commit().expect("commit");
     stream.synchronize().expect("sync");
 
     let actual_ptr = out_buf.contents().as_ptr() as *const half::bf16;
-    let actual: &[half::bf16] = unsafe {
-        std::slice::from_raw_parts(actual_ptr, (m as usize) * (n as usize))
-    };
+    let actual: &[half::bf16] =
+        unsafe { std::slice::from_raw_parts(actual_ptr, (m as usize) * (n as usize)) };
 
     // Tolerance: we sum split_k=4 bf16-cast partial values; each cast
     // is ~bf16_eps * |sum_so_far|. Final bf16 cast is ~bf16_eps * |out|.
@@ -204,16 +209,23 @@ fn splitk_reduce_sum_f16_matches_cpu_reference() {
     let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
     let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
     reduce
-        .execute(&in_buf, &out_buf, m, n, split_k, DequantDtype::F16, &encoder)
+        .execute(
+            &in_buf,
+            &out_buf,
+            m,
+            n,
+            split_k,
+            DequantDtype::F16,
+            &encoder,
+        )
         .expect("splitk_reduce dispatch");
     encoder.endEncoding();
     stream.commit().expect("commit");
     stream.synchronize().expect("sync");
 
     let actual_ptr = out_buf.contents().as_ptr() as *const half::f16;
-    let actual: &[half::f16] = unsafe {
-        std::slice::from_raw_parts(actual_ptr, (m as usize) * (n as usize))
-    };
+    let actual: &[half::f16] =
+        unsafe { std::slice::from_raw_parts(actual_ptr, (m as usize) * (n as usize)) };
 
     // f16 eps = 1/1024 (vs bf16_eps = 1/128); but the per-partition
     // CPU cast still introduces bf16-magnitude rounding so the budget

@@ -386,7 +386,12 @@ fn lower_one<W: CanonicalParams>(
                         threadgroups: tg,
                         threads_per_threadgroup: tpg,
                     },
-                    bindings: affine_qmm_bindings(*in_slot, *out_slot, *layer + layer_offset, *wt_fn),
+                    bindings: affine_qmm_bindings(
+                        *in_slot,
+                        *out_slot,
+                        *layer + layer_offset,
+                        *wt_fn,
+                    ),
                     gemm_dims: None,
                 }
             } else {
@@ -409,7 +414,12 @@ fn lower_one<W: CanonicalParams>(
                         threadgroups: tg,
                         threads_per_threadgroup: tpg,
                     },
-                    bindings: affine_qmm_bindings(*in_slot, *out_slot, *layer + layer_offset, *wt_fn),
+                    bindings: affine_qmm_bindings(
+                        *in_slot,
+                        *out_slot,
+                        *layer + layer_offset,
+                        *wt_fn,
+                    ),
                     gemm_dims: None,
                 }
             }
@@ -1031,10 +1041,7 @@ mod tests {
     /// signature honest without forcing the test to construct a
     /// real `LinearLayer::AffineQuant` (which would need a Metal
     /// device for the `Buffer` allocations).
-    fn affine_quant_stub(
-        _w: &TestParams,
-        _layer: u32,
-    ) -> &ferrite_kernels::layers::LinearLayer {
+    fn affine_quant_stub(_w: &TestParams, _layer: u32) -> &ferrite_kernels::layers::LinearLayer {
         panic!("affine_quant_stub: lowering tests must not invoke wt_fn");
     }
 
@@ -1207,7 +1214,10 @@ mod tests {
     #[test]
     fn affine_qmm_qmm_t_unaligned_n_picks_unaligned_kernel() {
         let inst: Instruction<TestParams> = Instruction::AffineQmm(
-            7, 11, 0, affine_quant_stub,
+            7,
+            11,
+            0,
+            affine_quant_stub,
             /*n=*/ 2050,
             /*k=*/ 2048,
             /*group_size=*/ 64,
@@ -1217,7 +1227,10 @@ mod tests {
         let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
             .expect("lower")
             .expect("non-metadata");
-        assert_eq!(cmd.function, "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0");
+        assert_eq!(
+            cmd.function,
+            "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0"
+        );
         // Ceil-div on N: 2050.div_ceil(32) = 65.
         assert_eq!(cmd.dispatch.threadgroups, (65, 64 / 32, 1));
     }

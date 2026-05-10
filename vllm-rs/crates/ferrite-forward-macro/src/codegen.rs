@@ -1766,11 +1766,7 @@ fn emit_fingerprint_check(
     // (pack_factor = 32 / bits = 8 for bits=4). Without this branch
     // both variants reject the affine checkpoint at the very first
     // shape check and `try_load` returns `Ok(None)`.
-    let embed_hidden_lit: TokenStream = match model
-        .quantization
-        .as_ref()
-        .map(|qc| &qc.method)
-    {
+    let embed_hidden_lit: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
         Some(crate::quantization::QuantMethod::Affine { bits, .. }) => {
             let pack_factor = 32u64 / (*bits as u64);
             let packed = hidden_size / pack_factor;

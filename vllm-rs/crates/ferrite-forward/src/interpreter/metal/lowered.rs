@@ -55,29 +55,19 @@ pub enum KernelId {
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,
-    /// Prefill-bucket attention over contiguous Q/K/V tiles. Causal
-    /// mask, per-sequence boundaries from `cu_seqlens_q`.
-    AttentionPrefillContiguous,
-    /// Prefill-bucket attention via faithful MLX `sdpa_vector` port —
-    /// 1 Q per threadgroup, dispatch `(num_q_heads, total_q, 1)`,
-    /// online softmax + per-simdgroup K-axis split. Same algorithm as
-    /// the decode kernel (`AttentionViaCache`) extended to multi-Q
-    /// with causal mask + cu_seqlens_q lookup. Reads contiguous K/V
-    /// (in-forward tiles); paged variant is `AttentionPrefillSdpaPaged`.
-    /// Replacement target for the legacy hand-written
-    /// `AttentionPrefillContiguous` kernel — kept as a parallel
-    /// `KernelId` for bisect during rollout.
-    AttentionPrefillSdpa,
     /// Prefill-bucket attention reading from the paged KV cache.
-    /// Same outer structure as `AttentionPrefillSdpa` (1 Q per
-    /// threadgroup, online softmax) but K/V access goes through
-    /// `block_table` indirection (mirroring `AttentionViaCache`).
-    /// K-axis covers the FULL `seqused_k[seq]` (prefix + new), and
-    /// the per-Q causal mask shifts by `(seqused_k[seq] -
-    /// new_q_for_seq)` to account for prior cached prefix.
-    /// Required for chunked prefill, prefix caching, mixed
-    /// prefill/decode batches, and multi-turn chat continuation —
-    /// scenarios the contiguous prefill kernel cannot handle.
+    /// Faithful MLX `sdpa_vector` port: 1 Q per threadgroup,
+    /// online softmax + per-simdgroup K-axis split (same outer
+    /// structure as the decode kernel `AttentionViaCache`), with K/V
+    /// access through `block_table` indirection. K-axis covers the
+    /// FULL `seqused_k[seq]` (prefix + new), and the per-Q causal
+    /// mask shifts by `(seqused_k[seq] - new_q_for_seq)` to account
+    /// for prior cached prefix. Required for chunked prefill,
+    /// prefix caching, mixed prefill/decode batches, and multi-turn
+    /// chat continuation. The only prefill kernel emitted by metal
+    /// post-Phase B (the legacy contiguous and non-paged sdpa
+    /// kernels were retired once `Instruction::AttentionPrefillPaged`
+    /// became the universal metal prefill emitter).
     AttentionPrefillSdpaPaged,
     /// Pure scalar broadcast multiply: `out = x * scale`.
     ScalarMul,

@@ -145,9 +145,11 @@ pub trait CanonicalParams {
     /// canonical macro impls override for longer-context models.
     const MAX_BLOCKS_PER_SEQ: u32 = 128;
 
-    /// Q-axis tile size for `attention_prefill_contiguous_*_specialized`
-    /// — the kernel processes this many query tokens per threadgroup.
-    /// Backend-fixed; tuning requires kernel co-evolution.
+    /// Q-axis tile size for the cuda contiguous-prefill kernel — the
+    /// kernel processes this many query tokens per threadgroup.
+    /// Metal post-Phase B always emits `Instruction::AttentionPrefillPaged`
+    /// (1 Q per TG via `sdpa_vector` port) so this constant is
+    /// cuda-only; backend-fixed and tuning requires kernel co-evolution.
     const PREFILL_TILE_Q: u32 = 16;
 
     /// Partial-rope rotation dim — for models where only the first

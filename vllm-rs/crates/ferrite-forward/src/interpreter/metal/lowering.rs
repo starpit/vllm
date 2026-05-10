@@ -15,12 +15,15 @@
 //!    convention, and produces `Binding`s pointing at arena slots,
 //!    typed weight thunks, or runtime buffers.
 //!
-//! Coverage (Phase 5.A — TinyLlama-1.1B critical path):
+//! Coverage (post-Phase B):
 //! `Embed`, `RmsNorm`, `FusedAddRmsNorm`, `Gemm`, `FusedGateUpSiluMul`,
-//! `RopeAppend`, `AttentionViaCache`, `AttentionPrefillContiguous`,
-//! `AttentionPrefillPaged`, `Add`, `ScalarMul`, plus
-//! `Loop`/`Reshape`/`Alias`/`Free` as structural ops. Every other
-//! variant raises
+//! `RopeAppend`, `AttentionViaCache`, `AttentionPrefillPaged`,
+//! `Add`, `ScalarMul`, plus `Loop`/`Reshape`/`Alias`/`Free` as
+//! structural ops. `AttentionPrefillContiguous` is matched only as an
+//! `unreachable!` arm — Phase B's metal macro adapter
+//! (`metal/attention.rs::fan_out`) emits `AttentionPrefillPaged` for
+//! every metal model, so the contiguous variant should never reach
+//! lowering. Every other variant raises
 //! [`LoweringError::UnsupportedVariant`] with the variant's type name
 //! so the model author knows which arm to add next.
 
@@ -472,85 +475,18 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
-        // ── Prefill-bucket attention (contiguous Q/K/V tiles) ──────
-        // Default routes to the faithful MLX sdpa_vector multi-Q port
-        // (`attention_prefill_sdpa_v2_*`); validated bit-coherent with
-        // the legacy kernel on Llama-3.2-3B end-to-end. Set
-        // `FERRITE_METAL_PREFILL_KERNEL=legacy` for the legacy
-        // hand-written kernel (`attention_prefill_contiguous_*`) as a
-        // bisect / regression fallback. Both kernels stay compiled
-        // into the AoT metallib; the picker is per-tape-build.
-        I::AttentionPrefillContiguous(q_slot, k_slot, v_slot, out_slot, _is_causal) => {
-            let n_q_heads = W::NUM_Q_HEADS;
-            let use_sdpa = std::env::var("FERRITE_METAL_PREFILL_KERNEL")
-                .map(|v| v != "legacy")
-                .unwrap_or(true);
-            if use_sdpa {
-                LoweredCommand {
-                    kernel: KernelId::AttentionPrefillSdpa,
-                    // 1 Q per TG; head on grid X (small, ≤ 32), Q on
-                    // grid Y. 1024 threads = 32 simdgroups × 32 lanes,
-                    // matching the decode kernel.
-                    dispatch: DispatchShape {
-                        threadgroups: (n_q_heads, bucket_m, 1),
-                        threads_per_threadgroup: (1024, 1, 1),
-                    },
-                    bindings: vec![
-                        Binding::ArenaSlot {
-                            slot: *out_slot,
-                            binding_index: 0,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *q_slot,
-                            binding_index: 1,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *k_slot,
-                            binding_index: 2,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *v_slot,
-                            binding_index: 3,
-                        },
-                        Binding::Runtime {
-                            kind: RuntimeBindingKind::CuSeqlensQ,
-                            binding_index: 4,
-                        },
-                    ],
-                    gemm_dims: None,
-                }
-            } else {
-                LoweredCommand {
-                    kernel: KernelId::AttentionPrefillContiguous,
-                    dispatch: DispatchShape {
-                        threadgroups: (bucket_m.div_ceil(PREFILL_TILE_Q), n_q_heads, 1),
-                        threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
-                    },
-                    bindings: vec![
-                        Binding::ArenaSlot {
-                            slot: *out_slot,
-                            binding_index: 0,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *q_slot,
-                            binding_index: 1,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *k_slot,
-                            binding_index: 2,
-                        },
-                        Binding::ArenaSlot {
-                            slot: *v_slot,
-                            binding_index: 3,
-                        },
-                        Binding::Runtime {
-                            kind: RuntimeBindingKind::CuSeqlensQ,
-                            binding_index: 4,
-                        },
-                    ],
-                    gemm_dims: None,
-                }
-            }
+        // ── Plain prefill on metal goes through `AttentionPrefillPaged` ─
+        // Phase B (`crates/ferrite-forward-macro/src/metal/attention.rs`
+        // `(false, true)` arm) emits `Instruction::AttentionPrefillPaged`
+        // for every metal Llama-arch model — the contiguous variant
+        // is CUDA-only on metal builds. Hitting this arm means a
+        // future macro change started emitting the wrong variant.
+        I::AttentionPrefillContiguous(_, _, _, _, _) => {
+            unreachable!(
+                "metal lowering: AttentionPrefillContiguous is unreachable post-Phase B \
+                 — metal::attention::fan_out emits AttentionPrefillPaged. \
+                 If this fires, a macro adapter for a metal model is emitting the wrong variant."
+            );
         }
 
         // ── Prefill-bucket attention reading from the paged KV cache ─
@@ -688,11 +624,6 @@ const THREADS_PER_GROUP: u32 = 256;
 /// per (model, bucket) by the SpecializedPipelineCache in Phase 5.B.
 const GEMM_TILE_M: u32 = 16;
 const GEMM_TILE_N: u32 = 16;
-
-/// Prefill attention Q-axis tile. Each threadgroup handles
-/// `PREFILL_TILE_Q` query tokens for one head; chosen to fit the
-/// hand-rolled tile shader's K-axis budget.
-const PREFILL_TILE_Q: u32 = 16;
 
 /// Output tile dim for the fused MLP kernel
 /// (`fused_gate_up_silu_mul_gemm_f16_specialized`). One simdgroup

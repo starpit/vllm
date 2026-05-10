@@ -370,6 +370,22 @@ pub enum Instruction<W> {
     ),
     AttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
     AttentionPrefillContiguous(u32, u32, u32, u32, bool),
+    /// Prefill attention reading K/V from the paged KV cache via
+    /// block_table indirection. `(q_slot, out_slot, layer, interleaved)`.
+    /// Drops the (k_slot, v_slot) pair that
+    /// [`Instruction::AttentionPrefillContiguous`] carries — the
+    /// upstream `RopeAppend` already wrote rotated K + raw V into the
+    /// per-layer paged cache slots, and the kernel reads them through
+    /// `block_table` with the K-axis covering the FULL `seqused_k[seq]`
+    /// (prefix + new). The per-Q causal mask shifts by
+    /// `(seqused_k[seq] - new_q_for_seq)` so prior cached prefix
+    /// contributes to attention. Required for chunked prefill, prefix
+    /// caching, mixed prefill+decode batches, and multi-turn chat —
+    /// scenarios `AttentionPrefillContiguous` cannot handle because
+    /// its K-axis is bounded by `cu_seqlens_q` (new tokens only).
+    /// Currently emitted only by the metal adapter; cuda continues to
+    /// route prefill through `flash_attn_contiguous`.
+    AttentionPrefillPaged(u32, u32, u32, bool),
     /// Bidirectional / encoder attention. Reads contiguous Q/K/V from
     /// the upstream tile slots; calls `flash_attn_contiguous` with
     /// `is_causal=false` and a null cos_sin pointer (RoPE applied
@@ -1391,6 +1407,12 @@ impl<W: CanonicalParams> Instruction<W> {
                     out.reshape(&[nt, W::Q_SIZE], dt);
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            }
+            Instruction::AttentionPrefillPaged(_q_slot, _out_slot, _layer, _interleaved) => {
+                unimplemented!(
+                    "AttentionPrefillPaged is metal-only — cuda routes prefill through \
+                     `Instruction::AttentionPrefillContiguous` (flash_attn_contiguous)."
+                );
             }
             Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => {
                 // Encoder/bidirectional self-attention: same FA2 kernel

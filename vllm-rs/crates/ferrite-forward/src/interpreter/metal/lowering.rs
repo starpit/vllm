@@ -18,8 +18,9 @@
 //! Coverage (Phase 5.A — TinyLlama-1.1B critical path):
 //! `Embed`, `RmsNorm`, `FusedAddRmsNorm`, `Gemm`, `FusedGateUpSiluMul`,
 //! `RopeAppend`, `AttentionViaCache`, `AttentionPrefillContiguous`,
-//! `Add`, `ScalarMul`, plus `Loop`/`Reshape`/`Alias`/`Free` as
-//! structural ops. Every other variant raises
+//! `AttentionPrefillPaged`, `Add`, `ScalarMul`, plus
+//! `Loop`/`Reshape`/`Alias`/`Free` as structural ops. Every other
+//! variant raises
 //! [`LoweringError::UnsupportedVariant`] with the variant's type name
 //! so the model author knows which arm to add next.
 
@@ -549,6 +550,67 @@ fn lower_one<W: CanonicalParams>(
                     ],
                     gemm_dims: None,
                 }
+            }
+        }
+
+        // ── Prefill-bucket attention reading from the paged KV cache ─
+        // The paged variant of `attention_prefill_sdpa_v2_*`. The
+        // upstream `RopeAppend` wrote rotated K + raw V into the
+        // per-layer paged cache; this kernel reads them through
+        // `block_table` indirection. K-axis covers the FULL
+        // `seqused_k[seq]` (prefix + new tokens), so the kernel
+        // serves chunked-prefill / prefix-cache-hit / multi-turn
+        // scenarios that the contiguous prefill kernel cannot
+        // (its K-axis = `cu_seqlens_q`, new tokens only).
+        //
+        // Bindings match the kernel's `set_buffer(i, …)` order:
+        // 0 output, 1 Q, 2 cu_seqlens_q, 3 seq_used_k,
+        // 4 block_table, 5 K cache (per-layer), 6 V cache (per-layer).
+        // Dispatch matches `AttentionPrefillSdpa` (1 Q per
+        // threadgroup, head on grid X, Q on grid Y, 1024 threads).
+        I::AttentionPrefillPaged(q_slot, out_slot, layer, _interleaved) => {
+            let n_q_heads = W::NUM_Q_HEADS;
+            LoweredCommand {
+                kernel: KernelId::AttentionPrefillSdpaPaged,
+                dispatch: DispatchShape {
+                    threadgroups: (n_q_heads, bucket_m, 1),
+                    threads_per_threadgroup: (1024, 1, 1),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::CuSeqlensQ,
+                        binding_index: 2,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::SeqUsedK,
+                        binding_index: 3,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::BlockTable,
+                        binding_index: 4,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::KvCacheK {
+                            layer: *layer + layer_offset,
+                        },
+                        binding_index: 5,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::KvCacheV {
+                            layer: *layer + layer_offset,
+                        },
+                        binding_index: 6,
+                    },
+                ],
+                gemm_dims: None,
             }
         }
 

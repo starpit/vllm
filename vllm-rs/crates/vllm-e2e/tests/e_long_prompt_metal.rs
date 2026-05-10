@@ -16,13 +16,17 @@
 //! engine `seqused_k` for prefill) is required to actually route
 //! chunked prefill through the paged kernel.
 //!
-//! Until Phase B lands, the chunked-prefill case either produces
-//! wrong output (model fixates on input pattern) or panics in the
-//! metal worker with `WeightLookupFailed { reason: "per-step commit
-//! failed" }` once decode pushes total context past the cache cap.
+//! Phase B landed: the metal macro adapter now emits
+//! `Instruction::AttentionPrefillPaged` for prefill on every Llama-arch
+//! model (`crates/ferrite-forward-macro/src/metal/attention.rs`), and
+//! the lowering arm routes that to `KernelId::AttentionPrefillSdpaPaged`.
+//! Engine-side `seqused_k` / `block_table` were already populated by
+//! `FerriteWorker::execute_model` (`vllm-executor/src/ferrite_worker.rs`).
+//! Both chunked-prefill and multi-turn tests below are now gating
+//! regressions — drop the `#[ignore]` and the suite must stay green.
 //!
 //! Run with:
-//!   `cargo test -p vllm-e2e --features e2e --test e_long_prompt_metal -- --ignored`
+//!   `cargo test -p vllm-e2e --features e2e --test e_long_prompt_metal`
 
 #![cfg(feature = "e2e")]
 #![cfg(target_os = "macos")]
@@ -78,10 +82,9 @@ async fn start_metal_server() -> (TestServer, Client) {
 }
 
 /// Sanity baseline: ~1k-token prompt fits in the M=4096 bucket as a
-/// single contiguous prefill call. Must succeed today; would catch a
-/// regression in the contiguous prefill path.
+/// single (paged) prefill call. Catches regressions in the prefill
+/// path independent of the chunked / multi-turn cases below.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn long_prompt_metal_within_bucket_completes() {
     let (_server, client) = start_metal_server().await;
 
@@ -103,18 +106,12 @@ async fn long_prompt_metal_within_bucket_completes() {
 /// Chunked-prefill regression: ~5000-token prompt forces the engine
 /// to split the prefill across two steps (chunk 1 = 4096 tokens,
 /// chunk 2 ≈ 900 tokens). Chunk 2 must attend over chunk 1's prior
-/// cached K — only the paged prefill kernel can do this.
-///
-/// **Currently expected to FAIL** (panic in metal worker with
-/// `WeightLookupFailed { reason: "per-step commit failed" }` or
-/// produce wrong / repetitive output) until Phase B lands the
-/// lowering arm + worker bucket plumbing for the paged-prefill
-/// kernel committed in `60ef837f4`.
-///
-/// Once Phase B lands: drop the `#[ignore]` to convert this into a
-/// gating regression test for chunked prefill correctness.
+/// cached K — only the paged prefill kernel can do this. Phase B
+/// (commits landing on top of `4224bc2e4`) wired this through the
+/// macro adapter + lowering arm; before that, this case panicked or
+/// produced repetitive garbage. Validated end-to-end on
+/// Llama-3.2-3B at 5000 tokens (`"The grass is green."`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn long_prompt_metal_chunked_prefill_completes() {
     let (_server, client) = start_metal_server().await;
 
@@ -148,12 +145,9 @@ async fn long_prompt_metal_chunked_prefill_completes() {
 /// Multi-turn regression: build a conversation whose accumulated
 /// context exceeds the 4096-token bucket cap on turn 2+. Each turn
 /// after the first must attend over the prior turns' cached K — the
-/// same primitive as chunked prefill.
-///
-/// **Currently expected to FAIL** for the same reason as the
-/// chunked-prefill case above.
+/// same primitive as chunked prefill. Gated by the same Phase B
+/// landing as `long_prompt_metal_chunked_prefill_completes`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn long_prompt_metal_multi_turn_continuation_completes() {
     let (_server, client) = start_metal_server().await;
 

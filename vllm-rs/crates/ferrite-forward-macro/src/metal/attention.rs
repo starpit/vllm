@@ -8,8 +8,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::classified::Program;
-use crate::fuf::{Fuf, TileId};
+use quote::quote;
+
+use crate::classified::{ExternKind, Program};
+use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     AttentionPrefillContiguousImpl, AttentionViaCacheImpl, CostCtx, Handoff, Implementation,
     LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources,
@@ -291,7 +293,18 @@ impl Implementation for MetalAttentionImpl {
     fn opcode_shape(&self) -> OpcodeShape {
         match (self.is_sliding, self.is_multihead) {
             (false, false) => AttentionViaCacheImpl.opcode_shape(),
-            (false, true) => AttentionPrefillContiguousImpl.opcode_shape(),
+            // Metal prefill emits the paged variant — different shape
+            // from the contiguous (q+k+v+out+causal): drops k/v slots,
+            // adds layer for cache lookup. See [`Self::fan_out`].
+            (false, true) => OpcodeShape::new(
+                "AttentionPrefillPaged",
+                vec![
+                    ("q_slot", syn::parse_quote!(u32)),
+                    ("out_slot", syn::parse_quote!(u32)),
+                    ("layer", syn::parse_quote!(u32)),
+                    ("interleaved", syn::parse_quote!(bool)),
+                ],
+            ),
             (true, false) => SlidingAttentionViaCacheImpl.opcode_shape(),
             (true, true) => SlidingAttentionPrefillContiguousImpl.opcode_shape(),
         }
@@ -306,7 +319,64 @@ impl Implementation for MetalAttentionImpl {
     ) -> Option<Vec<OpInstance>> {
         match (self.is_sliding, self.is_multihead) {
             (false, false) => AttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
-            (false, true) => AttentionPrefillContiguousImpl.fan_out(m, fuf, program, bounds, slots),
+            // Metal prefill: emit `Instruction::AttentionPrefillPaged`
+            // instead of `AttentionPrefillContiguous`. The paged kernel
+            // reads K/V from the per-layer paged cache (written upstream
+            // by `RopeAppend`), so we drop the k_slot/v_slot operands
+            // and carry the layer index instead. K/V tiles still get
+            // produced by the upstream FusedQkvRopePrefill+RopeAppend
+            // chain (and consumed by the cache write); they're just
+            // not read by this attention kernel. Required for
+            // chunked-prefill / prefix-cache / multi-turn paths the
+            // contiguous prefill cannot handle.
+            (false, true) => {
+                let tile = m.claimed_tiles[0];
+                let node = fuf.get(tile);
+                let resolve = |idx: usize| -> (TileId, u8) {
+                    match node.inputs.get(idx) {
+                        Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                        other => panic!(
+                            "AttentionPrefillPaged: input {idx} must be a Tile (got {other:?})"
+                        ),
+                    }
+                };
+                let (q_id, q_in) = resolve(0);
+                let q_slot = slots.of(q_id, q_in);
+                let out_slot = slots.of(tile, 0);
+                // Layer comes from the same KvCache extern the
+                // contiguous variant walks (see
+                // `AttentionPrefillContiguousImpl::fan_out` in
+                // impl_lib.rs). The decoder DSL always carries this
+                // extern; fall back to 0 for the encoder shape (which
+                // never claims this Impl since `MetalAttentionImpl`
+                // gates by `attention_has_kv_cache_extern` via its
+                // delegated matcher).
+                let layer: u32 = node
+                    .inputs
+                    .iter()
+                    .find_map(|i| match i {
+                        FufInput::Extern {
+                            kind: ExternKind::KvCache,
+                            index: Some(layer),
+                        } => Some(*layer as u32),
+                        _ => None,
+                    })
+                    .expect("AttentionPrefillPaged: decoder DSL must expose a KvCache extern");
+                // The metal paged kernel reads pre-rotated K from the
+                // cache and never consumes this bool. Emit `false` —
+                // a future cuda eval body for this variant should walk
+                // the FUF (`layer_rope_is_interleaved`) instead.
+                let interleaved = false;
+                Some(vec![OpInstance::new(
+                    syn::Ident::new("AttentionPrefillPaged", proc_macro2::Span::call_site()),
+                    vec![
+                        quote! { #q_slot },
+                        quote! { #out_slot },
+                        quote! { #layer },
+                        quote! { #interleaved },
+                    ],
+                )])
+            }
             (true, false) => SlidingAttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
             (true, true) => {
                 SlidingAttentionPrefillContiguousImpl.fan_out(m, fuf, program, bounds, slots)

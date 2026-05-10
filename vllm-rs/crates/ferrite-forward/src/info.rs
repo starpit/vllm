@@ -421,6 +421,15 @@ impl<W> Instruction<W> {
                     F::ConstBool(interleaved),
                 ],
             ),
+            Instruction::AttentionPrefillPaged(q_slot, out_slot, layer, interleaved) => (
+                "AttentionPrefillPaged",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::ConstBool(interleaved),
+                ],
+            ),
             Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => (
                 "EncoderAttention",
                 vec![

@@ -444,6 +444,278 @@ pub fn get_qmv_batch_limit(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Prefill-bucket qmm_t dispatcher — port of `quantized.cpp:680 qmm()`
+// (transpose=true branch) + `:774 qmm_splitk()`. Used when M >=
+// vector_limit (matmul branch in `dispatch_qmv`'s outer
+// `QuantizedMatmul::eval_gpu` rule).
+// ─────────────────────────────────────────────────────────────────
+
+/// Picked qmm_t variant for a given `(M, N, K, B)` shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QmmTKernel {
+    /// `affine_qmm_t_*_alN_<bool>_batch_0` — standard prefill matmul,
+    /// transpose=true. Always fires for `B > 1` or when split_k
+    /// reduces to 1. MLX `qmm` at `quantized.cpp:680`.
+    Standard,
+    /// `affine_qmm_t_splitk_*_alN_<bool>` — split-K variant. Fires only
+    /// when `B == 1` and a non-trivial split_k is feasible (the
+    /// `qmm_splitk` heuristic at `quantized.cpp:788-805` targets
+    /// ~512 threadgroups; falls back to `Standard` if split_k ≤ 1).
+    SplitK {
+        split_k: u32,
+        k_partition_size: u32,
+    },
+}
+
+/// Compute the splitk plan per MLX `qmm_splitk` (`quantized.cpp:788-805`):
+///   bm=bn=32, target ~512 active threadgroups → split_k = max(1, 512 / (n_tiles*m_tiles))
+///   cap by K/group_size, ensure K % (split_k * group_size) == 0
+///   if split_k <= 1: fall back to standard qmm_t
+pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
+    const BM: u32 = 32;
+    const BN: u32 = 32;
+    let n_tiles = n.div_ceil(BN);
+    let m_tiles = m.div_ceil(BM);
+    let current_tgs = n_tiles * m_tiles;
+    if current_tgs == 0 {
+        return 1;
+    }
+    let mut split_k = (512u32 / current_tgs).max(1);
+    let group_cap = k / group_size;
+    if group_cap == 0 {
+        return 1;
+    }
+    split_k = split_k.min(group_cap);
+    while split_k > 1 && (k % (split_k * group_size) != 0) {
+        split_k -= 1;
+    }
+    split_k
+}
+
+/// Pick the right qmm_t variant per MLX's matmul-branch routing.
+/// Mirrors `quantized.cpp:1411-1424`:
+///
+/// ```text
+/// if transpose && B == 1:                           qmm_splitk
+/// else if transpose:                                qmm (transpose=true)
+/// ```
+pub fn pick_qmm_t_kernel(m: u32, n: u32, k: u32, b: u32, group_size: u32) -> QmmTKernel {
+    if b == 1 {
+        let split_k = pick_qmm_t_split_k(m, n, k, group_size);
+        if split_k > 1 {
+            return QmmTKernel::SplitK {
+                split_k,
+                k_partition_size: k / split_k,
+            };
+        }
+    }
+    QmmTKernel::Standard
+}
+
+/// Threadgroup grid + threads-per-group for a picked qmm_t variant.
+///
+/// `qmm_t`: bm=bn=32, wm=wn=2 → group (32, 2, 2); grid
+/// `(ceil(N/32), ceil(M/32), B)` (`quantized.cpp:720-721`).
+///
+/// `qmm_t_splitk`: same group; grid `(n_tiles, m_tiles, split_k)`
+/// (`quantized.cpp:822-824`).
+pub fn qmm_t_dispatch_shape(
+    kernel: QmmTKernel,
+    m: u32,
+    n: u32,
+    b: u32,
+) -> ((u32, u32, u32), (u32, u32, u32)) {
+    let n_tiles = n.div_ceil(32);
+    let m_tiles = m.div_ceil(32);
+    match kernel {
+        QmmTKernel::Standard => ((n_tiles, m_tiles, b), (32, 2, 2)),
+        QmmTKernel::SplitK { split_k, .. } => ((n_tiles, m_tiles, split_k), (32, 2, 2)),
+    }
+}
+
+/// Format the kernel symbol name. Matches the `INST_QMM_*` macros in
+/// `shaders/quantized_qmm.metal`.
+pub fn qmm_t_kernel_name(
+    kernel: QmmTKernel,
+    dtype: DequantDtype,
+    group_size: u32,
+    bits: u32,
+    aligned_n: bool,
+) -> String {
+    let dtype = dtype.symbol_infix();
+    let aln = if aligned_n { "true" } else { "false" };
+    match kernel {
+        QmmTKernel::Standard => format!(
+            "affine_qmm_t_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}_batch_0",
+        ),
+        QmmTKernel::SplitK { .. } => format!(
+            "affine_qmm_t_splitk_{dtype}_gs_{group_size}_b_{bits}_alN_{aln}",
+        ),
+    }
+}
+
+/// MLX-affine int4 prefill-matmul (transpose=true) dispatcher. Wraps
+/// the `quantized_qmm` metallib's `affine_qmm_t` and
+/// `affine_qmm_t_splitk` kernels.
+///
+/// Caller invariants:
+/// - Activations `x`: `[M, K]` row-contiguous in `dtype`. (B=1
+///   currently; batched=1 is unwired in P4 — gates on the MoE
+///   `adjust_matrix_offsets` port in P13.)
+/// - Packed weight `w`: `[N, K / pack_factor]` U32 (`pack_factor = 8 /
+///   bits = 2` for bits=4).
+/// - `scales`, `biases`: `[N, K / group_size]` in `dtype`.
+/// - Output `y`: `[M, N]` in `dtype` for the `Standard` kernel; for
+///   `SplitK`, caller passes an intermediate scratch of shape
+///   `[split_k, M, N]` in `dtype` and is responsible for the
+///   downstream sum-reduce along axis 0 (mirrors
+///   `quantized.cpp:861 strided_reduce_general_dispatch`).
+/// - `bits` ∈ {4} (P4 mandate).
+/// - `group_size` ∈ {32, 64, 128}.
+pub struct MetalAffineQmmT {
+    shader_cache: Arc<ShaderCache>,
+}
+
+impl MetalAffineQmmT {
+    pub fn new(device: Device) -> Result<Self, MetalStreamError> {
+        Ok(Self {
+            shader_cache: Arc::new(ShaderCache::new(device)?),
+        })
+    }
+
+    pub fn with_shader_cache(shader_cache: Arc<ShaderCache>) -> Self {
+        Self { shader_cache }
+    }
+
+    /// Returns the picked kernel variant for the given shape (so the
+    /// caller knows whether they need to allocate a splitk scratch
+    /// `[split_k, M, N]` and emit the downstream sum-reduce).
+    pub fn plan(&self, m: u32, n: u32, k: u32, b: u32, group_size: u32) -> QmmTKernel {
+        pick_qmm_t_kernel(m, n, k, b, group_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        x: &Buffer,
+        packed_w: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        y: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        b: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<QmmTKernel, MetalStreamError> {
+        if bits != 4 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_t: only bits=4 is wired in P4, got bits={bits}"
+            )));
+        }
+        if !matches!(group_size, 32 | 64 | 128) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_t: only group_size in {{32, 64, 128}} is wired, got {group_size}"
+            )));
+        }
+        if b > 1 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_t: batched=1 (B={b}) not yet wired (B=1 in P4)"
+            )));
+        }
+        if k % group_size != 0 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_t: K={k} not divisible by group_size={group_size}"
+            )));
+        }
+
+        let aligned_n = n % 32 == 0;
+        let kernel = pick_qmm_t_kernel(m, n, k, b, group_size);
+        let kernel_name = qmm_t_kernel_name(kernel, dtype, group_size, bits, aligned_n);
+        let pipeline = self.shader_cache.get_pipeline(&kernel_name)?;
+        encoder.setComputePipelineState(&pipeline);
+
+        // Buffer bindings 0..4 — packed weight, scales, biases, x, y.
+        // Same layout as MLX `affine_qmm_t` kernel signature
+        // (`quantized.h:1716-1721`).
+        // SAFETY: all buffer pointers are valid `Retained` objects;
+        // `setBuffer:offset:atIndex:` only borrows them through the call.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(packed_w), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(x), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y), 0, 4);
+        }
+
+        // Buffer 5 = K, 6 = N, 7 = M (i32, matches `const constant int&`).
+        let k_i32 = k as i32;
+        let n_i32 = n as i32;
+        let m_i32 = m as i32;
+        unsafe {
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&k_i32 as *const i32 as *mut c_void).unwrap(),
+                std::mem::size_of::<i32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&n_i32 as *const i32 as *mut c_void).unwrap(),
+                std::mem::size_of::<i32>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&m_i32 as *const i32 as *mut c_void).unwrap(),
+                std::mem::size_of::<i32>(),
+                7,
+            );
+        }
+
+        // Splitk also takes buffer 8 = k_partition_size and buffer 9 =
+        // split_k_partition_stride. Both `int` per MLX
+        // (`quantized.h:1797-1798`).
+        if let QmmTKernel::SplitK {
+            k_partition_size, ..
+        } = kernel
+        {
+            let k_part = k_partition_size as i32;
+            // split_k_partition_stride = M * N (mirroring `quantized.cpp:808`).
+            // Output buffer must be at least `split_k * M * N * dtype.elem_size()`
+            // bytes — caller's responsibility.
+            let split_stride = (m as i32) * (n as i32);
+            unsafe {
+                encoder.setBytes_length_atIndex(
+                    NonNull::new(&k_part as *const i32 as *mut c_void).unwrap(),
+                    std::mem::size_of::<i32>(),
+                    8,
+                );
+                encoder.setBytes_length_atIndex(
+                    NonNull::new(&split_stride as *const i32 as *mut c_void).unwrap(),
+                    std::mem::size_of::<i32>(),
+                    9,
+                );
+            }
+        }
+
+        let (tg, tpg) = qmm_t_dispatch_shape(kernel, m, n, b);
+        let threadgroups = MTLSize {
+            width: tg.0 as usize,
+            height: tg.1 as usize,
+            depth: tg.2 as usize,
+        };
+        let threads_per_threadgroup = MTLSize {
+            width: tpg.0 as usize,
+            height: tpg.1 as usize,
+            depth: tpg.2 as usize,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(kernel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +787,90 @@ mod tests {
             qmv_kernel_name(QmvKernel::Quad { d: 128 }, DequantDtype::Bf16, 128, 4, false),
             "affine_qmv_quad_bf16_gs_128_b_4_d_128_batch_0"
         );
+    }
+
+    #[test]
+    fn qmm_t_split_k_matches_mlx_heuristic() {
+        // Llama-1B prefill q_proj: M=64, N=2048, K=2048, gs=64, B=1.
+        // n_tiles = 64, m_tiles = 2 → current_tgs = 128 → target_split_k =
+        // 512/128 = 4. K/group_size = 32 → cap 32. K % (4*64) = 0 → 4 stands.
+        assert_eq!(pick_qmm_t_split_k(64, 2048, 2048, 64), 4);
+
+        // Llama-1B prefill o_proj: same shape, B=1.
+        // Same as above.
+        assert_eq!(pick_qmm_t_split_k(64, 2048, 2048, 64), 4);
+
+        // Long-prompt prefill: M=512, N=2048, K=2048, gs=64.
+        // n_tiles = 64, m_tiles = 16 → current_tgs = 1024 → target_split_k
+        // = 512/1024 = 0, clamped to 1.
+        assert_eq!(pick_qmm_t_split_k(512, 2048, 2048, 64), 1);
+
+        // Decode-shape qmm border: M=18, N=8192, K=2048, gs=64.
+        // n_tiles = 256, m_tiles = 1 → tgs = 256 → 512/256 = 2. cap = 32.
+        // K % (2*64) = 0 → 2 stands.
+        assert_eq!(pick_qmm_t_split_k(18, 8192, 2048, 64), 2);
+    }
+
+    #[test]
+    fn qmm_t_kernel_pick_routes_splitk_only_for_b_eq_1() {
+        // B == 1, decent splitk → SplitK
+        let k = pick_qmm_t_kernel(64, 2048, 2048, 1, 64);
+        assert!(matches!(k, QmmTKernel::SplitK { split_k: 4, .. }));
+
+        // B > 1 → always Standard
+        let k = pick_qmm_t_kernel(64, 2048, 2048, 2, 64);
+        assert_eq!(k, QmmTKernel::Standard);
+
+        // B == 1, splitk collapses to 1 → Standard
+        let k = pick_qmm_t_kernel(512, 2048, 2048, 1, 64);
+        assert_eq!(k, QmmTKernel::Standard);
+    }
+
+    #[test]
+    fn qmm_t_kernel_name_matches_metallib_symbols() {
+        assert_eq!(
+            qmm_t_kernel_name(QmmTKernel::Standard, DequantDtype::Bf16, 64, 4, true),
+            "affine_qmm_t_bf16_gs_64_b_4_alN_true_batch_0"
+        );
+        assert_eq!(
+            qmm_t_kernel_name(QmmTKernel::Standard, DequantDtype::F16, 32, 4, false),
+            "affine_qmm_t_f16_gs_32_b_4_alN_false_batch_0"
+        );
+        assert_eq!(
+            qmm_t_kernel_name(
+                QmmTKernel::SplitK {
+                    split_k: 4,
+                    k_partition_size: 512
+                },
+                DequantDtype::Bf16,
+                128,
+                4,
+                true
+            ),
+            "affine_qmm_t_splitk_bf16_gs_128_b_4_alN_true"
+        );
+    }
+
+    #[test]
+    fn qmm_t_dispatch_shape_matches_mlx_grid_dims() {
+        // Standard: grid (ceil(N/32), ceil(M/32), B); group (32, 2, 2).
+        let ((tx, ty, tz), (gx, gy, gz)) =
+            qmm_t_dispatch_shape(QmmTKernel::Standard, 64, 2048, 1);
+        assert_eq!((tx, ty, tz), (64, 2, 1));
+        assert_eq!((gx, gy, gz), (32, 2, 2));
+
+        // SplitK: grid (n_tiles, m_tiles, split_k); same group.
+        let ((tx, ty, tz), (gx, gy, gz)) = qmm_t_dispatch_shape(
+            QmmTKernel::SplitK {
+                split_k: 4,
+                k_partition_size: 512,
+            },
+            64,
+            2048,
+            1,
+        );
+        assert_eq!((tx, ty, tz), (64, 2, 4));
+        assert_eq!((gx, gy, gz), (32, 2, 2));
     }
 
     #[test]

@@ -16,8 +16,8 @@
 | P1 — plumbing (`LinearLayer::AffineQuant` + macro emit) | ✅ done | `4bf6f7ba8` | Plumbed but unreachable until P2 |
 | P2 — kernel + cpu_golden parity | ✅ done | `42fececd8` | `quantized_dequantize.metal` + `cpu_golden::affine_dequantize_b4_*`; bit-exact ≤ 1 ULP |
 | P2 — E2E (Llama-3.2-1B-4bit coherent) | ✅ done | `c2ba7c459` | Load-time CPU dequant in lieu of forward-time `AffineDequantizeThenGemm`; see deviation note below |
-| P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ✅ kernels | tbd | Three faithful ports + cpu-parity tests; forward-time swap deferred to P3-P4 integration (prefill needs `qmm_t`) |
-| P4 — prefill GEMM transpose=true | ⏳ next | — | Required to flip macro from load-time dequant to forward-time `AffineQmm`; lands together with P3 wiring |
+| P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ✅ kernels | `93eb4a846` | Three faithful ports + cpu-parity tests; forward-time swap deferred to P3-P4 integration |
+| P4 — prefill GEMM transpose=true | ✅ kernels | tbd | `qmm_t` + `qmm_t_splitk` ports + dispatcher (`pick_qmm_t_kernel` + split_k heuristic) + cpu-parity tests for aligned / unaligned / splitk; macro flip to forward-time `AffineQmm` lands in the next integration commit |
 | P5 — transpose=false (`qmm_n` / `qvm` / `qvm_split_k`) | pending | — | |
 | P6 — quantized embedding lookup | pending | — | P2 dequants the embedding at load; P6 lifts to forward-time gather + dequant |
 | P7 — NAX (M4+) | pending | — | |
@@ -62,6 +62,33 @@ diagnostics. `tests/quantized_qmv_test.rs` exercises all three
 kernels against a CPU reference (dequantize-then-matmul); the noise
 floor is bounded by `sqrt(K) × bf16_eps × max_per_elem_magnitude`
 with a 4× safety factor.
+
+**P4 kernel landing.** `quantized_qmm.metal` ports MLX's `affine_qmm_t`
+(`quantized.h:1707`) and `affine_qmm_t_splitk` (`:1780`) with the
+`qmm_t_impl` body (`:1094`) reproduced inline. The steel BlockMMA /
+BlockLoader / QuantizedBlockLoader trio is inlined (not vendored)
+to stay in the validated grid-X regime that
+`fused_gate_up_silu_mul_gemm_steel_*_specialized` already operates
+in — the prior vendored-steel attempt hit a deterministic wall at
+grid_x ≥ 1024 (per `project_metal_gemm_port_dead_end`); Llama-1B/3B
+q4 prefill shapes have N ≤ 8192 → grid_x ≤ 256, well inside the
+safe regime. Tile constants match MLX (BM=BN=BK=32, WM=WN=2; BK=32
+keeps every BK iter aligned to a single quant group for gs ∈ {32,
+64, 128}). Instantiation grid: bits=4 × gs∈{32,64,128} ×
+dtype∈{f16, bf16} × aligned_N∈{true, false} — 24 exported symbols
+across qmm_t (batched=0) + qmm_t_splitk. `MetalAffineQmmT`
+dispatcher mirrors the `quantized.cpp:1411-1424` matmul-branch rule
+plus the `qmm_splitk` heuristic at `:788-805` (target ~512
+threadgroups, capped by K/group_size, K-divisibility-guarded
+fallback to `Standard`). `KernelId::AffineQmmT{,SplitK}` variants
+land for diagnostics. `tests/quantized_qmm_test.rs` covers aligned
+(N % 32 == 0) / unaligned / splitk paths; splitk test reads the
+`[split_k, M, N]` intermediate and sum-reduces in CPU (mirroring
+`strided_reduce_general_dispatch`). Forward-time wiring (macro flip
+from load-time dequant to `Instruction::AffineQmm` + `lower_one`
+dispatch tree covering both qmv and qmm_t branches + downstream
+reduce for splitk) lands in the next integration commit, gated on
+both P3 and P4 kernels existing.
 
 **Mandate.** 100% parity with MLX's int4 (`affine` mode) quantization across every kernel, every model class (dense + MoE), every backend variant (standard + NAX/M4+). No omitted kernels, no skipped models. Sequencing prioritizes; nothing is dropped. The only out-of-scope item is `fp_quantized.metal` (NVFP4 / MXFP8 / MXFP4) — this is *production* in MLX (`jit_kernels.cpp:861`), not experimental, but it's a different mode with different weight layouts, captured as Phase 17 (parallel parity track).
 

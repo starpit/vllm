@@ -94,6 +94,19 @@ pub enum KernelId {
     /// Maps to `affine_qmv_<dtype>_gs_<gs>_b_4_batch_<batched>`.
     /// Faithful port of MLX's `affine_qmv` (`quantized.h:1548`).
     AffineQmv,
+    /// MLX-affine int4 prefill matmul, transpose=true. Maps to
+    /// `affine_qmm_t_<dtype>_gs_<gs>_b_4_alN_<bool>_batch_0` in
+    /// `quantized_qmm.metallib`. Faithful port of MLX's
+    /// `affine_qmm_t` (`quantized.h:1707`).
+    AffineQmmT,
+    /// MLX-affine int4 prefill matmul, transpose=true, split-K
+    /// variant for small-M / B=1 shapes. Maps to
+    /// `affine_qmm_t_splitk_<dtype>_gs_<gs>_b_4_alN_<bool>`. Faithful
+    /// port of MLX's `affine_qmm_t_splitk` (`quantized.h:1780`).
+    /// Downstream sum-reduce across the split_k partition axis is
+    /// emitted by the lowering pass (mirroring
+    /// `quantized.cpp:861 strided_reduce_general_dispatch`).
+    AffineQmmTSplitK,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source

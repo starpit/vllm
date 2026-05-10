@@ -144,6 +144,21 @@ fn translate_digit_suffix(seg: &str) -> String {
 enum FieldLoad {
     /// `Embedding::load(gw, prefix)`.
     Embedding(String),
+    /// MLX-affine int4 quantized embedding (Metal-only). Reads
+    /// `<prefix>.{weight,scales,biases}` and CPU-dequantizes to BF16
+    /// at load time so the rest of the forward path sees a normal
+    /// dense embedding. Used by every `mlx-community/*-4bit` checkpoint
+    /// in the int4 mandate's coverage matrix — they all ship the
+    /// embedding as an affine triple (`INT4_PARITY_PROBES.md` §2),
+    /// with the sole exception of Gemma-3-MM's language-model
+    /// embedding (Gemma-3-MM is currently absent from the int4 P2
+    /// gate). `group_size` / `bits` are taken from `quantization_config`
+    /// at compile time. Emits `Embedding::load_affine_dequant`.
+    EmbeddingAffine {
+        prefix: String,
+        group_size: u32,
+        bits: u32,
+    },
     /// `RmsNorm::load(gw, prefix, eps)`. `eps` is baked in from the
     /// model config (`rms_norm_eps`).
     RmsNorm(String, f32),
@@ -155,14 +170,25 @@ enum FieldLoad {
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
     LinearConcat(Vec<String>),
-    /// MLX-affine int4 quantized linear (Metal-only). Single-source —
-    /// fused-concat for affine isn't an MLX-native shape (mlx-community
-    /// 4bit checkpoints store gate_proj / up_proj separately) and would
-    /// require a runtime concat that the macro doesn't currently emit
-    /// for affine sources. `group_size` and `bits` come from
-    /// `quantization_config`. Emits `LinearLayer::load_affine_quant`.
+    /// MLX-affine int4 quantized linear (Metal-only), single source.
+    /// `group_size` and `bits` come from `quantization_config`. Under
+    /// INT4 P2 emits `LinearLayer::load_affine_dequant_as_dense`
+    /// (CPU dequant at load → Dense BF16). Under P3 will flip to
+    /// `LinearLayer::load_affine_quant` for forward-time qmv.
     LinearAffine {
         prefix: String,
+        group_size: u32,
+        bits: u32,
+    },
+    /// Fused-concat MLX-affine int4 quantized linear (Metal-only).
+    /// `gate_proj` + `up_proj` (and q/k/v) ship as separate affine
+    /// triples in mlx-community 4bit repos; the forward DSL fuses
+    /// them into one `gate_up_proj` / `qkv_proj` linear so the metal
+    /// `FusedGateUpSiluMul` impl pool matches the standard pattern.
+    /// Emits `LinearLayer::load_affine_dequant_concat_as_dense`
+    /// (CPU dequant per prefix, byte-concat along dim 0, alloc once).
+    LinearAffineConcat {
+        prefixes: Vec<String>,
         group_size: u32,
         bits: u32,
     },
@@ -977,6 +1003,19 @@ fn plan_field_load(
             accessor.name,
             prefixes.len()
         );
+        // MLX-affine int4 embedding: detect via the same
+        // `storage_format_for_weight` lookup the `is_linear` arm uses
+        // below. Single source by construction (assertion above).
+        let only_src = accessor.source_weights[0].0;
+        if let crate::quantization::StorageFormat::Affine { bits, group_size } =
+            crate::quantization::storage_format_for_weight(program, fuf, only_src, model)
+        {
+            return FieldLoad::EmbeddingAffine {
+                prefix: prefixes.into_iter().next().unwrap(),
+                group_size,
+                bits,
+            };
+        }
         FieldLoad::Embedding(prefixes.into_iter().next().unwrap())
     } else if is_rmsnorm {
         assert_eq!(
@@ -1059,18 +1098,19 @@ fn plan_field_load(
                     accessor.name,
                 );
             }
-            assert_eq!(
-                prefixes.len(),
-                1,
-                "accessor `{}` declared Affine across {} source weights — \
-                     fused-concat for MLX-affine isn't supported (gate/up are stored \
-                     separately in mlx-community 4bit repos; concat would need a \
-                     runtime gather the macro doesn't currently emit)",
-                accessor.name,
-                prefixes.len(),
-            );
-            return FieldLoad::LinearAffine {
-                prefix: prefixes.into_iter().next().unwrap(),
+            if prefixes.len() == 1 {
+                return FieldLoad::LinearAffine {
+                    prefix: prefixes.into_iter().next().unwrap(),
+                    group_size,
+                    bits,
+                };
+            }
+            // Multi-source fuse (gate_up_proj / qkv_proj on mlx-community
+            // 4bit repos): CPU-dequant per prefix, byte-concat along
+            // dim 0 at load time. Result is one Dense BF16 weight that
+            // FusedGateUpSiluMul / FusedQkv* claim normally.
+            return FieldLoad::LinearAffineConcat {
+                prefixes,
                 group_size,
                 bits,
             };
@@ -1272,6 +1312,11 @@ fn emit_fingerprint_check(
         // qweight_shape_gate) plus the absence of fp8/bnb4 markers
         // at `.weight_scale` / `.weight.absmax`.
         Some(crate::quantization::QuantMethod::Ggml) => ("weight", "qweight"),
+        // MLX-affine ships `.weight` (U32 packed) + `.scales` + `.biases`
+        // sibling triple. Dense's same `.weight` suffix is disjoint
+        // because the affine `tensor_info` shape gate above keys on
+        // `hidden_size / pack_factor` rather than `hidden_size`.
+        Some(crate::quantization::QuantMethod::Affine { .. }) => ("weight", "qweight"),
         Some(_) => ("qweight", "weight"),
         None => ("weight", "qweight"),
     };
@@ -1715,6 +1760,26 @@ fn emit_fingerprint_check(
         .unwrap_or_else(|| format!("{dec_root}.embed_tokens.weight"));
     let embed_path_lit = proc_macro2::Literal::string(embed_path.as_str());
 
+    // Hidden-size shape gate for the embedding fingerprint sniff. Dense
+    // variants see `[vocab, hidden_size]`; MLX-affine variants ship the
+    // packed U32 embedding as `[vocab, hidden_size / pack_factor]`
+    // (pack_factor = 32 / bits = 8 for bits=4). Without this branch
+    // both variants reject the affine checkpoint at the very first
+    // shape check and `try_load` returns `Ok(None)`.
+    let embed_hidden_lit: TokenStream = match model
+        .quantization
+        .as_ref()
+        .map(|qc| &qc.method)
+    {
+        Some(crate::quantization::QuantMethod::Affine { bits, .. }) => {
+            let pack_factor = 32u64 / (*bits as u64);
+            let packed = hidden_size / pack_factor;
+            let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
+            quote! { #lit }
+        }
+        _ => quote! { #hidden_lit },
+    };
+
     quote! {
         /// Per-variant compile-time fingerprint check. See
         /// macro's `emit_fingerprint_check` for the rules.
@@ -1730,7 +1795,7 @@ fn emit_fingerprint_check(
                 Some(ref shape)
                     if shape.len() >= 2
                         && shape[0] == #vocab_lit
-                        && shape[1] == #hidden_lit => {}
+                        && shape[1] == #embed_hidden_lit => {}
                 _ => return false,
             }
             if !gw.contains(#last_tensor) {
@@ -1878,6 +1943,19 @@ fn emit_weights_struct(
                     true
                 ) | (
                     crate::quantization::StorageFormat::Ggml,
+                    false,
+                    false,
+                    false
+                ) | (
+                    // MLX-affine pairs with the dense-style accessor
+                    // types (Embedding, LinearLayer, RmsNorm — though
+                    // RmsNorm is never quantized on disk). Under INT4
+                    // P2 the loader CPU-dequants at load time and
+                    // returns the dense runtime type, so the accessor
+                    // type stays `Embedding` / `LinearLayer` — no
+                    // separate AffineLinear runtime type is generated
+                    // by the macro.
+                    crate::quantization::StorageFormat::Affine { .. },
                     false,
                     false,
                     false
@@ -3209,6 +3287,23 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 }
             }
         }
+        FieldLoad::EmbeddingAffine {
+            prefix,
+            group_size,
+            bits,
+        } => {
+            // MLX-affine int4 quantized embedding (Metal-only). No
+            // sharded variant — single-GPU is the only metal target.
+            // CPU-dequant at load, store as BF16 Embedding so the
+            // forward path's gather kernel reads a normal dense table.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            quote! {
+                let #name = ::ferrite_kernels::layers::Embedding::load_affine_dequant(
+                    gw, #prefix, #gs_lit, #bits_lit,
+                )?;
+            }
+        }
         FieldLoad::RmsNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
         },
@@ -3303,12 +3398,42 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // single-GPU is the only metal target initially. No
             // GGUF fallback — affine and ggml are disjoint storage
             // formats.
+            //
+            // INT4 P2 slow-reference path: CPU-dequantize at load,
+            // store as BF16 Dense. P3 will flip back to
+            // `load_affine_quant` (which keeps the packed / scales /
+            // biases on device for forward-time qmv dispatch).
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
-                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_quant(
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_dequant_as_dense(
                     gw,
                     #prefix,
+                    #gs_lit,
+                    #bits_lit,
+                )?;
+            }
+        }
+        FieldLoad::LinearAffineConcat {
+            prefixes,
+            group_size,
+            bits,
+        } => {
+            // Fused gate_up_proj / qkv_proj on mlx-community 4bit
+            // repos — see `FieldLoad::LinearAffineConcat` doc.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            let prefix_lits: Vec<TokenStream> = prefixes
+                .iter()
+                .map(|p| {
+                    let lit = syn::LitStr::new(p, proc_macro2::Span::call_site());
+                    quote! { #lit }
+                })
+                .collect();
+            quote! {
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_dequant_concat_as_dense(
+                    gw,
+                    &[#(#prefix_lits),*],
                     #gs_lit,
                     #bits_lit,
                 )?;
@@ -3320,6 +3445,12 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // [vocab_size, hidden_size] works for both
             // Embedding (gather rows) and LinearLayer
             // (matmul against hidden_size). No bias.
+            //
+            // Under INT4 P2 the embedding is loaded via
+            // `Embedding::load_affine_dequant` (when its source weight
+            // is affine), so the borrowed `#embed_ident.weight` is
+            // already BF16 here — the Dense arm sees it as a normal
+            // tensor, no further dequant required.
             let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
                 ::ferrite_kernels::layers::Linear::new(
                     #embed_ident.weight,
@@ -3801,6 +3932,19 @@ fn emit_layered_load_body(
                 }
             }
         }
+        FieldLoad::EmbeddingAffine { .. } => {
+            // No per-arch model in the int4 P2 coverage matrix has a
+            // *layered* affine embedding — `embed_tokens` is top-level
+            // on every Llama / Qwen / Mistral / Gemma / DeepSeek-V3 4bit
+            // checkpoint. The unindexed `emit_unindexed_let` arm covers
+            // every concrete model; if a future arch surfaces a layered
+            // affine embedding, add `load_layered_affine_dequant_embedding`
+            // alongside the existing layered helpers.
+            panic!(
+                "codegen: layered FieldLoad::EmbeddingAffine is not wired — no model in the \
+                 int4 P2 coverage matrix exercises a per-layer affine embedding"
+            );
+        }
         FieldLoad::RmsNorm(prefix, eps) => {
             let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
             if is_vision {
@@ -3935,8 +4079,28 @@ fn emit_layered_load_body(
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
-                ::ferrite_forward::load_layered_linear_affine_quant(
+                ::ferrite_forward::load_layered_linear_affine_dequant_as_dense(
                     gw, #n_lit, #dec_root_lit, #suffix, #gs_lit, #bits_lit,
+                )?
+            }
+        }
+        FieldLoad::LinearAffineConcat {
+            prefixes,
+            group_size,
+            bits,
+        } => {
+            let suffixes: Vec<TokenStream> = prefixes
+                .iter()
+                .map(|p| {
+                    let s = layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref);
+                    quote! { #s }
+                })
+                .collect();
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            quote! {
+                ::ferrite_forward::load_layered_linear_affine_dequant_concat_as_dense(
+                    gw, #n_lit, #dec_root_lit, &[ #(#suffixes),* ], #gs_lit, #bits_lit,
                 )?
             }
         }

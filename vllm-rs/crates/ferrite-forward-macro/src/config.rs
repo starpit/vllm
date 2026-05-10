@@ -384,18 +384,23 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     // identical Impl-set signatures share one emitted body. Without
     // that dedup, N sizes × M presets quickly blow up release-build
     // LLVM work.
-    // Under `--features metal` we skip quant-variant synthesis
-    // entirely. Every preset (awq-gemm, gptq-sym, bnb-nf4-dq, fp8-*,
-    // ct-int4-sym, ggml, …) is CUDA-only at the impl-library level —
-    // the metal impl pool has no `MarlinFusedGateUpSiluMul` /
-    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` claimants, so the
-    // solver explodes with `UnclaimedTile` on the first quant variant
-    // it touches. The Dense base variants still flow through
-    // unchanged. Re-enable once the corresponding metal-quant impls
-    // land. (Tracked alongside the moe / mla-split / mean / bias-add
-    // gaps in `project_ferrite_metal_port_handoff.md`.)
+    // Under `--features metal` we skip CUDA-only quant variants
+    // (awq-gemm / gptq-* / bnb-nf4-dq / fp8-* / ct-int4-sym / ggml) —
+    // their on-disk layouts route through `MarlinFusedGateUpSiluMul` /
+    // `Bnb4Linear` / `Fp8Linear` / `GgmlLinear` impls that the metal
+    // impl pool has no claimants for, so the solver explodes with
+    // `UnclaimedTile` on the first quant tile. The dense base
+    // variants still flow through.
+    //
+    // MLX-affine presets (`mlx-affine-b<bits>-g<gs>`) are the
+    // exception: their codegen materializes a Dense `LinearLayer` at
+    // load time via `LinearLayer::load_affine_dequant_as_dense`, so
+    // the forward path remains the existing bf16 Gemm path that the
+    // metal impl pool already claims. The preset-filter inside the
+    // overlay loop below keeps CUDA-only presets out while still
+    // synthesizing the affine variant.
     let quantizations_path = dir.join("quantizations.json");
-    if !cfg!(feature = "metal") && quantizations_path.exists() {
+    if quantizations_path.exists() {
         let (_, qjson) = read_json_file(&quantizations_path)?;
         // Each entry is either a bare preset name (`"fp8-..."`,
         // `"ggml"`) or a single-key object carrying registration data
@@ -454,6 +459,14 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         };
 
         for preset_name in &presets {
+            // Metal: only `mlx-affine-*` variants reach the solver as
+            // Dense (codegen dequantizes at load time). Every other
+            // preset routes through CUDA-only Impls (Marlin / Bnb4 /
+            // Fp8 / Ggml) that the metal impl pool has no claimants
+            // for, so the solver would explode with `UnclaimedTile`.
+            if cfg!(feature = "metal") && !preset_name.starts_with("mlx-affine-") {
+                continue;
+            }
             let preset_path = preset_root.join(format!("{preset_name}.json"));
             let (_, preset_json) = read_json_file(&preset_path)?;
 
@@ -478,17 +491,22 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     }
 
     // Drop any explicitly-quantized base configs under
-    // `--features metal`. The macro-side preset overlay was already
-    // skipped above, but a few arches ship checked-in
-    // `<size>-<preset>.json` base configs (e.g.
-    // `qwen3-0.6b-bnb-4bit.json`). Those land in `base_raw` directly
-    // and reach the solver as if they were dense bases. The metal
-    // impl pool has no quantized claimants (Marlin / Bnb4 / Fp8 /
-    // GGML are CUDA-only), so the solver explodes on the first
-    // quantized tile. Same rationale as the synthesized-variant
-    // skip above; same future-fix path (land metal-quant impls).
+    // `--features metal` *except* MLX-affine, which routes through the
+    // existing Dense Impl pool at solve time (codegen materializes a
+    // Dense `LinearLayer` at load via
+    // `LinearLayer::load_affine_dequant_as_dense`). Other
+    // checked-in `<size>-<preset>.json` base configs
+    // (e.g. `qwen3-0.6b-bnb-4bit.json`) still reach the solver as
+    // quantized and the metal impl pool has no claimants — the
+    // solver would explode on the first quantized tile.
     if cfg!(feature = "metal") {
-        out.retain(|m| m.quantization.is_none());
+        out.retain(|m| {
+            m.quantization.is_none()
+                || matches!(
+                    m.quantization.as_ref().map(|qc| &qc.method),
+                    Some(crate::quantization::QuantMethod::Affine { .. })
+                )
+        });
     }
 
     // Keep the final list sorted by stem so emitted

@@ -1196,6 +1196,237 @@ impl GpuWeights {
         Ok(result)
     }
 
+    /// MLX-affine int4 dequantize-then-upload, Metal-only.
+    ///
+    /// Reads three safetensors entries straight from the mmap'd backing
+    /// store — `<prefix>.weight` (U32, `[N, K/8]`), `<prefix>.scales`
+    /// (F16, `[N, K/group_size]`), `<prefix>.biases` (F16, same shape) —
+    /// dequantizes on CPU into `dtype_out` (F16 or BF16) without ever
+    /// uploading the packed / scales / biases bytes to the device
+    /// allocator, then `alloc_packed_from_host`s the dequantized
+    /// `[N, K]` weight.
+    ///
+    /// This is the load-time slow-reference for INT4 P2 (kernel-validated
+    /// against `cpu_golden::affine_dequantize_b4_*` in the metal-kernels
+    /// crate). Forward-time `qmv_*` dispatch lands in P3 — at which point
+    /// the macro flips back to `LinearLayer::load_affine_quant` and the
+    /// packed/scales/biases get uploaded as separate tensors that the
+    /// qmv kernels consume directly.
+    ///
+    /// Memory impact: only the dequantized `[N, K]` `dtype_out` weight
+    /// hits the device arena. The packed/scales/biases bytes stay in
+    /// mmap'd OS-page cache until the `Arc<Mmap>` ref count drops
+    /// (typically when `GpuWeights` is itself dropped post-load).
+    pub fn take_affine_dequant_b4(
+        &mut self,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+        dtype_out: DType,
+    ) -> Result<GpuTensor> {
+        let (out_bytes, n, k) =
+            self.take_affine_dequant_b4_bytes(prefix, group_size, bits, dtype_out)?;
+        self.alloc_packed_from_host(&out_bytes, &[n, k], dtype_out)
+    }
+
+    /// Sibling of [`take_affine_dequant_b4`] for fused-concat accessors
+    /// (`gate_up_proj`, `qkv_proj`). CPU-dequantizes each prefix's
+    /// affine triple in turn, byte-concats the `[N, K]` results along
+    /// dim 0 into one packed buffer, then `alloc_packed_from_host`s the
+    /// fused `[sum(N), K]` Dense weight. All sources must share `K`
+    /// (in_features), `group_size`, `bits`, and `dtype_out`.
+    ///
+    /// This is how MLX-affine `gate_proj` / `up_proj` get fused into a
+    /// single `gate_up_proj` Dense linear at load time so the metal
+    /// `FusedGateUpSiluMul` impl pool can match the standard
+    /// `Gemm(packed_gate_up) → silu * mul` pattern. mlx-community 4bit
+    /// repos ship the two prefixes separately; without this concat the
+    /// solver leaves the resulting standalone `Silu` tile unclaimed
+    /// (the metal pool has no per-op `Silu` impl).
+    pub fn take_affine_dequant_b4_concat(
+        &mut self,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        dtype_out: DType,
+    ) -> Result<GpuTensor> {
+        anyhow::ensure!(
+            !prefixes.is_empty(),
+            "take_affine_dequant_b4_concat: empty prefix list"
+        );
+        let elem_size = match dtype_out {
+            DType::F16 | DType::BF16 => 2,
+            _ => anyhow::bail!(
+                "take_affine_dequant_b4_concat: dtype_out must be F16 or BF16, got {dtype_out}"
+            ),
+        };
+
+        let mut packed: Vec<u8> = Vec::new();
+        let mut total_n: usize = 0;
+        let mut k_shared: Option<usize> = None;
+        for prefix in prefixes {
+            let (bytes, n, k) =
+                self.take_affine_dequant_b4_bytes(prefix, group_size, bits, dtype_out)?;
+            if let Some(prev_k) = k_shared {
+                anyhow::ensure!(
+                    prev_k == k,
+                    "take_affine_dequant_b4_concat: in_features mismatch across prefixes \
+                     ({prev_k} vs {k} at `{prefix}`)"
+                );
+            } else {
+                k_shared = Some(k);
+            }
+            total_n += n;
+            // Sanity: byte length matches [N, K] dtype_out layout.
+            anyhow::ensure!(
+                bytes.len() == n * k * elem_size,
+                "take_affine_dequant_b4_concat: `{prefix}` produced {} bytes; expected {}",
+                bytes.len(),
+                n * k * elem_size,
+            );
+            packed.extend_from_slice(&bytes);
+        }
+        let k = k_shared.expect("take_affine_dequant_b4_concat: prefixes non-empty above");
+        self.alloc_packed_from_host(&packed, &[total_n, k], dtype_out)
+    }
+
+    /// Inner half of [`take_affine_dequant_b4`] that returns
+    /// `(dequantized_bytes, n, k)` instead of allocating a device
+    /// buffer. Shared by the single + concat-fused load paths.
+    fn take_affine_dequant_b4_bytes(
+        &mut self,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+        dtype_out: DType,
+    ) -> Result<(Vec<u8>, usize, usize)> {
+        anyhow::ensure!(
+            bits == 4,
+            "take_affine_dequant_b4: only bits=4 is wired in P2, got bits={bits}"
+        );
+        anyhow::ensure!(
+            matches!(dtype_out, DType::F16 | DType::BF16),
+            "take_affine_dequant_b4: dtype_out must be F16 or BF16, got {dtype_out}"
+        );
+
+        let weight_name = format!("{prefix}.weight");
+        let scales_name = format!("{prefix}.scales");
+        let biases_name = format!("{prefix}.biases");
+
+        let w_ref = self.tensors.remove(&weight_name).ok_or_else(|| {
+            anyhow::anyhow!("take_affine_dequant_b4: packed weight `{weight_name}` not found")
+        })?;
+        let s_ref = self.tensors.remove(&scales_name).ok_or_else(|| {
+            anyhow::anyhow!("take_affine_dequant_b4: scales `{scales_name}` not found")
+        })?;
+        let b_ref = self.tensors.remove(&biases_name).ok_or_else(|| {
+            anyhow::anyhow!("take_affine_dequant_b4: biases `{biases_name}` not found")
+        })?;
+
+        anyhow::ensure!(
+            w_ref.dtype == DType::U32,
+            "take_affine_dequant_b4: `{weight_name}` dtype is {} (expected U32)",
+            w_ref.dtype,
+        );
+        anyhow::ensure!(
+            s_ref.dtype == DType::F16,
+            "take_affine_dequant_b4: `{scales_name}` dtype is {} (expected F16)",
+            s_ref.dtype,
+        );
+        anyhow::ensure!(
+            b_ref.dtype == DType::F16,
+            "take_affine_dequant_b4: `{biases_name}` dtype is {} (expected F16)",
+            b_ref.dtype,
+        );
+        anyhow::ensure!(
+            w_ref.shape.len() == 2,
+            "take_affine_dequant_b4: packed weight shape rank {} (expected 2)",
+            w_ref.shape.len(),
+        );
+
+        // pack_factor = 32 / bits = 8 for bits=4 (U32-packed nibbles).
+        let n = w_ref.shape[0];
+        let k = w_ref.shape[1] * 8;
+        anyhow::ensure!(
+            k % group_size as usize == 0,
+            "take_affine_dequant_b4: K={k} not divisible by group_size={group_size}"
+        );
+        let n_groups = (n * k) / group_size as usize;
+        anyhow::ensure!(
+            s_ref.shape == [n, k / group_size as usize],
+            "take_affine_dequant_b4: scales shape {:?} != [{n}, {}]",
+            s_ref.shape,
+            k / group_size as usize,
+        );
+        anyhow::ensure!(
+            b_ref.shape == s_ref.shape,
+            "take_affine_dequant_b4: biases shape {:?} != scales shape {:?}",
+            b_ref.shape,
+            s_ref.shape,
+        );
+
+        let w_bytes = w_ref.data();
+        let n_packed_bytes = n * k / 2;
+        anyhow::ensure!(
+            w_bytes.len() == n_packed_bytes,
+            "take_affine_dequant_b4: packed weight bytes {} != expected {}",
+            w_bytes.len(),
+            n_packed_bytes,
+        );
+
+        let s_bytes = s_ref.data();
+        let b_bytes = b_ref.data();
+        anyhow::ensure!(
+            s_bytes.len() == n_groups * 2 && b_bytes.len() == n_groups * 2,
+            "take_affine_dequant_b4: scales/biases byte length mismatch \
+             (scales={} biases={} expected={})",
+            s_bytes.len(),
+            b_bytes.len(),
+            n_groups * 2,
+        );
+        let s_halves =
+            unsafe { std::slice::from_raw_parts(s_bytes.as_ptr() as *const u16, n_groups) };
+        let b_halves =
+            unsafe { std::slice::from_raw_parts(b_bytes.as_ptr() as *const u16, n_groups) };
+
+        // f32-intermediate FMA single-rounding matches the kernel's
+        // hardware fp16/bf16 FMA — see the matching note on
+        // `cpu_golden::affine_dequantize_b4_*` in ferrite-forward.
+        let mut out_bytes = vec![0u8; n * k * 2];
+        let gs = group_size as usize;
+        let out_halves = unsafe {
+            std::slice::from_raw_parts_mut(out_bytes.as_mut_ptr() as *mut u16, n * k)
+        };
+        for (offset, &byte) in w_bytes.iter().enumerate() {
+            let oindex = offset * 2;
+            let gindex = oindex / gs;
+            let scale = half::f16::from_bits(s_halves[gindex]).to_f32();
+            let bias = half::f16::from_bits(b_halves[gindex]).to_f32();
+            let lo = (byte & 0x0f) as f32;
+            let hi = ((byte >> 4) & 0x0f) as f32;
+            match dtype_out {
+                DType::F16 => {
+                    out_halves[oindex] = half::f16::from_f32(scale * lo + bias).to_bits();
+                    out_halves[oindex + 1] = half::f16::from_f32(scale * hi + bias).to_bits();
+                }
+                DType::BF16 => {
+                    // MLX casts F16 → BF16 inline at kernel time
+                    // (`T scale = scales[gindex]` with `T = bfloat`);
+                    // we do the same here at dequant time. The f32
+                    // intermediate covers the cross-dtype expansion
+                    // exactly (F16 fits in f32 mantissa).
+                    out_halves[oindex] = half::bf16::from_f32(scale * lo + bias).to_bits();
+                    out_halves[oindex + 1] = half::bf16::from_f32(scale * hi + bias).to_bits();
+                }
+                _ => unreachable!("dtype_out guarded above"),
+            }
+        }
+
+        // Drop the CpuTensorRefs; mmap pages will be reclaimed by the OS.
+        drop((w_ref, s_ref, b_ref));
+        Ok((out_bytes, n, k))
+    }
+
     /// Get the shape and effective dtype of a tensor without loading it to GPU.
     ///
     /// If `target_dtype` is set and the tensor is a floating-point type, the

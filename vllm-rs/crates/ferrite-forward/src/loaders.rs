@@ -189,7 +189,8 @@ pub fn load_layered_linear_dense(
 
 /// MLX-affine int4 layered linear load (Metal-only). Reads the
 /// `<root>.<layer>.<suffix>.{weight,scales,biases,bias?}` triple per
-/// decoder layer.
+/// decoder layer. Produces AffineQuant LinearLayers — forward-time
+/// qmv path consumer (P3+).
 #[cfg(feature = "metal")]
 pub fn load_layered_linear_affine_quant(
     gw: &mut GpuWeights,
@@ -207,6 +208,54 @@ pub fn load_layered_linear_affine_quant(
                 group_size,
                 bits,
             )
+        })
+        .collect()
+}
+
+/// MLX-affine int4 layered dequant-as-dense load (Metal-only). INT4
+/// P2 slow-reference path: CPU-dequantize each per-layer affine
+/// triple into a BF16 Dense Linear. Mirrors
+/// [`load_layered_linear_affine_quant`] but the macro emits this
+/// (not the AffineQuant variant) so the forward path stays on the
+/// existing dense Gemm impls.
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_affine_dequant_as_dense(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffix: &str,
+    group_size: u32,
+    bits: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            LinearLayer::load_affine_dequant_as_dense(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                group_size,
+                bits,
+            )
+        })
+        .collect()
+}
+
+/// Fused-concat sibling of [`load_layered_linear_affine_dequant_as_dense`].
+/// One Dense per layer, each containing the byte-concat of the per-layer
+/// affine prefixes (gate / up, or q / k / v).
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_affine_dequant_concat_as_dense(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffixes: &[&str],
+    group_size: u32,
+    bits: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(root, layer, suffixes);
+            let refs = as_str_refs(&paths);
+            LinearLayer::load_affine_dequant_concat_as_dense(gw, &refs, group_size, bits)
         })
         .collect()
 }

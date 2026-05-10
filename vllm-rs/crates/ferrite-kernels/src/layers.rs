@@ -13,6 +13,8 @@
 use anyhow::Result;
 use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
+#[cfg(feature = "metal")]
+use ferrite_cuda_core::DType;
 
 #[cfg(feature = "cuda")]
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
@@ -1140,7 +1142,9 @@ impl LinearLayer {
     /// Load an MLX-affine int4 quantized linear layer (Metal-only).
     /// Reads `<prefix>.weight` + `<prefix>.scales` + `<prefix>.biases`
     /// (and optional `<prefix>.bias`) from the safetensors. Wraps
-    /// `AffineQuantLinear::load`.
+    /// `AffineQuantLinear::load`. Forward-time qmv dispatch consumer
+    /// (P3+) — the macro currently emits `load_affine_dequant_as_dense`
+    /// instead, which dequantizes at load time and returns `Dense`.
     #[cfg(feature = "metal")]
     pub fn load_affine_quant(
         weights: &mut GpuWeights,
@@ -1151,6 +1155,66 @@ impl LinearLayer {
         Ok(Self::AffineQuant(Box::new(AffineQuantLinear::load(
             weights, prefix, group_size, bits,
         )?)))
+    }
+
+    /// MLX-affine int4 → BF16 dequantize-at-load (Metal-only).
+    ///
+    /// CPU-dequantizes `<prefix>.{weight,scales,biases}` directly out
+    /// of the mmap'd safetensors via
+    /// [`GpuWeights::take_affine_dequant_b4`], producing a single
+    /// `[N, K]` BF16 tensor that the rest of the forward path consumes
+    /// as a normal `Dense` linear. This is INT4 P2's slow-reference
+    /// path — kernel-validated against the Metal
+    /// `affine_dequantize` shader in
+    /// `ferrite-metal-kernels/tests/quantized_dequantize_test.rs`.
+    /// P3 will introduce forward-time qmv dispatch and the macro will
+    /// switch back to [`Self::load_affine_quant`].
+    ///
+    /// The optional fp linear-layer bias (`<prefix>.bias`, absent on
+    /// Llama-3.2 / Qwen3-bf16) is loaded as-is into the Dense layer's
+    /// bias slot.
+    #[cfg(feature = "metal")]
+    pub fn load_affine_dequant_as_dense(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight =
+            weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
+        let bias_name = format!("{prefix}.bias");
+        let bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        Ok(Self::Dense(Linear::new(weight, bias)))
+    }
+
+    /// Fused-concat sibling of [`Self::load_affine_dequant_as_dense`]
+    /// for `gate_up_proj` / `qkv_proj` accessors whose source weights
+    /// are MLX-affine on disk (Metal-only).
+    ///
+    /// mlx-community 4bit repos ship gate_proj / up_proj (and
+    /// q_proj / k_proj / v_proj) as separate affine triples; the
+    /// forward DSL fuses them into a single linear so the metal
+    /// `FusedGateUpSiluMul` impl can match. We CPU-dequant each
+    /// prefix, byte-concat the resulting `[N, K]` BF16 chunks along
+    /// dim 0, and wrap the fused `[sum(N), K]` weight as Dense. No
+    /// per-prefix bias is supported here — every affine accessor in
+    /// the int4 P2 coverage matrix has bias=false at the fused level
+    /// (matches the dense `load_dense_concat_packed` no-bias case
+    /// for these same fuses).
+    #[cfg(feature = "metal")]
+    pub fn load_affine_dequant_concat_as_dense(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights
+            .take_affine_dequant_b4_concat(prefixes, group_size, bits, DType::BF16)?;
+        Ok(Self::Dense(Linear::new(weight, None)))
     }
 
     /// Load a linear layer that may be either dense (safetensors) or
@@ -2089,6 +2153,27 @@ impl Embedding {
     pub fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
         let weight = weights.take(&weight_name)?;
+        Ok(Self::new(weight))
+    }
+
+    /// MLX-affine int4 → BF16 dequantize-at-load (Metal-only).
+    ///
+    /// Sibling of [`LinearLayer::load_affine_dequant_as_dense`] for
+    /// quantized token embeddings. CPU-dequantizes `<prefix>.{weight,
+    /// scales,biases}` via [`GpuWeights::take_affine_dequant_b4`] and
+    /// wraps the resulting `[vocab_size, hidden_size]` BF16 tensor in
+    /// an `Embedding`. Used by every `mlx-community/*-4bit` checkpoint
+    /// in the int4 mandate's coverage matrix — they all ship the
+    /// embedding as an affine triple (`INT4_PARITY_PROBES.md` §2).
+    #[cfg(feature = "metal")]
+    pub fn load_affine_dequant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight =
+            weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
         Ok(Self::new(weight))
     }
 

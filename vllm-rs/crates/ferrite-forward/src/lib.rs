@@ -53,6 +53,13 @@ pub use loaders::{
     load_layered_linear_dense, load_layered_linear_dense_concat_packed,
     load_layered_linear_dense_vision, load_layered_rms_norm, load_layered_rms_norm_vision,
 };
+// MLX-affine helpers — Metal-only. Macro-emitted code uses these
+// against `mlx-community/*-4bit` checkpoints.
+#[cfg(feature = "metal")]
+pub use loaders::{
+    load_layered_linear_affine_dequant_as_dense,
+    load_layered_linear_affine_dequant_concat_as_dense, load_layered_linear_affine_quant,
+};
 // Stream-using and quant helpers — cuda-only.
 #[cfg(feature = "cuda")]
 pub use loaders::{

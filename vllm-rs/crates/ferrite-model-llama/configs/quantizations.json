@@ -7,6 +7,7 @@
     "ct-int4-sym",
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor",
+    "mlx-affine-b4-g64",
     {"ggml": {
       "qk_permute": true,
       "llama3_rope_scaling_inference": true

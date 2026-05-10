@@ -59,6 +59,30 @@ using namespace metal;
 MLX_MTL_CONST int SIMD_SIZE = 32;
 
 // ─────────────────────────────────────────────────────────────────
+// Function constants — baked at pipeline build time by
+// `MetalAffineQmmT::execute` (and the lower_one path once
+// `Instruction::AffineQmm` lands). MLX passes K / N / M (and the
+// splitk wrapper passes k_partition_size + split_k_partition_stride)
+// as setBytes runtime args; ferrite specializes per-shape so each
+// (K, N, M[, k_partition_size]) tuple gets its own pipeline. This is
+// the same trade `fused_gate_up_silu_mul` already takes — and is
+// required for ICB recording, which exposes setKernelBuffer but not
+// setKernelBytes.
+//
+// `split_k_partition_stride` (M * N) is computed inline from QMM_M /
+// QMM_N rather than baked separately, so the constant slots stay
+// shared across the standard and splitk variants.
+//
+// Indices match `ConstantValue::uint(N, value)` in the dispatcher;
+// keep them stable.
+// ─────────────────────────────────────────────────────────────────
+
+constant int QMM_K                [[function_constant(0)]];
+constant int QMM_N                [[function_constant(1)]];
+constant int QMM_M                [[function_constant(2)]];
+constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
+
+// ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26 (same constants as
 // quantized_qmv.metal; duplicated here so each .metal compiles
 // stand-alone — `build.rs` produces one .metallib per file).
@@ -366,9 +390,9 @@ template <typename T, int group_size, int bits, bool aligned_N>
     const device T*        biases   [[buffer(2)]],
     const device T*        x        [[buffer(3)]],
     device T*              y        [[buffer(4)]],
-    const constant int&    K        [[buffer(5)]],
-    const constant int&    N        [[buffer(6)]],
-    const constant int&    M        [[buffer(7)]],
+    // buffer(5) / buffer(6) / buffer(7) (K / N / M) replaced by file-
+    // scope function constants QMM_K / QMM_N / QMM_M so this kernel is
+    // recordable into an MTLIndirectComputeCommand (no setKernelBytes).
     uint  simd_group_id [[simdgroup_index_in_threadgroup]],
     uint  simd_lane_id  [[thread_index_in_simdgroup]],
     uint3 tgid          [[threadgroup_position_in_grid]])
@@ -381,7 +405,7 @@ template <typename T, int group_size, int bits, bool aligned_N>
   qmm_t_impl_inline<T, group_size, bits, aligned_N>(
       w, scales, biases, x, y,
       Xs, Ws, out_scratch,
-      K, N, M, /*K_eff=*/K,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
       simd_group_id, simd_lane_id, tgid);
 }
 
@@ -403,11 +427,10 @@ template <typename T, int group_size, int bits, bool aligned_N>
     const device T*        biases                   [[buffer(2)]],
     const device T*        x                        [[buffer(3)]],
     device T*              y                        [[buffer(4)]],
-    const constant int&    K                        [[buffer(5)]],
-    const constant int&    N                        [[buffer(6)]],
-    const constant int&    M                        [[buffer(7)]],
-    const constant int&    k_partition_size         [[buffer(8)]],
-    const constant int&    split_k_partition_stride [[buffer(9)]],
+    // buffer(5)..buffer(9) replaced by file-scope function constants
+    // QMM_K / QMM_N / QMM_M / QMM_K_PARTITION_SIZE; the
+    // split_k_partition_stride that MLX passes at buffer(9) is
+    // computed inline as QMM_M * QMM_N (see `quantized.cpp:808`).
     uint  simd_group_id [[simdgroup_index_in_threadgroup]],
     uint  simd_lane_id  [[thread_index_in_simdgroup]],
     uint3 tgid          [[threadgroup_position_in_grid]])
@@ -415,7 +438,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
   constexpr int pack_factor    = get_pack_factor<bits, 8>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
-  const int k_start = int(tgid.z) * k_partition_size;
+  const int k_start = int(tgid.z) * QMM_K_PARTITION_SIZE;
+  const int split_k_partition_stride = QMM_M * QMM_N;
 
   const device T*       x_shift = x + k_start;
   const device uint8_t* wl      = (const device uint8_t*)w;
@@ -436,8 +460,8 @@ template <typename T, int group_size, int bits, bool aligned_N>
       x_shift,
       y_shift,
       Xs, Ws, out_scratch,
-      K, N, M,
-      /*K_eff=*/k_partition_size,
+      QMM_K, QMM_N, QMM_M,
+      /*K_eff=*/QMM_K_PARTITION_SIZE,
       simd_group_id, simd_lane_id, tgid);
 }
 
@@ -458,9 +482,6 @@ template <typename T, int group_size, int bits, bool aligned_N>
       const device mtl_type* biases   [[buffer(2)]],                         \
       const device mtl_type* x        [[buffer(3)]],                         \
       device mtl_type*       y        [[buffer(4)]],                         \
-      const constant int& K           [[buffer(5)]],                         \
-      const constant int& N           [[buffer(6)]],                         \
-      const constant int& M           [[buffer(7)]],                         \
       uint  simd_group_id [[simdgroup_index_in_threadgroup]],                \
       uint  simd_lane_id  [[thread_index_in_simdgroup]],                     \
       uint3 tgid          [[threadgroup_position_in_grid]]);
@@ -475,11 +496,6 @@ template <typename T, int group_size, int bits, bool aligned_N>
       const device mtl_type* biases                   [[buffer(2)]],         \
       const device mtl_type* x                        [[buffer(3)]],         \
       device mtl_type*       y                        [[buffer(4)]],         \
-      const constant int&    K                        [[buffer(5)]],         \
-      const constant int&    N                        [[buffer(6)]],         \
-      const constant int&    M                        [[buffer(7)]],         \
-      const constant int&    k_partition_size         [[buffer(8)]],         \
-      const constant int&    split_k_partition_stride [[buffer(9)]],         \
       uint  simd_group_id [[simdgroup_index_in_threadgroup]],                \
       uint  simd_lane_id  [[thread_index_in_simdgroup]],                     \
       uint3 tgid          [[threadgroup_position_in_grid]]);

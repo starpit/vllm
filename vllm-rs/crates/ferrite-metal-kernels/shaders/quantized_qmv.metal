@@ -37,6 +37,21 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
 // ─────────────────────────────────────────────────────────────────
+// Function constants — baked at pipeline build time by
+// `MetalAffineQmv::execute` (and the lower_one path once
+// `Instruction::AffineQmm` lands). These hold the K/N dims that MLX
+// passes as setBytes runtime args; ferrite specializes per-shape so
+// the values are pipeline-constants the Metal compiler can fold.
+//
+// Indices match `ConstantValue::uint(0, K)` / `ConstantValue::uint(1, N)`
+// in the dispatcher; keep them stable, ICB-recorded commands key on
+// the constant bag.
+// ─────────────────────────────────────────────────────────────────
+
+constant int IN_VEC_SIZE  [[function_constant(0)]];
+constant int OUT_VEC_SIZE [[function_constant(1)]];
+
+// ─────────────────────────────────────────────────────────────────
 // Pack helpers — quantized.h:17-26
 // ─────────────────────────────────────────────────────────────────
 
@@ -516,8 +531,11 @@ METAL_FUNC void qmv_quad_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    constant int& in_vec_size,
-    const constant int& out_vec_size,
+    // K / N now baked as function constants on the kernel side
+    // (IN_VEC_SIZE / OUT_VEC_SIZE) and forwarded by-value here so
+    // the impl body matches the MLX C++ source line-for-line.
+    int in_vec_size,
+    int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]]) {
@@ -577,8 +595,8 @@ METAL_FUNC void qmv_fast_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    int in_vec_size,
+    int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -648,8 +666,8 @@ METAL_FUNC void qmv_impl(
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
-    const constant int& out_vec_size,
+    int in_vec_size,
+    int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -813,8 +831,10 @@ template <typename T, int group_size, int bits, int D, bool batched>
     const device T* biases [[buffer(2)]],
     const device T* x [[buffer(3)]],
     device T* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
+    // buffer(5) / buffer(6) (in_vec_size / out_vec_size) replaced by
+    // file-scope function constants IN_VEC_SIZE / OUT_VEC_SIZE so this
+    // kernel is recordable into an MTLIndirectComputeCommand (which
+    // exposes setKernelBuffer but not setKernelBytes).
     const constant int& x_batch_ndims [[buffer(7)]],
     const constant int* x_shape [[buffer(8)]],
     const constant int64_t* x_strides [[buffer(9)]],
@@ -834,7 +854,7 @@ template <typename T, int group_size, int bits, int D, bool batched>
         scales,
         biases,
         y,
-        out_vec_size * M,
+        OUT_VEC_SIZE * M,
         x_batch_ndims,
         x_shape,
         x_strides,
@@ -851,8 +871,8 @@ template <typename T, int group_size, int bits, int D, bool batched>
       biases,
       x,
       y,
-      in_vec_size,
-      out_vec_size,
+      IN_VEC_SIZE,
+      OUT_VEC_SIZE,
       tid,
       quad_gid,
       quad_lid);
@@ -869,8 +889,8 @@ template <typename T, int group_size, int bits, bool batched>
     const device T* biases [[buffer(2)]],
     const device T* x [[buffer(3)]],
     device T* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
+    // buffer(5) / buffer(6): see note on affine_qmv_quad above —
+    // K / N now ride as function constants IN_VEC_SIZE / OUT_VEC_SIZE.
     const constant int& x_batch_ndims [[buffer(7)]],
     const constant int* x_shape [[buffer(8)]],
     const constant int64_t* x_strides [[buffer(9)]],
@@ -890,7 +910,7 @@ template <typename T, int group_size, int bits, bool batched>
         scales,
         biases,
         y,
-        out_vec_size * M,
+        OUT_VEC_SIZE * M,
         x_batch_ndims,
         x_shape,
         x_strides,
@@ -907,8 +927,8 @@ template <typename T, int group_size, int bits, bool batched>
       biases,
       x,
       y,
-      in_vec_size,
-      out_vec_size,
+      IN_VEC_SIZE,
+      OUT_VEC_SIZE,
       tid,
       simd_gid,
       simd_lid);
@@ -925,8 +945,8 @@ template <typename T, const int group_size, const int bits, bool batched>
     const device T* biases [[buffer(2)]],
     const device T* x [[buffer(3)]],
     device T* y [[buffer(4)]],
-    const constant int& in_vec_size [[buffer(5)]],
-    const constant int& out_vec_size [[buffer(6)]],
+    // buffer(5) / buffer(6): see note on affine_qmv_quad above —
+    // K / N now ride as function constants IN_VEC_SIZE / OUT_VEC_SIZE.
     const constant int& x_batch_ndims [[buffer(7)]],
     const constant int* x_shape [[buffer(8)]],
     const constant int64_t* x_strides [[buffer(9)]],
@@ -946,7 +966,7 @@ template <typename T, const int group_size, const int bits, bool batched>
         scales,
         biases,
         y,
-        out_vec_size * M,
+        OUT_VEC_SIZE * M,
         x_batch_ndims,
         x_shape,
         x_strides,
@@ -963,8 +983,8 @@ template <typename T, const int group_size, const int bits, bool batched>
       biases,
       x,
       y,
-      in_vec_size,
-      out_vec_size,
+      IN_VEC_SIZE,
+      OUT_VEC_SIZE,
       tid,
       simd_gid,
       simd_lid);

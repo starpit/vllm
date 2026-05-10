@@ -31,13 +31,21 @@ type MetallibBytes = &'static [u8];
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConstantType {
     UInt,
+    /// Signed 32-bit. Required for MLX-port kernels whose function
+    /// constants are declared `constant int` — Metal validates the
+    /// type byte-for-byte against the constant declaration, so a
+    /// `uint` payload bound to an `int` slot fails pipeline build
+    /// with `MTLLibraryErrorDomain` 3 ("Constant X is of type
+    /// MTLDataTypeInt but value found has type MTLDataTypeUInt").
+    Int,
     Float,
 }
 
 impl ConstantType {
-    fn metal_data_type(self) -> MTLDataType {
+    pub(crate) fn metal_data_type(self) -> MTLDataType {
         match self {
             ConstantType::UInt => MTLDataType::UInt,
+            ConstantType::Int => MTLDataType::Int,
             ConstantType::Float => MTLDataType::Float,
         }
     }
@@ -56,6 +64,18 @@ impl ConstantValue {
             index,
             bits: value,
             ty: ConstantType::UInt,
+        }
+    }
+
+    /// Signed 32-bit constant. Use for kernels whose function
+    /// constants are declared `constant int` (the qmv / qmm_t MLX
+    /// ports — see `quantized_qmv.metal::IN_VEC_SIZE` /
+    /// `quantized_qmm.metal::QMM_K`).
+    pub fn int(index: u16, value: i32) -> Self {
+        Self {
+            index,
+            bits: value as u32,
+            ty: ConstantType::Int,
         }
     }
 

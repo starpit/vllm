@@ -27,11 +27,10 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLSize,
 };
-use std::ffi::c_void;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::shader_cache::ShaderCache;
+use crate::specialized_pipeline_cache::ConstantValue;
 use crate::stream::MetalStreamError;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -344,7 +343,20 @@ impl MetalAffineQmv {
             debug_assert!(d == 64 || d == 128);
         }
         let kernel_name = qmv_kernel_name(kernel, dtype, group_size, bits, false);
-        let pipeline = self.shader_cache.get_pipeline(&kernel_name)?;
+        // K (in_vec_size) and N (out_vec_size) ride as function
+        // constants 0/1 in `quantized_qmv.metal` — see the `IN_VEC_SIZE`
+        // / `OUT_VEC_SIZE` declarations at the top of that shader.
+        // Both are declared `constant int` to match the MLX C++ source
+        // (`int` runtime args at `quantized.h:519-520`); Metal type-
+        // checks the constant payload byte-for-byte against the slot
+        // declaration, so we send signed.
+        let constants = [
+            ConstantValue::int(0, k as i32),
+            ConstantValue::int(1, n as i32),
+        ];
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(&kernel_name, &constants)?;
         encoder.setComputePipelineState(&pipeline);
 
         // Buffer bindings 0-4 — packed weight, scales, biases, x, y.
@@ -356,26 +368,6 @@ impl MetalAffineQmv {
             encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(x), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(y), 0, 4);
-        }
-
-        // Buffer 5 = in_vec_size (K), buffer 6 = out_vec_size (N).
-        // Both are `int` (32-bit signed) per the kernel signature; we
-        // pass i32 to avoid silent reinterpretation if N or K ever
-        // exceeds 2^31 (which they won't for any realistic LLM, but
-        // matching MLX's signed encoding keeps the bit-pattern stable).
-        let in_vec_size = k as i32;
-        let out_vec_size = n as i32;
-        unsafe {
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&in_vec_size as *const i32 as *mut c_void).unwrap(),
-                std::mem::size_of::<i32>(),
-                5,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&out_vec_size as *const i32 as *mut c_void).unwrap(),
-                std::mem::size_of::<i32>(),
-                6,
-            );
         }
 
         // Buffers 7..14 are the batch-metadata block; skipped for B==1
@@ -636,7 +628,31 @@ impl MetalAffineQmmT {
         let aligned_n = n % 32 == 0;
         let kernel = pick_qmm_t_kernel(m, n, k, b, group_size);
         let kernel_name = qmm_t_kernel_name(kernel, dtype, group_size, bits, aligned_n);
-        let pipeline = self.shader_cache.get_pipeline(&kernel_name)?;
+        // K / N / M (and `k_partition_size` for splitk) ride as
+        // function constants 0/1/2 (and 3) in `quantized_qmm.metal`
+        // — see the `QMM_K` / `QMM_N` / `QMM_M` /
+        // `QMM_K_PARTITION_SIZE` declarations at the top of that
+        // shader. All declared `constant int` to match the MLX C++
+        // source (`int` runtime args at `quantized.h:1719-1721`);
+        // Metal type-checks the constant payload byte-for-byte
+        // against the slot declaration. The split_k_partition_stride
+        // that MLX passes at buffer(9) is computed inline in the
+        // splitk kernel as `QMM_M * QMM_N`, so it doesn't need its
+        // own constant slot.
+        let mut constants = vec![
+            ConstantValue::int(0, k as i32),
+            ConstantValue::int(1, n as i32),
+            ConstantValue::int(2, m as i32),
+        ];
+        if let QmmTKernel::SplitK {
+            k_partition_size, ..
+        } = kernel
+        {
+            constants.push(ConstantValue::int(3, k_partition_size as i32));
+        }
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(&kernel_name, &constants)?;
         encoder.setComputePipelineState(&pipeline);
 
         // Buffer bindings 0..4 — packed weight, scales, biases, x, y.
@@ -650,54 +666,6 @@ impl MetalAffineQmmT {
             encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(x), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(y), 0, 4);
-        }
-
-        // Buffer 5 = K, 6 = N, 7 = M (i32, matches `const constant int&`).
-        let k_i32 = k as i32;
-        let n_i32 = n as i32;
-        let m_i32 = m as i32;
-        unsafe {
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&k_i32 as *const i32 as *mut c_void).unwrap(),
-                std::mem::size_of::<i32>(),
-                5,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&n_i32 as *const i32 as *mut c_void).unwrap(),
-                std::mem::size_of::<i32>(),
-                6,
-            );
-            encoder.setBytes_length_atIndex(
-                NonNull::new(&m_i32 as *const i32 as *mut c_void).unwrap(),
-                std::mem::size_of::<i32>(),
-                7,
-            );
-        }
-
-        // Splitk also takes buffer 8 = k_partition_size and buffer 9 =
-        // split_k_partition_stride. Both `int` per MLX
-        // (`quantized.h:1797-1798`).
-        if let QmmTKernel::SplitK {
-            k_partition_size, ..
-        } = kernel
-        {
-            let k_part = k_partition_size as i32;
-            // split_k_partition_stride = M * N (mirroring `quantized.cpp:808`).
-            // Output buffer must be at least `split_k * M * N * dtype.elem_size()`
-            // bytes — caller's responsibility.
-            let split_stride = (m as i32) * (n as i32);
-            unsafe {
-                encoder.setBytes_length_atIndex(
-                    NonNull::new(&k_part as *const i32 as *mut c_void).unwrap(),
-                    std::mem::size_of::<i32>(),
-                    8,
-                );
-                encoder.setBytes_length_atIndex(
-                    NonNull::new(&split_stride as *const i32 as *mut c_void).unwrap(),
-                    std::mem::size_of::<i32>(),
-                    9,
-                );
-            }
         }
 
         let (tg, tpg) = qmm_t_dispatch_shape(kernel, m, n, b);

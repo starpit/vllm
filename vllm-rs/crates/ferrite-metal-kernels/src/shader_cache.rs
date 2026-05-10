@@ -7,21 +7,36 @@ use dispatch2::DispatchData;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
-use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
+use objc2_metal::{
+    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunctionConstantValues,
+    MTLLibrary, MTLPipelineOption,
+};
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::Mutex;
 
+use crate::specialized_pipeline_cache::ConstantValue;
 use crate::stream::MetalStreamError;
 
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 pub type Library = Retained<ProtocolObject<dyn MTLLibrary>>;
 pub type ComputePipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
-/// Cache for compiled Metal shaders
+/// Cache for compiled Metal shaders.
+///
+/// Two pipeline pots: `pipelines` for kernels that don't take any
+/// `[[function_constant(N)]]` (keyed on symbol name only), and
+/// `specialized_pipelines` for the qmv / qmm_t family which bake
+/// K / N / M (and friends) in as function constants — the same
+/// trade `SpecializedPipelineCache` makes on the worker side.
+/// Standalone test paths reach the specialized variant via
+/// [`Self::get_pipeline_specialized`].
 pub struct ShaderCache {
     device: Device,
     libraries: HashMap<String, Library>,
     pipelines: Mutex<HashMap<String, ComputePipelineState>>,
+    specialized_pipelines: Mutex<HashMap<(String, Vec<ConstantValue>), ComputePipelineState>>,
 }
 
 impl ShaderCache {
@@ -62,19 +77,12 @@ impl ShaderCache {
             device,
             libraries,
             pipelines: Mutex::new(HashMap::new()),
+            specialized_pipelines: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Get or compile a pipeline for a given kernel name
-    pub fn get_pipeline(&self, name: &str) -> Result<ComputePipelineState, MetalStreamError> {
-        {
-            let pipelines = self.pipelines.lock().unwrap();
-            if let Some(pipeline) = pipelines.get(name) {
-                return Ok(pipeline.clone());
-            }
-        }
-
-        let library = if name.starts_with("rope_") {
+    fn library_for(&self, name: &str) -> Result<&Library, MetalStreamError> {
+        let lib = if name.starts_with("rope_") {
             self.libraries.get("rope")
         } else if name.starts_with("rmsnorm_") {
             self.libraries.get("rmsnorm")
@@ -94,13 +102,27 @@ impl ShaderCache {
             self.libraries.get("quantized_qmv")
         } else {
             self.libraries.get("activation")
-        }
-        .ok_or_else(|| {
+        };
+        lib.ok_or_else(|| {
             MetalStreamError::ShaderCompilationFailed(format!(
                 "No library found for kernel '{}'",
                 name
             ))
-        })?;
+        })
+    }
+
+    /// Get or compile a pipeline for a given kernel name (no function
+    /// constants — for kernels whose symbol uniquely determines the
+    /// pipeline).
+    pub fn get_pipeline(&self, name: &str) -> Result<ComputePipelineState, MetalStreamError> {
+        {
+            let pipelines = self.pipelines.lock().unwrap();
+            if let Some(pipeline) = pipelines.get(name) {
+                return Ok(pipeline.clone());
+            }
+        }
+
+        let library = self.library_for(name)?;
 
         let ns_name = NSString::from_str(name);
         let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
@@ -120,6 +142,86 @@ impl ShaderCache {
         {
             let mut pipelines = self.pipelines.lock().unwrap();
             pipelines.insert(name.to_string(), pipeline.clone());
+        }
+
+        Ok(pipeline)
+    }
+
+    /// Get or compile a pipeline specialized on the provided function
+    /// constants. The qmv / qmm_t family uses this — K / N / M ride
+    /// as `[[function_constant(N)]]` in `quantized_qmv.metal` and
+    /// `quantized_qmm.metal` so the same kernel symbol can serve
+    /// every per-Linear shape with a per-shape pipeline.
+    ///
+    /// Cache key is `(symbol_name, sorted-by-index constants)`. The
+    /// sort matches `SpecializedPipelineCache::PipelineKey::new` so
+    /// callers can hand identical constant bags to either cache and
+    /// get the same lookup behavior.
+    pub fn get_pipeline_specialized(
+        &self,
+        name: &str,
+        constants: &[ConstantValue],
+    ) -> Result<ComputePipelineState, MetalStreamError> {
+        let mut sorted_constants = constants.to_vec();
+        sorted_constants.sort_by_key(|c| c.index);
+        let cache_key = (name.to_string(), sorted_constants.clone());
+        {
+            let pipelines = self.specialized_pipelines.lock().unwrap();
+            if let Some(pipeline) = pipelines.get(&cache_key) {
+                return Ok(pipeline.clone());
+            }
+        }
+
+        let library = self.library_for(name)?;
+
+        let constant_values = MTLFunctionConstantValues::new();
+        for c in &sorted_constants {
+            unsafe {
+                constant_values.setConstantValue_type_atIndex(
+                    NonNull::new(&c.bits as *const u32 as *mut c_void).unwrap(),
+                    c.ty.metal_data_type(),
+                    c.index as usize,
+                );
+            }
+        }
+
+        let ns_name = NSString::from_str(name);
+        let function = library
+            .newFunctionWithName_constantValues_error(&ns_name, &constant_values)
+            .map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "newFunctionWithName('{}', {} constants): {e:?}",
+                    name,
+                    sorted_constants.len(),
+                ))
+            })?;
+
+        let descriptor = MTLComputePipelineDescriptor::new();
+        descriptor.setComputeFunction(Some(&function));
+        // ICB-recordable pipelines must declare this — the same flag
+        // `SpecializedPipelineCache::get_or_build` sets. Without it,
+        // any future attempt to record this kernel into an MTL ICB
+        // fails at validation time.
+        descriptor.setSupportIndirectCommandBuffers(true);
+
+        let pipeline = self
+            .device
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &descriptor,
+                MTLPipelineOption::None,
+                None,
+            )
+            .map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "build pipeline '{}' with {} constants: {e:?}",
+                    name,
+                    sorted_constants.len(),
+                ))
+            })?;
+
+        {
+            let mut pipelines = self.specialized_pipelines.lock().unwrap();
+            pipelines.insert(cache_key, pipeline.clone());
         }
 
         Ok(pipeline)

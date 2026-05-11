@@ -21,7 +21,7 @@
 //! taught the new arm — same closed-emitter invariant the
 //! interpreter `eval` already enforces.
 
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 use crate::Instruction;
 
@@ -1069,6 +1069,47 @@ impl<W> Instruction<W> {
                     F::Layer(layer),
                     F::LayerKind("Fp8AnyLinear"),
                     F::RopeCosSin,
+                ],
+            ),
+            // MLX-affine int4 family. `AffineQmm` is the metal-only
+            // quantized matmul; CUDA `eval` is `unreachable!`, but the
+            // variant is unconditional on `Instruction<W>` so info.rs
+            // must cover it under either backend. `SiluMul` is the
+            // P3-P4 C4a fused activation that pairs with two
+            // `AffineQmm`s on the q-MLP decomposed branch.
+            Instruction::AffineQmm(
+                in_slot,
+                out_slot,
+                layer,
+                _wf,
+                n,
+                k,
+                _group_size,
+                _bits,
+                _vector_limit,
+            ) => (
+                "AffineQmm",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                    F::WeightShape { n, k },
+                ],
+            ),
+            Instruction::SiluMul(gate_slot, up_slot, out_slot) => (
+                "SiluMul",
+                vec![F::Slot(gate_slot), F::Slot(up_slot), F::Slot(out_slot)],
+            ),
+            // Metal-only fused gather+dequant for `*-4bit` checkpoints
+            // (P6). Variant is cfg-gated on `Instruction<W>` so the
+            // arm matches its gate.
+            #[cfg(feature = "metal")]
+            Instruction::AffineEmbed(out_slot, _wf, _group_size, _bits) => (
+                "AffineEmbed",
+                vec![
+                    F::Slot(out_slot),
+                    F::LayerKind("AffineQuantEmbedding"),
                 ],
             ),
             Instruction::Loop(count, body_len) => {

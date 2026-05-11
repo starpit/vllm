@@ -9,7 +9,7 @@ pub mod bench;
 pub mod chat;
 pub mod collect_env;
 pub mod convert;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod ferrite;
 #[cfg(feature = "gce")]
 pub mod gce;

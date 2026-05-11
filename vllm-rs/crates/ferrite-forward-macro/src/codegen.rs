@@ -5488,9 +5488,13 @@ pub fn emit_model(
 
     // FORWARD_TABLE — one row per bucket. `__B` aliases the
     // `BucketEntry` tuple-struct constructor so each row stays on a
-    // single line in expanded source.
+    // single line in expanded source. Available under either backend
+    // — `vllm ferrite info`'s per-variant `dump()` walks it on both
+    // cuda and metal. The cuda runtime additionally drives `forward`
+    // / `forward_backbone` from it; metal's pool uses `METAL_BUCKETS`
+    // instead and ignores the runtime fields here.
     let forward_table = quote! {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         static FORWARD_TABLE: &[::ferrite_forward::BucketEntry<__I>] = {
             use ::ferrite_forward::BucketEntry as __B;
             &[
@@ -5997,8 +6001,10 @@ pub fn emit_model(
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
         /// row, with backbone + lm_head normalized for non-generic
         /// inspection (no `&Weights`, no GPU). Used by
-        /// `vllm ferrite info` via the inventory registry.
-        #[cfg(feature = "cuda")]
+        /// `vllm ferrite info` via the inventory registry. Available
+        /// under either backend so the CLI subcommand can dump
+        /// metal-compiled arches too.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub fn dump() -> ::std::vec::Vec<::ferrite_forward::BucketDump> {
             FORWARD_TABLE
                 .iter()
@@ -6079,8 +6085,14 @@ fn emit_shim_model(
     quote! {
         #weights
 
+        // `dump` is the per-variant `vllm ferrite info` accessor —
+        // available under either backend so shim variants register
+        // under metal too.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        pub use super::#canonical::dump;
+
         #[cfg(feature = "cuda")]
-        pub use super::#canonical::{dump, forward, forward_backbone};
+        pub use super::#canonical::{forward, forward_backbone};
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{

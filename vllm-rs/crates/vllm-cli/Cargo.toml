@@ -14,7 +14,13 @@ bench = ["vllm-bench"]
 cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-bench?/cuda", "dep:ferrite-forward", "ferrite-forward/cuda", "dep:ferrite-cuda-targets", "dep:vllm-cuda"]
 nccl = ["cuda", "vllm-cuda/nccl", "vllm-serve/nccl", "vllm-executor/nccl"]
 profiling = ["cuda"]
-metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal"]
+# `dep:ferrite-forward` + `ferrite-forward/metal` surface
+# `BackboneDumpRegistration` + `Instruction::normalize` so
+# `vllm ferrite info` works on metal builds the same way it does on
+# cuda. `ferrite-cuda-targets` stays cuda-only — the
+# `--cublas-analysis` flag is gated on the `cuda` feature inside
+# `commands/ferrite.rs`.
+metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal", "dep:ferrite-forward", "ferrite-forward/metal"]
 wgpu = ["vllm-serve/wgpu"]
 guided-decoding = ["vllm-serve/guided-decoding"]
 multimodal = ["vllm-serve/multimodal"]

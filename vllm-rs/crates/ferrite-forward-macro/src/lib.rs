@@ -1864,8 +1864,9 @@ fn emit_arch_dispatcher(
         // every (model, tp) variant via `dump_rows`. Independent of
         // the per-tp `FerriteArchRegistration` above — `vllm ferrite
         // info` walks this registry separately, with no runtime GPU
-        // or weight loading.
-        #[cfg(feature = "cuda")]
+        // or weight loading. Gated on either backend feature so the
+        // metal CLI sees compiled-in metal arches too.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         ::ferrite_forward::inventory::submit! {
             ::ferrite_forward::BackboneDumpRegistration {
                 arch_name: #arch_name_lit,

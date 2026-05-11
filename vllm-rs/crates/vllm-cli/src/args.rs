@@ -57,19 +57,19 @@ pub enum Commands {
     #[cfg(feature = "top")]
     Top(TopArgs),
     /// Ferrite tooling: inspect compiled-in model backbones, etc.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     Ferrite(FerriteCommand),
 }
 
 /// `vllm ferrite <subcommand>`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[derive(Parser, Debug)]
 pub struct FerriteCommand {
     #[command(subcommand)]
     pub command: FerriteSubcommand,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[derive(Subcommand, Debug)]
 pub enum FerriteSubcommand {
     /// Print the per-bucket backbone instruction list for compiled
@@ -79,7 +79,7 @@ pub enum FerriteSubcommand {
     Info(FerriteInfoArgs),
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[derive(Parser, Debug)]
 pub struct FerriteInfoArgs {
     /// Color/style output. `auto` uses ANSI when stdout is a tty
@@ -92,9 +92,12 @@ pub struct FerriteInfoArgs {
     /// the best non-cuBLAS standalone-GEMM kernel and identify
     /// fusion-gap reasons (Gemm→Add / Norm→Gemm / Gemm→ScalarMul /
     /// lm_head). Uses the bundled cost CSV for exact-row lookups.
+    /// cuda-only — keyed off `ferrite_cuda_targets` profiles.
+    #[cfg(feature = "cuda")]
     #[arg(short = 'c', long = "cublas-analysis")]
     pub cublas_analysis: bool,
     /// With `-c/--cublas-analysis`, also print a per-arch breakdown.
+    #[cfg(feature = "cuda")]
     #[arg(long, requires = "cublas_analysis")]
     pub per_arch: bool,
     /// Substring filters. A variant is shown when its
@@ -103,7 +106,7 @@ pub struct FerriteInfoArgs {
     pub filters: Vec<String>,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
 pub enum ColorWhen {
     #[default]

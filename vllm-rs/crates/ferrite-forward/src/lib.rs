@@ -10,7 +10,12 @@ pub use ferrite_forward_macro::{forward, vision_forward};
 #[cfg(feature = "cuda")]
 pub mod attack_surface;
 pub mod cpu_golden;
-#[cfg(feature = "cuda")]
+// `info` is the non-generic, hashable backbone view used by
+// `vllm ferrite info`. The whole pipeline (BackboneDumpRegistration
+// inventory + Instruction::normalize) is backend-agnostic — opened to
+// both `cuda` and `metal` so the CLI subcommand walks compiled metal
+// arches too.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod info;
 // `instr` is dual-mode: the `Instruction<W>` enum + `CanonicalParams` trait +
 // `WtFn`/`CosSinFn` aliases compile under either `cuda` or `metal`. The
@@ -34,7 +39,7 @@ pub mod vision_arch;
 #[cfg(feature = "metal")]
 pub mod interpreter;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use info::{
     BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep, VariantDump,
     normalize_slice,
@@ -101,7 +106,14 @@ pub use vision_arch::{VisionArchWeights, VisionWrapper};
 ///   6 = num_slots      — tile-table size for `run`/`run_backbone`
 ///   7 = backbone_slot  — slot `forward_backbone` returns
 ///   8 = terminal_slot  — slot `forward` returns (after lm_head)
-#[cfg(feature = "cuda")]
+// `BucketEntry` is a plain tuple struct — no backend deps. Lifted to
+// `any(cuda, metal)` so the metal-side macro emits `FORWARD_TABLE`
+// too and `vllm ferrite info`'s `dump()` walks it. The cuda runtime
+// uses fields 6/7/8 (num_slots / backbone_slot / terminal_slot) to
+// size the tile table and pick return slots; the metal pool uses
+// `METAL_BUCKETS` instead, so those fields stay populated but
+// untouched on metal.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct BucketEntry<Op: 'static>(
     pub u64,
     pub u64,

@@ -320,7 +320,8 @@ mod tests {
                 | KernelId::AffineEmbed
                 | KernelId::SiluMul
                 | KernelId::SplitKReduceSum
-                | KernelId::FusedAffineQkvRopeCache,
+                | KernelId::FusedAffineQkvRopeCache
+                | KernelId::SynthPreAttn,
                 _,
             ) => {
                 unreachable!(
@@ -392,7 +393,8 @@ mod tests {
             | KernelId::AffineEmbed
             | KernelId::SiluMul
             | KernelId::SplitKReduceSum
-            | KernelId::FusedAffineQkvRopeCache => {
+            | KernelId::FusedAffineQkvRopeCache
+            | KernelId::SynthPreAttn => {
                 // See `kernel_msl_names` for the matching gap — this
                 // helper isn't wired for the Affine*/SiluMul/SplitKReduce
                 // path. Production constants come from the lowering pass

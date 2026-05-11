@@ -102,6 +102,18 @@ pub trait CanonicalParams {
     /// matching `Instruction` variants stay registered but unreachable.
     /// Set by `#[vision_forward]` from the vision config.
     const VISION_NUM_HEADS: u32 = 0;
+
+    /// Metal-only: list of compiler-synthesized kernel sources (per
+    /// `ferrite-forward-macro::fuse_pass`). Each entry is
+    /// `(symbol_name, MSL source)`. The MetalWorkerPool registers each
+    /// via `SpecializedPipelineCache::register_source_library` at init
+    /// time so the lowering arm for `Instruction::SynthPreAttn` can
+    /// reference these symbols. Default empty — the macro overrides
+    /// this per Metal arch with the actual synthesized sources from
+    /// the FUF analysis.
+    fn synthesized_kernel_sources() -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
     /// Vision-tower attention head dimension. Same defaults / set-by
     /// rule as [`Self::VISION_NUM_HEADS`].
     const VISION_HEAD_DIM: u32 = 0;
@@ -589,6 +601,32 @@ pub enum Instruction<W> {
     ///
     /// CUDA eval is `unreachable!` — emit only on the metal forward.
     AffineQmm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
+    /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
+    /// write) into one dispatch. The kernel itself is generated at
+    /// macro-expansion time by
+    /// `ferrite-forward-macro/src/fuse_pass.rs` stitching MK primitive
+    /// calls; the symbol name carried here resolves at runtime against
+    /// a per-arch source-compiled library registered into the
+    /// `SpecializedPipelineCache` at worker-pool init.
+    ///
+    /// Tuple fields: `(residual_slot, delta_slot, q_out_slot, layer,
+    /// weight_fn, rms_weight_fn, cos_sin_fn, group_size, bits,
+    /// kernel_symbol)`.
+    ///
+    /// CUDA eval is `unreachable!`.
+    SynthPreAttn(
+        u32,
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, ferrite_kernels::layers::RmsNorm>,
+        CosSinFn<W>,
+        u32,
+        u32,
+        &'static str,
+    ),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
@@ -3019,6 +3057,12 @@ impl<W: CanonicalParams> Instruction<W> {
                     "Instruction::AffineQmm is metal-only — the macro must \
                      not emit it on the cuda forward (Affine weights stay \
                      in StorageFormat::Dense on cuda by the FUF downgrade)"
+                );
+            }
+            Instruction::SynthPreAttn(..) => {
+                unreachable!(
+                    "Instruction::SynthPreAttn is metal-only — emitted by the \
+                     compiler-driven megakernel synthesis pass on the metal forward only"
                 );
             }
             Instruction::SiluMul(..) => {

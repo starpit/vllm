@@ -178,6 +178,23 @@ impl Implementation for MetalAffineQmmImpl {
         affine_qmm_opcode_shape()
     }
 
+    fn as_atom(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+    ) -> Option<Box<dyn crate::atom::Atom>> {
+        // Only the decode branch (M < vector_limit) participates in
+        // synthesis today. Prefill stays on the qmm_t hand-written
+        // kernels until Phase 5 (mk_mma) lands.
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (group_size, _bits) = match weight_storage_of(node) {
+            Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
+            _ => return None,
+        };
+        Some(Box::new(crate::atom_lib::AffineQmvAtom { group_size }))
+    }
+
     fn fan_out(
         &self,
         m: &MatchInfo,

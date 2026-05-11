@@ -142,6 +142,12 @@ pub enum KernelId {
     /// `nn.QuantizedEmbedding.__call__`
     /// (`python/mlx/nn/layers/quantized.py:144`).
     AffineEmbed,
+    /// Compiler-synthesized pre-attention megakernel. Symbol resolves
+    /// against a per-arch source-compiled library registered at worker
+    /// init via `SpecializedPipelineCache::register_source_library`.
+    /// Kernel body is generated at macro-expansion time by
+    /// `ferrite-forward-macro::fuse_pass`.
+    SynthPreAttn,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source

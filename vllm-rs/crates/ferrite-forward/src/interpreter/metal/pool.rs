@@ -356,8 +356,21 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
-        let cache = SpecializedPipelineCache::with_standard_shaders((*device).clone())
+        let mut cache = SpecializedPipelineCache::with_standard_shaders((*device).clone())
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
+        // Compiler-driven synthesis (METAL_KITTENS_SYNTHESIS_PLAN.md):
+        // each Metal arch exposes its macro-generated synthesized
+        // kernel sources via `W::synthesized_kernel_sources()`. The
+        // pool JIT-compiles them once here (newLibraryWithSource) so
+        // SynthPreAttn / future Synth* lowering arms can resolve their
+        // symbols against the cache like any hand-written kernel.
+        for (name, source) in W::synthesized_kernel_sources() {
+            cache.register_source_library(name, source).map_err(|e| {
+                PoolBuildError::PipelineCacheBuild(format!(
+                    "synthesized kernel `{name}`: {e:?}"
+                ))
+            })?;
+        }
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
 
         let mut tapes: Vec<LoweredMetalTape<W>> = Vec::with_capacity(bucket_specs.len());

@@ -564,6 +564,23 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         0.0
     }
 
+    /// Return an `Atom` view of this Impl's claim, or `None` if it
+    /// can't participate in compiler-driven megakernel synthesis
+    /// (must stay as a standalone kernel call). Default `None` —
+    /// existing Impls aren't fuseable until they opt in.
+    ///
+    /// The fuse pass (`fuse_pass.rs`) walks the solver's claim
+    /// assignments, calls `as_atom` on each Impl, and groups
+    /// adjacent atoms whose dispatch shape and data-flow are
+    /// compatible into one synthesized kernel.
+    fn as_atom(
+        &self,
+        _m: &MatchInfo,
+        _fuf: &Fuf,
+    ) -> Option<Box<dyn crate::atom::Atom>> {
+        None
+    }
+
     /// Per-CTA resource demand of this implementation.
     fn resources(&self, m: &MatchInfo) -> Resources;
 
@@ -4694,6 +4711,14 @@ impl Implementation for FusedAddRmsNormImpl {
                 ),
             ],
         )
+    }
+
+    fn as_atom(
+        &self,
+        _m: &MatchInfo,
+        _fuf: &Fuf,
+    ) -> Option<Box<dyn crate::atom::Atom>> {
+        Some(Box::new(crate::atom_lib::AddRmsNormAtom))
     }
 
     fn fan_out(

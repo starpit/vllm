@@ -135,6 +135,36 @@ impl SpecializedPipelineCache {
         })
     }
 
+    /// Register a synthesized kernel library compiled from source at
+    /// runtime via `newLibraryWithSource`. The macro emits these as
+    /// `&'static str` constants and the worker pool registers them at
+    /// init time, BEFORE any pipeline-lookup happens.
+    ///
+    /// One-time JIT cost (~50-150ms per source on Apple M-series). For
+    /// the typical synthesized-decoder-body kernel count (≤ 6 per
+    /// model arch) this is well under engine init's overall budget.
+    ///
+    /// Used by the compiler-driven megakernel synthesis pass
+    /// (`ferrite-forward-macro/src/fuse_pass.rs`).
+    pub fn register_source_library(
+        &mut self,
+        name: &'static str,
+        source: &str,
+    ) -> Result<(), MetalStreamError> {
+        let opts = objc2_metal::MTLCompileOptions::new();
+        let ns_source = NSString::from_str(source);
+        let lib = self
+            .device
+            .newLibraryWithSource_options_error(&ns_source, Some(&opts))
+            .map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "compile synthesized library `{name}`: {e:?}"
+                ))
+            })?;
+        self.libraries.insert(name, lib);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sources(
         device: Device,

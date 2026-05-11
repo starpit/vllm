@@ -176,6 +176,14 @@ impl Implementation for MetalRopeAppendImpl {
     ) -> Option<Vec<OpInstance>> {
         RopeAppendRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
+
+    fn as_atom(
+        &self,
+        _m: &MatchInfo,
+        _fuf: &Fuf,
+    ) -> Option<Box<dyn crate::atom::Atom>> {
+        Some(Box::new(crate::atom_lib::RopeAppendAtom))
+    }
 }
 
 /// Metal implementation for RopeAppendInterleaved (GPT-J style)

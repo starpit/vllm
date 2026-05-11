@@ -173,66 +173,89 @@ pub fn colored_slot_map(
         }
     }
 
-    // Last use per OWNER (resolving alias chains): the latest
-    // subgraph that reads this owner's storage, directly or via a
-    // View. Last use of a non-owner (a View slot itself) is computed
+    // Per-tile sub-positions. Each tile gets a unique flat index by
+    // walking subgraphs in execution order, then tiles within each
+    // subgraph in claim order. Coarser per-subgraph positions would
+    // collapse every tile in a subgraph to the same `dp`, so a
+    // producer tile whose only reader sits in the SAME subgraph's
+    // claim ends up freed at its own def — and the next tile in the
+    // subgraph reuses its color. Fine for single-kernel claims (the
+    // producer's output is never materialized in the arena), but
+    // wrong for storage-polymorphic impls whose `fan_out` emits
+    // multiple kernels per subgraph (MetalFusedGateUpSiluMulImpl's
+    // affine path: AffineQmm gate, AffineQmm up, SiluMul). Per-tile
+    // sub-positions let the within-subgraph read walk below record
+    // the consumer's sub-position as the producer's `last_use`, so
+    // gate's slot stays distinct from up's slot across the SiluMul
+    // read.
+    //
+    // Layer-template byte-equivalence: per-tile positions increment
+    // monotonically. Each layer body's tiles occupy the same
+    // relative offset range, so per-layer color assignments stay
+    // byte-equivalent (the linear-scan reg allocation runs against
+    // the same free-pool state at the same relative positions).
+    let mut tile_position: HashMap<TileId, usize> = HashMap::new();
+    let mut next_pos: usize = 0;
+    for &sg in &order_arr {
+        for tile in sfuf.tiles_in_subgraph(sg) {
+            tile_position.insert(tile, next_pos);
+            next_pos += 1;
+        }
+    }
+
+    // Last use per OWNER (resolving alias chains): the latest tile-
+    // position that reads this owner's storage, directly or via a
+    // View. Within-subgraph reads count too (the impl's fan_out may
+    // emit a kernel chain whose intermediate outputs hit the arena).
+    // Last use of a non-owner (a View slot itself) is computed
     // separately below.
     let mut owner_last_use: HashMap<(TileId, u8), usize> = HashMap::new();
     for &sg in &order_arr {
-        let pos = order[&sg];
-        let claimed: HashSet<TileId> = sfuf.tiles_in_subgraph(sg).into_iter().collect();
-        for tile in &claimed {
-            for input in &fuf.get(*tile).inputs {
+        for tile in sfuf.tiles_in_subgraph(sg) {
+            let consumer_pos = tile_position[&tile];
+            for input in &fuf.get(tile).inputs {
                 if let FufInput::Tile { id, slot } = input {
-                    if claimed.contains(id) {
-                        continue;
-                    }
                     let owner = resolve((*id, *slot));
                     owner_last_use
                         .entry(owner)
-                        .and_modify(|p| *p = (*p).max(pos))
-                        .or_insert(pos);
+                        .and_modify(|p| *p = (*p).max(consumer_pos))
+                        .or_insert(consumer_pos);
                 }
             }
         }
     }
     // View slots' last_use: when is the View itself read? A View is
     // read whenever its dst slot appears as a Tile input to some
-    // downstream subgraph. Same walk but without alias resolution.
+    // downstream tile. Same walk but without alias resolution.
     let mut view_last_use: HashMap<(TileId, u8), usize> = HashMap::new();
     for &sg in &order_arr {
-        let pos = order[&sg];
-        let claimed: HashSet<TileId> = sfuf.tiles_in_subgraph(sg).into_iter().collect();
-        for tile in &claimed {
-            for input in &fuf.get(*tile).inputs {
+        for tile in sfuf.tiles_in_subgraph(sg) {
+            let consumer_pos = tile_position[&tile];
+            for input in &fuf.get(tile).inputs {
                 if let FufInput::Tile { id, slot } = input {
-                    if claimed.contains(id) {
-                        continue;
-                    }
                     if alias_to_owner.contains_key(&(*id, *slot)) {
                         view_last_use
                             .entry((*id, *slot))
-                            .and_modify(|p| *p = (*p).max(pos))
-                            .or_insert(pos);
+                            .and_modify(|p| *p = (*p).max(consumer_pos))
+                            .or_insert(consumer_pos);
                     }
                 }
             }
         }
     }
 
-    // Collect every (tile, output_slot) pair, sorted by def position.
+    // Collect every (tile, output_slot) pair, sorted by per-tile
+    // sub-position.
     let mut def_pos: HashMap<TileId, usize> = HashMap::new();
-    for &sg in &order_arr {
-        for tile in sfuf.tiles_in_subgraph(sg) {
-            def_pos.insert(tile, order[&sg]);
-        }
+    for (&tile, &pos) in &tile_position {
+        def_pos.insert(tile, pos);
     }
     let mut pairs: Vec<(usize, TileId, u8)> = Vec::new();
     for &sg in &order_arr {
         for tile in sfuf.tiles_in_subgraph(sg) {
             let n_out = fuf.get(tile).outputs.len().max(1) as u8;
             for slot in 0..n_out {
-                pairs.push((order[&sg], tile, slot));
+                pairs.push((tile_position[&tile], tile, slot));
             }
         }
     }

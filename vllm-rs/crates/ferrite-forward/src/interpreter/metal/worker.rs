@@ -389,7 +389,27 @@ impl<W: CanonicalParams> MetalWorker<W> {
             None
         };
 
+        // Runtime metadata buffers (`input_ids`, `positions`,
+        // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
+        // are allocated by the per-canonical `RuntimeFactory` closure
+        // and never inserted into the residency set there. ICB-recorded
+        // commands bind them via `set_kernel_buffer` at bake time, so
+        // the encoder firing `executeCommandsInBuffer` never sees a
+        // `setBuffer` for them — without an explicit residency entry,
+        // Apple's lazy paging can hand back stale pages and the ICB
+        // path produces garbage output (the dormant comment at
+        // `pool.rs` flagging "wrong outputs for decode buckets" was
+        // exactly this). The KV cache buffers in `kv_cache_k/v` are
+        // already inserted by the executor that constructs the pool;
+        // inserting them again would be a no-op but we skip to keep
+        // the loop tight.
         if let Some(r) = residency {
+            r.insert(&runtime.input_ids);
+            r.insert(&runtime.positions);
+            r.insert(&runtime.slot_mapping);
+            r.insert(&runtime.cu_seqlens_q);
+            r.insert(&runtime.seq_used_k);
+            r.insert(&runtime.block_table);
             r.commit();
         }
 

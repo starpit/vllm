@@ -9525,6 +9525,42 @@ impl Worker for FerriteWorker {
             model.arch_name()
         );
 
+        {
+            use std::sync::atomic::Ordering;
+            let s = weights.metal_allocator().load_stats();
+            let zc = s.zero_copy_calls.load(Ordering::Relaxed);
+            let zb = s.zero_copy_bytes.load(Ordering::Relaxed);
+            let mc = s.memcpy_calls.load(Ordering::Relaxed);
+            let mb = s.memcpy_bytes.load(Ordering::Relaxed);
+            let small = s.memcpy_small_calls.load(Ordering::Relaxed);
+            let med = s.memcpy_med_calls.load(Ordering::Relaxed);
+            let large = s.memcpy_large_calls.load(Ordering::Relaxed);
+            let unaligned = s.memcpy_unaligned.load(Ordering::Relaxed);
+            let outside = s.memcpy_outside_mmap.load(Ordering::Relaxed);
+            info!(
+                "FerriteWorker(metal): load routing — zero-copy {zc} calls / {:.1} MiB | \
+                 memcpy {mc} calls / {:.1} MiB ({} small <1MiB, {} med 1-16MiB, {} large ≥16MiB; \
+                 fallback reason: {} unaligned, {} outside-mmap)",
+                zb as f64 / (1 << 20) as f64,
+                mb as f64 / (1 << 20) as f64,
+                small,
+                med,
+                large,
+                unaligned,
+                outside,
+            );
+            let hist: Vec<u64> = s
+                .alignment_hist
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect();
+            info!(
+                "FerriteWorker(metal): tensor-offset alignment histogram \
+                 (#trailing-zeros → count): {:?}",
+                hist
+            );
+        }
+
         // Compile + cache the greedy-sampling pipeline once. Argmax fires
         // outside the per-bucket ICB, so it owns its own pipeline cache
         // here on the worker rather than living in the per-canonical

@@ -5,6 +5,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -39,6 +40,13 @@ struct MmapRegion {
 unsafe impl Send for MmapRegion {}
 unsafe impl Sync for MmapRegion {}
 
+#[derive(Clone, Copy)]
+enum MmapClassify {
+    Aligned,
+    Unaligned,
+    Outside,
+}
+
 pub type ArenaHook = Arc<dyn Fn(&Buffer) + Send + Sync>;
 
 pub struct MetalAllocator {
@@ -48,6 +56,54 @@ pub struct MetalAllocator {
     on_new_arena: Arc<Mutex<Option<ArenaHook>>>,
     residency: ferrite_metal_kernels::residency::MetalResidencySet,
     mmaps: Arc<Mutex<Vec<MmapRegion>>>,
+    /// Diagnostic counters for `alloc_and_copy_host` routing. Bumped
+    /// once per call so the worker can print a one-shot "zero-copy
+    /// vs memcpy" breakdown after `try_load` completes. Atomics are
+    /// `Relaxed` — these aren't synchronization, just stats.
+    load_stats: Arc<LoadStats>,
+}
+
+/// Histogram of tensor-offset trailing-zero counts. Index `i` counts
+/// tensors whose offset within their mmap has exactly `i` trailing
+/// zero bits (i.e. is aligned to `2^i` but not `2^(i+1)`). Capped at
+/// 16; anything ≥ 16 lands in bucket 16. Wired through `LoadStats`.
+pub const ALIGNMENT_HISTOGRAM_BUCKETS: usize = 17;
+
+#[derive(Default)]
+pub struct LoadStats {
+    /// `alloc_and_copy_host` call returned an mmap-aliased pointer
+    /// (no copy, ≤ a few hundred ns).
+    pub zero_copy_calls: AtomicU64,
+    pub zero_copy_bytes: AtomicU64,
+    /// `alloc_and_copy_host` call fell through to arena memcpy
+    /// (~5 GB/s on Apple Silicon). High-volume miss here is the
+    /// startup-time bottleneck.
+    pub memcpy_calls: AtomicU64,
+    pub memcpy_bytes: AtomicU64,
+    /// Per-prefix breakdown: keyed by a coarse category derived
+    /// from the byte count (so we can tell scales/biases apart
+    /// from packed weight blobs without threading prefix strings
+    /// down to the allocator).
+    pub memcpy_small_calls: AtomicU64, // < 1 MiB
+    pub memcpy_med_calls: AtomicU64,   // 1 MiB ≤ ... < 16 MiB
+    pub memcpy_large_calls: AtomicU64, // ≥ 16 MiB
+    /// Why zero-copy failed: source pointer wasn't in any
+    /// registered mmap region (e.g. tensor was already heap-copied
+    /// upstream, or mmap was never registered).
+    pub memcpy_outside_mmap: AtomicU64,
+    /// Why zero-copy failed: pointer was inside a registered mmap,
+    /// but the offset wasn't 16-byte aligned. This is the
+    /// safetensors-data-section-base alignment problem.
+    pub memcpy_unaligned: AtomicU64,
+    /// Histogram of observed offset trailing-zero counts (0..=16).
+    pub alignment_hist: [AtomicU64; ALIGNMENT_HISTOGRAM_BUCKETS],
+}
+
+impl LoadStats {
+    fn observe_offset_alignment(&self, tz: u32) {
+        let idx = (tz as usize).min(ALIGNMENT_HISTOGRAM_BUCKETS - 1);
+        self.alignment_hist[idx].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 unsafe impl Send for MetalAllocator {}
@@ -62,6 +118,7 @@ impl Clone for MetalAllocator {
             on_new_arena: Arc::clone(&self.on_new_arena),
             residency: self.residency.clone(),
             mmaps: Arc::clone(&self.mmaps),
+            load_stats: Arc::clone(&self.load_stats),
         }
     }
 }
@@ -76,6 +133,7 @@ impl MetalAllocator {
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
+            load_stats: Arc::new(LoadStats::default()),
         }
     }
 
@@ -88,7 +146,15 @@ impl MetalAllocator {
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
+            load_stats: Arc::new(LoadStats::default()),
         }
+    }
+
+    /// Snapshot the load-time routing counters. Caller is expected
+    /// to log them once (after `try_load` completes) — the atomics
+    /// are not reset.
+    pub fn load_stats(&self) -> &LoadStats {
+        &self.load_stats
     }
 
     pub fn residency(&self) -> &ferrite_metal_kernels::residency::MetalResidencySet {
@@ -204,6 +270,26 @@ impl MetalAllocator {
 
     fn src_in_registered_mmap(&self, src: *const u8, bytes: usize) -> bool {
         self.aligned_mmap_offset(src, bytes).is_some()
+    }
+
+    fn classify_mmap_offset(&self, src: *const u8, bytes: usize) -> MmapClassify {
+        let p = src as usize;
+        let end = p.saturating_add(bytes);
+        let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+        for region in mmaps.iter() {
+            let r_start = region.base as usize;
+            let r_end = r_start + region.len;
+            if p >= r_start && end <= r_end {
+                let offset = p - r_start;
+                let tz = offset.trailing_zeros();
+                self.load_stats.observe_offset_alignment(tz);
+                if offset % Self::MIN_BIND_ALIGN == 0 {
+                    return MmapClassify::Aligned;
+                }
+                return MmapClassify::Unaligned;
+            }
+        }
+        MmapClassify::Outside
     }
 
     pub fn arena_count(&self) -> usize {
@@ -323,8 +409,28 @@ impl DeviceAllocator for MetalAllocator {
         // bindings on int4 packed weights). Misaligned sources fall
         // through to the arena-copy path, which `alloc_uninit` keeps
         // 16-byte aligned per allocation.
-        if bytes > 0 && self.src_in_registered_mmap(src_host, bytes) {
-            return Ok(src_host as *mut u8);
+        if bytes > 0 {
+            match self.classify_mmap_offset(src_host, bytes) {
+                MmapClassify::Aligned => {
+                    self.load_stats
+                        .zero_copy_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.load_stats
+                        .zero_copy_bytes
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                    return Ok(src_host as *mut u8);
+                }
+                MmapClassify::Unaligned => {
+                    self.load_stats
+                        .memcpy_unaligned
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                MmapClassify::Outside => {
+                    self.load_stats
+                        .memcpy_outside_mmap
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         let aligned_bytes = if bytes == 0 {
             0
@@ -372,6 +478,20 @@ impl DeviceAllocator for MetalAllocator {
         let dst = unsafe { arena.base.add(offset) };
         unsafe { std::ptr::copy_nonoverlapping(src_host, dst, bytes) };
         arena.used = offset + aligned_bytes;
+        self.load_stats
+            .memcpy_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.load_stats
+            .memcpy_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        let bucket = if bytes < 1 << 20 {
+            &self.load_stats.memcpy_small_calls
+        } else if bytes < 16 << 20 {
+            &self.load_stats.memcpy_med_calls
+        } else {
+            &self.load_stats.memcpy_large_calls
+        };
+        bucket.fetch_add(1, Ordering::Relaxed);
         Ok(dst)
     }
 }

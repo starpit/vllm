@@ -10,6 +10,26 @@
 
 ## Status (2026-05-11)
 
+> **Metal-runtime perf landing**, orthogonal to int4 but unblocks
+> the P16 perf comparison: batched ICB exec is now the production
+> default for `MetalWorkerPool::run_forward_with_inputs_inner`,
+> with one compute encoder per forward (commits `efb2983b7`,
+> `c0bec10b7`, `717664b58`). Llama-3.2-1B-Instruct-4bit decode at
+> single-prompt greedy goes ~37ms/forward (~27 tok/s) → ~9ms/forward
+> (~110 tok/s); Llama-3.2-3B-Instruct-4bit ~23ms/forward (~43 tok/s).
+> Root cause of the prior batched-ICB "wrong output for decode
+> buckets" was `RuntimeBindings` metadata buffers missing from
+> `MetalResidencySet` — fixed in `efb2983b7`. The follow-on goal of
+> a single `executeCommandsInBuffer` per forward isn't reachable
+> with Apple's compute-ICB API (only `ConcurrentDispatch` available;
+> intra-range commands race on RAW), so the production shape is one
+> encoder + N `executeCommandsInBuffer` per forward — cross-exec
+> ordering on a Serial-default encoder is the RAW-safety guarantee
+> we rely on. P16 now has a real baseline to A/B vs `mlx_lm.generate`
+> against.
+
+
+
 | Phase | State | Commit | Notes |
 |---|---|---|---|
 | P0 — verification + probes | ✅ done | `a798db0d3` | `INT4_PARITY_PROBES.md` |
@@ -41,7 +61,7 @@
 | P13 — MoE | pending | — | |
 | P14 — NAX MoE | pending | — | |
 | P15 — long-prompt / long-decode under q4 | pending | — | Intersects `project_metal_long_decode_panic` |
-| P16 — A/B vs MLX + perf gate | pending | — | |
+| P16 — A/B vs MLX + perf gate | partial baseline | `efb2983b7`, `c0bec10b7`, `717664b58` | Metal-runtime perf overhaul lands: residency-set fix unblocks batched ICB, batched ICB becomes default, then one encoder per forward replaces the per-step end+reopen pattern. Llama-3.2-1B-4bit decode 27 tok/s → 110 tok/s; Llama-3.2-3B-4bit ~43 tok/s. Formal A/B vs `mlx_lm.generate` + per-shape kernel benchmarks still owe. |
 | P17 — FP-quant mode (mxfp4 / mxfp8 / nvfp4) | pending | — | Parallel parity track |
 
 **P2 deviation worth carrying forward.** The plan called for forward-time

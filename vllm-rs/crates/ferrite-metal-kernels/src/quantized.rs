@@ -924,6 +924,425 @@ impl MetalSplitKReduce {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Prefill-bucket qmm_n dispatcher — port of `quantized.cpp:680
+// qmm()` (transpose=false branch). Used when `M >= vector_limit`
+// AND transpose=false (which for MLX means `vector_limit = 4`
+// flat per `quantized.cpp:1409`; ferrite mirrors that for the
+// transpose=false matmul branch). No SplitK variant for qmm_n in
+// MLX (only qmm_t has splitk per `quantized.cpp:1413`).
+// ─────────────────────────────────────────────────────────────────
+
+/// Format the qmm_n kernel symbol. Matches the `INST_QMM_N` macro in
+/// `shaders/quantized_qmm.metal`.
+pub fn qmm_n_kernel_name(dtype: DequantDtype, group_size: u32, bits: u32) -> String {
+    let dtype = dtype.symbol_infix();
+    format!("affine_qmm_n_{dtype}_gs_{group_size}_b_{bits}_batch_0")
+}
+
+/// `&'static str` view of [`qmm_n_kernel_name`] for the lowering pass.
+pub fn qmm_n_kernel_static_name(dtype: DequantDtype, bits: u32, group_size: u32) -> &'static str {
+    debug_assert_eq!(bits, 4, "qmm_n_kernel_static_name: only bits=4 is wired");
+    use DequantDtype::*;
+    match (dtype, group_size) {
+        (F16, 32) => "affine_qmm_n_f16_gs_32_b_4_batch_0",
+        (F16, 64) => "affine_qmm_n_f16_gs_64_b_4_batch_0",
+        (F16, 128) => "affine_qmm_n_f16_gs_128_b_4_batch_0",
+        (Bf16, 32) => "affine_qmm_n_bf16_gs_32_b_4_batch_0",
+        (Bf16, 64) => "affine_qmm_n_bf16_gs_64_b_4_batch_0",
+        (Bf16, 128) => "affine_qmm_n_bf16_gs_128_b_4_batch_0",
+        (_, gs) => panic!(
+            "qmm_n_kernel_static_name: unsupported group_size={gs} \
+             — only 32, 64, 128 instantiated"
+        ),
+    }
+}
+
+/// Threadgroup grid + threads-per-group for qmm_n. Matches MLX
+/// `quantized.cpp:720-721`: bm=bn=32, wm=wn=2 → group (32, 2, 2);
+/// grid `(ceil(N/32), ceil(M/32), B)`.
+pub fn qmm_n_dispatch_shape(m: u32, n: u32, b: u32) -> ((u32, u32, u32), (u32, u32, u32)) {
+    let n_tiles = n.div_ceil(32);
+    let m_tiles = m.div_ceil(32);
+    ((n_tiles, m_tiles, b), (32, 2, 2))
+}
+
+/// MLX-affine int4 prefill-matmul (transpose=false) dispatcher.
+/// Wraps the `quantized_qmm` metallib's `affine_qmm_n` kernel.
+///
+/// Caller invariants (mirroring `MetalAffineQmmT` for the symmetric
+/// transpose=true case):
+/// - Activations `x`: `[M, K]` row-contiguous in `dtype`.
+/// - Packed weight `w`: `[K, N / pack_factor]` U32 (`pack_factor = 8`
+///   for bits=4). Note the layout differs from `qmm_t` (which is
+///   `[N, K / pack_factor]`); MLX's quantize-along-last-axis convention
+///   keeps the last axis of W as the quantized one — that's K for
+///   transpose=true (W shape `[N, K]`) and N for transpose=false
+///   (W shape `[K, N]`).
+/// - `scales`, `biases`: `[K, N / group_size]` in `dtype`. Same
+///   last-axis convention.
+/// - Output `y`: `[M, N]` in `dtype`.
+/// - `bits` ∈ {4} (P5 mandate).
+/// - `group_size` ∈ {32, 64, 128}.
+/// - `N % 32 == 0` (MLX `qmm_n` assumes this; the dispatcher in
+///   `quantized.cpp` doesn't gate on it but kernel store_result
+///   writes unconditional BN×BM tiles for full-M tiles).
+pub struct MetalAffineQmmN {
+    shader_cache: Arc<ShaderCache>,
+}
+
+impl MetalAffineQmmN {
+    pub fn new(device: Device) -> Result<Self, MetalStreamError> {
+        Ok(Self {
+            shader_cache: Arc::new(ShaderCache::new(device)?),
+        })
+    }
+
+    pub fn with_shader_cache(shader_cache: Arc<ShaderCache>) -> Self {
+        Self { shader_cache }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        x: &Buffer,
+        packed_w: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        y: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        b: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<(), MetalStreamError> {
+        if bits != 4 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_n: only bits=4 is wired in P5, got bits={bits}"
+            )));
+        }
+        if !matches!(group_size, 32 | 64 | 128) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_n: only group_size in {{32, 64, 128}} is wired, got {group_size}"
+            )));
+        }
+        if b > 1 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_n: batched=1 (B={b}) not yet wired (B=1 in P5)"
+            )));
+        }
+        if !n.is_multiple_of(group_size) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qmm_n: N={n} not divisible by group_size={group_size} \
+                 (transpose=false stores scales/biases per (K, N/gs))"
+            )));
+        }
+
+        let kernel_name = qmm_n_kernel_name(dtype, group_size, bits);
+        // K / N / M ride as function constants 0/1/2 (matching the
+        // qmm_t / qmm_t_splitk pattern in this same metallib).
+        let constants = [
+            ConstantValue::int(0, k as i32),
+            ConstantValue::int(1, n as i32),
+            ConstantValue::int(2, m as i32),
+        ];
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(&kernel_name, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+
+        // SAFETY: all buffer pointers are valid `Retained` objects;
+        // `setBuffer:offset:atIndex:` only borrows them through the call.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(packed_w), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(x), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y), 0, 4);
+        }
+
+        let (tg, tpg) = qmm_n_dispatch_shape(m, n, b);
+        let threadgroups = MTLSize {
+            width: tg.0 as usize,
+            height: tg.1 as usize,
+            depth: tg.2 as usize,
+        };
+        let threads_per_threadgroup = MTLSize {
+            width: tpg.0 as usize,
+            height: tpg.1 as usize,
+            depth: tpg.2 as usize,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Decode-bucket qvm / qvm_split_k dispatcher — port of
+// `quantized.cpp:419 qvm()` + `:298 qvm_split_k()`. Fires when
+// M < vector_limit AND transpose=false (the matvec-transpose=false
+// branch at `:1444-1453`):
+//   K <  1024  →  qvm
+//   K >= 1024  →  qvm_split_k (split_k = K > 8192 ? 32 : 8)
+// ─────────────────────────────────────────────────────────────────
+
+/// Picked qvm variant for a given `(M, N, K)` shape (matvec
+/// transpose=false branch). Mirrors `QuantizedMatmul::eval_gpu`
+/// at `quantized.cpp:1445-1452`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QvmKernel {
+    /// `affine_qvm_*_batch_0` — K < 1024. MLX `qvm` at
+    /// `quantized.cpp:419`.
+    Standard,
+    /// `affine_qvm_split_k_*` — K >= 1024. MLX `qvm_split_k` at
+    /// `quantized.cpp:298`; `split_k = K > 8192 ? 32 : 8` and
+    /// `split_D = ceil(K / split_k)`.
+    SplitK {
+        split_k: u32,
+        k_partition_size: u32,
+        final_block_size: u32,
+    },
+}
+
+/// Pick the right qvm variant for `(M, N, K)`. Mirrors MLX's
+/// transpose=false matvec routing at `quantized.cpp:1444-1453`:
+///
+/// ```text
+/// if (K < 1024)  qvm(...)
+/// else           qvm_split_k(...)
+///   split_k = K > 8192 ? 32 : 8
+///   split_D = ceil(K / split_k)
+///   final_block_size = K - (split_k - 1) * split_D
+/// ```
+pub fn pick_qvm_kernel(k: u32) -> QvmKernel {
+    if k < 1024 {
+        QvmKernel::Standard
+    } else {
+        let split_k: u32 = if k > 8192 { 32 } else { 8 };
+        let split_d = k.div_ceil(split_k);
+        let final_block_size = k - (split_k - 1) * split_d;
+        QvmKernel::SplitK {
+            split_k,
+            k_partition_size: split_d,
+            final_block_size,
+        }
+    }
+}
+
+/// Threadgroup grid + threads-per-group for a picked qvm variant.
+/// Matches MLX's dispatch:
+///
+/// qvm (`quantized.cpp:438-439`):
+///   group (bk=32, num_simdgroups=2, 1); grid (M, (N+bn-1)/bn, B)
+///   where `bn = min(group_size, 32) * 2`.
+///
+/// qvm_split_k (`quantized.cpp:322-323`):
+///   group (bk=32, num_simdgroups=2, 1); grid (M, N/bn, B*split_k).
+pub fn qvm_dispatch_shape(
+    kernel: QvmKernel,
+    m: u32,
+    n: u32,
+    b: u32,
+    group_size: u32,
+) -> ((u32, u32, u32), (u32, u32, u32)) {
+    let bn: u32 = group_size.min(32) * 2; // 64 for gs ∈ {32, 64, 128}
+    match kernel {
+        QvmKernel::Standard => ((m, n.div_ceil(bn), b), (32, 2, 1)),
+        QvmKernel::SplitK { split_k, .. } => ((m, n / bn, b * split_k), (32, 2, 1)),
+    }
+}
+
+/// Format the kernel symbol name. Matches the `INST_QVM_*` macros
+/// in `shaders/quantized_qvm.metal`.
+pub fn qvm_kernel_name(
+    kernel: QvmKernel,
+    dtype: DequantDtype,
+    group_size: u32,
+    bits: u32,
+) -> String {
+    let dtype = dtype.symbol_infix();
+    match kernel {
+        QvmKernel::Standard => {
+            format!("affine_qvm_{dtype}_gs_{group_size}_b_{bits}_batch_0")
+        }
+        QvmKernel::SplitK { .. } => {
+            format!("affine_qvm_split_k_{dtype}_gs_{group_size}_b_{bits}")
+        }
+    }
+}
+
+/// `&'static str` view of [`qvm_kernel_name`] for the lowering pass.
+pub fn qvm_kernel_static_name(
+    kernel: QvmKernel,
+    dtype: DequantDtype,
+    bits: u32,
+    group_size: u32,
+) -> &'static str {
+    debug_assert_eq!(bits, 4, "qvm_kernel_static_name: only bits=4 is wired");
+    use DequantDtype::*;
+    match (kernel, dtype, group_size) {
+        // ── qvm Standard ──────────────────────────────────────────
+        (QvmKernel::Standard, F16, 32) => "affine_qvm_f16_gs_32_b_4_batch_0",
+        (QvmKernel::Standard, F16, 64) => "affine_qvm_f16_gs_64_b_4_batch_0",
+        (QvmKernel::Standard, F16, 128) => "affine_qvm_f16_gs_128_b_4_batch_0",
+        (QvmKernel::Standard, Bf16, 32) => "affine_qvm_bf16_gs_32_b_4_batch_0",
+        (QvmKernel::Standard, Bf16, 64) => "affine_qvm_bf16_gs_64_b_4_batch_0",
+        (QvmKernel::Standard, Bf16, 128) => "affine_qvm_bf16_gs_128_b_4_batch_0",
+        // ── qvm_split_k ──────────────────────────────────────────
+        (QvmKernel::SplitK { .. }, F16, 32) => "affine_qvm_split_k_f16_gs_32_b_4",
+        (QvmKernel::SplitK { .. }, F16, 64) => "affine_qvm_split_k_f16_gs_64_b_4",
+        (QvmKernel::SplitK { .. }, F16, 128) => "affine_qvm_split_k_f16_gs_128_b_4",
+        (QvmKernel::SplitK { .. }, Bf16, 32) => "affine_qvm_split_k_bf16_gs_32_b_4",
+        (QvmKernel::SplitK { .. }, Bf16, 64) => "affine_qvm_split_k_bf16_gs_64_b_4",
+        (QvmKernel::SplitK { .. }, Bf16, 128) => "affine_qvm_split_k_bf16_gs_128_b_4",
+        (_, _, gs) => panic!(
+            "qvm_kernel_static_name: unsupported group_size={gs} \
+             — only 32, 64, 128 instantiated"
+        ),
+    }
+}
+
+/// MLX-affine int4 decode-matvec transpose=false dispatcher. Wraps
+/// the `quantized_qvm` metallib's `affine_qvm` + `affine_qvm_split_k`
+/// kernels.
+///
+/// Caller invariants (same as `MetalAffineQmmN`):
+/// - `x`: `[M, K]` row-contiguous in `dtype`.
+/// - `w`: `[K, N / pack_factor]` U32.
+/// - `scales`, `biases`: `[K, N / group_size]` in `dtype`.
+/// - `y`: `[M, N]` in `dtype` for the `Standard` kernel; for
+///   `SplitK`, caller passes an intermediate scratch of shape
+///   `[split_k, M, N]` and is responsible for the downstream
+///   sum-reduce along axis 0 (mirrors
+///   `strided_reduce_general_dispatch` at `quantized.cpp:415`).
+/// - `bits` ∈ {4}.
+/// - `group_size` ∈ {32, 64, 128}.
+/// - `N % bn == 0` where `bn = min(group_size, 32) * 2 = 64` (the
+///   `qvm` kernel ceils via `(N + bn - 1) / bn` so unaligned N is
+///   safe at the grid level, but `qvm_split_k` uses `N / bn` with
+///   no ceil — so it requires `N % 64 == 0`).
+pub struct MetalAffineQvm {
+    shader_cache: Arc<ShaderCache>,
+}
+
+impl MetalAffineQvm {
+    pub fn new(device: Device) -> Result<Self, MetalStreamError> {
+        Ok(Self {
+            shader_cache: Arc::new(ShaderCache::new(device)?),
+        })
+    }
+
+    pub fn with_shader_cache(shader_cache: Arc<ShaderCache>) -> Self {
+        Self { shader_cache }
+    }
+
+    /// Returns the picked variant for the given K (so the caller
+    /// knows whether to allocate a `[split_k, M, N]` scratch + emit
+    /// a downstream sum-reduce).
+    pub fn plan(&self, k: u32) -> QvmKernel {
+        pick_qvm_kernel(k)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        x: &Buffer,
+        packed_w: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        y: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        b: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<QvmKernel, MetalStreamError> {
+        if bits != 4 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qvm: only bits=4 is wired in P5, got bits={bits}"
+            )));
+        }
+        if !matches!(group_size, 32 | 64 | 128) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qvm: only group_size in {{32, 64, 128}} is wired, got {group_size}"
+            )));
+        }
+        if b > 1 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qvm: batched=1 (B={b}) not yet wired (B=1 in P5)"
+            )));
+        }
+        if !n.is_multiple_of(group_size) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_qvm: N={n} not divisible by group_size={group_size} \
+                 (transpose=false stores scales/biases per (K, N/gs))"
+            )));
+        }
+
+        let kernel = pick_qvm_kernel(k);
+        let kernel_name = qvm_kernel_name(kernel, dtype, group_size, bits);
+        // Function constants 0..5 (only the ones the picked variant
+        // reads are needed, but the Metal compiler dead-codes unused
+        // constant reads; we send all five for the splitk variant
+        // and only K/N/M for the standard variant).
+        let constants: Vec<ConstantValue> = match kernel {
+            QvmKernel::Standard => vec![
+                ConstantValue::int(0, k as i32),
+                ConstantValue::int(1, n as i32),
+                ConstantValue::int(2, m as i32),
+            ],
+            QvmKernel::SplitK {
+                split_k,
+                k_partition_size,
+                final_block_size,
+            } => vec![
+                ConstantValue::int(0, k as i32),
+                ConstantValue::int(1, n as i32),
+                ConstantValue::int(2, m as i32),
+                ConstantValue::int(3, k_partition_size as i32),
+                ConstantValue::int(4, final_block_size as i32),
+                ConstantValue::int(5, split_k as i32),
+            ],
+        };
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(&kernel_name, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+
+        // Buffer bindings 0..4 — same layout as MLX
+        // `affine_qvm` kernel signature (`quantized.h:1601-1605`).
+        // SAFETY: all buffer pointers are valid `Retained` objects;
+        // `setBuffer:offset:atIndex:` only borrows them through the call.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(packed_w), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(x), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y), 0, 4);
+        }
+
+        let (tg, tpg) = qvm_dispatch_shape(kernel, m, n, b, group_size);
+        let threadgroups = MTLSize {
+            width: tg.0 as usize,
+            height: tg.1 as usize,
+            depth: tg.2 as usize,
+        };
+        let threads_per_threadgroup = MTLSize {
+            width: tpg.0 as usize,
+            height: tpg.1 as usize,
+            depth: tpg.2 as usize,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(kernel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1496,109 @@ mod tests {
             1,
         );
         assert_eq!((tx, ty, tz), (64, 2, 4));
+        assert_eq!((gx, gy, gz), (32, 2, 2));
+    }
+
+    #[test]
+    fn qvm_kernel_pick_matches_mlx_rule() {
+        // K < 1024 → Standard
+        assert_eq!(pick_qvm_kernel(64), QvmKernel::Standard);
+        assert_eq!(pick_qvm_kernel(1023), QvmKernel::Standard);
+        // K == 1024 → SplitK with split_k=8
+        let k = pick_qvm_kernel(1024);
+        assert!(matches!(
+            k,
+            QvmKernel::SplitK {
+                split_k: 8,
+                k_partition_size: 128,
+                final_block_size: 128,
+            }
+        ));
+        // K = 4096 → SplitK with split_k=8, split_D=512
+        let k = pick_qvm_kernel(4096);
+        assert!(matches!(
+            k,
+            QvmKernel::SplitK {
+                split_k: 8,
+                k_partition_size: 512,
+                final_block_size: 512,
+            }
+        ));
+        // K = 8193 → split_k=32 (K > 8192)
+        let k = pick_qvm_kernel(8193);
+        assert!(matches!(k, QvmKernel::SplitK { split_k: 32, .. }));
+        // K = 8200 → split_k=32, split_D=257, final_block_size=200
+        // (K - 31*257 = 8200 - 7967 = 233, but 8200/32 ceil = 257)
+        let k = pick_qvm_kernel(8200);
+        if let QvmKernel::SplitK {
+            split_k,
+            k_partition_size,
+            final_block_size,
+        } = k
+        {
+            assert_eq!(split_k, 32);
+            assert_eq!(k_partition_size, 257); // ceil(8200/32)
+            assert_eq!(final_block_size, 8200 - 31 * 257);
+        } else {
+            panic!("expected SplitK, got {k:?}");
+        }
+    }
+
+    #[test]
+    fn qvm_dispatch_shape_matches_mlx() {
+        // qvm: grid (M, ceil(N / bn), B); bn = min(gs, 32)*2 = 64
+        let ((tx, ty, tz), (gx, gy, gz)) = qvm_dispatch_shape(QvmKernel::Standard, 1, 4096, 1, 64);
+        assert_eq!((tx, ty, tz), (1, 4096 / 64, 1));
+        assert_eq!((gx, gy, gz), (32, 2, 1));
+
+        // qvm_split_k: grid (M, N/bn, B * split_k)
+        let kernel = QvmKernel::SplitK {
+            split_k: 8,
+            k_partition_size: 512,
+            final_block_size: 512,
+        };
+        let ((tx, ty, tz), _) = qvm_dispatch_shape(kernel, 1, 4096, 1, 64);
+        assert_eq!((tx, ty, tz), (1, 4096 / 64, 8));
+    }
+
+    #[test]
+    fn qvm_kernel_name_matches_metallib_symbols() {
+        assert_eq!(
+            qvm_kernel_name(QvmKernel::Standard, DequantDtype::Bf16, 64, 4),
+            "affine_qvm_bf16_gs_64_b_4_batch_0"
+        );
+        assert_eq!(
+            qvm_kernel_name(
+                QvmKernel::SplitK {
+                    split_k: 8,
+                    k_partition_size: 512,
+                    final_block_size: 512
+                },
+                DequantDtype::F16,
+                128,
+                4
+            ),
+            "affine_qvm_split_k_f16_gs_128_b_4"
+        );
+    }
+
+    #[test]
+    fn qmm_n_kernel_name_matches_metallib_symbols() {
+        assert_eq!(
+            qmm_n_kernel_name(DequantDtype::Bf16, 64, 4),
+            "affine_qmm_n_bf16_gs_64_b_4_batch_0"
+        );
+        assert_eq!(
+            qmm_n_kernel_name(DequantDtype::F16, 32, 4),
+            "affine_qmm_n_f16_gs_32_b_4_batch_0"
+        );
+    }
+
+    #[test]
+    fn qmm_n_dispatch_shape_matches_mlx() {
+        // qmm_n: grid (ceil(N/32), ceil(M/32), B); group (32, 2, 2)
+        let ((tx, ty, tz), (gx, gy, gz)) = qmm_n_dispatch_shape(64, 2048, 1);
+        assert_eq!((tx, ty, tz), (64, 2, 1));
         assert_eq!((gx, gy, gz), (32, 2, 2));
     }
 

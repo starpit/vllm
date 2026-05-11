@@ -68,6 +68,10 @@ impl ShaderCache {
                 &crate::embedded_metallib!("quantized_qmm")[..],
             ),
             (
+                "quantized_qvm",
+                &crate::embedded_metallib!("quantized_qvm")[..],
+            ),
+            (
                 "quantized_splitk_reduce",
                 &crate::embedded_metallib!("quantized_splitk_reduce")[..],
             ),
@@ -97,14 +101,24 @@ impl ShaderCache {
             self.libraries.get("fused_gate_up_silu_mul")
         } else if name.starts_with("affine_dequantize_") {
             self.libraries.get("quantized_dequantize")
-        } else if name.starts_with("affine_qmm_t_") {
-            // Matches both `affine_qmm_t_<dtype>_*` and
-            // `affine_qmm_t_splitk_<dtype>_*` by prefix.
+        } else if name.starts_with("affine_qmm_t_") || name.starts_with("affine_qmm_n_") {
+            // Matches `affine_qmm_t_<dtype>_*`,
+            // `affine_qmm_t_splitk_<dtype>_*`, and
+            // `affine_qmm_n_<dtype>_*` by prefix — all live in
+            // shaders/quantized_qmm.metal.
             self.libraries.get("quantized_qmm")
         } else if name.starts_with("affine_qmv_") {
             // Also matches `affine_qmv_quad_*` and `affine_qmv_fast_*`
             // by prefix.
             self.libraries.get("quantized_qmv")
+        } else if name.starts_with("affine_qvm_") {
+            // Matches `affine_qvm_<dtype>_*` and
+            // `affine_qvm_split_k_<dtype>_*` by prefix. Distinct
+            // from qmv (the letter order matters): qmv =
+            // matvec-transpose=true (in quantized_qmv.metal); qvm
+            // = vector × matrix transpose=false
+            // (in quantized_qvm.metal).
+            self.libraries.get("quantized_qvm")
         } else if name.starts_with("splitk_reduce_") {
             self.libraries.get("quantized_splitk_reduce")
         } else if name.starts_with("silu_mul") {

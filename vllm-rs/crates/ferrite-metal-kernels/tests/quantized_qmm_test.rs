@@ -19,6 +19,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use ferrite_metal_kernels::cpu_reference::affine_qmm_t_b4_bf16 as cpu_qmm_t_bf16;
 use ferrite_metal_kernels::device::detect_device;
 use ferrite_metal_kernels::quantized::{
     pick_qmm_t_kernel, DequantDtype, MetalAffineQmmT, QmmTKernel,
@@ -102,45 +103,9 @@ fn make_inputs_bf16(
     (packed, scales, biases, x)
 }
 
-/// Full CPU matmul reference (M × K) @ (N × K)^T → (M × N), bf16 in/out
-/// with f32 accumulation. Equivalent semantics to dequant-then-matmul.
-fn cpu_qmm_t_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    // Dequantize the full weight tile [N, K]. Inline the 4-bit
-    // dequant formula (`quantized.h:521-527` for the per-byte case;
-    // we walk packed-byte order which gives 2 nibbles / byte).
-    let mut w = vec![half::bf16::ZERO; n * k];
-    for (offset, &byte) in packed.iter().enumerate() {
-        let oindex = offset * 2;
-        let gindex = oindex / group_size;
-        let scale = scales[gindex].to_f32();
-        let bias = biases[gindex].to_f32();
-        let lo = (byte & 0x0f) as f32;
-        let hi = ((byte >> 4) & 0x0f) as f32;
-        w[oindex] = half::bf16::from_f32(scale * lo + bias);
-        w[oindex + 1] = half::bf16::from_f32(scale * hi + bias);
-    }
-    // y[i, j] = sum_k(x[i, k] * w[j, k])  (transpose=true).
-    let mut y = vec![half::bf16::ZERO; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc: f32 = 0.0;
-            for kk in 0..k {
-                acc += x[i * k + kk].to_f32() * w[j * k + kk].to_f32();
-            }
-            y[i * n + j] = half::bf16::from_f32(acc);
-        }
-    }
-    y
-}
+// CPU reference is shared with qmv (same math, transpose=true) — see
+// `ferrite_metal_kernels::cpu_reference::affine_qmm_t_b4_bf16`,
+// imported above as `cpu_qmm_t_bf16`.
 
 #[allow(clippy::too_many_arguments)]
 fn run_qmm_t_bf16(

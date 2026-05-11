@@ -9,6 +9,7 @@
 pub mod activation;
 pub mod allocator;
 pub mod argmax;
+pub mod cpu_reference;
 pub mod device;
 pub mod fused_kernels;
 pub mod gemm;

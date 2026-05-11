@@ -19,6 +19,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use ferrite_metal_kernels::cpu_reference::affine_qvm_b4_bf16 as cpu_qvm_bf16;
 use ferrite_metal_kernels::device::detect_device;
 use ferrite_metal_kernels::quantized::{pick_qvm_kernel, DequantDtype, MetalAffineQvm, QvmKernel};
 use ferrite_metal_kernels::stream::MetalStream;
@@ -100,44 +101,9 @@ fn make_inputs_bf16(
     (packed, scales, biases, x)
 }
 
-/// CPU reference: dequant + dense matmul for transpose=false (W is
-/// `[K, N]` row-major). Same math as qmm_n.
-fn cpu_qvm_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    let mut w = vec![half::bf16::ZERO; k * n];
-    for kk in 0..k {
-        for byte_j in 0..(n / 2) {
-            let byte = packed[kk * (n / 2) + byte_j];
-            let n_col = 2 * byte_j;
-            let group_idx = kk * (n / group_size) + n_col / group_size;
-            let scale = scales[group_idx].to_f32();
-            let bias = biases[group_idx].to_f32();
-            let lo = (byte & 0x0f) as f32;
-            let hi = ((byte >> 4) & 0x0f) as f32;
-            w[kk * n + n_col] = half::bf16::from_f32(scale * lo + bias);
-            w[kk * n + n_col + 1] = half::bf16::from_f32(scale * hi + bias);
-        }
-    }
-    let mut y = vec![half::bf16::ZERO; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc: f32 = 0.0;
-            for kk in 0..k {
-                acc += x[i * k + kk].to_f32() * w[kk * n + j].to_f32();
-            }
-            y[i * n + j] = half::bf16::from_f32(acc);
-        }
-    }
-    y
-}
+// CPU reference now lives in `ferrite_metal_kernels::cpu_reference`
+// (imported above as `cpu_qvm_bf16`). Shares the transpose=false
+// matmul with qmm_n.
 
 #[allow(clippy::too_many_arguments)]
 fn run_qvm_bf16(

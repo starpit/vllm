@@ -17,6 +17,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use ferrite_metal_kernels::device::detect_device;
 use ferrite_metal_kernels::quantized::{pick_qmv_kernel, DequantDtype, MetalAffineQmv, QmvKernel};
 use ferrite_metal_kernels::stream::MetalStream;
@@ -101,45 +102,6 @@ fn make_inputs_bf16(
         .collect();
 
     (packed, scales, biases, x)
-}
-
-/// CPU reference: dequantize w → bf16 [N, K], then `y = x @ w^T`
-/// accumulating in f32 and casting per-output to bf16.
-fn cpu_qmv_bf16(
-    packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
-    x: &[half::bf16],
-    m: usize,
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Vec<half::bf16> {
-    // Dequantize the full weight tile [N, K] using the cpu_golden formula
-    // inlined locally (so this test stays self-contained).
-    let mut w = vec![half::bf16::ZERO; n * k];
-    for (offset, &byte) in packed.iter().enumerate() {
-        let oindex = offset * 2;
-        let gindex = oindex / group_size;
-        let scale = scales[gindex].to_f32();
-        let bias = biases[gindex].to_f32();
-        let lo = (byte & 0x0f) as f32;
-        let hi = ((byte >> 4) & 0x0f) as f32;
-        w[oindex] = half::bf16::from_f32(scale * lo + bias);
-        w[oindex + 1] = half::bf16::from_f32(scale * hi + bias);
-    }
-    // Matmul: y[i, j] = sum_k(x[i, k] * w[j, k]) — transpose=true.
-    let mut y = vec![half::bf16::ZERO; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc: f32 = 0.0;
-            for kk in 0..k {
-                acc += x[i * k + kk].to_f32() * w[j * k + kk].to_f32();
-            }
-            y[i * n + j] = half::bf16::from_f32(acc);
-        }
-    }
-    y
 }
 
 #[allow(clippy::too_many_arguments)]

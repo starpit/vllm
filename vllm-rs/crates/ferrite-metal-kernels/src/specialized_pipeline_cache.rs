@@ -177,6 +177,10 @@ impl SpecializedPipelineCache {
                     "fused_qkv_rope_cache",
                     crate::embedded_metallib!("fused_qkv_rope_cache"),
                 ),
+                (
+                    "fused_affine_qkv_rope_cache",
+                    crate::embedded_metallib!("fused_affine_qkv_rope_cache"),
+                ),
                 ("attention", crate::embedded_metallib!("attention")),
                 ("rope", crate::embedded_metallib!("rope")),
                 ("embed", crate::embedded_metallib!("embed")),

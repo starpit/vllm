@@ -61,6 +61,15 @@ pub enum KernelId {
     /// `fused_qkv_rope_cache_<dtype>_specialized` in
     /// `fused_qkv_rope_cache.metallib`.
     FusedQkvRopeCache,
+    /// Affine-int4 sibling of [`KernelId::FusedQkvRopeCache`]. Reads
+    /// packed `u32` weights + per-group F16 scales/biases (mlx-community
+    /// 4bit layout) for Q/K/V concatenated along the output axis, fuses
+    /// the dequant→matmul→RoPE→paged-cache-write chain in a single
+    /// launch. Maps to
+    /// `fused_affine_qkv_rope_cache_<dtype>_s_<scale_dtype>_b_4_specialized`
+    /// in `fused_affine_qkv_rope_cache.metallib`. Group size rides on
+    /// function constant 7.
+    FusedAffineQkvRopeCache,
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,

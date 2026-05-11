@@ -476,34 +476,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 r
             })
             .collect();
-        // We open compute encoders lazily so a leading-GEMM bucket
-        // doesn't open an empty one. `current` is `Some` only while
-        // an encoder is live — every Gemm step ends it, every Icb
-        // step opens it on demand.
+        // One compute encoder per ICB run. A run starts on the first
+        // `BucketStep::Icb`, grows across every subsequent ICB step,
+        // and only ends when a `BucketStep::Gemm` forces an encoder
+        // boundary (production canonicals don't emit MPS GEMMs, so
+        // every q4 / bf16 Llama bucket runs under one encoder
+        // end-to-end). The encoder's default `dispatchType` is
+        // `Serial`, which serializes consecutive
+        // `executeCommandsInBuffer` calls on the same encoder — the
+        // same RAW-correctness guarantee we used to get from
+        // ending+reopening the encoder per step, at a fraction of the
+        // cost.
         let mut current: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>> = None;
-        // Storage for the live encoder. `metal-rs` returns a
-        // `&ComputeCommandEncoderRef` borrowed from the cmd buffer;
-        // there's no owned wrapper, so we keep the active one in a
-        // local `Option` and re-fetch via `cmdbuf.computeCommandEncoder().expect("computeCommandEncoder returned nil")`
-        // when we need a new one.
-        // Track the previous ICB step's resources so we can insert a
-        // memory barrier between dependent ICB commands inside the
-        // same compute encoder. ICB's `concurrentDispatchThreadgroups`
-        // (the only ICB dispatch primitive) makes consecutive
-        // `executeCommandsInBuffer` calls concurrent — without this
-        // barrier a read-after-write hazard between e.g. RopeAppend
-        // (writes KV cache) and AttentionViaCache (reads it) races and
-        // produces 100x slowdown / wrong data.
-        //
-        // The FUF/lowered tape carries the exact slot + runtime
-        // bindings each command touches, so we insert the barrier
-        // unconditionally between consecutive ICB steps with the
-        // PREVIOUS step's resources as the barrier's resource set.
-        // (The next step's reads will be ordered after those writes.)
-        // Per `memoryBarrierWithResources:` semantics, only the listed
-        // resources are synchronized — much cheaper than ending the
-        // encoder.
-        let mut prev_step_resources: Option<Vec<&Buffer>> = None;
         for step in &baking.steps {
             match step {
                 BucketStep::Icb {
@@ -512,25 +496,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     step_resources,
                     ..
                 } => {
-                    // End the encoder between every ICB step. Within
-                    // one compute encoder Apple's `concurrentDispatchThreadgroups`
-                    // (the only ICB dispatch primitive) makes
-                    // consecutive `executeCommandsInBuffer` calls
-                    // concurrent — and `memoryBarrierWithResources:`
-                    // empirically does NOT suffice to serialize
-                    // consecutive ICB execs. Cross-encoder ordering
-                    // is enforced by Apple's command queue, so each
-                    // ICB step becoming its own encoder gives us
-                    // correct RAW dependencies. Cost is ~us per
-                    // encoder boundary.
-                    if let Some(enc) = current.take() {
-                        enc.endEncoding();
-                    }
-                    let _ = step_resources; // reserved for finer-grained barrier later
-                    let _ = &prev_step_resources;
-                    let enc = cmdbuf
-                        .computeCommandEncoder()
-                        .expect("computeCommandEncoder returned nil");
+                    let _ = step_resources;
+                    let enc = match current.as_ref() {
+                        Some(e) => e.clone(),
+                        None => {
+                            let e = cmdbuf
+                                .computeCommandEncoder()
+                                .expect("computeCommandEncoder returned nil");
+                            current = Some(e.clone());
+                            e
+                        }
+                    };
                     if std::env::var("FERRITE_METAL_FORCE_USE_RESOURCES").is_ok()
                         && !resource_refs.is_empty()
                     {
@@ -543,16 +519,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     }
                     enc.setComputePipelineState(pipeline);
                     baking.icb.execute_on_encoder(&enc, range.clone());
-                    current = Some(enc);
                 }
                 BucketStep::Gemm { a, b, c, m, n, k } => {
                     if let Some(enc) = current.take() {
                         enc.endEncoding();
                     }
-                    // Encoder boundary clears the prev-resources tracking;
-                    // ordering across encoders is provided by Apple's
-                    // command queue.
-                    prev_step_resources = None;
                     encode_gemm_into_command_buffer(
                         device,
                         cmdbuf,

@@ -575,28 +575,42 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout(weights)?;
         write_runtime_inputs(&guard.runtime, inputs)?;
 
-        // Default execution: per-step command buffer + direct dispatch
-        // (ICB bypass). Two reasons we make this the default:
-        //  1. The ICB execution path is currently broken for bf16 GEMM
-        //     — the kernel runs but produces stale/wrong outputs for
-        //     decode buckets. Symptom on Llama-3.2-3B: prefill emits a
-        //     coherent first token then decode collapses to repeated
-        //     special characters. Direct dispatch sidesteps the ICB
-        //     write bug entirely (matches every passing kernel golden).
-        //  2. Per-step cmdbufs are empirically ~10× faster than the
-        //     batched single-cmdbuf `run_bucket` on Apple Silicon.
+        // Default execution: batched single-cmdbuf + ICB execute.
+        // One command buffer per forward, one encoder per step, one
+        // `executeCommandsInBuffer` per ICB range, commit once, wait
+        // once. The prior "ICB produces wrong output" issue was rooted
+        // in `RuntimeBindings` metadata buffers missing from the
+        // residency set — `MetalWorker::new_with_residency` now
+        // inserts them, so ICB-bound runtime reads see live pages
+        // instead of stale ones.
         //
-        // The env vars below stay as overrides for debugging:
+        // Env-var diagnostic overrides:
         //   `FERRITE_METAL_STEP_DEBUG=1` — per-step + eprintln dumps.
-        //   `FERRITE_METAL_USE_BATCHED_CMDBUF=1` — old `run_bucket`
-        //                                          batched path.
-        //   `FERRITE_METAL_NO_DIRECT_DISPATCH=1` — keep per-step but
-        //     drive ICB execution (broken for bf16; left for diagnosis).
+        //   `FERRITE_METAL_PER_STEP_CMDBUF=1` — opt back into the
+        //     per-step cmdbuf + direct-dispatch fallback (4× slower
+        //     than the batched ICB path; kept for bisecting any
+        //     future ICB regression).
         if std::env::var_os("FERRITE_METAL_STEP_DEBUG").is_some() {
             guard
                 .worker
                 .run_bucket_per_step_debug(bucket_idx, &self.device, queue)?;
-        } else if std::env::var_os("FERRITE_METAL_USE_BATCHED_CMDBUF").is_some() {
+        } else if std::env::var_os("FERRITE_METAL_PER_STEP_CMDBUF").is_some() {
+            // Diagnostic fallback: per-step cmdbuf + direct dispatch.
+            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+            let t0 = std::time::Instant::now();
+            guard
+                .worker
+                .run_bucket_per_step_silent(bucket_idx, &self.device, queue)?;
+            if trace {
+                eprintln!(
+                    "[forward bucket={} num_tokens={} per_step] total={:?}",
+                    bucket_idx,
+                    inputs.num_tokens,
+                    t0.elapsed(),
+                );
+            }
+        } else {
+            // Production default: batched ICB execute.
             let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
             let t_pre = std::time::Instant::now();
             let cb = queue.commandBuffer().expect("commandBuffer returned nil");
@@ -620,23 +634,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
             if status != MTLCommandBufferStatus::Completed {
                 return Err(ForwardError::ExecutionFailed(status));
-            }
-        } else {
-            // Production default: per-step + direct-dispatch path. The
-            // `run_bucket_per_step_silent` defaults `direct=true` and
-            // reads `FERRITE_METAL_DIRECT_DISPATCH=0` as the off-switch.
-            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
-            let t0 = std::time::Instant::now();
-            guard
-                .worker
-                .run_bucket_per_step_silent(bucket_idx, &self.device, queue)?;
-            if trace {
-                eprintln!(
-                    "[forward bucket={} num_tokens={} per_step] total={:?}",
-                    bucket_idx,
-                    inputs.num_tokens,
-                    t0.elapsed(),
-                );
             }
         }
 

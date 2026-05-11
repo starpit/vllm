@@ -305,6 +305,7 @@ mod tests {
                 | KernelId::AffineQmv
                 | KernelId::AffineQmmT
                 | KernelId::AffineQmmTSplitK
+                | KernelId::AffineEmbed
                 | KernelId::SiluMul
                 | KernelId::SplitKReduceSum,
                 _,
@@ -366,6 +367,7 @@ mod tests {
             | KernelId::AffineQmv
             | KernelId::AffineQmmT
             | KernelId::AffineQmmTSplitK
+            | KernelId::AffineEmbed
             | KernelId::SiluMul
             | KernelId::SplitKReduceSum => {
                 // See `kernel_msl_names` for the matching gap — this

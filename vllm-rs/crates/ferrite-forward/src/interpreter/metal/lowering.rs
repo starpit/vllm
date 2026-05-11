@@ -568,6 +568,94 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── MLX-affine int4 quantized embedding (P6) ─────────────
+        //
+        // `Instruction::AffineEmbed` replaces `Instruction::Embed`
+        // when `model.embed_tokens` ships as a quantized triple
+        // `(weight=U32, scales, biases)` — i.e. every
+        // `mlx-community/*-4bit` checkpoint. The fused
+        // `affine_embed_<dtype>_gs_<gs>_b_4` kernel reads
+        // `vocab_idx = indices[token_row]` then dequants from row
+        // `vocab_idx` of the packed weight + scales + biases in one
+        // pass (faithful port of `nn.QuantizedEmbedding.__call__`).
+        //
+        // 2D dispatch:
+        //   threadgroups = (ceil((Q_SIZE/2) / 256), bucket_m, 1)
+        //   threads_per_threadgroup = (256, 1, 1)
+        // The kernel bounds-checks `index.x * 2 >= hidden_size`,
+        // which keeps the partial trailing threadgroup safe when
+        // Q_SIZE/2 is not a multiple of 256 (Llama-3.2-3B's
+        // Q_SIZE=3072 → bytes_per_row=1536 = 6 × 256, clean; Qwen2
+        // 1.5B's Q_SIZE=1536 → 768 = 3 × 256, clean; but
+        // e.g. Q_SIZE=2048 → 1024 = 4 × 256, no partial threads —
+        // pessimistically still safe).
+        //
+        // Bindings (mirror `affine_qmm_bindings` ordering for
+        // consistency with the standalone `MetalAffineEmbed::execute`):
+        //   buffer(0) packed weight   buffer(1) scales   buffer(2) biases
+        //   buffer(3) input_ids       buffer(4) out (arena[out_slot])
+        // hidden_size rides as `[[function_constant(0)]]`.
+        #[cfg(feature = "metal")]
+        I::AffineEmbed(out_slot, wt_fn, group_size, bits) => {
+            let dtype = dequant_dtype_for::<W>();
+            let bits_v = *bits;
+            let gs = *group_size;
+            assert_eq!(
+                bits_v, 4,
+                "AffineEmbed: only bits=4 is wired in P6 (every sampled \
+                 mlx-community 4bit checkpoint uses bits=4; \
+                 INT4_PARITY_PROBES.md §1); got bits={bits_v}"
+            );
+            assert!(
+                matches!(gs, 32 | 64 | 128),
+                "AffineEmbed: only group_size ∈ {{32, 64, 128}} is wired \
+                 (mlx-community uses gs=64 for every Llama/Qwen/Gemma 4bit; \
+                 INT4_PARITY_PROBES.md §3); got gs={gs}"
+            );
+            let hidden_size = W::Q_SIZE as u32;
+            let bytes_per_row = hidden_size / 2;
+            let groups_x = bytes_per_row.div_ceil(THREADS_PER_GROUP);
+            LoweredCommand {
+                kernel: KernelId::AffineEmbed,
+                library: "quantized_dequantize",
+                function: affine_embed_kernel_static_name(dtype, gs),
+                constants: vec![ConstantValue::uint(0, hidden_size)],
+                dispatch: DispatchShape {
+                    threadgroups: (groups_x, bucket_m, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                },
+                bindings: vec![
+                    Binding::Weight {
+                        kind: WeightBundleKind::AffineQuantEmbedding(*wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: 0,
+                        binding_index: 0,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::AffineQuantEmbedding(*wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: 0,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::AffineQuantEmbedding(*wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: 0,
+                        binding_index: 2,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::InputIds,
+                        binding_index: 3,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 4,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Fused gate-up SwiGLU MLP (GEMM + SwiGLU in one dispatch) ──
         //
         // Two specialized variants behind `KernelId::FusedGateUpSiluMul`:
@@ -1153,6 +1241,25 @@ fn elem_size_bytes(dtype: DequantDtype) -> u32 {
     }
 }
 
+/// Format the kernel symbol name for an `AffineEmbed` lowering.
+/// Matches the `DEFINE_AFFINE_EMBED_B4` macro invocations in
+/// `shaders/quantized_dequantize.metal`. Same enumeration as
+/// `affine_dequantize_<dtype>_gs_<gs>_b_4`.
+fn affine_embed_kernel_static_name(dtype: DequantDtype, group_size: u32) -> &'static str {
+    match (dtype, group_size) {
+        (DequantDtype::F16, 32) => "affine_embed_f16_gs_32_b_4",
+        (DequantDtype::F16, 64) => "affine_embed_f16_gs_64_b_4",
+        (DequantDtype::F16, 128) => "affine_embed_f16_gs_128_b_4",
+        (DequantDtype::Bf16, 32) => "affine_embed_bf16_gs_32_b_4",
+        (DequantDtype::Bf16, 64) => "affine_embed_bf16_gs_64_b_4",
+        (DequantDtype::Bf16, 128) => "affine_embed_bf16_gs_128_b_4",
+        (dt, gs) => unreachable!(
+            "affine_embed_kernel_static_name: (dtype={dt:?}, gs={gs}) not instantiated \
+             — only (f16|bf16, 32|64|128) ship; lower_one's assert should have caught this"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,5 +1576,97 @@ mod tests {
         );
         // Ceil-div on N: 2050.div_ceil(32) = 65; M-tiles: 512/32 = 16.
         assert_eq!(cmd.dispatch.threadgroups, (65, 512 / 32, 1));
+    }
+
+    /// `WtFn` stub for AffineQuantEmbedding (P6). Same shape as
+    /// `affine_quant_stub` but for the embedding bundle. Lowering
+    /// stores the pointer in `Binding::Weight` and the worker
+    /// resolver (untested here) calls it at ICB-record time.
+    fn affine_quant_embed_stub(
+        _: &TestParams,
+        _: u32,
+    ) -> &'static ferrite_kernels::layers::AffineQuantEmbedding {
+        panic!("affine_quant_embed_stub: lowering tests must not invoke wt_fn");
+    }
+
+    /// AffineEmbed lowers to a single command targeting
+    /// `affine_embed_<dtype>_gs_<gs>_b_4` in `quantized_dequantize`,
+    /// with hidden_size in function_constant(0) and a 2D dispatch
+    /// (bytes_per_row in X, num_tokens in Y).
+    #[test]
+    fn affine_embed_lowers_to_single_command_with_2d_dispatch() {
+        let inst: Instruction<TestParams> = Instruction::AffineEmbed(
+            /*out_slot=*/ 0,
+            affine_quant_embed_stub,
+            /*group_size=*/ 64,
+            /*bits=*/ 4,
+        );
+        let bucket_m = 32u32;
+        let mut scratch = 0u32;
+        let cmds = lower_one(&inst, 0, bucket_m, /*layer_offset=*/ 5, &mut scratch)
+            .expect("lower");
+        assert_eq!(cmds.len(), 1, "AffineEmbed always emits a single command");
+        assert_eq!(scratch, 0, "AffineEmbed never allocates splitk scratch");
+
+        let cmd = &cmds[0];
+        assert_eq!(cmd.kernel, KernelId::AffineEmbed);
+        assert_eq!(cmd.library, "quantized_dequantize");
+        // TestParams pins Bf16 + Q_SIZE=2048 → gs=64 → bf16/gs=64 symbol.
+        assert_eq!(cmd.function, "affine_embed_bf16_gs_64_b_4");
+
+        // function_constant(0) = hidden_size = W::Q_SIZE = 2048.
+        assert_eq!(cmd.constants, vec![ConstantValue::uint(0, 2048)]);
+
+        // 2D dispatch: (Q_SIZE/2 / THREADS_PER_GROUP, bucket_m, 1).
+        // Q_SIZE=2048 → bytes_per_row=1024; THREADS_PER_GROUP=256.
+        // groups_x = 1024.div_ceil(256) = 4.
+        assert_eq!(cmd.dispatch.threadgroups, (4, bucket_m, 1));
+        assert_eq!(cmd.dispatch.threads_per_threadgroup, (THREADS_PER_GROUP, 1, 1));
+
+        // 5 bindings: weight (0), scales (1), biases (2), input_ids (3), out (4).
+        assert_eq!(cmd.bindings.len(), 5);
+        match &cmd.bindings[0] {
+            Binding::Weight {
+                kind: WeightBundleKind::AffineQuantEmbedding(_),
+                which,
+                layer,
+                binding_index,
+            } => {
+                assert_eq!(*which, WeightTensor::Weight);
+                // Embed is unlayered — `layer = 0` regardless of layer_offset.
+                assert_eq!(*layer, 0);
+                assert_eq!(*binding_index, 0);
+            }
+            _ => panic!("bindings[0]: expected AffineQuantEmbedding Weight"),
+        }
+        match &cmd.bindings[1] {
+            Binding::Weight { which, .. } => assert_eq!(*which, WeightTensor::AffineScales),
+            _ => panic!("bindings[1]: expected AffineScales"),
+        }
+        match &cmd.bindings[2] {
+            Binding::Weight { which, .. } => assert_eq!(*which, WeightTensor::AffineBiases),
+            _ => panic!("bindings[2]: expected AffineBiases"),
+        }
+        match &cmd.bindings[3] {
+            Binding::Runtime {
+                kind,
+                binding_index,
+            } => {
+                assert_eq!(*kind, RuntimeBindingKind::InputIds);
+                assert_eq!(*binding_index, 3);
+            }
+            _ => panic!("bindings[3]: expected InputIds runtime"),
+        }
+        match &cmd.bindings[4] {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
+                assert_eq!(*slot, 0);
+                assert_eq!(*binding_index, 4);
+            }
+            _ => panic!("bindings[4]: expected out_slot ArenaSlot"),
+        }
+        assert!(cmd.gemm_dims.is_none());
     }
 }

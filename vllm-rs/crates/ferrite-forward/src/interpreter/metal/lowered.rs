@@ -118,6 +118,13 @@ pub enum KernelId {
     /// Lowered alongside `AffineQmmTSplitK` so the worker sees
     /// (qmm_t_splitk → scratch, reduce → out) as adjacent commands.
     SplitKReduceSum,
+    /// MLX-affine int4 quantized embedding lookup: gather + dequant
+    /// in one pass. Maps to
+    /// `affine_embed_<dtype>_gs_<gs>_b_4` in
+    /// `quantized_dequantize.metallib`. Faithful port of MLX's
+    /// `nn.QuantizedEmbedding.__call__`
+    /// (`python/mlx/nn/layers/quantized.py:144`).
+    AffineEmbed,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source
@@ -256,6 +263,13 @@ pub enum WeightBundleKind<W: CanonicalParams> {
     /// RoPE cos/sin table lookup: `CosSinFn<W>` returns the per-layer
     /// table directly (no struct wrapper).
     CosSin(crate::CosSinFn<W>),
+    /// MLX-affine int4 quantized embedding (Metal-only). Carries the
+    /// packed U32 weight + F16 scales + F16 affine offsets the
+    /// `affine_embed` kernel reads. P6 macro emission decides between
+    /// this and `Embedding` per-layer based on safetensors layout
+    /// (U32 weight ⇒ AffineQuantEmbedding, else Embedding).
+    #[cfg(feature = "metal")]
+    AffineQuantEmbedding(crate::WtFn<W, ferrite_kernels::layers::AffineQuantEmbedding>),
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding

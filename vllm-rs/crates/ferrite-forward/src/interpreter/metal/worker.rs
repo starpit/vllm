@@ -1526,6 +1526,26 @@ fn resolve_weight<W: CanonicalParams>(
             }
         }
         WeightBundleKind::CosSin(cosfn) => (cosfn)(weights, layer),
+        // MLX-affine int4 quantized embedding (P6). The lowering's
+        // `AffineEmbed` arm always uses `layer = 0` (embed_tokens is
+        // not a layered weight) and the kernel expects three buffer
+        // bindings: packed weight, scales, biases.
+        #[cfg(feature = "metal")]
+        WeightBundleKind::AffineQuantEmbedding(wtfn) => {
+            let e = (wtfn)(weights, layer);
+            match which {
+                WeightTensor::Weight => e.weight,
+                WeightTensor::AffineScales => e.scales,
+                WeightTensor::AffineBiases => e.affine_biases,
+                WeightTensor::Bias
+                | WeightTensor::AffineLinearBias => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "AffineQuantEmbedding has no linear-layer bias \
+                                 — embeddings only carry (weight, scales, biases)",
+                    });
+                }
+            }
+        }
     };
     allocator
         .buffer_for(tensor.raw_ptr())

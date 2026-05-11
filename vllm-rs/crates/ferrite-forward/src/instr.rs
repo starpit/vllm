@@ -35,6 +35,8 @@
 // are now ungated at the lib.rs level (see `ferrite-kernels/src/lib.rs`).
 
 use ferrite_cuda_core::tensor::{GpuTensor, MAX_DIMS};
+#[cfg(feature = "metal")]
+use ferrite_kernels::layers::AffineQuantEmbedding;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
@@ -600,6 +602,24 @@ pub enum Instruction<W> {
     /// output is the same shape. CUDA eval is `unreachable!` —
     /// metal-only (CUDA's q-MLP routes through Marlin/Bnb/etc).
     SiluMul(u32, u32, u32),
+    /// MLX-affine int4 quantized embedding lookup (Metal-only).
+    /// Replaces `Instruction::Embed` when `model.embed_tokens` ships
+    /// as a quantized triple `(weight=U32, scales, biases)` — i.e.
+    /// every `mlx-community/*-4bit` checkpoint.
+    ///
+    /// Faithful port of MLX's `nn.QuantizedEmbedding.__call__`
+    /// (`python/mlx/nn/layers/quantized.py:144`), fused into one
+    /// dispatch via `affine_embed_<dtype>_gs_<gs>_b_4` in
+    /// `quantized_dequantize.metal`. Without this lift the embedding
+    /// would CPU-dequantize at load (P2 deviation), burning ~2 GB of
+    /// arena on Llama-3.2-1B.
+    ///
+    /// Tuple fields: `(out_slot, weight_fn, group_size, bits)`. The
+    /// hidden_size rides through `W::Q_SIZE` (function constant baked
+    /// at lower time). Metal-only — `AffineQuantEmbedding` is cfg-gated
+    /// to the metal backend (mirrors `LinearLayer::AffineQuant`).
+    #[cfg(feature = "metal")]
+    AffineEmbed(u32, WtFn<W, AffineQuantEmbedding>, u32, u32),
     /// Re-run the next `body_len` instructions `count` times.
     Loop(u32, u32),
     /// `tiles[dst] = Some(View(src))`.
@@ -3006,6 +3026,14 @@ impl<W: CanonicalParams> Instruction<W> {
                     "Instruction::SiluMul is metal-only — emitted by the \
                      decomposed q-MLP path on Affine; cuda's q-MLP routes \
                      through Marlin/Bnb/Fp8/etc fused kernels"
+                );
+            }
+            #[cfg(feature = "metal")]
+            Instruction::AffineEmbed(..) => {
+                unreachable!(
+                    "Instruction::AffineEmbed is metal-only — emitted by the \
+                     P6 quantized embedding lift; cuda's quantized embeddings \
+                     never lift to forward-time (Marlin/Bnb keep dense embed)"
                 );
             }
             Instruction::Loop(_, _) => {

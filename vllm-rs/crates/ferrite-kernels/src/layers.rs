@@ -824,6 +824,92 @@ impl AffineQuantLinear {
 }
 
 // ---------------------------------------------------------------------------
+// AffineQuantEmbedding — MLX-affine int4 quantized token embedding (Metal-only)
+// ---------------------------------------------------------------------------
+
+/// MLX-affine int4 quantized token-embedding table. Mirrors
+/// `AffineQuantLinear` (the int4 Linear) but for an embedding's
+/// `[vocab_size, hidden_size]` layout. Stored as packed U32 weights
+/// (`[vocab, hidden / pack_factor]`, `pack_factor = 32 / bits = 8` for
+/// bits=4) plus per-group `scales` / `affine_biases`
+/// (`[vocab, hidden / group_size]` F16). MLX terminology: "biases" is
+/// the per-group affine offset, NOT a linear-layer bias — embeddings
+/// have no fp bias term at all.
+///
+/// Used by P6's `Instruction::AffineEmbed`: forward-time gather +
+/// dequant via `affine_embed_<dtype>_gs_<gs>_b_4`. The macro emits this
+/// type instead of `Embedding` when `model.embed_tokens` carries
+/// `(weight=U32, scales, biases)` safetensors keys. Tied lm_head reuses
+/// the same buffer triple (GpuTensor is Copy under metal — it's a thin
+/// pointer wrapper) via `LinearLayer::AffineQuant`.
+#[cfg(feature = "metal")]
+pub struct AffineQuantEmbedding {
+    /// Packed 4-bit weights, shape `[vocab_size, hidden_size / pack_factor]`,
+    /// dtype `U32`.
+    pub weight: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group scales, shape `[vocab_size, hidden_size / group_size]`,
+    /// dtype `F16`.
+    pub scales: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group affine offsets, shape `[vocab_size, hidden_size / group_size]`,
+    /// dtype `F16`. NOT a linear-layer bias — MLX-terminology naming.
+    pub affine_biases: ferrite_cuda_core::tensor::GpuTensor,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub group_size: u32,
+    pub bits: u32,
+}
+
+#[cfg(feature = "metal")]
+impl AffineQuantEmbedding {
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
+    /// (`U32`, `[vocab, hidden / pack_factor]`), `<prefix>.scales`
+    /// (`F16`, `[vocab, hidden / group_size]`), `<prefix>.biases`
+    /// (`F16`, same shape).
+    ///
+    /// `group_size` and `bits` come from the model's
+    /// `quantization_config` (parsed at compile time by the macro);
+    /// `vocab_size` / `hidden_size` are derived from the weight
+    /// tensor's shape.
+    pub fn load(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+        // Scales / biases ship F16 on every mlx-community 4bit repo
+        // sampled in P0; ferrite-metal's affine_embed kernel is
+        // templated on the activation dtype `T` and binds scales /
+        // biases as `device const T*` (matching MLX). On the BF16
+        // metal stack `T = bfloat`, so `take()` CASTS F16 → BF16 to
+        // match the kernel's binding — same handling as
+        // `AffineQuantLinear::load`.
+        let scales = weights.take(&format!("{prefix}.scales"))?;
+        let affine_biases = weights.take(&format!("{prefix}.biases"))?;
+        let pack_factor = (32 / bits) as usize;
+        let vocab_size = weight.dim(0);
+        let hidden_size = weight.dim(1) * pack_factor;
+        Ok(Self {
+            weight,
+            scales,
+            affine_biases,
+            vocab_size,
+            hidden_size,
+            group_size,
+            bits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, Fp8, AffineQuant)
 // ---------------------------------------------------------------------------
 

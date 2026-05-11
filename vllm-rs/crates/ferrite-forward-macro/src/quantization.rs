@@ -777,21 +777,21 @@ pub fn storage_format_for_weight(
     // For MLX-affine the on-disk embed_tokens is itself quantized
     // (`model.embed_tokens.{weight,scales,biases}` is the affine
     // triple — confirmed across every mlx-community 4bit repo
-    // sampled in P0). On metal the load path runs the embedding
-    // through `Embedding::load_affine_dequant` (CPU dequant →
-    // BF16 Dense Embedding); the codegen `LinearTiedToEmbedding`
-    // arm then wraps the *dequantized* BF16 weight as a Dense
-    // LinearLayer. So at solve time the tied lm_head Gemm sees a
-    // Dense tensor too — `MetalGemmImpl` claims it and dispatches
-    // through MPS, not `MetalAffineQmmImpl` (which would expect
-    // AffineQuant at runtime and fail the `resolve_weight` bridge
-    // because the loader emitted Dense).
-    //
-    // A future phase can lift the embed to a forward-time affine
-    // dispatch path; until then the load-time CPU dequant is the
-    // memory-cheap fallback (one ~256k × hidden BF16 buffer
-    // shared between embed and lm_head).
+    // sampled in P0). Pre-P6, the load path CPU-dequantized the
+    // embedding (`Embedding::load_affine_dequant` → BF16 Dense),
+    // so the tied lm_head saw a Dense tensor and routed through
+    // MetalGemmImpl. P6 lifts the embedding to forward-time gather
+    // + dequant (`Instruction::AffineEmbed`), which means the
+    // embed buffer triple stays quantized at runtime — the tied
+    // lm_head must now also see Affine storage so the solver
+    // picks `MetalAffineQmmImpl` and the codegen
+    // `LinearTiedToEmbedding { affine: Some((gs, bits)) }` arm
+    // emits `LinearLayer::AffineQuant(...)` sharing the embed's
+    // packed buffers.
     if dotted == "lm_head" && model.tie_word_embeddings {
+        if let QuantMethod::Affine { bits, group_size } = qc.method {
+            return StorageFormat::Affine { bits, group_size };
+        }
         return StorageFormat::Dense;
     }
 

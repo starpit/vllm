@@ -19,7 +19,9 @@ use std::ptr::NonNull;
 
 use ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16 as cpu_qmv_bf16;
 use ferrite_metal_kernels::device::detect_device;
-use ferrite_metal_kernels::quantized::{pick_qmv_kernel, DequantDtype, MetalAffineQmv, QmvKernel};
+use ferrite_metal_kernels::quantized::{
+    pick_qmv_kernel, DequantDtype, MetalAffineQmv, QmvKernel, ScaleDtype,
+};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -83,18 +85,20 @@ fn make_inputs_bf16(
     k: usize,
     m: usize,
     group_size: usize,
-) -> (Vec<u8>, Vec<half::bf16>, Vec<half::bf16>, Vec<half::bf16>) {
+) -> (Vec<u8>, Vec<half::f16>, Vec<half::f16>, Vec<half::bf16>) {
     assert_eq!(k % group_size, 0);
     let n_bytes = n * k / 2; // pack_factor = 2 nibbles/byte
     let n_groups = n * k / group_size;
 
     let mut rng = SplitMix64(seed);
     let packed: Vec<u8> = (0..n_bytes).map(|_| rng.next_byte()).collect();
-    let scales: Vec<half::bf16> = (0..n_groups)
-        .map(|_| half::bf16::from_f32(0.01 + 0.04 * rng.next_unit_f32()))
+    // P10b: scales/biases ship F16 on disk (`T_scale = half`); the kernel
+    // casts to T_act in-register (`INT4_PARITY_PROBES.md` §7).
+    let scales: Vec<half::f16> = (0..n_groups)
+        .map(|_| half::f16::from_f32(0.01 + 0.04 * rng.next_unit_f32()))
         .collect();
-    let biases: Vec<half::bf16> = (0..n_groups)
-        .map(|_| half::bf16::from_f32(rng.next_unit_f32() - 0.5))
+    let biases: Vec<half::f16> = (0..n_groups)
+        .map(|_| half::f16::from_f32(rng.next_unit_f32() - 0.5))
         .collect();
     // Activations in [-1, 1) — typical residual-stream magnitude.
     let x: Vec<half::bf16> = (0..(m * k))
@@ -107,8 +111,8 @@ fn make_inputs_bf16(
 #[allow(clippy::too_many_arguments)]
 fn run_qmv_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     x: &[half::bf16],
     m: usize,
     n: usize,
@@ -151,6 +155,7 @@ fn run_qmv_bf16(
         group_size,
         4,
         DequantDtype::Bf16,
+        ScaleDtype::F16,
         &encoder,
     )
     .expect("qmv dispatch");
@@ -352,8 +357,8 @@ fn buffer_from_bytes_offset_into_parent(
 #[allow(clippy::too_many_arguments)]
 fn run_qmv_bf16_with_packed_prefix(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     x: &[half::bf16],
     m: usize,
     n: usize,
@@ -400,6 +405,7 @@ fn run_qmv_bf16_with_packed_prefix(
         group_size,
         4,
         DequantDtype::Bf16,
+        ScaleDtype::F16,
         &encoder,
     )
     .expect("qmv dispatch");

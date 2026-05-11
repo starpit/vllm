@@ -38,8 +38,9 @@ fn dequant_b4_bf16_scale_bias_apply_per_group() {
     // group1 scale=0.5, bias=-1 → nibbles (1,2,3,4) → -0.5, 0, 0.5, 1
     // Packed bytes pack (lo, hi) → byte = hi<<4 | lo.
     let packed: Vec<u8> = vec![0x43, 0x65, 0x21, 0x43];
-    let scales = vec![half::bf16::from_f32(2.0), half::bf16::from_f32(0.5)];
-    let biases = vec![half::bf16::from_f32(1.0), half::bf16::from_f32(-1.0)];
+    // P10b: bf16-act path takes F16 scales/biases (`T_scale = half`).
+    let scales = vec![half::f16::from_f32(2.0), half::f16::from_f32(0.5)];
+    let biases = vec![half::f16::from_f32(1.0), half::f16::from_f32(-1.0)];
     let mut out = vec![half::bf16::ZERO; 8];
     affine_dequantize_b4_bf16(&packed, &scales, &biases, &mut out, 4);
     let want = [7.0, 9.0, 11.0, 13.0, -0.5, 0.0, 0.5, 1.0];
@@ -61,8 +62,9 @@ fn qmm_t_b4_bf16_all_ones_matches_row_sum() {
     let k = 8;
     let gs = 8;
     let packed = vec![0x11_u8; n * k / 2];
-    let scales = vec![half::bf16::from_f32(1.0); n * k / gs];
-    let biases = vec![half::bf16::ZERO; n * k / gs];
+    // P10b: bf16-act path takes F16 scales/biases.
+    let scales = vec![half::f16::from_f32(1.0); n * k / gs];
+    let biases = vec![half::f16::ZERO; n * k / gs];
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|i| half::bf16::from_f32(i as f32))
         .collect();
@@ -87,8 +89,9 @@ fn qmm_n_b4_bf16_all_ones_matches_row_sum() {
     let k = 8;
     let gs = 4; // qmm_n requires N % gs == 0
     let packed = vec![0x11_u8; k * n / 2];
-    let scales = vec![half::bf16::from_f32(1.0); k * n / gs];
-    let biases = vec![half::bf16::ZERO; k * n / gs];
+    // P10b: bf16-act path takes F16 scales/biases.
+    let scales = vec![half::f16::from_f32(1.0); k * n / gs];
+    let biases = vec![half::f16::ZERO; k * n / gs];
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|i| half::bf16::from_f32(i as f32))
         .collect();
@@ -133,11 +136,12 @@ fn qvm_alias_matches_qmm_n() {
     let k = 8;
     let gs = 4;
     let packed: Vec<u8> = (0..(k * n / 2) as u8).collect();
-    let scales: Vec<half::bf16> = (0..(k * n / gs))
-        .map(|i| half::bf16::from_f32(0.01 + i as f32 * 0.001))
+    // P10b: bf16-act path takes F16 scales/biases.
+    let scales: Vec<half::f16> = (0..(k * n / gs))
+        .map(|i| half::f16::from_f32(0.01 + i as f32 * 0.001))
         .collect();
-    let biases: Vec<half::bf16> = (0..(k * n / gs))
-        .map(|i| half::bf16::from_f32(-0.05 + i as f32 * 0.002))
+    let biases: Vec<half::f16> = (0..(k * n / gs))
+        .map(|i| half::f16::from_f32(-0.05 + i as f32 * 0.002))
         .collect();
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|i| half::bf16::from_f32((i as f32) * 0.1))

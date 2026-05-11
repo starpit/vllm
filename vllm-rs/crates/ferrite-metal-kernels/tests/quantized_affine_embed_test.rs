@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use ferrite_metal_kernels::device::detect_device;
-use ferrite_metal_kernels::quantized::{DequantDtype, MetalAffineEmbed};
+use ferrite_metal_kernels::quantized::{DequantDtype, MetalAffineEmbed, ScaleDtype};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -87,8 +87,8 @@ fn cpu_affine_embed_b4_f16(
 
 fn cpu_affine_embed_b4_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     indices: &[u32],
     hidden_size: usize,
     group_size: usize,
@@ -103,8 +103,10 @@ fn cpu_affine_embed_b4_bf16(
             let byte = packed[vocab_idx * bytes_per_row + byte_idx];
             let col_base = byte_idx * 2;
             let g = vocab_idx * groups_per_row + col_base / group_size;
-            let scale = scales[g].to_f32();
-            let bias = biases[g].to_f32();
+            // Match the kernel's in-register T_scale (f16) → T_act (bf16)
+            // cast so the CPU ref matches within ~2 ULP of the GPU FMA.
+            let scale = half::bf16::from_f32(scales[g].to_f32()).to_f32();
+            let bias = half::bf16::from_f32(biases[g].to_f32()).to_f32();
             let lo = (byte & 0x0f) as f32;
             let hi = ((byte >> 4) & 0x0f) as f32;
             out[token * hidden_size + col_base] = half::bf16::from_f32(scale * lo + bias);
@@ -192,11 +194,12 @@ fn affine_embed_b4_bf16_kernel_matches_cpu_reference() {
 
         let mut rng = SplitMix64(0xDEADBEEF_u64 ^ group_size as u64);
         let packed: Vec<u8> = (0..n_bytes).map(|_| rng.next_byte()).collect();
-        let scales: Vec<half::bf16> = (0..n_groups)
-            .map(|_| half::bf16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
+        // P10b: scales/biases ship F16 on disk.
+        let scales: Vec<half::f16> = (0..n_groups)
+            .map(|_| half::f16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
             .collect();
-        let biases: Vec<half::bf16> = (0..n_groups)
-            .map(|_| half::bf16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
+        let biases: Vec<half::f16> = (0..n_groups)
+            .map(|_| half::f16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
             .collect();
         let indices: Vec<u32> = (0..n_tokens)
             .map(|_| rng.next_u32_below(vocab_size as u32))
@@ -242,11 +245,12 @@ fn affine_embed_b4_bf16_partial_trailing_threadgroup() {
 
     let mut rng = SplitMix64(0xBADC0FFE);
     let packed: Vec<u8> = (0..n_bytes).map(|_| rng.next_byte()).collect();
-    let scales: Vec<half::bf16> = (0..n_groups)
-        .map(|_| half::bf16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
+    // P10b: scales/biases ship F16 on disk.
+    let scales: Vec<half::f16> = (0..n_groups)
+        .map(|_| half::f16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
         .collect();
-    let biases: Vec<half::bf16> = (0..n_groups)
-        .map(|_| half::bf16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
+    let biases: Vec<half::f16> = (0..n_groups)
+        .map(|_| half::f16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
         .collect();
     let indices: Vec<u32> = (0..n_tokens)
         .map(|_| rng.next_u32_below(vocab_size as u32))
@@ -316,6 +320,7 @@ fn run_kernel_f16(
             group_size,
             4,
             DequantDtype::F16,
+            ScaleDtype::F16,
             &encoder,
         )
         .expect("affine_embed dispatch");
@@ -328,8 +333,8 @@ fn run_kernel_f16(
 
 fn run_kernel_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     indices: &[u32],
     hidden_size: u32,
     group_size: u32,
@@ -368,6 +373,7 @@ fn run_kernel_bf16(
             group_size,
             4,
             DequantDtype::Bf16,
+            ScaleDtype::F16,
             &encoder,
         )
         .expect("affine_embed dispatch");

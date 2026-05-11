@@ -215,15 +215,15 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
 // `QVM_FINAL_BLOCK_SIZE` based on the partition index.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits>
 METAL_FUNC void qvm_impl_inline(
-    const device uint32_t* w,
-    const device T*        scales,
-    const device T*        biases,
-    const device T*        x,
-    device T*              y,
-    const int              in_vec_size_arg,
-    const int              out_vec_size,
+    const device uint32_t*  w,
+    const device T_scale*   scales,
+    const device T_scale*   biases,
+    const device T_act*     x,
+    device T_act*           y,
+    const int               in_vec_size_arg,
+    const int               out_vec_size,
     uint3 tid,
     uint  simd_gid,
     uint  simd_lid)
@@ -320,7 +320,7 @@ METAL_FUNC void qvm_impl_inline(
   if (simd_lid == 0) {
     MLX_MTL_PRAGMA_UNROLL
     for (int k = 0; k < tn * pack_factor; k++) {
-      y[k] = static_cast<T>(result[k]);
+      y[k] = static_cast<T_act>(result[k]);
     }
   }
 }
@@ -332,13 +332,13 @@ METAL_FUNC void qvm_impl_inline(
 // (`quantized.h:1351`), deferred to P13 alongside MoE gather.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits>
 [[kernel]] void affine_qvm_kernel(
-    const device uint32_t* w        [[buffer(0)]],
-    const device T*        scales   [[buffer(1)]],
-    const device T*        biases   [[buffer(2)]],
-    const device T*        x        [[buffer(3)]],
-    device T*              y        [[buffer(4)]],
+    const device uint32_t*  w        [[buffer(0)]],
+    const device T_scale*   scales   [[buffer(1)]],
+    const device T_scale*   biases   [[buffer(2)]],
+    const device T_act*     x        [[buffer(3)]],
+    device T_act*           y        [[buffer(4)]],
     // K (in_vec_size) and N (out_vec_size) ride as file-scope
     // function constants QVM_K / QVM_N. MLX passes them as
     // buffer(5)/buffer(6) setBytes; ferrite specializes per-shape.
@@ -346,7 +346,7 @@ template <typename T, int group_size, int bits>
     uint  simd_gid      [[simdgroup_index_in_threadgroup]],
     uint  simd_lid      [[thread_index_in_simdgroup]])
 {
-  qvm_impl_inline<T, group_size, bits>(
+  qvm_impl_inline<T_act, T_scale, group_size, bits>(
       w, scales, biases, x, y,
       /*in_vec_size_arg=*/QVM_K,
       /*out_vec_size=*/QVM_N,
@@ -378,13 +378,13 @@ template <typename T, int group_size, int bits>
 // — matches `quantized.h:1691-1692`.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T, int group_size, int bits>
+template <typename T_act, typename T_scale, int group_size, int bits>
 [[kernel]] void affine_qvm_split_k_kernel(
-    const device uint32_t* w        [[buffer(0)]],
-    const device T*        scales   [[buffer(1)]],
-    const device T*        biases   [[buffer(2)]],
-    const device T*        x        [[buffer(3)]],
-    device T*              y        [[buffer(4)]],
+    const device uint32_t*  w        [[buffer(0)]],
+    const device T_scale*   scales   [[buffer(1)]],
+    const device T_scale*   biases   [[buffer(2)]],
+    const device T_act*     x        [[buffer(3)]],
+    device T_act*           y        [[buffer(4)]],
     uint3 tid           [[threadgroup_position_in_grid]],
     uint  simd_gid      [[simdgroup_index_in_threadgroup]],
     uint  simd_lid      [[thread_index_in_simdgroup]])
@@ -406,10 +406,10 @@ template <typename T, int group_size, int bits>
   const int part_idx     = int(tid.z);
   const int k_part_off   = part_idx * QVM_K_PARTITION_SIZE;
   const device uint32_t* w_part      = w      + int64_t(k_part_off) * n_packed;
-  const device T*        scales_part = scales + int64_t(k_part_off) * (QVM_N / group_size);
-  const device T*        biases_part = biases + int64_t(k_part_off) * (QVM_N / group_size);
-  const device T*        x_part      = x      + int64_t(k_part_off);
-  device T*              y_part      = y      + int64_t(part_idx) * QVM_M * QVM_N;
+  const device T_scale*  scales_part = scales + int64_t(k_part_off) * (QVM_N / group_size);
+  const device T_scale*  biases_part = biases + int64_t(k_part_off) * (QVM_N / group_size);
+  const device T_act*    x_part      = x      + int64_t(k_part_off);
+  device T_act*          y_part      = y      + int64_t(part_idx) * QVM_M * QVM_N;
 
   const int in_vec_size_adj = (part_idx == QVM_SPLIT_K - 1)
       ? QVM_FINAL_BLOCK_SIZE
@@ -421,7 +421,7 @@ template <typename T, int group_size, int bits>
   // together via the reshape so a single advance covers both, but
   // here we collapse to a single pre-shift since strides are known).
   uint3 inner_tid = uint3(tid.x, tid.y, 0u);
-  qvm_impl_inline<T, group_size, bits>(
+  qvm_impl_inline<T_act, T_scale, group_size, bits>(
       w_part, scales_part, biases_part, x_part, y_part,
       in_vec_size_adj, QVM_N,
       inner_tid, simd_gid, simd_lid);
@@ -435,41 +435,42 @@ template <typename T, int group_size, int bits>
 // template-arg approach but functionally identical.
 // ─────────────────────────────────────────────────────────────────
 
-#define INST_QVM(dtype_tag, mtl_type, gs)                                    \
-  template [[host_name(                                                      \
-      "affine_qvm_" #dtype_tag "_gs_" #gs "_b_4_batch_0"                     \
-      )]] [[kernel]] void                                                    \
-  affine_qvm_kernel<mtl_type, gs, 4>(                                        \
-      const device uint32_t* w        [[buffer(0)]],                         \
-      const device mtl_type* scales   [[buffer(1)]],                         \
-      const device mtl_type* biases   [[buffer(2)]],                         \
-      const device mtl_type* x        [[buffer(3)]],                         \
-      device mtl_type*       y        [[buffer(4)]],                         \
-      uint3 tid           [[threadgroup_position_in_grid]],                  \
-      uint  simd_gid      [[simdgroup_index_in_threadgroup]],                \
+#define INST_QVM(act_tag, act_type, scale_tag, scale_type, gs)                 \
+  template [[host_name(                                                        \
+      "affine_qvm_" #act_tag "_s_" #scale_tag "_gs_" #gs                       \
+      "_b_4_batch_0")]] [[kernel]] void                                        \
+  affine_qvm_kernel<act_type, scale_type, gs, 4>(                              \
+      const device uint32_t*   w        [[buffer(0)]],                         \
+      const device scale_type* scales   [[buffer(1)]],                         \
+      const device scale_type* biases   [[buffer(2)]],                         \
+      const device act_type*   x        [[buffer(3)]],                         \
+      device act_type*         y        [[buffer(4)]],                         \
+      uint3 tid           [[threadgroup_position_in_grid]],                    \
+      uint  simd_gid      [[simdgroup_index_in_threadgroup]],                  \
       uint  simd_lid      [[thread_index_in_simdgroup]]);
 
-#define INST_QVM_SPLIT_K(dtype_tag, mtl_type, gs)                            \
-  template [[host_name(                                                      \
-      "affine_qvm_split_k_" #dtype_tag "_gs_" #gs "_b_4"                     \
-      )]] [[kernel]] void                                                    \
-  affine_qvm_split_k_kernel<mtl_type, gs, 4>(                                \
-      const device uint32_t* w        [[buffer(0)]],                         \
-      const device mtl_type* scales   [[buffer(1)]],                         \
-      const device mtl_type* biases   [[buffer(2)]],                         \
-      const device mtl_type* x        [[buffer(3)]],                         \
-      device mtl_type*       y        [[buffer(4)]],                         \
-      uint3 tid           [[threadgroup_position_in_grid]],                  \
-      uint  simd_gid      [[simdgroup_index_in_threadgroup]],                \
+#define INST_QVM_SPLIT_K(act_tag, act_type, scale_tag, scale_type, gs)         \
+  template [[host_name(                                                        \
+      "affine_qvm_split_k_" #act_tag "_s_" #scale_tag "_gs_" #gs               \
+      "_b_4")]] [[kernel]] void                                                \
+  affine_qvm_split_k_kernel<act_type, scale_type, gs, 4>(                      \
+      const device uint32_t*   w        [[buffer(0)]],                         \
+      const device scale_type* scales   [[buffer(1)]],                         \
+      const device scale_type* biases   [[buffer(2)]],                         \
+      const device act_type*   x        [[buffer(3)]],                         \
+      device act_type*         y        [[buffer(4)]],                         \
+      uint3 tid           [[threadgroup_position_in_grid]],                    \
+      uint  simd_gid      [[simdgroup_index_in_threadgroup]],                  \
       uint  simd_lid      [[thread_index_in_simdgroup]]);
 
-#define INST_QVM_ALL(dtype_tag, mtl_type, gs)  \
-  INST_QVM(dtype_tag, mtl_type, gs)            \
-  INST_QVM_SPLIT_K(dtype_tag, mtl_type, gs)
+#define INST_QVM_ALL(act_tag, act_type, scale_tag, scale_type, gs)  \
+  INST_QVM(act_tag, act_type, scale_tag, scale_type, gs)            \
+  INST_QVM_SPLIT_K(act_tag, act_type, scale_tag, scale_type, gs)
 
-INST_QVM_ALL(f16,  half,    32)
-INST_QVM_ALL(f16,  half,    64)
-INST_QVM_ALL(f16,  half,   128)
-INST_QVM_ALL(bf16, bfloat,  32)
-INST_QVM_ALL(bf16, bfloat,  64)
-INST_QVM_ALL(bf16, bfloat, 128)
+// Coverage: see header note in `quantized_qmv.metal`.
+INST_QVM_ALL(f16,  half,   f16, half,  32)
+INST_QVM_ALL(f16,  half,   f16, half,  64)
+INST_QVM_ALL(f16,  half,   f16, half, 128)
+INST_QVM_ALL(bf16, bfloat, f16, half,  32)
+INST_QVM_ALL(bf16, bfloat, f16, half,  64)
+INST_QVM_ALL(bf16, bfloat, f16, half, 128)

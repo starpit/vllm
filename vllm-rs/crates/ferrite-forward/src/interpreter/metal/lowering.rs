@@ -29,7 +29,7 @@
 
 use crate::{CanonicalParams, Instruction};
 use ferrite_metal_kernels::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, pick_qmm_t_kernel, pick_qmv_kernel,
+    DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
     qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmv_dispatch_shape, qmv_kernel_static_name,
     splitk_reduce_kernel_static_name,
 };
@@ -376,6 +376,7 @@ fn lower_one<W: CanonicalParams>(
         // setBytes — required for ICB recording.
         I::AffineQmm(in_slot, out_slot, layer, wt_fn, n, k, group_size, bits, vector_limit) => {
             let dtype = dequant_dtype_for::<W>();
+            let scale_dtype = scale_dtype_for::<W>();
             let n_v = *n;
             let k_v = *k;
             let bits_v = *bits;
@@ -394,7 +395,7 @@ fn lower_one<W: CanonicalParams>(
                 LoweredCommand {
                     kernel: kernel_id,
                     library: "quantized_qmv",
-                    function: qmv_kernel_static_name(kernel, dtype, bits_v, gs),
+                    function: qmv_kernel_static_name(kernel, dtype, scale_dtype, bits_v, gs),
                     constants: vec![
                         ConstantValue::int(0, k_v as i32),
                         ConstantValue::int(1, n_v as i32),
@@ -431,7 +432,7 @@ fn lower_one<W: CanonicalParams>(
                             kernel: KernelId::AffineQmmT,
                             library: "quantized_qmm",
                             function: qmm_t_kernel_static_name(
-                                kernel, dtype, bits_v, gs, aligned_n,
+                                kernel, dtype, scale_dtype, bits_v, gs, aligned_n,
                             ),
                             constants: vec![
                                 ConstantValue::int(0, k_v as i32),
@@ -469,7 +470,7 @@ fn lower_one<W: CanonicalParams>(
                             kernel: KernelId::AffineQmmTSplitK,
                             library: "quantized_qmm",
                             function: qmm_t_kernel_static_name(
-                                kernel, dtype, bits_v, gs, aligned_n,
+                                kernel, dtype, scale_dtype, bits_v, gs, aligned_n,
                             ),
                             // SplitK needs FOUR function constants:
                             // (0=K, 1=N, 2=M, 3=k_partition_size) per
@@ -598,6 +599,7 @@ fn lower_one<W: CanonicalParams>(
         #[cfg(feature = "metal")]
         I::AffineEmbed(out_slot, wt_fn, group_size, bits) => {
             let dtype = dequant_dtype_for::<W>();
+            let scale_dtype = scale_dtype_for::<W>();
             let bits_v = *bits;
             let gs = *group_size;
             assert_eq!(
@@ -618,7 +620,7 @@ fn lower_one<W: CanonicalParams>(
             LoweredCommand {
                 kernel: KernelId::AffineEmbed,
                 library: "quantized_dequantize",
-                function: affine_embed_kernel_static_name(dtype, gs),
+                function: affine_embed_kernel_static_name(dtype, scale_dtype, gs),
                 constants: vec![ConstantValue::uint(0, hidden_size)],
                 dispatch: DispatchShape {
                     threadgroups: (groups_x, bucket_m, 1),
@@ -1154,6 +1156,18 @@ fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
     }
 }
 
+/// Scale-storage dtype the kernel reads `*.scales` / `*.biases` device
+/// pointers as — i.e. the safetensors on-disk dtype for the affine
+/// quant per-group params. Every sampled mlx-community 4bit checkpoint
+/// ships F16 scales (`INT4_PARITY_PROBES.md:73,287`), so this is a
+/// constant today; P11 (mixed-quant / NAX / FP-quant) will extend it.
+/// Kept as a separate fn for symmetry with [`dequant_dtype_for`] so the
+/// model author has a single seam to extend.
+fn scale_dtype_for<W: CanonicalParams>() -> ScaleDtype {
+    let _ = std::marker::PhantomData::<W>;
+    ScaleDtype::F16
+}
+
 /// Bindings shared by every `Instruction::AffineQmm` lowering's qmv
 /// and qmm_t Standard kernels — both bind buffers 0..4 in the same
 /// order: (packed weight, scales, biases, x in, y out). Worker
@@ -1244,18 +1258,24 @@ fn elem_size_bytes(dtype: DequantDtype) -> u32 {
 /// Format the kernel symbol name for an `AffineEmbed` lowering.
 /// Matches the `DEFINE_AFFINE_EMBED_B4` macro invocations in
 /// `shaders/quantized_dequantize.metal`. Same enumeration as
-/// `affine_dequantize_<dtype>_gs_<gs>_b_4`.
-fn affine_embed_kernel_static_name(dtype: DequantDtype, group_size: u32) -> &'static str {
-    match (dtype, group_size) {
-        (DequantDtype::F16, 32) => "affine_embed_f16_gs_32_b_4",
-        (DequantDtype::F16, 64) => "affine_embed_f16_gs_64_b_4",
-        (DequantDtype::F16, 128) => "affine_embed_f16_gs_128_b_4",
-        (DequantDtype::Bf16, 32) => "affine_embed_bf16_gs_32_b_4",
-        (DequantDtype::Bf16, 64) => "affine_embed_bf16_gs_64_b_4",
-        (DequantDtype::Bf16, 128) => "affine_embed_bf16_gs_128_b_4",
-        (dt, gs) => unreachable!(
-            "affine_embed_kernel_static_name: (dtype={dt:?}, gs={gs}) not instantiated \
-             — only (f16|bf16, 32|64|128) ship; lower_one's assert should have caught this"
+/// `affine_dequantize_<dtype>_s_<scale_dtype>_gs_<gs>_b_4`.
+fn affine_embed_kernel_static_name(
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+) -> &'static str {
+    use ScaleDtype as S;
+    match (dtype, scale_dtype, group_size) {
+        (DequantDtype::F16, S::F16, 32)  => "affine_embed_f16_s_f16_gs_32_b_4",
+        (DequantDtype::F16, S::F16, 64)  => "affine_embed_f16_s_f16_gs_64_b_4",
+        (DequantDtype::F16, S::F16, 128) => "affine_embed_f16_s_f16_gs_128_b_4",
+        (DequantDtype::Bf16, S::F16, 32)  => "affine_embed_bf16_s_f16_gs_32_b_4",
+        (DequantDtype::Bf16, S::F16, 64)  => "affine_embed_bf16_s_f16_gs_64_b_4",
+        (DequantDtype::Bf16, S::F16, 128) => "affine_embed_bf16_s_f16_gs_128_b_4",
+        (dt, sdt, gs) => unreachable!(
+            "affine_embed_kernel_static_name: (dtype={dt:?}, scale_dtype={sdt:?}, gs={gs}) \
+             not instantiated — only (f16|bf16, f16, 32|64|128) ship; \
+             lower_one's assert should have caught this"
         ),
     }
 }

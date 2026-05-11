@@ -1019,6 +1019,40 @@ impl GpuWeights {
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
     }
 
+    /// Like [`take`] but skips the `target_dtype` cast — bytes go to
+    /// the device exactly as they were stored on disk.
+    ///
+    /// Used by `AffineQuantLinear::load` / `AffineQuantEmbedding::load`
+    /// (Metal int4 path) for `*.scales` / `*.biases`: those ship F16
+    /// on disk and the ferrite-metal int4 kernels read them as `F16`
+    /// `T_scale` pointers, casting to the activation dtype in-register
+    /// (`INT4_PARITY_PROBES.md` §7 `Decision: in-register cast`).
+    /// Routing through `take()` would F16→BF16 truncate the scales at
+    /// load on the bf16 stack — that's the P10b regression site.
+    ///
+    /// [`take`]: Self::take
+    pub fn take_keep_dtype(&mut self, name: &str) -> Result<GpuTensor> {
+        if let Some(t) = self.gguf_dense.remove(name) {
+            return Ok(t);
+        }
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        // CUDA precast path would have produced cast bytes; consume the
+        // precast slot so it's not leaked, but ignore the cast and use
+        // the on-disk view. (Metal has no precast.)
+        #[cfg(feature = "cuda")]
+        if let Some(entry) = self.take_precast(name) {
+            unsafe { driver::mem_free_host(entry.pinned_ptr).ok(); }
+        }
+        let gpu_ptr = unsafe {
+            self.allocator
+                .alloc_and_copy_host(cpu_ref.data().as_ptr(), cpu_ref.size_bytes)?
+        };
+        Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, cpu_ref.dtype) })
+    }
+
 
     /// Same as [`take`] but creates the returned `GpuTensor` with a
     /// caller-provided shape instead of the on-disk shape. The two

@@ -794,13 +794,16 @@ impl AffineQuantLinear {
     ) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
         // Scales / biases ship F16 on every mlx-community 4bit repo
-        // sampled in P0, but ferrite-metal's qmv / qmm_t kernels are
-        // templated on the activation dtype `T` and bind scales /
-        // biases as `device const T*` (matching MLX's all-one-dtype
-        // template). On the BF16 ferrite-metal stack `T = bfloat`, so
-        // `take()` here CASTS F16 → BF16 to match the kernel's binding.
-        let scales = weights.take(&format!("{prefix}.scales"))?;
-        let affine_biases = weights.take(&format!("{prefix}.biases"))?;
+        // sampled in P0; ferrite-metal's qmv / qmm_t / qvm / qmm_n
+        // kernels now read them as `T_scale = half` regardless of the
+        // activation dtype and cast to `T_act` in-register (per
+        // `INT4_PARITY_PROBES.md` §7 `Decision: in-register cast`).
+        // Use `take_keep_dtype` to skip the loader-side F16→BF16 cast
+        // that P1-P6 silently inherited from `set_target_dtype(BF16)`
+        // — that path truncated 3 mantissa bits per scale (10→7) and
+        // was the P10 late-token drift contributor this repair fixes.
+        let scales = weights.take_keep_dtype(&format!("{prefix}.scales"))?;
+        let affine_biases = weights.take_keep_dtype(&format!("{prefix}.biases"))?;
         let bias_name = format!("{prefix}.bias");
         let linear_bias = if weights.contains(&bias_name) {
             Some(weights.take(&bias_name)?)
@@ -886,14 +889,13 @@ impl AffineQuantEmbedding {
     ) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
         // Scales / biases ship F16 on every mlx-community 4bit repo
-        // sampled in P0; ferrite-metal's affine_embed kernel is
-        // templated on the activation dtype `T` and binds scales /
-        // biases as `device const T*` (matching MLX). On the BF16
-        // metal stack `T = bfloat`, so `take()` CASTS F16 → BF16 to
-        // match the kernel's binding — same handling as
-        // `AffineQuantLinear::load`.
-        let scales = weights.take(&format!("{prefix}.scales"))?;
-        let affine_biases = weights.take(&format!("{prefix}.biases"))?;
+        // sampled in P0; ferrite-metal's affine_embed kernel reads
+        // them as `T_scale = half` and casts to T_act in-register
+        // (`INT4_PARITY_PROBES.md` §7). `take_keep_dtype` skips the
+        // loader-side F16→BF16 cast — see `AffineQuantLinear::load`
+        // for the full reasoning.
+        let scales = weights.take_keep_dtype(&format!("{prefix}.scales"))?;
+        let affine_biases = weights.take_keep_dtype(&format!("{prefix}.biases"))?;
         let pack_factor = (32 / bits) as usize;
         let vocab_size = weight.dim(0);
         let hidden_size = weight.dim(1) * pack_factor;

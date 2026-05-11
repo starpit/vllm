@@ -58,11 +58,19 @@ impl HalfF for half::bf16 {
 /// `packed` correspond to two consecutive output elements (contiguous-K
 /// row order). `output.len()` must equal `packed.len() * 2` and be a
 /// multiple of `group_size`; scales/biases are one entry per group.
-fn affine_dequantize_b4<T: HalfF>(
+///
+/// `TAct` is the output dtype (the int4 kernels' `TAct` template
+/// parameter); `TScale` is the scales/biases storage dtype (`TScale`).
+/// After P10b the two diverge: every mlx-community 4bit ships F16
+/// scales (`TScale = f16`) but the activation path is bf16 on Llama,
+/// Qwen, Gemma. The dequant arithmetic mirrors MLX `quantized.h:521-527`:
+/// scale + bias load into the activation type, multiply-add in
+/// activation type.
+fn affine_dequantize_b4<TAct: HalfF, TScale: HalfF>(
     packed: &[u8],
-    scales: &[T],
-    biases: &[T],
-    output: &mut [T],
+    scales: &[TScale],
+    biases: &[TScale],
+    output: &mut [TAct],
     group_size: usize,
 ) {
     assert_eq!(output.len(), packed.len() * 2);
@@ -78,12 +86,14 @@ fn affine_dequantize_b4<T: HalfF>(
     for (offset, &byte) in packed.iter().enumerate() {
         let oindex = offset * 2;
         let gindex = oindex / group_size;
-        let scale = scales[gindex].to_f32();
-        let bias = biases[gindex].to_f32();
+        // TScale → TAct cast happens here (mirrors the kernel's
+        // in-register cast — see `INT4_PARITY_PROBES.md` §7).
+        let scale = TAct::from_f32(scales[gindex].to_f32()).to_f32();
+        let bias = TAct::from_f32(biases[gindex].to_f32()).to_f32();
         let lo = (byte & 0x0f) as f32;
         let hi = ((byte >> 4) & 0x0f) as f32;
-        output[oindex] = T::from_f32(scale * lo + bias);
-        output[oindex + 1] = T::from_f32(scale * hi + bias);
+        output[oindex] = TAct::from_f32(scale * lo + bias);
+        output[oindex + 1] = TAct::from_f32(scale * hi + bias);
     }
 }
 
@@ -94,33 +104,33 @@ fn affine_dequantize_b4<T: HalfF>(
 ///
 /// Also serves as the reference for `affine_qmv` — the small-M and
 /// large-M kernels differ in dispatch, not math.
-fn affine_qmm_t_b4<T: HalfF>(
+fn affine_qmm_t_b4<TAct: HalfF, TScale: HalfF>(
     packed: &[u8],
-    scales: &[T],
-    biases: &[T],
-    x: &[T],
+    scales: &[TScale],
+    biases: &[TScale],
+    x: &[TAct],
     m: usize,
     n: usize,
     k: usize,
     group_size: usize,
-) -> Vec<T> {
+) -> Vec<TAct> {
     assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
     assert_eq!(packed.len(), n * k / 2);
     assert_eq!(scales.len(), n * k / group_size);
     assert_eq!(biases.len(), n * k / group_size);
     assert_eq!(x.len(), m * k);
 
-    let mut w = vec![T::ZERO; n * k];
-    affine_dequantize_b4::<T>(packed, scales, biases, &mut w, group_size);
+    let mut w = vec![TAct::ZERO; n * k];
+    affine_dequantize_b4::<TAct, TScale>(packed, scales, biases, &mut w, group_size);
 
-    let mut y = vec![T::ZERO; m * n];
+    let mut y = vec![TAct::ZERO; m * n];
     for i in 0..m {
         for j in 0..n {
             let mut acc: f32 = 0.0;
             for kk in 0..k {
                 acc += x[i * k + kk].to_f32() * w[j * k + kk].to_f32();
             }
-            y[i * n + j] = T::from_f32(acc);
+            y[i * n + j] = TAct::from_f32(acc);
         }
     }
     y
@@ -132,16 +142,16 @@ fn affine_qmm_t_b4<T: HalfF>(
 /// `y[i,j] = Σ_k x[i,k] * w[k,j]` (i.e. `y = x @ w`).
 ///
 /// Also serves as the reference for `affine_qvm`.
-fn affine_qmm_n_b4<T: HalfF>(
+fn affine_qmm_n_b4<TAct: HalfF, TScale: HalfF>(
     packed: &[u8],
-    scales: &[T],
-    biases: &[T],
-    x: &[T],
+    scales: &[TScale],
+    biases: &[TScale],
+    x: &[TAct],
     m: usize,
     n: usize,
     k: usize,
     group_size: usize,
-) -> Vec<T> {
+) -> Vec<TAct> {
     assert_eq!(n % group_size, 0, "N must be a multiple of group_size");
     assert_eq!(packed.len(), k * n / 2);
     assert_eq!(scales.len(), k * n / group_size);
@@ -150,34 +160,42 @@ fn affine_qmm_n_b4<T: HalfF>(
 
     let groups_per_row = n / group_size;
     let bytes_per_row = n / 2;
-    let mut w = vec![T::ZERO; k * n];
+    let mut w = vec![TAct::ZERO; k * n];
     for kk in 0..k {
         for byte_j in 0..bytes_per_row {
             let byte = packed[kk * bytes_per_row + byte_j];
             let n_col = 2 * byte_j;
             let group_idx = kk * groups_per_row + n_col / group_size;
-            let scale = scales[group_idx].to_f32();
-            let bias = biases[group_idx].to_f32();
+            // Match the kernel's in-register TScale → TAct cast.
+            let scale = TAct::from_f32(scales[group_idx].to_f32()).to_f32();
+            let bias = TAct::from_f32(biases[group_idx].to_f32()).to_f32();
             let lo = (byte & 0x0f) as f32;
             let hi = ((byte >> 4) & 0x0f) as f32;
-            w[kk * n + n_col] = T::from_f32(scale * lo + bias);
-            w[kk * n + n_col + 1] = T::from_f32(scale * hi + bias);
+            w[kk * n + n_col] = TAct::from_f32(scale * lo + bias);
+            w[kk * n + n_col + 1] = TAct::from_f32(scale * hi + bias);
         }
     }
-    let mut y = vec![T::ZERO; m * n];
+    let mut y = vec![TAct::ZERO; m * n];
     for i in 0..m {
         for j in 0..n {
             let mut acc: f32 = 0.0;
             for kk in 0..k {
                 acc += x[i * k + kk].to_f32() * w[kk * n + j].to_f32();
             }
-            y[i * n + j] = T::from_f32(acc);
+            y[i * n + j] = TAct::from_f32(acc);
         }
     }
     y
 }
 
 // ---- Concrete-dtype entry points ----------------------------------
+//
+// Post-P10b: the kernels' `TAct` and `TScale` template parameters are
+// independent. The mlx-community 4bit checkpoints all ship `TScale =
+// f16`; `TAct` follows `torch_dtype` (f16 or bf16). The `_bf16` /
+// `_f16` suffix below names `TAct`; both variants now consume F16
+// scales/biases. The previous symmetric (`TAct = TScale = bf16`)
+// path is gone — that was the P1-P6 regression site.
 
 pub fn affine_dequantize_b4_f16(
     packed: &[u8],
@@ -186,17 +204,17 @@ pub fn affine_dequantize_b4_f16(
     output: &mut [half::f16],
     group_size: usize,
 ) {
-    affine_dequantize_b4::<half::f16>(packed, scales, biases, output, group_size);
+    affine_dequantize_b4::<half::f16, half::f16>(packed, scales, biases, output, group_size);
 }
 
 pub fn affine_dequantize_b4_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     output: &mut [half::bf16],
     group_size: usize,
 ) {
-    affine_dequantize_b4::<half::bf16>(packed, scales, biases, output, group_size);
+    affine_dequantize_b4::<half::bf16, half::f16>(packed, scales, biases, output, group_size);
 }
 
 pub fn affine_qmm_t_b4_f16(
@@ -209,20 +227,20 @@ pub fn affine_qmm_t_b4_f16(
     k: usize,
     group_size: usize,
 ) -> Vec<half::f16> {
-    affine_qmm_t_b4::<half::f16>(packed, scales, biases, x, m, n, k, group_size)
+    affine_qmm_t_b4::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
 }
 
 pub fn affine_qmm_t_b4_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     x: &[half::bf16],
     m: usize,
     n: usize,
     k: usize,
     group_size: usize,
 ) -> Vec<half::bf16> {
-    affine_qmm_t_b4::<half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+    affine_qmm_t_b4::<half::bf16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
 }
 
 pub fn affine_qmm_n_b4_f16(
@@ -235,20 +253,20 @@ pub fn affine_qmm_n_b4_f16(
     k: usize,
     group_size: usize,
 ) -> Vec<half::f16> {
-    affine_qmm_n_b4::<half::f16>(packed, scales, biases, x, m, n, k, group_size)
+    affine_qmm_n_b4::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
 }
 
 pub fn affine_qmm_n_b4_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     x: &[half::bf16],
     m: usize,
     n: usize,
     k: usize,
     group_size: usize,
 ) -> Vec<half::bf16> {
-    affine_qmm_n_b4::<half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+    affine_qmm_n_b4::<half::bf16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
 }
 
 // Kernel-name aliases. `qmv` and `qmm_t` share math (transpose=true);

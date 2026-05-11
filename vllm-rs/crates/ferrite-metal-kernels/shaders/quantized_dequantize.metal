@@ -20,12 +20,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
-template <typename T, const int group_size>
+// `T_act` is the activation / output dtype (f16 or bf16). `T_scale` is the
+// scales/biases storage dtype on disk (always f16 in every sampled
+// mlx-community 4bit checkpoint — see `INT4_PARITY_PROBES.md` §7
+// `Decision: in-register cast`). The cast `T_scale → T_act` happens on
+// first load below, mirroring MLX's storage-vs-arithmetic split.
+template <typename T_act, typename T_scale, const int group_size>
 inline void affine_dequantize_b4_kernel(
     const device uint8_t* w,
-    const device T* scales,
-    const device T* biases,
-    device T* out,
+    const device T_scale* scales,
+    const device T_scale* biases,
+    device T_act* out,
     uint2 index,
     uint2 grid_dim) {
     // pack_factor = 8 / bits = 2 for bits=4.
@@ -35,32 +40,38 @@ inline void affine_dequantize_b4_kernel(
     size_t oindex = offset * pack_factor;
     size_t gindex = oindex / group_size;
 
-    T scale = scales[gindex];
-    T bias = biases[gindex];
+    // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7).
+    T_act scale = static_cast<T_act>(scales[gindex]);
+    T_act bias  = static_cast<T_act>(biases[gindex]);
 
     uint val = w[offset];
-    out[oindex + 0] = scale * T(val & 0x0f)        + bias;
-    out[oindex + 1] = scale * T((val >> 4) & 0x0f) + bias;
+    out[oindex + 0] = scale * T_act(val & 0x0f)        + bias;
+    out[oindex + 1] = scale * T_act((val >> 4) & 0x0f) + bias;
 }
 
-#define DEFINE_AFFINE_DEQUANTIZE_B4(dtype, mtl_type, gs)                       \
-    kernel void affine_dequantize_##dtype##_gs_##gs##_b_4(                     \
-        const device uint8_t* w        [[buffer(0)]],                          \
-        const device mtl_type* scales  [[buffer(1)]],                          \
-        const device mtl_type* biases  [[buffer(2)]],                          \
-        device mtl_type* out           [[buffer(3)]],                          \
-        uint2 index    [[thread_position_in_grid]],                            \
-        uint2 grid_dim [[threads_per_grid]]) {                                 \
-        affine_dequantize_b4_kernel<mtl_type, gs>(                             \
-            w, scales, biases, out, index, grid_dim);                          \
+#define DEFINE_AFFINE_DEQUANTIZE_B4(act_tag, act_type, scale_tag, scale_type, gs)        \
+    kernel void affine_dequantize_##act_tag##_s_##scale_tag##_gs_##gs##_b_4(             \
+        const device uint8_t* w           [[buffer(0)]],                                 \
+        const device scale_type* scales   [[buffer(1)]],                                 \
+        const device scale_type* biases   [[buffer(2)]],                                 \
+        device act_type* out              [[buffer(3)]],                                 \
+        uint2 index    [[thread_position_in_grid]],                                      \
+        uint2 grid_dim [[threads_per_grid]]) {                                           \
+        affine_dequantize_b4_kernel<act_type, scale_type, gs>(                           \
+            w, scales, biases, out, index, grid_dim);                                    \
     }
 
-DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,    32)
-DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,    64)
-DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,   128)
-DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat,  32)
-DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat,  64)
-DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, 128)
+// Coverage: T_scale=half always (every sampled mlx-community 4bit ships
+// F16 scales/biases — verified `INT4_PARITY_PROBES.md:73,287`). T_act in
+// {half, bfloat} per `torch_dtype`. Pre-P10b also had `bfloat×bfloat`
+// (loader cast F16→BF16 at load); that path is the regression site and
+// is removed here.
+DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,   f16, half,  32)
+DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,   f16, half,  64)
+DEFINE_AFFINE_DEQUANTIZE_B4(f16,  half,   f16, half, 128)
+DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half,  32)
+DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half,  64)
+DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, f16, half, 128)
 
 // ============================================================================
 // affine_embed_b4_kernel — gather + dequantize in one pass.
@@ -101,13 +112,13 @@ DEFINE_AFFINE_DEQUANTIZE_B4(bf16, bfloat, 128)
 
 constant uint AFFINE_EMBED_HIDDEN_SIZE [[function_constant(0)]];
 
-template <typename T, const int group_size>
+template <typename T_act, typename T_scale, const int group_size>
 inline void affine_embed_b4_kernel(
     const device uint8_t* w,
-    const device T* scales,
-    const device T* biases,
+    const device T_scale* scales,
+    const device T_scale* biases,
     const device uint* indices,
-    device T* out,
+    device T_act* out,
     uint hidden_size,
     uint2 index) {
     constexpr int pack_factor = 2;
@@ -126,29 +137,30 @@ inline void affine_embed_b4_kernel(
     size_t gindex      = size_t(vocab_idx) * groups_per_row + (out_col / group_size);
     size_t out_offset  = size_t(index.y) * size_t(hidden_size) + out_col;
 
-    T scale = scales[gindex];
-    T bias  = biases[gindex];
+    // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7).
+    T_act scale = static_cast<T_act>(scales[gindex]);
+    T_act bias  = static_cast<T_act>(biases[gindex]);
     uint val = w[w_offset];
 
-    out[out_offset + 0] = scale * T(val & 0x0f)        + bias;
-    out[out_offset + 1] = scale * T((val >> 4) & 0x0f) + bias;
+    out[out_offset + 0] = scale * T_act(val & 0x0f)        + bias;
+    out[out_offset + 1] = scale * T_act((val >> 4) & 0x0f) + bias;
 }
 
-#define DEFINE_AFFINE_EMBED_B4(dtype, mtl_type, gs)                            \
-    kernel void affine_embed_##dtype##_gs_##gs##_b_4(                          \
-        const device uint8_t* w        [[buffer(0)]],                          \
-        const device mtl_type* scales  [[buffer(1)]],                          \
-        const device mtl_type* biases  [[buffer(2)]],                          \
-        const device uint*    indices  [[buffer(3)]],                          \
-        device mtl_type* out           [[buffer(4)]],                          \
-        uint2 index    [[thread_position_in_grid]]) {                          \
-        affine_embed_b4_kernel<mtl_type, gs>(                                  \
-            w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index); \
+#define DEFINE_AFFINE_EMBED_B4(act_tag, act_type, scale_tag, scale_type, gs)             \
+    kernel void affine_embed_##act_tag##_s_##scale_tag##_gs_##gs##_b_4(                  \
+        const device uint8_t* w           [[buffer(0)]],                                 \
+        const device scale_type* scales   [[buffer(1)]],                                 \
+        const device scale_type* biases   [[buffer(2)]],                                 \
+        const device uint*       indices  [[buffer(3)]],                                 \
+        device act_type* out              [[buffer(4)]],                                 \
+        uint2 index    [[thread_position_in_grid]]) {                                    \
+        affine_embed_b4_kernel<act_type, scale_type, gs>(                                \
+            w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);           \
     }
 
-DEFINE_AFFINE_EMBED_B4(f16,  half,    32)
-DEFINE_AFFINE_EMBED_B4(f16,  half,    64)
-DEFINE_AFFINE_EMBED_B4(f16,  half,   128)
-DEFINE_AFFINE_EMBED_B4(bf16, bfloat,  32)
-DEFINE_AFFINE_EMBED_B4(bf16, bfloat,  64)
-DEFINE_AFFINE_EMBED_B4(bf16, bfloat, 128)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,  32)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,  64)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half, 128)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,  32)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,  64)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half, 128)

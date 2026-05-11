@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use ferrite_metal_kernels::device::detect_device;
-use ferrite_metal_kernels::quantized::{DequantDtype, MetalAffineDequantize};
+use ferrite_metal_kernels::quantized::{DequantDtype, MetalAffineDequantize, ScaleDtype};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -79,8 +79,8 @@ fn cpu_affine_dequantize_b4_f16(
 
 fn cpu_affine_dequantize_b4_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     group_size: usize,
 ) -> Vec<half::bf16> {
     let out_len = packed.len() * 2;
@@ -88,8 +88,11 @@ fn cpu_affine_dequantize_b4_bf16(
     for (offset, &byte) in packed.iter().enumerate() {
         let oindex = offset * 2;
         let gindex = oindex / group_size;
-        let scale = scales[gindex].to_f32();
-        let bias = biases[gindex].to_f32();
+        // P10b: kernel casts T_scale (f16) → T_act (bf16) in-register
+        // before the dequant math. Match that exactly in the CPU ref so
+        // we can compare bit-for-bit (within ~2 ULP for bf16 FMA).
+        let scale = half::bf16::from_f32(scales[gindex].to_f32()).to_f32();
+        let bias = half::bf16::from_f32(biases[gindex].to_f32()).to_f32();
         let lo = (byte & 0x0f) as f32;
         let hi = ((byte >> 4) & 0x0f) as f32;
         out[oindex] = half::bf16::from_f32(scale * lo + bias);
@@ -161,11 +164,13 @@ fn affine_dequantize_b4_bf16_kernel_matches_cpu_reference() {
 
         let mut rng = SplitMix64(0xDEADBEEF_u64 ^ group_size as u64);
         let packed: Vec<u8> = (0..n_bytes).map(|_| rng.next_byte()).collect();
-        let scales: Vec<half::bf16> = (0..n_groups)
-            .map(|_| half::bf16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
+        // P10b: scales/biases ship F16 on disk; the kernel reads them
+        // as `T_scale = half` and casts to `T_act` in-register.
+        let scales: Vec<half::f16> = (0..n_groups)
+            .map(|_| half::f16::from_f32(0.1 + 0.9 * rng.next_unit_f32()))
             .collect();
-        let biases: Vec<half::bf16> = (0..n_groups)
-            .map(|_| half::bf16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
+        let biases: Vec<half::f16> = (0..n_groups)
+            .map(|_| half::f16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
             .collect();
 
         let expected = cpu_affine_dequantize_b4_bf16(&packed, &scales, &biases, group_size);
@@ -218,6 +223,7 @@ fn run_kernel_f16(
             group_size,
             4,
             DequantDtype::F16,
+            ScaleDtype::F16,
             &encoder,
         )
         .expect("dequant dispatch");
@@ -230,8 +236,8 @@ fn run_kernel_f16(
 
 fn run_kernel_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     n: usize,
     k: usize,
     group_size: u32,
@@ -264,6 +270,7 @@ fn run_kernel_bf16(
             group_size,
             4,
             DequantDtype::Bf16,
+            ScaleDtype::F16,
             &encoder,
         )
         .expect("dequant dispatch");

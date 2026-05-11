@@ -21,7 +21,9 @@ use std::ptr::NonNull;
 
 use ferrite_metal_kernels::cpu_reference::affine_qvm_b4_bf16 as cpu_qvm_bf16;
 use ferrite_metal_kernels::device::detect_device;
-use ferrite_metal_kernels::quantized::{pick_qvm_kernel, DequantDtype, MetalAffineQvm, QvmKernel};
+use ferrite_metal_kernels::quantized::{
+    pick_qvm_kernel, DequantDtype, MetalAffineQvm, QvmKernel, ScaleDtype,
+};
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -81,18 +83,19 @@ fn make_inputs_bf16(
     k: usize,
     m: usize,
     group_size: usize,
-) -> (Vec<u8>, Vec<half::bf16>, Vec<half::bf16>, Vec<half::bf16>) {
+) -> (Vec<u8>, Vec<half::f16>, Vec<half::f16>, Vec<half::bf16>) {
     assert_eq!(n % group_size, 0, "qvm requires N % group_size == 0");
     let n_bytes = k * n / 2;
     let n_groups = k * n / group_size;
 
     let mut rng = SplitMix64(seed);
     let packed: Vec<u8> = (0..n_bytes).map(|_| rng.next_byte()).collect();
-    let scales: Vec<half::bf16> = (0..n_groups)
-        .map(|_| half::bf16::from_f32(0.01 + 0.04 * rng.next_unit_f32()))
+    // P10b: scales/biases ship F16 on disk (`T_scale = half`).
+    let scales: Vec<half::f16> = (0..n_groups)
+        .map(|_| half::f16::from_f32(0.01 + 0.04 * rng.next_unit_f32()))
         .collect();
-    let biases: Vec<half::bf16> = (0..n_groups)
-        .map(|_| half::bf16::from_f32(rng.next_unit_f32() - 0.5))
+    let biases: Vec<half::f16> = (0..n_groups)
+        .map(|_| half::f16::from_f32(rng.next_unit_f32() - 0.5))
         .collect();
     let x: Vec<half::bf16> = (0..(m * k))
         .map(|_| half::bf16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
@@ -108,8 +111,8 @@ fn make_inputs_bf16(
 #[allow(clippy::too_many_arguments)]
 fn run_qvm_bf16(
     packed: &[u8],
-    scales: &[half::bf16],
-    biases: &[half::bf16],
+    scales: &[half::f16],
+    biases: &[half::f16],
     x: &[half::bf16],
     m: usize,
     n: usize,
@@ -156,6 +159,7 @@ fn run_qvm_bf16(
             group_size,
             4,
             DequantDtype::Bf16,
+            ScaleDtype::F16,
             &encoder,
         )
         .expect("qvm dispatch");

@@ -8,7 +8,7 @@
 > - All sampled mlx-community 4bit checkpoints use uniform `gs=64, bits=4`
 > - Embedding is quantized in every checkpoint sampled (with one exception: Gemma-3-MM language_model embedding stored fp)
 
-## Status (2026-05-10)
+## Status (2026-05-11)
 
 | Phase | State | Commit | Notes |
 |---|---|---|---|
@@ -19,10 +19,10 @@
 | P3 — decode GEMV (`qmv_quad` / `qmv_fast` / `qmv`) | ✅ kernels | `93eb4a846` | Three faithful ports + cpu-parity tests; forward-time swap deferred to P3-P4 integration |
 | P4 — prefill GEMM transpose=true | ✅ kernels | `49a51e485` | `qmm_t` + `qmm_t_splitk` ports + dispatcher (`pick_qmm_t_kernel` + split_k heuristic) + cpu-parity tests for aligned / unaligned / splitk |
 | P3-P4 C1 — function-constant refactor (ICB readiness) | ✅ done | `cd6eb49ba` | qmv/qmm_t K/N/M moved to `[[function_constant(N)]]` + `ShaderCache::get_pipeline_specialized` + `ConstantValue::Int` variant; standalone parity tests preserved |
-| P3-P4 C2 — `Instruction::AffineQmm` + `lower_one` | ✅ done | tbd | Variant + cuda unreachable arm + lowering arm (qmv quad/fast/generic + qmm_t Standard) + 3 lowering-shape unit tests; SplitK still C3 |
+| P3-P4 C2 — `Instruction::AffineQmm` + `lower_one` | ✅ done | `405a36931` | Variant + cuda unreachable arm + lowering arm (qmv quad/fast/generic + qmm_t Standard) + 3 lowering-shape unit tests; SplitK still C3 |
 | P3-P4 C3 — splitk reduce kernel | ✅ kernel | `1e4426d26` | `splitk_reduce_sum_<dtype>` shader + `MetalSplitKReduce` dispatcher + bf16/f16 parity tests; lowering integration + scratch slot allocation deferred to C4 |
-| P3-P4 C4a — `Instruction::SiluMul` + kernel + lowering arm | ✅ done | tbd | New `silu_mul_<dtype>` shader + `Instruction::SiluMul` + `KernelId::SiluMul` + lowering arm + 1 lowering-shape unit test; dead code in production until C4b wires the solver / FusedGateUpSiluMul fan_out switch |
-| P3-P4 C4b — solver Impl + macro flip + FUF revert + Llama-1B verify | pending | — | `MetalAffineQmmImpl` + extend `MetalFusedGateUpSiluMulImpl::matches`/`fan_out` to emit decomposed for Affine + reject Dense in `MetalGemmImpl` for Affine (so AffineQmm wins) + macro flips `LinearAffine` → `load_affine_quant` + revert `fuf.rs` Affine→Dense downgrade + scratch-slot allocation for SplitK + lowering switch to SplitK when `pick_qmm_t_kernel` says so + Llama-1B-4bit `vllm chat` smoke |
+| P3-P4 C4a — `Instruction::SiluMul` + kernel + lowering arm | ✅ done | `6f1592b1a` | New `silu_mul_<dtype>` shader + `Instruction::SiluMul` + `KernelId::SiluMul` + lowering arm + 1 lowering-shape unit test |
+| P3-P4 C4b parts 1-4 — Llama-1B-4bit coherent E2E | ✅ done | `9c62889cc`, `02aff6bea`, `de9241fbb`, `e304f8a07` | Forward-time qmv/qmm_t wiring (part 1) + SplitK plumbing + per-layer affine load + tied lm_head (part 2) + per-tile dp slot allocator (part 3) + u32-unaligned mmap-alias fix (part 4 — Apple's M-series driver returns garbage on unaligned u32 binding offsets; mlx-community Llama-3.2-1B-4bit safetensors header is 41161 bytes so data section starts at file pos %4=1). Llama-3.2-1B-4bit + Llama-3.2-3B-4bit both produce coherent end-to-end output. |
 | P5 — transpose=false (`qmm_n` / `qvm` / `qvm_split_k`) | pending | — | |
 | P6 — quantized embedding lookup | pending | — | P2 dequants the embedding at load; P6 lifts to forward-time gather + dequant |
 | P7 — NAX (M4+) | pending | — | |

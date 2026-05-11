@@ -27,12 +27,15 @@ use syn::parse::{Parse, ParseStream};
 use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
 
 mod ast;
+mod atom;
+mod atom_lib;
 mod cfg;
 mod classified;
 mod classify;
 mod codegen;
 mod concurrency;
 mod config;
+mod fuse_pass;
 mod cost;
 mod emit;
 mod fuf;
@@ -340,6 +343,17 @@ fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path:
 
 #[proc_macro_attribute]
 pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
+    // FERRITE_DUMP_SYNTH=<path> writes the MVP-synthesized pre-attn
+    // chunk kernel for Llama-3.2-3B-4bit shape to the given path, then
+    // proceeds with normal macro expansion. Lets us run `xcrun metal`
+    // on the generated source without standing up the full solver
+    // integration. Phase-2.5 verification hook — drops out once the
+    // full fuse pass + lowering integration lands.
+    if let Ok(path) = std::env::var("FERRITE_DUMP_SYNTH") {
+        let kernel = fuse_pass::dump_llama_3_2_3b_4bit_pre_attn();
+        let _ = std::fs::write(&path, &kernel.source);
+    }
+
     let args = parse_macro_input!(args as ForwardArgs);
     let carrier = parse_macro_input!(item as ItemFn);
 

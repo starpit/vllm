@@ -1,0 +1,455 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Backend-neutral atom impls for the decoder body. Each `Atom` here
+// captures the per-claim parameters (group_size, bits, head dims, ...)
+// and emits a per-backend code fragment from `emit_metal_body` /
+// `emit_cuda_body` (CUDA bodies land in a later phase).
+//
+// The fuse pass consumes these atoms (one per solver claim, when the
+// Impl's `as_atom` returns `Some`), groups them by dispatch shape +
+// data-flow compatibility, and stitches the emitted fragments into a
+// single synthesized kernel.
+//
+// Channel naming convention (used in the emit fragments via
+// `AtomCtx::bound_inputs` / `bound_outputs`):
+//
+//   "x_norm"   — TG-memory activation of length HIDDEN, post-RMSNorm.
+//                Produced by AddRmsNormAtom / RmsNormAtom; consumed
+//                by AffineQmvAtom.
+//   "qmv_smem" — TG-memory dot-product result of length HEAD_DIM (for
+//                the QKV variant) or TILE_N (for gate/up/down variants).
+//                Produced by AffineQmvAtom; consumed by RopeAppend /
+//                ResidualWriteBack / SiluMul.
+//
+// All atoms in a fuse group share the dispatch shape
+// (M, NUM_HEADS_TOTAL, 1) × (MK_SIMD_SIZE * HEAD_DIM / MK_ROWS_PER_SIMDGROUP).
+//
+// Fragments use placeholder substitutions:
+//   {T_act}   → AtomCtx::t_act         (e.g. "bfloat" / "half")
+//   {T_scale} → AtomCtx::t_scale       ("half" universally for affine-int4)
+//
+// The fuse pass performs simple string substitution before writing
+// the synthesized kernel to disk.
+
+#![allow(dead_code)] // Atoms have no callers until the fuse pass lands in Phase 3.
+
+use crate::atom::{
+    Atom, AtomChannel, AtomConstantValue, AtomCtx, AtomDispatchShape, AtomKind, AtomSignature,
+    ChannelKind, Fuseability,
+};
+
+/// AddRmsNorm atom: computes `residual_new = residual + delta`,
+/// then `scale = rsqrt(mean((residual_new)²) + eps)`, then writes
+/// `x_norm[i] = residual_new[i] * scale * rms_weight[i]` into TG
+/// memory. TGs whose `head < NUM_Q_HEADS` additionally write
+/// their `[head*HEAD_DIM, (head+1)*HEAD_DIM)` slice of
+/// `residual_new` back to the residual buffer for the NEXT layer's
+/// consumer. K/V-head TGs skip the device write.
+///
+/// Output channel `x_norm`: TG-mem `{T_act} x_norm[HIDDEN_MAX]`. The
+/// fuse pass binds this channel to the kernel's actual TG-mem array
+/// name and threads it to the AffineQmv consumer.
+#[derive(Clone, Debug)]
+pub struct AddRmsNormAtom;
+
+impl Atom for AddRmsNormAtom {
+    fn kind(&self) -> AtomKind {
+        AtomKind::AddRmsNorm
+    }
+
+    fn signature(&self) -> AtomSignature {
+        AtomSignature {
+            inputs: vec![
+                AtomChannel {
+                    name: "residual_io".into(),
+                    kind: ChannelKind::Device,
+                    ty: "{T_act}".into(),
+                },
+                AtomChannel {
+                    name: "delta".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const {T_act}".into(),
+                },
+                AtomChannel {
+                    name: "rms_weight".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const {T_scale}".into(),
+                },
+            ],
+            outputs: vec![AtomChannel {
+                name: "x_norm".into(),
+                kind: ChannelKind::Threadgroup,
+                ty: "{T_act}".into(),
+            }],
+        }
+    }
+
+    fn dispatch_shape(&self, _ctx: &AtomCtx) -> AtomDispatchShape {
+        // Per (token, output_head). Compatible with AffineQmvAtom,
+        // RopeAppendAtom, etc.
+        AtomDispatchShape {
+            threadgroups: (0, 0, 1),                // M and num_heads_total filled by fuse pass
+            threads_per_threadgroup: (0, 1, 1),     // 32 * HEAD_DIM / 4, filled by fuse pass
+        }
+    }
+
+    fn fuseability(&self) -> Fuseability {
+        Fuseability::WithSameDispatch
+    }
+
+    fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
+        let res = &ctx.bound_inputs[0]; // residual_io
+        let del = &ctx.bound_inputs[1]; // delta
+        let rw  = &ctx.bound_inputs[2]; // rms_weight
+        let out = &ctx.bound_outputs[0]; // x_norm (TG memory)
+
+        let t_act = ctx.t_act;
+        // Body sourced from fused_add_rmsnorm_affine_qkv_rope_cache.metal:
+        // each thread reads its strided slice of (residual, delta) over
+        // HIDDEN, accumulates sumsq, mk_tg_rmsnorm_scale, then writes
+        // x_norm[i] = (residual + delta) * scale * rms_weight[i]. Q-head
+        // TGs additionally write residual_new back to device.
+        Some(format!(
+            r#"
+    // --- atom: AddRmsNorm ---
+    {{
+        device {t_act}* __res_row = {res} + (size_t)__t * (size_t)__hidden;
+        device const {t_act}* __del_row = {del} + (size_t)__t * (size_t)__hidden;
+        float __local_sumsq = 0.0f;
+        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
+            const float __r = float(__res_row[__i]);
+            const float __d = float(__del_row[__i]);
+            const float __v = __r + __d;
+            __local_sumsq += __v * __v;
+            {out}[__i] = {t_act}(__v);
+        }}
+        const float __scale = mk_tg_rmsnorm_scale(__local_sumsq, __hidden, __eps,
+                                                  __scratch, __num_simdgroups,
+                                                  __simd_gid, __simd_lid);
+        const bool __writes_residual = (__head < __num_q);
+        const uint __res_slice_lo = __head * __head_dim;
+        const uint __res_slice_hi = __res_slice_lo + __head_dim;
+        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
+            const float __v_pre = float({out}[__i]);
+            const float __w     = float({rw}[__i]);
+            const float __normed = __v_pre * __scale * __w;
+            if (__writes_residual && __i >= __res_slice_lo && __i < __res_slice_hi) {{
+                __res_row[__i] = {t_act}(__v_pre);
+            }}
+            {out}[__i] = {t_act}(__normed);
+        }}
+        mk_sync();
+    }}
+"#,
+            t_act = t_act,
+            res = res,
+            del = del,
+            rw = rw,
+            out = out,
+        ))
+    }
+}
+
+/// Affine-int4 cooperative GEMV. Reads a TG-memory activation
+/// (`x_norm`), produces TG-memory dot-products (`qmv_smem`) of length
+/// HEAD_DIM. Uses `mk_qmv_fast` to compute 4 outputs per simdgroup;
+/// `simd_gid` selects the output row within the head's HEAD_DIM-sized
+/// slice.
+///
+/// The `weight_packed` / `scales` / `biases` buffers index globally as
+/// `(NUM_Q + 2 * NUM_KV) * HEAD_DIM` rows × HIDDEN columns — the
+/// caller's lowering arm provides the concat'd `AffineQuantLinear`.
+#[derive(Clone, Debug)]
+pub struct AffineQmvAtom {
+    pub group_size: u32,
+}
+
+impl Atom for AffineQmvAtom {
+    fn kind(&self) -> AtomKind {
+        AtomKind::AffineQmv
+    }
+
+    fn signature(&self) -> AtomSignature {
+        AtomSignature {
+            inputs: vec![
+                AtomChannel {
+                    name: "x_norm".into(),
+                    kind: ChannelKind::Threadgroup,
+                    ty: "{T_act}".into(),
+                },
+                AtomChannel {
+                    name: "weight_packed".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const uint32_t".into(),
+                },
+                AtomChannel {
+                    name: "scales".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const {T_scale}".into(),
+                },
+                AtomChannel {
+                    name: "biases".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const {T_scale}".into(),
+                },
+            ],
+            outputs: vec![AtomChannel {
+                name: "qmv_smem".into(),
+                kind: ChannelKind::Threadgroup,
+                ty: "float".into(),
+            }],
+        }
+    }
+
+    fn dispatch_shape(&self, _ctx: &AtomCtx) -> AtomDispatchShape {
+        AtomDispatchShape {
+            threadgroups: (0, 0, 1),
+            threads_per_threadgroup: (0, 1, 1),
+        }
+    }
+
+    fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
+        let x   = &ctx.bound_inputs[0];  // x_norm
+        let w   = &ctx.bound_inputs[1];  // weight_packed
+        let s   = &ctx.bound_inputs[2];  // scales
+        let b   = &ctx.bound_inputs[3];  // biases
+        let out = &ctx.bound_outputs[0]; // qmv_smem
+
+        let t_act = ctx.t_act;
+        let t_scale = ctx.t_scale;
+        let gs = self.group_size;
+
+        Some(format!(
+            r#"
+    // --- atom: AffineQmv (gs={gs}) ---
+    {{
+        constexpr int __bits              = 4;
+        constexpr int __pack_factor       = mk_get_pack_factor<__bits, 32>();
+        constexpr int __bytes_per_pack    = mk_get_bytes_per_pack<__bits, 32>();
+        constexpr int __values_per_thread = __pack_factor * MK_PACKS_PER_THREAD;
+        constexpr int __scale_step        = {gs} / __values_per_thread;
+        const uint __global_out_row_base = __head * __head_dim + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+        const int  __in_vec_size_w       = (int)__hidden * __bytes_per_pack / __pack_factor;
+        const int  __in_vec_size_g       = (int)__hidden / {gs};
+        const device uint8_t*  __ws = (const device uint8_t*){w}
+            + (size_t)__global_out_row_base * (size_t)__in_vec_size_w
+            + (size_t)__simd_lid * MK_PACKS_PER_THREAD * __bytes_per_pack;
+        const device {t_scale}* __sc = {s}
+            + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
+            + __simd_lid / __scale_step;
+        const device {t_scale}* __bi = {b}
+            + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
+            + __simd_lid / __scale_step;
+        thread float __x_thread[__values_per_thread];
+        thread float __result[MK_ROWS_PER_SIMDGROUP] = {{ 0 }};
+        const int __block_size = __values_per_thread * MK_SIMD_SIZE;
+        threadgroup {t_act}* __x_tg = {x} + __simd_lid * __values_per_thread;
+        const device uint8_t*  __ws_iter = __ws;
+        const device {t_scale}* __sc_iter = __sc;
+        const device {t_scale}* __bi_iter = __bi;
+        for (int __k = 0; __k < (int)__hidden; __k += __block_size) {{
+            float __sum = mk_load_vector<{t_act}, float, __values_per_thread, __bits>(__x_tg, __x_thread);
+            for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+                const device uint8_t*  __wl = __ws_iter + __row * __in_vec_size_w;
+                float __s = float(__sc_iter[__row * __in_vec_size_g]);
+                float __b = float(__bi_iter[__row * __in_vec_size_g]);
+                __result[__row] += mk_qdot<float, __values_per_thread, __bits>(__wl, __x_thread, __s, __b, __sum);
+            }}
+            __ws_iter += __block_size * __bytes_per_pack / __pack_factor;
+            __sc_iter += __block_size / {gs};
+            __bi_iter += __block_size / {gs};
+            __x_tg    += __block_size;
+        }}
+        for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+            __result[__row] = simd_sum(__result[__row]);
+            if (__simd_lid == 0) {{
+                {out}[__simd_gid * MK_ROWS_PER_SIMDGROUP + __row] = __result[__row];
+            }}
+        }}
+        mk_sync();
+    }}
+"#,
+            t_act = t_act,
+            t_scale = t_scale,
+            gs = gs,
+            x = x,
+            w = w,
+            s = s,
+            b = b,
+            out = out,
+        ))
+    }
+}
+
+/// RopeAppend atom: reads `qmv_smem[HEAD_DIM]`, applies NeoX RoPE on
+/// the rotational dims, writes:
+///   - For `head < NUM_Q`: rotated values to `q_out[t, head, :]`.
+///   - For `head < NUM_Q + NUM_KV` (K head): rotated values to
+///     `kv_cache_k[block_id, kv_head, block_offset, :]`.
+///   - Else (V head): pass-through values to `kv_cache_v[...]`.
+///
+/// Skips the cache write when `slot_mapping[t] == 0xFFFFFFFF` (padding
+/// lane sentinel) to match the standalone `rope_append_*_specialized`
+/// kernel's behavior.
+#[derive(Clone, Debug)]
+pub struct RopeAppendAtom;
+
+impl Atom for RopeAppendAtom {
+    fn kind(&self) -> AtomKind {
+        // The kind discriminator is shared for the Q / K / V branches
+        // since one atom emits the whole epilogue (per-band switch
+        // happens inside the emitted body).
+        AtomKind::KvPagedWrite
+    }
+
+    fn signature(&self) -> AtomSignature {
+        AtomSignature {
+            inputs: vec![
+                AtomChannel {
+                    name: "qmv_smem".into(),
+                    kind: ChannelKind::Threadgroup,
+                    ty: "float".into(),
+                },
+                AtomChannel {
+                    name: "cos_sin".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const {T_act}".into(),
+                },
+                AtomChannel {
+                    name: "positions".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const uint".into(),
+                },
+                AtomChannel {
+                    name: "slot_mapping".into(),
+                    kind: ChannelKind::Device,
+                    ty: "const uint".into(),
+                },
+            ],
+            outputs: vec![
+                AtomChannel {
+                    name: "q_out".into(),
+                    kind: ChannelKind::Device,
+                    ty: "{T_act}".into(),
+                },
+                AtomChannel {
+                    name: "kv_cache_k".into(),
+                    kind: ChannelKind::Device,
+                    ty: "{T_act}".into(),
+                },
+                AtomChannel {
+                    name: "kv_cache_v".into(),
+                    kind: ChannelKind::Device,
+                    ty: "{T_act}".into(),
+                },
+            ],
+        }
+    }
+
+    fn dispatch_shape(&self, _ctx: &AtomCtx) -> AtomDispatchShape {
+        AtomDispatchShape {
+            threadgroups: (0, 0, 1),
+            threads_per_threadgroup: (0, 1, 1),
+        }
+    }
+
+    fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
+        let qmv = &ctx.bound_inputs[0];
+        let cs  = &ctx.bound_inputs[1];
+        let pos = &ctx.bound_inputs[2];
+        let slm = &ctx.bound_inputs[3];
+        let qo  = &ctx.bound_outputs[0];
+        let kc  = &ctx.bound_outputs[1];
+        let vc  = &ctx.bound_outputs[2];
+
+        let t_act = ctx.t_act;
+
+        Some(format!(
+            r#"
+    // --- atom: RopeAppend + KvPagedWrite ---
+    {{
+        if (__simd_lid == 0) {{
+            const uint __base_d = __simd_gid * MK_ROWS_PER_SIMDGROUP;
+            const uint __kQ_END = __num_q;
+            const uint __kK_END = __num_q + __num_kv;
+            if (__head < __kQ_END) {{
+                device {t_act}* __q_row = {qo}
+                    + (size_t)__t    * (size_t)(__num_q * __head_dim)
+                    + (size_t)__head * (size_t)__head_dim;
+                if (__base_d < __half_dim) {{
+                    const uint __p = {pos}[__t];
+                    device const {t_act}* __cos_row = {cs} + (size_t)__p * (size_t)__rot_dim;
+                    device const {t_act}* __sin_row = __cos_row + __half_dim;
+                    for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++) {{
+                        const uint __d = __base_d + __r;
+                        float __x0 = {qmv}[__d];
+                        float __x1 = {qmv}[__half_dim + __d];
+                        mk_rope_pair(__x0, __x1, float(__cos_row[__d]), float(__sin_row[__d]));
+                        __q_row[__d]            = {t_act}(__x0);
+                        __q_row[__half_dim + __d] = {t_act}(__x1);
+                    }}
+                }} else if (__base_d >= __rot_dim) {{
+                    for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++)
+                        __q_row[__base_d + __r] = {t_act}({qmv}[__base_d + __r]);
+                }}
+            }} else if (__head < __kK_END) {{
+                const uint __kv_head = __head - __num_q;
+                const uint __slot    = {slm}[__t];
+                if (__slot != 0xFFFFFFFFu) {{
+                    const uint __block_id     = __slot / __block_sz;
+                    const uint __block_offset = __slot % __block_sz;
+                    device {t_act}* __k_dst = {kc}
+                        + (size_t)__block_id     * (size_t)(__num_kv * __block_sz * __head_dim)
+                        + (size_t)__kv_head      * (size_t)(__block_sz * __head_dim)
+                        + (size_t)__block_offset * (size_t)__head_dim;
+                    if (__base_d < __half_dim) {{
+                        const uint __p = {pos}[__t];
+                        device const {t_act}* __cos_row = {cs} + (size_t)__p * (size_t)__rot_dim;
+                        device const {t_act}* __sin_row = __cos_row + __half_dim;
+                        for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++) {{
+                            const uint __d = __base_d + __r;
+                            float __x0 = {qmv}[__d];
+                            float __x1 = {qmv}[__half_dim + __d];
+                            mk_rope_pair(__x0, __x1, float(__cos_row[__d]), float(__sin_row[__d]));
+                            __k_dst[__d]            = {t_act}(__x0);
+                            __k_dst[__half_dim + __d] = {t_act}(__x1);
+                        }}
+                    }} else if (__base_d >= __rot_dim) {{
+                        for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++)
+                            __k_dst[__base_d + __r] = {t_act}({qmv}[__base_d + __r]);
+                    }}
+                }}
+            }} else {{
+                const uint __kv_head = __head - __kK_END;
+                const uint __slot    = {slm}[__t];
+                if (__slot != 0xFFFFFFFFu) {{
+                    const uint __block_id     = __slot / __block_sz;
+                    const uint __block_offset = __slot % __block_sz;
+                    device {t_act}* __v_dst = {vc}
+                        + (size_t)__block_id     * (size_t)(__num_kv * __block_sz * __head_dim)
+                        + (size_t)__kv_head      * (size_t)(__block_sz * __head_dim)
+                        + (size_t)__block_offset * (size_t)__head_dim;
+                    for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++)
+                        __v_dst[__base_d + __r] = {t_act}({qmv}[__base_d + __r]);
+                }}
+            }}
+        }}
+    }}
+"#,
+            t_act = t_act,
+            qmv = qmv,
+            cs = cs,
+            pos = pos,
+            slm = slm,
+            qo = qo,
+            kc = kc,
+            vc = vc,
+        ))
+    }
+}
+
+// Silence unused-import warnings in this scaffolding module.
+#[allow(dead_code)]
+fn _atom_lib_uses() {
+    let _: AtomConstantValue = AtomConstantValue::Uint(0);
+}

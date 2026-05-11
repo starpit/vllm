@@ -201,3 +201,180 @@ inline void mk_qmv_fast_to_smem(
             smem[base + r] = result[r];
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Decode-atom primitives (Phase 1 of the fusion-synthesis plan)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These are the building blocks the fuse pass stitches together when
+// synthesizing per-(model, bucket, dtype) decoder kernels. Each is a
+// pure register / threadgroup-memory operation — no device-memory
+// side effects beyond declared output channels. The atom adapters in
+// `ferrite-forward-macro/src/atom.rs` emit calls to these from
+// `emit_metal_body`.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_load_vector — threadgroup-source overload
+//
+// Identical body to the device-source `mk_load_vector` above; used by
+// fused kernels that stage `x` into TG memory (e.g. RmsNorm-fold
+// fusions that compute `x = (residual + delta) * scale * rms_weight`
+// once per TG and then run mk_qmv_fast's inner loop reading from TG mem).
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename T, typename U, int values_per_thread, int bits>
+inline U mk_load_vector(const threadgroup T* x, thread U* x_thread) {
+    U sum = 0;
+    if (bits == 4) {
+        for (int i = 0; i < values_per_thread; i += 4) {
+            sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+            x_thread[i]   = x[i];
+            x_thread[i+1] = x[i+1] / 16.0f;
+            x_thread[i+2] = x[i+2] / 256.0f;
+            x_thread[i+3] = x[i+3] / 4096.0f;
+        }
+    } else if (bits == 8) {
+        for (int i = 0; i < values_per_thread; i++) {
+            sum += x[i];
+            x_thread[i] = x[i];
+        }
+    }
+    return sum;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_tg_sum — cooperative sum across an entire threadgroup
+//
+// Each thread contributes `local`; returns the total broadcast to all
+// threads. Two-stage hardware-supported reduction: `simd_sum` within
+// each simdgroup, then a single simdgroup folds the per-simdgroup
+// partials via `scratch`. `scratch` must hold ≥ `num_simdgroups`
+// floats. Bounded by `num_simdgroups ≤ MK_SIMD_SIZE` (32 lanes) —
+// 1024-thread TGs at the upper edge.
+// ─────────────────────────────────────────────────────────────────────────────
+
+inline float mk_tg_sum(
+    float              local,
+    threadgroup float* scratch,
+    uint               num_simdgroups,
+    uint               simd_gid,
+    uint               simd_lid)
+{
+    const float simd_partial = simd_sum(local);
+    if (simd_lid == 0) {
+        scratch[simd_gid] = simd_partial;
+    }
+    mk_sync();
+
+    if (simd_gid == 0) {
+        float v = (simd_lid < num_simdgroups) ? scratch[simd_lid] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lid == 0) scratch[0] = v;
+    }
+    mk_sync();
+    return scratch[0];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_tg_rmsnorm_scale — RMSNorm scale factor `rsqrt(mean(x²) + eps)`
+//
+// Each thread contributes its `local_sumsq` (partial sum-of-squares
+// over its slice of the input vector). Returns the broadcast scale
+// to all TG threads. `scratch` and `num_simdgroups` as for `mk_tg_sum`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+inline float mk_tg_rmsnorm_scale(
+    float              local_sumsq,
+    uint               n,
+    float              eps,
+    threadgroup float* scratch,
+    uint               num_simdgroups,
+    uint               simd_gid,
+    uint               simd_lid)
+{
+    const float sumsq = mk_tg_sum(local_sumsq, scratch, num_simdgroups,
+                                  simd_gid, simd_lid);
+    return rsqrt(sumsq / float(n) + eps);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_silu — SiLU activation (x * sigmoid(x))
+//
+// SiLU(x) = x / (1 + exp(-x)). Pure register operation. Typed to
+// promote to float for the exp/divide, returning float so callers can
+// stage further FMAs before casting back to T_act.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename T>
+inline float mk_silu(T x) {
+    const float v = float(x);
+    return v / (1.0f + exp(-v));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_rope_pair — in-register NeoX-style RoPE pair rotation
+//
+// Rotates (x0, x1) by (cos, sin) in place:
+//   x0' = x0 * cos - x1 * sin
+//   x1' = x1 * cos + x0 * sin
+//
+// Used by attention-block fusions where Q/K vector elements live in
+// per-thread registers and the rotation happens before the paged-cache
+// or arena write.
+// ─────────────────────────────────────────────────────────────────────────────
+
+inline void mk_rope_pair(
+    thread float& x0,
+    thread float& x1,
+    float         cos_v,
+    float         sin_v)
+{
+    const float n0 = x0 * cos_v - x1 * sin_v;
+    const float n1 = x1 * cos_v + x0 * sin_v;
+    x0 = n0;
+    x1 = n1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_paged_kv_write_row — paged KV-cache element write
+//
+// Writes one element at `cache[block_id, kv_head, block_offset, d]`
+// where `(block_id, block_offset) = divmod(slot, block_size)`. The
+// caller is responsible for sentinel-slot handling
+// (slot == 0xFFFFFFFF marks a padding token and the write should be
+// skipped).
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename T>
+inline void mk_paged_kv_write_row(
+    device T* cache_base,
+    uint      slot,
+    uint      kv_head,
+    uint      num_kv,
+    uint      block_size,
+    uint      head_dim,
+    uint      d,
+    T         value)
+{
+    const uint block_id     = slot / block_size;
+    const uint block_offset = slot % block_size;
+    device T* dst = cache_base
+        + (size_t)block_id     * (size_t)(num_kv * block_size * head_dim)
+        + (size_t)kv_head      * (size_t)(block_size * head_dim)
+        + (size_t)block_offset * (size_t)head_dim;
+    dst[d] = value;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_apply_rms_scale — per-element RMSNorm output (x * scale * weight)
+//
+// One step of the RMSNorm output computation, applied after
+// `mk_tg_rmsnorm_scale` has produced `scale` for this token's
+// `[HIDDEN]` vector. Promotes through float for FMA single-rounding
+// — matches MLX rmsnorm behavior.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename T_act, typename T_scale>
+inline T_act mk_apply_rms_scale(T_act x, float scale, T_scale weight) {
+    return T_act(float(x) * scale * float(weight));
+}

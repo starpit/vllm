@@ -1885,9 +1885,15 @@ pub fn starter_library() -> ImplementationLibrary {
     }
     #[cfg(feature = "metal")]
     {
-        // Metal Embed implementations - only match Metal targets
+        // Metal Embed implementations - only match Metal targets.
+        // MetalEmbedImpl handles dense embeddings; MetalAffineEmbedImpl
+        // (P6) handles MLX-affine int4 quantized embeddings via a fused
+        // gather + dequant kernel. Storage-format gates in `matches`
+        // partition the OpKind::Embed seeds between them — no overlap.
         lib.push(Box::new(crate::metal::MetalEmbedImpl::fp16()));
         lib.push(Box::new(crate::metal::MetalEmbedImpl::bf16()));
+        lib.push(Box::new(crate::metal::MetalAffineEmbedImpl::fp16()));
+        lib.push(Box::new(crate::metal::MetalAffineEmbedImpl::bf16()));
         // Metal RMSNorm implementations - only match Metal targets
         lib.push(Box::new(crate::metal_bridge::MetalRmsNormImpl::new_fp16()));
         lib.push(Box::new(crate::metal_bridge::MetalRmsNormImpl::new_bf16()));

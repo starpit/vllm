@@ -203,7 +203,16 @@ enum FieldLoad {
     /// its weight with `embed_tokens`. No safetensors read — build
     /// the `LinearLayer` from the already-loaded embedding field
     /// whose name is carried here.
-    LinearTiedToEmbedding(syn::Ident),
+    ///
+    /// `affine` captures whether the source embedding is MLX-affine
+    /// quantized (P6). When `Some((group_size, bits))`, the lm_head
+    /// emits `LinearLayer::AffineQuant(...)` reading the embed's
+    /// packed buffers; when `None`, it emits the legacy
+    /// `LinearLayer::Dense(Linear::new(embed.weight, None))`.
+    LinearTiedToEmbedding {
+        embed_ident: syn::Ident,
+        affine: Option<(u32, u32)>,
+    },
     /// 4-bit packed INT4 linear that feeds a Marlin GEMM. Single-
     /// source (one prefix) or fused (multiple prefixes concat along
     /// dim N → one wider `MarlinLinear`). `format` selects the
@@ -492,6 +501,15 @@ fn plan_field_load(
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
+    // P6: MLX-affine int4 quantized embedding. Distinct type from
+    // `Embedding` (carries packed U32 weight + F16 scales + F16
+    // affine offsets); the field_load arm always routes to
+    // `EmbeddingAffine` since the storage is known-Affine by
+    // construction (`MetalAffineEmbedImpl::matches` gates on
+    // `StorageFormat::Affine`).
+    let is_affine_quant_embedding = ty.ends_with("::AffineQuantEmbedding")
+        || ty == "AffineQuantEmbedding"
+        || ty.ends_with("layers::AffineQuantEmbedding");
     let is_rmsnorm =
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_layer_norm =
@@ -995,7 +1013,7 @@ fn plan_field_load(
         };
     }
 
-    if is_embedding {
+    if is_embedding || is_affine_quant_embedding {
         assert_eq!(
             prefixes.len(),
             1,
@@ -1016,6 +1034,15 @@ fn plan_field_load(
                 bits,
             };
         }
+        // If the accessor type is AffineQuantEmbedding but the source
+        // weight is NOT Affine, the macro / impl pairing is broken —
+        // MetalAffineEmbedImpl should only fire on Affine sources.
+        assert!(
+            !is_affine_quant_embedding,
+            "AffineQuantEmbedding accessor `{}` paired with non-Affine source storage — \
+             MetalAffineEmbedImpl::matches should have rejected this",
+            accessor.name,
+        );
         FieldLoad::Embedding(prefixes.into_iter().next().unwrap())
     } else if is_rmsnorm {
         assert_eq!(
@@ -1059,10 +1086,23 @@ fn plan_field_load(
             && (prefixes[0] == "lm_head" || prefixes[0].ends_with(".lm_head"))
             && tie_word_embeddings(model)
         {
-            return FieldLoad::LinearTiedToEmbedding(syn::Ident::new(
-                "embed_tokens",
-                proc_macro2::Span::call_site(),
-            ));
+            // P6: detect whether the source embedding is MLX-affine
+            // quantized. The tied lm_head's `source_weights` resolves
+            // to the embed_tokens weight ID — same lookup the
+            // non-tied Affine path at line 1075 does.
+            let mut affine: Option<(u32, u32)> = None;
+            for (wid, _idx) in &accessor.source_weights {
+                if let crate::quantization::StorageFormat::Affine { bits, group_size } =
+                    crate::quantization::storage_format_for_weight(program, fuf, *wid, model)
+                {
+                    affine = Some((group_size, bits));
+                    break;
+                }
+            }
+            return FieldLoad::LinearTiedToEmbedding {
+                embed_ident: syn::Ident::new("embed_tokens", proc_macro2::Span::call_site()),
+                affine,
+            };
         }
         // MLX-affine int4 storage: every source weight resolves to
         // `StorageFormat::Affine`. Single-source only — see the doc
@@ -3288,14 +3328,18 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             group_size,
             bits,
         } => {
-            // MLX-affine int4 quantized embedding (Metal-only). No
-            // sharded variant — single-GPU is the only metal target.
-            // CPU-dequant at load, store as BF16 Embedding so the
-            // forward path's gather kernel reads a normal dense table.
+            // MLX-affine int4 quantized embedding (Metal-only). P6 lift:
+            // load the packed U32 weight + F16 scales + F16 affine
+            // offsets verbatim into an `AffineQuantEmbedding` bundle;
+            // the forward path emits `Instruction::AffineEmbed`, which
+            // dispatches the fused `affine_embed_*_gs_*_b_4` gather +
+            // dequant kernel (saves ~vocab * hidden * 1.5 bytes of
+            // BF16 arena vs the old load-time CPU-dequant fallback).
+            // No sharded variant — single-GPU is the only metal target.
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
-                let #name = ::ferrite_kernels::layers::Embedding::load_affine_dequant(
+                let #name = ::ferrite_kernels::layers::AffineQuantEmbedding::load(
                     gw, #prefix, #gs_lit, #bits_lit,
                 )?;
             }
@@ -3435,25 +3479,54 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
-        FieldLoad::LinearTiedToEmbedding(embed_ident) => quote! {
-            // Tied embedding: lm_head reuses the
-            // `#embed_ident` field's weight tensor. Shape
-            // [vocab_size, hidden_size] works for both
-            // Embedding (gather rows) and LinearLayer
-            // (matmul against hidden_size). No bias.
-            //
-            // Under INT4 P2 the embedding is loaded via
-            // `Embedding::load_affine_dequant` (when its source weight
-            // is affine), so the borrowed `#embed_ident.weight` is
-            // already BF16 here — the Dense arm sees it as a normal
-            // tensor, no further dequant required.
-            let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
-                ::ferrite_kernels::layers::Linear::new(
-                    #embed_ident.weight,
-                    None,
-                )
-            );
-        },
+        FieldLoad::LinearTiedToEmbedding {
+            embed_ident,
+            affine,
+        } => {
+            if let Some((group_size, bits)) = affine {
+                // P6: tied lm_head + Affine source embedding. The
+                // embed_tokens field is an `AffineQuantEmbedding`
+                // carrying the packed U32 weight + F16 scales + F16
+                // affine offsets; the lm_head reads those same
+                // buffers via `LinearLayer::AffineQuant`. `GpuTensor`
+                // is Copy on metal (raw pointer wrapper), so the
+                // buffer triple is shared with the embedding's
+                // forward-time gather kernel without ownership
+                // gymnastics. `in_features = hidden_size`,
+                // `out_features = vocab_size` (Linear matmul reads
+                // hidden inputs and produces vocab logits).
+                let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+                let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+                quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::AffineQuant(
+                        Box::new(::ferrite_kernels::layers::AffineQuantLinear {
+                            weight: #embed_ident.weight,
+                            scales: #embed_ident.scales,
+                            affine_biases: #embed_ident.affine_biases,
+                            linear_bias: None,
+                            in_features: #embed_ident.hidden_size,
+                            out_features: #embed_ident.vocab_size,
+                            group_size: #gs_lit,
+                            bits: #bits_lit,
+                        })
+                    );
+                }
+            } else {
+                quote! {
+                    // Tied embedding (dense): lm_head reuses the
+                    // `#embed_ident` field's weight tensor. Shape
+                    // [vocab_size, hidden_size] works for both
+                    // Embedding (gather rows) and LinearLayer
+                    // (matmul against hidden_size). No bias.
+                    let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
+                        ::ferrite_kernels::layers::Linear::new(
+                            #embed_ident.weight,
+                            None,
+                        )
+                    );
+                }
+            }
+        }
         FieldLoad::MarlinLinear { prefixes, .. } => {
             // Every Marlin accessor emits the SAME call shape
             // regardless of AWQ/GPTQ/CT: the runtime
@@ -4058,7 +4131,7 @@ fn emit_layered_load_body(
                 }
             }
         }
-        FieldLoad::LinearTiedToEmbedding(_) => panic!(
+        FieldLoad::LinearTiedToEmbedding { .. } => panic!(
             "LinearTiedToEmbedding is only ever used for the unindexed \
              `lm_head` accessor — should never appear in a layered group"
         ),

@@ -14,7 +14,9 @@ use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, EmbedRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
     OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
+    weight_storage_of,
 };
+use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
 
 /// Metal implementation for Embed operation.
@@ -73,6 +75,14 @@ impl Implementation for MetalEmbedImpl {
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         let node = fuf.get(seed);
         if node.op != OpKind::Embed {
+            return None;
+        }
+        // P6: reject MLX-affine quantized embeddings — peer
+        // `MetalAffineEmbedImpl` matches those and produces the fused
+        // gather + dequant kernel. The dense gather (`embed.metal`)
+        // would treat packed U32 buffers as fp16/bf16 and produce
+        // garbage.
+        if let Some(StorageFormat::Affine { .. }) = weight_storage_of(node) {
             return None;
         }
 

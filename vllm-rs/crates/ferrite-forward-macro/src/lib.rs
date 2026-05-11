@@ -942,6 +942,10 @@ fn compile_common(
                 #[cfg(feature = "metal")]
                 "metal_embed_f16",
                 #[cfg(feature = "metal")]
+                "metal_affine_embed_f16",
+                #[cfg(feature = "metal")]
+                "metal_affine_embed_bf16",
+                #[cfg(feature = "metal")]
                 "metal_reshape",
                 #[cfg(feature = "metal")]
                 "metal_bias_add_f16",

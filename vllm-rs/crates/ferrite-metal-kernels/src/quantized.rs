@@ -176,6 +176,138 @@ impl MetalAffineDequantize {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// MLX-affine int4 quantized embedding dispatcher — port of
+// `nn.QuantizedEmbedding.__call__` (`python/mlx/nn/layers/quantized.py:144`).
+// MLX dispatches as 3 gathers + 1 dequantize; ferrite-metal fuses them
+// into one kernel (`affine_embed_<dtype>_gs_<gs>_b_4` in
+// `shaders/quantized_dequantize.metal`) because the gather-row
+// indirection per output is constant — not a cross-op fusion.
+// ─────────────────────────────────────────────────────────────────
+
+/// MLX-affine int4 quantized embedding lookup. Holds a `ShaderCache`
+/// that lazily builds one pipeline per `(dtype, group_size, hidden_size)`
+/// instantiation (`hidden_size` rides as a function constant).
+pub struct MetalAffineEmbed {
+    shader_cache: Arc<ShaderCache>,
+}
+
+impl MetalAffineEmbed {
+    pub fn new(device: Device) -> Result<Self, MetalStreamError> {
+        Ok(Self {
+            shader_cache: Arc::new(ShaderCache::new(device)?),
+        })
+    }
+
+    pub fn with_shader_cache(shader_cache: Arc<ShaderCache>) -> Self {
+        Self { shader_cache }
+    }
+
+    /// Dispatch `affine_embed_<dtype>_gs_<gs>_b_<bits>` against an open
+    /// encoder. Gathers + dequants `num_tokens` rows from a quantized
+    /// embedding table in one pass.
+    ///
+    /// - `packed_weight`: `[vocab_size, hidden_size / 8]` U32, treated
+    ///   as `[vocab_size * hidden_size / 2]` bytes by the kernel
+    ///   (`buffer(0)`).
+    /// - `scales`, `biases`: `[vocab_size * hidden_size / group_size]`
+    ///   half-precision per-group affine parameters
+    ///   (`buffer(1)` / `buffer(2)`).
+    /// - `indices`: `[num_tokens]` U32 token IDs (`buffer(3)`).
+    /// - `output`: `[num_tokens, hidden_size]` half-precision result
+    ///   (`buffer(4)`).
+    /// - `hidden_size`: ridden as `[[function_constant(0)]]` so the
+    ///   pipeline bakes in the bucket's `Q_SIZE`.
+    /// - `group_size`: must be one of {32, 64, 128}.
+    /// - `bits`: must equal 4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        packed_weight: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        indices: &Buffer,
+        output: &Buffer,
+        num_tokens: u32,
+        hidden_size: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<(), MetalStreamError> {
+        if bits != 4 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_embed: only bits=4 is wired, got bits={bits}"
+            )));
+        }
+        if !matches!(group_size, 32 | 64 | 128) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_embed: only group_size in {{32, 64, 128}} is wired, got {group_size}"
+            )));
+        }
+        // packs_per_int = 8 / bits = 2 for bits=4. Each thread emits 2
+        // output elements (one packed byte). hidden_size must be a
+        // multiple of pack_factor; mlx-community 4bit ships hidden_size
+        // divisible by 8 (= 32-bit pack width), so /2 is always clean.
+        let packs_per_int: u32 = 2;
+        if !hidden_size.is_multiple_of(packs_per_int) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_embed: hidden_size={hidden_size} not divisible by \
+                 pack_factor={packs_per_int} (bits={bits})"
+            )));
+        }
+
+        let kernel_name = format!(
+            "affine_embed_{}_gs_{}_b_{}",
+            dtype.symbol_infix(),
+            group_size,
+            bits
+        );
+        // `hidden_size` rides as function_constant(0) — see
+        // `AFFINE_EMBED_HIDDEN_SIZE` in `quantized_dequantize.metal`.
+        let constants = [ConstantValue::uint(0, hidden_size)];
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(&kernel_name, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+
+        // SAFETY: all buffer pointers are valid `Retained` objects;
+        // `setBuffer:offset:atIndex:` only borrows them through the call.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(packed_weight), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(indices), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 4);
+        }
+
+        // 2D dispatch: x = byte-offset within a token row, y = token
+        // index. Each thread emits 2 output elements. The kernel itself
+        // bounds-checks `index.x * 2 >= hidden_size` to catch the
+        // partial trailing threadgroup when hidden_size/2 exceeds the
+        // pipeline's max threadgroup width (Llama-3B: hidden=3072 → K/2
+        // =1536, max tpg width 1024 forces 2 threadgroups along x).
+        let bytes_per_row = hidden_size / packs_per_int;
+        let max_tpg = pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(u32::MAX as usize) as u32;
+        let tpg_x = bytes_per_row.min(max_tpg).max(1);
+        let groups_x = bytes_per_row.div_ceil(tpg_x);
+        let threads_per_threadgroup = MTLSize {
+            width: tpg_x as usize,
+            height: 1,
+            depth: 1,
+        };
+        let threadgroups = MTLSize {
+            width: groups_x as usize,
+            height: num_tokens as usize,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Decode-bucket qmv dispatcher — port of `quantized.cpp:1365
 // dispatch_qmv` + `:177 qmv_quad` + `:235 qmv` (which itself picks
 // qmv_fast vs qmv).

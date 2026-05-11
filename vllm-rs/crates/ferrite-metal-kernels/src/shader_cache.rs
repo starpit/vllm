@@ -99,7 +99,10 @@ impl ShaderCache {
             self.libraries.get("fused_add_rmsnorm")
         } else if name.starts_with("fused_gate_up_silu_mul_") {
             self.libraries.get("fused_gate_up_silu_mul")
-        } else if name.starts_with("affine_dequantize_") {
+        } else if name.starts_with("affine_dequantize_") || name.starts_with("affine_embed_") {
+            // Both kernels live in shaders/quantized_dequantize.metal —
+            // affine_embed reuses the dequant math under a gather
+            // indirection (P6).
             self.libraries.get("quantized_dequantize")
         } else if name.starts_with("affine_qmm_t_") || name.starts_with("affine_qmm_n_") {
             // Matches `affine_qmm_t_<dtype>_*`,

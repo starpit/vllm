@@ -11,12 +11,16 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLDevice, MTLResourceOptions,
+};
 
 use crate::device_allocator::DeviceAllocator;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const DEFAULT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
@@ -31,9 +35,37 @@ unsafe impl Send for MetalArena {}
 unsafe impl Sync for MetalArena {}
 
 struct MmapRegion {
+    /// Original mmap base pointer + length. The mmap remains the
+    /// canonical *source* identity — callers hand us tensor pointers
+    /// computed from the safetensors data section, which are offsets
+    /// from `base`. Classification (is `src` in any region?) walks
+    /// `[base, base + len)`.
     base: *const u8,
     len: usize,
-    buffer: Buffer,
+    /// **Pre-aligned destination buffer.** At `register_mmap` we
+    /// allocate a fresh 16-aligned `MTLBuffer` of size `len + shift`
+    /// and bulk-copy the mmap contents into it starting at offset
+    /// `shift`. After that, every tensor whose intra-mmap offset
+    /// matches the canonical safetensors layout (tensors at
+    /// `data_section_start + k * 16`) lands at
+    /// `aligned_base + offset + shift` where the trailing bits are
+    /// 0 mod 16 — letting the strict 16-byte zero-copy gate pass
+    /// for U32 packed weights, F32, F16, BF16, and any future SIMD-
+    /// wide binding type.
+    ///
+    /// All `alloc_and_copy_host{,_aligned}` zero-copy returns point
+    /// into this buffer (not into the mmap). `buffer_for` maps these
+    /// pointers back to `(aligned_buffer, aligned_offset)` for
+    /// `setBuffer:offset:atIndex:`.
+    aligned_buffer: Buffer,
+    aligned_base: *mut u8,
+    /// Byte shift such that `(offset + shift) mod 16 == 0` for the
+    /// data-section-aligned safetensors layout. Computed from the
+    /// 8-byte little-endian header_size prefix of the mmap. Falls
+    /// back to `0` if the prefix doesn't look like safetensors —
+    /// in that case the zero-copy gate behaves identically to the
+    /// pre-bulk-copy world (just operating against the new buffer).
+    shift: usize,
     _mmap: Arc<memmap2::Mmap>,
 }
 
@@ -42,8 +74,18 @@ unsafe impl Sync for MmapRegion {}
 
 #[derive(Clone, Copy)]
 enum MmapClassify {
-    Aligned,
+    /// Source `src` lies within a registered mmap and its shifted
+    /// offset (`mmap_offset + region.shift`) is `min_align`-aligned.
+    /// `aligned_ptr` is the address inside the per-region pre-aligned
+    /// destination buffer where the bulk-copied bytes live — i.e.
+    /// what `alloc_and_copy_host{,_aligned}` returns to the caller.
+    Aligned { aligned_ptr: *mut u8 },
+    /// Source `src` is in a registered mmap but the shifted offset
+    /// isn't `min_align`-aligned — falls through to the arena memcpy
+    /// path.
     Unaligned,
+    /// Source `src` is outside every registered mmap (e.g. the bytes
+    /// were heap-allocated by `maybe_cast_cpu` after a CPU cast).
     Outside,
 }
 
@@ -56,6 +98,12 @@ pub struct MetalAllocator {
     on_new_arena: Arc<Mutex<Option<ArenaHook>>>,
     residency: ferrite_metal_kernels::residency::MetalResidencySet,
     mmaps: Arc<Mutex<Vec<MmapRegion>>>,
+    /// Command queue lazily allocated on first `register_mmap`, used
+    /// for the bulk MTLBlit DMA copy mmap → aligned_buffer. Held by
+    /// `Mutex<Option<...>>` so `Clone` shares the queue across
+    /// `MetalAllocator` handles and so the queue is dropped together
+    /// with the last handle.
+    bulk_copy_queue: Arc<Mutex<Option<CommandQueue>>>,
     /// Diagnostic counters for `alloc_and_copy_host` routing. Bumped
     /// once per call so the worker can print a one-shot "zero-copy
     /// vs memcpy" breakdown after `try_load` completes. Atomics are
@@ -127,6 +175,7 @@ impl Clone for MetalAllocator {
             on_new_arena: Arc::clone(&self.on_new_arena),
             residency: self.residency.clone(),
             mmaps: Arc::clone(&self.mmaps),
+            bulk_copy_queue: Arc::clone(&self.bulk_copy_queue),
             load_stats: Arc::clone(&self.load_stats),
         }
     }
@@ -142,6 +191,7 @@ impl MetalAllocator {
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
+            bulk_copy_queue: Arc::new(Mutex::new(None)),
             load_stats: Arc::new(LoadStats::default()),
         }
     }
@@ -155,6 +205,7 @@ impl MetalAllocator {
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
+            bulk_copy_queue: Arc::new(Mutex::new(None)),
             load_stats: Arc::new(LoadStats::default()),
         }
     }
@@ -187,10 +238,15 @@ impl MetalAllocator {
         {
             let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
             for region in mmaps.iter() {
-                let start = region.base as usize;
-                let end = start + region.len;
-                if p >= start && p < end {
-                    return Some((region.buffer.clone(), (p - start) as u64));
+                // Zero-copy returns from `alloc_and_copy_host_aligned`
+                // point into the per-region pre-aligned MTLBuffer (not
+                // into the original mmap). The valid byte range is
+                // `[aligned_base + shift, aligned_base + shift + len)`
+                // — that's where the bulk-copy landed the mmap bytes.
+                let a_start = region.aligned_base as usize + region.shift;
+                let a_end = a_start + region.len;
+                if p >= a_start && p < a_end {
+                    return Some((region.aligned_buffer.clone(), (p - a_start + region.shift) as u64));
                 }
             }
         }
@@ -205,37 +261,151 @@ impl MetalAllocator {
         None
     }
 
+    /// Read the safetensors header prefix and compute the byte shift
+    /// such that the data section starts at a 16-aligned offset within
+    /// the pre-aligned destination buffer.
+    ///
+    /// Safetensors format: `[u64 header_size_le][header JSON
+    /// (header_size bytes)][data section]`. The data section starts at
+    /// `8 + header_size`. If we copy the mmap into a 16-aligned
+    /// destination buffer at offset `shift`, the data section lands at
+    /// `dest_base + shift + 8 + header_size`. We want that quantity to
+    /// be `mod 16 == 0`, so `shift = (-(8 + header_size)) mod 16`.
+    ///
+    /// Returns 0 on any of:
+    /// - mmap shorter than 8 bytes (no header to read)
+    /// - `header_size` would put the data section past EOF
+    /// - the bytes don't look like a safetensors prefix
+    ///
+    /// In those cases the bulk copy still happens (just without the
+    /// shift trick), so zero-copy on a future tensor offset is still
+    /// possible if that offset is naturally 16-aligned.
+    fn compute_safetensors_shift(base: *const u8, len: usize) -> usize {
+        if len < 8 {
+            return 0;
+        }
+        // SAFETY: `base` points to at least 8 mapped bytes.
+        let header_size =
+            unsafe { std::ptr::read_unaligned(base as *const u64).to_le() } as usize;
+        if header_size == 0 || header_size > len.saturating_sub(8) {
+            return 0;
+        }
+        let data_section_start = 8 + header_size;
+        let r = data_section_start % Self::MIN_BIND_ALIGN;
+        if r == 0 {
+            0
+        } else {
+            Self::MIN_BIND_ALIGN - r
+        }
+    }
+
+    /// Get-or-create the per-allocator command queue used for the bulk
+    /// MTLBlit copy. One queue is enough since `register_mmap` calls
+    /// `waitUntilCompleted` on every blit (the bulk copy is loader-
+    /// side, not on the hot path) — concurrent in-flight blits aren't
+    /// needed.
+    fn bulk_copy_queue(&self) -> CommandQueue {
+        let mut slot = self
+            .bulk_copy_queue
+            .lock()
+            .expect("MetalAllocator bulk_copy_queue Mutex");
+        if let Some(q) = slot.as_ref() {
+            return q.clone();
+        }
+        let q = self
+            .device
+            .newCommandQueue()
+            .expect("MTLDevice.newCommandQueue returned nil");
+        *slot = Some(q.clone());
+        q
+    }
+
     pub fn register_mmap(&self, mmap: Arc<memmap2::Mmap>) {
         let base = mmap.as_ptr();
         let len = mmap.len();
         if len == 0 {
             return;
         }
+
+        // Compute the shift so the safetensors data section lands at
+        // a 16-aligned offset in the destination buffer. Falls back
+        // to 0 on non-safetensors prefixes (still does the bulk copy
+        // but without the alignment trick).
+        let shift = Self::compute_safetensors_shift(base, len);
+        let dst_capacity = len + shift;
+
+        // Destination: fresh, 16-aligned (MTLDevice returns page-
+        // aligned buffers; pages are ≥ 16 bytes) `MTLBuffer`. Sized
+        // exactly to hold the mmap contents plus the shift prefix.
+        let dst_buffer = self
+            .device
+            .newBufferWithLength_options(dst_capacity, MTLResourceOptions::StorageModeShared)
+            .expect("MetalAllocator::register_mmap: newBufferWithLength returned nil");
+        let aligned_base = dst_buffer.contents().as_ptr() as *mut u8;
+        assert!(
+            !aligned_base.is_null(),
+            "MetalAllocator::register_mmap: aligned destination buffer.contents() is null"
+        );
+
+        // Source: transient `newBufferWithBytesNoCopy` view of the
+        // mmap, needed to give the blit encoder a `MTLBuffer` handle.
+        // Released as soon as the blit completes — the underlying
+        // bytes stay alive via `mmap`'s Arc on the caller's side, but
+        // the noCopy wrapper itself goes away.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let buffer_len = (len + page_size - 1) & !(page_size - 1);
-        // SAFETY: `base` covers `buffer_len` valid mapped pages (mmap's
-        // overmap to a page boundary makes the trailing bytes legal).
-        // Caller's `Arc<Mmap>` keeps the pages alive as long as the
-        // MmapRegion holds a clone of it; we pass `deallocator: None`
-        // so Metal does not try to free the bytes itself.
-        let buffer = unsafe {
+        let src_buffer_len = (len + page_size - 1) & !(page_size - 1);
+        // SAFETY: `base` covers `src_buffer_len` valid mapped pages
+        // (mmap over-maps to a page boundary). `deallocator: None`
+        // keeps Metal from trying to free the bytes; the Arc held by
+        // the caller keeps the pages alive until the blit completes.
+        let src_buffer = unsafe {
             let bytes = NonNull::new(base as *mut c_void).expect("non-null mmap base");
             self.device
                 .newBufferWithBytesNoCopy_length_options_deallocator(
                     bytes,
-                    buffer_len,
+                    src_buffer_len,
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
                 .expect("newBufferWithBytesNoCopy returned nil")
         };
+
+        // Bulk-copy mmap → aligned_buffer at offset `shift` via the
+        // blit engine (~30 GB/s on Apple Silicon vs ~5 GB/s CPU
+        // memcpy_nonoverlapping on M2/M3 unified-memory hardware).
+        let queue = self.bulk_copy_queue();
+        let cmd_buf = queue
+            .commandBuffer()
+            .expect("MTLCommandQueue.commandBuffer returned nil");
+        let blit = cmd_buf
+            .blitCommandEncoder()
+            .expect("MTLCommandBuffer.blitCommandEncoder returned nil");
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &src_buffer,
+                0,
+                &dst_buffer,
+                shift,
+                len,
+            );
+        }
+        blit.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        // `src_buffer` drops here — the noCopy wrapper is gone, the
+        // mmap pages stay live via the caller's Arc.
+
+        self.residency.insert(&dst_buffer);
+
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")
             .push(MmapRegion {
                 base,
                 len,
-                buffer,
+                aligned_buffer: dst_buffer,
+                aligned_base,
+                shift,
                 _mmap: mmap,
             });
     }
@@ -253,16 +423,20 @@ impl MetalAllocator {
     /// and is cheap enough to gate the mmap-alias short-circuit on.
     const MIN_BIND_ALIGN: usize = 16;
 
-    /// `Some(offset)` if `src` lies within a registered mmap AND the
-    /// offset from that mmap's base is a multiple of `min_align`.
-    /// `None` otherwise — including the case where the bytes are
-    /// in-range but the offset is unaligned, since binding through the
-    /// mmap buffer with an unaligned offset is UB for any kernel that
-    /// reads at a stride larger than the binding's underlying offset.
+    /// `Some(aligned_ptr)` if `src` lies within a registered mmap AND
+    /// the shifted offset `offset + region.shift` is a multiple of
+    /// `min_align`. The returned pointer points into the per-region
+    /// pre-aligned destination buffer (not into the mmap) — the bulk
+    /// MTLBlit at `register_mmap` time copied the mmap bytes there at
+    /// offset `region.shift`, so reading from `aligned_ptr` produces
+    /// the same bytes the caller would have read from `src`.
+    ///
+    /// `None` otherwise — either `src` is outside all registered
+    /// mmaps, or `(offset + shift)` doesn't meet the binding's
+    /// `min_align` requirement.
     ///
     /// `min_align` is clamped to `MIN_BIND_ALIGN` from above on the
-    /// trait `alloc_and_copy_host` path (callers without dtype info
-    /// must satisfy the worst-case 16-byte gate); the
+    /// trait `alloc_and_copy_host` path; the
     /// `alloc_and_copy_host_aligned` path passes the per-binding-dtype
     /// scalar alignment (2 for F16/BF16, 4 for U32/F32, etc.).
     fn aligned_mmap_offset(
@@ -270,7 +444,7 @@ impl MetalAllocator {
         src: *const u8,
         bytes: usize,
         min_align: usize,
-    ) -> Option<u64> {
+    ) -> Option<*mut u8> {
         let p = src as usize;
         let end = p.saturating_add(bytes);
         let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
@@ -278,9 +452,12 @@ impl MetalAllocator {
             let r_start = region.base as usize;
             let r_end = r_start + region.len;
             if p >= r_start && end <= r_end {
-                let offset = p - r_start;
-                if min_align == 0 || offset % min_align == 0 {
-                    return Some(offset as u64);
+                let mmap_offset = p - r_start;
+                let shifted = mmap_offset + region.shift;
+                if min_align == 0 || shifted % min_align == 0 {
+                    let aligned_ptr =
+                        unsafe { region.aligned_base.add(shifted) };
+                    return Some(aligned_ptr);
                 }
                 return None;
             }
@@ -293,6 +470,9 @@ impl MetalAllocator {
             .is_some()
     }
 
+    /// As [`aligned_mmap_offset`] but also bumps the histogram /
+    /// classification counters and returns `Unaligned` vs `Outside`
+    /// distinctly for the diagnostic log.
     fn classify_mmap_offset(
         &self,
         src: *const u8,
@@ -306,11 +486,19 @@ impl MetalAllocator {
             let r_start = region.base as usize;
             let r_end = r_start + region.len;
             if p >= r_start && end <= r_end {
-                let offset = p - r_start;
-                let tz = offset.trailing_zeros();
+                let mmap_offset = p - r_start;
+                // Histogram still buckets by the RAW intra-mmap offset
+                // (pre-shift): it characterizes the safetensors file
+                // layout, not our routing. After this change the count
+                // at `tz == 4` (mod 16 = 0 post-shift) effectively
+                // tells you how successful the shift was.
+                let tz = mmap_offset.trailing_zeros();
                 self.load_stats.observe_offset_alignment(tz);
-                if min_align == 0 || offset % min_align == 0 {
-                    return MmapClassify::Aligned;
+                let shifted = mmap_offset + region.shift;
+                if min_align == 0 || shifted % min_align == 0 {
+                    let aligned_ptr =
+                        unsafe { region.aligned_base.add(shifted) };
+                    return MmapClassify::Aligned { aligned_ptr };
                 }
                 return MmapClassify::Unaligned;
             }
@@ -457,7 +645,7 @@ impl DeviceAllocator for MetalAllocator {
         let effective_min_align = min_align.min(Self::MIN_BIND_ALIGN).max(1);
         if bytes > 0 {
             match self.classify_mmap_offset(src_host, bytes, effective_min_align) {
-                MmapClassify::Aligned => {
+                MmapClassify::Aligned { aligned_ptr } => {
                     self.load_stats
                         .zero_copy_calls
                         .fetch_add(1, Ordering::Relaxed);
@@ -468,6 +656,10 @@ impl DeviceAllocator for MetalAllocator {
                     // actually do anything? Re-check at the strict
                     // 16-byte gate; if THAT would have failed, the
                     // relaxation is responsible for this zero-copy.
+                    // After the register-time bulk-copy lands the
+                    // shift, this counter should approach 0 (every
+                    // canonical-layout tensor passes the strict gate
+                    // already).
                     if effective_min_align < Self::MIN_BIND_ALIGN {
                         let strict = self
                             .aligned_mmap_offset(src_host, bytes, Self::MIN_BIND_ALIGN);
@@ -480,7 +672,7 @@ impl DeviceAllocator for MetalAllocator {
                                 .fetch_add(bytes as u64, Ordering::Relaxed);
                         }
                     }
-                    return Ok(src_host as *mut u8);
+                    return Ok(aligned_ptr);
                 }
                 MmapClassify::Unaligned => {
                     self.load_stats

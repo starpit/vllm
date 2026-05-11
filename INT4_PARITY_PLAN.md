@@ -30,7 +30,8 @@
 | P6 C4 — tied lm_head storage gate fix + E2E | ✅ done | `74545207c` | `storage_format_for_weight(lm_head)` returned Dense unconditionally for tied embeds (legacy P2 workaround); now returns Affine when `QuantMethod::Affine`, so the solver picks `MetalAffineQmmImpl` over `MetalGemmImpl` and the tied lm_head emits `LinearLayer::AffineQuant(...)` sharing the embed's packed buffers. Llama-3.2-1B-4bit + Llama-3.2-3B-4bit produce coherent output on the canonical smoke prompts under forward-time embedding lift. |
 | P7 — NAX (M4+) | pending | — | |
 | P8 — pipeline cache key extension | pending | — | |
-| P9 — cpu_golden q4 reference + per-model 4bit goldens | partial | — | `affine_dequantize_b4_*` landed in P2; per-model goldens pending |
+| P9 — cpu_golden q4 reference + per-model 4bit goldens | partial | — | `affine_dequantize_b4_*` landed in P2; cpu_reference matmul refs lifted in C1; per-model goldens pending |
+| P9 C1 — `cpu_reference` module + lift duplicated test helpers | ✅ done | `accc3d3e4` | New `ferrite-metal-kernels::cpu_reference` module hosts `affine_dequantize_b4_*` + `affine_qmm_t_b4_*` + `affine_qmm_n_b4_*` + `qmv`/`qvm` aliases (HalfF trait dedupes f16/bf16 bodies). Lifted out of `quantized_q{mv,mm,mm_n,vm}_test.rs` (−161/+14 LoC). Lives in metal-kernels because tests can't reach up to `ferrite_forward::cpu_golden`; can re-export later when a non-test consumer needs it. 6 new unit tests + 25 existing kernel parity tests all pass. |
 | P10 — Llama-3.2-1B/3B 4bit E2E | partial | `c2ba7c459` | 1B coherent on the load-time fallback; 3B + token-stream A/B vs `mlx_lm.generate` pending |
 | P11 — mixed-quant loader | pending | — | |
 | P12 — q-MLP composition | pending | — | Branch (i) recommended; defer (ii) until pipelines.rs Phase 2 |

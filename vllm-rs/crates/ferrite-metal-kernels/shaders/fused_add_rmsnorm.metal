@@ -139,18 +139,24 @@ constant float FUSED_ARN_EPS         [[function_constant(2)]];
 ///   - `residual += delta` in place
 ///   - `delta` is overwritten with `rmsnorm(residual_after_add, weight, eps)`
 ///
+/// Template form (`<T_act, T_scale>`) — same P10b in-register cast
+/// pattern: residual/delta in the activation dtype, weight in its
+/// on-disk dtype (F16 for every sampled mlx-community / Llama-3.x
+/// checkpoint), all promoted to `float` for the reduction.
+///
 /// Bindings (must match `interpreter::metal::lowering::lower_one` for
 /// `Instruction::FusedAddRmsNorm`):
 ///   buffer(0) = residual (in/out)
 ///   buffer(1) = delta    (in/out — overwritten with normed result)
-///   buffer(2) = weight   (in)
+///   buffer(2) = weight   (in; on-disk dtype)
 ///
 /// Dispatch: `(M, 1, 1)` threadgroups × `tg_size` threads, cooperative
 /// reduction over `HIDDEN_SIZE`.
-kernel void fused_add_rmsnorm_f16_specialized(
-    device       half* residual [[buffer(0)]],
-    device       half* delta    [[buffer(1)]],
-    device const half* weight   [[buffer(2)]],
+template <typename T_act, typename T_scale>
+[[kernel]] void fused_add_rmsnorm_specialized_impl(
+    device       T_act*   residual [[buffer(0)]],
+    device       T_act*   delta    [[buffer(1)]],
+    device const T_scale* weight   [[buffer(2)]],
     uint gid     [[threadgroup_position_in_grid]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]]
@@ -165,7 +171,7 @@ kernel void fused_add_rmsnorm_f16_specialized(
         float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
         float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
         float s = r + d;
-        residual[gid * FUSED_ARN_HIDDEN_SIZE + i] = half(s);
+        residual[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act(s);
         local_sum += s * s;
     }
     shared_sum[tid] = local_sum;
@@ -184,52 +190,20 @@ kernel void fused_add_rmsnorm_f16_specialized(
     for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
         float s = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
         float w = float(weight[i]);
-        delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = half((s / rms) * w);
+        delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act((s / rms) * w);
     }
 }
 
-/// BF16 specialized variant. Mirror of `fused_add_rmsnorm_f16_specialized`
-/// — same function-constant bag, same reduction structure, same
-/// in-place semantics; the only differences are the `bfloat` binding
-/// types and the `bfloat(...)` casts on writeback.
-kernel void fused_add_rmsnorm_bf16_specialized(
-    device       bfloat* residual [[buffer(0)]],
-    device       bfloat* delta    [[buffer(1)]],
-    device const bfloat* weight   [[buffer(2)]],
-    uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= FUSED_ARN_M) return;
+#define INST_FUSED_ARN(act_tag, act_type, scale_tag, scale_type)              \
+  template [[host_name("fused_add_rmsnorm_" #act_tag "_s_" #scale_tag         \
+                       "_specialized")]]                                      \
+  [[kernel]] decltype(fused_add_rmsnorm_specialized_impl<act_type, scale_type>) \
+      fused_add_rmsnorm_specialized_impl<act_type, scale_type>;
 
-    threadgroup float shared_sum[1024];
-
-    float local_sum = 0.0f;
-    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
-        float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float s = r + d;
-        residual[gid * FUSED_ARN_HIDDEN_SIZE + i] = bfloat(s);
-        local_sum += s * s;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = sqrt(shared_sum[0] / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
-
-    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
-        float s = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float w = float(weight[i]);
-        delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = bfloat((s / rms) * w);
-    }
-}
+// Coverage matches the standalone rmsnorm template: T_scale = half
+// always; the `bf16 × bf16` instantiation is removed.
+INST_FUSED_ARN(f16,  half,   f16, half)
+INST_FUSED_ARN(bf16, bfloat, f16, half)
 
 /// Optimized variant with vectorized loads (half4) for better memory bandwidth
 /// Requires N to be multiple of 4

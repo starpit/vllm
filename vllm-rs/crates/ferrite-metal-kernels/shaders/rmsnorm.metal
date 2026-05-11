@@ -60,15 +60,25 @@ constant uint  RMSNORM_M           [[function_constant(0)]];
 constant uint  RMSNORM_HIDDEN_SIZE [[function_constant(1)]];
 constant float RMSNORM_EPS         [[function_constant(2)]];
 
+// Template form (`<T_act, T_scale>`): same in-register cast pattern as
+// the affine quant kernels (`shaders/quantized_*.metal`). The kernel
+// reads activations through a `T_act` device pointer, the gain through
+// a separate `T_scale` device pointer, and promotes both to `float`
+// for the reduction. Lets the loader keep RMSNorm gains in their
+// on-disk dtype (F16 for every sampled mlx-community / Llama-3.x
+// checkpoint) instead of F16→BF16 truncating at load on the bf16
+// stack — the same regression repair P10b applied to quant scales.
+//
 // Bindings (must match `interpreter::metal::lowering::lower_one` for
 // `Instruction::RmsNorm`):
 //   buffer(0) = output (out_slot — written)
 //   buffer(1) = input  (in_slot  — read)
-//   buffer(2) = weight (read)
-kernel void rmsnorm_f16_specialized(
-    device       half* output [[buffer(0)]],
-    device const half* input  [[buffer(1)]],
-    device const half* weight [[buffer(2)]],
+//   buffer(2) = weight (read; on-disk dtype)
+template <typename T_act, typename T_scale>
+[[kernel]] void rmsnorm_specialized_impl(
+    device       T_act*   output [[buffer(0)]],
+    device const T_act*   input  [[buffer(1)]],
+    device const T_scale* weight [[buffer(2)]],
     uint gid     [[threadgroup_position_in_grid]],
     uint tid     [[thread_position_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]]
@@ -97,50 +107,21 @@ kernel void rmsnorm_f16_specialized(
     for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
         float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
         float w   = float(weight[i]);
-        output[gid * RMSNORM_HIDDEN_SIZE + i] = half((val / rms) * w);
+        output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act((val / rms) * w);
     }
 }
 
-/// BF16 specialized variant. Mirror of `rmsnorm_f16_specialized` with
-/// `device bfloat*` bindings — `bfloat` is a native MSL type since
-/// Metal 3.1, and Apple Silicon M3+ has hardware bf16 MMA. Function
-/// constants are the same indices; the runtime picks this symbol when
-/// the model's resolved dtype is bf16 (Llama-3.x ships bf16 on disk).
-kernel void rmsnorm_bf16_specialized(
-    device       bfloat* output [[buffer(0)]],
-    device const bfloat* input  [[buffer(1)]],
-    device const bfloat* weight [[buffer(2)]],
-    uint gid     [[threadgroup_position_in_grid]],
-    uint tid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    if (gid >= RMSNORM_M) return;
+#define INST_RMSNORM(act_tag, act_type, scale_tag, scale_type)              \
+  template [[host_name("rmsnorm_" #act_tag "_s_" #scale_tag "_specialized")]] \
+  [[kernel]] decltype(rmsnorm_specialized_impl<act_type, scale_type>)       \
+      rmsnorm_specialized_impl<act_type, scale_type>;
 
-    threadgroup float shared_sum[1024];
-
-    float local_sum = 0.0f;
-    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
-        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        local_sum += val * val;
-    }
-    shared_sum[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = sqrt(shared_sum[0] / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
-
-    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
-        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        float w   = float(weight[i]);
-        output[gid * RMSNORM_HIDDEN_SIZE + i] = bfloat((val / rms) * w);
-    }
-}
+// Coverage: T_scale = half always (mlx-community / Llama-3.x norms
+// ship F16 gains on disk). T_act per the model's resolved dtype. The
+// `bf16 × bf16` instantiation that the pre-P10c codebase shipped
+// (loader-cast F16→BF16) is removed here.
+INST_RMSNORM(f16,  half,   f16, half)
+INST_RMSNORM(bf16, bfloat, f16, half)
 
 /// BF16 variant (uses float16 as Metal doesn't have native bfloat16)
 kernel void rmsnorm_bf16(

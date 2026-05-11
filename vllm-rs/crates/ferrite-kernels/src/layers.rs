@@ -2349,8 +2349,28 @@ impl RmsNorm {
     }
 
     /// Load from `GpuWeights` by prefix.
+    ///
+    /// Metal: route through `take_keep_dtype` so the on-disk gain
+    /// dtype (F16 on every sampled mlx-community / Llama-3.x
+    /// checkpoint) reaches the device verbatim. The
+    /// `<T_act, T_scale>` rmsnorm kernel (`shaders/rmsnorm.metal`,
+    /// picked by `interpreter::metal::lowering::rmsnorm_kernel_static_name`)
+    /// casts the gain to the activation dtype in registers. Mirrors
+    /// the P10b in-register cast applied to affine quant scales; the
+    /// pre-P10c bf16-stack `take()` truncated the F16 gain to BF16 at
+    /// load (10→7 bit mantissa).
+    ///
+    /// CUDA: keep the existing `take()` path — `rms_norm_bf16` /
+    /// `rms_norm_f16` (`kernels.rs:26-46`) take a single typed
+    /// weight pointer, so the loader cast is what makes the
+    /// dtype-matched dispatcher (`rms_norm_with_offset`) work today.
+    /// Extending the kernel signature is its own thread; out of P10c
+    /// scope.
     pub fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
+        #[cfg(feature = "metal")]
+        let weight = weights.take_keep_dtype(&weight_name)?;
+        #[cfg(not(feature = "metal"))]
         let weight = weights.take(&weight_name)?;
         Ok(Self::new(weight, eps))
     }

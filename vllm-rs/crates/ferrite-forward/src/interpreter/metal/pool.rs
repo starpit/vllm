@@ -935,7 +935,7 @@ mod tests {
         let cmd = LoweredCommand {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
-            function: "rmsnorm_f16_specialized",
+            function: "rmsnorm_f16_s_f16_specialized",
             constants: vec![
                 ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue::uint(0, bucket_m),
                 ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue::uint(

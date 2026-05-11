@@ -228,11 +228,13 @@ fn lower_one<W: CanonicalParams>(
         I::RmsNorm(in_slot, out_slot, layer, wt_fn) => LoweredCommand {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
-            function: pick_specialized_symbol(
-                "rmsnorm_f16_specialized",
-                "rmsnorm_bf16_specialized",
-                W::METAL_DTYPE,
-            ),
+            // Symbol names are `rmsnorm_<T_act>_s_<T_scale>_specialized`
+            // — the in-register T_scale cast P10c added so RMSNorm
+            // gains stay F16 on device (`feedback_no_silent_deferrals`,
+            // mirrors P10b for quant scales). `scale_dtype_for::<W>()`
+            // returns F16 today; expand the picker when a model ships
+            // bf16 norm gains on disk.
+            function: rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
             constants: vec![
                 ConstantValue::uint(0, bucket_m),
                 ConstantValue::uint(1, W::Q_SIZE as u32),
@@ -268,10 +270,10 @@ fn lower_one<W: CanonicalParams>(
             LoweredCommand {
                 kernel: KernelId::FusedAddRmsNorm,
                 library: "fused_add_rmsnorm",
-                function: pick_specialized_symbol(
-                    "fused_add_rmsnorm_f16_specialized",
-                    "fused_add_rmsnorm_bf16_specialized",
-                    W::METAL_DTYPE,
+                // Symbol `fused_add_rmsnorm_<T_act>_s_<T_scale>_specialized`
+                // (P10c — see RmsNorm comment above).
+                function: fused_add_rmsnorm_kernel_static_name::<W>(
+                    scale_dtype_for::<W>(),
                 ),
                 constants: vec![
                     ConstantValue::uint(0, bucket_m),
@@ -1255,6 +1257,47 @@ fn elem_size_bytes(dtype: DequantDtype) -> u32 {
     }
 }
 
+/// Format the kernel symbol name for an `Instruction::RmsNorm`
+/// lowering. Matches the `INST_RMSNORM` instantiations in
+/// `shaders/rmsnorm.metal` — `rmsnorm_<T_act>_s_<T_scale>_specialized`.
+/// Mirrors P10b's in-register cast pattern (`feedback_no_silent_deferrals`
+/// / `INT4_PARITY_PROBES.md` §7): RMSNorm gains stay in their on-disk
+/// dtype on the device, the kernel reads them through a `T_scale`
+/// pointer and casts to `T_act` in registers.
+fn rmsnorm_kernel_static_name<W: CanonicalParams>(
+    scale_dtype: ScaleDtype,
+) -> &'static str {
+    use ScaleDtype as S;
+    match (W::METAL_DTYPE, scale_dtype) {
+        (MetalDtype::F16, S::F16) => "rmsnorm_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16) => "rmsnorm_bf16_s_f16_specialized",
+        (dt, sdt) => unreachable!(
+            "rmsnorm_kernel_static_name: (dtype={dt:?}, scale_dtype={sdt:?}) \
+             not instantiated — only (f16|bf16, f16) ship today; \
+             lower_one's pre-checks should have caught this"
+        ),
+    }
+}
+
+/// As [`rmsnorm_kernel_static_name`] for `Instruction::FusedAddRmsNorm`.
+/// Symbol naming: `fused_add_rmsnorm_<T_act>_s_<T_scale>_specialized`,
+/// matching the `INST_FUSED_ARN` instantiations in
+/// `shaders/fused_add_rmsnorm.metal`.
+fn fused_add_rmsnorm_kernel_static_name<W: CanonicalParams>(
+    scale_dtype: ScaleDtype,
+) -> &'static str {
+    use ScaleDtype as S;
+    match (W::METAL_DTYPE, scale_dtype) {
+        (MetalDtype::F16, S::F16) => "fused_add_rmsnorm_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16) => "fused_add_rmsnorm_bf16_s_f16_specialized",
+        (dt, sdt) => unreachable!(
+            "fused_add_rmsnorm_kernel_static_name: (dtype={dt:?}, \
+             scale_dtype={sdt:?}) not instantiated — only (f16|bf16, f16) \
+             ship today; lower_one's pre-checks should have caught this"
+        ),
+    }
+}
+
 /// Format the kernel symbol name for an `AffineEmbed` lowering.
 /// Matches the `DEFINE_AFFINE_EMBED_B4` macro invocations in
 /// `shaders/quantized_dequantize.metal`. Same enumeration as
@@ -1345,7 +1388,7 @@ mod tests {
         let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::AffineQmvFast);
         assert_eq!(cmd.library, "quantized_qmv");
-        assert_eq!(cmd.function, "affine_qmv_fast_bf16_gs_64_b_4_batch_0");
+        assert_eq!(cmd.function, "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0");
         assert_eq!(
             cmd.constants,
             vec![ConstantValue::int(0, 2048), ConstantValue::int(1, 2048)],
@@ -1426,7 +1469,7 @@ mod tests {
         let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::AffineQmmT);
         assert_eq!(cmd.library, "quantized_qmm");
-        assert_eq!(cmd.function, "affine_qmm_t_bf16_gs_64_b_4_alN_true_batch_0");
+        assert_eq!(cmd.function, "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_true_batch_0");
         assert_eq!(
             cmd.constants,
             vec![
@@ -1474,7 +1517,7 @@ mod tests {
         assert_eq!(qmm_t.library, "quantized_qmm");
         assert_eq!(
             qmm_t.function,
-            "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_true",
+            "affine_qmm_t_splitk_bf16_s_f16_gs_64_b_4_alN_true",
         );
         // qmm_t_splitk grid: (n_tiles, m_tiles, split_k); group same as qmm_t.
         assert_eq!(qmm_t.dispatch.threadgroups, (64, 2, 4));
@@ -1592,7 +1635,7 @@ mod tests {
         let cmd = &cmds[0];
         assert_eq!(
             cmd.function,
-            "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0"
+            "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_false_batch_0"
         );
         // Ceil-div on N: 2050.div_ceil(32) = 65; M-tiles: 512/32 = 16.
         assert_eq!(cmd.dispatch.threadgroups, (65, 512 / 32, 1));
@@ -1632,7 +1675,7 @@ mod tests {
         assert_eq!(cmd.kernel, KernelId::AffineEmbed);
         assert_eq!(cmd.library, "quantized_dequantize");
         // TestParams pins Bf16 + Q_SIZE=2048 → gs=64 → bf16/gs=64 symbol.
-        assert_eq!(cmd.function, "affine_embed_bf16_gs_64_b_4");
+        assert_eq!(cmd.function, "affine_embed_bf16_s_f16_gs_64_b_4");
 
         // function_constant(0) = hidden_size = W::Q_SIZE = 2048.
         assert_eq!(cmd.constants, vec![ConstantValue::uint(0, 2048)]);

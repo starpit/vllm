@@ -238,14 +238,18 @@ mod tests {
         Ok(match (kernel, dtype) {
             (KernelId::Embed, MetalDtype::F16) => ("embed", "embed_f16_specialized"),
             (KernelId::Embed, MetalDtype::Bf16) => ("embed", "embed_bf16_specialized"),
-            (KernelId::RmsNorm, MetalDtype::F16) => ("rmsnorm", "rmsnorm_f16_specialized"),
-            (KernelId::RmsNorm, MetalDtype::Bf16) => ("rmsnorm", "rmsnorm_bf16_specialized"),
-            (KernelId::FusedAddRmsNorm, MetalDtype::F16) => {
-                ("fused_add_rmsnorm", "fused_add_rmsnorm_f16_specialized")
+            (KernelId::RmsNorm, MetalDtype::F16) => ("rmsnorm", "rmsnorm_f16_s_f16_specialized"),
+            (KernelId::RmsNorm, MetalDtype::Bf16) => {
+                ("rmsnorm", "rmsnorm_bf16_s_f16_specialized")
             }
-            (KernelId::FusedAddRmsNorm, MetalDtype::Bf16) => {
-                ("fused_add_rmsnorm", "fused_add_rmsnorm_bf16_specialized")
-            }
+            (KernelId::FusedAddRmsNorm, MetalDtype::F16) => (
+                "fused_add_rmsnorm",
+                "fused_add_rmsnorm_f16_s_f16_specialized",
+            ),
+            (KernelId::FusedAddRmsNorm, MetalDtype::Bf16) => (
+                "fused_add_rmsnorm",
+                "fused_add_rmsnorm_bf16_s_f16_specialized",
+            ),
             (KernelId::FusedGateUpSiluMul, MetalDtype::F16) if bucket_m == 1 => (
                 "fused_gate_up_silu_mul",
                 "fused_gate_up_silu_mul_decode_f16_specialized",
@@ -2833,7 +2837,7 @@ mod tests {
         }
     }
 
-    /// Numerical-correctness check for `rmsnorm_f16_specialized`
+    /// Numerical-correctness check for `rmsnorm_f16_s_f16_specialized`
     /// against `cpu_golden::rmsnorm`. Hardens the binding contract
     /// (out=0, in=1, weight=2) the in/out swap fix in 3bb5b9c89 put
     /// in place, and catches any future arithmetic regression in the
@@ -2984,11 +2988,12 @@ mod tests {
         }
     }
 
-    /// BF16 RmsNorm at M=64. Compiles `rmsnorm_bf16_specialized` via
-    /// the dtype-aware pipeline picker, dispatches against bf16 host
-    /// data, and compares to the bf16-round-tripped CPU reference.
-    /// First end-to-end exercise of the bf16 path on the metal
-    /// backend.
+    /// BF16 RmsNorm at M=64. Compiles
+    /// `rmsnorm_bf16_s_f16_specialized` via the dtype-aware pipeline
+    /// picker (P10c: in-register T_scale cast — bf16 activation,
+    /// **f16** weight on disk). Dispatches against bf16 input/output
+    /// + f16 weight host buffers and compares to a CPU reference that
+    /// mirrors that mixed-dtype shape.
     #[cfg(target_os = "macos")]
     #[test]
     fn rmsnorm_bf16_matches_cpu_golden_m64() {
@@ -3046,6 +3051,25 @@ mod tests {
             }
             buf
         }
+        fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
+            let half_data: Vec<half::f16> =
+                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let bytes = std::mem::size_of_val(half_data.as_slice());
+            let buf = device
+                .newBufferWithLength_options(
+                    bytes.max(1) as u64 as usize,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBuffer");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    half_data.as_ptr() as *const u8,
+                    buf.contents().as_ptr() as *mut u8,
+                    bytes,
+                );
+            }
+            buf
+        }
         fn alloc_zero_bf16(device: &Device, n: usize) -> Buffer {
             let bytes = (n * std::mem::size_of::<half::bf16>()).max(1);
             let buf = device
@@ -3060,8 +3084,11 @@ mod tests {
             buf
         }
 
+        // P10c shape: T_act = bfloat (input/output), T_scale = half
+        // (weight). Mirrors the on-disk dtype split for every sampled
+        // mlx-community / Llama-3.x RMSNorm gain.
         let input_buf = alloc_bf16(&device, &input_data);
-        let weight_buf = alloc_bf16(&device, &weight_data);
+        let weight_buf = alloc_f16(&device, &weight_data);
         let output_buf = alloc_zero_bf16(&device, m * hidden);
 
         let cb = queue.commandBuffer().expect("commandBuffer returned nil");
@@ -3094,14 +3121,15 @@ mod tests {
         cb.commit();
         cb.waitUntilCompleted();
 
-        // BF16-round-trip Q/K to match the kernel's input precision.
+        // Match the kernel: input round-trips through bf16, weight
+        // through f16 (P10c — `T_scale = half`).
         let input_bf16: Vec<f32> = input_data
             .iter()
             .map(|&v| half::bf16::from_f32(v).to_f32())
             .collect();
-        let weight_bf16: Vec<f32> = weight_data
+        let weight_f16: Vec<f32> = weight_data
             .iter()
-            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .map(|&v| half::f16::from_f32(v).to_f32())
             .collect();
         let mut output_cpu = vec![0.0_f32; m * hidden];
         let eps = 1e-5_f32;
@@ -3109,7 +3137,7 @@ mod tests {
             let base = row * hidden;
             cpu_golden::rmsnorm(
                 &input_bf16[base..base + hidden],
-                &weight_bf16,
+                &weight_f16,
                 &mut output_cpu[base..base + hidden],
                 eps,
             );
@@ -3460,8 +3488,9 @@ mod tests {
         }
     }
 
-    /// Numerical-correctness check for `fused_add_rmsnorm_f16_specialized`
-    /// against `cpu_golden::fused_add_rmsnorm`. Verifies the in-place
+    /// Numerical-correctness check for
+    /// `fused_add_rmsnorm_f16_s_f16_specialized` against
+    /// `cpu_golden::fused_add_rmsnorm`. Verifies the in-place
     /// `residual += delta` step lands in buffer(0) and the
     /// `rmsnorm(residual_after_add, weight)` lands in buffer(1).
     /// Runs at M=4 (small smoke) AND M=64 (TinyLlama prefill bucket).

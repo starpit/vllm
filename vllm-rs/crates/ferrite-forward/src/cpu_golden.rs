@@ -154,8 +154,8 @@ pub fn scalar_mul(input: &[f32], output: &mut [f32], scale: f32) {
 }
 
 /// Fused add + RMSNorm with the same semantics as the Metal
-/// `fused_add_rmsnorm_f16_specialized` kernel and CUDA's
-/// `fused_add_rms_norm_inplace`:
+/// `fused_add_rmsnorm_<T_act>_s_<T_scale>_specialized` kernel and
+/// CUDA's `fused_add_rms_norm_inplace`:
 ///
 /// - Pass 1: `residual += delta` (in place).
 /// - Pass 2: `delta = rmsnorm(residual_after_add, weight, eps)`.

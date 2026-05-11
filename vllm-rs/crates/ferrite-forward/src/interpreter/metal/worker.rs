@@ -1785,7 +1785,7 @@ mod tests {
         let rmsnorm = LoweredCommand {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
-            function: "rmsnorm_f16_specialized",
+            function: "rmsnorm_f16_s_f16_specialized",
             constants: vec![
                 ConstantValue::uint(0, bucket_m),
                 ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
@@ -1816,7 +1816,7 @@ mod tests {
         let fused_add_rmsnorm = LoweredCommand {
             kernel: KernelId::FusedAddRmsNorm,
             library: "fused_add_rmsnorm",
-            function: "fused_add_rmsnorm_f16_specialized",
+            function: "fused_add_rmsnorm_f16_s_f16_specialized",
             constants: vec![
                 ConstantValue::uint(0, bucket_m),
                 ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),
@@ -2218,7 +2218,7 @@ mod tests {
         let rmsnorm_pre = LoweredCommand {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
-            function: "rmsnorm_f16_specialized",
+            function: "rmsnorm_f16_s_f16_specialized",
             constants: vec![
                 ConstantValue::uint(0, 1),
                 ConstantValue::uint(1, <TestWeights as CanonicalParams>::Q_SIZE as u32),

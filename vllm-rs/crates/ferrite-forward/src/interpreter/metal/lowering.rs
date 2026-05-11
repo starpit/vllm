@@ -841,6 +841,104 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Fused QKV matmul + RoPE + paged KV-cache write ─────────
+        // Dense BF16/F16 path; Llama-style NeoX, no QKV bias. Qwen2
+        // bias / Cohere interleaved variants land in follow-up
+        // commits, gated at the matcher.
+        I::FusedQkvRopeCache(
+            in_slot,
+            out_slot,
+            layer,
+            wt_fn,
+            cos_sin_fn,
+            biased,
+            interleaved,
+        ) => {
+            assert!(
+                !*biased && !*interleaved,
+                "metal lowering: FusedQkvRopeCache currently supports only \
+                 NeoX-style RoPE without QKV bias (biased={biased} \
+                 interleaved={interleaved}); the matcher should not have \
+                 claimed this shape",
+            );
+            let n_q_heads = W::NUM_Q_HEADS;
+            let n_kv_heads = W::NUM_KV_HEADS;
+            let num_heads_total = n_q_heads + 2 * n_kv_heads;
+            LoweredCommand {
+                kernel: KernelId::FusedQkvRopeCache,
+                library: "fused_qkv_rope_cache",
+                function: pick_specialized_symbol(
+                    "fused_qkv_rope_cache_f16_specialized",
+                    "fused_qkv_rope_cache_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                constants: vec![
+                    ConstantValue::uint(0, W::Q_SIZE as u32),
+                    ConstantValue::uint(1, W::NUM_Q_HEADS),
+                    ConstantValue::uint(2, W::NUM_KV_HEADS),
+                    ConstantValue::uint(3, W::HEAD_DIM),
+                    ConstantValue::uint(4, W::ROT_DIM),
+                    ConstantValue::uint(5, W::BLOCK_SIZE),
+                    ConstantValue::uint(6, bucket_m),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, num_heads_total, 1),
+                    threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
+                },
+                bindings: vec![
+                    // 0: q_out
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    // 1: input
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    // 2: packed [Q|K|V] weight
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 2,
+                    },
+                    // 3: cos_sin table
+                    Binding::Weight {
+                        kind: WeightBundleKind::CosSin(*cos_sin_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 3,
+                    },
+                    // 4: positions
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::Positions,
+                        binding_index: 4,
+                    },
+                    // 5: slot_mapping
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::SlotMapping,
+                        binding_index: 5,
+                    },
+                    // 6: kv_cache_k
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::KvCacheK {
+                            layer: *layer + layer_offset,
+                        },
+                        binding_index: 6,
+                    },
+                    // 7: kv_cache_v
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::KvCacheV {
+                            layer: *layer + layer_offset,
+                        },
+                        binding_index: 7,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Decode-bucket attention (single query token / seq) ─────
         I::AttentionViaCache(q_slot, out_slot, layer, _cos_sin_fn, _is_decode) => {
             // 2D dispatch: (batch, num_q_heads). Each threadgroup

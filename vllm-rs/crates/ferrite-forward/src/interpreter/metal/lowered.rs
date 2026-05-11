@@ -53,6 +53,14 @@ pub enum KernelId {
     /// paged KV cache at the per-request slot. Output: rotated Q
     /// only (K/V are sunk into cache).
     RopeAppend,
+    /// Fused QKV matmul + NeoX-style RoPE + paged KV-cache write in
+    /// one kernel. Replaces the four-dispatch
+    /// `Q_proj + K_proj + V_proj + RopeAppend` chain on the dense
+    /// (BF16 / F16) path. Affine-int4 / prefill variants land
+    /// separately per `project_metal_fused_qkv_handoff`. Maps to
+    /// `fused_qkv_rope_cache_<dtype>_specialized` in
+    /// `fused_qkv_rope_cache.metallib`.
+    FusedQkvRopeCache,
     /// Decode-bucket attention reading from the paged KV cache.
     /// Single-query-token-per-sequence path.
     AttentionViaCache,

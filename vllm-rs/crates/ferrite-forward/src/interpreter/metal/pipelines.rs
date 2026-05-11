@@ -268,6 +268,14 @@ mod tests {
             ),
             (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
             (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
+            (KernelId::FusedQkvRopeCache, MetalDtype::F16) => (
+                "fused_qkv_rope_cache",
+                "fused_qkv_rope_cache_f16_specialized",
+            ),
+            (KernelId::FusedQkvRopeCache, MetalDtype::Bf16) => (
+                "fused_qkv_rope_cache",
+                "fused_qkv_rope_cache_bf16_specialized",
+            ),
             (KernelId::AttentionViaCache, MetalDtype::F16) => {
                 ("attention", "attention_via_cache_v2_f16_specialized")
             }
@@ -354,6 +362,15 @@ mod tests {
                 ConstantValue::uint(2, W::NUM_KV_HEADS),
                 ConstantValue::uint(3, W::ROT_DIM),
                 ConstantValue::uint(4, W::BLOCK_SIZE),
+            ],
+            KernelId::FusedQkvRopeCache => vec![
+                ConstantValue::uint(0, W::Q_SIZE as u32),
+                ConstantValue::uint(1, W::NUM_Q_HEADS),
+                ConstantValue::uint(2, W::NUM_KV_HEADS),
+                ConstantValue::uint(3, W::HEAD_DIM),
+                ConstantValue::uint(4, W::ROT_DIM),
+                ConstantValue::uint(5, W::BLOCK_SIZE),
+                ConstantValue::uint(6, bucket_m),
             ],
             KernelId::AttentionViaCache | KernelId::AttentionPrefillSdpaPaged => vec![
                 ConstantValue::uint(0, W::HEAD_DIM),

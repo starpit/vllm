@@ -173,6 +173,10 @@ impl SpecializedPipelineCache {
                     "fused_gate_up_silu_mul",
                     crate::embedded_metallib!("fused_gate_up_silu_mul"),
                 ),
+                (
+                    "fused_qkv_rope_cache",
+                    crate::embedded_metallib!("fused_qkv_rope_cache"),
+                ),
                 ("attention", crate::embedded_metallib!("attention")),
                 ("rope", crate::embedded_metallib!("rope")),
                 ("embed", crate::embedded_metallib!("embed")),

@@ -364,6 +364,145 @@ fn affine_qmm_t_unaligned_b4_bf16_matches_cpu_reference() {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Llama-3.2-1B-4bit prefill-bucket parity tests. Each linear in the
+// model routes to one of (Standard, SplitK) at the prefill bucket
+// (bucket_m = 64 in the macro's workload-point set). The standalone
+// tests above don't exercise these specific shapes, so a divergence
+// at e.g. gate_proj's Standard path would slip through.
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn affine_qmm_t_b4_bf16_llama_3_2_1b_q_proj_prefill_shape() {
+    // q_proj / o_proj at bucket_m=64: M=64, N=2048, K=2048, gs=64.
+    // pick: tgs = 64*2 = 128, split_k = 4 → SplitK(4, k_partition=512).
+    let m = 64;
+    let n = 2048;
+    let k = 2048;
+    let group_size = 64;
+
+    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32);
+    assert!(
+        matches!(expected_kernel, QmmTKernel::SplitK { split_k: 4, .. }),
+        "Llama-1B q_proj prefill shape should route to SplitK(4), got {:?}",
+        expected_kernel
+    );
+
+    let (packed, scales, biases, x) =
+        make_inputs_bf16(0x11B_u64 ^ group_size as u64, n, k, m, group_size);
+    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmm_t_bf16(
+        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+    );
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let allowed = allowed * 2.0;
+    assert!(
+        abs_err <= allowed,
+        "qmm_t Llama-1B q_proj SplitK (M=64, N=2048, K=2048, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+#[test]
+fn affine_qmm_t_b4_bf16_llama_3_2_1b_kv_proj_prefill_shape() {
+    // k_proj / v_proj at bucket_m=64: M=64, N=512, K=2048, gs=64.
+    // pick: tgs = 16*2 = 32, split_k = 16 → SplitK(16, k_partition=128).
+    let m = 64;
+    let n = 512;
+    let k = 2048;
+    let group_size = 64;
+
+    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32);
+    assert!(
+        matches!(expected_kernel, QmmTKernel::SplitK { split_k: 16, .. }),
+        "Llama-1B kv_proj prefill shape should route to SplitK(16), got {:?}",
+        expected_kernel
+    );
+
+    let (packed, scales, biases, x) =
+        make_inputs_bf16(0x11C_u64 ^ group_size as u64, n, k, m, group_size);
+    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmm_t_bf16(
+        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+    );
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let allowed = allowed * 2.0;
+    assert!(
+        abs_err <= allowed,
+        "qmm_t Llama-1B kv_proj SplitK (M=64, N=512, K=2048, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+#[test]
+fn affine_qmm_t_b4_bf16_llama_3_2_1b_gate_up_prefill_shape() {
+    // gate_proj / up_proj at bucket_m=64: M=64, N=8192, K=2048, gs=64.
+    // pick: tgs = 256*2 = 512, split_k = 1 → Standard.
+    let m = 64;
+    let n = 8192;
+    let k = 2048;
+    let group_size = 64;
+
+    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32);
+    assert_eq!(
+        expected_kernel,
+        QmmTKernel::Standard,
+        "Llama-1B gate/up_proj prefill shape should route to Standard"
+    );
+
+    let (packed, scales, biases, x) =
+        make_inputs_bf16(0x11D_u64 ^ group_size as u64, n, k, m, group_size);
+    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmm_t_bf16(
+        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+    );
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    assert!(
+        abs_err <= allowed,
+        "qmm_t Llama-1B gate/up_proj Standard (M=64, N=8192, K=2048, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+#[test]
+fn affine_qmm_t_b4_bf16_llama_3_2_1b_down_proj_prefill_shape() {
+    // down_proj at bucket_m=64: M=64, N=2048, K=8192, gs=64.
+    // pick: tgs = 64*2 = 128, split_k = 4 → SplitK(4, k_partition=2048).
+    let m = 64;
+    let n = 2048;
+    let k = 8192;
+    let group_size = 64;
+
+    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32);
+    assert!(
+        matches!(expected_kernel, QmmTKernel::SplitK { split_k: 4, .. }),
+        "Llama-1B down_proj prefill shape should route to SplitK(4), got {:?}",
+        expected_kernel
+    );
+
+    let (packed, scales, biases, x) =
+        make_inputs_bf16(0x11E_u64 ^ group_size as u64, n, k, m, group_size);
+    let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmm_t_bf16(
+        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+    );
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let allowed = allowed * 2.0;
+    assert!(
+        abs_err <= allowed,
+        "qmm_t Llama-1B down_proj SplitK (M=64, N=2048, K=8192, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────
 // qmm_t_splitk parity — small-prefill split-K + sum-reduce
 // ─────────────────────────────────────────────────────────────────
 

@@ -165,15 +165,45 @@ impl MetalAllocator {
             });
     }
 
-    fn src_in_registered_mmap(&self, src: *const u8, bytes: usize) -> bool {
+    /// Largest alignment the qmv / qmm_t / NAX kernels demand on a
+    /// buffer offset bound via `setBuffer:offset:atIndex:`. The packed
+    /// int4 weight binding is declared `device const uint32_t*`
+    /// (`shaders/quantized_qmv.metal:829`, `quantized_qmm.metal:388`),
+    /// which requires 4-byte aligned offsets — and Apple's M-series
+    /// driver does NOT silently tolerate misalignment (see
+    /// `tests/quantized_qmv_test.rs::affine_qmv_fast_b4_bf16_unaligned_packed_offset_1_byte_prefix`,
+    /// which reproduces the live divergence by binding at offset
+    /// %4 = 1 and gets `worst abs_err = 19.07` vs an allowed 0.39).
+    /// 16 covers u32 + simdgroup_float4 + any future SIMD-wide types,
+    /// and is cheap enough to gate the mmap-alias short-circuit on.
+    const MIN_BIND_ALIGN: usize = 16;
+
+    /// `Some(offset)` if `src` lies within a registered mmap AND the
+    /// offset from that mmap's base is a multiple of `MIN_BIND_ALIGN`.
+    /// `None` otherwise — including the case where the bytes are
+    /// in-range but the offset is unaligned, since binding through the
+    /// mmap buffer with an unaligned offset is UB for any kernel that
+    /// types the binding as u32 / SIMD.
+    fn aligned_mmap_offset(&self, src: *const u8, bytes: usize) -> Option<u64> {
         let p = src as usize;
         let end = p.saturating_add(bytes);
         let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
-        mmaps.iter().any(|region| {
+        for region in mmaps.iter() {
             let r_start = region.base as usize;
             let r_end = r_start + region.len;
-            p >= r_start && end <= r_end
-        })
+            if p >= r_start && end <= r_end {
+                let offset = p - r_start;
+                if offset % Self::MIN_BIND_ALIGN == 0 {
+                    return Some(offset as u64);
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    fn src_in_registered_mmap(&self, src: *const u8, bytes: usize) -> bool {
+        self.aligned_mmap_offset(src, bytes).is_some()
     }
 
     pub fn arena_count(&self) -> usize {
@@ -244,31 +274,63 @@ impl MetalAllocator {
             }
             return Ok(arenas[0].base);
         }
-        let idx = if let Some(idx) = arenas.iter().rposition(|a| a.capacity - a.used >= bytes) {
+        // Pad `used` up to MIN_BIND_ALIGN so every subsequent
+        // allocation lands at a properly-aligned offset. Without this,
+        // a small tensor whose size isn't a multiple of 16 (e.g. an
+        // F16 vector with an odd element count) would shift every
+        // following allocation off-alignment, and an int4 U32 weight
+        // bound there would hit the same unaligned-binding UB we
+        // gate against on the mmap-alias path. Wastes at most 15
+        // bytes per allocation; negligible against tensor sizes.
+        let aligned_bytes =
+            bytes.div_ceil(Self::MIN_BIND_ALIGN) * Self::MIN_BIND_ALIGN;
+        let idx = if let Some(idx) = arenas
+            .iter()
+            .rposition(|a| a.capacity - a.used >= aligned_bytes)
+        {
             idx
         } else {
             Self::push_arena_locked(
                 &self.device,
                 &mut arenas,
                 self.chunk_bytes,
-                bytes,
+                aligned_bytes,
                 &self.on_new_arena,
                 &self.residency,
             )?
         };
         let arena = &mut arenas[idx];
         let offset = arena.used;
+        debug_assert_eq!(
+            offset % Self::MIN_BIND_ALIGN,
+            0,
+            "arena.used is not {}-aligned on entry; previous alloc didn't pad",
+            Self::MIN_BIND_ALIGN
+        );
         let dst = unsafe { arena.base.add(offset) };
-        arena.used = offset + bytes;
+        arena.used = offset + aligned_bytes;
         Ok(dst)
     }
 }
 
 impl DeviceAllocator for MetalAllocator {
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
+        // Zero-copy fast path: the source already lives in a
+        // registered safetensors mmap AND lands at a properly-aligned
+        // offset for any kernel binding type (see
+        // `aligned_mmap_offset` for why this gate matters — Apple's
+        // M-series driver does not silently tolerate unaligned u32
+        // bindings on int4 packed weights). Misaligned sources fall
+        // through to the arena-copy path, which `alloc_uninit` keeps
+        // 16-byte aligned per allocation.
         if bytes > 0 && self.src_in_registered_mmap(src_host, bytes) {
             return Ok(src_host as *mut u8);
         }
+        let aligned_bytes = if bytes == 0 {
+            0
+        } else {
+            bytes.div_ceil(Self::MIN_BIND_ALIGN) * Self::MIN_BIND_ALIGN
+        };
         let mut arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
         if bytes == 0 {
             if arenas.is_empty() {
@@ -284,23 +346,32 @@ impl DeviceAllocator for MetalAllocator {
             return Ok(arenas[0].base);
         }
 
-        let idx = if let Some(idx) = arenas.iter().rposition(|a| a.capacity - a.used >= bytes) {
+        let idx = if let Some(idx) = arenas
+            .iter()
+            .rposition(|a| a.capacity - a.used >= aligned_bytes)
+        {
             idx
         } else {
             Self::push_arena_locked(
                 &self.device,
                 &mut arenas,
                 self.chunk_bytes,
-                bytes,
+                aligned_bytes,
                 &self.on_new_arena,
                 &self.residency,
             )?
         };
         let arena = &mut arenas[idx];
         let offset = arena.used;
+        debug_assert_eq!(
+            offset % Self::MIN_BIND_ALIGN,
+            0,
+            "arena.used is not {}-aligned on entry",
+            Self::MIN_BIND_ALIGN
+        );
         let dst = unsafe { arena.base.add(offset) };
         unsafe { std::ptr::copy_nonoverlapping(src_host, dst, bytes) };
-        arena.used = offset + bytes;
+        arena.used = offset + aligned_bytes;
         Ok(dst)
     }
 }
@@ -330,7 +401,12 @@ mod tests {
         assert!(!ptr.is_null());
         let read = unsafe { std::slice::from_raw_parts(ptr, src.len()) };
         assert_eq!(read, src);
-        assert_eq!(alloc.used_bytes(), src.len());
+        // `used_bytes` reports the padded request (rounded up to
+        // `MIN_BIND_ALIGN` so the *next* allocation lands at an
+        // aligned offset). 12 bytes round up to 16.
+        let expected_used = src.len().div_ceil(MetalAllocator::MIN_BIND_ALIGN)
+            * MetalAllocator::MIN_BIND_ALIGN;
+        assert_eq!(alloc.used_bytes(), expected_used);
         assert_eq!(alloc.arena_count(), 1);
 
         let (buf, off) = alloc.buffer_for(ptr).expect("buffer_for");
@@ -380,6 +456,10 @@ mod tests {
         assert!(read_c.iter().all(|&b| b == 0xCC));
 
         assert_eq!(alloc.arena_count(), 2);
+        // Each allocation rounds up to a multiple of MIN_BIND_ALIGN
+        // (16). 1024, 1024, 3072 are already multiples of 16 so the
+        // total is unchanged here — this test serves as a guardrail
+        // that aligned-size inputs don't grow.
         assert_eq!(alloc.used_bytes(), 1024 + 1024 + 3072);
     }
 

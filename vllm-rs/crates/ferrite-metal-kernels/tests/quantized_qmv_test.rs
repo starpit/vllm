@@ -309,6 +309,280 @@ fn affine_qmv_fast_b4_bf16_matches_cpu_reference() {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Pins the qmv_fast kernel against an unaligned packed-weight buffer
+// offset, mimicking what `MetalAllocator::alloc_and_copy_host`'s
+// mmap-alias short-circuit does for the live forward: the safetensors
+// header for mlx-community/Llama-3.2-1B-Instruct-4bit is 41161 bytes
+// (so the data section starts at file pos 41169 ≡ 1 mod 4), which
+// makes every packed u32 weight tensor land at an offset whose
+// remainder mod 4 is 1 within the mmap-backed Metal buffer. Binding
+// that as `device const uint32_t* w [[buffer(0)]]` with an unaligned
+// offset is UB per the Metal spec; whether Apple's driver silently
+// tolerates it or returns wrong values determines whether the live
+// divergence ("first decoded token correct, subsequent tokens
+// repetitive garbage") is alignment-driven.
+//
+// The test allocates a buffer with an extra prefix of `ALIGN_PREFIX`
+// bytes, places the packed weight at offset `ALIGN_PREFIX` (= 1 byte,
+// i.e. mod-4 = 1), and binds via `setBuffer:offset:atIndex:` with
+// that offset. If the kernel produces wrong values, alignment is the
+// root cause.
+//
+// FAILS → alignment is the bug.
+// PASSES → alignment is silently tolerated, look elsewhere.
+// ─────────────────────────────────────────────────────────────────
+
+/// Variant of `run_qmv_bf16` whose packed-weight buffer is allocated
+/// with `prefix_bytes` of slack at the start, mimicking the live
+/// forward's mmap-alias short-circuit that hands the kernel an
+/// unaligned offset into a registered safetensors mmap. `MetalAffineQmv`
+/// itself binds at offset 0 (its `execute` always passes `offset=0`),
+/// so the test pre-creates a new sub-buffer view at the offset we
+/// want by calling `newBufferWithBytesNoCopy` against the parent
+/// buffer's contents+prefix pointer. The driver then sees a buffer
+/// whose CONTENT-BASE is shifted by `prefix_bytes` from its parent
+/// allocation, which is exactly the same address arithmetic the
+/// mmap-alias path produces.
+fn buffer_from_bytes_offset_into_parent(
+    device: &Device,
+    bytes: &[u8],
+    prefix_bytes: usize,
+) -> (Buffer, Buffer) {
+    // Parent: prefix_bytes of slack + the actual packed bytes,
+    // page-padded so newBufferWithBytesNoCopy doesn't reject.
+    let page_size: usize = 16384; // Apple Silicon page size
+    let total_payload = prefix_bytes + bytes.len();
+    let parent_bytes = total_payload.div_ceil(page_size) * page_size;
+    let parent = device
+        .newBufferWithLength_options(parent_bytes, MTLResourceOptions::StorageModeShared)
+        .expect("parent newBufferWithLength returned nil");
+    unsafe {
+        let dst = parent.contents().as_ptr() as *mut u8;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(prefix_bytes), bytes.len());
+    }
+    // Sub-buffer view starting at +prefix_bytes from parent's content
+    // base. The driver will internally compute byte offsets from THIS
+    // buffer's base — which is the parent's base + prefix_bytes — so
+    // a kernel that binds with offset=0 against `child` is equivalent
+    // to binding with offset=prefix_bytes against `parent`. That is
+    // the exact byte-pattern the mmap-alias short-circuit produces.
+    let child = unsafe {
+        let parent_ptr = parent.contents().as_ptr() as *mut u8;
+        let child_ptr = parent_ptr.add(prefix_bytes);
+        let len = bytes.len();
+        // Page-align the view length so newBufferWithBytesNoCopy
+        // accepts it (the driver requires the bytes pointer + length
+        // to be page-aligned; we already over-allocate the parent so
+        // there's slack at the tail).
+        let view_len = len.div_ceil(page_size) * page_size;
+        device
+            .newBufferWithBytesNoCopy_length_options_deallocator(
+                NonNull::new(child_ptr as *mut c_void).expect("non-null child ptr"),
+                view_len,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+            .expect("child newBufferWithBytesNoCopy returned nil")
+    };
+    (parent, child)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qmv_bf16_with_packed_prefix(
+    packed: &[u8],
+    scales: &[half::bf16],
+    biases: &[half::bf16],
+    x: &[half::bf16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: u32,
+    prefix_bytes: usize,
+) -> Vec<half::bf16> {
+    let device = detect_device().expect("Metal device").device;
+    let mut stream = MetalStream::new(&device);
+    let qmv = MetalAffineQmv::new(device.clone()).expect("MetalAffineQmv");
+
+    // Parent must stay live through dispatch; the child is the
+    // buffer bound to the kernel.
+    let (_parent_keepalive, packed_buf) =
+        buffer_from_bytes_offset_into_parent(&device, packed, prefix_bytes);
+
+    let scales_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(scales.as_ptr() as *const u8, std::mem::size_of_val(scales))
+    };
+    let biases_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(biases.as_ptr() as *const u8, std::mem::size_of_val(biases))
+    };
+    let x_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x)) };
+    let scales_buf = buffer_from_bytes(&device, scales_bytes);
+    let biases_buf = buffer_from_bytes(&device, biases_bytes);
+    let x_buf = buffer_from_bytes(&device, x_bytes);
+
+    let n_out = m * n;
+    let y_buf = zeroed_buffer(&device, n_out * std::mem::size_of::<half::bf16>());
+
+    let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
+    qmv.execute(
+        &x_buf,
+        &packed_buf,
+        &scales_buf,
+        &biases_buf,
+        &y_buf,
+        m as u32,
+        n as u32,
+        k as u32,
+        1, /* B */
+        group_size,
+        4,
+        DequantDtype::Bf16,
+        &encoder,
+    )
+    .expect("qmv dispatch");
+    encoder.endEncoding();
+    stream.commit().expect("commit");
+    stream.synchronize().expect("sync");
+
+    read_buffer_bf16(&y_buf, n_out)
+}
+
+/// Reproduces the live forward's unaligned-binding scenario: packed
+/// u32 weight at offset %4 = 1 within a Metal buffer. We expect this
+/// to PANIC on the `assert!(abs_err <= allowed)` because Apple's
+/// M-series Metal driver returns wrong values from unaligned u32
+/// bindings. The kernel itself can't defend against this; the fix
+/// lives in `MetalAllocator::aligned_mmap_offset`, which refuses the
+/// mmap-alias short-circuit when the safetensors offset isn't 16-byte
+/// aligned. If this test ever STOPS panicking (e.g. Apple silently
+/// fixes the driver), revisit whether the allocator gate is still
+/// needed — but until then it is load-bearing for int4 correctness.
+#[test]
+#[should_panic(expected = "qmv_fast UNALIGNED packed offset")]
+fn affine_qmv_fast_b4_bf16_unaligned_packed_offset_1_byte_prefix() {
+    let m = 1;
+    let n = 2048;
+    let k = 2048;
+    let group_size = 64usize;
+    let (packed, scales, biases, x) = make_inputs_bf16(0xA11A_u64, n, k, m, group_size);
+    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmv_bf16_with_packed_prefix(
+        &packed,
+        &scales,
+        &biases,
+        &x,
+        m,
+        n,
+        k,
+        group_size as u32,
+        /*prefix_bytes=*/ 1,
+    );
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    assert!(
+        abs_err <= allowed,
+        "qmv_fast UNALIGNED packed offset (prefix=1, q_proj shape M=1 N=2048 K=2048 gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} (allowed {allowed:.5}; metal={mv}, cpu={ev}). \
+         If this fails, the safetensors mmap-alias short-circuit in MetalAllocator binds U32 \
+         packed weights at an unaligned offset and Metal silently returns wrong values."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// qmv_fast at the actual Llama-3.2-1B-4bit decode-time projection
+// shapes. The standalone N=64/K=512 case passes but doesn't exercise
+// the multi-simdgroup walk over a 2048-row out_vec, which is what
+// the model actually hits. Pins the kernel against the live shapes.
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn affine_qmv_fast_b4_bf16_llama_3_2_1b_q_proj_shape() {
+    // q_proj / o_proj: hidden -> hidden = 2048 -> 2048, gs=64.
+    let m = 1;
+    let n = 2048;
+    let k = 2048;
+    let group_size = 64usize;
+    let (packed, scales, biases, x) = make_inputs_bf16(0x11B_u64, n, k, m, group_size);
+    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    assert!(
+        abs_err <= allowed,
+        "qmv_fast Llama-1B q_proj (M=1, N=2048, K=2048, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} \
+         (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+#[test]
+fn affine_qmv_fast_b4_bf16_llama_3_2_1b_kv_proj_shape() {
+    // k_proj / v_proj: hidden -> 8 * head_dim = 2048 -> 512, gs=64.
+    let m = 1;
+    let n = 512;
+    let k = 2048;
+    let group_size = 64usize;
+    let (packed, scales, biases, x) = make_inputs_bf16(0x11C_u64, n, k, m, group_size);
+    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    assert!(
+        abs_err <= allowed,
+        "qmv_fast Llama-1B kv_proj (M=1, N=512, K=2048, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} \
+         (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+#[test]
+fn affine_qmv_fast_b4_bf16_llama_3_2_1b_gate_up_shape() {
+    // gate_proj / up_proj: hidden -> intermediate = 2048 -> 8192, gs=64.
+    let m = 1;
+    let n = 8192;
+    let k = 2048;
+    let group_size = 64usize;
+    let (packed, scales, biases, x) = make_inputs_bf16(0x11D_u64, n, k, m, group_size);
+    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    assert!(
+        abs_err <= allowed,
+        "qmv_fast Llama-1B gate/up_proj (M=1, N=8192, K=2048, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} \
+         (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+#[test]
+fn affine_qmv_fast_b4_bf16_llama_3_2_1b_down_proj_shape() {
+    // down_proj: intermediate -> hidden = 8192 -> 2048, gs=64.
+    // Largest K in the model: 8192. K%512==0, N%8==0 → fast.
+    let m = 1;
+    let n = 2048;
+    let k = 8192;
+    let group_size = 64usize;
+    let (packed, scales, biases, x) = make_inputs_bf16(0x11E_u64, n, k, m, group_size);
+    let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
+    let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+
+    let (idx, mv, ev, abs_err, allowed) =
+        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    assert!(
+        abs_err <= allowed,
+        "qmv_fast Llama-1B down_proj (M=1, N=2048, K=8192, gs=64): \
+         worst abs_err={abs_err:.5} at idx {idx} \
+         (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────
 // qmv generic parity (unaligned tail path)
 // ─────────────────────────────────────────────────────────────────
 

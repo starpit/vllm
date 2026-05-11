@@ -4074,8 +4074,11 @@ fn emit_layered_load_body(
             let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            // INT4 P3/P4 forward-time path (post-C4b): per-layer
+            // AffineQuant LinearLayers kept on device for the qmv /
+            // qmm_t dispatchers `MetalAffineQmmImpl` emits.
             quote! {
-                ::ferrite_forward::load_layered_linear_affine_dequant_as_dense(
+                ::ferrite_forward::load_layered_linear_affine_quant(
                     gw, #n_lit, #dec_root_lit, #suffix, #gs_lit, #bits_lit,
                 )?
             }

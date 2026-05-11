@@ -793,6 +793,12 @@ impl AffineQuantLinear {
         bits: u32,
     ) -> Result<Self> {
         let weight = weights.take(&format!("{prefix}.weight"))?;
+        // Scales / biases ship F16 on every mlx-community 4bit repo
+        // sampled in P0, but ferrite-metal's qmv / qmm_t kernels are
+        // templated on the activation dtype `T` and bind scales /
+        // biases as `device const T*` (matching MLX's all-one-dtype
+        // template). On the BF16 ferrite-metal stack `T = bfloat`, so
+        // `take()` here CASTS F16 → BF16 to match the kernel's binding.
         let scales = weights.take(&format!("{prefix}.scales"))?;
         let affine_biases = weights.take(&format!("{prefix}.biases"))?;
         let bias_name = format!("{prefix}.bias");

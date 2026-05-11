@@ -1019,6 +1019,7 @@ impl GpuWeights {
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
     }
 
+
     /// Same as [`take`] but creates the returned `GpuTensor` with a
     /// caller-provided shape instead of the on-disk shape. The two
     /// shapes must agree on total element count. Used to flatten

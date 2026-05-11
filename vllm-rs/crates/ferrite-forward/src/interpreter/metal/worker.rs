@@ -200,6 +200,15 @@ pub enum WorkerError {
     /// tensor (e.g. bias absent on a no-bias linear) or the tensor's
     /// raw pointer didn't fall inside any of the allocator's arenas.
     WeightLookupFailed { reason: &'static str },
+    /// A command referenced `Binding::Scratch` but the worker has no
+    /// SplitK scratch buffer allocated. Indicates a lowering /
+    /// `LoweredMetalTape::splitk_scratch_bytes` accounting bug —
+    /// either lowering emitted Scratch without registering the
+    /// scratch byte count, or the worker discarded the buffer.
+    ScratchBufferMissing {
+        bucket_index: usize,
+        command_index: usize,
+    },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -242,6 +251,15 @@ impl std::fmt::Display for WorkerError {
             Self::WeightLookupFailed { reason } => {
                 write!(f, "MetalWorker: weight lookup: {reason}")
             }
+            Self::ScratchBufferMissing {
+                bucket_index,
+                command_index,
+            } => write!(
+                f,
+                "MetalWorker: bucket {bucket_index} command {command_index}: \
+                 Binding::Scratch with no splitk scratch buffer allocated \
+                 (lowering / tape accounting bug)"
+            ),
         }
     }
 }
@@ -254,6 +272,14 @@ impl std::error::Error for WorkerError {}
 pub struct MetalWorker<W: CanonicalParams> {
     pub arena: Vec<Buffer>,
     pub bucket_bakings: Vec<BucketBaking>,
+    /// Shared SplitK scratch buffer. `Some` when any bucket tape
+    /// requested a non-zero `splitk_scratch_bytes` (i.e. at least one
+    /// `Instruction::AffineQmm` in the tape picked
+    /// `QmmTKernel::SplitK`); `None` otherwise. Sized to the max
+    /// `splitk_scratch_bytes` across all bucket tapes, since
+    /// successive `affine_qmm_t_splitk` calls inside a single ICB
+    /// run sequentially and can reuse the same buffer.
+    pub splitk_scratch: Option<Buffer>,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -336,6 +362,33 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 buf
             })
             .collect();
+
+        // Shared SplitK scratch buffer sized to the max across all
+        // bucket tapes — one buffer suffices because successive
+        // `affine_qmm_t_splitk` / `splitk_reduce_sum` pairs run
+        // serially inside a single encoder. Allocated only when at
+        // least one tape requested non-zero scratch; bakings that
+        // don't reference `Binding::Scratch` pay nothing.
+        let max_splitk_scratch_bytes: u32 = bucket_tapes
+            .iter()
+            .map(|t| t.splitk_scratch_bytes)
+            .max()
+            .unwrap_or(0);
+        let splitk_scratch: Option<Buffer> = if max_splitk_scratch_bytes > 0 {
+            let buf = device
+                .newBufferWithLength_options(
+                    max_splitk_scratch_bytes as usize,
+                    MTLResourceOptions::StorageModePrivate,
+                )
+                .expect("newBufferWithLength_options returned nil (splitk scratch)");
+            if let Some(r) = residency {
+                r.insert(&buf);
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
         if let Some(r) = residency {
             r.commit();
         }
@@ -346,6 +399,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 bucket_idx,
                 tape,
                 &arena,
+                splitk_scratch.as_ref(),
                 pipelines,
                 weights,
                 allocator,
@@ -358,6 +412,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         Ok(Self {
             arena,
             bucket_bakings,
+            splitk_scratch,
             _marker: std::marker::PhantomData,
         })
     }
@@ -994,6 +1049,7 @@ fn bake_bucket<W: CanonicalParams>(
     bucket_index: usize,
     tape: &LoweredMetalTape<W>,
     arena: &[Buffer],
+    splitk_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
     weights: &W,
     allocator: &MetalAllocator,
@@ -1224,6 +1280,7 @@ fn bake_bucket<W: CanonicalParams>(
             cmd_idx,
             cmd,
             arena,
+            splitk_scratch,
             weights,
             allocator,
             runtime,
@@ -1350,11 +1407,14 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
 ) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
+    // KernelId::Gemm never references the SplitK scratch buffer
+    // (Dense GEMM has its own dispatch path via MPS), so pass None.
     let bound = resolve_bindings(
         bucket_index,
         command_index,
         cmd,
         arena,
+        /*splitk_scratch=*/ None,
         weights,
         allocator,
         runtime,
@@ -1480,11 +1540,13 @@ fn resolve_weight<W: CanonicalParams>(
 /// Returns owned `Buffer` clones (cheap ObjC refcount) so callers
 /// don't have to thread the [`MetalAllocator`]'s arenas-`Mutex` lock
 /// guard through to the encoder.
+#[allow(clippy::too_many_arguments)]
 fn resolve_bindings<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand<W>,
     arena: &[Buffer],
+    splitk_scratch: Option<&Buffer>,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
@@ -1524,6 +1586,13 @@ fn resolve_bindings<W: CanonicalParams>(
                 0u64,
                 *binding_index as u64,
             ),
+            Binding::Scratch { binding_index } => {
+                let scratch = splitk_scratch.ok_or(WorkerError::ScratchBufferMissing {
+                    bucket_index,
+                    command_index,
+                })?;
+                (scratch.clone(), 0u64, *binding_index as u64)
+            }
         };
         out.push((buf, off, idx));
     }
@@ -1777,6 +1846,7 @@ mod tests {
                 fused_add_rmsnorm.clone_for_test(),
                 fused_add_rmsnorm,
             ],
+            splitk_scratch_bytes: 0,
         }
     }
 
@@ -1821,6 +1891,9 @@ mod tests {
                             binding_index,
                         } => Binding::Runtime {
                             kind: *kind,
+                            binding_index: *binding_index,
+                        },
+                        Binding::Scratch { binding_index } => Binding::Scratch {
                             binding_index: *binding_index,
                         },
                     })
@@ -2004,6 +2077,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             commands: vec![attn],
+            splitk_scratch_bytes: 0,
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2082,6 +2156,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             commands: vec![build_gemm_command(1, 2048, 2048)],
+            splitk_scratch_bytes: 0,
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2198,6 +2273,7 @@ mod tests {
             bucket_m: 1,
             num_arena_slots: 2,
             commands: vec![rmsnorm_pre, build_gemm_command(1, 2048, 2048), rmsnorm_post],
+            splitk_scratch_bytes: 0,
         };
 
         let worker = MetalWorker::<TestWeights>::new(

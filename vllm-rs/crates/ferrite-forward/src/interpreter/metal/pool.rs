@@ -976,6 +976,7 @@ mod tests {
             bucket_m,
             num_arena_slots: 2,
             commands: vec![cmd],
+            splitk_scratch_bytes: 0,
         }
     }
 

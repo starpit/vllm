@@ -229,6 +229,19 @@ pub enum Binding<W: CanonicalParams> {
         kind: RuntimeBindingKind,
         binding_index: u8,
     },
+    /// The worker's shared SplitK scratch buffer — sized to
+    /// `LoweredMetalTape::splitk_scratch_bytes` at worker init, used
+    /// by the two-command lowering for `Instruction::AffineQmm` when
+    /// the bucket picks `QmmTKernel::SplitK`. The first command
+    /// (`affine_qmm_t_splitk_*`) writes the `[split_k, M, N]`
+    /// partial here; the second (`splitk_reduce_sum_*`) reads it and
+    /// reduces to `[M, N]` in the AffineQmm's arena slot.
+    ///
+    /// Only one scratch buffer is needed even when multiple AffineQmm
+    /// tiles pick SplitK: ICB commands inside a single encoder are
+    /// serialized, so the writer/reader pair fully completes before
+    /// the next AffineQmm overwrites the scratch.
+    Scratch { binding_index: u8 },
 }
 
 /// Discriminator over the typed weight thunks `Instruction<W>` carries.
@@ -380,6 +393,14 @@ pub struct LoweredMetalTape<W: CanonicalParams> {
     /// per shape class.
     pub num_arena_slots: u32,
     pub commands: Vec<LoweredCommand<W>>,
+    /// Byte size of the shared SplitK scratch buffer the worker
+    /// allocates if any `Instruction::AffineQmm` in this tape was
+    /// lowered to the SplitK two-command form. Computed as
+    /// `max(split_k * bucket_m * N * elem_size)` across all such
+    /// instructions. Zero when no AffineQmm picked SplitK (in which
+    /// case `Binding::Scratch` never appears and the worker skips
+    /// the buffer allocation).
+    pub splitk_scratch_bytes: u32,
 }
 
 /// Errors produced by the lowering pass.

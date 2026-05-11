@@ -29,8 +29,9 @@
 
 use crate::{CanonicalParams, Instruction};
 use ferrite_metal_kernels::quantized::{
-    DequantDtype, QmmTKernel, QmvKernel, pick_qmv_kernel, qmm_t_dispatch_shape,
-    qmm_t_kernel_static_name, qmv_dispatch_shape, qmv_kernel_static_name,
+    DequantDtype, QmmTKernel, QmvKernel, pick_qmm_t_kernel, pick_qmv_kernel,
+    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmv_dispatch_shape, qmv_kernel_static_name,
+    splitk_reduce_kernel_static_name,
 };
 use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
@@ -69,6 +70,7 @@ pub fn lower_pair<W: CanonicalParams>(
         bucket_m,
         num_arena_slots,
         commands,
+        splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
     })
 }
 
@@ -90,6 +92,7 @@ pub fn lower<W: CanonicalParams>(
     num_arena_slots: u32,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
     let mut commands = Vec::with_capacity(instructions.len());
+    let mut splitk_scratch_bytes: u32 = 0;
     let mut i = 0usize;
 
     while i < instructions.len() {
@@ -118,19 +121,21 @@ pub fn lower<W: CanonicalParams>(
                 // the weight lookups bake the right per-layer offset.
                 for iter in 0..count_usize {
                     for (offset, inst) in body.iter().enumerate() {
-                        if let Some(cmd) =
-                            lower_one(inst, body_start + offset, bucket_m, iter as u32)?
-                        {
-                            commands.push(cmd);
-                        }
+                        let cmds = lower_one(
+                            inst,
+                            body_start + offset,
+                            bucket_m,
+                            iter as u32,
+                            &mut splitk_scratch_bytes,
+                        )?;
+                        commands.extend(cmds);
                     }
                 }
                 i = body_end;
             }
             other => {
-                if let Some(cmd) = lower_one(other, i, bucket_m, 0)? {
-                    commands.push(cmd);
-                }
+                let cmds = lower_one(other, i, bucket_m, 0, &mut splitk_scratch_bytes)?;
+                commands.extend(cmds);
                 i += 1;
             }
         }
@@ -140,12 +145,18 @@ pub fn lower<W: CanonicalParams>(
         bucket_m,
         num_arena_slots,
         commands,
+        splitk_scratch_bytes,
     })
 }
 
-/// Lower one non-`Loop` instruction. Returns `None` for metadata-only
-/// instructions (`Reshape`/`Alias`/`Free`) that don't emit a Metal
-/// dispatch.
+/// Lower one non-`Loop` instruction to zero, one, or many
+/// `LoweredCommand`s. Most instructions produce exactly one; metadata-
+/// only instructions (`Reshape`/`Alias`/`Free`) produce zero;
+/// `Instruction::AffineQmm` in the matmul branch produces two when the
+/// dispatcher picks `QmmTKernel::SplitK` (the `affine_qmm_t_splitk`
+/// kernel writes a `[split_k, M, N]` partial into a shared scratch
+/// buffer, then `splitk_reduce_sum` reduces it into the AffineQmm's
+/// arena slot).
 ///
 /// `layer_offset` is the enclosing `Loop`'s iteration index (0 for
 /// straight-line code). Combined with each variant's compile-time
@@ -156,12 +167,18 @@ pub fn lower<W: CanonicalParams>(
 /// resolves to layer 0 — which wedges the model on layer 0's norms,
 /// projections, RoPE caches, and KV-cache slots, producing nonsense
 /// logits at the end of the chain.
+///
+/// `splitk_scratch_bytes` is the running max of `split_k * M * N *
+/// elem_size_bytes(dtype)` across every `AffineQmm` in this tape that
+/// picked `SplitK`. The worker uses it to size the shared scratch
+/// buffer that `Binding::Scratch` resolves against.
 fn lower_one<W: CanonicalParams>(
     inst: &Instruction<W>,
     index: usize,
     bucket_m: u32,
     layer_offset: u32,
-) -> Result<Option<LoweredCommand<W>>, LoweringError> {
+    splitk_scratch_bytes: &mut u32,
+) -> Result<Vec<LoweredCommand<W>>, LoweringError> {
     use Instruction as I;
 
     let cmd = match inst {
@@ -395,32 +412,117 @@ fn lower_one<W: CanonicalParams>(
                     gemm_dims: None,
                 }
             } else {
-                // Matmul branch (prefill-shape). Standard only — SplitK
-                // lands in C3 together with the sum-reduce kernel its
-                // [split_k, M, N] intermediate needs.
-                let kernel = QmmTKernel::Standard;
-                let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
+                // mirrors MLX `quantized.cpp:1411-1424 + :788-805`:
+                //   * `Standard` when split_k ≤ 1 (target ~512 tgs).
+                //   * `SplitK` when n_tiles × m_tiles is sparse enough
+                //     that splitting K into `split_k` partitions pushes
+                //     the total threadgroup count up to roughly 512;
+                //     fed by the `splitk_reduce_sum` kernel that
+                //     collapses the `[split_k, M, N]` partial to
+                //     `[M, N]` in the AffineQmm's out slot.
+                let kernel = pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs);
                 let aligned_n = n_v.is_multiple_of(32);
-                LoweredCommand {
-                    kernel: KernelId::AffineQmmT,
-                    library: "quantized_qmm",
-                    function: qmm_t_kernel_static_name(kernel, dtype, bits_v, gs, aligned_n),
-                    constants: vec![
-                        ConstantValue::int(0, k_v as i32),
-                        ConstantValue::int(1, n_v as i32),
-                        ConstantValue::int(2, bucket_m as i32),
-                    ],
-                    dispatch: DispatchShape {
-                        threadgroups: tg,
-                        threads_per_threadgroup: tpg,
-                    },
-                    bindings: affine_qmm_bindings(
-                        *in_slot,
-                        *out_slot,
-                        *layer + layer_offset,
-                        *wt_fn,
-                    ),
-                    gemm_dims: None,
+                match kernel {
+                    QmmTKernel::Standard => {
+                        let (tg, tpg) =
+                            qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                        LoweredCommand {
+                            kernel: KernelId::AffineQmmT,
+                            library: "quantized_qmm",
+                            function: qmm_t_kernel_static_name(
+                                kernel, dtype, bits_v, gs, aligned_n,
+                            ),
+                            constants: vec![
+                                ConstantValue::int(0, k_v as i32),
+                                ConstantValue::int(1, n_v as i32),
+                                ConstantValue::int(2, bucket_m as i32),
+                            ],
+                            dispatch: DispatchShape {
+                                threadgroups: tg,
+                                threads_per_threadgroup: tpg,
+                            },
+                            bindings: affine_qmm_bindings(
+                                *in_slot,
+                                *out_slot,
+                                *layer + layer_offset,
+                                *wt_fn,
+                            ),
+                            gemm_dims: None,
+                        }
+                    }
+                    QmmTKernel::SplitK { split_k, k_partition_size } => {
+                        // Two commands:
+                        //   (1) qmm_t_splitk writes the `[split_k, M, N]`
+                        //       partial into `Binding::Scratch`.
+                        //   (2) splitk_reduce_sum reads scratch and
+                        //       reduces along axis 0 into the AffineQmm's
+                        //       arena slot.
+                        let elem_bytes = elem_size_bytes(dtype);
+                        let scratch_bytes =
+                            split_k.saturating_mul(bucket_m).saturating_mul(n_v).saturating_mul(elem_bytes);
+                        *splitk_scratch_bytes = (*splitk_scratch_bytes).max(scratch_bytes);
+
+                        let (tg, tpg) =
+                            qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                        let qmm_t_cmd = LoweredCommand {
+                            kernel: KernelId::AffineQmmTSplitK,
+                            library: "quantized_qmm",
+                            function: qmm_t_kernel_static_name(
+                                kernel, dtype, bits_v, gs, aligned_n,
+                            ),
+                            // SplitK needs FOUR function constants:
+                            // (0=K, 1=N, 2=M, 3=k_partition_size) per
+                            // `quantized_qmm.metal:80-83`. The
+                            // standalone `MetalAffineQmmT::execute`
+                            // (`quantized.rs:776-781`) emits the same
+                            // four; missing `k_partition_size` (slot 3)
+                            // leaves the partition stride undefined and
+                            // every layer's prefill output is garbage.
+                            constants: vec![
+                                ConstantValue::int(0, k_v as i32),
+                                ConstantValue::int(1, n_v as i32),
+                                ConstantValue::int(2, bucket_m as i32),
+                                ConstantValue::int(3, k_partition_size as i32),
+                            ],
+                            dispatch: DispatchShape {
+                                threadgroups: tg,
+                                threads_per_threadgroup: tpg,
+                            },
+                            bindings: affine_qmm_splitk_bindings(
+                                *in_slot,
+                                *layer + layer_offset,
+                                *wt_fn,
+                            ),
+                            gemm_dims: None,
+                        };
+
+                        // splitk_reduce_sum: bindings (0=output → out_slot,
+                        // 1=intermediate → Scratch), function constants
+                        // (0=M, 1=N, 2=split_k), 1D dispatch over M*N
+                        // output elements.
+                        let nthreads = bucket_m.saturating_mul(n_v);
+                        let reduce_cmd = LoweredCommand {
+                            kernel: KernelId::SplitKReduceSum,
+                            library: "quantized_splitk_reduce",
+                            function: splitk_reduce_kernel_static_name(dtype),
+                            constants: vec![
+                                ConstantValue::uint(0, bucket_m),
+                                ConstantValue::uint(1, n_v),
+                                ConstantValue::uint(2, split_k),
+                            ],
+                            dispatch: DispatchShape::dispatch_1d(nthreads, THREADS_PER_GROUP),
+                            bindings: vec![
+                                Binding::ArenaSlot {
+                                    slot: *out_slot,
+                                    binding_index: 0,
+                                },
+                                Binding::Scratch { binding_index: 1 },
+                            ],
+                            gemm_dims: None,
+                        };
+                        return Ok(vec![qmm_t_cmd, reduce_cmd]);
+                    }
                 }
             }
         }
@@ -870,7 +972,7 @@ fn lower_one<W: CanonicalParams>(
             // view but don't touch device memory. Subsequent commands
             // in the lowered tape see the new logical shape via the
             // worker's slot tracker (resolved at worker init).
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // ── Loop already handled by the caller ─────────────────────
@@ -885,7 +987,7 @@ fn lower_one<W: CanonicalParams>(
         }
     };
 
-    Ok(Some(cmd))
+    Ok(vec![cmd])
 }
 
 /// Default 1D threads-per-threadgroup. Matches Metal's preferred
@@ -964,11 +1066,11 @@ fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
     }
 }
 
-/// Bindings shared by every `Instruction::AffineQmm` lowering — the
-/// qmv and qmm_t kernels both bind buffers 0..4 in the same order:
-/// (packed weight, scales, biases, x in, y out). Worker resolves
-/// the `Affine*` `WeightTensor` arms via `LinearLayer::AffineQuant`
-/// (`worker.rs:1414`).
+/// Bindings shared by every `Instruction::AffineQmm` lowering's qmv
+/// and qmm_t Standard kernels — both bind buffers 0..4 in the same
+/// order: (packed weight, scales, biases, x in, y out). Worker
+/// resolves the `Affine*` `WeightTensor` arms via
+/// `LinearLayer::AffineQuant` (`worker.rs:1414`).
 fn affine_qmm_bindings<W: CanonicalParams>(
     in_slot: u32,
     out_slot: u32,
@@ -1003,6 +1105,52 @@ fn affine_qmm_bindings<W: CanonicalParams>(
             binding_index: 4,
         },
     ]
+}
+
+/// Bindings for `affine_qmm_t_splitk`: same first four bindings as
+/// `affine_qmm_bindings` (packed weight, scales, biases, x in) but
+/// the `y` output (binding 4) is the shared `Binding::Scratch`
+/// buffer instead of an arena slot — the kernel writes the
+/// `[split_k, M, N]` partial here, and the follow-up
+/// `splitk_reduce_sum` reads it.
+fn affine_qmm_splitk_bindings<W: CanonicalParams>(
+    in_slot: u32,
+    layer: u32,
+    wt_fn: crate::WtFn<W, ferrite_kernels::layers::LinearLayer>,
+) -> Vec<Binding<W>> {
+    vec![
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer(wt_fn),
+            which: WeightTensor::Weight,
+            layer,
+            binding_index: 0,
+        },
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer(wt_fn),
+            which: WeightTensor::AffineScales,
+            layer,
+            binding_index: 1,
+        },
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer(wt_fn),
+            which: WeightTensor::AffineBiases,
+            layer,
+            binding_index: 2,
+        },
+        Binding::ArenaSlot {
+            slot: in_slot,
+            binding_index: 3,
+        },
+        Binding::Scratch { binding_index: 4 },
+    ]
+}
+
+/// Byte width of one element in the activation dtype the worker
+/// allocates the SplitK scratch buffer against. F16 / Bf16 = 2 bytes.
+fn elem_size_bytes(dtype: DequantDtype) -> u32 {
+    match dtype {
+        DequantDtype::F16 | DequantDtype::Bf16 => 2,
+    }
 }
 
 #[cfg(test)]
@@ -1062,9 +1210,12 @@ mod tests {
             /*bits=*/ 4,
             /*vector_limit=*/ 18,
         );
-        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 1, /*layer_offset=*/ 5)
-            .expect("lower")
-            .expect("non-metadata");
+        let mut scratch = 0u32;
+        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 1, /*layer_offset=*/ 5, &mut scratch)
+            .expect("lower");
+        assert_eq!(cmds.len(), 1, "qmv branch emits exactly one command");
+        assert_eq!(scratch, 0, "qmv branch never allocates splitk scratch");
+        let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::AffineQmvFast);
         assert_eq!(cmd.library, "quantized_qmv");
         assert_eq!(cmd.function, "affine_qmv_fast_bf16_gs_64_b_4_batch_0");
@@ -1122,10 +1273,13 @@ mod tests {
         assert!(cmd.gemm_dims.is_none());
     }
 
-    /// At `bucket_m >= vector_limit` we land on the qmm_t Standard
-    /// path (SplitK is C3). aligned_N=true since N=2048 % 32 == 0.
+    /// At a bucket_m where `pick_qmm_t_kernel` returns `Standard`
+    /// (current_tgs ≥ 512 → split_k=1), AffineQmm lowers to a single
+    /// `KernelId::AffineQmmT` command. bucket_m=512 with N=K=2048,
+    /// gs=64 gives n_tiles=64, m_tiles=16 → current_tgs=1024 ≥ 512.
+    /// aligned_N=true since N=2048 % 32 == 0.
     #[test]
-    fn affine_qmm_lowers_to_qmm_t_at_prefill_bucket() {
+    fn affine_qmm_lowers_to_qmm_t_standard_when_grid_full() {
         let inst: Instruction<TestParams> = Instruction::AffineQmm(
             /*in_slot=*/ 7,
             /*out_slot=*/ 11,
@@ -1137,9 +1291,12 @@ mod tests {
             /*bits=*/ 4,
             /*vector_limit=*/ 18,
         );
-        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
-            .expect("lower")
-            .expect("non-metadata");
+        let mut scratch = 0u32;
+        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 512, /*layer_offset=*/ 0, &mut scratch)
+            .expect("lower");
+        assert_eq!(cmds.len(), 1, "Standard path emits exactly one command");
+        assert_eq!(scratch, 0, "Standard path never allocates splitk scratch");
+        let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::AffineQmmT);
         assert_eq!(cmd.library, "quantized_qmm");
         assert_eq!(cmd.function, "affine_qmm_t_bf16_gs_64_b_4_alN_true_batch_0");
@@ -1148,14 +1305,87 @@ mod tests {
             vec![
                 ConstantValue::int(0, 2048),
                 ConstantValue::int(1, 2048),
-                ConstantValue::int(2, 64),
+                ConstantValue::int(2, 512),
             ],
         );
         // qmm_t grid: (ceil(N/32), ceil(M/32), B); group: (32, 2, 2).
-        assert_eq!(cmd.dispatch.threadgroups, (2048 / 32, 64 / 32, 1));
+        assert_eq!(cmd.dispatch.threadgroups, (2048 / 32, 512 / 32, 1));
         assert_eq!(cmd.dispatch.threads_per_threadgroup, (32, 2, 2));
         assert_eq!(cmd.bindings.len(), 5);
         assert!(cmd.gemm_dims.is_none());
+    }
+
+    /// At a bucket_m where `pick_qmm_t_kernel` returns SplitK
+    /// (current_tgs < 512), AffineQmm lowers to TWO commands:
+    /// `AffineQmmTSplitK` writing to the shared scratch buffer +
+    /// `SplitKReduceSum` reducing `[split_k, M, N]` → `[M, N]`.
+    /// bucket_m=64 with N=K=2048, gs=64 → n_tiles=64, m_tiles=2,
+    /// current_tgs=128, split_k=4 (gated to 2048 % (4*64) == 0).
+    #[test]
+    fn affine_qmm_lowers_to_qmm_t_splitk_pair_at_sparse_prefill() {
+        let inst: Instruction<TestParams> = Instruction::AffineQmm(
+            /*in_slot=*/ 7,
+            /*out_slot=*/ 11,
+            /*layer=*/ 3,
+            affine_quant_stub,
+            /*n=*/ 2048,
+            /*k=*/ 2048,
+            /*group_size=*/ 64,
+            /*bits=*/ 4,
+            /*vector_limit=*/ 18,
+        );
+        let mut scratch = 0u32;
+        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0, &mut scratch)
+            .expect("lower");
+        assert_eq!(cmds.len(), 2, "SplitK pair emits two commands");
+        // Scratch sized to split_k * M * N * 2 bytes (bf16 = 2):
+        // 4 * 64 * 2048 * 2 = 1_048_576.
+        assert_eq!(scratch, 4 * 64 * 2048 * 2);
+
+        let qmm_t = &cmds[0];
+        assert_eq!(qmm_t.kernel, KernelId::AffineQmmTSplitK);
+        assert_eq!(qmm_t.library, "quantized_qmm");
+        assert_eq!(
+            qmm_t.function,
+            "affine_qmm_t_splitk_bf16_gs_64_b_4_alN_true",
+        );
+        // qmm_t_splitk grid: (n_tiles, m_tiles, split_k); group same as qmm_t.
+        assert_eq!(qmm_t.dispatch.threadgroups, (64, 2, 4));
+        assert_eq!(qmm_t.dispatch.threads_per_threadgroup, (32, 2, 2));
+        // Bindings: w/scales/biases as Weight (0/1/2), in as ArenaSlot (3),
+        // y output as Scratch (4).
+        assert_eq!(qmm_t.bindings.len(), 5);
+        match &qmm_t.bindings[4] {
+            Binding::Scratch { binding_index } => assert_eq!(*binding_index, 4),
+            _ => panic!("qmm_t bindings[4]: expected Scratch"),
+        }
+
+        let reduce = &cmds[1];
+        assert_eq!(reduce.kernel, KernelId::SplitKReduceSum);
+        assert_eq!(reduce.library, "quantized_splitk_reduce");
+        assert_eq!(reduce.function, "splitk_reduce_sum_bf16");
+        // reduce constants: 0=M, 1=N, 2=split_k.
+        assert_eq!(
+            reduce.constants,
+            vec![
+                ConstantValue::uint(0, 64),
+                ConstantValue::uint(1, 2048),
+                ConstantValue::uint(2, 4),
+            ],
+        );
+        // Bindings: 0 = output ArenaSlot, 1 = Scratch input.
+        assert_eq!(reduce.bindings.len(), 2);
+        match &reduce.bindings[0] {
+            Binding::ArenaSlot { slot, binding_index } => {
+                assert_eq!(*slot, 11);
+                assert_eq!(*binding_index, 0);
+            }
+            _ => panic!("reduce bindings[0]: expected out ArenaSlot"),
+        }
+        match &reduce.bindings[1] {
+            Binding::Scratch { binding_index } => assert_eq!(*binding_index, 1),
+            _ => panic!("reduce bindings[1]: expected Scratch"),
+        }
     }
 
     /// SiluMul lowers to a 1D dispatch over `bucket_m * intermediate_size`
@@ -1165,9 +1395,11 @@ mod tests {
     fn silu_mul_lowers_with_three_arena_bindings_and_n_constant() {
         let inst: Instruction<TestParams> =
             Instruction::SiluMul(/*gate=*/ 5, /*up=*/ 6, /*out=*/ 7);
-        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
-            .expect("lower")
-            .expect("non-metadata");
+        let mut scratch = 0u32;
+        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0, &mut scratch)
+            .expect("lower");
+        assert_eq!(cmds.len(), 1, "SiluMul emits exactly one command");
+        let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::SiluMul);
         assert_eq!(cmd.library, "silu_mul");
         assert_eq!(cmd.function, "silu_mul_bf16");
@@ -1210,7 +1442,9 @@ mod tests {
 
     /// Unaligned-N Llama-1B-style lm_head (N=128256 — 128256 % 32 = 0
     /// so this is actually aligned). Use a synthetic shape for the
-    /// unaligned branch: N=2050 → N % 32 = 2 → alN=false.
+    /// unaligned branch: N=2050 → N % 32 = 2 → alN=false. Use
+    /// bucket_m=512 so we stay on the Standard path
+    /// (`pick_qmm_t_kernel` returns SplitK at small bucket_m).
     #[test]
     fn affine_qmm_qmm_t_unaligned_n_picks_unaligned_kernel() {
         let inst: Instruction<TestParams> = Instruction::AffineQmm(
@@ -1224,14 +1458,16 @@ mod tests {
             /*bits=*/ 4,
             /*vector_limit=*/ 18,
         );
-        let cmd = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0)
-            .expect("lower")
-            .expect("non-metadata");
+        let mut scratch = 0u32;
+        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 512, /*layer_offset=*/ 0, &mut scratch)
+            .expect("lower");
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
         assert_eq!(
             cmd.function,
             "affine_qmm_t_bf16_gs_64_b_4_alN_false_batch_0"
         );
-        // Ceil-div on N: 2050.div_ceil(32) = 65.
-        assert_eq!(cmd.dispatch.threadgroups, (65, 64 / 32, 1));
+        // Ceil-div on N: 2050.div_ceil(32) = 65; M-tiles: 512/32 = 16.
+        assert_eq!(cmd.dispatch.threadgroups, (65, 512 / 32, 1));
     }
 }

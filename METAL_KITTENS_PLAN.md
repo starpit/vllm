@@ -142,6 +142,86 @@ Bandwidth saved: 2 × HIDDEN × sizeof(T) per layer (one write + one read of
 the hidden state eliminated). For 3B: 2 × 3072 × 2 = 12KB × 28 layers ≈
 336KB/forward — small but worth having for free.
 
+## Beyond QKV — fusions enabled by the same primitive set
+
+The MK abstraction ("32 threads cooperatively compute 4 output rows of an
+int4 GEMV") composes well beyond QKV. Ordering below is by ROI given the
+current Llama / Qwen / Gemma decode loop.
+
+### Tier 1 — same primitive, new fusion (no new MK code needed)
+
+#### P5: FusedAffineGateUpSiluMul (q-MLP single dispatch)
+
+Today the q-MLP path emits three instructions per layer (`AffineQmm` gate +
+`AffineQmm` up + `SiluMul`). Two `mk_qmv_fast` calls (gate, up), per-element
+SiLU(gate)·up in registers, store the `[M, INTERMEDIATE]` output. One kernel.
+
+Saving on Llama-3.2-3B-4bit: 2 dispatches × 28 layers = 56/token. Largest
+single perf lever after FusedQkvRopeCache.
+
+Note this lives next to the existing macro-side fused-gate-up impl
+(`MetalFusedGateUpSiluMulImpl` Affine branch in
+`metal/fused_kernels.rs:599`), which today is "fusion in name only" —
+it decomposes into the three separate instructions above. P5 replaces
+that decomposition with a real fused `Instruction::AffineFusedGateUpSiluMul`
+variant + MK kernel.
+
+#### P6: FusedAffineDownProjAddRmsNorm
+
+`down_proj`'s output adds to residual then goes through RMSNorm before next
+layer's QKV. `mk_qmv_fast` for the down_proj GEMV, residual fold in
+registers, simdgroup reduction for RMS variance, smem broadcast for the
+scale. Saves the standalone Add + FusedAddRmsNorm dispatches per layer.
+
+#### P7: FusedAffineOProjAddRmsNorm
+
+Same shape on the post-attention side: o_proj output → add to residual →
+RMSNorm. Folds into the o_proj GEMV.
+
+### Tier 2 — Qwen3 / Gemma3 specific
+
+#### P8: FusedAffineQkvQkNormRopeCache
+
+Qwen3 and Gemma3 add per-head Q/K RMSNorm between QKV gemv and RoPE. The
+per-head `[head_dim]` row already lives in smem after the QKV step;
+add one simdgroup reduce + broadcast + rescale before the RoPE pair.
+
+### Tier 3 — new MK primitives, biggest ceiling
+
+#### P9: `mk_qmv_quad` primitive
+
+Port `qmv_quad_impl` (quantized.h:692-747) — quads of 4 threads with
+`quad_sum` reduction. Enables MK-based fusion on small head_dim (D=64)
+models where the dispatcher picks the quad kernel over fast.
+
+#### P10: `mk_load_tile` / `mk_store_tile` / `mk_mma`
+
+Cooperative threadgroup-memory tile load/store + `simdgroup_multiply_accumulate`
+wrapper. Foundation for `mk_qmm_t` (prefill int4 matmul). Unlocks fused
+prefill QKV + RoPE + cache, fused prefill gate/up/down — the prefill perf
+gap.
+
+#### P11: `mk_simd_reduce` family
+
+Sum / max / mean across a simdgroup, cooperatively staging to smem.
+Universal RMSNorm + softmax building block. P4 / P6 / P7 / P8 all want
+this; pulling it into MK avoids three near-copies of the same reduction.
+
+#### P12: `mk_rope_pair`
+
+Extract the RoPE pair (cos, sin) rotation from `fused_qkv_rope_cache.metal`
+into an inline header. Reused by P8 and any future rope-on-write fusion.
+
+### Ceiling
+
+With P10 + P11 + per-element ops in place, MK is positioned for a full
+Apple-silicon megakernel for the attention block:
+`RmsNorm → QKV → RoPE → Attention → OProj → AddRmsNorm` in a single
+dispatch, intermediates threadgroup-resident. Same direction as
+`project_metal_ferrite_status` / `project_metal_ferrite_handoff` already
+aimed, but with MK as the composable building block instead of a
+hand-rolled emitter — keeps `feedback_no_handcoded_fusion` satisfied.
+
 ## File layout
 
 ```

@@ -1030,7 +1030,17 @@ impl GpuWeights {
     /// Routing through `take()` would F16→BF16 truncate the scales at
     /// load on the bf16 stack — that's the P10b regression site.
     ///
+    /// Routes through [`alloc_and_copy_host_aligned`] with the
+    /// dtype's scalar size as `min_align`. On Metal this unlocks the
+    /// mmap-zero-copy fast path for F16/BF16 scales/biases/RMSNorm
+    /// gains in `mlx-community` 4bit safetensors (whose data section
+    /// lands at file-offset `mod 16 = 2`, permanently failing the
+    /// strict 16-byte `MetalAllocator::MIN_BIND_ALIGN` gate). On
+    /// CUDA the call is forwarded to `alloc_and_copy_host` — the
+    /// alignment hint is a no-op there.
+    ///
     /// [`take`]: Self::take
+    /// [`alloc_and_copy_host_aligned`]: crate::device_allocator::DeviceAllocator::alloc_and_copy_host_aligned
     pub fn take_keep_dtype(&mut self, name: &str) -> Result<GpuTensor> {
         if let Some(t) = self.gguf_dense.remove(name) {
             return Ok(t);
@@ -1047,8 +1057,11 @@ impl GpuWeights {
             unsafe { driver::mem_free_host(entry.pinned_ptr).ok(); }
         }
         let gpu_ptr = unsafe {
-            self.allocator
-                .alloc_and_copy_host(cpu_ref.data().as_ptr(), cpu_ref.size_bytes)?
+            self.allocator.alloc_and_copy_host_aligned(
+                cpu_ref.data().as_ptr(),
+                cpu_ref.size_bytes,
+                cpu_ref.dtype.size_bytes(),
+            )?
         };
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, cpu_ref.dtype) })
     }

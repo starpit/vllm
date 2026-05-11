@@ -75,6 +75,15 @@ pub struct LoadStats {
     /// (no copy, ≤ a few hundred ns).
     pub zero_copy_calls: AtomicU64,
     pub zero_copy_bytes: AtomicU64,
+    /// Subset of `zero_copy_calls` that only succeeded because the
+    /// caller passed `min_align < MIN_BIND_ALIGN` via
+    /// `alloc_and_copy_host_aligned` (e.g. F16 scales/biases at
+    /// `mod 4 == 2` taking the 2-byte-aligned fast path). Bumps
+    /// only when the offset would have FAILED the strict 16-byte
+    /// gate but PASSED the relaxed gate — pure visibility into how
+    /// much the dtype-aware relaxation actually saves.
+    pub zero_copy_relaxed_calls: AtomicU64,
+    pub zero_copy_relaxed_bytes: AtomicU64,
     /// `alloc_and_copy_host` call fell through to arena memcpy
     /// (~5 GB/s on Apple Silicon). High-volume miss here is the
     /// startup-time bottleneck.
@@ -245,12 +254,23 @@ impl MetalAllocator {
     const MIN_BIND_ALIGN: usize = 16;
 
     /// `Some(offset)` if `src` lies within a registered mmap AND the
-    /// offset from that mmap's base is a multiple of `MIN_BIND_ALIGN`.
+    /// offset from that mmap's base is a multiple of `min_align`.
     /// `None` otherwise — including the case where the bytes are
     /// in-range but the offset is unaligned, since binding through the
     /// mmap buffer with an unaligned offset is UB for any kernel that
-    /// types the binding as u32 / SIMD.
-    fn aligned_mmap_offset(&self, src: *const u8, bytes: usize) -> Option<u64> {
+    /// reads at a stride larger than the binding's underlying offset.
+    ///
+    /// `min_align` is clamped to `MIN_BIND_ALIGN` from above on the
+    /// trait `alloc_and_copy_host` path (callers without dtype info
+    /// must satisfy the worst-case 16-byte gate); the
+    /// `alloc_and_copy_host_aligned` path passes the per-binding-dtype
+    /// scalar alignment (2 for F16/BF16, 4 for U32/F32, etc.).
+    fn aligned_mmap_offset(
+        &self,
+        src: *const u8,
+        bytes: usize,
+        min_align: usize,
+    ) -> Option<u64> {
         let p = src as usize;
         let end = p.saturating_add(bytes);
         let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
@@ -259,7 +279,7 @@ impl MetalAllocator {
             let r_end = r_start + region.len;
             if p >= r_start && end <= r_end {
                 let offset = p - r_start;
-                if offset % Self::MIN_BIND_ALIGN == 0 {
+                if min_align == 0 || offset % min_align == 0 {
                     return Some(offset as u64);
                 }
                 return None;
@@ -269,10 +289,16 @@ impl MetalAllocator {
     }
 
     fn src_in_registered_mmap(&self, src: *const u8, bytes: usize) -> bool {
-        self.aligned_mmap_offset(src, bytes).is_some()
+        self.aligned_mmap_offset(src, bytes, Self::MIN_BIND_ALIGN)
+            .is_some()
     }
 
-    fn classify_mmap_offset(&self, src: *const u8, bytes: usize) -> MmapClassify {
+    fn classify_mmap_offset(
+        &self,
+        src: *const u8,
+        bytes: usize,
+        min_align: usize,
+    ) -> MmapClassify {
         let p = src as usize;
         let end = p.saturating_add(bytes);
         let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
@@ -283,7 +309,7 @@ impl MetalAllocator {
                 let offset = p - r_start;
                 let tz = offset.trailing_zeros();
                 self.load_stats.observe_offset_alignment(tz);
-                if offset % Self::MIN_BIND_ALIGN == 0 {
+                if min_align == 0 || offset % min_align == 0 {
                     return MmapClassify::Aligned;
                 }
                 return MmapClassify::Unaligned;
@@ -401,16 +427,36 @@ impl MetalAllocator {
 
 impl DeviceAllocator for MetalAllocator {
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
+        unsafe {
+            self.alloc_and_copy_host_aligned(src_host, bytes, Self::MIN_BIND_ALIGN)
+        }
+    }
+
+    unsafe fn alloc_and_copy_host_aligned(
+        &mut self,
+        src_host: *const u8,
+        bytes: usize,
+        min_align: usize,
+    ) -> Result<*mut u8> {
         // Zero-copy fast path: the source already lives in a
-        // registered safetensors mmap AND lands at a properly-aligned
-        // offset for any kernel binding type (see
-        // `aligned_mmap_offset` for why this gate matters — Apple's
-        // M-series driver does not silently tolerate unaligned u32
-        // bindings on int4 packed weights). Misaligned sources fall
-        // through to the arena-copy path, which `alloc_uninit` keeps
-        // 16-byte aligned per allocation.
+        // registered safetensors mmap AND lands at a `min_align`-aligned
+        // offset. `min_align` is clamped above by `MIN_BIND_ALIGN` since
+        // any pointer we return is also reachable via the trait
+        // `alloc_and_copy_host` (no dtype guarantee), and may be bound
+        // to arbitrary kernels later. The clamp below keeps the
+        // SIMD-wide-safe floor; per-dtype relaxation below 16 only
+        // helps for offsets in `(MIN_BIND_ALIGN, dtype_size]`.
+        //
+        // For `mlx-community` 4bit safetensors the data section lands
+        // at file-offset `mod 16 = 2`, so the 16-byte gate rejects
+        // every tensor (cf. `project_metal_safetensors_alignment`).
+        // Relaxing to `min_align = 2` lets F16/BF16 scales/biases/
+        // RMSNorm-gain tensors take this path — those kernel bindings
+        // read scalar (`sl[0]`, `weight[i]`) and 2-byte alignment is
+        // safe.
+        let effective_min_align = min_align.min(Self::MIN_BIND_ALIGN).max(1);
         if bytes > 0 {
-            match self.classify_mmap_offset(src_host, bytes) {
+            match self.classify_mmap_offset(src_host, bytes, effective_min_align) {
                 MmapClassify::Aligned => {
                     self.load_stats
                         .zero_copy_calls
@@ -418,6 +464,22 @@ impl DeviceAllocator for MetalAllocator {
                     self.load_stats
                         .zero_copy_bytes
                         .fetch_add(bytes as u64, Ordering::Relaxed);
+                    // Visibility bookkeeping: did the relaxation
+                    // actually do anything? Re-check at the strict
+                    // 16-byte gate; if THAT would have failed, the
+                    // relaxation is responsible for this zero-copy.
+                    if effective_min_align < Self::MIN_BIND_ALIGN {
+                        let strict = self
+                            .aligned_mmap_offset(src_host, bytes, Self::MIN_BIND_ALIGN);
+                        if strict.is_none() {
+                            self.load_stats
+                                .zero_copy_relaxed_calls
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.load_stats
+                                .zero_copy_relaxed_bytes
+                                .fetch_add(bytes as u64, Ordering::Relaxed);
+                        }
+                    }
                     return Ok(src_host as *mut u8);
                 }
                 MmapClassify::Unaligned => {

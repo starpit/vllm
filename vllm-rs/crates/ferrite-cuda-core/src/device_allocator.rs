@@ -47,4 +47,41 @@ pub trait DeviceAllocator: Send + Sync {
     /// memory works but blocks the CPU. Metal implementations
     /// `memcpy` from `src_host`, so any host memory is fine.
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8>;
+
+    /// Variant of [`alloc_and_copy_host`] that promises the resulting
+    /// device pointer will only be bound to kernel arguments whose
+    /// scalar binding type requires at most `min_align` bytes of
+    /// offset alignment (e.g. 2 for `device const half*` /
+    /// `device const bfloat*`, 4 for `device const uint32_t*`).
+    ///
+    /// Metal's zero-copy mmap-alias path is gated on the offset
+    /// being a multiple of `MIN_BIND_ALIGN = 16` (covers u32 packed
+    /// int4 weights + simdgroup_float4 / any SIMD-wide reads).
+    /// `mlx-community` 4bit safetensors land tensor offsets at
+    /// `mod 16 = 2`, so the 16-byte gate rejects every F16/BF16
+    /// scales/biases/RMSNorm-gain tensor even though those bindings
+    /// only do scalar reads. Threading dtype-aware `min_align` lets
+    /// those tensors take zero-copy.
+    ///
+    /// CUDA has no analogous gate (cudaMalloc returns 256-byte
+    /// aligned pointers; the host→device copy is the cost-dominant
+    /// step regardless of alignment), so the default forwards to
+    /// [`alloc_and_copy_host`] and ignores `min_align`.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`alloc_and_copy_host`]. Caller is responsible for
+    /// ensuring the returned pointer is only bound to kernels that
+    /// read at `min_align` granularity — wider SIMD-vector reads
+    /// (e.g. `vec<half, 4>`) require strictly higher alignment.
+    ///
+    /// [`alloc_and_copy_host`]: Self::alloc_and_copy_host
+    unsafe fn alloc_and_copy_host_aligned(
+        &mut self,
+        src_host: *const u8,
+        bytes: usize,
+        _min_align: usize,
+    ) -> Result<*mut u8> {
+        unsafe { self.alloc_and_copy_host(src_host, bytes) }
+    }
 }

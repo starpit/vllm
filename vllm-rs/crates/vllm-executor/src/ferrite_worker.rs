@@ -9530,6 +9530,8 @@ impl Worker for FerriteWorker {
             let s = weights.metal_allocator().load_stats();
             let zc = s.zero_copy_calls.load(Ordering::Relaxed);
             let zb = s.zero_copy_bytes.load(Ordering::Relaxed);
+            let zcr = s.zero_copy_relaxed_calls.load(Ordering::Relaxed);
+            let zbr = s.zero_copy_relaxed_bytes.load(Ordering::Relaxed);
             let mc = s.memcpy_calls.load(Ordering::Relaxed);
             let mb = s.memcpy_bytes.load(Ordering::Relaxed);
             let small = s.memcpy_small_calls.load(Ordering::Relaxed);
@@ -9538,10 +9540,13 @@ impl Worker for FerriteWorker {
             let unaligned = s.memcpy_unaligned.load(Ordering::Relaxed);
             let outside = s.memcpy_outside_mmap.load(Ordering::Relaxed);
             info!(
-                "FerriteWorker(metal): load routing — zero-copy {zc} calls / {:.1} MiB | \
+                "FerriteWorker(metal): load routing — zero-copy {zc} calls / {:.1} MiB \
+                 (of which {} calls / {:.1} MiB took the dtype-relaxed gate) | \
                  memcpy {mc} calls / {:.1} MiB ({} small <1MiB, {} med 1-16MiB, {} large ≥16MiB; \
                  fallback reason: {} unaligned, {} outside-mmap)",
                 zb as f64 / (1 << 20) as f64,
+                zcr,
+                zbr as f64 / (1 << 20) as f64,
                 mb as f64 / (1 << 20) as f64,
                 small,
                 med,

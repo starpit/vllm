@@ -36,16 +36,26 @@ impl MetalDevice {
 pub fn detect_device() -> Option<MetalDevice> {
     let device = MTLCreateSystemDefaultDevice()?;
 
-    // Detect architecture from device name
+    // Detect architecture from device name. Each chip routes to the
+    // profile whose embedded cost CSV was swept on that chip — the
+    // solver consults `cost_table` per-impl `cost_us`, so an empty
+    // table forces every impl onto the analytical roofline. M4 has a
+    // populated table today (per `profiles/cost_m4.csv`); other chips
+    // either ship empty tables (M1/M2/M3 base / M4 10-core fallback)
+    // or the M1 Max 32-core variant which has its own sweep.
     let name = device.name().to_string();
     let profile = if name.contains("M1") {
-        ferrite_metal_targets::M1_8CORE
+        if name.contains("Max") {
+            ferrite_metal_targets::m1_max_with_costs()
+        } else {
+            ferrite_metal_targets::M1_8CORE
+        }
     } else if name.contains("M2") {
         ferrite_metal_targets::M2_10CORE
     } else if name.contains("M3") {
         ferrite_metal_targets::M3_10CORE
     } else if name.contains("M4") {
-        ferrite_metal_targets::M4_10CORE
+        ferrite_metal_targets::m4_with_costs()
     } else {
         // Default to M1 for unknown devices
         eprintln!(

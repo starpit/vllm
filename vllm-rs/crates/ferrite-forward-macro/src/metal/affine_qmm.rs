@@ -117,6 +117,17 @@ impl Implementation for MetalAffineQmmImpl {
                     _ => None,
                 })
                 .unwrap_or(2048);
+
+            // Consult empirical cost table first. Reconstruct the
+            // kernel-variant key by re-running the dispatcher decision
+            // (vector_limit + qmv/qmm_t pick) on `(M, N, K, gs, bits)`.
+            // Names match `ferrite-metal-cost-sweep::affine_q{mv,mm}_sweep::
+            // csv_kernel_name`. Falls back to the analytical roofline when
+            // the chip's profile has no row for this shape (chip ships
+            // empty cost_table or the sweep didn't cover this (M, N, K)).
+            if let Some(cost) = empirical_cost_us(self.dtype, mm, nn, kk, node, ctx) {
+                return cost;
+            }
             return self.analytical_cost_us(mm, nn, kk, ctx.profile.peak_tflops_fp16);
         }
         500.0
@@ -218,6 +229,68 @@ impl Implementation for MetalAffineQmmImpl {
             ],
         )])
     }
+}
+
+/// Look up the empirical kernel cost for an AffineQmm tile. Returns
+/// `None` when the profile has no row for the (kernel, M, N, K) key —
+/// either the chip ships an empty cost_table or the sweep didn't cover
+/// this exact shape. Caller falls back to the analytical roofline in
+/// either case.
+///
+/// Reconstructs the dispatcher's per-shape kernel pick:
+///   * `M < vector_limit` → matvec branch (`pick_qmv_kernel`)
+///   * else                → matmul branch (`pick_qmm_t_kernel`)
+///
+/// Kernel-name format mirrors the rows emitted by
+/// `ferrite-metal-cost-sweep::affine_q{mv,mm}_sweep::csv_kernel_name`.
+fn empirical_cost_us(
+    dtype: &'static str,
+    m: u32,
+    n: u32,
+    k: u32,
+    node: &crate::fuf::FufNode,
+    ctx: &CostCtx,
+) -> Option<f64> {
+    use ferrite_metal_kernels::quantized::{
+        pick_qmm_t_kernel, pick_qmv_kernel, QmmTKernel, QmvKernel,
+    };
+
+    let dtype_str = match dtype {
+        "fp16" => "f16",
+        "bf16" => "bf16",
+        _ => return None,
+    };
+    let (group_size, _bits) = match weight_storage_of(node) {
+        Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
+        _ => return None,
+    };
+
+    let vector_limit = affine_qmm_vector_limit(k, n);
+    let name = if m < vector_limit {
+        let kernel = pick_qmv_kernel(n, k, 4);
+        match kernel {
+            QmvKernel::Quad { d } => {
+                format!("affine_qmv_quad_{dtype_str}_gs{group_size}_d{d}")
+            }
+            QmvKernel::Fast => format!("affine_qmv_fast_{dtype_str}_gs{group_size}"),
+            QmvKernel::Generic => format!("affine_qmv_{dtype_str}_gs{group_size}"),
+        }
+    } else {
+        let kernel = pick_qmm_t_kernel(m, n, k, 1, group_size);
+        match kernel {
+            QmmTKernel::Standard => format!("affine_qmm_t_{dtype_str}_gs{group_size}"),
+            QmmTKernel::SplitK { split_k, .. } => {
+                format!("affine_qmm_t_splitk{split_k}_{dtype_str}_gs{group_size}")
+            }
+        }
+    };
+    // For matvec the sweep emits M=1 rows; the AffineQmm tile's bucket
+    // M ≥ 1 in all decode cases. Force M=1 on the lookup so the right
+    // row is found regardless of the bucket size — kernel cost is
+    // M-independent in the matvec regime (one threadgroup per output
+    // row, M only widens the input fetch).
+    let lookup_m = if m < vector_limit { 1 } else { m };
+    ctx.profile.cost_us_for(&name, lookup_m, n, k)
 }
 
 /// `Instruction::AffineQmm` variant shape used by both the standalone

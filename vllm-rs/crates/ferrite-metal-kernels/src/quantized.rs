@@ -49,7 +49,7 @@ pub enum DequantDtype {
 }
 
 impl DequantDtype {
-    fn symbol_infix(self) -> &'static str {
+    pub fn symbol_infix(self) -> &'static str {
         match self {
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
@@ -74,7 +74,7 @@ pub enum ScaleDtype {
 }
 
 impl ScaleDtype {
-    fn symbol_infix(self) -> &'static str {
+    pub fn symbol_infix(self) -> &'static str {
         match self {
             Self::F16 => "f16",
         }

@@ -177,6 +177,21 @@ pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
     cost_table: BTreeMap::new(),
 };
 
+/// M4 device profile with measured costs loaded from
+/// `profiles/cost_m4.csv` (regenerate via
+/// `cargo run -p ferrite-metal-cost-sweep --release > profiles/cost_m4.csv`).
+/// Used by `detect_device()` when the runtime chip identifies as M4 so
+/// the solver's per-impl `cost_us` can consult empirical rows instead
+/// of falling back to the analytical roofline.
+pub fn m4_with_costs() -> MetalTargetProfile {
+    let mut profile = M4_10CORE.clone();
+    let csv = include_str!("../profiles/cost_m4.csv");
+    profile
+        .load_costs_from_csv(csv)
+        .expect("Failed to load M4 cost data");
+    profile
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

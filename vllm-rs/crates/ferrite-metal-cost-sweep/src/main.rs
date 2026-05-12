@@ -28,6 +28,7 @@
 mod affine_qmm_sweep;
 mod affine_qmv_sweep;
 mod rmsnorm_sweep;
+mod synth_mlp_pre_down_sweep;
 mod synth_pre_attn_sweep;
 mod util;
 
@@ -61,6 +62,9 @@ fn main() {
     }
     if want("synth_pre_attn") {
         synth_pre_attn_sweep::run(launch_overhead_us);
+    }
+    if want("synth_mlp_pre_down") {
+        synth_mlp_pre_down_sweep::run(launch_overhead_us);
     }
 
     eprintln!("metal_cost_sweep: done");

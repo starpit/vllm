@@ -28,6 +28,7 @@ use crate::interpreter::metal::__re::{
     Buffer, CommandQueue, Device, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandQueue,
 };
+use objc2_metal::MTLDevice;
 
 use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
 
@@ -263,6 +264,22 @@ struct PoolInner<W: CanonicalParams> {
     total_created: usize,
 }
 
+/// Probe MTL4 availability once at pool construction. Logs the
+/// result at info level so cold-start traces show whether the
+/// upcoming Phase A side-by-side path is reachable on this host.
+///
+/// `newMTL4CommandQueue()` returns `Some` iff the host runs
+/// macOS 15+ on Apple Family 7+ silicon AND the driver exposes
+/// MTL4. On macOS 14 / older drivers this returns `None`; the
+/// caller falls back to the MTL3 path. The queue is dropped
+/// immediately — this is a one-shot capability probe, not the
+/// production queue (`run_forward_with_inputs_inner` will lazily
+/// build its own once the side-by-side path lands in A.2/A.3).
+fn probe_mtl4_availability(device: &Device) {
+    let available = device.newMTL4CommandQueue().is_some();
+    tracing::info!(target: "ferrite-metal", available, "mtl4 capability probe");
+}
+
 impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// Build the pool and eagerly create the first worker.
     ///
@@ -289,6 +306,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // buffers (allocated outside the allocator, in `MetalWorker::new`)
         // still need explicit insertion; that happens in `spawn_worker`
         // below by reading `allocator.residency()`.
+
+        // Phase A.1 MTL4 probe (see `FERRITE_METAL_MTL4_MIGRATION.md`).
+        // Side-effect-free: tries `device.newMTL4CommandQueue()`, logs
+        // availability, drops the queue. Result is recomputed cheaply
+        // when the side-by-side path (A.2/A.3) consults
+        // `FERRITE_METAL_MTL4` — kept out of the pool struct until the
+        // hot path actually uses it.
+        probe_mtl4_availability(&device);
 
         let pool = Self {
             device,

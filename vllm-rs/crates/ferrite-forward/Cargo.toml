@@ -46,7 +46,21 @@ ferrite-vision = { path = "../ferrite-vision", optional = true }
 # downstream callers gate their consuming code.
 ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
 objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true, features = [
+    # MTL4 surfaces for the in-progress migration off the
+    # MTLCommandBuffer + Serial-encoder + ICB pattern. Probed at
+    # runtime via `device.newMTL4CommandQueue()`; falls back to MTL3
+    # on macOS 14 or absent driver support. See
+    # `FERRITE_METAL_MTL4_MIGRATION.md`.
+    "MTL4ArgumentTable",
+    "MTL4BufferRange",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+] }
 objc2-foundation = { version = "0.3", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

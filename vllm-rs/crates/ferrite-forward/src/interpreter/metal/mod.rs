@@ -55,6 +55,14 @@ pub mod __re {
         MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues, MTLLibrary,
         MTLPipelineOption, MTLResourceOptions, MTLSize,
     };
+    // MTL4 surfaces re-exported for the Scope-A side-by-side path
+    // (see `FERRITE_METAL_MTL4_MIGRATION.md`). All four are optional
+    // at runtime: `MetalWorkerPool::new` probes
+    // `device.newMTL4CommandQueue()` once and stores the result.
+    pub use ::objc2_metal::{
+        MTL4ArgumentTable, MTL4CommandBuffer, MTL4CommandQueue, MTL4ComputeCommandEncoder,
+    };
+    pub type Mtl4Queue = Retained<ProtocolObject<dyn MTL4CommandQueue>>;
     pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
     pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
     pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;

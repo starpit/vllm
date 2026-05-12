@@ -599,6 +599,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// callers should only land here behind the `FERRITE_METAL_MTL4`
     /// env-var, which is documented as macOS 15+ / Apple Family 7+.
     fn ensure_mtl4(&self) {
+        use objc2::runtime::AnyObject;
         let mut slot = self.mtl4.lock().expect("mtl4 mutex");
         if slot.is_some() {
             return;
@@ -615,6 +616,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newSharedEvent()
             .expect("device.newSharedEvent() returned nil");
+        // Belt-and-braces residency: attach the same residency set
+        // (weights + arenas + KV cache) to the MTL4 queue, in
+        // addition to the per-cmdbuf `useResidencySet:` we do at
+        // `run_bucket_mtl4`. The per-cmdbuf attach is documented
+        // sufficient, but on M1 Max we observed the paged KV cache
+        // reading garbage without this — likely because the
+        // `block_table` indirection lands on pages that aren't
+        // declared on the cmdbuf's set (the set tracks the cache
+        // pool buffer, not every indirected page reference).
+        let queue_ptr: *mut AnyObject =
+            ::objc2::rc::Retained::as_ptr(&queue) as *const AnyObject as *mut AnyObject;
+        unsafe {
+            self.allocator.residency().attach_to_mtl4_queue(queue_ptr);
+        }
         *slot = Some(Mtl4Pool {
             queue,
             allocator,

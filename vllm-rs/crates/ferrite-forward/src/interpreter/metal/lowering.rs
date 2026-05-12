@@ -954,7 +954,9 @@ fn lower_one<W: CanonicalParams>(
             delta_slot,
             q_out_slot,
             layer,
-            wt_fn,
+            q_wt_fn,
+            k_wt_fn,
+            v_wt_fn,
             rms_wt_fn,
             cos_sin_fn,
             group_size,
@@ -993,20 +995,11 @@ fn lower_one<W: CanonicalParams>(
                 },
                 bindings: vec![
                     // 0: q_out
-                    Binding::ArenaSlot {
-                        slot: *q_out_slot,
-                        binding_index: 0,
-                    },
+                    Binding::ArenaSlot { slot: *q_out_slot, binding_index: 0 },
                     // 1: residual_io (read+write)
-                    Binding::ArenaSlot {
-                        slot: *residual_slot,
-                        binding_index: 1,
-                    },
+                    Binding::ArenaSlot { slot: *residual_slot, binding_index: 1 },
                     // 2: delta (read)
-                    Binding::ArenaSlot {
-                        slot: *delta_slot,
-                        binding_index: 2,
-                    },
+                    Binding::ArenaSlot { slot: *delta_slot, binding_index: 2 },
                     // 3: rms_weight
                     Binding::Weight {
                         kind: WeightBundleKind::RmsNorm(*rms_wt_fn),
@@ -1014,57 +1007,89 @@ fn lower_one<W: CanonicalParams>(
                         layer: *layer + layer_offset,
                         binding_index: 3,
                     },
-                    // 4: packed QKV weight
+                    // 4..6: Q weight + scales + biases
                     Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer(*wt_fn),
+                        kind: WeightBundleKind::LinearLayer(*q_wt_fn),
                         which: WeightTensor::Weight,
                         layer: *layer + layer_offset,
                         binding_index: 4,
                     },
-                    // 5: scales
                     Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer(*wt_fn),
+                        kind: WeightBundleKind::LinearLayer(*q_wt_fn),
                         which: WeightTensor::AffineScales,
                         layer: *layer + layer_offset,
                         binding_index: 5,
                     },
-                    // 6: biases
                     Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer(*wt_fn),
+                        kind: WeightBundleKind::LinearLayer(*q_wt_fn),
                         which: WeightTensor::AffineBiases,
                         layer: *layer + layer_offset,
                         binding_index: 6,
                     },
-                    // 7: cos_sin
+                    // 7..9: K weight + scales + biases
                     Binding::Weight {
-                        kind: WeightBundleKind::CosSin(*cos_sin_fn),
+                        kind: WeightBundleKind::LinearLayer(*k_wt_fn),
                         which: WeightTensor::Weight,
                         layer: *layer + layer_offset,
                         binding_index: 7,
                     },
-                    // 8: positions
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::Positions,
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*k_wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: *layer + layer_offset,
                         binding_index: 8,
                     },
-                    // 9: slot_mapping
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::SlotMapping,
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*k_wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: *layer + layer_offset,
                         binding_index: 9,
                     },
-                    // 10: kv_cache_k
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheK {
-                            layer: *layer + layer_offset,
-                        },
+                    // 10..12: V weight + scales + biases
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*v_wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
                         binding_index: 10,
                     },
-                    // 11: kv_cache_v
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheV {
-                            layer: *layer + layer_offset,
-                        },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*v_wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: *layer + layer_offset,
                         binding_index: 11,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*v_wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: *layer + layer_offset,
+                        binding_index: 12,
+                    },
+                    // 13: cos_sin
+                    Binding::Weight {
+                        kind: WeightBundleKind::CosSin(*cos_sin_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 13,
+                    },
+                    // 14: positions
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::Positions,
+                        binding_index: 14,
+                    },
+                    // 15: slot_mapping
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::SlotMapping,
+                        binding_index: 15,
+                    },
+                    // 16: kv_cache_k
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::KvCacheK { layer: *layer + layer_offset },
+                        binding_index: 16,
+                    },
+                    // 17: kv_cache_v
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::KvCacheV { layer: *layer + layer_offset },
+                        binding_index: 17,
                     },
                 ],
                 gemm_dims: None,

@@ -611,8 +611,13 @@ pub enum Instruction<W> {
     /// `SpecializedPipelineCache` at worker-pool init.
     ///
     /// Tuple fields: `(residual_slot, delta_slot, q_out_slot, layer,
-    /// weight_fn, rms_weight_fn, cos_sin_fn, group_size, bits,
-    /// kernel_symbol)`.
+    /// q_weight_fn, k_weight_fn, v_weight_fn, rms_weight_fn,
+    /// cos_sin_fn, group_size, bits, kernel_symbol)`.
+    ///
+    /// Three separate `WtFn<W, LinearLayer>`s (Q, K, V) instead of a
+    /// packed concat — each AffineQmm in the detected chain
+    /// contributes its own LinearLayer accessor. Avoids the load-time
+    /// packed-concat infrastructure that Phase 0's revert dropped.
     ///
     /// CUDA eval is `unreachable!`.
     SynthPreAttn(
@@ -620,6 +625,8 @@ pub enum Instruction<W> {
         u32,
         u32,
         u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
         WtFn<W, LinearLayer>,
         WtFn<W, ferrite_kernels::layers::RmsNorm>,
         CosSinFn<W>,

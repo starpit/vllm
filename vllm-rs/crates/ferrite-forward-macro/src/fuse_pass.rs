@@ -94,9 +94,20 @@ pub fn synthesize_pre_attn_chunk(
     let residual_io   = "__residual_io".to_string();
     let delta_buf     = "__delta".to_string();
     let rms_wt_buf    = "__rms_weight".to_string();
-    let qkv_wt_buf    = "__qkv_weight".to_string();
-    let qkv_sc_buf    = "__qkv_scales".to_string();
-    let qkv_bi_buf    = "__qkv_biases".to_string();
+    // Per-projection weight triples — the chain emits ONE
+    // SynthPreAttn that binds three separate `LinearLayer::AffineQuant`s
+    // (Q, K, V). The kernel branches on head index to pick the right
+    // triple for its qmv. Avoids the load-time packed-concat
+    // infrastructure that would be needed for a single-buffer design.
+    let q_wt_buf      = "__q_weight".to_string();
+    let q_sc_buf      = "__q_scales".to_string();
+    let q_bi_buf      = "__q_biases".to_string();
+    let k_wt_buf      = "__k_weight".to_string();
+    let k_sc_buf      = "__k_scales".to_string();
+    let k_bi_buf      = "__k_biases".to_string();
+    let v_wt_buf      = "__v_weight".to_string();
+    let v_sc_buf      = "__v_scales".to_string();
+    let v_bi_buf      = "__v_biases".to_string();
     let cos_sin_buf   = "__cos_sin".to_string();
     let positions_buf = "__positions".to_string();
     let slot_map_buf  = "__slot_mapping".to_string();
@@ -132,20 +143,13 @@ pub fn synthesize_pre_attn_chunk(
         t_scale,
     };
 
-    let qmv_in  = vec![
-        x_norm_name.clone(),
-        qkv_wt_buf.clone(),
-        qkv_sc_buf.clone(),
-        qkv_bi_buf.clone(),
-    ];
-    let qmv_out = vec![qmv_smem_name.clone()];
-    let qmv_ctx = AtomCtx {
-        bound_inputs: &qmv_in,
-        bound_outputs: &qmv_out,
-        constants: &constants_slice,
-        t_act,
-        t_scale,
-    };
+    // QKV qmv is hand-written inline (not via AffineQmvAtom) because
+    // each band uses a DIFFERENT per-projection head index
+    // (`head - num_q` for K, `head - num_q - num_kv` for V), which
+    // the current AffineQmvAtom doesn't parameterize. Future
+    // atomization will add a `head_offset` ctx field; for the MVP
+    // we hand-stitch the three qmv calls below in `qmv_block`.
+    let _ = qmv_smem_name;
 
     let rope_in  = vec![
         qmv_smem_name.clone(),
@@ -164,10 +168,96 @@ pub fn synthesize_pre_attn_chunk(
 
     let addrms_body = addrms.emit_metal_body(&addrms_ctx)
         .expect("AddRmsNormAtom Metal emit");
-    let qmv_body    = qmv.emit_metal_body(&qmv_ctx)
-        .expect("AffineQmvAtom Metal emit");
+    let _ = qmv; // qmv body is hand-emitted per-band below (head-offset is per-band)
     let rope_body   = rope.emit_metal_body(&rope_ctx)
         .expect("RopeAppendAtom Metal emit");
+
+    // Hand-emit the per-band qmv. Each band uses a different weight
+    // triple AND a different head-offset expression for the global
+    // output row index (`head` for Q, `head - num_q` for K,
+    // `head - num_q - num_kv` for V — the latter two are local within
+    // each projection). Result goes to `qmv_smem` regardless of band
+    // so the downstream RopeAppend atom doesn't care.
+    let emit_qmv_band = |w: &str, sc: &str, bi: &str, head_expr: &str| -> String {
+        format!(
+            r#"
+        {{
+            constexpr int __bits              = 4;
+            constexpr int __pack_factor       = mk_get_pack_factor<__bits, 32>();
+            constexpr int __bytes_per_pack    = mk_get_bytes_per_pack<__bits, 32>();
+            constexpr int __values_per_thread = __pack_factor * MK_PACKS_PER_THREAD;
+            constexpr int __scale_step        = {gs} / __values_per_thread;
+            const uint __local_head           = {head_expr};
+            const uint __global_out_row_base  = __local_head * __head_dim + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+            const int  __in_vec_size_w        = (int)__hidden * __bytes_per_pack / __pack_factor;
+            const int  __in_vec_size_g        = (int)__hidden / {gs};
+            const device uint8_t*  __ws = (const device uint8_t*){w}
+                + (size_t)__global_out_row_base * (size_t)__in_vec_size_w
+                + (size_t)__simd_lid * MK_PACKS_PER_THREAD * __bytes_per_pack;
+            const device {t_scale}* __sc = {sc}
+                + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
+                + __simd_lid / __scale_step;
+            const device {t_scale}* __bi = {bi}
+                + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
+                + __simd_lid / __scale_step;
+            thread float __x_thread[__values_per_thread];
+            thread float __result[MK_ROWS_PER_SIMDGROUP] = {{ 0 }};
+            const int __block_size = __values_per_thread * MK_SIMD_SIZE;
+            threadgroup {t_act}* __x_tg = {x_norm} + __simd_lid * __values_per_thread;
+            const device uint8_t*  __ws_iter = __ws;
+            const device {t_scale}* __sc_iter = __sc;
+            const device {t_scale}* __bi_iter = __bi;
+            for (int __k = 0; __k < (int)__hidden; __k += __block_size) {{
+                float __sum = mk_load_vector<{t_act}, float, __values_per_thread, __bits>(__x_tg, __x_thread);
+                for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+                    const device uint8_t*  __wl = __ws_iter + __row * __in_vec_size_w;
+                    float __s = float(__sc_iter[__row * __in_vec_size_g]);
+                    float __b = float(__bi_iter[__row * __in_vec_size_g]);
+                    __result[__row] += mk_qdot<float, __values_per_thread, __bits>(__wl, __x_thread, __s, __b, __sum);
+                }}
+                __ws_iter += __block_size * __bytes_per_pack / __pack_factor;
+                __sc_iter += __block_size / {gs};
+                __bi_iter += __block_size / {gs};
+                __x_tg    += __block_size;
+            }}
+            for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+                __result[__row] = simd_sum(__result[__row]);
+                if (__simd_lid == 0) {{
+                    {smem}[__simd_gid * MK_ROWS_PER_SIMDGROUP + __row] = __result[__row];
+                }}
+            }}
+            mk_sync();
+        }}
+"#,
+            t_act = t_act,
+            t_scale = t_scale,
+            gs = consts.group_size,
+            w = w,
+            sc = sc,
+            bi = bi,
+            head_expr = head_expr,
+            x_norm = x_norm_name,
+            smem = qmv_smem_name,
+        )
+    };
+    let qmv_q_body = emit_qmv_band(&q_wt_buf, &q_sc_buf, &q_bi_buf, "__head");
+    let qmv_k_body = emit_qmv_band(&k_wt_buf, &k_sc_buf, &k_bi_buf, "(__head - __num_q)");
+    let qmv_v_body = emit_qmv_band(&v_wt_buf, &v_sc_buf, &v_bi_buf, "(__head - __num_q - __num_kv)");
+    let qmv_body = format!(
+        r#"
+    // --- per-band QKV qmv (hand-emitted, head-offset varies per band) ---
+    if (__head < __num_q) {{
+        {qmv_q_body}
+    }} else if (__head < __num_q + __num_kv) {{
+        {qmv_k_body}
+    }} else {{
+        {qmv_v_body}
+    }}
+"#,
+        qmv_q_body = qmv_q_body,
+        qmv_k_body = qmv_k_body,
+        qmv_v_body = qmv_v_body,
+    );
 
     // Symbol name: deterministic hash of the atom sequence + dtype + gs.
     // For the MVP we just use a readable name; production version uses
@@ -201,14 +291,20 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     device       {t_act}*   {residual_io}    [[buffer(1)]],
     device const {t_act}*   {delta_buf}      [[buffer(2)]],
     device const {t_scale}* {rms_wt_buf}     [[buffer(3)]],
-    device const uint32_t*  {qkv_wt_buf}     [[buffer(4)]],
-    device const {t_scale}* {qkv_sc_buf}     [[buffer(5)]],
-    device const {t_scale}* {qkv_bi_buf}     [[buffer(6)]],
-    device const {t_act}*   {cos_sin_buf}    [[buffer(7)]],
-    device const uint*      {positions_buf}  [[buffer(8)]],
-    device const uint*      {slot_map_buf}   [[buffer(9)]],
-    device       {t_act}*   {kv_cache_k}     [[buffer(10)]],
-    device       {t_act}*   {kv_cache_v}     [[buffer(11)]],
+    device const uint32_t*  {q_wt_buf}       [[buffer(4)]],
+    device const {t_scale}* {q_sc_buf}       [[buffer(5)]],
+    device const {t_scale}* {q_bi_buf}       [[buffer(6)]],
+    device const uint32_t*  {k_wt_buf}       [[buffer(7)]],
+    device const {t_scale}* {k_sc_buf}       [[buffer(8)]],
+    device const {t_scale}* {k_bi_buf}       [[buffer(9)]],
+    device const uint32_t*  {v_wt_buf}       [[buffer(10)]],
+    device const {t_scale}* {v_sc_buf}       [[buffer(11)]],
+    device const {t_scale}* {v_bi_buf}       [[buffer(12)]],
+    device const {t_act}*   {cos_sin_buf}    [[buffer(13)]],
+    device const uint*      {positions_buf}  [[buffer(14)]],
+    device const uint*      {slot_map_buf}   [[buffer(15)]],
+    device       {t_act}*   {kv_cache_k}     [[buffer(16)]],
+    device       {t_act}*   {kv_cache_v}     [[buffer(17)]],
     uint3 __tg_pos    [[threadgroup_position_in_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
     uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -249,9 +345,15 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         residual_io = residual_io,
         delta_buf = delta_buf,
         rms_wt_buf = rms_wt_buf,
-        qkv_wt_buf = qkv_wt_buf,
-        qkv_sc_buf = qkv_sc_buf,
-        qkv_bi_buf = qkv_bi_buf,
+        q_wt_buf = q_wt_buf,
+        q_sc_buf = q_sc_buf,
+        q_bi_buf = q_bi_buf,
+        k_wt_buf = k_wt_buf,
+        k_sc_buf = k_sc_buf,
+        k_bi_buf = k_bi_buf,
+        v_wt_buf = v_wt_buf,
+        v_sc_buf = v_sc_buf,
+        v_bi_buf = v_bi_buf,
         cos_sin_buf = cos_sin_buf,
         positions_buf = positions_buf,
         slot_map_buf = slot_map_buf,

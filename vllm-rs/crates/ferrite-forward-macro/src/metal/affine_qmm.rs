@@ -192,7 +192,10 @@ impl Implementation for MetalAffineQmmImpl {
             Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
             _ => return None,
         };
-        Some(Box::new(crate::atom_lib::AffineQmvAtom { group_size }))
+        Some(Box::new(crate::atom_lib::AffineQmvAtom {
+            group_size,
+            local_head_expr: "__head",
+        }))
     }
 
     fn fan_out(

@@ -162,6 +162,15 @@ impl Atom for AddRmsNormAtom {
 #[derive(Clone, Debug)]
 pub struct AffineQmvAtom {
     pub group_size: u32,
+    /// Expression (in synthesized-kernel scope) for the local-head
+    /// index — i.e. the row index within this atom's weight band.
+    /// Defaults to `"__head"` when the atom consumes a globally
+    /// concatenated QKV weight buffer. Pre-attn synthesis with three
+    /// separate Q/K/V triples sets this per band to `"__head"`,
+    /// `"(__head - __num_q)"`, `"(__head - __num_q - __num_kv)"` so
+    /// each band's qmv addresses rows starting at 0 within its own
+    /// weight buffer.
+    pub local_head_expr: &'static str,
 }
 
 impl Atom for AffineQmvAtom {
@@ -218,17 +227,19 @@ impl Atom for AffineQmvAtom {
         let t_act = ctx.t_act;
         let t_scale = ctx.t_scale;
         let gs = self.group_size;
+        let local_head_expr = self.local_head_expr;
 
         Some(format!(
             r#"
-    // --- atom: AffineQmv (gs={gs}) ---
+    // --- atom: AffineQmv (gs={gs}, local_head={local_head_expr}) ---
     {{
         constexpr int __bits              = 4;
         constexpr int __pack_factor       = mk_get_pack_factor<__bits, 32>();
         constexpr int __bytes_per_pack    = mk_get_bytes_per_pack<__bits, 32>();
         constexpr int __values_per_thread = __pack_factor * MK_PACKS_PER_THREAD;
         constexpr int __scale_step        = {gs} / __values_per_thread;
-        const uint __global_out_row_base = __head * __head_dim + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+        const uint __local_head           = ({local_head_expr});
+        const uint __global_out_row_base = __local_head * __head_dim + __simd_gid * MK_ROWS_PER_SIMDGROUP;
         const int  __in_vec_size_w       = (int)__hidden * __bytes_per_pack / __pack_factor;
         const int  __in_vec_size_g       = (int)__hidden / {gs};
         const device uint8_t*  __ws = (const device uint8_t*){w}
@@ -272,6 +283,7 @@ impl Atom for AffineQmvAtom {
             t_act = t_act,
             t_scale = t_scale,
             gs = gs,
+            local_head_expr = local_head_expr,
             x = x,
             w = w,
             s = s,

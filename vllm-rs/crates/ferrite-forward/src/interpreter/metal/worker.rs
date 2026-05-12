@@ -47,7 +47,7 @@ use crate::interpreter::metal::__re::{
 };
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
-use ::objc2_metal::{MTLResource, MTLResourceUsage};
+use ::objc2_metal::{MTL4ComputeCommandEncoder, MTLResource, MTLResourceUsage};
 use ferrite_metal_kernels::gemm::{GemmDtype, GemmError, encode_gemm_into_command_buffer};
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
 type ResourceRef = ProtocolObject<dyn MTLResource>;
@@ -156,6 +156,11 @@ pub struct BucketBaking {
     pub icb: RecordingContext,
     pub steps: Vec<BucketStep>,
     pub baked_resources: Vec<Buffer>,
+    /// Optional Phase-A MTL4 mirror of `steps`. `Some` iff every step
+    /// is an `Icb` (MPS GEMM falls back to MTL3) AND each kernel fits
+    /// the argument-table binding cap. One `Mtl4Step` per `Icb` step;
+    /// see `super::mtl4`.
+    pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
 }
 
 #[derive(Debug)]
@@ -548,6 +553,53 @@ impl<W: CanonicalParams> MetalWorker<W> {
         }
         if let Some(enc) = current.take() {
             enc.endEncoding();
+        }
+        Ok(())
+    }
+
+    /// Phase A.3 MTL4 mirror of [`Self::run_bucket`]. Encodes the
+    /// bucket's `mtl4_steps` onto a caller-provided MTL4 compute
+    /// encoder using pre-baked `MTL4ArgumentTable`s. The caller owns
+    /// command-buffer lifecycle (`begin`/`endCommandBuffer`),
+    /// residency wiring (`useResidencySet`), commit, and event-based
+    /// wait. Returns an error if MTL4 was not baked for this bucket
+    /// (e.g. an MPS GEMM step disqualifies it).
+    pub fn run_bucket_mtl4(
+        &self,
+        bucket: usize,
+        enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+    ) -> Result<(), WorkerError> {
+        use ::objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
+        let baking = &self.bucket_bakings[bucket];
+        let mtl4_steps =
+            baking
+                .mtl4_steps
+                .as_ref()
+                .ok_or(WorkerError::WeightLookupFailed {
+                    reason: "MTL4 path requested but bucket has no mtl4_steps (Gemm or too-many-bindings fallback)",
+                })?;
+        // MTL4 compute encoders do NOT auto-serialize successive
+        // dispatches the way MTL3's default-Serial encoder does;
+        // without an explicit barrier every kernel races every other.
+        // Conservative Phase-A correctness: insert a Dispatch→Dispatch
+        // barrier with Device-visibility cache flush between every
+        // pair of dispatches in the encoder. Phase C will refine this
+        // to only barrier across actual RAW hazards.
+        let mut first = true;
+        for step in mtl4_steps {
+            enc.setComputePipelineState(&step.pipeline);
+            for (table, (tg, tpt)) in step.tables.iter().zip(step.dispatches.iter()) {
+                if !first {
+                    enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                        MTLStages::Dispatch,
+                        MTLStages::Dispatch,
+                        MTL4VisibilityOptions::Device,
+                    );
+                }
+                enc.setArgumentTable(Some(table));
+                enc.dispatchThreadgroups_threadsPerThreadgroup(*tg, *tpt);
+                first = false;
+            }
         }
         Ok(())
     }
@@ -1074,7 +1126,7 @@ fn bake_bucket<W: CanonicalParams>(
     } else {
         tape.commands.len().max(1)
     };
-    let mut ctx = RecordingContext::new(device, icb_capacity).map_err(WorkerError::Recording)?;
+    let mut ctx = RecordingContext::new(device.clone(), icb_capacity).map_err(WorkerError::Recording)?;
     let mut steps: Vec<BucketStep> = Vec::new();
     // Unique buffers referenced by ICB commands. Used at firing time
     // to satisfy the `inheritBuffers=false` residency contract via
@@ -1375,11 +1427,13 @@ fn bake_bucket<W: CanonicalParams>(
         }
     }
 
+    let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device);
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         icb: ctx,
         steps,
         baked_resources,
+        mtl4_steps,
     })
 }
 

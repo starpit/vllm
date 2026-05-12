@@ -19,6 +19,8 @@ pub mod pool;
 pub mod runtime;
 #[cfg(feature = "metal")]
 pub mod worker;
+#[cfg(feature = "metal")]
+pub mod mtl4;
 
 pub use lowered::{
     Binding, DispatchShape, KernelId, LoweredCommand, LoweredMetalTape, LoweringError, MetalDtype,
@@ -60,9 +62,15 @@ pub mod __re {
     // at runtime: `MetalWorkerPool::new` probes
     // `device.newMTL4CommandQueue()` once and stores the result.
     pub use ::objc2_metal::{
-        MTL4ArgumentTable, MTL4CommandBuffer, MTL4CommandQueue, MTL4ComputeCommandEncoder,
+        MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
+        MTL4CommandQueue, MTL4ComputeCommandEncoder, MTLEvent, MTLSharedEvent,
     };
     pub type Mtl4Queue = Retained<ProtocolObject<dyn MTL4CommandQueue>>;
+    pub type Mtl4Allocator = Retained<ProtocolObject<dyn MTL4CommandAllocator>>;
+    pub type Mtl4CommandBuffer = Retained<ProtocolObject<dyn MTL4CommandBuffer>>;
+    pub type Mtl4ComputeEncoder = Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>>;
+    pub type Mtl4ArgTable = Retained<ProtocolObject<dyn MTL4ArgumentTable>>;
+    pub type SharedEvent = Retained<ProtocolObject<dyn MTLSharedEvent>>;
     pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
     pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
     pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;

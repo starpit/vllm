@@ -28,7 +28,10 @@ use crate::interpreter::metal::__re::{
     Buffer, CommandQueue, Device, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
     MTLCommandQueue,
 };
-use objc2_metal::MTLDevice;
+use objc2_metal::{
+    MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
+    MTLSharedEvent,
+};
 
 use ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache;
 
@@ -241,8 +244,24 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     /// is idempotent per (queue, set) pair so a second attach from
     /// `ferrite_worker::initialize_cache` is harmless.
     residency_attached: std::sync::atomic::AtomicBool,
+    /// Phase A.3 MTL4 surface. Lazily initialized on the first forward
+    /// observing `FERRITE_METAL_MTL4=1`. Panics on init if MTL4 is
+    /// unavailable — the env-var gate is treated as a hard assertion
+    /// that the host supports MTL4 (macOS 15+ / Apple Family 7+).
+    mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
+}
+
+/// Pool-owned MTL4 surface. The allocator is reset between forwards;
+/// the command buffer is re-created per forward (cheap — Metal pools
+/// internally). The shared event is monotonically signaled and
+/// host-waited on each commit.
+struct Mtl4Pool {
+    queue: crate::interpreter::metal::__re::Mtl4Queue,
+    allocator: crate::interpreter::metal::__re::Mtl4Allocator,
+    shared_event: crate::interpreter::metal::__re::SharedEvent,
+    signal_counter: u64,
 }
 
 // `Retained<ProtocolObject<dyn MTL*>>` from objc2 isn't auto-Send/Sync
@@ -324,6 +343,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             runtime_factory,
             max_workers,
             residency_attached: std::sync::atomic::AtomicBool::new(false),
+            mtl4: Mutex::new(None),
             inner: Mutex::new(PoolInner {
                 available: Vec::new(),
                 total_created: 0,
@@ -562,6 +582,126 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         })
     }
 
+    /// Lazily build the pool's MTL4 surface (queue + allocator +
+    /// shared event). Panics if MTL4 is unavailable on this host —
+    /// callers should only land here behind the `FERRITE_METAL_MTL4`
+    /// env-var, which is documented as macOS 15+ / Apple Family 7+.
+    fn ensure_mtl4(&self) {
+        let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+        if slot.is_some() {
+            return;
+        }
+        let queue = self.device.newMTL4CommandQueue().expect(
+            "FERRITE_METAL_MTL4 set but device.newMTL4CommandQueue() returned nil \
+             — host does not support MTL4 (requires macOS 15+ on Apple Family 7+)",
+        );
+        let allocator = self
+            .device
+            .newCommandAllocator()
+            .expect("device.newCommandAllocator() returned nil");
+        let shared_event = self
+            .device
+            .newSharedEvent()
+            .expect("device.newSharedEvent() returned nil");
+        *slot = Some(Mtl4Pool {
+            queue,
+            allocator,
+            shared_event,
+            signal_counter: 0,
+        });
+    }
+
+    /// Phase A.3 MTL4 forward path. Hard-asserts MTL4 availability on
+    /// first use (see `ensure_mtl4`).
+    fn run_bucket_mtl4(
+        &self,
+        worker: &MetalWorker<W>,
+        bucket_idx: usize,
+        num_tokens: usize,
+    ) -> Result<(), ForwardError> {
+        use objc2::runtime::AnyObject;
+        use std::ptr::NonNull;
+        self.ensure_mtl4();
+        let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+        let t_pre = std::time::Instant::now();
+        let cb = self
+            .device
+            .newCommandBuffer()
+            .expect("newCommandBuffer returned nil");
+        let (signal_value, queue_clone, event_clone) = {
+            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+            let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
+            cb.beginCommandBufferWithAllocator(&mtl4.allocator);
+            // Residency: MTL4 cmdbufs declare per-cmdbuf rather than
+            // inheriting from the queue. Reuse the same set the MTL3
+            // queue is attached to (weights + arenas + KV cache).
+            let cb_ptr: *mut AnyObject =
+                ::objc2::rc::Retained::as_ptr(&cb) as *const AnyObject as *mut AnyObject;
+            unsafe {
+                self.allocator
+                    .residency()
+                    .attach_to_mtl4_command_buffer(cb_ptr);
+            }
+            let enc = cb
+                .computeCommandEncoder()
+                .expect("MTL4 computeCommandEncoder returned nil");
+            worker
+                .run_bucket_mtl4(bucket_idx, &enc)
+                .map_err(ForwardError::Worker)?;
+            enc.endEncoding();
+            cb.endCommandBuffer();
+            mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
+            let val = mtl4.signal_counter;
+            let qc = mtl4.queue.clone();
+            let ec = mtl4.shared_event.clone();
+            // Drop the lock before the host-side wait so a concurrent
+            // pool consumer can probe `ensure_mtl4` while we wait.
+            (val, qc, ec)
+        };
+        let encoded = t_pre.elapsed();
+        let cb_protocol: &::objc2::runtime::ProtocolObject<
+            dyn ::objc2_metal::MTL4CommandBuffer,
+        > = &cb;
+        let cb_nn = NonNull::from(cb_protocol);
+        let mut cb_array = [cb_nn];
+        unsafe {
+            queue_clone.commit_count(NonNull::from(&mut cb_array[0]), 1);
+        }
+        // Signal AFTER the cmdbuf so the wait fires only once GPU work
+        // is fully drained.
+        queue_clone.signalEvent_value(::objc2::runtime::ProtocolObject::from_ref(&*event_clone), signal_value);
+        let committed = t_pre.elapsed();
+        // 60s timeout — same order of magnitude as the longest single
+        // bucket we'd ever expect; any wait approaching this is a
+        // hang and we'd rather panic than spin forever.
+        let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
+        if !ok {
+            return Err(ForwardError::ExecutionFailed(
+                MTLCommandBufferStatus::Error,
+            ));
+        }
+        // Reset the allocator now that the GPU is done. Holds the
+        // mutex briefly.
+        {
+            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+            if let Some(mtl4) = slot.as_mut() {
+                mtl4.allocator.reset();
+            }
+        }
+        let waited = t_pre.elapsed();
+        if trace {
+            eprintln!(
+                "[forward bucket={} num_tokens={} mtl4] encode={:?} commit={:?} wait={:?}",
+                bucket_idx,
+                num_tokens,
+                encoded,
+                committed - encoded,
+                waited - committed,
+            );
+        }
+        Ok(())
+    }
+
     /// Run one forward step.
     ///
     /// Pipeline:
@@ -629,7 +769,17 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         //     per-step cmdbuf + direct-dispatch fallback (4× slower
         //     than the batched ICB path; kept for bisecting any
         //     future ICB regression).
-        if std::env::var_os("FERRITE_METAL_STEP_DEBUG").is_some() {
+        let mtl4_requested = std::env::var_os("FERRITE_METAL_MTL4").is_some();
+        if mtl4_requested {
+            assert!(
+                guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
+                "FERRITE_METAL_MTL4=1 set but bucket {} was not bake-eligible for MTL4 \
+                 (likely an MPS GEMM or a kernel exceeding 31 buffer bindings); \
+                 unset the env var to fall back to MTL3 for this model",
+                bucket_idx,
+            );
+            self.run_bucket_mtl4(&guard.worker, bucket_idx, inputs.num_tokens as usize)?;
+        } else if std::env::var_os("FERRITE_METAL_STEP_DEBUG").is_some() {
             guard
                 .worker
                 .run_bucket_per_step_debug(bucket_idx, &self.device, queue)?;

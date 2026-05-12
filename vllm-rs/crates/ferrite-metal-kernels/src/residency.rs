@@ -108,6 +108,25 @@ impl MetalResidencySet {
             let _: () = msg_send![queue_ptr, addResidencySet: inner.set_ptr];
         }
     }
+
+    /// Phase-A MTL4 helper: invoke `useResidencySet:` on a
+    /// `MTL4CommandBuffer`. MTL4 cmdbufs declare residency per-buffer
+    /// (unlike MTL3 cmdbufs which inherit from the queue-attached
+    /// set), so each fresh `MTL4CommandBuffer` needs this call between
+    /// `beginCommandBufferWithAllocator` and `endCommandBuffer`.
+    /// Takes a raw `*mut AnyObject` rather than a typed reference so
+    /// the kernels crate can stay free of an `objc2-metal` MTL4 dep.
+    ///
+    /// # Safety
+    /// `cb_ptr` must be a non-null pointer to a live MTL4CommandBuffer
+    /// in the recording state.
+    pub unsafe fn attach_to_mtl4_command_buffer(&self, cb_ptr: *mut AnyObject) {
+        let inner = self.inner.lock().expect("residency set mutex");
+        if inner.set_ptr.is_null() || cb_ptr.is_null() {
+            return;
+        }
+        let _: () = msg_send![cb_ptr, useResidencySet: inner.set_ptr];
+    }
 }
 
 /// Build a residency set on `device`. Returns null on macOS < 15 or

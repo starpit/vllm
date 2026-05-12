@@ -22,13 +22,13 @@
 
 use std::collections::BTreeMap;
 
-use crate::classified::{OpKind, Program};
+use crate::classified::{ExternKind, OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    consumes_tile, default_required_weights, first_tile_input, weight_storage_of, CostCtx,
-    Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources,
-    SlotMap, WeightAccessor, WorkloadConstraint,
+    consumes_tile, default_required_weights, first_tile_input, kv_cache_extern_layer,
+    weight_storage_of, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
+    OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -282,34 +282,78 @@ impl Implementation for MetalSynthPreAttnImpl {
         vec![Layout::Any; m.boundary_outputs.len()]
     }
 
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Mirrors `FusedQkvRopeCacheImpl::output_alias`: the only
+        // externally-visible output is rotated-Q (rope slot 0). Slots
+        // 1/2 (K/V) are paged-cache views, owned by the kv_cache pool
+        // — absent from the alias map (untracked). The intermediate
+        // rms-out + qmv-band outputs live in threadgroup memory inside
+        // the megakernel and never escape to a runtime slot, so we
+        // omit them too — declaring them as standalone Impl outputs
+        // (the default behavior) would have the slot allocator size
+        // arena buffers for ghost slots no kernel binds.
+        let rope_id = *claimed_tiles
+            .iter()
+            .find(|t| matches!(fuf.get(**t).op, OpKind::RopeAppend))
+            .expect("SynthPreAttn claim contains RopeAppend");
+        vec![((rope_id, 0), None)]
+    }
+
+    fn kv_layer_io(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> (Option<u32>, Option<u32>) {
+        // SynthPreAttn writes the per-layer paged KV cache (its
+        // RopeAppend sub-tile carries the `ExternKind::KvCache`
+        // extern). Reads nothing from KV. Without this override the
+        // hazard analyzer never inserts a barrier between this
+        // dispatch and the immediately-following AttentionViaCache
+        // that reads the same KV slot — Metal then runs the attention
+        // concurrently with the KV write and produces garbage.
+        (kv_cache_extern_layer(claimed_tiles, fuf), None)
+    }
+
     fn opcode_shape(&self) -> OpcodeShape {
+        // MUST stay byte-identical to
+        // `interpreter_codegen::synth_pre_attn_opcode_shape` —
+        // arch_opcodes registers under one logical "SynthPreAttn"
+        // name and the macro panics on cross-registrar disagreement.
+        // Canonical names/types match the
+        // `ferrite_forward::Instruction::SynthPreAttn` tuple variant
+        // declared in `ferrite-forward::instr`.
         OpcodeShape::new(
             "SynthPreAttn",
             vec![
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("delta_slot", syn::parse_quote!(u32)),
-                ("q_out_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
                 (
-                    "q_wt_fn",
+                    "q_weight_fn",
                     syn::parse_quote!(
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
                 (
-                    "k_wt_fn",
+                    "k_weight_fn",
                     syn::parse_quote!(
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
                 (
-                    "v_wt_fn",
+                    "v_weight_fn",
                     syn::parse_quote!(
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
                     ),
                 ),
                 (
-                    "rms_wt_fn",
+                    "rms_weight_fn",
                     syn::parse_quote!(
                         for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
                     ),
@@ -317,11 +361,7 @@ impl Implementation for MetalSynthPreAttnImpl {
                 (
                     "cos_sin_fn",
                     syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> (&'a ::ferrite_kernels::OwnedTensor, &'a ::ferrite_kernels::OwnedTensor)
+                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
                     ),
                 ),
                 ("group_size", syn::parse_quote!(u32)),
@@ -421,7 +461,11 @@ impl Implementation for MetalSynthPreAttnImpl {
         {
             return None;
         }
-        let q_out_slot_idx = slots.of(q_tile, 0);
+        // q_out_slot: the *post-rope* Q output, i.e. RopeAppend's
+        // output slot 0 — that's where the downstream attention reads
+        // Q from. The pre-rope Q-gemm's output is internal to the
+        // synth kernel and lives in TG memory.
+        let q_out_slot_idx = slots.of(rope_tile, 0);
 
         // Layer index — recover from any of the per-layer weight
         // inputs. The Gemm tiles' weight has an `index` field;
@@ -451,7 +495,27 @@ impl Implementation for MetalSynthPreAttnImpl {
         let k_acc = acc_for(k_tile)?;
         let v_acc = acc_for(v_tile)?;
         let rms_acc = acc_for(rmsnorm_tile)?;
-        let rope_acc = acc_for(rope_tile)?;
+        // RopeAppend has no FufInput::Weight inputs — its cos_sin cache
+        // is plumbed as an `ExternKind::Rotary` / `RotaryLocal` extern.
+        // Mirror `RopeAppendRefImpl::fan_out`: pick the per-arch
+        // `Weights::rotary_cos_sin{,_local}` field accessor based on
+        // which extern kind appears in the claimed tiles.
+        let uses_local_rotary = m.claimed_tiles.iter().any(|&tid| {
+            fuf.get(tid).inputs.iter().any(|i| {
+                matches!(
+                    i,
+                    FufInput::Extern {
+                        kind: ExternKind::RotaryLocal,
+                        ..
+                    }
+                )
+            })
+        });
+        let cos_sin_ident = if uses_local_rotary {
+            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
+        } else {
+            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
+        };
 
         let to_weights_path = |acc: &WeightAccessor| -> proc_macro2::TokenStream {
             let (base, _layer) = split_base_layer(&acc.name.to_string());
@@ -462,7 +526,7 @@ impl Implementation for MetalSynthPreAttnImpl {
         let k_wt = to_weights_path(&k_acc);
         let v_wt = to_weights_path(&v_acc);
         let rms_wt = to_weights_path(&rms_acc);
-        let cs_fn = to_weights_path(&rope_acc);
+        let cs_fn = quote! { Weights::#cos_sin_ident };
 
         // group_size + bits from the Affine storage on any Gemm.
         let (gs, bits) = match weight_storage_of(fuf.get(q_tile)) {

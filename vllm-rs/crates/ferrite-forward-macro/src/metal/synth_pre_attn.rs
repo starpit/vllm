@@ -402,11 +402,19 @@ impl Implementation for MetalSynthPreAttnImpl {
 
         // residual_slot / delta_slot:
         //   - Non-init: the two `FufInput::Tile` operands of the Add.
-        //     By DSL convention `add(delta, residual)` (delta is the
-        //     o_proj output, residual is the running stream); but to
-        //     stay tolerant we just take the two tile inputs in order
-        //     and trust the runtime kernel's binding contract
-        //     (binding(0)=residual, binding(1)=delta).
+        //     DSL convention `Add(delta, residual)` — inputs[0] is the
+        //     o_proj/mlp-down delta, inputs[1] is the running residual.
+        //     This MUST match `FusedAddRmsNormImpl::fan_out` /
+        //     `output_alias` (impl_lib.rs ~4740) so that solver-picked
+        //     synth kernels at L≥1 land their slot indices in the same
+        //     order as the post-pass `apply_synth_replacement` would
+        //     have emitted them (post-pass reads `field_values[0]` as
+        //     delta and `field_values[1]` as residual). Getting this
+        //     backwards swaps `residual_slot`/`delta_slot` in the loop
+        //     body once cost rows make the solver pick this Impl: the
+        //     kernel writes the in-place residual update into the
+        //     wrong arena buffer (the one a later `AffineQmm o_proj`
+        //     clobbers), producing garbage decode.
         //   - Init: residual_slot == delta_slot == norm's first tile
         //     input. The kernel ignores the delta read in init mode.
         let (residual_slot_idx, delta_slot_idx) = match add_tile {
@@ -423,9 +431,11 @@ impl Implementation for MetalSynthPreAttnImpl {
                 if tile_inputs.len() != 2 {
                     return None;
                 }
+                let delta = tile_inputs[0];
+                let residual = tile_inputs[1];
                 (
-                    slots.of(tile_inputs[0].0, tile_inputs[0].1),
-                    slots.of(tile_inputs[1].0, tile_inputs[1].1),
+                    slots.of(residual.0, residual.1),
+                    slots.of(delta.0, delta.1),
                 )
             }
             None => {

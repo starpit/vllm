@@ -5499,27 +5499,8 @@ pub fn emit_model(
     // pick — `SynthPreAttnImpl::cost_us` vs `(FusedAddRmsNorm + 3
     // AffineQmm)::cost_us` from the swept CSV.
     for (wp, (cl, _, _, _, _)) in canonical_lowered.iter_mut() {
-        let bucket_m = wp.num_tokens;
-        let apply_synth = synth_t_act.is_some() && bucket_m < 2;
-        if let Some(tag) = synth_t_act
-            && apply_synth
-        {
-            // `MetalSynthPreAttnImpl::cost_us` ships a finite
-            // component-sum fallback for chips without
-            // `synth_pre_attn_*` CSV rows, so pre-attn synth fusion
-            // is now fully solver-driven at L=0..N. The MLP-pre-down
-            // chain still lacks a solver Impl — `MetalSynthMlpPreDownImpl`
-            // is the next handoff step — so the post-pass below is
-            // the only path that folds the
-            // `(FusedAddRmsNorm + gate + up + silu_mul)` chunk today.
-            // Retire this call site once `MetalSynthMlpPreDownImpl`
-            // lands.
-            crate::interpreter_codegen::apply_synth_replacement_mlp(
-                &mut arch_opcodes,
-                &mut cl.backbone,
-                tag,
-            );
-        }
+        let _ = synth_t_act;
+        let _ = wp;
         crate::interpreter_codegen::apply_loop_compression(
             &arch_opcodes,
             &mut cl.backbone,

@@ -1985,6 +1985,9 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(
             crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_init(),
         ));
+        lib.push(Box::new(
+            crate::metal::synth_mlp_pre_down::MetalSynthMlpPreDownImpl::bf16_gs64(),
+        ));
         // Metal Fused Add+RMSNorm implementations - only match Metal targets
         lib.push(Box::new(
             crate::metal_bridge::MetalFusedAddRmsNormImpl::new_fp16(),

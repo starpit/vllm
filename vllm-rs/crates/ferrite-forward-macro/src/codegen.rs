@@ -4881,6 +4881,66 @@ fn impl_names_for(
 /// every column-parallel dim (KV replication when
 /// `num_kv_heads < tp_size` is task #6's loader-sharding work);
 /// `compile()` skips a `(variant, tp)` tuple when divisibility fails.
+/// Emit the `synthesized_kernel_sources()` override for the
+/// `CanonicalParams` impl when this model can use compiler-driven
+/// megakernel synthesis. Returns `quote! {}` (empty) when:
+///   - the model isn't quantized with MLX-affine int4 (no AffineQmv
+///     atoms to fuse), or
+///   - the model lacks the standard transformer-decoder shape we know
+///     how to synthesize for.
+///
+/// When emitting, calls `fuse_pass::synthesize_pre_attn_chunk` at
+/// macro-expansion time to generate the MSL source, then bakes the
+/// `(symbol, source)` pair into the generated arch as a `&'static
+/// [(&'static str, &'static str)]`.
+fn emit_synthesized_kernel_sources_override(model: &ModelParams) -> TokenStream {
+    use crate::quantization::QuantMethod;
+    let (bits, group_size) = match model.quantization.as_ref().map(|q| &q.method) {
+        Some(QuantMethod::Affine { bits, group_size }) => (*bits, *group_size),
+        _ => return quote! {},
+    };
+    if bits != 4 {
+        return quote! {};
+    }
+    // bf16 activation is the default for every modern Llama / Qwen /
+    // Mistral / Gemma metal arch (per CanonicalParams::METAL_DTYPE).
+    // Future: thread W::METAL_DTYPE through and emit per-dtype variants.
+    let t_act = "bfloat";
+    let t_scale = "half";
+
+    let consts = crate::fuse_pass::ChunkConstants {
+        // The non-function-constant fields of ChunkConstants only
+        // contribute to the symbol name; the actual shape parameters
+        // arrive at kernel launch time as function constants. We just
+        // need a deterministic symbol and the gs in the host_name.
+        hidden:       0,
+        num_q_heads:  0,
+        num_kv_heads: 0,
+        head_dim:     0,
+        rot_dim:      0,
+        block_size:   0,
+        m:            0,
+        group_size,
+        rms_norm_eps: 0.0,
+    };
+    let kernel = crate::fuse_pass::synthesize_pre_attn_chunk(
+        crate::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let symbol = kernel.symbol;
+    let source = kernel.source;
+    let symbol_lit = syn::LitStr::new(&symbol, proc_macro2::Span::call_site());
+    let source_lit = syn::LitStr::new(&source, proc_macro2::Span::call_site());
+    quote! {
+        fn synthesized_kernel_sources() -> &'static [(&'static str, &'static str)] {
+            const __SYNTH_SRC: &str = #source_lit;
+            &[(#symbol_lit, __SYNTH_SRC)]
+        }
+    }
+}
+
 fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenStream {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -5032,6 +5092,12 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
         None => quote! {},
     };
 
+    // Synthesized-kernel sources override (Metal-only, affine-int4
+    // gated). Empty for cuda models and any model that doesn't ship
+    // an MLX-affine int4 quantization config; default `&[]` from the
+    // CanonicalParams trait kicks in there.
+    let synth_sources_override = emit_synthesized_kernel_sources_override(model);
+
     quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
@@ -5064,6 +5130,7 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
             #mrope_section_tokens
+            #synth_sources_override
         }
     }
 }

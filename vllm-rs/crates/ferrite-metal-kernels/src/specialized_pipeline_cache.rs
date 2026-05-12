@@ -135,32 +135,28 @@ impl SpecializedPipelineCache {
         })
     }
 
-    /// Register a synthesized kernel library compiled from source at
-    /// runtime via `newLibraryWithSource`. The macro emits these as
-    /// `&'static str` constants and the worker pool registers them at
-    /// init time, BEFORE any pipeline-lookup happens.
-    ///
-    /// One-time JIT cost (~50-150ms per source on Apple M-series). For
-    /// the typical synthesized-decoder-body kernel count (≤ 6 per
-    /// model arch) this is well under engine init's overall budget.
+    /// Register a synthesized kernel library from precompiled metallib
+    /// bytes. The macro AOT-compiles synthesized `.metal` sources at
+    /// proc-macro expansion time (shells out to `xcrun metal -c` +
+    /// `xcrun metallib`) and embeds the resulting bytes as
+    /// `&'static [u8]`. Same `newLibraryWithData` path used by all
+    /// hand-written shaders — NOT the runtime MSL→AIR compile path
+    /// (`newLibraryWithSource`), which produces different binaries
+    /// across Apple GPU generations and was the source of a real M1
+    /// runtime failure.
     ///
     /// Used by the compiler-driven megakernel synthesis pass
     /// (`ferrite-forward-macro/src/fuse_pass.rs`).
-    pub fn register_source_library(
+    pub fn register_metallib_library(
         &mut self,
         name: &'static str,
-        source: &str,
+        bytes: &'static [u8],
     ) -> Result<(), MetalStreamError> {
-        let opts = objc2_metal::MTLCompileOptions::new();
-        let ns_source = NSString::from_str(source);
-        let lib = self
-            .device
-            .newLibraryWithSource_options_error(&ns_source, Some(&opts))
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "compile synthesized library `{name}`: {e:?}"
-                ))
-            })?;
+        let lib = load_library_from_bytes(&self.device, bytes).map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!(
+                "load synthesized metallib `{name}`: {e}"
+            ))
+        })?;
         self.libraries.insert(name, lib);
         Ok(())
     }

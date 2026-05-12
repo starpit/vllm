@@ -105,13 +105,17 @@ pub trait CanonicalParams {
 
     /// Metal-only: list of compiler-synthesized kernel sources (per
     /// `ferrite-forward-macro::fuse_pass`). Each entry is
-    /// `(symbol_name, MSL source)`. The MetalWorkerPool registers each
-    /// via `SpecializedPipelineCache::register_source_library` at init
-    /// time so the lowering arm for `Instruction::SynthPreAttn` can
-    /// reference these symbols. Default empty — the macro overrides
-    /// this per Metal arch with the actual synthesized sources from
-    /// the FUF analysis.
-    fn synthesized_kernel_sources() -> &'static [(&'static str, &'static str)] {
+    /// `(symbol_name, precompiled .metallib bytes)`. The proc-macro
+    /// AOT-compiles synthesized MSL via `xcrun metal -c` +
+    /// `xcrun metallib` at macro-expansion time and embeds the
+    /// resulting bytes as `&'static [u8]`. The MetalWorkerPool
+    /// registers each via
+    /// `SpecializedPipelineCache::register_metallib_library`
+    /// (`newLibraryWithData`) — same path used by every hand-written
+    /// shader, NOT `newLibraryWithSource`. Default empty — the macro
+    /// overrides this per Metal arch with the actual synthesized
+    /// metallibs from the FUF analysis.
+    fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
         &[]
     }
     /// Vision-tower attention head dimension. Same defaults / set-by

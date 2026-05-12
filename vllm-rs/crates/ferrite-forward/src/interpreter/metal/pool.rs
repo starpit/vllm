@@ -360,12 +360,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
         // Compiler-driven synthesis (METAL_KITTENS_SYNTHESIS_PLAN.md):
         // each Metal arch exposes its macro-generated synthesized
-        // kernel sources via `W::synthesized_kernel_sources()`. The
-        // pool JIT-compiles them once here (newLibraryWithSource) so
-        // SynthPreAttn / future Synth* lowering arms can resolve their
-        // symbols against the cache like any hand-written kernel.
-        for (name, source) in W::synthesized_kernel_sources() {
-            cache.register_source_library(name, source).map_err(|e| {
+        // kernel metallibs via `W::synthesized_kernel_metallibs()`.
+        // The proc-macro AOT-compiles MSL via `xcrun metal -c` at
+        // macro-expansion time; we load the precompiled bytes here
+        // via `newLibraryWithData` — same path used by every
+        // hand-written shader. NOT `newLibraryWithSource`.
+        for (name, bytes) in W::synthesized_kernel_metallibs() {
+            cache.register_metallib_library(name, bytes).map_err(|e| {
                 PoolBuildError::PipelineCacheBuild(format!(
                     "synthesized kernel `{name}`: {e:?}"
                 ))

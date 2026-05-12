@@ -4941,30 +4941,110 @@ fn emit_synthesized_kernel_sources_override(model: &ModelParams) -> TokenStream 
         t_scale,
         &consts,
     );
+    // AOT-compile each synth source to a `.metallib` blob at macro
+    // expansion time. Same `xcrun metal -c` + `xcrun metallib`
+    // pipeline used by `ferrite-metal-kernels/build.rs` for every
+    // hand-written shader. Runtime loads via `newLibraryWithData`
+    // (NOT `newLibraryWithSource`) so the resulting Metal binaries
+    // are identical to the AOT-compiled shaders — same compiler
+    // path, same behavior across Apple GPU generations.
+    let pa_bytes = aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
+    let pi_bytes = aot_compile_metallib(&pre_attn_init.symbol, &pre_attn_init.source);
+    let md_bytes = aot_compile_metallib(&mlp_pre_down.symbol, &mlp_pre_down.source);
+
     let pa_symbol_lit =
         syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
-    let pa_source_lit =
-        syn::LitStr::new(&pre_attn.source, proc_macro2::Span::call_site());
     let pi_symbol_lit =
         syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
-    let pi_source_lit =
-        syn::LitStr::new(&pre_attn_init.source, proc_macro2::Span::call_site());
     let md_symbol_lit =
         syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
-    let md_source_lit =
-        syn::LitStr::new(&mlp_pre_down.source, proc_macro2::Span::call_site());
+
+    let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
+    let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
+    let md_bytes_lit = syn::LitByteStr::new(&md_bytes, proc_macro2::Span::call_site());
+
     quote! {
-        fn synthesized_kernel_sources() -> &'static [(&'static str, &'static str)] {
-            const __SYNTH_PRE_ATTN_SRC: &str = #pa_source_lit;
-            const __SYNTH_PRE_ATTN_INIT_SRC: &str = #pi_source_lit;
-            const __SYNTH_MLP_PRE_DOWN_SRC: &str = #md_source_lit;
+        fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
+            const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
+            const __SYNTH_PRE_ATTN_INIT_LIB: &[u8] = #pi_bytes_lit;
+            const __SYNTH_MLP_PRE_DOWN_LIB: &[u8] = #md_bytes_lit;
             &[
-                (#pa_symbol_lit, __SYNTH_PRE_ATTN_SRC),
-                (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_SRC),
-                (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_SRC),
+                (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
+                (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
+                (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_LIB),
             ]
         }
     }
+}
+
+/// AOT-compile MSL source to a `.metallib` blob via `xcrun metal -c`
+/// + `xcrun metallib`. Same flow as `ferrite-metal-kernels/build.rs`.
+/// Runs at proc-macro expansion time; the resulting bytes are
+/// embedded into the generated arch as `&'static [u8]`.
+///
+/// Panics on `xcrun` failure — synth compile errors here are build
+/// errors that need to surface, not runtime soft-fail.
+fn aot_compile_metallib(symbol: &str, source: &str) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::Command;
+
+    // Skip on non-macOS hosts (no `xcrun`). The synth metallibs are
+    // only ever consumed by the metal backend, so emitting empty
+    // bytes is fine on Linux/cuda builds — `synthesized_kernel_metallibs`
+    // is only called from `pool.rs` (cfg(target_os = "macos")).
+    let host_os = std::env::var("CARGO_CFG_TARGET_OS")
+        .unwrap_or_else(|_| std::env::consts::OS.to_string());
+    if host_os != "macos" {
+        return Vec::new();
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ferrite-synth-{}-{}",
+        symbol,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp_dir)
+        .unwrap_or_else(|e| panic!("synth: create tmp dir {tmp_dir:?}: {e}"));
+
+    let metal_path = tmp_dir.join(format!("{symbol}.metal"));
+    let air_path = tmp_dir.join(format!("{symbol}.air"));
+    let metallib_path = tmp_dir.join(format!("{symbol}.metallib"));
+
+    let mut f = std::fs::File::create(&metal_path)
+        .unwrap_or_else(|e| panic!("synth: create {metal_path:?}: {e}"));
+    f.write_all(source.as_bytes())
+        .unwrap_or_else(|e| panic!("synth: write {metal_path:?}: {e}"));
+    drop(f);
+
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat", "-c"])
+        .arg(&metal_path)
+        .arg("-o")
+        .arg(&air_path)
+        .status()
+        .unwrap_or_else(|e| panic!("synth: spawn xcrun metal: {e}"));
+    if !status.success() {
+        panic!(
+            "synth: `xcrun metal` failed for `{symbol}` (source at {metal_path:?})"
+        );
+    }
+
+    let status = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metallib"])
+        .arg(&air_path)
+        .arg("-o")
+        .arg(&metallib_path)
+        .status()
+        .unwrap_or_else(|e| panic!("synth: spawn xcrun metallib: {e}"));
+    if !status.success() {
+        panic!("synth: `xcrun metallib` failed for `{symbol}`");
+    }
+
+    let bytes = std::fs::read(&metallib_path)
+        .unwrap_or_else(|e| panic!("synth: read {metallib_path:?}: {e}"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    bytes
 }
 
 fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenStream {

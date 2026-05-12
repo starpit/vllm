@@ -1006,6 +1006,116 @@ grid X stays bounded by `num_q_heads ≤ 32`.
    adjustment `q_abs = (seqused_k[seq] - new_q_for_seq) +
    (global_q - cu_seqlens_q[seq])` for non-zero cached prefix.
 
+### Phase 5.M — Synth fusion solver migration (2026-05-12, HEAD `9db9ca97d`)
+
+Move synth-kernel pick from the after-the-solver post-pass in
+`interpreter_codegen.rs` (`apply_synth_replacement{,_init,_mlp}`)
+into the solver DP itself, where it can be cost-driven per bucket.
+Post-pass machinery now fully retired.
+
+#### What landed
+
+| commit | piece |
+|---|---|
+| `8ec37a14c` | `MetalSynthPreAttnImpl::cost_us` finite component-sum analytical fallback — norm BW + 3×AffineQmm compute roofline + RopeAppend BW, ×0.95 fused bias. Replaces the 1e9 sentinel that kept the Impl out of the solver on uncalibrated chips. |
+| `628a47231` | Retired `apply_synth_replacement` + `apply_synth_replacement_init` (the pre-attn post-passes, 387 lines). Solver now picks fused vs unfused on real cost. |
+| `46958ea4f` | New `MetalSynthMlpPreDownImpl` claims the `(Add, RmsNorm, 2×Gemm, Silu, Mul)` post-attn chain. Mirrors `MetalSynthPreAttnImpl`. Retired `apply_synth_replacement_mlp` — the last metal synth post-pass. |
+| `9db9ca97d` | Mirror `synth_pre_attn_sweep` for `synth_mlp_pre_down`; append 15 measured rows (3 shapes × 5 M buckets) to `cost_m4.csv`. |
+
+#### Result on M4 (Llama-3.2-3B-4bit, 5-run mean, 200-tok decode)
+
+| state | tok/s |
+|---|---|
+| Pre-cutover (post-pass driven) `4834331c4` | 46.74 (σ≈0.08) |
+| PreAttn Impl picked via CSV `6ffd780d4` | 46.72 (σ≈0.1) |
+| Pre-attn post-pass retired `628a47231` | 46.16 (σ≈0.30) |
+| MlpPreDown Impl picked via fallback `46958ea4f` | 46.92 (σ≈0.43) |
+| MLP CSV calibrated → solver picks unfused `9db9ca97d` | 46.18 (σ≈0.95) |
+| Reference: pre-ferrite vllm-mlx `feat/rust` | 48.32 (σ≈0.34) |
+| Reference: `mlx_lm.generate` | 52.5 |
+
+All within thermal noise — bench-neutral by design. Ferrite at
+≈97% of pre-ferrite MLX vllm.
+
+#### Surprising data point
+
+With real measurements, the MLP synth kernel is a wash-to-negative
+on M4: the qmv-shape dispatch redoes per-TG full-HIDDEN norm work
+(64-112 TGs depending on `intermediate / head_dim`). On M4 the
+sweep measures 671 µs at M=1 for 3B vs the unfused chain's ~310 µs
+of empirical component costs — solver correctly picks unfused.
+The kernel is correct (decode coherent E2E); shape just doesn't
+fit M4's qmv pattern. Matches the prior session's
+`FERRITE_NO_MLP_SYNTH=1` direct probe.
+
+#### Implementation traps (preserved here so they don't get
+re-learned by the next session)
+
+- **Slot order:** `Add(delta, residual)` — `inputs[0]=delta`,
+  `inputs[1]=residual`. Both synth Impls' `fan_out` MUST emit
+  `(residual_slot, delta_slot, ...)` in that order. Reverse swaps
+  the in-place residual write into the next-dispatch's scratch
+  and produces silent decode gibberish (commit `6ffd780d4` ate
+  this trap on PreAttn; same trap exists for MlpPreDown).
+- **Silu + Mul are separate FUF tiles** — they get fused into
+  one `SiluMul` OpInstance by a downstream pass. Solver Impls
+  match on the FUF (separate `OpKind::Silu` + `OpKind::Mul`);
+  the retired post-pass operated on lowered OpInstances
+  (already fused).
+- **Symbol naming** MUST match `fuse_pass::synthesize_*_chunk`'s
+  emitted `symbol` field exactly. Mismatch → silent nil from
+  `newFunctionWithName` at runtime.
+- **`ChunkConstants::num_q_heads`** is overloaded as
+  INTERMEDIATE inside `synthesize_mlp_pre_down_chunk` — pass
+  intermediate there when sweeping the MLP variant.
+
+#### M1 Max status
+
+**Forward runs end-to-end on M1 Max (2026-05-12).** The prior
+status-5 crash is gone. Cost sweep also runs cleanly. Next step
+is to land the M1 Max cost CSV.
+
+#### Run the M1 Max sweep
+
+```bash
+cd vllm-rs
+cargo run -p ferrite-metal-cost-sweep --release --bin metal_cost_sweep \
+  > crates/ferrite-metal-targets/profiles/cost_m1_max.csv
+```
+
+Full sweep takes ~4 min; `>` overwrites. To iterate on a single
+family:
+
+```bash
+FERRITE_SWEEP=synth_pre_attn,synth_mlp_pre_down \
+  cargo run -p ferrite-metal-cost-sweep --release --bin metal_cost_sweep \
+  | grep '^synth_' >> crates/ferrite-metal-targets/profiles/cost_m1_max.csv
+```
+
+(`>>` appends — only safe if non-synth rows are already in the
+file from a prior full sweep.)
+
+#### Open follow-ups
+
+1. **Land `cost_m1_max.csv`.** Forward works now — run the full
+   sweep on M1 Max and commit the CSV.
+2. **MLP synth kernel redesign.** Current qmv shape is the
+   reason it's a wash on M4. A matmul-tile + shared-mem-reduction
+   redesign (`mk_mma` path; Phase 5 of
+   `METAL_KITTENS_SYNTHESIS_PLAN.md`) could flip wash → win.
+   Re-running the sweep auto-picks the new variant if it scores
+   lower.
+3. **NAX / MPP `matmul2d`** (M4+ only). ~16% gap to `mlx_lm.generate`
+   on Llama-3.2-1B-4bit is largely NAX MMA. Lives in the qmv /
+   qmm_t primitive layer, not synthesis. Affects all synth
+   kernels indirectly (atoms emit primitive calls; primitives
+   select NAX vs scalar at the MK header level).
+4. **MTL4 migration** (`FERRITE_METAL_MTL4_MIGRATION.md`). A.1
+   probe landed; B/C/D phases open. `MTL4ArgumentTable` replaces
+   ~18 setBuffer calls/dispatch with one bind, and MTL4 has
+   compute sequencing as a first-class concept rather than the
+   current "executeCommandsInBuffer on a Serial encoder" hack.
+
 ## Notes
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
@@ -1016,6 +1126,7 @@ grid X stays bounded by `num_q_heads ≤ 32`.
 - Phase 5.J: ✅ COMPLETE - lowering correctness fixes (RmsNorm slot swap + loop layer_offset + MPS Gemm offset + bf16 KV slot-0 race)
 - Phase 5.K: ✅ COMPLETE - startup time 2.91s → 240ms warm; 1 structural follow-up (gate_up pack elimination) tracked in `project_metal_unpacked_mlp_next.md`
 - Phase 5.L: ✅ COMPLETE - contiguous prefill replaced by MLX `sdpa_vector` multi-Q port; legacy kept one cycle as bisect fallback (`FERRITE_METAL_PREFILL_KERNEL=legacy`); paged variant tracked as follow-up
+- Phase 5.M: ✅ COMPLETE - synth fusion fully solver-driven; post-pass machinery retired; `synth_mlp_pre_down` swept on M4; M1 Max forward green again — next step is to commit `cost_m1_max.csv`
 - 78 Phase 1-4 tests + 70 ferrite-forward metal lib tests passing
 - `cargo build --bin vllm -Fmetal` ✓ on darwin
 - `vllm chat ... --device metal` runs end-to-end with coherent output on TinyLlama, Llama-3.2-1B, Llama-3.2-3B

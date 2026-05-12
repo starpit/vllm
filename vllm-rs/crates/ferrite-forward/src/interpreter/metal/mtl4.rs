@@ -97,6 +97,12 @@ pub fn bake_mtl4_steps(
         std::collections::HashSet::new();
     let mut pending_reads_kv: std::collections::HashSet<u32> =
         std::collections::HashSet::new();
+    // Phase C is opt-in via FERRITE_METAL_MTL4_SELECTIVE_BARRIERS=1
+    // until the compile-time DAG → barrier_before mapping is verified
+    // to match MTL3 output across all production models. Default:
+    // barrier between every pair of dispatches (matches Phase A.3
+    // behavior). Read once per bake.
+    let selective = std::env::var_os("FERRITE_METAL_MTL4_SELECTIVE_BARRIERS").is_some();
     let mut first = true;
     for (step, dataflows) in steps.iter().zip(step_dataflows.iter()) {
         let BucketStep::Icb {
@@ -145,12 +151,6 @@ pub fn bake_mtl4_steps(
                     .writes_kv_layer
                     .map(|l| pending_writes_kv.contains(&l) || pending_reads_kv.contains(&l))
                     .unwrap_or(false);
-            // Phase C is opt-in via FERRITE_METAL_MTL4_SELECTIVE_BARRIERS=1
-            // until the compile-time DAG → barrier_before mapping is
-            // verified to match MTL3 output at greedy temp across all
-            // models. Default: conservative — barrier between every
-            // pair of dispatches (matches the Phase A behavior).
-            let selective = std::env::var_os("FERRITE_METAL_MTL4_SELECTIVE_BARRIERS").is_some();
             let need = if selective {
                 !first && (arena_conflict || kv_conflict)
             } else {

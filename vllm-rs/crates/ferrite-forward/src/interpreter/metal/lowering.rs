@@ -311,7 +311,14 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*residual_slot],
+                // fused_add_rmsnorm_specialized kernel actually
+                // writes BOTH binding(0)=residual (in-place add
+                // target) AND binding(1)=delta ("overwritten with
+                // normed result" per the kernel doc). Missing the
+                // delta write left lm_head readers of the normed
+                // slot racing the FusedAddRmsNorm in selective-
+                // barrier mode.
+                output_arena_slots: vec![*residual_slot, *delta_slot],
                 input_arena_slots: vec![*delta_slot, *residual_slot],
                 writes_kv_layer: None,
                 reads_kv_layer: None,
@@ -524,11 +531,15 @@ fn lower_one<W: CanonicalParams>(
                             gemm_dims: None,
                             // qmm_t_splitk writes the [split_k, M, N]
                             // partial into the shared SplitK scratch
-                            // buffer — no arena slot touched on the
-                            // write side. The companion
-                            // splitk_reduce_sum command below has the
-                            // arena-side output.
-                            output_arena_slots: vec![],
+                            // buffer. The scratch is one physical
+                            // buffer reused across every SplitK pair
+                            // in the bucket, so cross-pair ordering
+                            // hazards (qmm_t pair N writes scratch
+                            // while reduce pair N-1 still reads it)
+                            // need a sentinel slot id in the
+                            // hazard graph. Use `u32::MAX` — outside
+                            // the legal arena slot range.
+                            output_arena_slots: vec![u32::MAX],
                             input_arena_slots: vec![*in_slot],
                             writes_kv_layer: None,
                             reads_kv_layer: None,
@@ -558,9 +569,11 @@ fn lower_one<W: CanonicalParams>(
                             ],
                             gemm_dims: None,
                             output_arena_slots: vec![*out_slot],
-                            // Reads the SplitK scratch (no arena
-                            // slot); no upstream arena dependency.
-                            input_arena_slots: vec![],
+                            // Reads the shared SplitK scratch
+                            // (sentinel slot `u32::MAX`), then
+                            // writes the reduced result into the
+                            // arena's out_slot.
+                            input_arena_slots: vec![u32::MAX],
                             writes_kv_layer: None,
                             reads_kv_layer: None,
                         };

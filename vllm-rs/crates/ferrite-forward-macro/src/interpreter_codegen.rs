@@ -577,6 +577,252 @@ fn parse_u32_literal(ts: &TokenStream) -> Option<u32> {
 /// name as a parameter so the same code works for any future
 /// loop construct (e.g., per-head, per-block) that adds a
 /// different convention.
+/// Compiler-driven synthesis: detect the
+/// `(FusedAddRmsNorm, AffineQmm × 3, RopeAppend)` pre-attention
+/// decoder chain in the fully-unrolled per-claim `OpInstance` list
+/// and replace each match with one `SynthPreAttn` instance. Runs
+/// BEFORE `apply_loop_compression` so the synthesized chain becomes
+/// a single per-layer op the loop-compression then folds normally.
+///
+/// On the existing Llama / Qwen / Mistral text-decoder shape, the
+/// chain spans the layer-K→layer-(K+1) boundary: layer K's
+/// post-MLP `FusedAddRmsNorm` flows into layer K+1's Q/K/V/Rope
+/// because the `FusedAddRmsNorm` writes the next-layer pre-attn
+/// normed activation into its delta slot in-place. The 5
+/// instructions are CONTIGUOUS in the unrolled vec.
+///
+/// Layer-0 has a structurally distinct prelude (`RmsNorm` instead
+/// of `FusedAddRmsNorm`) and the last layer's post-MLP `FusedAddRmsNorm`
+/// has no following QKV — these stay as straight-line code per the
+/// existing loop-compression "boundary residue" handling.
+///
+/// Currently registers no new OpcodeShape — the SynthPreAttn shape
+/// is registered by the metal Impl chain via
+/// `extra_opcode_shapes()`. (Future: register here so non-metal
+/// builds also see the shape for static-slice typechecking, even
+/// when the SynthPreAttn arm is `unreachable!()` for them.)
+///
+/// `t_act_tag` is the activation dtype symbol (`"bfloat"` /
+/// `"half"`) used to build the synth kernel symbol name. Must
+/// match the tag the macro used in
+/// `CanonicalParams::synthesized_kernel_sources()`.
+pub fn apply_synth_replacement(
+    arch_opcodes: &mut ArchOpcodes,
+    lowered: &mut LoweredBucket,
+    t_act_tag: &'static str,
+) {
+    use proc_macro2::Span;
+    use quote::quote;
+    use syn::LitStr;
+
+    // Register the SynthPreAttn shape so loop compression can
+    // discover the iter-index field (`layer`) by position.
+    arch_opcodes.register(synth_pre_attn_opcode_shape());
+
+    let synth_ident = syn::Ident::new("SynthPreAttn", Span::call_site());
+    let i_fused_add_rmsnorm = syn::Ident::new("FusedAddRmsNorm", Span::call_site());
+    let i_affine_qmm = syn::Ident::new("AffineQmm", Span::call_site());
+    let i_rope_append = syn::Ident::new("RopeAppend", Span::call_site());
+
+    let instances = std::mem::take(&mut lowered.instances);
+    let mut rewritten: Vec<OpInstance> = Vec::with_capacity(instances.len());
+    let mut i = 0usize;
+    while i < instances.len() {
+        if i + 5 > instances.len() {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+        let a = &instances[i];     // FusedAddRmsNorm
+        let q = &instances[i + 1]; // AffineQmm Q
+        let k = &instances[i + 2]; // AffineQmm K
+        let v = &instances[i + 3]; // AffineQmm V
+        let r = &instances[i + 4]; // RopeAppend
+
+        if a.name != i_fused_add_rmsnorm
+            || q.name != i_affine_qmm
+            || k.name != i_affine_qmm
+            || v.name != i_affine_qmm
+            || r.name != i_rope_append
+        {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Field-shape sanity. Mirror the variants' declared fields
+        // in `instr.rs`:
+        //   FusedAddRmsNorm(delta_slot, residual_slot, layer, wt_fn)         — 4
+        //   AffineQmm(in_slot, out_slot, layer, wt_fn, n, k, gs, bits, vl)  — 9
+        //   RopeAppend(q_slot, k_slot, v_slot, q_out, k_out, v_out, layer,
+        //              cos_sin_fn, interleaved)                              — 9
+        if a.field_values.len() != 4
+            || q.field_values.len() != 9
+            || k.field_values.len() != 9
+            || v.field_values.len() != 9
+            || r.field_values.len() != 9
+        {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Slot/connectivity checks. Token-stream string equality is
+        // sufficient — these are all literal slot ids / layer ids
+        // emitted by the same codegen path.
+        let s = |ts: &proc_macro2::TokenStream| ts.to_string();
+        let delta_slot = s(&a.field_values[0]);
+        let layer_a = s(&a.field_values[2]);
+
+        let q_in   = s(&q.field_values[0]);
+        let q_out  = s(&q.field_values[1]);
+        let q_lay  = s(&q.field_values[2]);
+        let q_gs   = s(&q.field_values[6]);
+        let q_bits = s(&q.field_values[7]);
+
+        let k_in   = s(&k.field_values[0]);
+        let k_out  = s(&k.field_values[1]);
+        let k_lay  = s(&k.field_values[2]);
+        let k_gs   = s(&k.field_values[6]);
+        let k_bits = s(&k.field_values[7]);
+
+        let v_in   = s(&v.field_values[0]);
+        let v_out  = s(&v.field_values[1]);
+        let v_lay  = s(&v.field_values[2]);
+        let v_gs   = s(&v.field_values[6]);
+        let v_bits = s(&v.field_values[7]);
+
+        let r_q   = s(&r.field_values[0]);
+        let r_k   = s(&r.field_values[1]);
+        let r_vv  = s(&r.field_values[2]);
+        let r_lay = s(&r.field_values[6]);
+        let r_int = s(&r.field_values[8]);
+
+        let connectivity_ok = q_in == delta_slot
+            && k_in == delta_slot
+            && v_in == delta_slot
+            && q_lay == layer_a
+            && k_lay == layer_a
+            && v_lay == layer_a
+            && r_lay == layer_a
+            && q_gs == k_gs
+            && q_gs == v_gs
+            && q_bits == k_bits
+            && q_bits == v_bits
+            && q_bits.starts_with("4")
+            && r_int == "false"
+            && r_q == q_out
+            && r_k == k_out
+            && r_vv == v_out;
+        if !connectivity_ok {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Build the SynthPreAttn instance. Mirrors the variant
+        // declared in `ferrite-forward::instr::Instruction`:
+        //   SynthPreAttn(residual_slot, delta_slot, q_out_slot, layer,
+        //                q_wt_fn, k_wt_fn, v_wt_fn, rms_wt_fn,
+        //                cos_sin_fn, group_size, bits, kernel_symbol)
+        let residual_slot = a.field_values[1].clone();
+        let delta_slot_tok = a.field_values[0].clone();
+        let q_out_slot = r.field_values[3].clone();
+        let layer_tok = a.field_values[2].clone();
+        let q_wt = q.field_values[3].clone();
+        let k_wt = k.field_values[3].clone();
+        let v_wt = v.field_values[3].clone();
+        let rms_wt = a.field_values[3].clone();
+        let cs_fn = r.field_values[7].clone();
+        let gs_tok = q.field_values[6].clone();
+        let bits_tok = q.field_values[7].clone();
+        // Symbol name must match `fuse_pass::synthesize_pre_attn_chunk`
+        // for the same `(t_act, t_scale, group_size)`. t_scale = "half"
+        // universally for affine-int4.
+        // `q_gs` is a token stringification of a `u32` literal, so
+        // it carries the `u32` suffix (e.g., `64u32`). The fuse_pass
+        // symbol uses the bare integer (e.g., `gs64`). Strip the
+        // type suffix so the two symbols match.
+        let gs_str: String = q_gs
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let symbol = format!(
+            "synth_pre_attn_{}_half_gs{}",
+            t_act_tag, gs_str
+        );
+        let symbol_lit = LitStr::new(&symbol, Span::call_site());
+        let synth = OpInstance::new(
+            synth_ident.clone(),
+            vec![
+                residual_slot,
+                delta_slot_tok,
+                q_out_slot,
+                layer_tok,
+                q_wt,
+                k_wt,
+                v_wt,
+                rms_wt,
+                cs_fn,
+                gs_tok,
+                bits_tok,
+                quote! { #symbol_lit },
+            ],
+        );
+        rewritten.push(synth);
+        i += 5;
+    }
+    lowered.instances = rewritten;
+}
+
+/// OpcodeShape for `Instruction::SynthPreAttn`. Must match the
+/// variant declared in `ferrite-forward::instr` field-for-field
+/// (codegen panics on shape disagreement).
+fn synth_pre_attn_opcode_shape() -> OpcodeShape {
+    OpcodeShape::new(
+        "SynthPreAttn",
+        vec![
+            ("residual_slot", syn::parse_quote!(u32)),
+            ("delta_slot", syn::parse_quote!(u32)),
+            ("out_slot", syn::parse_quote!(u32)),
+            ("layer", syn::parse_quote!(u32)),
+            (
+                "q_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "k_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "v_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "rms_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                ),
+            ),
+            (
+                "cos_sin_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                ),
+            ),
+            ("group_size", syn::parse_quote!(u32)),
+            ("bits", syn::parse_quote!(u32)),
+            ("kernel_symbol", syn::parse_quote!(&'static str)),
+        ],
+    )
+}
+
 pub fn apply_loop_compression(
     arch_opcodes: &ArchOpcodes,
     lowered: &mut LoweredBucket,

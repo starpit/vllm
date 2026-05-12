@@ -5386,7 +5386,29 @@ pub fn emit_model(
     // detection picks the largest CONTIGUOUS run that genuinely
     // repeats — middle layers — and keeps the boundary residues as
     // straight-line code in prelude/suffix.
+    // Pre-attention chain synthesis (compiler-driven). Detect the
+    // contiguous `(FusedAddRmsNorm, AffineQmm × 3, RopeAppend)` chain
+    // that spans the K→K+1 layer boundary in the unrolled per-claim
+    // op list and replace each match with one `SynthPreAttn` op
+    // backed by the synthesized MSL kernel emitted via
+    // `emit_synthesized_kernel_sources_override`. Must run BEFORE
+    // `apply_loop_compression` — once the loop body collapses we
+    // can't see the boundary chain anymore.
+    let synth_t_act: Option<&'static str> = {
+        use crate::quantization::QuantMethod;
+        match model.quantization.as_ref().map(|q| &q.method) {
+            Some(QuantMethod::Affine { bits: 4, .. }) => Some("bfloat"),
+            _ => None,
+        }
+    };
     for (cl, _, _, _, _) in canonical_lowered.values_mut() {
+        if let Some(tag) = synth_t_act {
+            crate::interpreter_codegen::apply_synth_replacement(
+                &mut arch_opcodes,
+                &mut cl.backbone,
+                tag,
+            );
+        }
         crate::interpreter_codegen::apply_loop_compression(
             &arch_opcodes,
             &mut cl.backbone,

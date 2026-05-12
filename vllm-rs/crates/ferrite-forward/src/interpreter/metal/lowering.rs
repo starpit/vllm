@@ -120,57 +120,21 @@ pub fn lower<W: CanonicalParams>(
                 // iterations. Pass `iter as u32` into `lower_one` so
                 // the weight lookups bake the right per-layer offset.
                 for iter in 0..count_usize {
-                    let mut j = 0usize;
-                    while j < body.len() {
-                        if let Some(synth) =
-                            try_synth_pre_attn::<W>(body, j, bucket_m)
-                        {
-                            let cmds = lower_one(
-                                &synth,
-                                body_start + j,
-                                bucket_m,
-                                iter as u32,
-                                &mut splitk_scratch_bytes,
-                            )?;
-                            commands.extend(cmds);
-                            j += 5;
-                            continue;
-                        }
+                    for (offset, inst) in body.iter().enumerate() {
                         let cmds = lower_one(
-                            &body[j],
-                            body_start + j,
+                            inst,
+                            body_start + offset,
                             bucket_m,
                             iter as u32,
                             &mut splitk_scratch_bytes,
                         )?;
                         commands.extend(cmds);
-                        j += 1;
                     }
                 }
                 i = body_end;
             }
-            _ => {
-                if let Some(synth) =
-                    try_synth_pre_attn::<W>(instructions, i, bucket_m)
-                {
-                    let cmds = lower_one(
-                        &synth,
-                        i,
-                        bucket_m,
-                        0,
-                        &mut splitk_scratch_bytes,
-                    )?;
-                    commands.extend(cmds);
-                    i += 5;
-                    continue;
-                }
-                let cmds = lower_one(
-                    &instructions[i],
-                    i,
-                    bucket_m,
-                    0,
-                    &mut splitk_scratch_bytes,
-                )?;
+            other => {
+                let cmds = lower_one(other, i, bucket_m, 0, &mut splitk_scratch_bytes)?;
                 commands.extend(cmds);
                 i += 1;
             }
@@ -1612,131 +1576,6 @@ fn affine_embed_kernel_static_name(
              lower_one's assert should have caught this"
         ),
     }
-}
-
-/// Detect the (FusedAddRmsNorm, AffineQmm × 3, RopeAppend) pre-
-/// attention decoder chain at `insts[i..i+5]` and, on match, return a
-/// synthesized `Instruction::SynthPreAttn` that the per-instruction
-/// `lower_one` arm handles. Returns `None` when the chain shape
-/// doesn't match — caller falls through to normal per-instruction
-/// lowering.
-///
-/// Phase 3c integration of the compiler-driven megakernel synthesis
-/// (per `METAL_KITTENS_SYNTHESIS_PLAN.md`). The synthesized kernel's
-/// MSL source is emitted at macro time by `fuse_pass` and registered
-/// in the SpecializedPipelineCache at worker-pool init; this peek
-/// just routes the chain through `SynthPreAttn` so the lowering arm
-/// produces a `LoweredCommand` referencing that pre-registered
-/// symbol.
-/// Match `(AffineQmm Q, AffineQmm K, AffineQmm V, RopeAppend)` at
-/// `insts[i..i+4]` — the within-Loop-iteration shape of the
-/// pre-attention compute chain. The upstream pre-attn RMSNorm
-/// (`RmsNorm` at layer 0, `FusedAddRmsNorm` from the previous iter
-/// for L>=1) lives OUTSIDE this iter's body, so the synth kernel
-/// itself does NOT fold AddRmsNorm — it consumes the post-norm
-/// activation that the previous instruction wrote.
-///
-/// On match: returns a synthetic `Instruction::SynthPreAttn` whose
-/// `delta_slot` is the shared input slot (the post-norm activation),
-/// `residual_slot` is unused (zero — kept in the variant for future
-/// AddRmsNorm-fold synth where the chain spans iters).
-fn try_synth_pre_attn<W: CanonicalParams>(
-    insts: &[crate::Instruction<W>],
-    i: usize,
-    bucket_m: u32,
-) -> Option<crate::Instruction<W>> {
-    use crate::Instruction as I;
-    if i + 4 > insts.len() {
-        return None;
-    }
-    let (a_in, a_out, a_layer, a_wt, a_gs, a_bits) = match &insts[i] {
-        I::AffineQmm(in_s, out_s, l, wt, _n, _k, gs, bits, _vl) => {
-            (*in_s, *out_s, *l, *wt, *gs, *bits)
-        }
-        _ => return None,
-    };
-    let (b_in, b_out, b_layer, b_wt, b_gs, b_bits) = match &insts[i + 1] {
-        I::AffineQmm(in_s, out_s, l, wt, _n, _k, gs, bits, _vl) => {
-            (*in_s, *out_s, *l, *wt, *gs, *bits)
-        }
-        _ => return None,
-    };
-    let (c_in, c_out, c_layer, c_wt, c_gs, c_bits) = match &insts[i + 2] {
-        I::AffineQmm(in_s, out_s, l, wt, _n, _k, gs, bits, _vl) => {
-            (*in_s, *out_s, *l, *wt, *gs, *bits)
-        }
-        _ => return None,
-    };
-    let (r_q, r_k, r_v, r_qo, _r_ko, _r_vo, r_layer, r_cs, r_interleaved) = match &insts[i + 3] {
-        I::RopeAppend(q, k, v, qo, ko, vo, l, cs, interleaved) => {
-            (*q, *k, *v, *qo, *ko, *vo, *l, *cs, *interleaved)
-        }
-        _ => return None,
-    };
-    if bucket_m != 1 {
-        return None;
-    }
-    // All three AffineQmm share the same input slot (the post-norm
-    // activation).
-    if a_in != b_in || a_in != c_in {
-        return None;
-    }
-    if a_layer != b_layer || a_layer != c_layer || a_layer != r_layer {
-        return None;
-    }
-    if a_gs != b_gs || a_gs != c_gs {
-        return None;
-    }
-    if a_bits != 4 || b_bits != 4 || c_bits != 4 {
-        return None;
-    }
-    if r_interleaved {
-        return None;
-    }
-    if r_q != a_out || r_k != b_out || r_v != c_out {
-        return None;
-    }
-    let t_act = match W::METAL_DTYPE {
-        MetalDtype::F16 => "half",
-        MetalDtype::Bf16 => "bfloat",
-        MetalDtype::Int4 => return None,
-    };
-    let symbol: &'static str = match (t_act, a_gs) {
-        ("bfloat", 32) => "synth_pre_attn_bfloat_half_gs32",
-        ("bfloat", 64) => "synth_pre_attn_bfloat_half_gs64",
-        ("bfloat", 128) => "synth_pre_attn_bfloat_half_gs128",
-        ("half", 32) => "synth_pre_attn_half_half_gs32",
-        ("half", 64) => "synth_pre_attn_half_half_gs64",
-        ("half", 128) => "synth_pre_attn_half_half_gs128",
-        _ => return None,
-    };
-    // CHAIN-SHAPE MISMATCH (next-phase work):
-    //
-    // The synth kernel emitted by `fuse_pass::synthesize_pre_attn_chunk`
-    // currently folds AddRmsNorm into the prelude — it expects bindings
-    // for `residual_io`, `delta`, and `rms_weight` and runs the RMS
-    // reduction over the input vector itself. The within-Loop-iter
-    // pattern this peek matches DOESN'T have an AddRmsNorm at its
-    // head (the pre-attn norm lives at the END of the previous iter's
-    // body, or as a standalone outside the Loop for layer 0).
-    //
-    // Two ways to land this:
-    //   1. Reshape `synthesize_pre_attn_chunk` to drop the AddRmsNorm
-    //      prelude. Synth kernel becomes 3×qmv + RoPE + cache only,
-    //      consumes already-normed input. Simpler match here
-    //      (the pattern already extracted above) — pass `a_in` as
-    //      the input slot, omit `rms_wt_fn` / `residual_slot`.
-    //   2. Flatten the unrolled Instruction stream in `lower()` so
-    //      the peek can match the cross-iter
-    //      (FusedAddRmsNorm, AffineQmm × 3, RopeAppend) shape that
-    //      actually appears in the dispatched sequence. Keeps the
-    //      richer AddRmsNorm-fold synth kernel and saves more
-    //      per-token work.
-    //
-    // Option 1 is the smaller delta; option 2 saves more memory
-    // bandwidth. Either is doable in a focused session.
-    let _ = (a_wt, b_wt, c_wt, r_cs, r_qo, a_layer);
-    None
 }
 
 #[cfg(test)]

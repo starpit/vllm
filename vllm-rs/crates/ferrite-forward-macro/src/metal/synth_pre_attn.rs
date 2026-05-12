@@ -23,11 +23,12 @@
 use std::collections::BTreeMap;
 
 use crate::classified::{OpKind, Program};
+use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    consumes_tile, first_tile_input, weight_storage_of, CostCtx, Handoff, Implementation,
-    LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor,
-    WorkloadConstraint,
+    consumes_tile, default_required_weights, first_tile_input, weight_storage_of, CostCtx,
+    Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -354,50 +355,190 @@ impl Implementation for MetalSynthPreAttnImpl {
 
     fn fan_out(
         &self,
-        _m: &MatchInfo,
-        _fuf: &Fuf,
-        _program: &Program,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
         _bounds: &BTreeMap<String, u64>,
-        _slots: &SlotMap,
+        slots: &SlotMap,
     ) -> Option<Vec<OpInstance>> {
-        // TODO(solver-driven-synth): build the SynthPreAttn OpInstance
-        // directly from the claimed tiles' weight accessors.
-        //
-        // Current state: `interpreter_codegen::apply_synth_replacement`
-        // still owns the post-pass rewrite, gated by the `bucket_m < 2`
-        // heuristic. This Impl is registered so the solver tracks it
-        // (cost comparisons stay correct), but `fan_out` returns
-        // `None` to fall back to the unfused chain emission while the
-        // weight-accessor → token-stream plumbing lands.
-        //
-        // The full implementation needs to:
-        //  1. Pull WeightAccessors from each claimed Gemm (Q/K/V),
-        //     the RmsNorm, and the RopeAppend (cos_sin).
-        //  2. Convert each accessor name to `Weights::<base>` via
-        //     `crate::codegen::split_base_layer`.
-        //  3. Resolve slot ids for residual_slot, delta_slot,
-        //     q_out_slot via `slots.of(tile, output_slot)`.
-        //  4. Build the 12-field OpInstance matching the variant in
-        //     `ferrite_forward::instr::Instruction::SynthPreAttn`.
-        //
-        // Until that lands, returning `None` means the solver doesn't
-        // pick this Impl at codegen (no fan_out → no emission), and
-        // the legacy `apply_synth_replacement` continues to work as
-        // before. The cost_us above still participates in solver
-        // scoring, so when this fan_out lands the right pick is
-        // already in place.
-        None
+        // Find the four key tiles within the claim by op-kind. The
+        // claim is sorted by TileId so we walk it and pick.
+        let mut add_tile: Option<TileId> = None;
+        let mut rmsnorm_tile: Option<TileId> = None;
+        let mut gemm_tiles: Vec<TileId> = Vec::new();
+        let mut rope_tile: Option<TileId> = None;
+        for &t in &m.claimed_tiles {
+            match fuf.get(t).op {
+                OpKind::Add => add_tile = Some(t),
+                OpKind::RmsNorm => rmsnorm_tile = Some(t),
+                OpKind::Gemm => gemm_tiles.push(t),
+                OpKind::RopeAppend => rope_tile = Some(t),
+                _ => {}
+            }
+        }
+        let rmsnorm_tile = rmsnorm_tile?;
+        let rope_tile = rope_tile?;
+        if gemm_tiles.len() != 3 {
+            return None;
+        }
+
+        // residual_slot / delta_slot:
+        //   - Non-init: the two `FufInput::Tile` operands of the Add.
+        //     By DSL convention `add(delta, residual)` (delta is the
+        //     o_proj output, residual is the running stream); but to
+        //     stay tolerant we just take the two tile inputs in order
+        //     and trust the runtime kernel's binding contract
+        //     (binding(0)=residual, binding(1)=delta).
+        //   - Init: residual_slot == delta_slot == norm's first tile
+        //     input. The kernel ignores the delta read in init mode.
+        let (residual_slot_idx, delta_slot_idx) = match add_tile {
+            Some(a) => {
+                let add_node = fuf.get(a);
+                let tile_inputs: Vec<(TileId, u8)> = add_node
+                    .inputs
+                    .iter()
+                    .filter_map(|i| match i {
+                        FufInput::Tile { id, slot } => Some((*id, *slot)),
+                        _ => None,
+                    })
+                    .collect();
+                if tile_inputs.len() != 2 {
+                    return None;
+                }
+                (
+                    slots.of(tile_inputs[0].0, tile_inputs[0].1),
+                    slots.of(tile_inputs[1].0, tile_inputs[1].1),
+                )
+            }
+            None => {
+                let (norm_in, norm_slot) = first_tile_input(fuf.get(rmsnorm_tile))?;
+                let idx = slots.of(norm_in, norm_slot);
+                (idx, idx)
+            }
+        };
+
+        // q_out_slot: the Q-projection Gemm's output. Identify Q
+        // among the 3 Gemms by the RopeAppend's input ordering —
+        // rope's first tile input is the Q-gemm, second is K, third
+        // is V.
+        let rope_node = fuf.get(rope_tile);
+        let rope_tile_inputs: Vec<TileId> = rope_node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .take(3)
+            .collect();
+        if rope_tile_inputs.len() != 3 {
+            return None;
+        }
+        let q_tile = rope_tile_inputs[0];
+        let k_tile = rope_tile_inputs[1];
+        let v_tile = rope_tile_inputs[2];
+        if !gemm_tiles.contains(&q_tile)
+            || !gemm_tiles.contains(&k_tile)
+            || !gemm_tiles.contains(&v_tile)
+        {
+            return None;
+        }
+        let q_out_slot_idx = slots.of(q_tile, 0);
+
+        // Layer index — recover from any of the per-layer weight
+        // inputs. The Gemm tiles' weight has an `index` field;
+        // RmsNorm/RopeAppend also have one each.
+        let layer = (|| {
+            for &t in &m.claimed_tiles {
+                for input in &fuf.get(t).inputs {
+                    if let FufInput::Weight {
+                        index: Some(layer), ..
+                    } = input
+                    {
+                        return Some(*layer as u32);
+                    }
+                }
+            }
+            None
+        })()?;
+
+        // WeightAccessors per tile. Use `default_required_weights`
+        // on each individually so we can route by source tile.
+        let acc_for = |tile: TileId| -> Option<WeightAccessor> {
+            default_required_weights(&[tile], fuf, program)
+                .into_iter()
+                .next()
+        };
+        let q_acc = acc_for(q_tile)?;
+        let k_acc = acc_for(k_tile)?;
+        let v_acc = acc_for(v_tile)?;
+        let rms_acc = acc_for(rmsnorm_tile)?;
+        let rope_acc = acc_for(rope_tile)?;
+
+        let to_weights_path = |acc: &WeightAccessor| -> proc_macro2::TokenStream {
+            let (base, _layer) = split_base_layer(&acc.name.to_string());
+            let ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+            quote! { Weights::#ident }
+        };
+        let q_wt = to_weights_path(&q_acc);
+        let k_wt = to_weights_path(&k_acc);
+        let v_wt = to_weights_path(&v_acc);
+        let rms_wt = to_weights_path(&rms_acc);
+        let cs_fn = to_weights_path(&rope_acc);
+
+        // group_size + bits from the Affine storage on any Gemm.
+        let (gs, bits) = match weight_storage_of(fuf.get(q_tile)) {
+            Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
+            _ => return None,
+        };
+
+        // Kernel symbol matches `fuse_pass::synthesize_pre_attn{,_init}_chunk`.
+        let symbol = if self.init {
+            format!(
+                "synth_pre_attn_init_{}_{}_gs{}",
+                self.act_tag, self.scale_tag, self.group_size,
+            )
+        } else {
+            format!(
+                "synth_pre_attn_{}_{}_gs{}",
+                self.act_tag, self.scale_tag, self.group_size,
+            )
+        };
+        let symbol_lit = syn::LitStr::new(&symbol, proc_macro2::Span::call_site());
+
+        let _ = bits;
+        let bits_lit = self.bits;
+        let gs_lit = gs;
+        let layer_lit = layer;
+
+        Some(vec![OpInstance::new(
+            syn::Ident::new("SynthPreAttn", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #residual_slot_idx },
+                quote! { #delta_slot_idx },
+                quote! { #q_out_slot_idx },
+                quote! { #layer_lit },
+                q_wt,
+                k_wt,
+                v_wt,
+                rms_wt,
+                cs_fn,
+                quote! { #gs_lit },
+                quote! { #bits_lit },
+                quote! { #symbol_lit },
+            ],
+        )])
     }
 
     fn required_weights(
         &self,
-        _claimed_tiles: &[TileId],
-        _fuf: &Fuf,
-        _program: &Program,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
     ) -> Vec<WeightAccessor> {
-        // See `fan_out` TODO — once fan_out lands, this returns the
-        // five accessors (q_proj, k_proj, v_proj, input_layernorm,
-        // rotary) collected from the claimed tiles' Weight inputs.
-        Vec::new()
+        // Aggregate accessors from every claimed tile so the loader
+        // pulls every weight the synth kernel reads (rms gain, three
+        // QKV LinearLayer triples, rotary cos/sin).
+        default_required_weights(claimed_tiles, fuf, program)
     }
 }

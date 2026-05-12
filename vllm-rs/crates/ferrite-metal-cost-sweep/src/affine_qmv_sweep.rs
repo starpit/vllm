@@ -21,7 +21,7 @@
 
 use crate::util::{self, Buffer, Device};
 use ferrite_metal_kernels::quantized::{
-    pick_qmv_kernel, DequantDtype, MetalAffineQmv, QmvKernel, ScaleDtype,
+    valid_qmv_kernels, DequantDtype, MetalAffineQmv, QmvKernel, ScaleDtype,
 };
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder};
@@ -113,10 +113,25 @@ pub fn run(launch_overhead_us: f64) {
                 if !k.is_multiple_of(gs) {
                     continue;
                 }
-                let cost_us = bench_qmv(&qmv, device, dtype, n, k, gs, launch_overhead_us);
-                let kernel = pick_qmv_kernel(n, k, 4);
-                let name = csv_kernel_name(kernel, dtype, gs);
-                println!("{name},1,{n},{k},{cost_us:.2}");
+                // Sweep every variant that's *valid* for this shape,
+                // not just the heuristic's pick. The CSV is the
+                // solver's source of truth — emitting only one row
+                // per shape collapses to "the heuristic was always
+                // right," which is a tautology, not measurement.
+                for kernel in valid_qmv_kernels(n, k, 4) {
+                    let cost_us = bench_qmv_variant(
+                        &qmv,
+                        device,
+                        dtype,
+                        n,
+                        k,
+                        gs,
+                        kernel,
+                        launch_overhead_us,
+                    );
+                    let name = csv_kernel_name(kernel, dtype, gs);
+                    println!("{name},1,{n},{k},{cost_us:.2}");
+                }
             }
         }
     }
@@ -140,13 +155,14 @@ pub fn csv_kernel_name(kernel: QmvKernel, dtype: DequantDtype, gs: u32) -> Strin
     }
 }
 
-fn bench_qmv(
+fn bench_qmv_variant(
     qmv: &MetalAffineQmv,
     device: &Device,
     dtype: DequantDtype,
     n: u32,
     k: u32,
     gs: u32,
+    kernel: QmvKernel,
     launch_overhead_us: f64,
 ) -> f64 {
     // Match the per-tensor byte sizes used in production:
@@ -171,7 +187,8 @@ fn bench_qmv(
     util::time_kernel(launch_overhead_us, 3, 20, || {
         let cb = stream.get_command_buffer().expect("cmd buf").clone();
         let enc = cb.computeCommandEncoder().expect("encoder");
-        qmv.execute(
+        qmv.execute_with_kernel(
+            kernel,
             &x as &Buffer,
             &packed as &Buffer,
             &scales as &Buffer,

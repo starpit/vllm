@@ -272,12 +272,18 @@ fn empirical_cost_us(
     ctx: &CostCtx,
 ) -> Option<f64> {
     use ferrite_metal_kernels::quantized::{
-        pick_qmm_t_kernel, pick_qmv_kernel, QmmTKernel, QmvKernel,
+        pick_qmm_t_kernel, pick_qmv_kernel_by_cost, qmv_csv_kernel_name, DequantDtype,
+        QmmTKernel,
     };
 
     let dtype_str = match dtype {
         "fp16" => "f16",
         "bf16" => "bf16",
+        _ => return None,
+    };
+    let dequant_dtype = match dtype {
+        "fp16" => DequantDtype::F16,
+        "bf16" => DequantDtype::Bf16,
         _ => return None,
     };
     let (group_size, _bits) = match weight_storage_of(node) {
@@ -287,14 +293,19 @@ fn empirical_cost_us(
 
     let vector_limit = affine_qmm_vector_limit(k, n);
     let name = if m < vector_limit {
-        let kernel = pick_qmv_kernel(n, k, 4);
-        match kernel {
-            QmvKernel::Quad { d } => {
-                format!("affine_qmv_quad_{dtype_str}_gs{group_size}_d{d}")
-            }
-            QmvKernel::Fast => format!("affine_qmv_fast_{dtype_str}_gs{group_size}"),
-            QmvKernel::Generic => format!("affine_qmv_{dtype_str}_gs{group_size}"),
-        }
+        // Cost-driven: walk every valid qmv variant for this shape
+        // and pick the one with min cost_us from the profile's CSV.
+        // The runtime lowering pass uses the same picker so the
+        // cost decision and the dispatch decision can't disagree.
+        let kernel = pick_qmv_kernel_by_cost(
+            |name, mm, nn, kk| ctx.profile.cost_us_for(name, mm, nn, kk),
+            n,
+            k,
+            4,
+            group_size,
+            dequant_dtype,
+        );
+        qmv_csv_kernel_name(kernel, dequant_dtype, group_size)
     } else {
         let kernel = pick_qmm_t_kernel(m, n, k, 1, group_size);
         match kernel {

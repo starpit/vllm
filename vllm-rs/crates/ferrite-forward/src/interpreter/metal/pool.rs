@@ -429,6 +429,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
 
+        // Detect this device's target profile so the lowering pass
+        // can run cost-driven kernel-variant selection from the
+        // sweep CSV. Falls through to `None` (heuristic fallback) if
+        // we're on an uncalibrated chip — `detect_device` returns
+        // the populated profile for M4 + M1 Max and an empty-cost
+        // table for everything else.
+        let target_profile =
+            ferrite_metal_kernels::detect_device().map(|d| d.profile);
         let mut tapes: Vec<LoweredMetalTape<W>> = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
             let tape = lower_pair(
@@ -438,6 +446,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 spec.lm_head_barriers,
                 spec.bucket_m,
                 spec.num_arena_slots,
+                target_profile.as_ref(),
             )
             .map_err(|e| PoolBuildError::BucketLower {
                 bucket_m: spec.bucket_m,

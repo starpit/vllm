@@ -42,6 +42,10 @@ macro_rules! embedded_metallib {
 pub use allocator::{AllocatorError, MetalAllocator, PooledBuffer};
 pub use device::{detect_device, MetalDevice};
 pub use stream::{wait_for_completion, MetalStream, MetalStreamError};
+// Re-export the targets crate so downstream consumers (ferrite-forward
+// runtime lowering) can name `MetalTargetProfile` without taking
+// a direct dep on `ferrite-metal-targets`.
+pub use ferrite_metal_targets;
 
 /// Metal buffer wrapper with automatic memory management
 pub struct MetalBuffer {

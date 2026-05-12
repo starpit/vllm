@@ -63,9 +63,10 @@ pub fn lower_pair<W: CanonicalParams>(
     lm_head_barriers: &[bool],
     bucket_m: u32,
     num_arena_slots: u32,
+    profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
-    let bb = lower(backbone, backbone_barriers, bucket_m, num_arena_slots)?;
-    let lh = lower(lm_head, lm_head_barriers, bucket_m, num_arena_slots)?;
+    let bb = lower(backbone, backbone_barriers, bucket_m, num_arena_slots, profile)?;
+    let lh = lower(lm_head, lm_head_barriers, bucket_m, num_arena_slots, profile)?;
     let mut commands = bb.commands;
     commands.extend(lh.commands);
     let mut barrier_before = bb.barrier_before;
@@ -96,6 +97,7 @@ pub fn lower<W: CanonicalParams>(
     barriers_in: &[bool],
     bucket_m: u32,
     num_arena_slots: u32,
+    profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
     let mut commands = Vec::with_capacity(instructions.len());
     let mut barrier_before: Vec<bool> = Vec::with_capacity(instructions.len());
@@ -145,6 +147,7 @@ pub fn lower<W: CanonicalParams>(
                             bucket_m,
                             iter as u32,
                             &mut splitk_scratch_bytes,
+                            profile,
                         )?;
                         let n_cmds = cmds.len();
                         commands.extend(cmds);
@@ -159,7 +162,7 @@ pub fn lower<W: CanonicalParams>(
                 i = body_end;
             }
             other => {
-                let cmds = lower_one(other, i, bucket_m, 0, &mut splitk_scratch_bytes)?;
+                let cmds = lower_one(other, i, bucket_m, 0, &mut splitk_scratch_bytes, profile)?;
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
@@ -212,6 +215,7 @@ fn lower_one<W: CanonicalParams>(
     bucket_m: u32,
     layer_offset: u32,
     splitk_scratch_bytes: &mut u32,
+    profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<Vec<LoweredCommand<W>>, LoweringError> {
     use Instruction as I;
 
@@ -420,8 +424,23 @@ fn lower_one<W: CanonicalParams>(
             let vl = *vector_limit;
 
             if bucket_m < vl {
-                // Matvec branch (decode-shape).
-                let kernel = pick_qmv_kernel(n_v, k_v, bits_v);
+                // Matvec branch (decode-shape). Cost-driven pick
+                // when the target profile is available — walks every
+                // valid qmv variant for `(n, k, bits)` and picks min
+                // cost_us from the profile's CSV. Falls back to the
+                // MLX-mirrored heuristic when no profile (uncalibrated
+                // chip).
+                let kernel = match profile {
+                    Some(p) => ferrite_metal_kernels::quantized::pick_qmv_kernel_by_cost(
+                        |name, mm, nn, kk| p.cost_us_for(name, mm, nn, kk),
+                        n_v,
+                        k_v,
+                        bits_v,
+                        gs,
+                        dtype,
+                    ),
+                    None => pick_qmv_kernel(n_v, k_v, bits_v),
+                };
                 let (tg, tpg) = qmv_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                 let kernel_id = match kernel {
                     QmvKernel::Quad { .. } => KernelId::AffineQmvQuad,

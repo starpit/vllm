@@ -377,6 +377,76 @@ pub fn pick_qmv_kernel(n: u32, k: u32, bits: u32) -> QmvKernel {
     }
 }
 
+/// Every `QmvKernel` variant that is *valid* for shape `(n, k, bits)`
+/// — i.e. produces correct output. The cost sweep benches each one
+/// and the solver picks the min-cost variant from the resulting CSV,
+/// replacing [`pick_qmv_kernel`]'s heuristic with empirical data.
+///
+/// `Generic` is always valid (it has the bounds-checked tail).
+/// `Fast` requires `N % 8 == 0 && K % 512 == 0`.
+/// `Quad` requires `K ∈ {64, 128}` with pow2 bits.
+pub fn valid_qmv_kernels(n: u32, k: u32, bits: u32) -> Vec<QmvKernel> {
+    let mut out = Vec::with_capacity(3);
+    let pow2_bits = bits != 0 && (bits & (bits - 1)) == 0;
+    if (k == 64 || k == 128) && pow2_bits {
+        out.push(QmvKernel::Quad { d: k });
+    }
+    if n.is_multiple_of(8) && k.is_multiple_of(512) {
+        out.push(QmvKernel::Fast);
+    }
+    out.push(QmvKernel::Generic);
+    out
+}
+
+/// CSV row name for a picked `QmvKernel`, matching what the
+/// `ferrite-metal-cost-sweep::affine_qmv_sweep` binary emits.
+pub fn qmv_csv_kernel_name(kernel: QmvKernel, dtype: DequantDtype, gs: u32) -> String {
+    let dt = dtype.symbol_infix();
+    match kernel {
+        QmvKernel::Quad { d } => format!("affine_qmv_quad_{dt}_gs{gs}_d{d}"),
+        QmvKernel::Fast => format!("affine_qmv_fast_{dt}_gs{gs}"),
+        QmvKernel::Generic => format!("affine_qmv_{dt}_gs{gs}"),
+    }
+}
+
+/// Cost-driven `QmvKernel` selection. Walks [`valid_qmv_kernels`],
+/// looks each up via `cost_lookup`, and returns the variant with
+/// minimum `cost_us`. When the lookup has no row for any valid
+/// variant (uncalibrated chip / sweep gap), falls back to the
+/// [`pick_qmv_kernel`] heuristic.
+///
+/// This is the **solver-side** picker. Both the codegen-time cost
+/// estimator (`MetalAffineQmmImpl::cost_us`) and the runtime
+/// lowering pass call it so the cost decision and the dispatch
+/// decision can't disagree.
+///
+/// `cost_lookup` is a closure rather than a concrete profile type
+/// so the macro's wrapped `TargetProfile` and the runtime's
+/// `MetalTargetProfile` can both feed in without this crate having
+/// to know about the macro side.
+pub fn pick_qmv_kernel_by_cost(
+    cost_lookup: impl Fn(&str, u32, u32, u32) -> Option<f64>,
+    n: u32,
+    k: u32,
+    bits: u32,
+    group_size: u32,
+    dtype: DequantDtype,
+) -> QmvKernel {
+    let mut best: Option<(QmvKernel, f64)> = None;
+    for kernel in valid_qmv_kernels(n, k, bits) {
+        let name = qmv_csv_kernel_name(kernel, dtype, group_size);
+        if let Some(cost) = cost_lookup(&name, 1, n, k) {
+            match best {
+                None => best = Some((kernel, cost)),
+                Some((_, c)) if cost < c => best = Some((kernel, cost)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(k_pick, _)| k_pick)
+        .unwrap_or_else(|| pick_qmv_kernel(n, k, bits))
+}
+
 /// Threadgroup grid + threads-per-group for a picked qmv variant.
 ///
 /// `qmv_quad`: `bn = quads_per_simd * results_per_quadgroup = 8 * 8 = 64`
@@ -543,6 +613,39 @@ impl MetalAffineQmv {
         scale_dtype: ScaleDtype,
         encoder: &ComputeCommandEncoderRef,
     ) -> Result<(), MetalStreamError> {
+        let kernel = pick_qmv_kernel(n, k, bits);
+        self.execute_with_kernel(
+            kernel, x, packed_w, scales, biases, y, m, n, k, b, group_size, bits, dtype,
+            scale_dtype, encoder,
+        )
+    }
+
+    /// Variant-explicit form of [`execute`]: caller picks the
+    /// `QmvKernel` rather than going through [`pick_qmv_kernel`].
+    /// Used by the cost sweep to bench each valid variant per shape
+    /// (the heuristic picker emits only one row per shape, which
+    /// prevents the solver from being cost-driven). Production code
+    /// should call [`execute`] unless it's doing its own cost
+    /// lookup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_kernel(
+        &self,
+        kernel: QmvKernel,
+        x: &Buffer,
+        packed_w: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        y: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        b: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        scale_dtype: ScaleDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<(), MetalStreamError> {
         if bits != 4 {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
                 "affine_qmv: only bits=4 is wired in P3, got bits={bits}"
@@ -554,21 +657,11 @@ impl MetalAffineQmv {
             )));
         }
         if b > 1 {
-            // batched=1 instantiation requires the additional buffer-7..14
-            // batch-metadata bindings ported from MLX `add_strides_and_shapes`
-            // (`quantized.cpp:128`); ferrite's Linear path is non-batched
-            // (B=1) on every model in the current matrix, so this is a
-            // forward-compat path tracked under P13 (gather variants).
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
                 "affine_qmv: batched=1 (B={b}) not yet wired (decode-only B=1 in P3)"
             )));
         }
-
-        let kernel = pick_qmv_kernel(n, k, bits);
         if let QmvKernel::Quad { d } = kernel {
-            // qmv_quad is templated on D = K; only K∈{64,128} are
-            // instantiated. The picker already enforces this — so a
-            // mismatch here is a programmer error, not a user error.
             debug_assert!(d == 64 || d == 128);
         }
         let kernel_name = qmv_kernel_name(kernel, dtype, scale_dtype, group_size, bits, false);

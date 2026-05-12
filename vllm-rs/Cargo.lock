@@ -2118,6 +2118,7 @@ name = "ferrite-forward-macro"
 version = "0.1.0"
 dependencies = [
  "ferrite-cuda-targets",
+ "ferrite-fusion-synth",
  "ferrite-metal-kernels",
  "ferrite-metal-targets",
  "prettyplease",
@@ -2128,6 +2129,10 @@ dependencies = [
  "syn",
  "trybuild",
 ]
+
+[[package]]
+name = "ferrite-fusion-synth"
+version = "0.1.0"
 
 [[package]]
 name = "ferrite-gguf"

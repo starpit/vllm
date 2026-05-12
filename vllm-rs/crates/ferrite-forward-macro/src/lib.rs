@@ -27,15 +27,15 @@ use syn::parse::{Parse, ParseStream};
 use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
 
 mod ast;
-mod atom;
-mod atom_lib;
+use ferrite_fusion_synth::atom;
+use ferrite_fusion_synth::atom_lib;
 mod cfg;
 mod classified;
 mod classify;
 mod codegen;
 mod concurrency;
 mod config;
-mod fuse_pass;
+use ferrite_fusion_synth::fuse_pass;
 mod cost;
 mod emit;
 mod fuf;

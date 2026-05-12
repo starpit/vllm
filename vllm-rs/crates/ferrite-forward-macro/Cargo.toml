@@ -31,6 +31,7 @@ metal = ["dep:ferrite-metal-targets", "dep:ferrite-metal-kernels"]
 nccl = []
 
 [dependencies]
+ferrite-fusion-synth = { path = "../ferrite-fusion-synth" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

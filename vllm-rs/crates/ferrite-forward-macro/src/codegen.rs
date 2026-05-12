@@ -5504,6 +5504,16 @@ pub fn emit_model(
         if let Some(tag) = synth_t_act
             && apply_synth
         {
+            // With `synth_pre_attn_*` cost rows in
+            // `ferrite-metal-targets/profiles/cost_<chip>.csv`,
+            // `MetalSynthPreAttnImpl` is solver-picked at L=0..N
+            // and these scans find no FusedAddRmsNorm/RmsNorm-headed
+            // chains left to fold (inert no-ops). Without cost rows
+            // the Impl's `cost_us` returns a sentinel and the solver
+            // skips it; the post-pass is the fallback that keeps
+            // synth fusion working on uncalibrated chips. Retire
+            // once `MetalSynthPreAttnImpl::cost_us` ships a finite
+            // component-sum fallback for the no-CSV case.
             crate::interpreter_codegen::apply_synth_replacement(
                 &mut arch_opcodes,
                 &mut cl.backbone,

@@ -72,7 +72,7 @@ Port ferrite's compile-time DSL → kernel compilation from CUDA to Metal for Ap
   - Helper functions: `dispatch_1d()`, `dispatch_2d()`
   - Module structure: `rmsnorm`, `gemm`, `attention`, `fused`
 
-### Phase 5: Worker Pool + Lowering + Specialized Pipelines 🔄 IN PROGRESS (5.A–5.E + 5.F.1–5.F.5 done)
+### Phase 5: Worker Pool + Lowering + Specialized Pipelines ✅ COMPLETE through 5.M (synth solver migration)
 **Goal:** End-to-end Metal forward via the worker-pool architecture finalized in `FERRITE_METAL_ARCHITECTURE.md` (2026-05-06).
 **Status:** 5.A, 5.B, 5.C, 5.D, 5.E complete. 5.F split into sub-phases: 5.F.1 (build hygiene), 5.F.2 (cfg-gate impl pushes), 5.F.3 (Metal impls' fan_out / opcode_shape wiring), 5.F.4 (`MetalWorkerPool::for_buckets` + `lower_pair`), and 5.F.5 (per-canonical macro emission of `Weights` ZST + `METAL_BUCKETS` static + `metal_pool()` constructor) all complete. 5.G + 5.6 still pending.
 
@@ -141,7 +141,7 @@ Split into two commits: 5.E.1 = ICB execution prerequisites (purely additive Met
 
 8 new `pool::tests` device-bound tests: `pick_bucket_returns_smallest_fit`, `pick_bucket_zero_tokens_errors`, `pick_bucket_overflow_errors`, `pick_bucket_handles_unsorted_tape_order`, `forward_runs_one_decode_step`, `forward_rejects_zero_tokens`, `forward_rejects_oversized_token_count`, `forward_rejects_oversized_input_slice`. 33 ferrite-forward Metal lib tests pass total under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`.
 
-#### Phase 5.F: Macro emission 🔄 IN PROGRESS (5.F.1 + 5.F.2 done; 5.F.3 next)
+#### Phase 5.F: Macro emission ✅ COMPLETE (5.F.1–5.F.5 all landed; superseded by 5.G/5.J/5.K/5.L/5.M)
 `#[forward]` emits `MetalWorkerPool::for_<model>()` constructor alongside CUDA's `try_load`. Lowering happens at constructor time.
 
 **5.F.1 (commit `81371a644`) — Build hygiene for `--features metal` macro path. ✅ COMPLETE**
@@ -218,7 +218,7 @@ Build results under `--features metal`: text-only non-quantized models now compi
 
 **Models with no Metal impl coverage (separate gap):** Mixtral, Qwen-MoE, Qwen3-MoE (Moe op), DeepSeek-V2/V3 (MlaSplit op), CommandR (Mean op). Will not compile under metal feature until the missing impls are added. Out of scope for the TinyLlama-1.1B path.
 
-#### Phase 5.G: Correctness wiring 🔄 IN PROGRESS (5.G.1 done)
+#### Phase 5.G: Correctness wiring ✅ COMPLETE (closed by 5.G.5 → Phase F → 5.J/5.K)
 Hook into existing `cpu_golden::*` per-op references and `vllm-e2e` golden framework — same path CUDA uses. No bespoke Metal-only test scaffolding (per `feedback_no_reinvent_testing.md`).
 
 **5.G.1 — `cpu_golden::*` per-op refs for metal-lowered ops. ✅ COMPLETE (2026-05-06)**
@@ -330,11 +330,15 @@ Per-arch state under metal:
 - `ferrite-model-{llama, mistral, qwen3, granite}`: still compile cleanly under `--features metal`. 49/49 ferrite-forward metal lib tests pass.
 - `ferrite-model-phi3`: `metal` feature commented out — Phi-3 needs LongRoPE which `RotaryCache::new_from_gpuweights` doesn't yet cover (compile_error fires at macro expansion). Re-enable in a follow-up that ports `build_longrope` + `new_partial_longrope_from_stream` to a `_from_gpuweights` counterpart.
 
-**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** 🔄 IN PROGRESS via the F.* phases below.
+**5.G.5 — TinyLlama-1.1B end-to-end via vllm-e2e.** ✅ COMPLETE — TinyLlama was the unblocker; we now run Llama-3.2-{1B,3B}-4bit, Qwen / Mistral / Granite text decoders end-to-end on both M4 and M1 Max via `vllm chat ... --device metal` and `vllm bench latency ... --device metal`.
 
-### Phase F: Worker integration → vllm-e2e TinyLlama golden 🔄 IN PROGRESS
+### Phase F: Worker integration → vllm-e2e TinyLlama golden ✅ COMPLETE
 
-`vllm-e2e` drives a real `vllm-serve` child process; under metal that needs a `Worker` impl to load the model, hold the KV cache, and run forward steps. Phase F delivers it.
+`vllm-e2e` drives a real `vllm-serve` child process; under metal that needs a `Worker` impl to load the model, hold the KV cache, and run forward steps. Phase F delivered it. Worker bodies live at
+`crates/vllm-executor/src/ferrite_worker.rs:9415` (`load_model`),
+`:9591` (`initialize_cache`), `:9745` (`execute_model`) on current HEAD.
+
+The historical narration below is preserved as the record of *how* this phase landed — not as live status. Steps 1–3 of THE PLAN all shipped; everything marked ⏳ here was completed in subsequent commits before Phases 5.J–5.M.
 
 **HEAD: Steps 1 + 2 of THE PLAN landed (2026-05-07). Step 3 in flight (2026-05-07).** Step 1 lifted `OwnedTensor` / `RawGpuMem` / `KvCachePool` to `cfg(any(cuda, metal))`. Step 2 renamed `CudaWorker` → `FerriteWorker` and added the cfg-mutex'd metal arm at `crates/vllm-executor/src/ferrite_worker.rs:9270–9395` with stub `Err(WorkerExecution(...))` returns at every method that 3.E will body-fill. The `argmax_f16` MSL kernel + Rust dispatcher landed at `4b179b0e7`. Cuda host built + ran on those commits.
 
@@ -359,12 +363,12 @@ Per-arch state under metal:
   - Macro emits `cfg(metal) pub unsafe fn forward(wm, ctx, device, num_tokens) -> OwnedTensor` per canonical: lazy-inits `wm.metal_pool` from `(device.device, &allocator, METAL_BUCKETS, runtime_factory_capturing_ctx_kv_cache_k_v_clones, max_workers=1)`. Runtime buffers sized as `METAL_MAX_BUCKET_M * 4` for u32 fields, `(METAL_MAX_BUCKET_M + 1) * 4` for `cu_seqlens_q`, `METAL_MAX_BUCKET_M * <W>::MAX_BLOCKS_PER_SEQ * 4` for `block_table`. Reads `ForwardInputs` slices off `ctx.<input>.as_raw().raw_ptr()` (host-visible under metal). Returns `OwnedTensor::from_metal_buffer(arena[terminal_slot], shape=[n, METAL_VOCAB_SIZE], f16)` — Buffer-clone, no copy.
   - Cross-variant `forward` dispatcher in `impl_lib.rs` widened to `cfg(any(cuda, metal))`. `FerriteWeights::forward` trait body collapsed to `unsafe { forward(self, ctx, device, num_tokens) }` under both backends.
   - 49/49 metal lib tests still pass; `cargo check -p vllm-executor --features metal --lib` clean; `cargo clippy --features metal` clean on metal-supported crates.
-- ⏳ **Step 3.E (worker bodies) — remaining.** `FerriteWorker(metal)::{load_model, initialize_cache, execute_model}` still need bodies. `load_model`: build `GpuDevice` (metal arm) + `MetalAllocator`, call `GpuWeights::from_dir(&model_dir, allocator)`, call `ferrite_forward::try_load(gw, (), arch_hint, 1, 0, max_model_len, hf)`, store the resulting `Box<dyn FerriteWeights>` on the worker. `initialize_cache`: `KvCachePool::new(layers, blocks, bs, kv_heads, head_dim, F16, |bytes| Ok(RawGpuMem::from_buffer(device.new_buffer(bytes, StorageModeShared))))`. `execute_model`: build `ForwardCtx` from `InputBatch` + `SchedulerOutput`, call `model.forward(&ctx, &mut device, num_tokens)`, run `argmax_f16` on the returned OwnedTensor logits, build `ModelRunnerOutput`. The macro side is now the well-defined entry point — the worker just plumbs `ForwardCtx` to it.
-- ⏳ **Step 3.B-finalize** Replace 512 MiB peak placeholder in `ferrite_worker.rs:9349` with `sum(METAL_BUCKETS[...].arena_bytes_per_slot) * max_workers` once 3.E exposes the loaded handle's accessor (or a per-canonical static).
-- ⏳ **Step 3.A** Per user clarification: ferrite's `try_load` already does the dispatch — vllm-serve's metal branch should just instantiate `FerriteWorker(metal)`; the `Ok(None)` from `try_load` falls through to `MlxWorker` via the same pattern cuda already uses. No special wiring needed beyond what 3.E unblocks.
-- ⏳ **Step 3.F** TinyLlama-1.1B vllm-e2e golden run.
+- ✅ **Step 3.E (worker bodies).** `FerriteWorker(metal)::{load_model, initialize_cache, execute_model}` bodied. Same shape as the plan called for: `load_model` builds `GpuDevice` (metal arm) + `MetalAllocator`, runs `GpuWeights::from_dir`, dispatches via `ferrite_forward::try_load`; `initialize_cache` constructs `KvCachePool::new` with the `StorageModeShared` buffer closure; `execute_model` builds `ForwardCtx` from `InputBatch` + `SchedulerOutput`, calls `model.forward`, runs `argmax_f16` on logits, builds `ModelRunnerOutput`. Current line refs: `ferrite_worker.rs:9415` / `:9591` / `:9745`.
+- ✅ **Step 3.B-finalize.** Peak-activation placeholder replaced with real per-canonical arena bytes via `METAL_ARENA_BYTES_M_<m>` statics.
+- ✅ **Step 3.A.** `vllm-serve` metal branch instantiates `FerriteWorker(metal)`; `try_load` returns `Ok(None)` for unsupported arches and falls through to `MlxWorker` exactly as cuda's dispatch pattern.
+- ✅ **Step 3.F.** TinyLlama-1.1B vllm-e2e golden landed long ago; production now runs the larger Llama / Mistral / Qwen / Granite text decoders.
 
-**Detailed file:line refs for every Step 3 wire** live in memory `project_ferrite_metal_step3_surface.md` — read it first next session. **The "MetalArchHandle / MetalArchImpl" section in that memory is OUTDATED — it described a parallel-types approach that was rejected. The correct shape (above) extends the cuda dispatcher via cfg-mutex.**
+**Phase F file:line refs** above point at the current `ferrite_worker.rs` (HEAD `9db9ca97d`). Cfg-mutex shape held — no `Backend` trait, no per-backend forks. Don't re-litigate.
 
 **Pre-existing Step 1 detail:** `OwnedTensor` and `RawGpuMem` lifted from `cfg(cuda)` `alloc.rs` into sibling modules (`owned_tensor.rs`, `raw_mem.rs`) gated `cfg(any(cuda, metal))`; storage / drop path are cfg-mutexed inside the same struct (cuda holds `*mut CachingAllocator`, metal holds `metal::Buffer`). `KvCachePool` lifted to `cfg(any(cuda, metal))` in `ferrite-kernels`; storage layout, sizing, slot decomposition, and span/FP8 *fields* stay one place — FP8 scale machinery, the `gather_kv_contiguous` D2D path, and the GPU mirrors of the span flags are `cfg(feature = "cuda")` *inside* the unified type. `KvCachePool::new` takes a `FnMut(usize) -> Result<RawGpuMem>` closure for the platform-specific allocation; cuda call sites pass a closure wrapping `driver::mem_alloc`, metal will pass one wrapping `device.new_buffer(StorageModeShared)`. All 49 ferrite-forward metal lib tests pass; the metal-supported model crates (llama / mistral / qwen3 / granite) compile cleanly.
 
@@ -390,8 +394,8 @@ The worker layer differs between backends in exactly three places: kernels (alre
 - **Do not delete cuda functionality or cuda test coverage to make metal compile.** Cuda is the working backend; it stays working through every step. Cuda host runs `cargo test` and `vllm-e2e` goldens after each of steps 1, 2, 3 — green-stays-green.
 - **The phrase "this is risky, can I confirm before doing X"** is not in scope for the three steps. The three steps are the confirmation. Execute.
 
-### Phase 5.6: TinyLlama-1.1B golden 🔜 PLANNED
-Same as Phase F.7 — closing 5.G.5 IS the 5.6 goal. Profile the function-constant specialization win at small buckets vs. an unspecialized control build as a follow-up.
+### Phase 5.6: TinyLlama-1.1B golden ✅ COMPLETE
+Closed alongside Phase F (5.G.5). Production now runs larger models. Function-constant specialization profiling at small buckets vs. an unspecialized control build still open as a perf follow-up.
 
 See `FERRITE_METAL_ARCHITECTURE.md` for the source-of-truth design and `FERRITE_METAL_PHASE5_PLAN.md` for prior context (Phase 5.6+ steps still valid; 5.1–5.5 superseded).
 
@@ -1120,9 +1124,9 @@ file from a prior full sweep.)
 - Phase 1-4: ✅ COMPLETE - All foundation work done (including 4.6 ICB infrastructure)
 - Phase 5.A–5.E: ✅ COMPLETE - Lowering, function-constant cache, worker, pool, forward
 - Phase 5.F.1 + 5.F.2: ✅ COMPLETE - Build hygiene + cfg-gated impl pushes
-- Phase 5.F.3 + 5.F (residual) + 5.G + 5.6: 🔜 PLANNED - Per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
+- Phase 5.F + 5.G + 5.6: ✅ COMPLETE - per-Metal-impl IR emission, macro constructor emission, e2e wiring, golden
 - Phase 5.H: ⚠️ PARTIAL - simdgroup_matrix fused MLP landed; M4+ MPP variant + larger-tile tuning still TODO
-- Phase 5.I: ⚠️ IN PROGRESS - perf + correctness investigation; ICB writes broken (workaround = direct dispatch)
+- Phase 5.I: ✅ COMPLETE - ICB writes path fixed in Phase 5.K era (residency-set insertion + batched-ICB-on-Serial-encoder)
 - Phase 5.J: ✅ COMPLETE - lowering correctness fixes (RmsNorm slot swap + loop layer_offset + MPS Gemm offset + bf16 KV slot-0 race)
 - Phase 5.K: ✅ COMPLETE - startup time 2.91s → 240ms warm; 1 structural follow-up (gate_up pack elimination) tracked in `project_metal_unpacked_mlp_next.md`
 - Phase 5.L: ✅ COMPLETE - contiguous prefill replaced by MLX `sdpa_vector` multi-Q port; legacy kept one cycle as bisect fallback (`FERRITE_METAL_PREFILL_KERNEL=legacy`); paged variant tracked as follow-up

@@ -775,6 +775,175 @@ pub fn apply_synth_replacement(
     lowered.instances = rewritten;
 }
 
+/// Layer-0 variant of `apply_synth_replacement`: matches the
+/// `(RmsNorm, AffineQmm Q, AffineQmm K, AffineQmm V, RopeAppend)` chain
+/// at the model prelude (before the first layer's attention residual
+/// exists, so the norm has no `delta` to add). Emits a `SynthPreAttn`
+/// instance whose `kernel_symbol` is the `synth_pre_attn_init_*`
+/// variant. Both the `residual_slot` and `delta_slot` bind to the
+/// RmsNorm's input slot (the embedding output) — the init kernel
+/// ignores `delta`.
+///
+/// Runs AFTER `apply_synth_replacement` so any FusedAddRmsNorm-headed
+/// chains have already been consumed.
+pub fn apply_synth_replacement_init(
+    arch_opcodes: &mut ArchOpcodes,
+    lowered: &mut LoweredBucket,
+    t_act_tag: &'static str,
+) {
+    use proc_macro2::Span;
+    use quote::quote;
+    use syn::LitStr;
+
+    // SynthPreAttn opcode shape already registered by the
+    // FusedAddRmsNorm-headed matcher; no-op-safe to re-register but
+    // avoid relying on call order — register defensively.
+    arch_opcodes.register(synth_pre_attn_opcode_shape());
+
+    let synth_ident = syn::Ident::new("SynthPreAttn", Span::call_site());
+    let i_rmsnorm = syn::Ident::new("RmsNorm", Span::call_site());
+    let i_affine_qmm = syn::Ident::new("AffineQmm", Span::call_site());
+    let i_rope_append = syn::Ident::new("RopeAppend", Span::call_site());
+
+    let instances = std::mem::take(&mut lowered.instances);
+    let mut rewritten: Vec<OpInstance> = Vec::with_capacity(instances.len());
+    let mut i = 0usize;
+    while i < instances.len() {
+        if i + 5 > instances.len() {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+        let a = &instances[i];     // RmsNorm
+        let q = &instances[i + 1]; // AffineQmm Q
+        let k = &instances[i + 2]; // AffineQmm K
+        let v = &instances[i + 3]; // AffineQmm V
+        let r = &instances[i + 4]; // RopeAppend
+
+        if a.name != i_rmsnorm
+            || q.name != i_affine_qmm
+            || k.name != i_affine_qmm
+            || v.name != i_affine_qmm
+            || r.name != i_rope_append
+        {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Field-shape sanity.
+        //   RmsNorm(in_slot, out_slot, layer, wt_fn)                       — 4
+        //   AffineQmm(in_slot, out_slot, layer, wt_fn, n, k, gs, bits, vl) — 9
+        //   RopeAppend(q, k, v, q_out, k_out, v_out, layer, cs_fn, intr)   — 9
+        if a.field_values.len() != 4
+            || q.field_values.len() != 9
+            || k.field_values.len() != 9
+            || v.field_values.len() != 9
+            || r.field_values.len() != 9
+        {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        let s = |ts: &proc_macro2::TokenStream| ts.to_string();
+        let norm_in   = s(&a.field_values[0]);  // residual_in (= embed_out, s0)
+        let norm_out  = s(&a.field_values[1]);  // x_norm slot the Qmms read
+        let layer_a   = s(&a.field_values[2]);
+
+        let q_in   = s(&q.field_values[0]);
+        let q_out  = s(&q.field_values[1]);
+        let q_lay  = s(&q.field_values[2]);
+        let q_gs   = s(&q.field_values[6]);
+        let q_bits = s(&q.field_values[7]);
+
+        let k_in   = s(&k.field_values[0]);
+        let k_out  = s(&k.field_values[1]);
+        let k_lay  = s(&k.field_values[2]);
+        let k_gs   = s(&k.field_values[6]);
+        let k_bits = s(&k.field_values[7]);
+
+        let v_in   = s(&v.field_values[0]);
+        let v_out  = s(&v.field_values[1]);
+        let v_lay  = s(&v.field_values[2]);
+        let v_gs   = s(&v.field_values[6]);
+        let v_bits = s(&v.field_values[7]);
+
+        let r_q   = s(&r.field_values[0]);
+        let r_k   = s(&r.field_values[1]);
+        let r_vv  = s(&r.field_values[2]);
+        let r_lay = s(&r.field_values[6]);
+        let r_int = s(&r.field_values[8]);
+
+        let connectivity_ok = q_in == norm_out
+            && k_in == norm_out
+            && v_in == norm_out
+            && q_lay == layer_a
+            && k_lay == layer_a
+            && v_lay == layer_a
+            && r_lay == layer_a
+            && q_gs == k_gs
+            && q_gs == v_gs
+            && q_bits == k_bits
+            && q_bits == v_bits
+            && q_bits.starts_with("4")
+            && r_int == "false"
+            && r_q == q_out
+            && r_k == k_out
+            && r_vv == v_out;
+        if !connectivity_ok {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Build the SynthPreAttn instance. The init kernel binds
+        // BOTH residual_slot and delta_slot to `norm_in` (s0) — the
+        // delta binding is required by the IR shape but the init
+        // kernel body never reads it.
+        let residual_slot_tok = a.field_values[0].clone();
+        let delta_slot_tok = a.field_values[0].clone();
+        let q_out_slot = r.field_values[3].clone();
+        let layer_tok = a.field_values[2].clone();
+        let q_wt = q.field_values[3].clone();
+        let k_wt = k.field_values[3].clone();
+        let v_wt = v.field_values[3].clone();
+        let rms_wt = a.field_values[3].clone();
+        let cs_fn = r.field_values[7].clone();
+        let gs_tok = q.field_values[6].clone();
+        let bits_tok = q.field_values[7].clone();
+        let gs_str: String = q_gs
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let symbol = format!(
+            "synth_pre_attn_init_{}_half_gs{}",
+            t_act_tag, gs_str
+        );
+        let symbol_lit = LitStr::new(&symbol, Span::call_site());
+        let synth = OpInstance::new(
+            synth_ident.clone(),
+            vec![
+                residual_slot_tok,
+                delta_slot_tok,
+                q_out_slot,
+                layer_tok,
+                q_wt,
+                k_wt,
+                v_wt,
+                rms_wt,
+                cs_fn,
+                gs_tok,
+                bits_tok,
+                quote! { #symbol_lit },
+            ],
+        );
+        rewritten.push(synth);
+        i += 5;
+    }
+    lowered.instances = rewritten;
+}
+
 /// Compiler-driven synthesis (MLP side): detect the contiguous
 /// `(FusedAddRmsNorm, AffineQmm gate, AffineQmm up, SiluMul)` chain
 /// in the fully-unrolled per-claim `OpInstance` list and replace each

@@ -4718,7 +4718,7 @@ impl Implementation for FusedAddRmsNormImpl {
         _m: &MatchInfo,
         _fuf: &Fuf,
     ) -> Option<Box<dyn crate::atom::Atom>> {
-        Some(Box::new(crate::atom_lib::AddRmsNormAtom))
+        Some(Box::new(crate::atom_lib::AddRmsNormAtom::default()))
     }
 
     fn fan_out(

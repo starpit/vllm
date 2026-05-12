@@ -49,8 +49,15 @@ use crate::atom::{
 /// Output channel `x_norm`: TG-mem `{T_act} x_norm[HIDDEN_MAX]`. The
 /// fuse pass binds this channel to the kernel's actual TG-mem array
 /// name and threads it to the AffineQmv consumer.
-#[derive(Clone, Debug)]
-pub struct AddRmsNormAtom;
+#[derive(Clone, Debug, Default)]
+pub struct AddRmsNormAtom {
+    /// Layer-0 mode: skip the `residual += delta` step and the
+    /// per-Q-head residual writeback. The kernel reads `residual_io`
+    /// as the already-correct input (i.e. the embedding output) and
+    /// just normalizes it. `delta` is still bound (the lowering arm
+    /// keeps the binding count stable) but the kernel never reads it.
+    pub init: bool,
+}
 
 impl Atom for AddRmsNormAtom {
     fn kind(&self) -> AtomKind {
@@ -104,6 +111,41 @@ impl Atom for AddRmsNormAtom {
         let out = &ctx.bound_outputs[0]; // x_norm (TG memory)
 
         let t_act = ctx.t_act;
+        if self.init {
+            // Layer-0 mode: `residual_io` is the (already-final) input
+            // (the embedding output). No delta to add, no residual
+            // writeback (the caller's downstream consumer reads the
+            // same `residual_io` unchanged).
+            return Some(format!(
+                r#"
+    // --- atom: AddRmsNorm (init: layer-0 / no residual add) ---
+    {{
+        device const {t_act}* __res_row = (device const {t_act}*){res} + (size_t)__t * (size_t)__hidden;
+        float __local_sumsq = 0.0f;
+        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
+            const float __v = float(__res_row[__i]);
+            __local_sumsq += __v * __v;
+            {out}[__i] = {t_act}(__v);
+        }}
+        const float __scale = mk_tg_rmsnorm_scale(__local_sumsq, __hidden, __eps,
+                                                  __scratch, __num_simdgroups,
+                                                  __simd_gid, __simd_lid);
+        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
+            const float __v_pre  = float({out}[__i]);
+            const float __w      = float({rw}[__i]);
+            {out}[__i] = {t_act}(__v_pre * __scale * __w);
+        }}
+        mk_sync();
+        (void){del};
+    }}
+"#,
+                t_act = t_act,
+                res = res,
+                del = del,
+                rw = rw,
+                out = out,
+            ));
+        }
         // Body sourced from fused_add_rmsnorm_affine_qkv_rope_cache.metal:
         // each thread reads its strided slice of (residual, delta) over
         // HIDDEN, accumulates sumsq, mk_tg_rmsnorm_scale, then writes

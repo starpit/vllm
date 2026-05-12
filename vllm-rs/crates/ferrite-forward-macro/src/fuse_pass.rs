@@ -75,6 +75,30 @@ pub fn synthesize_pre_attn_chunk(
     t_scale: &'static str,
     consts: &ChunkConstants,
 ) -> SynthesizedKernel {
+    synthesize_pre_attn_chunk_impl(backend, t_act, t_scale, consts, false)
+}
+
+/// Layer-0 variant: emits the same kernel as `synthesize_pre_attn_chunk`
+/// but without the `residual += delta` step and without the per-Q-head
+/// residual writeback. Symbol name is `synth_pre_attn_init_<t_act>_<t_scale>_gs<gs>`.
+/// The lowering arm binds the input slot to BOTH the `residual_io` and
+/// `delta` bindings — the kernel never reads `delta` in init mode.
+pub fn synthesize_pre_attn_init_chunk(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    synthesize_pre_attn_chunk_impl(backend, t_act, t_scale, consts, true)
+}
+
+fn synthesize_pre_attn_chunk_impl(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+    init: bool,
+) -> SynthesizedKernel {
     assert_eq!(
         backend,
         SynthesisBackend::Metal,
@@ -128,7 +152,7 @@ pub fn synthesize_pre_attn_chunk(
         ("EPS",         AtomConstantValue::Float(consts.rms_norm_eps)),
     ];
 
-    let addrms = AddRmsNormAtom;
+    let addrms = AddRmsNormAtom { init };
     let rope   = RopeAppendAtom;
     // One AffineQmvAtom per QKV band — the only thing that varies
     // between bands is the local-head expression (each band's weight
@@ -227,12 +251,21 @@ pub fn synthesize_pre_attn_chunk(
     // Symbol name: deterministic hash of the atom sequence + dtype + gs.
     // For the MVP we just use a readable name; production version uses
     // a structural hash.
-    let symbol = format!(
-        "synth_pre_attn_{}_{}_gs{}",
-        t_act,
-        t_scale,
-        consts.group_size,
-    );
+    let symbol = if init {
+        format!(
+            "synth_pre_attn_init_{}_{}_gs{}",
+            t_act,
+            t_scale,
+            consts.group_size,
+        )
+    } else {
+        format!(
+            "synth_pre_attn_{}_{}_gs{}",
+            t_act,
+            t_scale,
+            consts.group_size,
+        )
+    };
 
     let source_tail = format!(
         r#"
@@ -421,7 +454,7 @@ pub fn synthesize_mlp_pre_down_chunk(
         ("EPS",          AtomConstantValue::Float(consts.rms_norm_eps)),
     ];
 
-    let addrms = AddRmsNormAtom;
+    let addrms = AddRmsNormAtom::default();
     let silu_mul = SiluMulAtom;
     // Both qmv bands address row 0..intermediate of their own
     // separate weight buffer — local_head_expr is just `__head` (the

@@ -1096,6 +1096,117 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Compiler-synthesized MLP pre-down megakernel ───────────
+        // Mirrors SynthPreAttn but for the (FusedAddRmsNorm + gate qmv
+        // + up qmv + SiluMul) chain. Output `silu_mul_out_slot` is a
+        // device buffer of shape `[M, intermediate_size]` consumed by
+        // the down-projection's standalone AffineQmm.
+        //
+        // Dispatch shape:
+        //   threadgroups = (M, INTERMEDIATE_SIZE / HEAD_DIM, 1)
+        //   threads_per_tg = MK_SIMD_SIZE * HEAD_DIM / MK_ROWS_PER_SIMDGROUP
+        // The qmv atom is reused unchanged by aliasing kernel-scope
+        // `__head_dim` = TILE_N and `__head` = tile index. TILE_N is
+        // set to HEAD_DIM so the same `32 * HEAD_DIM / 4` thread count
+        // and per-simdgroup row layout carries over from pre-attn.
+        I::SynthMlpPreDown(
+            residual_slot,
+            delta_slot,
+            silu_mul_out_slot,
+            layer,
+            gate_wt_fn,
+            up_wt_fn,
+            rms_wt_fn,
+            group_size,
+            bits,
+            symbol,
+        ) => {
+            assert_eq!(
+                *bits, 4,
+                "metal lowering: SynthMlpPreDown only wired for bits=4"
+            );
+            let _ = group_size;
+            let tile_n = W::HEAD_DIM;
+            let intermediate = W::INTERMEDIATE_SIZE as u32;
+            let num_tiles = intermediate / tile_n;
+            assert!(
+                intermediate % tile_n == 0,
+                "metal lowering: SynthMlpPreDown requires INTERMEDIATE_SIZE \
+                 ({intermediate}) divisible by HEAD_DIM ({tile_n})"
+            );
+            let threads_per_tg = 32 * tile_n / 4;
+            LoweredCommand {
+                kernel: KernelId::SynthMlpPreDown,
+                library: *symbol,
+                function: *symbol,
+                constants: vec![
+                    ConstantValue::uint(0, W::Q_SIZE as u32),
+                    ConstantValue::uint(1, intermediate),
+                    ConstantValue::uint(2, tile_n),
+                    ConstantValue::uint(3, bucket_m),
+                    ConstantValue::float(4, W::RMS_NORM_EPS),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, num_tiles, 1),
+                    threads_per_threadgroup: (threads_per_tg, 1, 1),
+                },
+                bindings: vec![
+                    // 0: silu_mul_out
+                    Binding::ArenaSlot { slot: *silu_mul_out_slot, binding_index: 0 },
+                    // 1: residual_io (read+write)
+                    Binding::ArenaSlot { slot: *residual_slot, binding_index: 1 },
+                    // 2: delta (read)
+                    Binding::ArenaSlot { slot: *delta_slot, binding_index: 2 },
+                    // 3: rms_weight
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm(*rms_wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 3,
+                    },
+                    // 4..6: gate weight + scales + biases
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*gate_wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 4,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*gate_wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: *layer + layer_offset,
+                        binding_index: 5,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*gate_wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: *layer + layer_offset,
+                        binding_index: 6,
+                    },
+                    // 7..9: up weight + scales + biases
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*up_wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 7,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*up_wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: *layer + layer_offset,
+                        binding_index: 8,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*up_wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: *layer + layer_offset,
+                        binding_index: 9,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Decode-bucket attention (single query token / seq) ─────
         I::AttentionViaCache(q_slot, out_slot, layer, _cos_sin_fn, _is_decode) => {
             // 2D dispatch: (batch, num_q_heads). Each threadgroup

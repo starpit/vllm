@@ -634,6 +634,38 @@ pub enum Instruction<W> {
         u32,
         &'static str,
     ),
+    /// Compiler-synthesized MLP pre-down chunk megakernel. Metal-only.
+    /// Combines (FusedAddRmsNorm → AffineQmv gate → AffineQmv up →
+    /// SiluMul) into one dispatch, leaving the down-projection as a
+    /// standalone `AffineQmm` consumer of the synthesized output. The
+    /// kernel itself is generated at macro-expansion time by
+    /// `ferrite-forward-macro::fuse_pass::synthesize_mlp_pre_down_chunk`;
+    /// the symbol name carried here resolves at runtime against a
+    /// per-arch source-compiled library registered into the
+    /// `SpecializedPipelineCache` at worker-pool init.
+    ///
+    /// Tuple fields: `(residual_slot, delta_slot, silu_mul_out_slot,
+    /// layer, gate_weight_fn, up_weight_fn, rms_weight_fn, group_size,
+    /// bits, kernel_symbol)`.
+    ///
+    /// Two separate `WtFn<W, LinearLayer>`s (gate, up) — each
+    /// AffineQmm in the detected chain contributes its own LinearLayer
+    /// accessor. The standalone `AffineQmm` for down_proj follows
+    /// directly in the instruction stream as before.
+    ///
+    /// CUDA eval is `unreachable!`.
+    SynthMlpPreDown(
+        u32,
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
+        WtFn<W, ferrite_kernels::layers::RmsNorm>,
+        u32,
+        u32,
+        &'static str,
+    ),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
@@ -3069,6 +3101,12 @@ impl<W: CanonicalParams> Instruction<W> {
             Instruction::SynthPreAttn(..) => {
                 unreachable!(
                     "Instruction::SynthPreAttn is metal-only — emitted by the \
+                     compiler-driven megakernel synthesis pass on the metal forward only"
+                );
+            }
+            Instruction::SynthMlpPreDown(..) => {
+                unreachable!(
+                    "Instruction::SynthMlpPreDown is metal-only — emitted by the \
                      compiler-driven megakernel synthesis pass on the metal forward only"
                 );
             }

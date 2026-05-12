@@ -148,6 +148,16 @@ pub enum KernelId {
     /// Kernel body is generated at macro-expansion time by
     /// `ferrite-forward-macro::fuse_pass`.
     SynthPreAttn,
+    /// Compiler-synthesized MLP pre-down megakernel. Symbol resolves
+    /// against a per-arch source-compiled library registered at worker
+    /// init via `SpecializedPipelineCache::register_source_library`.
+    /// Kernel body is generated at macro-expansion time by
+    /// `ferrite-forward-macro::fuse_pass::synthesize_mlp_pre_down_chunk`.
+    /// Fuses `FusedAddRmsNorm + gate AffineQmv + up AffineQmv + SiluMul`
+    /// into one dispatch; the standalone `AffineQmm` down_proj
+    /// instruction follows immediately and consumes the device-buffer
+    /// `silu_mul` output.
+    SynthMlpPreDown,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source

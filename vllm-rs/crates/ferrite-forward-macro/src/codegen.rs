@@ -4923,20 +4923,34 @@ fn emit_synthesized_kernel_sources_override(model: &ModelParams) -> TokenStream 
         group_size,
         rms_norm_eps: 0.0,
     };
-    let kernel = crate::fuse_pass::synthesize_pre_attn_chunk(
+    let pre_attn = crate::fuse_pass::synthesize_pre_attn_chunk(
         crate::fuse_pass::SynthesisBackend::Metal,
         t_act,
         t_scale,
         &consts,
     );
-    let symbol = kernel.symbol;
-    let source = kernel.source;
-    let symbol_lit = syn::LitStr::new(&symbol, proc_macro2::Span::call_site());
-    let source_lit = syn::LitStr::new(&source, proc_macro2::Span::call_site());
+    let mlp_pre_down = crate::fuse_pass::synthesize_mlp_pre_down_chunk(
+        crate::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let pa_symbol_lit =
+        syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
+    let pa_source_lit =
+        syn::LitStr::new(&pre_attn.source, proc_macro2::Span::call_site());
+    let md_symbol_lit =
+        syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
+    let md_source_lit =
+        syn::LitStr::new(&mlp_pre_down.source, proc_macro2::Span::call_site());
     quote! {
         fn synthesized_kernel_sources() -> &'static [(&'static str, &'static str)] {
-            const __SYNTH_SRC: &str = #source_lit;
-            &[(#symbol_lit, __SYNTH_SRC)]
+            const __SYNTH_PRE_ATTN_SRC: &str = #pa_source_lit;
+            const __SYNTH_MLP_PRE_DOWN_SRC: &str = #md_source_lit;
+            &[
+                (#pa_symbol_lit, __SYNTH_PRE_ATTN_SRC),
+                (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_SRC),
+            ]
         }
     }
 }
@@ -5404,6 +5418,11 @@ pub fn emit_model(
     for (cl, _, _, _, _) in canonical_lowered.values_mut() {
         if let Some(tag) = synth_t_act {
             crate::interpreter_codegen::apply_synth_replacement(
+                &mut arch_opcodes,
+                &mut cl.backbone,
+                tag,
+            );
+            crate::interpreter_codegen::apply_synth_replacement_mlp(
                 &mut arch_opcodes,
                 &mut cl.backbone,
                 tag,

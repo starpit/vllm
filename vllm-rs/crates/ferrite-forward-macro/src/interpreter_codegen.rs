@@ -775,6 +775,185 @@ pub fn apply_synth_replacement(
     lowered.instances = rewritten;
 }
 
+/// Compiler-driven synthesis (MLP side): detect the contiguous
+/// `(FusedAddRmsNorm, AffineQmm gate, AffineQmm up, SiluMul)` chain
+/// in the fully-unrolled per-claim `OpInstance` list and replace each
+/// match with one `SynthMlpPreDown` instance. Runs AFTER
+/// `apply_synth_replacement` (the pre-attn matcher) and BEFORE
+/// `apply_loop_compression`.
+///
+/// The chain shape lives entirely within a single layer body — the
+/// FusedAddRmsNorm here is the **post-attention** norm (residual
+/// absorbs `attn_delta` and produces the MLP-input norm), not the
+/// pre-attention norm the pre-attn matcher consumes. Connectivity:
+/// gate.in == up.in == fused_arn.delta_out; silu_mul.gate == gate.out,
+/// silu_mul.up == up.out. The standalone down-projection AffineQmm
+/// follows in the stream and consumes `silu_mul.out` directly.
+///
+/// Symbol name must match `fuse_pass::synthesize_mlp_pre_down_chunk`
+/// for the same `(t_act, t_scale, group_size)`.
+pub fn apply_synth_replacement_mlp(
+    arch_opcodes: &mut ArchOpcodes,
+    lowered: &mut LoweredBucket,
+    t_act_tag: &'static str,
+) {
+    use proc_macro2::Span;
+    use quote::quote;
+    use syn::LitStr;
+
+    arch_opcodes.register(synth_mlp_pre_down_opcode_shape());
+
+    let synth_ident = syn::Ident::new("SynthMlpPreDown", Span::call_site());
+    let i_fused_add_rmsnorm = syn::Ident::new("FusedAddRmsNorm", Span::call_site());
+    let i_affine_qmm = syn::Ident::new("AffineQmm", Span::call_site());
+    let i_silu_mul = syn::Ident::new("SiluMul", Span::call_site());
+
+    let instances = std::mem::take(&mut lowered.instances);
+    let mut rewritten: Vec<OpInstance> = Vec::with_capacity(instances.len());
+    let mut i = 0usize;
+    while i < instances.len() {
+        if i + 4 > instances.len() {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+        let a = &instances[i];     // FusedAddRmsNorm
+        let g = &instances[i + 1]; // AffineQmm gate
+        let u = &instances[i + 2]; // AffineQmm up
+        let s = &instances[i + 3]; // SiluMul
+
+        if a.name != i_fused_add_rmsnorm
+            || g.name != i_affine_qmm
+            || u.name != i_affine_qmm
+            || s.name != i_silu_mul
+        {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        // Field-shape sanity:
+        //   FusedAddRmsNorm(delta_slot, residual_slot, layer, wt_fn)        — 4
+        //   AffineQmm(in_slot, out_slot, layer, wt_fn, n, k, gs, bits, vl)  — 9
+        //   SiluMul(gate_slot, up_slot, out_slot)                           — 3
+        if a.field_values.len() != 4
+            || g.field_values.len() != 9
+            || u.field_values.len() != 9
+            || s.field_values.len() != 3
+        {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        let st = |ts: &proc_macro2::TokenStream| ts.to_string();
+        let delta_slot = st(&a.field_values[0]);
+        let layer_a = st(&a.field_values[2]);
+
+        let g_in   = st(&g.field_values[0]);
+        let g_out  = st(&g.field_values[1]);
+        let g_lay  = st(&g.field_values[2]);
+        let g_gs   = st(&g.field_values[6]);
+        let g_bits = st(&g.field_values[7]);
+
+        let u_in   = st(&u.field_values[0]);
+        let u_out  = st(&u.field_values[1]);
+        let u_lay  = st(&u.field_values[2]);
+        let u_gs   = st(&u.field_values[6]);
+        let u_bits = st(&u.field_values[7]);
+
+        let s_gate = st(&s.field_values[0]);
+        let s_up   = st(&s.field_values[1]);
+
+        let connectivity_ok = g_in == delta_slot
+            && u_in == delta_slot
+            && g_lay == layer_a
+            && u_lay == layer_a
+            && g_gs == u_gs
+            && g_bits == u_bits
+            && g_bits.starts_with("4")
+            && s_gate == g_out
+            && s_up == u_out;
+        if !connectivity_ok {
+            rewritten.push(instances[i].clone());
+            i += 1;
+            continue;
+        }
+
+        let residual_slot = a.field_values[1].clone();
+        let delta_slot_tok = a.field_values[0].clone();
+        let silu_mul_out_slot = s.field_values[2].clone();
+        let layer_tok = a.field_values[2].clone();
+        let gate_wt = g.field_values[3].clone();
+        let up_wt = u.field_values[3].clone();
+        let rms_wt = a.field_values[3].clone();
+        let gs_tok = g.field_values[6].clone();
+        let bits_tok = g.field_values[7].clone();
+        let gs_str: String = g_gs
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let symbol = format!(
+            "synth_mlp_pre_down_{}_half_gs{}",
+            t_act_tag, gs_str
+        );
+        let symbol_lit = LitStr::new(&symbol, Span::call_site());
+        let synth = OpInstance::new(
+            synth_ident.clone(),
+            vec![
+                residual_slot,
+                delta_slot_tok,
+                silu_mul_out_slot,
+                layer_tok,
+                gate_wt,
+                up_wt,
+                rms_wt,
+                gs_tok,
+                bits_tok,
+                quote! { #symbol_lit },
+            ],
+        );
+        rewritten.push(synth);
+        i += 4;
+    }
+    lowered.instances = rewritten;
+}
+
+/// OpcodeShape for `Instruction::SynthMlpPreDown`. Field-for-field
+/// match with the variant declared in `ferrite-forward::instr`.
+fn synth_mlp_pre_down_opcode_shape() -> OpcodeShape {
+    OpcodeShape::new(
+        "SynthMlpPreDown",
+        vec![
+            ("residual_slot", syn::parse_quote!(u32)),
+            ("delta_slot", syn::parse_quote!(u32)),
+            ("out_slot", syn::parse_quote!(u32)),
+            ("layer", syn::parse_quote!(u32)),
+            (
+                "gate_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "up_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "rms_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                ),
+            ),
+            ("group_size", syn::parse_quote!(u32)),
+            ("bits", syn::parse_quote!(u32)),
+            ("kernel_symbol", syn::parse_quote!(&'static str)),
+        ],
+    )
+}
+
 /// OpcodeShape for `Instruction::SynthPreAttn`. Must match the
 /// variant declared in `ferrite-forward::instr` field-for-field
 /// (codegen panics on shape disagreement).

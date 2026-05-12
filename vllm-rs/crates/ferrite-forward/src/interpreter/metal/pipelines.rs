@@ -321,7 +321,8 @@ mod tests {
                 | KernelId::SiluMul
                 | KernelId::SplitKReduceSum
                 | KernelId::FusedAffineQkvRopeCache
-                | KernelId::SynthPreAttn,
+                | KernelId::SynthPreAttn
+            | KernelId::SynthMlpPreDown,
                 _,
             ) => {
                 unreachable!(

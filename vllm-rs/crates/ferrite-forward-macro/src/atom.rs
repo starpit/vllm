@@ -44,6 +44,10 @@ pub enum AtomKind {
     Silu,
     /// Per-element multiply (silu_mul second half).
     Mul,
+    /// Fused `silu(gate) * up` over two TG-memory float channels,
+    /// writing the result as `T_act` to a device buffer. Used in the
+    /// MLP pre-down synth chunk.
+    SiluMul,
     /// Residual write-back to the layer's residual buffer (one TG
     /// owns a disjoint slice; producer of the input to the next
     /// layer's AddRmsNorm).

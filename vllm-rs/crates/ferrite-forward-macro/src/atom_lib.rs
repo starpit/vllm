@@ -460,6 +460,99 @@ impl Atom for RopeAppendAtom {
     }
 }
 
+/// SiluMul atom: reads two TG-memory float vectors (`gate_smem`,
+/// `up_smem`), each of length `__head_dim` (= TILE_N in the MLP
+/// pre-down synth kernel scope), computes `silu(g) * u` per element
+/// (`silu(g) = g / (1 + exp(-g))`), and writes the result as `T_act`
+/// to the device buffer `silu_mul_out` at row `__t`, tile-base
+/// `__head * __head_dim`. The full output row width is
+/// `__intermediate` columns — kernel scope must declare it.
+///
+/// Same per-simdgroup row-of-MK_ROWS_PER_SIMDGROUP layout as
+/// `RopeAppendAtom`'s epilogue — only lane 0 of each simdgroup
+/// stores; the floats it reads from TG memory were produced by
+/// `AffineQmvAtom` (which has `qmv_smem[__simd_gid*4 + r]` as its
+/// per-simdgroup write target, aliased here to `gate_smem` and
+/// `up_smem`).
+#[derive(Clone, Debug)]
+pub struct SiluMulAtom;
+
+impl Atom for SiluMulAtom {
+    fn kind(&self) -> AtomKind {
+        // The kind discriminator is shared with the standalone
+        // SiluMul Instruction. The atom emits the per-tile epilogue
+        // that the standalone kernel would otherwise emit as its
+        // own dispatch.
+        AtomKind::SiluMul
+    }
+
+    fn signature(&self) -> AtomSignature {
+        AtomSignature {
+            inputs: vec![
+                AtomChannel {
+                    name: "gate_smem".into(),
+                    kind: ChannelKind::Threadgroup,
+                    ty: "float".into(),
+                },
+                AtomChannel {
+                    name: "up_smem".into(),
+                    kind: ChannelKind::Threadgroup,
+                    ty: "float".into(),
+                },
+            ],
+            outputs: vec![AtomChannel {
+                name: "silu_mul_out".into(),
+                kind: ChannelKind::Device,
+                ty: "{T_act}".into(),
+            }],
+        }
+    }
+
+    fn dispatch_shape(&self, _ctx: &AtomCtx) -> AtomDispatchShape {
+        AtomDispatchShape {
+            threadgroups: (0, 0, 1),
+            threads_per_threadgroup: (0, 1, 1),
+        }
+    }
+
+    fn fuseability(&self) -> Fuseability {
+        Fuseability::WithSameDispatch
+    }
+
+    fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
+        let g   = &ctx.bound_inputs[0];  // gate_smem
+        let u   = &ctx.bound_inputs[1];  // up_smem
+        let out = &ctx.bound_outputs[0]; // silu_mul_out (device)
+
+        let t_act = ctx.t_act;
+
+        Some(format!(
+            r#"
+    // --- atom: SiluMul ---
+    {{
+        if (__simd_lid == 0) {{
+            const uint __base_d = __simd_gid * MK_ROWS_PER_SIMDGROUP;
+            device {t_act}* __out_row = {out}
+                + (size_t)__t    * (size_t)__intermediate
+                + (size_t)__head * (size_t)__head_dim;
+            for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++) {{
+                const uint __d  = __base_d + (uint)__r;
+                const float __gv = {g}[__d];
+                const float __uv = {u}[__d];
+                const float __sg = __gv / (1.0f + exp(-__gv));
+                __out_row[__d] = {t_act}(__sg * __uv);
+            }}
+        }}
+    }}
+"#,
+            t_act = t_act,
+            g = g,
+            u = u,
+            out = out,
+        ))
+    }
+}
+
 // Silence unused-import warnings in this scaffolding module.
 #[allow(dead_code)]
 fn _atom_lib_uses() {

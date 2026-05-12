@@ -1120,6 +1120,27 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
+            Instruction::SynthMlpPreDown(
+                residual_slot,
+                delta_slot,
+                out_slot,
+                layer,
+                _gate_wf,
+                _up_wf,
+                _rms_wf,
+                _group_size,
+                _bits,
+                _symbol,
+            ) => (
+                "SynthMlpPreDown",
+                vec![
+                    F::Slot(residual_slot),
+                    F::Slot(delta_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
             Instruction::SiluMul(gate_slot, up_slot, out_slot) => (
                 "SiluMul",
                 vec![F::Slot(gate_slot), F::Slot(up_slot), F::Slot(out_slot)],

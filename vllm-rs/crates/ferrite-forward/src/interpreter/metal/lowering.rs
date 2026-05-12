@@ -218,10 +218,6 @@ fn lower_one<W: CanonicalParams>(
                 },
             ],
             gemm_dims: None,
-            output_arena_slots: vec![*out_slot],
-            input_arena_slots: vec![],
-            writes_kv_layer: None,
-            reads_kv_layer: None,
         },
 
         // ── Standalone RMSNorm ─────────────────────────────────────
@@ -267,10 +263,6 @@ fn lower_one<W: CanonicalParams>(
                 },
             ],
             gemm_dims: None,
-            output_arena_slots: vec![*out_slot],
-            input_arena_slots: vec![*in_slot],
-            writes_kv_layer: None,
-            reads_kv_layer: None,
         },
 
         // ── Fused residual-add + RMSNorm ───────────────────────────
@@ -311,17 +303,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                // fused_add_rmsnorm_specialized kernel actually
-                // writes BOTH binding(0)=residual (in-place add
-                // target) AND binding(1)=delta ("overwritten with
-                // normed result" per the kernel doc). Missing the
-                // delta write left lm_head readers of the normed
-                // slot racing the FusedAddRmsNorm in selective-
-                // barrier mode.
-                output_arena_slots: vec![*residual_slot, *delta_slot],
-                input_arena_slots: vec![*delta_slot, *residual_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: None,
             }
         }
 
@@ -369,10 +350,6 @@ fn lower_one<W: CanonicalParams>(
                     n: *n,
                     k: *k,
                 }),
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![*in_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: None,
             }
         }
 
@@ -436,10 +413,6 @@ fn lower_one<W: CanonicalParams>(
                         *wt_fn,
                     ),
                     gemm_dims: None,
-                    output_arena_slots: vec![*out_slot],
-                    input_arena_slots: vec![*in_slot],
-                    writes_kv_layer: None,
-                    reads_kv_layer: None,
                 }
             } else {
                 // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
@@ -479,10 +452,6 @@ fn lower_one<W: CanonicalParams>(
                                 *wt_fn,
                             ),
                             gemm_dims: None,
-                            output_arena_slots: vec![*out_slot],
-                            input_arena_slots: vec![*in_slot],
-                            writes_kv_layer: None,
-                            reads_kv_layer: None,
                         }
                     }
                     QmmTKernel::SplitK { split_k, k_partition_size } => {
@@ -529,20 +498,6 @@ fn lower_one<W: CanonicalParams>(
                                 *wt_fn,
                             ),
                             gemm_dims: None,
-                            // qmm_t_splitk writes the [split_k, M, N]
-                            // partial into the shared SplitK scratch
-                            // buffer. The scratch is one physical
-                            // buffer reused across every SplitK pair
-                            // in the bucket, so cross-pair ordering
-                            // hazards (qmm_t pair N writes scratch
-                            // while reduce pair N-1 still reads it)
-                            // need a sentinel slot id in the
-                            // hazard graph. Use `u32::MAX` — outside
-                            // the legal arena slot range.
-                            output_arena_slots: vec![u32::MAX],
-                            input_arena_slots: vec![*in_slot],
-                            writes_kv_layer: None,
-                            reads_kv_layer: None,
                         };
 
                         // splitk_reduce_sum: bindings (0=output → out_slot,
@@ -568,14 +523,6 @@ fn lower_one<W: CanonicalParams>(
                                 Binding::Scratch { binding_index: 1 },
                             ],
                             gemm_dims: None,
-                            output_arena_slots: vec![*out_slot],
-                            // Reads the shared SplitK scratch
-                            // (sentinel slot `u32::MAX`), then
-                            // writes the reduced result into the
-                            // arena's out_slot.
-                            input_arena_slots: vec![u32::MAX],
-                            writes_kv_layer: None,
-                            reads_kv_layer: None,
                         };
                         return Ok(vec![qmm_t_cmd, reduce_cmd]);
                     }
@@ -621,10 +568,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![*gate_slot, *up_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: None,
             }
         }
 
@@ -714,10 +657,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![],
-                writes_kv_layer: None,
-                reads_kv_layer: None,
             }
         }
 
@@ -816,10 +755,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![*in_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: None,
             }
         }
 
@@ -903,15 +838,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                // RopeAppend rotates Q/K/V in place (q/k/v_slot are
-                // prefixed `_` because the kernel only takes the
-                // _out_ slots, treating them as in-place RW), and
-                // writes the rotated K/V to the layer's paged KV
-                // cache.
-                output_arena_slots: vec![*q_out_slot, *k_out_slot, *v_out_slot],
-                input_arena_slots: vec![*q_out_slot, *k_out_slot, *v_out_slot],
-                writes_kv_layer: Some(*layer + layer_offset),
-                reads_kv_layer: None,
             }
         }
 
@@ -1010,10 +936,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![*in_slot],
-                writes_kv_layer: Some(*layer + layer_offset),
-                reads_kv_layer: None,
             }
         }
 
@@ -1167,15 +1089,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                // SynthPreAttn fuses FusedAddRmsNorm into the pre-
-                // attention block: residual_slot is read+written
-                // in-place (add of delta_slot, then norm input);
-                // q_out_slot is the q-projection output; K/V land in
-                // the layer's paged KV cache.
-                output_arena_slots: vec![*q_out_slot, *residual_slot],
-                input_arena_slots: vec![*residual_slot, *delta_slot],
-                writes_kv_layer: Some(*layer + layer_offset),
-                reads_kv_layer: None,
             }
         }
 
@@ -1284,13 +1197,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                // SynthMlpPreDown fuses FusedAddRmsNorm in-place on
-                // residual_slot, then writes the silu(gate)*up
-                // intermediate into silu_mul_out_slot.
-                output_arena_slots: vec![*silu_mul_out_slot, *residual_slot],
-                input_arena_slots: vec![*residual_slot, *delta_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: None,
             }
         }
 
@@ -1360,10 +1266,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![*q_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: Some(*layer + layer_offset),
             }
         }
 
@@ -1457,10 +1359,6 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: None,
-                output_arena_slots: vec![*out_slot],
-                input_arena_slots: vec![*q_slot],
-                writes_kv_layer: None,
-                reads_kv_layer: Some(*layer + layer_offset),
             }
         }
 
@@ -1490,10 +1388,6 @@ fn lower_one<W: CanonicalParams>(
                 },
             ],
             gemm_dims: None,
-            output_arena_slots: vec![*residual_slot],
-            input_arena_slots: vec![*delta_slot, *residual_slot],
-            writes_kv_layer: None,
-            reads_kv_layer: None,
         },
 
         // ── Scalar-multiply broadcast ──────────────────────────────
@@ -1521,10 +1415,6 @@ fn lower_one<W: CanonicalParams>(
                 // no runtime binding needed.
             ],
             gemm_dims: None,
-            output_arena_slots: vec![*out_slot],
-            input_arena_slots: vec![*in_slot],
-            writes_kv_layer: None,
-            reads_kv_layer: None,
         },
 
         // ── Metadata-only: no Metal dispatch ───────────────────────

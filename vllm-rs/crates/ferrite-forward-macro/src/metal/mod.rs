@@ -9,6 +9,7 @@
 pub mod activation;
 pub mod add;
 pub mod dataflow;
+pub mod synth_pre_attn;
 pub mod affine_embed;
 pub mod affine_qmm;
 pub mod attention;

@@ -578,18 +578,24 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .ok_or(WorkerError::WeightLookupFailed {
                     reason: "MTL4 path requested but bucket has no mtl4_steps (Gemm or too-many-bindings fallback)",
                 })?;
-        // MTL4 compute encoders do NOT auto-serialize successive
-        // dispatches the way MTL3's default-Serial encoder does;
-        // without an explicit barrier every kernel races every other.
-        // Conservative Phase-A correctness: insert a Dispatch→Dispatch
-        // barrier with Device-visibility cache flush between every
-        // pair of dispatches in the encoder. Phase C will refine this
-        // to only barrier across actual RAW hazards.
-        let mut first = true;
+        // Phase-C: per-dispatch barrier flag baked at lowering time
+        // from the compile-time DAG
+        // (`LoweredCommand.{output_arena_slots, input_arena_slots,
+        // writes_kv_layer, reads_kv_layer}`). MTL4 compute encoders
+        // do NOT auto-serialize successive dispatches — we still
+        // insert a `Dispatch→Dispatch` barrier with Device-visibility
+        // cache flush wherever the bake walk found a RAW/WAW/WAR
+        // hazard, but independent dispatches in the same encoder run
+        // concurrently.
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
-            for (table, (tg, tpt)) in step.tables.iter().zip(step.dispatches.iter()) {
-                if !first {
+            for ((table, (tg, tpt)), need_barrier) in step
+                .tables
+                .iter()
+                .zip(step.dispatches.iter())
+                .zip(step.barrier_before.iter())
+            {
+                if *need_barrier {
                     enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                         MTLStages::Dispatch,
                         MTLStages::Dispatch,
@@ -598,7 +604,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(*tg, *tpt);
-                first = false;
             }
         }
         Ok(())
@@ -1128,6 +1133,14 @@ fn bake_bucket<W: CanonicalParams>(
     };
     let mut ctx = RecordingContext::new(device.clone(), icb_capacity).map_err(WorkerError::Recording)?;
     let mut steps: Vec<BucketStep> = Vec::new();
+    // Phase-C MTL4 hazard analysis: one Vec<Dataflow> per
+    // BucketStep::Icb, mirroring its `direct_bindings`. Built
+    // alongside `steps` from the compile-time
+    // `LoweredCommand.{output_arena_slots, input_arena_slots,
+    // writes_kv_layer, reads_kv_layer}` fields. Gemm steps get an
+    // empty `Vec<Dataflow>` (their MTL4 path bails anyway, but the
+    // shape needs to match steps.len() for the hazard walk).
+    let mut step_dataflows: Vec<Vec<super::mtl4::Dataflow>> = Vec::new();
     // Unique buffers referenced by ICB commands. Used at firing time
     // to satisfy the `inheritBuffers=false` residency contract via
     // `useResources`. Identity is by raw `metal::Buffer` pointer —
@@ -1219,6 +1232,10 @@ fn bake_bucket<W: CanonicalParams>(
                         n: dims.n,
                         k: dims.k,
                     });
+                    // MPS GEMM step — MTL4 bake bails on the whole
+                    // bucket if it sees one of these, so the
+                    // dataflow vec is shape-only filler.
+                    step_dataflows.push(vec![]);
                 }
                 MetalDtype::Bf16 => {
                     let pipeline = pipelines
@@ -1284,6 +1301,20 @@ fn bake_bucket<W: CanonicalParams>(
                             }
                             direct_bindings.push(bindings_for_cmd);
                             direct_dispatch.push(dispatch_for_cmd);
+                            // bf16 GEMM uses the `c=output, a=input,
+                            // b=weight` binding contract — output is
+                            // c.buffer (corresponds to cmd's out
+                            // slot), input is a.buffer (in slot).
+                            // The Dataflow refers to *arena slot
+                            // ids*, which are exactly what
+                            // `LoweredCommand.output_arena_slots /
+                            // input_arena_slots` carry.
+                            step_dataflows.last_mut().unwrap().push(super::mtl4::Dataflow {
+                                writes_arena: cmd.output_arena_slots.clone(),
+                                reads_arena: cmd.input_arena_slots.clone(),
+                                writes_kv_layer: cmd.writes_kv_layer,
+                                reads_kv_layer: cmd.reads_kv_layer,
+                            });
                         }
                         _ => {
                             steps.push(BucketStep::Icb {
@@ -1294,6 +1325,12 @@ fn bake_bucket<W: CanonicalParams>(
                                 direct_bindings: vec![bindings_for_cmd],
                                 direct_dispatch: vec![dispatch_for_cmd],
                             });
+                            step_dataflows.push(vec![super::mtl4::Dataflow {
+                                writes_arena: cmd.output_arena_slots.clone(),
+                                reads_arena: cmd.input_arena_slots.clone(),
+                                writes_kv_layer: cmd.writes_kv_layer,
+                                reads_kv_layer: cmd.reads_kv_layer,
+                            }]);
                         }
                     }
                 }
@@ -1413,6 +1450,12 @@ fn bake_bucket<W: CanonicalParams>(
                 }
                 direct_bindings.push(bindings_for_cmd);
                 direct_dispatch.push(dispatch_for_cmd);
+                step_dataflows.last_mut().unwrap().push(super::mtl4::Dataflow {
+                    writes_arena: cmd.output_arena_slots.clone(),
+                    reads_arena: cmd.input_arena_slots.clone(),
+                    writes_kv_layer: cmd.writes_kv_layer,
+                    reads_kv_layer: cmd.reads_kv_layer,
+                });
             }
             _ => {
                 steps.push(BucketStep::Icb {
@@ -1423,11 +1466,17 @@ fn bake_bucket<W: CanonicalParams>(
                     direct_bindings: vec![bindings_for_cmd],
                     direct_dispatch: vec![dispatch_for_cmd],
                 });
+                step_dataflows.push(vec![super::mtl4::Dataflow {
+                    writes_arena: cmd.output_arena_slots.clone(),
+                    reads_arena: cmd.input_arena_slots.clone(),
+                    writes_kv_layer: cmd.writes_kv_layer,
+                    reads_kv_layer: cmd.reads_kv_layer,
+                }]);
             }
         }
     }
 
-    let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device);
+    let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &step_dataflows, &device);
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         icb: ctx,

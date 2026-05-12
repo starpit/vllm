@@ -411,6 +411,29 @@ pub struct LoweredCommand<W: CanonicalParams> {
     /// `DispatchShape` because MPS does not consume threadgroup
     /// counts — the dimensions are the actual API parameters.
     pub gemm_dims: Option<GemmDims>,
+    /// Phase-C MTL4 dataflow: arena slots this command writes
+    /// (output / in-place mutated). Sourced directly from the
+    /// `Instruction<W>` variant pattern at lowering time, so it
+    /// mirrors the compile-time FUF DAG without a separate
+    /// `KernelId` classifier. Empty `Vec` means "I don't know /
+    /// be conservative" — the MTL4 hazard walk treats unknown
+    /// commands as touching every prior slot.
+    pub output_arena_slots: Vec<u32>,
+    /// Phase-C MTL4 dataflow: arena slots this command reads.
+    /// Includes slots that are also in `output_arena_slots` for
+    /// in-place ops (e.g. `FusedAddRmsNorm.residual`). Same
+    /// unknown-fallback semantics as `output_arena_slots`.
+    pub input_arena_slots: Vec<u32>,
+    /// Phase-C MTL4 dataflow: per-layer KV cache write side-effect
+    /// (`RopeAppend` and the fused-QKV megakernels write
+    /// `kv_cache_k[layer]` + `kv_cache_v[layer]`). Different layers
+    /// touch different buffers, so the layer index is the hazard
+    /// unit. `None` = command does not write the KV cache.
+    pub writes_kv_layer: Option<u32>,
+    /// Phase-C MTL4 dataflow: per-layer KV cache read side-effect
+    /// (`AttentionViaCache` / paged prefill read
+    /// `kv_cache_k[layer]` + `kv_cache_v[layer]`).
+    pub reads_kv_layer: Option<u32>,
 }
 
 /// Dense-GEMM dimensions for `KernelId::Gemm`.

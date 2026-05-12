@@ -4,6 +4,36 @@ Single-file pickup doc for any machine. Written 2026-05-12 at HEAD `5d04524e8`. 
 
 ---
 
+## Orient first — run these before reading further
+
+```bash
+git -C $WORKTREE log --oneline -10
+git -C $WORKTREE status
+cd $WORKTREE/vllm-rs
+FERRITE_MODELS=llama-3.2-3b-mlx-affine-b4-g64 \
+  cargo build --release -Fmetal --bin vllm
+./target/release/vllm chat --device metal \
+  --model mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --bench --max-tokens 200 -p "Write a 200-word poem about the ocean."
+./target/release/vllm ferrite info llama 3.2 3b mlx \
+  | grep -E "SynthPreAttn|SynthMlpPreDown|FusedAddRmsNorm"
+```
+
+If chat produces a coherent poem and bench reports ~46 tok/s on M4 (or whatever your chip's number is — capture it), the synth-solver migration is healthy and you're picking up from a green baseline. If anything panics or produces gibberish, that's the work — drop everything else.
+
+## Then do this next
+
+**Track 1 below: NAX / MPP `matmul2d` on M4+.** The single biggest perf lever, ~16 % gap to `mlx_lm.generate` is largely hardware MMA we don't use. Concrete first action:
+
+1. Read `feedback_mpp_confirmed` (in source via `git log --all --oneline | grep -i mpp` for context commits) — MPP `matmul2d` works with per-simdgroup execution + `cooperative_tensor`.
+2. Open `vllm-rs/crates/ferrite-metal-kernels/include/metal_kittens.h` — `mk_qmv_fast` is the scalar dot-product loop to replace on M4.
+3. Add an `Apple9`-gated `mk_qmv_nax` variant; runtime checks `device.supportsFamily(MTLGPUFamily::Apple9)` and dispatches the NAX path on M4+ / falls back to `mk_qmv_fast` on M1–M3.
+4. Re-sweep `cost_m4.csv` so the solver sees the new costs; the synth Impls benefit for free.
+
+Skip if you're on M1–M3 (NAX hardware doesn't exist there); pick a different track below.
+
+---
+
 ## What works today
 
 `vllm chat --device metal --model <model>` and `vllm bench latency --device metal --model <model>` run end-to-end on both **M4** and **M1 Max**, with coherent output. Models confirmed running:
@@ -93,7 +123,11 @@ Filterable families: `rmsnorm`, `affine_qmv`, `affine_qmm`, `synth_pre_attn`, `s
 
 ## Remaining work
 
-Independent tracks; pick any.
+Tracks 1–3 are the high-leverage perf moves. 4–9 are correctness / coverage / cleanup. Pick by chip + interest:
+
+- **On M4+:** start with track 1 (NAX). Then track 2 (MLP synth redesign — pairs naturally with NAX).
+- **On M1 Max / M1–M3:** start with track 3 (MTL4 migration). NAX doesn't help; MTL4 is OS-gated, not hardware-gated, and modernizes the dispatch path everywhere.
+- **Correctness or stuck on perf?** Tracks 4 (long-decode panic), 5 (safetensors zero-copy), or 8 (Phi-3 LongRoPE).
 
 ### 1. NAX / MPP `matmul2d` (M4+ only) — biggest perf lever on M4
 

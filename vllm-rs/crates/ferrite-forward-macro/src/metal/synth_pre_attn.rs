@@ -209,16 +209,15 @@ impl Implementation for MetalSynthPreAttnImpl {
         })
     }
 
-    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Read the swept synth cost when the CSV has a row for this
-        // bucket. The sweep wires through to
-        // `fuse_pass::synthesize_pre_attn_chunk` to compile + bench
-        // the actual synth kernel; absent that row, fall back to the
-        // sum of the unfused component costs (FusedAddRmsNorm +
-        // 3×AffineQmm + RopeAppend). The solver then picks via tie-
-        // break on (a) the small bias below favoring Synth for one
-        // fewer dispatch's worth of host-side overhead, or (b) any
-        // explicit CSV row if calibrated.
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // Prefer the swept synth-kernel row when the CSV has one for
+        // this chip + bucket. Absent that, synthesize a component-sum
+        // analytical estimate — the same shape `FusedAddRmsNormImpl`
+        // / `MetalAffineQmmImpl` / `MetalRopeAppendImpl` each fall
+        // back to. The solver then picks fused vs unfused on a tiny
+        // bias toward Synth (one fewer dispatch's worth of host
+        // overhead) rather than the 1e9 sentinel that used to keep
+        // this Impl out of the running on uncalibrated chips.
         let num_tokens = ctx.num_tokens() as u32;
         let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
         let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as u32;
@@ -231,7 +230,6 @@ impl Implementation for MetalSynthPreAttnImpl {
         let q_n = num_q.saturating_mul(head_dim);
         let kv_n = num_kv.saturating_mul(head_dim);
 
-        let _ = (q_n, kv_n, hidden, num_tokens);
         let synth_name = format!(
             "synth_pre_attn_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,
@@ -239,17 +237,56 @@ impl Implementation for MetalSynthPreAttnImpl {
         if let Some(cost) = ctx.profile.cost_us_for(&synth_name, num_tokens, hidden, 0) {
             return cost;
         }
-        // No swept synth cost for this chip yet. Return a very
-        // large finite cost so the solver never picks this Impl in
-        // the absence of real measurement — `apply_synth_replacement`
-        // (post-pass) + `bucket_m < 2` gate (2393cf820) continue to
-        // drive the fusion decision until the sweep emits
-        // synth_pre_attn rows. Once it does, this returns measured
-        // cost and the solver takes over (and the post-pass can be
-        // removed). f64::INFINITY trips the solver's finite-cost
-        // invariant ("cost_fn returned None"), so use a large but
-        // bounded value instead.
-        1.0e9
+
+        if hidden == 0 || q_n == 0 || kv_n == 0 {
+            return 1.0e9;
+        }
+
+        let bw = ctx.profile.memory_bandwidth_gbps;
+        let tflops = ctx.profile.peak_tflops_fp16;
+        if bw <= 0.0 || tflops <= 0.0 {
+            return 1.0e9;
+        }
+        let act_bytes = 2.0_f64;
+        let mf = num_tokens.max(1) as f64;
+        let h = hidden as f64;
+        let qn = q_n as f64;
+        let kvn = kv_n as f64;
+
+        // Norm step. `init=true` is a singleton RmsNorm (one [M,N]
+        // read + one [M,N] write); `init=false` is FusedAddRmsNorm
+        // with the residual read + residual_out write
+        // (matches `FusedAddRmsNormImpl::analytical_cost_us` with
+        // `has_residual_out=true` — synth always emits the writeback
+        // for the next layer's chain).
+        let norm_bytes = if self.init {
+            mf * h * act_bytes * 2.0 + h * act_bytes
+        } else {
+            mf * h * act_bytes * 4.0 + h * act_bytes
+        };
+        let norm_us = norm_bytes / 1e9 / bw * 1e6;
+
+        // 3×AffineQmm (Q+K+V). Mirror `MetalAffineQmmImpl::
+        // analytical_cost_us` (compute-roofline at peak_tflops_fp16)
+        // summed across the three N's. The qmv/qmm_t kernels
+        // dequantize in-register so peak compute is the right
+        // roofline regardless of the int4 BW saving.
+        let total_n = qn + 2.0 * kvn;
+        let gemm_flops = 2.0 * mf * h * total_n;
+        let gemm_us = gemm_flops / (tflops * 1e12) * 1e6;
+
+        // RopeAppend. Mirror `MetalRopeAppendImpl::analytical_cost_us`
+        // — bandwidth-bound on `2 * (q_n + kv_n) * M` elements (Q+K
+        // input/output streams). cos_sin cache adds the third read
+        // term.
+        let rope_elems = mf * (qn + kvn);
+        let rope_bytes = 5.0 * rope_elems * act_bytes;
+        let rope_us = rope_bytes / 1e9 / bw * 1e6;
+
+        // Small bias toward Synth so the solver picks fused on tie
+        // (one fewer dispatch's worth of host overhead, ~2-5 µs on
+        // Apple silicon).
+        (norm_us + gemm_us + rope_us) * 0.95
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {

@@ -28,6 +28,34 @@
 > we rely on. P16 now has a real baseline to A/B vs `mlx_lm.generate`
 > against.
 
+> **TWO MAJOR PERF DIRECTIONS — open TODOs (2026-05-12):**
+>
+> 1. **MTL4 command-encoding migration** (OS-gated; M1–M4
+>    compatible). `objc2-metal 0.3.2` has the bindings:
+>    `MTL4CommandBuffer`, `MTL4CommandQueue`, `MTL4CommandAllocator`,
+>    `MTL4ComputeCommandEncoder`, `MTL4ArgumentTable`. Replaces the
+>    current ICB-on-Serial-encoder hack (a workaround for Apple's
+>    `ConcurrentDispatch`-only compute-ICB API) with MTL4's native
+>    compute sequencing. `MTL4ArgumentTable` replaces ~18
+>    `setBuffer`/dispatch with one table bind. Plausibly fixes the
+>    open M1 Max `MTLCommandBufferStatus(5)` failure (current ICB
+>    hack is most likely M1 trigger). **Requires macOS 15+ / 26+**;
+>    no hardware exclusivity. Tracked in
+>    `project_ferrite_metal_status.md` under "What's next — TODO 1".
+>
+> 2. **NAX / `MetalPerformancePrimitives.matmul2d`** (M4+ hardware
+>    only). Already documented as **P7** below; gating predicate
+>    refined to `macOS 26.2+ runtime + arch_gen ≥ 17` (≥18 for `'p'`
+>    arch), not `Apple9 + arch_gen ≥ 13` (see P0 notes above).
+>    Largest single perf lever on M4 — accounts for most of the ~16%
+>    gap to `mlx_lm.generate` on M4. Falls back to existing
+>    `mk_qmv_fast` on M1–M3 (same path MLX uses).
+>
+> Sequencing: MTL4 first (broader applicability, may unblock M1),
+> NAX second (M4-specific perf). The MTL4 argument-table model is
+> also the preferred binding model for MPP-backed kernels — they
+> compose.
+
 
 
 | Phase | State | Commit | Notes |

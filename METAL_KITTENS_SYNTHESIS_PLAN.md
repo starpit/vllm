@@ -341,6 +341,17 @@ Extend fuse pass to the (o_proj + AddRmsNorm + gate + up + silu + mul
 
 Add `mk_mma`, `mk_load_tile`, `mk_store_tile`, `mk_qload_tile`.
 
+**M4+ NAX path (open TODO).** On Apple Family 9+ (M4 / A18 Pro+,
+macOS 26.2+ runtime + arch_gen ≥ 17 — refined gate per
+INT4_PARITY_PROBES.md), `mk_mma` should select `MetalPerformancePrimitives.matmul2d` +
+`cooperative_tensor` (the hardware MMA path MLX uses on M4). On
+M1–M3 fall back to the simdgroup-scalar tile-MMA implementation —
+same dual-path strategy MLX uses. Largest single perf lever on M4
+(accounts for most of the ~16% gap to `mlx_lm.generate`). See
+`feedback_mpp_confirmed` for the verified MPP `matmul2d` +
+`cooperative_tensor` surface. Coordinates with INT4_PARITY_PLAN.md
+P7 (the NAX qmm_t / qmm_n integration).
+
 ### Phase 6 — Prefill fuse pass
 
 Extend fuse pass to prefill claims. Synthesizes qmm_t-based
@@ -387,6 +398,35 @@ Each phase requires:
 - No tok/s regression on **both** M4 and M1 Max.
 - Generated `.metal` files reviewable in `OUT_DIR/synthesized_kernels/`.
 - `vllm ferrite info` shows the expected dispatch structure.
+
+## Orthogonal runtime TODO: MTL4 command-encoding migration
+
+The synthesis pipeline is independent of the command-encoding model
+used to dispatch the synthesized kernels. Today the pool encodes via
+MTLCommandBuffer + a per-step ICB on a Serial encoder — a hack to
+serialize Apple's `ConcurrentDispatch`-only compute-ICB API.
+
+`objc2-metal 0.3.2` exposes `MTL4CommandBuffer`, `MTL4CommandQueue`,
+`MTL4CommandAllocator`, `MTL4ComputeCommandEncoder`, and
+`MTL4ArgumentTable`. Migration would:
+
+- Replace ICB-on-Serial-encoder with native MTL4 compute sequencing
+  (compute dependencies are first-class in MTL4, no Concurrent-only
+  workaround).
+- Replace ~18 `setBuffer` calls per dispatch with one `setArgumentTable`
+  bind built once at warmup. Real CPU encoder savings on top of the
+  ICB savings already shipped.
+- Potentially fix the open M1 Max `MTLCommandBufferStatus(5)` failure
+  — the ICB hack is the most likely M1 trigger and MTL4 sidesteps
+  the whole `ConcurrentDispatch` constraint.
+
+**OS-gated (macOS 15+ / 26+); no hardware exclusivity** — works on
+M1 Max through M4. Composes with the M4+ NAX path: MTL4 argument
+tables are also the preferred binding model for MPP-backed kernels.
+
+Tracked alongside INT4_PARITY_PLAN.md "open TODOs" section.
+Scope-A experiment: side-by-side on the m=1..2 decode bucket, decision
+point after measured A/B vs the MTL3 path. ≥5% win → full migration.
 
 ## Build-speed notes (for iteration)
 

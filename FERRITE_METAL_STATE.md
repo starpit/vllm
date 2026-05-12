@@ -12,9 +12,17 @@ git -C $WORKTREE status
 cd $WORKTREE/vllm-rs
 FERRITE_MODELS=llama-3.2-3b-mlx-affine-b4-g64 \
   cargo build --release -Fmetal --bin vllm
+
+# M1 Max: MTL3 crashes; MTL4 is the only working path. Use this:
+FERRITE_METAL_MTL4=1 ./target/release/vllm chat --device metal \
+  --model mlx-community/Llama-3.2-3B-Instruct-4bit \
+  --bench --max-tokens 200 -p "Write a 200-word poem about the ocean."
+
+# M4 (MTL3 still works as default; MTL4 also works under the env flag):
 ./target/release/vllm chat --device metal \
   --model mlx-community/Llama-3.2-3B-Instruct-4bit \
   --bench --max-tokens 200 -p "Write a 200-word poem about the ocean."
+
 ./target/release/vllm ferrite info llama 3.2 3b mlx \
   | grep -E "SynthPreAttn|SynthMlpPreDown|FusedAddRmsNorm"
 ```
@@ -126,7 +134,7 @@ Filterable families: `rmsnorm`, `affine_qmv`, `affine_qmm`, `synth_pre_attn`, `s
 Tracks 1–3 are the high-leverage perf moves. 4–9 are correctness / coverage / cleanup. Pick by chip + interest:
 
 - **On M4+:** start with track 1 (NAX). Then track 2 (MLP synth redesign — pairs naturally with NAX).
-- **On M1 Max / M1–M3:** start with track 3 step A.4 — bench MTL4 under `FERRITE_METAL_MTL4=1` and decide whether to flip the default. NAX doesn't help these chips; MTL4 is OS-gated, already wired side-by-side, and modernizing the dispatch path is the next concrete move.
+- **On M1 Max / M1–M3:** track 3. MTL3 crashes on M1 Max so you must run with `FERRITE_METAL_MTL4=1`; first move is to flip the default and stop relying on the env var, then land Phase B + remaining C. NAX (track 1) doesn't help these chips.
 - **Correctness or stuck on perf?** Tracks 4 (long-decode panic), 5 (safetensors zero-copy), or 8 (Phi-3 LongRoPE).
 
 ### 1. NAX / MPP `matmul2d` (M4+ only) — biggest perf lever on M4
@@ -144,22 +152,25 @@ Constraints:
 
 Fix: matmul-tile dispatch + shared-mem reduction so the norm runs once per token, not once per (token, intermediate-tile). Re-running the sweep auto-picks the new variant if it scores lower than unfused. Pairs naturally with track 1 (NAX MMA).
 
-### 3. MTL4 migration
+### 3. MTL4 migration — finish it; MTL4 is the only working path on M1 Max
 
-**Already wired side-by-side; behind `FERRITE_METAL_MTL4=1` opt-in.** Default runtime path is still MTL3 (`MTLCommandBuffer` + Serial compute encoder + ICB). MTL4 path lives in `interpreter/metal/mtl4.rs` + pool wiring at `pool.rs:271,608+`; pick-up via `device.newMTL4CommandQueue()` at warmup. `FERRITE_METAL_MTL4_MIGRATION.md` is the executable plan.
+**MTL3 crashes on M1 Max. MTL4 works.** The env-var gate (`FERRITE_METAL_MTL4=1`) is not a "side-by-side experiment" — it's the only way to get a non-crashing forward on M1 Max today. Treat MTL4 as the production target and rip MTL3 out once the remaining phases land.
 
-Landed: A.1 probe (`ad7a4e5e1`), A.2 + A.3 bake-time + runtime path (`4d790077f`), partial Phase C compile-time DAG barrier analysis (`51c4ab812`, `59ac9b7ff`).
+Wired and running today (`interpreter/metal/mtl4.rs`, pool at `pool.rs:271,608+`; pick-up via `device.newMTL4CommandQueue()` at warmup):
+- A.1 probe (`ad7a4e5e1`)
+- A.2 + A.3 bake-time + runtime path (`4d790077f`)
+- Partial Phase C compile-time DAG barrier analysis (`51c4ab812`, `59ac9b7ff`)
 
 Open:
-- **A.4 — bench + decide.** Run the m=1..2 decode bucket under `FERRITE_METAL_MTL4=1` vs default and capture the delta. If ≥5 % win, commit to flipping the default.
+- **Flip the default.** Drop the `FERRITE_METAL_MTL4` env-var gate, make MTL4 the default whenever `device.newMTL4CommandQueue()` returns Some (macOS 15+ on Apple Family 7+). MTL3 stays only as a fallback for older OS. Also capture an A/B bench on M4 (m=1..2 decode) for the record, but the M1 Max evidence already makes the call — MTL3 isn't an option there.
 - **B — MTL4Compiler + serialized pipeline cache.** Today MTL4 path rebuilds compute pipelines per warmup; B caches them.
-- **C (rest) — explicit barriers, kill conservative serialization.** Compile-time barrier analysis already lands per `59ac9b7ff`; rest of C wires the runtime to emit only the necessary barriers.
+- **C (rest) — explicit barriers, kill conservative serialization.** Compile-time barrier analysis already lands per `59ac9b7ff`; rest of C wires the runtime to emit only the necessary barriers instead of full Serial.
 - **D — stitched compute pipelines.** Research phase; follow-up.
 
-Wins when the default flips:
+Why MTL4 wins anyway (independent of M1 crash):
 - `MTL4ArgumentTable` collapses ~18 `setBuffer` calls/dispatch into one bind for the synth kernels.
-- MTL4 has compute sequencing as a first-class concept — replaces the current "executeCommandsInBuffer-on-Serial-encoder" hack we use because compute ICBs only ship `ConcurrentDispatch`.
-- OS-gated (macOS 15+), not hardware-gated. Helps M1–M4.
+- MTL4 has compute sequencing as a first-class concept — replaces the "executeCommandsInBuffer-on-Serial-encoder" hack we use because compute ICBs only ship `ConcurrentDispatch`.
+- OS-gated (macOS 15+), not hardware-gated.
 
 ### 4. Long-decode panic
 

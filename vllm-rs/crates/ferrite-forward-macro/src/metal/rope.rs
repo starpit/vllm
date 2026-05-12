@@ -67,6 +67,15 @@ impl Implementation for MetalRopeAppendImpl {
         }
     }
 
+    fn kv_layer_io(
+        &self,
+        claimed_tiles: &[crate::fuf::TileId],
+        fuf: &crate::fuf::Fuf,
+    ) -> (Option<u32>, Option<u32>) {
+        // RopeAppend writes the per-layer paged KV cache.
+        (crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf), None)
+    }
+
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
         profile.backend == Backend::Metal
     }
@@ -229,6 +238,14 @@ impl Implementation for MetalRopeAppendInterleavedImpl {
             "bf16" => "metal_rope_append_interleaved_bf16",
             _ => "metal_rope_append_interleaved",
         }
+    }
+
+    fn kv_layer_io(
+        &self,
+        claimed_tiles: &[crate::fuf::TileId],
+        fuf: &crate::fuf::Fuf,
+    ) -> (Option<u32>, Option<u32>) {
+        (crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf), None)
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {

@@ -8,6 +8,7 @@
 
 pub mod activation;
 pub mod add;
+pub mod dataflow;
 pub mod affine_embed;
 pub mod affine_qmm;
 pub mod attention;

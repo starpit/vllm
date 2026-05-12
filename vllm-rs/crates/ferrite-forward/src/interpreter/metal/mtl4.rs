@@ -43,6 +43,12 @@ pub struct Mtl4Step {
     pub pipeline: ComputePipelineState,
     pub tables: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
     pub dispatches: Vec<(MTLSize, MTLSize)>,
+    /// One barrier-before flag per sub-dispatch (parallel to
+    /// `tables` / `dispatches`). Sourced from the macro-emitted
+    /// `LoweredMetalTape::barrier_before` — no runtime analysis.
+    /// `true` means the runtime must emit a `Dispatch→Dispatch`
+    /// MTL4 encoder barrier before this sub-dispatch.
+    pub barrier_before: Vec<bool>,
 }
 
 /// Build one `Mtl4Step` per `BucketStep::Icb`. Returns `None` if any
@@ -58,9 +64,11 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                 pipeline,
                 direct_bindings,
                 direct_dispatch,
+                barrier_before,
                 ..
             } => {
                 debug_assert_eq!(direct_bindings.len(), direct_dispatch.len());
+                debug_assert_eq!(direct_bindings.len(), barrier_before.len());
                 let mut tables = Vec::with_capacity(direct_bindings.len());
                 for cmd_bindings in direct_bindings {
                     let max_idx = cmd_bindings
@@ -92,6 +100,7 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                     pipeline: pipeline.clone(),
                     tables,
                     dispatches: direct_dispatch.clone(),
+                    barrier_before: barrier_before.clone(),
                 });
             }
         }

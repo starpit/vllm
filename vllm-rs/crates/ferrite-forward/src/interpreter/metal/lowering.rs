@@ -59,17 +59,22 @@ use super::lowered::{
 pub fn lower_pair<W: CanonicalParams>(
     backbone: &[Instruction<W>],
     lm_head: &[Instruction<W>],
+    backbone_barriers: &[bool],
+    lm_head_barriers: &[bool],
     bucket_m: u32,
     num_arena_slots: u32,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
-    let bb = lower(backbone, bucket_m, num_arena_slots)?;
-    let lh = lower(lm_head, bucket_m, num_arena_slots)?;
+    let bb = lower(backbone, backbone_barriers, bucket_m, num_arena_slots)?;
+    let lh = lower(lm_head, lm_head_barriers, bucket_m, num_arena_slots)?;
     let mut commands = bb.commands;
     commands.extend(lh.commands);
+    let mut barrier_before = bb.barrier_before;
+    barrier_before.extend(lh.barrier_before);
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
         commands,
+        barrier_before,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
     })
 }
@@ -88,12 +93,25 @@ pub fn lower_pair<W: CanonicalParams>(
 /// per-shape-class arena.
 pub fn lower<W: CanonicalParams>(
     instructions: &[Instruction<W>],
+    barriers_in: &[bool],
     bucket_m: u32,
     num_arena_slots: u32,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
     let mut commands = Vec::with_capacity(instructions.len());
+    let mut barrier_before: Vec<bool> = Vec::with_capacity(instructions.len());
     let mut splitk_scratch_bytes: u32 = 0;
     let mut i = 0usize;
+    // Macro-static-aligned barrier accessor: the macro emits one bool
+    // per `Instruction` (pre-loop-unrolling). Loop expansion at
+    // runtime reuses the body's flags across every iteration —
+    // body byte-equivalence (the precondition for the macro's loop
+    // compression) guarantees the same hazard signature per iter.
+    // For metadata-only instructions (Reshape/Alias/Free), no
+    // LoweredCommand is emitted so the flag is unused. For the
+    // SplitK matmul pair (2 LoweredCommands from 1 Instruction),
+    // the first emit takes the macro flag; the second emit gets
+    // `true` (intra-Instruction scratch RAW).
+    let flag_for = |idx: usize| -> bool { barriers_in.get(idx).copied().unwrap_or(true) };
 
     while i < instructions.len() {
         match &instructions[i] {
@@ -128,23 +146,39 @@ pub fn lower<W: CanonicalParams>(
                             iter as u32,
                             &mut splitk_scratch_bytes,
                         )?;
+                        let n_cmds = cmds.len();
                         commands.extend(cmds);
+                        if n_cmds >= 1 {
+                            barrier_before.push(flag_for(body_start + offset));
+                            for _ in 1..n_cmds {
+                                barrier_before.push(true);
+                            }
+                        }
                     }
                 }
                 i = body_end;
             }
             other => {
                 let cmds = lower_one(other, i, bucket_m, 0, &mut splitk_scratch_bytes)?;
+                let n_cmds = cmds.len();
                 commands.extend(cmds);
+                if n_cmds >= 1 {
+                    barrier_before.push(flag_for(i));
+                    for _ in 1..n_cmds {
+                        barrier_before.push(true);
+                    }
+                }
                 i += 1;
             }
         }
     }
 
+    debug_assert_eq!(commands.len(), barrier_before.len());
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
         commands,
+        barrier_before,
         splitk_scratch_bytes,
     })
 }

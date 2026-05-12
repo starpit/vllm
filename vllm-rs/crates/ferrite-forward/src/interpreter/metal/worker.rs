@@ -108,6 +108,13 @@ pub enum BucketStep {
         direct_bindings: Vec<Vec<(Buffer, u64, u64)>>,
         /// Per-command dispatch shape: `(threadgroups, threads_per_threadgroup)`.
         direct_dispatch: Vec<(MTLSize, MTLSize)>,
+        /// Per-sub-dispatch barrier-before flag (parallel to
+        /// `direct_bindings`/`direct_dispatch`). Sourced from
+        /// `LoweredMetalTape::barrier_before` at bake time. The
+        /// MTL3 ICB execution path ignores this (the encoder's
+        /// default Serial dispatch handles ordering); the MTL4
+        /// path consumes it via `Mtl4Step.barrier_before`.
+        barrier_before: Vec<bool>,
     },
     Gemm {
         /// Activation buffer bound to MPS' `leftMatrix` (shape
@@ -580,16 +587,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 })?;
         // MTL4 compute encoders do NOT auto-serialize successive
         // dispatches the way MTL3's default-Serial encoder does;
-        // without an explicit barrier every kernel races every other.
-        // Conservative Phase-A correctness: insert a Dispatch→Dispatch
-        // barrier with Device-visibility cache flush between every
-        // pair of dispatches in the encoder. Phase C will refine this
-        // to only barrier across actual RAW hazards.
-        let mut first = true;
+        // the per-sub-dispatch `barrier_before` flag was computed
+        // at macro time by `ferrite-forward-macro::interpreter_codegen
+        // ::lower_bucket` from the FUF dataflow + `Implementation::
+        // kv_layer_io`. Runtime does zero analysis — just emits a
+        // `Dispatch→Dispatch` barrier wherever the flag fires.
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
-            for (table, (tg, tpt)) in step.tables.iter().zip(step.dispatches.iter()) {
-                if !first {
+            for ((table, (tg, tpt)), need_barrier) in step
+                .tables
+                .iter()
+                .zip(step.dispatches.iter())
+                .zip(step.barrier_before.iter())
+            {
+                if *need_barrier {
                     enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                         MTLStages::Dispatch,
                         MTLStages::Dispatch,
@@ -598,7 +609,6 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(*tg, *tpt);
-                first = false;
             }
         }
         Ok(())
@@ -1261,6 +1271,11 @@ fn bake_bucket<W: CanonicalParams>(
                         ctx.record_compute_dispatch(&pipeline, &bound_refs, tg, tpt);
                     }
                     let recorded_at = cmd_idx;
+                    let cmd_barrier = tape
+                        .barrier_before
+                        .get(cmd_idx)
+                        .copied()
+                        .unwrap_or(true);
                     match steps.last_mut() {
                         Some(BucketStep::Icb {
                             pipeline: prev,
@@ -1268,6 +1283,7 @@ fn bake_bucket<W: CanonicalParams>(
                             step_resources,
                             direct_bindings,
                             direct_dispatch,
+                            barrier_before,
                             ..
                         }) if same_pipeline(prev, &pipeline) => {
                             range.end = recorded_at + 1;
@@ -1284,6 +1300,7 @@ fn bake_bucket<W: CanonicalParams>(
                             }
                             direct_bindings.push(bindings_for_cmd);
                             direct_dispatch.push(dispatch_for_cmd);
+                            barrier_before.push(cmd_barrier);
                         }
                         _ => {
                             steps.push(BucketStep::Icb {
@@ -1293,6 +1310,7 @@ fn bake_bucket<W: CanonicalParams>(
                                 step_resources: step_resources_for_cmd,
                                 direct_bindings: vec![bindings_for_cmd],
                                 direct_dispatch: vec![dispatch_for_cmd],
+                                barrier_before: vec![cmd_barrier],
                             });
                         }
                     }
@@ -1389,6 +1407,11 @@ fn bake_bucket<W: CanonicalParams>(
                 bind_summary.join(","),
             );
         }
+        let cmd_barrier = tape
+            .barrier_before
+            .get(cmd_idx)
+            .copied()
+            .unwrap_or(true);
         match steps.last_mut() {
             Some(BucketStep::Icb {
                 pipeline: prev,
@@ -1396,6 +1419,7 @@ fn bake_bucket<W: CanonicalParams>(
                 step_resources,
                 direct_bindings,
                 direct_dispatch,
+                barrier_before,
                 ..
             }) if same_pipeline(prev, &pipeline) => {
                 range.end = recorded_at + 1;
@@ -1413,6 +1437,7 @@ fn bake_bucket<W: CanonicalParams>(
                 }
                 direct_bindings.push(bindings_for_cmd);
                 direct_dispatch.push(dispatch_for_cmd);
+                barrier_before.push(cmd_barrier);
             }
             _ => {
                 steps.push(BucketStep::Icb {
@@ -1422,6 +1447,7 @@ fn bake_bucket<W: CanonicalParams>(
                     step_resources: step_resources_for_cmd,
                     direct_bindings: vec![bindings_for_cmd],
                     direct_dispatch: vec![dispatch_for_cmd],
+                    barrier_before: vec![cmd_barrier],
                 });
             }
         }
@@ -1912,6 +1938,7 @@ mod tests {
                 fused_add_rmsnorm,
             ],
             splitk_scratch_bytes: 0,
+            barrier_before: Vec::new(),
         }
     }
 
@@ -2143,6 +2170,7 @@ mod tests {
             num_arena_slots: 2,
             commands: vec![attn],
             splitk_scratch_bytes: 0,
+            barrier_before: Vec::new(),
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2222,6 +2250,7 @@ mod tests {
             num_arena_slots: 2,
             commands: vec![build_gemm_command(1, 2048, 2048)],
             splitk_scratch_bytes: 0,
+            barrier_before: Vec::new(),
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2339,6 +2368,7 @@ mod tests {
             num_arena_slots: 2,
             commands: vec![rmsnorm_pre, build_gemm_command(1, 2048, 2048), rmsnorm_post],
             splitk_scratch_bytes: 0,
+            barrier_before: Vec::new(),
         };
 
         let worker = MetalWorker::<TestWeights>::new(

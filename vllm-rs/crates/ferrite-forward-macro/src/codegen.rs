@@ -5495,14 +5495,24 @@ pub fn emit_model(
                 for extra in term_imp.extra_opcode_shapes() {
                     arch_opcodes.register(extra);
                 }
+                let n = term_emits.len();
                 crate::interpreter_codegen::LoweredBucket {
                     instances: term_emits,
+                    // Terminal Impl (lm_head) is emitted ad-hoc here
+                    // outside the FUF walker, so we don't have its
+                    // dataflow. Conservative all-barriers — runtime
+                    // serializes the lm_head dispatches. Upgrading
+                    // this to a proper analysis means running the
+                    // same walker against the terminal Impl's
+                    // claimed tiles.
+                    barriers: vec![true; n],
                     num_slots,
                     final_slot: terminal_slot,
                 }
             }
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
                 instances: Vec::new(),
+                barriers: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
             },
@@ -5618,6 +5628,20 @@ pub fn emit_model(
             &lm_head_static_ident,
             &shapes_by_name,
             &lowered.lm_head.instances,
+        ));
+        // Metal MTL4 barrier flags, computed at FUF/SlotMap level
+        // by `lower_bucket` (one bool per `OpInstance`). Length
+        // tracks the corresponding instructions static. Runtime
+        // consumes via `MetalBucketSpec.{backbone,lm_head}_barriers`.
+        let bb_barriers_ident = bucket_static_ident("BACKBONE_BARRIERS_M", *wp);
+        let lh_barriers_ident = bucket_static_ident("LM_HEAD_BARRIERS_M", *wp);
+        static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
+            &bb_barriers_ident,
+            &lowered.backbone.barriers,
+        ));
+        static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
+            &lh_barriers_ident,
+            &lowered.lm_head.barriers,
         ));
     }
 
@@ -5780,6 +5804,8 @@ pub fn emit_model(
         let canonical = bucket_canonical[i];
         let bb_static = bucket_static_ident("BACKBONE_M", canonical);
         let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
+        let bb_barriers_static = bucket_static_ident("BACKBONE_BARRIERS_M", canonical);
+        let lh_barriers_static = bucket_static_ident("LM_HEAD_BARRIERS_M", canonical);
         let (_, num_slots_b, _, terminal_slot_b, slots_b) = &canonical_lowered[&canonical];
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
@@ -5836,6 +5862,8 @@ pub fn emit_model(
                 arena_bytes: #arena_static_ident,
                 backbone: #bb_static,
                 lm_head: #lm_static,
+                backbone_barriers: #bb_barriers_static,
+                lm_head_barriers: #lh_barriers_static,
             },
         });
     }

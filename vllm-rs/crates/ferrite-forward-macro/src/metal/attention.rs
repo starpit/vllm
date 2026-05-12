@@ -156,6 +156,17 @@ impl MetalAttentionImpl {
 }
 
 impl Implementation for MetalAttentionImpl {
+    fn kv_layer_io(
+        &self,
+        claimed_tiles: &[crate::fuf::TileId],
+        fuf: &crate::fuf::Fuf,
+    ) -> (Option<u32>, Option<u32>) {
+        // Attention reads the per-layer paged KV cache (the rope+
+        // append upstream wrote it). All variants (paged decode,
+        // paged prefill, sliding) read from `ExternKind::KvCache`.
+        (None, crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf))
+    }
+
     fn name(&self) -> &'static str {
         match (
             self.is_sliding,

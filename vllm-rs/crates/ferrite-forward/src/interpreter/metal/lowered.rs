@@ -440,6 +440,17 @@ pub struct LoweredMetalTape<W: CanonicalParams> {
     /// per shape class.
     pub num_arena_slots: u32,
     pub commands: Vec<LoweredCommand<W>>,
+    /// MTL4 encoder barrier-before flag per command, mirroring
+    /// `commands.len()`. Sourced from the macro-emitted
+    /// `MetalBucketSpec::{backbone,lm_head}_barriers` slice (one
+    /// bool per `Instruction`) and expanded through loop
+    /// unrolling — the macro's loop-compression body has the same
+    /// barrier pattern across iterations (byte-equivalence is the
+    /// compression precondition), so iteration N's body row i
+    /// reuses iteration 0's flag at the same position. The bake
+    /// pass propagates this into `Mtl4Step.barrier_before`; the
+    /// runtime never re-derives the analysis.
+    pub barrier_before: Vec<bool>,
     /// Byte size of the shared SplitK scratch buffer the worker
     /// allocates if any `Instruction::AffineQmm` in this tape was
     /// lowered to the SplitK two-command form. Computed as

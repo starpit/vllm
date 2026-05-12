@@ -686,6 +686,36 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         Vec::new()
     }
 
+    /// Per-layer KV-cache side-effect declaration. Returns
+    /// `(writes_layer, reads_layer)` — the per-layer paged KV cache
+    /// buffer this impl writes (RopeAppend, fused QKV+cache,
+    /// SynthPreAttn) or reads (AttentionViaCache, paged prefill
+    /// attention). The layer index typically comes from a
+    /// `FufInput::Extern { kind: ExternKind::KvCache, index }` on
+    /// one of the claimed tiles — see [`kv_cache_extern_layer`].
+    ///
+    /// The FUF dependency graph doesn't model the KV cache as a
+    /// tile-output edge (it's a runtime-ambient resource, like
+    /// `input_ids`), so backends that need to schedule explicit
+    /// ordering around it (e.g. metal MTL4 encoder barriers) ask
+    /// each impl directly. CUDA backends with implicit stream
+    /// ordering can ignore the answer; they get the same
+    /// correctness for free from the stream.
+    ///
+    /// `claimed_tiles` lets a multi-tile fusion (e.g. SynthPreAttn
+    /// claims FusedAddRmsNorm + qmv_q + qmv_k + qmv_v +
+    /// RopeAppend) recover the layer index from the rope/attention
+    /// sub-tile.
+    ///
+    /// Default: `(None, None)` — no KV cache interaction.
+    fn kv_layer_io(
+        &self,
+        _claimed_tiles: &[TileId],
+        _fuf: &Fuf,
+    ) -> (Option<u32>, Option<u32>) {
+        (None, None)
+    }
+
     // ── Host-interpreter codegen ────────────────────────────────────
     //
     // Each Impl owns the shape of its own opcode — variant ident
@@ -742,6 +772,29 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     ) -> Option<Vec<OpInstance>> {
         None
     }
+}
+
+/// Walk `claimed` tiles' inputs for the first
+/// `FufInput::Extern { kind: ExternKind::KvCache, index: Some(layer) }`
+/// and return the layer index as a u32. KV-touching Impls
+/// (`RopeAppend`, fused QKV+cache, `SynthPreAttn`,
+/// `AttentionViaCache`, paged prefill attention) call this from
+/// their [`Implementation::kv_layer_io`] override — the same
+/// extern is already on the tile's input list, the Impl just
+/// declares which direction (write vs read) the layer flows.
+pub fn kv_cache_extern_layer(claimed_tiles: &[TileId], fuf: &Fuf) -> Option<u32> {
+    for &t in claimed_tiles {
+        for input in &fuf.get(t).inputs {
+            if let FufInput::Extern {
+                kind: ExternKind::KvCache,
+                index: Some(layer),
+            } = input
+            {
+                return Some(*layer as u32);
+            }
+        }
+    }
+    None
 }
 
 /// Variant declaration an Impl contributes to its arch's
@@ -6819,6 +6872,15 @@ fn rope_append_has_fused_qkv_upstream(fuf: &Fuf, rope_tile: TileId) -> bool {
 impl Implementation for FusedQkvRopeCacheImpl {
     fn name(&self) -> &'static str {
         "fused_qkv_rope_cache"
+    }
+
+    fn kv_layer_io(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> (Option<u32>, Option<u32>) {
+        // Fused QKV+rope+cache writes per-layer KV cache.
+        (kv_cache_extern_layer(claimed_tiles, fuf), None)
     }
 
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {

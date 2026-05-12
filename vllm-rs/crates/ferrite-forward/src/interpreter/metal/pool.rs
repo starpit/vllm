@@ -84,6 +84,16 @@ pub struct MetalBucketSpec<W: CanonicalParams + 'static> {
     pub arena_bytes: &'static [u64],
     pub backbone: &'static [Instruction<W>],
     pub lm_head: &'static [Instruction<W>],
+    /// MTL4 encoder barrier flags computed at macro time from the
+    /// FUF dataflow graph (one bool per `Instruction` in
+    /// `backbone`/`lm_head`). `true` means the MTL4 path must emit a
+    /// `Dispatch→Dispatch` barrier before this instruction's first
+    /// dispatched `LoweredCommand`. The runtime carries these
+    /// straight to `Mtl4Step.barrier_before`; no runtime hazard
+    /// walk. See `ferrite-forward-macro::interpreter_codegen::
+    /// lower_bucket` for the analysis.
+    pub backbone_barriers: &'static [bool],
+    pub lm_head_barriers: &'static [bool],
 }
 
 impl<W: CanonicalParams + 'static> Clone for MetalBucketSpec<W> {
@@ -424,6 +434,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let tape = lower_pair(
                 spec.backbone,
                 spec.lm_head,
+                spec.backbone_barriers,
+                spec.lm_head_barriers,
                 spec.bucket_m,
                 spec.num_arena_slots,
             )
@@ -1163,6 +1175,7 @@ mod tests {
             num_arena_slots: 2,
             commands: vec![cmd],
             splitk_scratch_bytes: 0,
+            barrier_before: Vec::new(),
         }
     }
 

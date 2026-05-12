@@ -375,6 +375,13 @@ pub struct LoweredBucket {
     /// Slot index whose `Owned` entry is the bucket fn's return
     /// value.
     pub final_slot: u32,
+    /// One `barrier_before` flag per entry in `instances`. `true`
+    /// means a concurrency-aware backend (today: metal MTL4
+    /// encoder) must serialize the dispatched instance against
+    /// every prior instance in the bucket. Computed at macro time
+    /// from the FUF dependency graph + per-`Implementation` KV-
+    /// layer-IO declarations — runtime never re-derives.
+    pub barriers: Vec<bool>,
 }
 
 /// Variant shapes the macro accumulates across every bucket of one
@@ -625,11 +632,14 @@ pub fn apply_synth_replacement(
     let i_rope_append = syn::Ident::new("RopeAppend", Span::call_site());
 
     let instances = std::mem::take(&mut lowered.instances);
+    let barriers = std::mem::take(&mut lowered.barriers);
     let mut rewritten: Vec<OpInstance> = Vec::with_capacity(instances.len());
+    let mut new_barriers: Vec<bool> = Vec::with_capacity(barriers.len());
     let mut i = 0usize;
     while i < instances.len() {
         if i + 5 > instances.len() {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -646,6 +656,7 @@ pub fn apply_synth_replacement(
             || r.name != i_rope_append
         {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -663,6 +674,7 @@ pub fn apply_synth_replacement(
             || r.field_values.len() != 9
         {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -716,6 +728,7 @@ pub fn apply_synth_replacement(
             && r_vv == v_out;
         if !connectivity_ok {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -770,9 +783,16 @@ pub fn apply_synth_replacement(
             ],
         );
         rewritten.push(synth);
+        // First original's flag — the boundary between pre-group
+        // and the start of the chain — covers the Synth's
+        // upstream RAW. Internal barriers within the 5 collapse
+        // into the megakernel itself (no inter-dispatch ordering
+        // needed for the fused kernel).
+        new_barriers.push(barriers[i]);
         i += 5;
     }
     lowered.instances = rewritten;
+    lowered.barriers = new_barriers;
 }
 
 /// Layer-0 variant of `apply_synth_replacement`: matches the
@@ -806,11 +826,14 @@ pub fn apply_synth_replacement_init(
     let i_rope_append = syn::Ident::new("RopeAppend", Span::call_site());
 
     let instances = std::mem::take(&mut lowered.instances);
+    let barriers = std::mem::take(&mut lowered.barriers);
     let mut rewritten: Vec<OpInstance> = Vec::with_capacity(instances.len());
+    let mut new_barriers: Vec<bool> = Vec::with_capacity(barriers.len());
     let mut i = 0usize;
     while i < instances.len() {
         if i + 5 > instances.len() {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -827,6 +850,7 @@ pub fn apply_synth_replacement_init(
             || r.name != i_rope_append
         {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -842,6 +866,7 @@ pub fn apply_synth_replacement_init(
             || r.field_values.len() != 9
         {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -893,6 +918,7 @@ pub fn apply_synth_replacement_init(
             && r_vv == v_out;
         if !connectivity_ok {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -939,9 +965,11 @@ pub fn apply_synth_replacement_init(
             ],
         );
         rewritten.push(synth);
+        new_barriers.push(barriers[i]);
         i += 5;
     }
     lowered.instances = rewritten;
+    lowered.barriers = new_barriers;
 }
 
 /// Compiler-driven synthesis (MLP side): detect the contiguous
@@ -978,11 +1006,14 @@ pub fn apply_synth_replacement_mlp(
     let i_silu_mul = syn::Ident::new("SiluMul", Span::call_site());
 
     let instances = std::mem::take(&mut lowered.instances);
+    let barriers = std::mem::take(&mut lowered.barriers);
     let mut rewritten: Vec<OpInstance> = Vec::with_capacity(instances.len());
+    let mut new_barriers: Vec<bool> = Vec::with_capacity(barriers.len());
     let mut i = 0usize;
     while i < instances.len() {
         if i + 4 > instances.len() {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -997,6 +1028,7 @@ pub fn apply_synth_replacement_mlp(
             || s.name != i_silu_mul
         {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -1011,6 +1043,7 @@ pub fn apply_synth_replacement_mlp(
             || s.field_values.len() != 3
         {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -1045,6 +1078,7 @@ pub fn apply_synth_replacement_mlp(
             && s_up == u_out;
         if !connectivity_ok {
             rewritten.push(instances[i].clone());
+            new_barriers.push(barriers[i]);
             i += 1;
             continue;
         }
@@ -1083,9 +1117,11 @@ pub fn apply_synth_replacement_mlp(
             ],
         );
         rewritten.push(synth);
+        new_barriers.push(barriers[i]);
         i += 4;
     }
     lowered.instances = rewritten;
+    lowered.barriers = new_barriers;
 }
 
 /// OpcodeShape for `Instruction::SynthMlpPreDown`. Field-for-field
@@ -1208,6 +1244,24 @@ pub fn apply_loop_compression(
         new_instances.push(copy);
     }
     new_instances.extend_from_slice(&lowered.instances[span_end..]);
+    // Compress barriers in lockstep with instances. The body is
+    // byte-equivalent across iterations (that's the precondition
+    // for loop compression to apply at all), so per-iteration
+    // barrier flags also repeat — keep iter-0's body slice. The
+    // Loop row inserted ahead of the body gets `false` (no
+    // dispatch). Body row 0's flag covers the boundary between
+    // the last pre-loop instance (iter 0 case) AND the last
+    // body instance of the previous iteration (iter N>0 case);
+    // both transitions have the same hazard footprint when the
+    // body is byte-equivalent, so the saved flag is correct.
+    if !lowered.barriers.is_empty() {
+        let mut new_barriers: Vec<bool> = Vec::new();
+        new_barriers.extend_from_slice(&lowered.barriers[..start]);
+        new_barriers.push(false);
+        new_barriers.extend_from_slice(&lowered.barriers[start..start + period]);
+        new_barriers.extend_from_slice(&lowered.barriers[span_end..]);
+        lowered.barriers = new_barriers;
+    }
     lowered.instances = new_instances;
 }
 
@@ -1513,6 +1567,17 @@ pub fn lower_bucket(
     // equivalence). So we don't emit Free here at all.
     let mut instances: Vec<OpInstance> =
         aliases.iter().map(|&(d, s)| alias_instance(d, s)).collect();
+    // Alias rows are metadata only — they don't dispatch on any
+    // backend — so they get `barrier_before = false`.
+    let mut barriers: Vec<bool> = vec![false; instances.len()];
+
+    // Hazard-analysis state, shared across waves (one logical MTL4
+    // encoder per bucket; barriers flush all pending sets).
+    let mut pending_writes: HashSet<u32> = HashSet::new();
+    let mut pending_reads: HashSet<u32> = HashSet::new();
+    let mut pending_kv_writes: HashSet<u32> = HashSet::new();
+    let mut pending_kv_reads: HashSet<u32> = HashSet::new();
+    let mut first_dispatch = true;
 
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
@@ -1550,13 +1615,93 @@ pub fn lower_bucket(
             for extra in imp.extra_opcode_shapes() {
                 arch_opcodes.register(extra);
             }
+
+            // Per-subgraph dataflow signature, sourced from the
+            // exact same primitives `colored_slot_map` uses:
+            // claimed-tile outputs (alias-resolved) for writes,
+            // FufInput::Tile boundary edges (alias-resolved) for
+            // reads, plus the impl's `kv_layer_io` declaration for
+            // the runtime-ambient KV cache.
+            let mut sg_writes: Vec<u32> = Vec::new();
+            let mut sg_writes_set: HashSet<u32> = HashSet::new();
+            for &t in &claimed {
+                let n_out = fuf.get(t).outputs.len().max(1) as u8;
+                for s in 0..n_out {
+                    let owner = resolve_owner((t, s));
+                    let slot = slots.of(owner.0, owner.1);
+                    if sg_writes_set.insert(slot) {
+                        sg_writes.push(slot);
+                    }
+                }
+            }
+            let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+            let mut sg_reads: Vec<u32> = Vec::new();
+            let mut sg_reads_set: HashSet<u32> = HashSet::new();
+            for &t in &claimed {
+                for input in &fuf.get(t).inputs {
+                    if let crate::fuf::FufInput::Tile { id, slot } = input
+                        && !claimed_set.contains(id)
+                    {
+                        let owner = resolve_owner((*id, *slot));
+                        let s = slots.of(owner.0, owner.1);
+                        if sg_reads_set.insert(s) {
+                            sg_reads.push(s);
+                        }
+                    }
+                }
+            }
+            let (kv_w, kv_r) = imp.kv_layer_io(&claimed, fuf);
+
+            // Hazard check against pending sets. RAW (my reads ∩
+            // pending writes) + WAW (my writes ∩ pending writes) +
+            // WAR (my writes ∩ pending reads) + KV-layer
+            // equivalents.
+            let arena_conflict = sg_reads.iter().any(|s| pending_writes.contains(s))
+                || sg_writes.iter().any(|s| pending_writes.contains(s))
+                || sg_writes.iter().any(|s| pending_reads.contains(s));
+            let kv_conflict = kv_r
+                .map(|l| pending_kv_writes.contains(&l))
+                .unwrap_or(false)
+                || kv_w
+                    .map(|l| pending_kv_writes.contains(&l) || pending_kv_reads.contains(&l))
+                    .unwrap_or(false);
+            let need_barrier = !first_dispatch && (arena_conflict || kv_conflict);
+            if need_barrier {
+                pending_writes.clear();
+                pending_reads.clear();
+                pending_kv_writes.clear();
+                pending_kv_reads.clear();
+            }
+            // Per-emit barrier flag. The first emit of an Impl's
+            // fan_out picks up the hazard flag we computed; any
+            // subsequent emits (e.g. AffineQmmTSplitK's qmm_t →
+            // reduce pair sharing scratch) are conservatively
+            // serialized — Impls that need internal concurrency
+            // can refine this later.
+            for (i, _emit) in emits.iter().enumerate() {
+                barriers.push(if i == 0 { need_barrier } else { true });
+            }
+            // Update pending sets after recording the flag.
+            pending_writes.extend(sg_writes.iter().copied());
+            pending_reads.extend(sg_reads.iter().copied());
+            if let Some(l) = kv_w {
+                pending_kv_writes.insert(l);
+            }
+            if let Some(l) = kv_r {
+                pending_kv_reads.insert(l);
+            }
+            if !emits.is_empty() {
+                first_dispatch = false;
+            }
             instances.extend(emits);
         }
     }
 
+    debug_assert_eq!(barriers.len(), instances.len());
     let final_slot = slots.of(final_tile.0, final_tile.1);
 
     LoweredBucket {
+        barriers,
         instances,
         num_slots,
         final_slot,
@@ -2289,6 +2434,7 @@ mod tests {
                 op("Norm", &["7u32", "1u32"]),
                 op("Norm", &["7u32", "2u32"]),
             ],
+            barriers: vec![false; 3],
             num_slots: 1,
             final_slot: 0,
         };
@@ -2334,6 +2480,7 @@ mod tests {
                 op("A", &["2u32"]),
                 op("B", &["3u32"]),
             ],
+            barriers: vec![false; 6],
             num_slots: 1,
             final_slot: 0,
         };
@@ -2365,6 +2512,7 @@ mod tests {
         let original = vec![op("A", &["0u32"])];
         let mut lb = LoweredBucket {
             instances: original.clone(),
+            barriers: vec![false; original.len()],
             num_slots: 1,
             final_slot: 0,
         };

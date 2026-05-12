@@ -1058,6 +1058,7 @@ fn compile_common(
                     } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_synth_"))
                     {
                         // Metal GEMM is currently routed through MPS
                         // matmul2d (see ferrite-metal-kernels::gemm);

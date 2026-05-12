@@ -5557,8 +5557,24 @@ pub fn emit_model(
             _ => None,
         }
     };
-    for (cl, _, _, _, _) in canonical_lowered.values_mut() {
-        if let Some(tag) = synth_t_act {
+    // Skip the synth fusion at bucket_m >= 2: the synth's
+    // `(M, num_heads_total)` threadgroup grid makes its AddRmsNorm
+    // phase redundantly process the residual+delta read once per
+    // (token, head) — work that scales as M*num_heads instead of M.
+    // At M=1 the redundancy is cheap relative to the saved qmv
+    // dispatch overhead and the synth wins. At M>=2 the redundant
+    // device reads dominate; the unfused chain (one norm dispatch
+    // per token + per-head qmv) is strictly cheaper.
+    //
+    // TODO: replace this hardcoded threshold with a solver-driven
+    // pick — `SynthPreAttnImpl::cost_us` vs `(FusedAddRmsNorm + 3
+    // AffineQmm)::cost_us` from the swept CSV.
+    for (wp, (cl, _, _, _, _)) in canonical_lowered.iter_mut() {
+        let bucket_m = wp.num_tokens;
+        let apply_synth = synth_t_act.is_some() && bucket_m < 2;
+        if let Some(tag) = synth_t_act
+            && apply_synth
+        {
             crate::interpreter_codegen::apply_synth_replacement(
                 &mut arch_opcodes,
                 &mut cl.backbone,

@@ -1975,6 +1975,16 @@ pub fn starter_library() -> ImplementationLibrary {
         // rejects Affine so these win on the quantized path.
         lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_fp16()));
         lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_bf16()));
+        // Solver-side claim for the synth pre-attn megakernel. With
+        // no swept `synth_pre_attn_*` rows in the chip's cost CSV,
+        // `cost_us` returns +infinity and the solver never picks
+        // this — the `apply_synth_replacement` post-pass + bucket_m
+        // gate continue to drive the fusion. Registered now so the
+        // pluck-in is ready when the sweep wires through.
+        lib.push(Box::new(crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64()));
+        lib.push(Box::new(
+            crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_init(),
+        ));
         // Metal Fused Add+RMSNorm implementations - only match Metal targets
         lib.push(Box::new(
             crate::metal_bridge::MetalFusedAddRmsNormImpl::new_fp16(),

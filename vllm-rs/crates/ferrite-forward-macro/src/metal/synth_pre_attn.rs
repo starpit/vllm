@@ -231,6 +231,7 @@ impl Implementation for MetalSynthPreAttnImpl {
         let q_n = num_q.saturating_mul(head_dim);
         let kv_n = num_kv.saturating_mul(head_dim);
 
+        let _ = (q_n, kv_n, hidden, num_tokens);
         let synth_name = format!(
             "synth_pre_attn_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,
@@ -238,40 +239,17 @@ impl Implementation for MetalSynthPreAttnImpl {
         if let Some(cost) = ctx.profile.cost_us_for(&synth_name, num_tokens, hidden, 0) {
             return cost;
         }
-
-        // Component-sum fallback.
-        let qmv_dt = if self.act_tag == "bfloat" { "bf16" } else { "f16" };
-        let qmv_name = format!(
-            "affine_qmv_fast_{}_gs{}",
-            qmv_dt, self.group_size,
-        );
-        let qmv_q = ctx
-            .profile
-            .cost_us_for(&qmv_name, num_tokens, q_n, hidden)
-            .unwrap_or(0.0);
-        let qmv_kv = ctx
-            .profile
-            .cost_us_for(&qmv_name, num_tokens, kv_n, hidden)
-            .unwrap_or(0.0);
-        let norm_name = if self.act_tag == "bfloat" {
-            "metal_fused_add_rmsnorm_bf16"
-        } else {
-            "metal_fused_add_rmsnorm_f16"
-        };
-        let norm = ctx
-            .profile
-            .cost_us_for(norm_name, num_tokens, hidden, 0)
-            .unwrap_or(0.0);
-        let rope = ctx
-            .profile
-            .cost_us_for("metal_rope_append_bf16", num_tokens, hidden, 0)
-            .unwrap_or(0.0);
-
-        // Bias the fused alternative slightly cheaper on tie so the
-        // solver picks Synth when components are equivalent and Synth
-        // saves dispatch-launch overhead (~50µs × 4 saved launches).
-        let bias_us = 50.0 * 4.0;
-        (norm + qmv_q + 2.0 * qmv_kv + rope) - bias_us
+        // No swept synth cost for this chip yet. Return a very
+        // large finite cost so the solver never picks this Impl in
+        // the absence of real measurement — `apply_synth_replacement`
+        // (post-pass) + `bucket_m < 2` gate (2393cf820) continue to
+        // drive the fusion decision until the sweep emits
+        // synth_pre_attn rows. Once it does, this returns measured
+        // cost and the solver takes over (and the post-pass can be
+        // removed). f64::INFINITY trips the solver's finite-cost
+        // invariant ("cost_fn returned None"), so use a large but
+        // bounded value instead.
+        1.0e9
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {

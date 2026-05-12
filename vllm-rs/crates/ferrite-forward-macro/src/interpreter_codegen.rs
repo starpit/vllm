@@ -847,7 +847,7 @@ pub fn apply_synth_replacement_init(
         }
 
         let s = |ts: &proc_macro2::TokenStream| ts.to_string();
-        let norm_in   = s(&a.field_values[0]);  // residual_in (= embed_out, s0)
+        // a.field_values[0] (norm_in / s0) is also `residual_slot_tok` below.
         let norm_out  = s(&a.field_values[1]);  // x_norm slot the Qmms read
         let layer_a   = s(&a.field_values[2]);
 

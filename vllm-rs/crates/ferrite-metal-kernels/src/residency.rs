@@ -127,24 +127,6 @@ impl MetalResidencySet {
         }
         let _: () = msg_send![cb_ptr, useResidencySet: inner.set_ptr];
     }
-
-    /// Belt-and-braces MTL4 helper: attach to the MTL4 command queue
-    /// via `addResidencySet:`. The per-cmdbuf `useResidencySet:` is
-    /// documented as sufficient, but on some hardware (M1 Max
-    /// observed) additionally attaching to the queue is required for
-    /// indirectly-addressed buffers (paged KV cache) to stay
-    /// resident across cmdbufs. Idempotent — Metal dedupes.
-    ///
-    /// # Safety
-    /// `queue_ptr` must be a non-null pointer to a live MTL4-shaped
-    /// command queue.
-    pub unsafe fn attach_to_mtl4_queue(&self, queue_ptr: *mut AnyObject) {
-        let inner = self.inner.lock().expect("residency set mutex");
-        if inner.set_ptr.is_null() || queue_ptr.is_null() {
-            return;
-        }
-        let _: () = msg_send![queue_ptr, addResidencySet: inner.set_ptr];
-    }
 }
 
 /// Build a residency set on `device`. Returns null on macOS < 15 or

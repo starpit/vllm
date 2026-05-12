@@ -45,6 +45,17 @@ pub struct SynthesizedKernel {
 
 /// Shape constants the synthesized kernel reads as function constants.
 /// Names match the indices used in the body fragments.
+/// Render an f32 as a valid MSL float literal. The caller appends the
+/// `f` suffix. Uses Rust's `Debug` formatting (`{:?}`) which preserves
+/// enough digits to round-trip and writes small magnitudes in
+/// scientific form (e.g. `1e-5`) — both forms MSL accepts.
+fn format_msl_float(v: f32) -> String {
+    // Debug format on f32 already emits a parseable literal across
+    // the full range; bare numerals don't need the `f` suffix to be
+    // double-promoted inside an `EPS = <lit>f;` initializer.
+    format!("{:?}", v)
+}
+
 #[derive(Clone, Debug)]
 pub struct ChunkConstants {
     pub hidden:        u32,
@@ -53,6 +64,10 @@ pub struct ChunkConstants {
     pub head_dim:      u32,
     pub rot_dim:       u32,
     pub block_size:    u32,
+    /// MLP intermediate size (TP-divided). Used only by
+    /// `synthesize_mlp_pre_down_chunk` for the `INTERMEDIATE`
+    /// `constant constexpr` bake. Set to 0 for pre-attn chunks.
+    pub intermediate:  u32,
     pub m:             u32,
     pub group_size:    u32,
     pub rms_norm_eps:  f32,
@@ -271,14 +286,19 @@ fn synthesize_pre_attn_chunk_impl(
         r#"
 
 
-constant uint  HIDDEN       [[function_constant(0)]];
-constant uint  NUM_Q        [[function_constant(1)]];
-constant uint  NUM_KV       [[function_constant(2)]];
-constant uint  HEAD_DIM     [[function_constant(3)]];
-constant uint  ROT_DIM      [[function_constant(4)]];
-constant uint  BLOCK_SIZE   [[function_constant(5)]];
-constant uint  M            [[function_constant(6)]];
-constant float EPS          [[function_constant(7)]];
+// Model-invariant dims baked at synth time. Same source-compile
+// optimizations as if they were hand-written literals: loop trip
+// counts known, divisions strength-reduced, branches folded.
+constant constexpr uint  HIDDEN     = {hidden_lit}u;
+constant constexpr uint  NUM_Q      = {num_q_lit}u;
+constant constexpr uint  NUM_KV     = {num_kv_lit}u;
+constant constexpr uint  HEAD_DIM   = {head_dim_lit}u;
+constant constexpr uint  ROT_DIM    = {rot_dim_lit}u;
+constant constexpr uint  BLOCK_SIZE = {block_size_lit}u;
+constant constexpr float EPS        = {eps_lit}f;
+// `M` (active token count up to bucket capacity) stays a
+// function constant — varies per dispatch bucket.
+constant uint  M [[function_constant(0)]];
 
 constant constexpr uint __HIDDEN_MAX  = 8192;
 constant constexpr uint __HEAD_DIM_MAX = 256;
@@ -362,6 +382,13 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         addrms_body = addrms_body,
         qmv_body = qmv_body,
         rope_body = rope_body,
+        hidden_lit = consts.hidden,
+        num_q_lit = consts.num_q_heads,
+        num_kv_lit = consts.num_kv_heads,
+        head_dim_lit = consts.head_dim,
+        rot_dim_lit = consts.rot_dim,
+        block_size_lit = consts.block_size,
+        eps_lit = format_msl_float(consts.rms_norm_eps),
     );
 
     // The runtime path (newLibraryWithSource) has no source-tree
@@ -520,11 +547,16 @@ pub fn synthesize_mlp_pre_down_chunk(
         r#"
 
 
-constant uint  HIDDEN_FC       [[function_constant(0)]];
-constant uint  INTERMEDIATE_FC [[function_constant(1)]];
-constant uint  TILE_N_FC       [[function_constant(2)]];
-constant uint  M_FC            [[function_constant(3)]];
-constant float EPS_FC          [[function_constant(4)]];
+// Model-invariant dims baked at synth time. See pre-attn chunk for
+// the rationale (constant folding, loop-trip-count known at source
+// compile, no function-constant indirection at pipeline creation).
+constant constexpr uint  HIDDEN_FC       = {hidden_lit}u;
+constant constexpr uint  INTERMEDIATE_FC = {intermediate_lit}u;
+constant constexpr uint  TILE_N_FC       = {tile_n_lit}u;
+constant constexpr float EPS_FC          = {eps_lit}f;
+// `M_FC` (active token count up to bucket capacity) stays a
+// function constant — varies per dispatch bucket.
+constant uint  M_FC [[function_constant(0)]];
 
 constant constexpr uint __HIDDEN_MAX   = 8192;
 constant constexpr uint __HEAD_DIM_MAX = 256;
@@ -601,6 +633,10 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         gate_qmv_body = gate_qmv_body,
         up_qmv_body = up_qmv_body,
         silu_mul_body = silu_mul_body,
+        hidden_lit = consts.hidden,
+        intermediate_lit = consts.intermediate,
+        tile_n_lit = consts.head_dim,
+        eps_lit = format_msl_float(consts.rms_norm_eps),
     );
 
     let mk_header = include_str!(
@@ -640,6 +676,7 @@ pub fn dump_llama_3_2_3b_4bit_pre_attn() -> SynthesizedKernel {
         head_dim:      128,
         rot_dim:       128,
         block_size:    16,
+        intermediate:  8192,
         m:             1,
         group_size:    64,
         rms_norm_eps:  1e-5,
@@ -661,6 +698,7 @@ mod tests {
             head_dim:      128,
             rot_dim:       128,
             block_size:    16,
+            intermediate:  8192,
             m:             1,
             group_size:    64,
             rms_norm_eps:  1e-5,

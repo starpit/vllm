@@ -4893,7 +4893,10 @@ fn impl_names_for(
 /// macro-expansion time to generate the MSL source, then bakes the
 /// `(symbol, source)` pair into the generated arch as a `&'static
 /// [(&'static str, &'static str)]`.
-fn emit_synthesized_kernel_sources_override(model: &ModelParams) -> TokenStream {
+fn emit_synthesized_kernel_sources_override(
+    model: &ModelParams,
+    tp_world_size: u8,
+) -> TokenStream {
     use crate::quantization::QuantMethod;
     let (bits, group_size) = match model.quantization.as_ref().map(|q| &q.method) {
         Some(QuantMethod::Affine { bits, group_size }) => (*bits, *group_size),
@@ -4908,20 +4911,49 @@ fn emit_synthesized_kernel_sources_override(model: &ModelParams) -> TokenStream 
     let t_act = "bfloat";
     let t_scale = "half";
 
+    // Model dims baked as MSL `constant constexpr` literals at synth
+    // time. Same TP-sharding rules as `emit_canonical_params_impl`:
+    // num_q / num_kv / intermediate split per-rank; hidden stays
+    // replicated (residual stream is post-allreduce).
+    let tp = tp_world_size as u32;
+    let tp_us = tp_world_size as usize;
+    let hidden = *model.bounds.get("hidden_size").unwrap_or(&0) as u32;
+    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
+    let num_q = (*model.bounds.get("num_attention_heads").unwrap_or(&0) as u32) / tp;
+    let num_kv = (*model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32) / tp;
+    let intermediate = (*model.bounds.get("intermediate_size").unwrap_or(&0) as u32) / tp;
+    let partial = model
+        .scalars
+        .get("partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9);
+    let rot_dim = match partial {
+        Some(f) => (f * head_dim as f64).round() as u32,
+        None => head_dim,
+    };
+    let eps = rms_norm_eps(model);
+    let _ = tp_us;
+
+    // Sanity-gate: if any required dim is zero, skip emission (the
+    // model isn't a standard transformer-decoder we can synthesize for).
+    if hidden == 0 || head_dim == 0 || num_q == 0 || num_kv == 0 || intermediate == 0 {
+        return quote! {};
+    }
+
     let consts = crate::fuse_pass::ChunkConstants {
-        // The non-function-constant fields of ChunkConstants only
-        // contribute to the symbol name; the actual shape parameters
-        // arrive at kernel launch time as function constants. We just
-        // need a deterministic symbol and the gs in the host_name.
-        hidden:       0,
-        num_q_heads:  0,
-        num_kv_heads: 0,
-        head_dim:     0,
-        rot_dim:      0,
-        block_size:   0,
+        // Baked as `constant constexpr` literals in the emitted MSL.
+        // M is the only remaining function constant (varies per
+        // bucket; can't be baked).
+        hidden,
+        num_q_heads: num_q,
+        num_kv_heads: num_kv,
+        head_dim,
+        rot_dim,
+        block_size: 16, // ferrite_forward::CanonicalParams::BLOCK_SIZE default
+        intermediate,
         m:            0,
         group_size,
-        rms_norm_eps: 0.0,
+        rms_norm_eps: eps,
     };
     let pre_attn = crate::fuse_pass::synthesize_pre_attn_chunk(
         crate::fuse_pass::SynthesisBackend::Metal,
@@ -5043,6 +5075,14 @@ fn aot_compile_metallib(symbol: &str, source: &str) -> Vec<u8> {
     let bytes = std::fs::read(&metallib_path)
         .unwrap_or_else(|e| panic!("synth: read {metallib_path:?}: {e}"));
 
+    // Stash a copy for debugging if FERRITE_SYNTH_DUMP is set. The
+    // tmp_dir is removed in the no-dump path.
+    if std::env::var("FERRITE_SYNTH_DUMP").is_ok() {
+        let dump_dir = std::path::PathBuf::from("/tmp/ferrite-synth-dump");
+        let _ = std::fs::create_dir_all(&dump_dir);
+        let _ = std::fs::copy(&metal_path, dump_dir.join(format!("{symbol}.metal")));
+        let _ = std::fs::copy(&metallib_path, dump_dir.join(format!("{symbol}.metallib")));
+    }
     let _ = std::fs::remove_dir_all(&tmp_dir);
     bytes
 }
@@ -5202,7 +5242,7 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
     // gated). Empty for cuda models and any model that doesn't ship
     // an MLX-affine int4 quantization config; default `&[]` from the
     // CanonicalParams trait kicks in there.
-    let synth_sources_override = emit_synthesized_kernel_sources_override(model);
+    let synth_sources_override = emit_synthesized_kernel_sources_override(model, tp_world_size);
 
     quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its

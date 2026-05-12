@@ -979,16 +979,12 @@ fn lower_one<W: CanonicalParams>(
                 // library per symbol so `library == function` here.
                 library: *symbol,
                 function: *symbol,
-                constants: vec![
-                    ConstantValue::uint(0, W::Q_SIZE as u32),
-                    ConstantValue::uint(1, W::NUM_Q_HEADS),
-                    ConstantValue::uint(2, W::NUM_KV_HEADS),
-                    ConstantValue::uint(3, W::HEAD_DIM),
-                    ConstantValue::uint(4, W::ROT_DIM),
-                    ConstantValue::uint(5, W::BLOCK_SIZE),
-                    ConstantValue::uint(6, bucket_m),
-                    ConstantValue::float(7, W::RMS_NORM_EPS),
-                ],
+                // Pre-attn synth kernel bakes HIDDEN / NUM_Q / NUM_KV /
+                // HEAD_DIM / ROT_DIM / BLOCK_SIZE / EPS as MSL
+                // `constant constexpr` literals at synth time. Only
+                // `M` (active token count up to bucket capacity)
+                // stays a function constant — varies per bucket.
+                constants: vec![ConstantValue::uint(0, bucket_m)],
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
@@ -1139,13 +1135,10 @@ fn lower_one<W: CanonicalParams>(
                 kernel: KernelId::SynthMlpPreDown,
                 library: *symbol,
                 function: *symbol,
-                constants: vec![
-                    ConstantValue::uint(0, W::Q_SIZE as u32),
-                    ConstantValue::uint(1, intermediate),
-                    ConstantValue::uint(2, tile_n),
-                    ConstantValue::uint(3, bucket_m),
-                    ConstantValue::float(4, W::RMS_NORM_EPS),
-                ],
+                // MLP-pre-down synth kernel bakes HIDDEN / INTERMEDIATE /
+                // TILE_N / EPS as MSL `constant constexpr` literals at
+                // synth time. Only `M_FC` stays a function constant.
+                constants: vec![ConstantValue::uint(0, bucket_m)],
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_tiles, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),

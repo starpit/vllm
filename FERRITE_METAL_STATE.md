@@ -126,7 +126,7 @@ Filterable families: `rmsnorm`, `affine_qmv`, `affine_qmm`, `synth_pre_attn`, `s
 Tracks 1–3 are the high-leverage perf moves. 4–9 are correctness / coverage / cleanup. Pick by chip + interest:
 
 - **On M4+:** start with track 1 (NAX). Then track 2 (MLP synth redesign — pairs naturally with NAX).
-- **On M1 Max / M1–M3:** start with track 3 (MTL4 migration). NAX doesn't help; MTL4 is OS-gated, not hardware-gated, and modernizes the dispatch path everywhere.
+- **On M1 Max / M1–M3:** start with track 3 step A.4 — bench MTL4 under `FERRITE_METAL_MTL4=1` and decide whether to flip the default. NAX doesn't help these chips; MTL4 is OS-gated, already wired side-by-side, and modernizing the dispatch path is the next concrete move.
 - **Correctness or stuck on perf?** Tracks 4 (long-decode panic), 5 (safetensors zero-copy), or 8 (Phi-3 LongRoPE).
 
 ### 1. NAX / MPP `matmul2d` (M4+ only) — biggest perf lever on M4
@@ -146,7 +146,17 @@ Fix: matmul-tile dispatch + shared-mem reduction so the norm runs once per token
 
 ### 3. MTL4 migration
 
-`FERRITE_METAL_MTL4_MIGRATION.md` is the design doc. A.1 probe landed; B/C/D phases open. Wins:
+**Already wired side-by-side; behind `FERRITE_METAL_MTL4=1` opt-in.** Default runtime path is still MTL3 (`MTLCommandBuffer` + Serial compute encoder + ICB). MTL4 path lives in `interpreter/metal/mtl4.rs` + pool wiring at `pool.rs:271,608+`; pick-up via `device.newMTL4CommandQueue()` at warmup. `FERRITE_METAL_MTL4_MIGRATION.md` is the executable plan.
+
+Landed: A.1 probe (`ad7a4e5e1`), A.2 + A.3 bake-time + runtime path (`4d790077f`), partial Phase C compile-time DAG barrier analysis (`51c4ab812`, `59ac9b7ff`).
+
+Open:
+- **A.4 — bench + decide.** Run the m=1..2 decode bucket under `FERRITE_METAL_MTL4=1` vs default and capture the delta. If ≥5 % win, commit to flipping the default.
+- **B — MTL4Compiler + serialized pipeline cache.** Today MTL4 path rebuilds compute pipelines per warmup; B caches them.
+- **C (rest) — explicit barriers, kill conservative serialization.** Compile-time barrier analysis already lands per `59ac9b7ff`; rest of C wires the runtime to emit only the necessary barriers.
+- **D — stitched compute pipelines.** Research phase; follow-up.
+
+Wins when the default flips:
 - `MTL4ArgumentTable` collapses ~18 `setBuffer` calls/dispatch into one bind for the synth kernels.
 - MTL4 has compute sequencing as a first-class concept — replaces the current "executeCommandsInBuffer-on-Serial-encoder" hack we use because compute ICBs only ship `ConcurrentDispatch`.
 - OS-gated (macOS 15+), not hardware-gated. Helps M1–M4.

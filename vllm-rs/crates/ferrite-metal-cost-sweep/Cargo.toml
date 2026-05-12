@@ -13,8 +13,10 @@ name = "metal_cost_sweep"
 path = "src/main.rs"
 
 [dependencies]
+ferrite-fusion-synth = { path = "../ferrite-fusion-synth" }
 ferrite-metal-kernels = { path = "../ferrite-metal-kernels" }
 ferrite-metal-targets = { path = "../ferrite-metal-targets" }
+dispatch2 = "0.3"
 objc2 = "0.6"
 objc2-metal = "0.3"
 objc2-foundation = "0.3"

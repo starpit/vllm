@@ -4,7 +4,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLResourceOptions,
 };
 use std::sync::OnceLock;
@@ -90,4 +90,20 @@ pub fn create_buffer(n_bytes: usize) -> Buffer {
     device()
         .newBufferWithLength_options(n_bytes, MTLResourceOptions::StorageModeShared)
         .expect("newBufferWithLength returned nil")
+}
+
+/// Zero the contents of a `StorageModeShared` buffer. `create_buffer`
+/// only allocates — Metal does not guarantee zero-init — so callers
+/// that bind the buffer to a shader that *reads* it as index data
+/// (positions, slot_mapping, etc.) must zero-fill first to avoid
+/// OOB reads / writes from junk values.
+pub fn zero_buffer(buf: &Buffer) {
+    let len = buf.length();
+    if len == 0 {
+        return;
+    }
+    let ptr = buf.contents();
+    unsafe {
+        std::ptr::write_bytes(ptr.as_ptr() as *mut u8, 0u8, len);
+    }
 }

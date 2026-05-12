@@ -28,6 +28,7 @@
 mod affine_qmm_sweep;
 mod affine_qmv_sweep;
 mod rmsnorm_sweep;
+mod synth_pre_attn_sweep;
 mod util;
 
 fn main() {
@@ -44,9 +45,23 @@ fn main() {
     println!("kernel,M,N,K,cost_us");
     println!("launch_overhead,0,0,0,{launch_overhead_us:.2}");
 
-    rmsnorm_sweep::run(launch_overhead_us);
-    affine_qmv_sweep::run(launch_overhead_us);
-    affine_qmm_sweep::run(launch_overhead_us);
+    // Optional filter — `FERRITE_SWEEP=synth_pre_attn` etc. — useful
+    // when iterating on a single sweep family without paying for the
+    // ~4-min full table regen.
+    let filter = std::env::var("FERRITE_SWEEP").ok();
+    let want = |name: &str| filter.as_deref().map_or(true, |f| f.split(',').any(|s| s == name));
+    if want("rmsnorm") {
+        rmsnorm_sweep::run(launch_overhead_us);
+    }
+    if want("affine_qmv") {
+        affine_qmv_sweep::run(launch_overhead_us);
+    }
+    if want("affine_qmm") {
+        affine_qmm_sweep::run(launch_overhead_us);
+    }
+    if want("synth_pre_attn") {
+        synth_pre_attn_sweep::run(launch_overhead_us);
+    }
 
     eprintln!("metal_cost_sweep: done");
 }

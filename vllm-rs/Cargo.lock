@@ -2168,6 +2168,8 @@ name = "ferrite-metal-cost-sweep"
 version = "0.1.0"
 dependencies = [
  "core-foundation 0.10.1",
+ "dispatch2",
+ "ferrite-fusion-synth",
  "ferrite-metal-kernels",
  "ferrite-metal-targets",
  "objc2",

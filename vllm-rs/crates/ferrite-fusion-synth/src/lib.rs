@@ -10,6 +10,7 @@
 // `crate::atom::*` / `crate::atom_lib::*` / `crate::fuse_pass::*`
 // paths keep working unchanged.
 
+pub mod aot;
 pub mod atom;
 pub mod atom_lib;
 pub mod fuse_pass;

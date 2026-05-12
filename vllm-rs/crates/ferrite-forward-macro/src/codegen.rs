@@ -4980,9 +4980,16 @@ fn emit_synthesized_kernel_sources_override(
     // (NOT `newLibraryWithSource`) so the resulting Metal binaries
     // are identical to the AOT-compiled shaders — same compiler
     // path, same behavior across Apple GPU generations.
-    let pa_bytes = aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
-    let pi_bytes = aot_compile_metallib(&pre_attn_init.symbol, &pre_attn_init.source);
-    let md_bytes = aot_compile_metallib(&mlp_pre_down.symbol, &mlp_pre_down.source);
+    let pa_bytes =
+        ::ferrite_fusion_synth::aot::aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
+    let pi_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &pre_attn_init.symbol,
+        &pre_attn_init.source,
+    );
+    let md_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &mlp_pre_down.symbol,
+        &mlp_pre_down.source,
+    );
 
     let pa_symbol_lit =
         syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
@@ -5007,84 +5014,6 @@ fn emit_synthesized_kernel_sources_override(
             ]
         }
     }
-}
-
-/// AOT-compile MSL source to a `.metallib` blob via `xcrun metal -c`
-/// + `xcrun metallib`. Same flow as `ferrite-metal-kernels/build.rs`.
-/// Runs at proc-macro expansion time; the resulting bytes are
-/// embedded into the generated arch as `&'static [u8]`.
-///
-/// Panics on `xcrun` failure — synth compile errors here are build
-/// errors that need to surface, not runtime soft-fail.
-fn aot_compile_metallib(symbol: &str, source: &str) -> Vec<u8> {
-    use std::io::Write;
-    use std::process::Command;
-
-    // Skip on non-macOS hosts (no `xcrun`). The synth metallibs are
-    // only ever consumed by the metal backend, so emitting empty
-    // bytes is fine on Linux/cuda builds — `synthesized_kernel_metallibs`
-    // is only called from `pool.rs` (cfg(target_os = "macos")).
-    let host_os = std::env::var("CARGO_CFG_TARGET_OS")
-        .unwrap_or_else(|_| std::env::consts::OS.to_string());
-    if host_os != "macos" {
-        return Vec::new();
-    }
-
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "ferrite-synth-{}-{}",
-        symbol,
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&tmp_dir)
-        .unwrap_or_else(|e| panic!("synth: create tmp dir {tmp_dir:?}: {e}"));
-
-    let metal_path = tmp_dir.join(format!("{symbol}.metal"));
-    let air_path = tmp_dir.join(format!("{symbol}.air"));
-    let metallib_path = tmp_dir.join(format!("{symbol}.metallib"));
-
-    let mut f = std::fs::File::create(&metal_path)
-        .unwrap_or_else(|e| panic!("synth: create {metal_path:?}: {e}"));
-    f.write_all(source.as_bytes())
-        .unwrap_or_else(|e| panic!("synth: write {metal_path:?}: {e}"));
-    drop(f);
-
-    let status = Command::new("xcrun")
-        .args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat", "-c"])
-        .arg(&metal_path)
-        .arg("-o")
-        .arg(&air_path)
-        .status()
-        .unwrap_or_else(|e| panic!("synth: spawn xcrun metal: {e}"));
-    if !status.success() {
-        panic!(
-            "synth: `xcrun metal` failed for `{symbol}` (source at {metal_path:?})"
-        );
-    }
-
-    let status = Command::new("xcrun")
-        .args(["-sdk", "macosx", "metallib"])
-        .arg(&air_path)
-        .arg("-o")
-        .arg(&metallib_path)
-        .status()
-        .unwrap_or_else(|e| panic!("synth: spawn xcrun metallib: {e}"));
-    if !status.success() {
-        panic!("synth: `xcrun metallib` failed for `{symbol}`");
-    }
-
-    let bytes = std::fs::read(&metallib_path)
-        .unwrap_or_else(|e| panic!("synth: read {metallib_path:?}: {e}"));
-
-    // Stash a copy for debugging if FERRITE_SYNTH_DUMP is set. The
-    // tmp_dir is removed in the no-dump path.
-    if std::env::var("FERRITE_SYNTH_DUMP").is_ok() {
-        let dump_dir = std::path::PathBuf::from("/tmp/ferrite-synth-dump");
-        let _ = std::fs::create_dir_all(&dump_dir);
-        let _ = std::fs::copy(&metal_path, dump_dir.join(format!("{symbol}.metal")));
-        let _ = std::fs::copy(&metallib_path, dump_dir.join(format!("{symbol}.metallib")));
-    }
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    bytes
 }
 
 fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenStream {

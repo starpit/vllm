@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `MetalWorkerPool`: growable, capped, semaphore-bounded checkout/checkin.
 //!
-//! Per `FERRITE_METAL_ARCHITECTURE.md` §2: the pool starts at size 1
-//! and grows on demand up to `max_workers`. Each worker holds a private
-//! arena, a private [`RuntimeBindings`], and one fully-baked ICB
-//! per bucket — never shared across workers. `checkout()` blocks if
-//! every worker is in use *and* the pool is at cap; otherwise it
-//! grows by one (allocates arena + records ICBs) and hands the new
-//! worker out.
+//! The pool starts at size 1 and grows on demand up to `max_workers`.
+//! Each worker holds a private arena, a private [`RuntimeBindings`],
+//! and one baked execution plan per bucket — never shared across workers.
+//! `checkout()` blocks if every worker is in use *and* the pool is at
+//! cap; otherwise it grows by one and hands the new worker out.
 //!
 //! `max_workers` is supplied by the caller (typically derived as
 //! `floor((device_total - weights - misc) / per_worker_arena)` by
@@ -60,9 +58,8 @@ use ferrite_cuda_core::MetalAllocator;
 /// at constructor time. Concatenation matches the cuda interpreter's
 /// behavior — `forward()` runs backbone then lm_head as one logical
 /// pass for a given bucket — and the metal worker bakes both halves
-/// into the bucket's single ICB plan so `forward()` issues one
-/// `executeCommandsInBuffer` per segment without an extra mid-bucket
-/// boundary.
+/// into the bucket's single execution plan so `forward()` dispatches
+/// both halves without an extra mid-bucket boundary.
 ///
 /// The slices are `&'static` because the macro emits them as static
 /// items; the spec is `Copy` so callers can drop the bucket plan into
@@ -176,10 +173,6 @@ pub type RuntimeFactory = Arc<dyn Fn(&Device) -> RuntimeBindings>;
 
 /// One unit the pool hands out: a worker plus its private
 /// [`RuntimeBindings`].
-///
-/// The engine writes input/positions/etc. into `runtime.<field>.contents()`
-/// before firing `worker.run_bucket(...)`. Both fields are owned by the
-/// pool; `WorkerGuard` deref's to this struct.
 pub struct PooledWorker<W: CanonicalParams> {
     pub worker: MetalWorker<W>,
     pub runtime: RuntimeBindings,
@@ -187,10 +180,6 @@ pub struct PooledWorker<W: CanonicalParams> {
 
 /// RAII guard returned by [`MetalWorkerPool::checkout`]. Returns the
 /// underlying [`PooledWorker`] to the pool on drop.
-///
-/// `Deref`/`DerefMut` to `PooledWorker<W>` so the engine can call
-/// `guard.worker.run_bucket(...)` and stage `guard.runtime.<field>`
-/// writes through the guard.
 pub struct WorkerGuard<'pool, W: CanonicalParams> {
     pool: &'pool MetalWorkerPool<W>,
     inner: Option<PooledWorker<W>>,
@@ -297,13 +286,10 @@ struct PoolInner<W: CanonicalParams> {
 /// result at info level so cold-start traces show whether the
 /// upcoming Phase A side-by-side path is reachable on this host.
 ///
-/// `newMTL4CommandQueue()` returns `Some` iff the host runs
-/// macOS 15+ on Apple Family 7+ silicon AND the driver exposes
-/// MTL4. On macOS 14 / older drivers this returns `None`; the
-/// caller falls back to the MTL3 path. The queue is dropped
-/// immediately — this is a one-shot capability probe, not the
-/// production queue (`run_forward_with_inputs_inner` will lazily
-/// build its own once the side-by-side path lands in A.2/A.3).
+/// `newMTL4CommandQueue()` returns `Some` iff the host runs macOS 15+
+/// on Apple Family 7+ silicon. The queue is dropped immediately — this
+/// is a one-shot capability probe; the production queue is built lazily
+/// by `ensure_mtl4` on first use.
 fn probe_mtl4_availability(device: &Device) {
     let available = device.newMTL4CommandQueue().is_some();
     tracing::info!(target: "ferrite-metal", available, "mtl4 capability probe");
@@ -604,16 +590,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     }
 
     /// Lazily build the pool's MTL4 surface (queue + allocator +
-    /// shared event). Panics if MTL4 is unavailable on this host —
-    /// callers should only land here behind the `FERRITE_METAL_MTL4`
-    /// env-var, which is documented as macOS 15+ / Apple Family 7+.
+    /// shared event). Panics if MTL4 is unavailable on this host
+    /// (requires macOS 15+ on Apple Family 7+).
     fn ensure_mtl4(&self) {
         let mut slot = self.mtl4.lock().expect("mtl4 mutex");
         if slot.is_some() {
             return;
         }
         let queue = self.device.newMTL4CommandQueue().expect(
-            "FERRITE_METAL_MTL4 set but device.newMTL4CommandQueue() returned nil \
+            "device.newMTL4CommandQueue() returned nil \
              — host does not support MTL4 (requires macOS 15+ on Apple Family 7+)",
         );
         let allocator = self
@@ -632,8 +617,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         });
     }
 
-    /// Phase A.3 MTL4 forward path. Hard-asserts MTL4 availability on
-    /// first use (see `ensure_mtl4`).
+    /// MTL4 forward path. Hard-asserts MTL4 availability on first use
+    /// (see `ensure_mtl4`).
     fn run_bucket_mtl4(
         &self,
         worker: &MetalWorker<W>,
@@ -654,8 +639,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
             cb.beginCommandBufferWithAllocator(&mtl4.allocator);
             // Residency: MTL4 cmdbufs declare per-cmdbuf rather than
-            // inheriting from the queue. Reuse the same set the MTL3
-            // queue is attached to (weights + arenas + KV cache).
+            // Residency: MTL4 cmdbufs declare per-cmdbuf.
+            // Reuse the same set as the pool (weights + arenas + KV cache).
             let cb_ptr: *mut AnyObject =
                 ::objc2::rc::Retained::as_ptr(&cb) as *const AnyObject as *mut AnyObject;
             unsafe {
@@ -723,25 +708,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(())
     }
 
-    /// Run one forward step.
+    /// Run one forward step via MTL4.
     ///
     /// Pipeline:
     ///  1. Pick the bucket from `inputs.num_tokens`.
     ///  2. Check out a worker (eagerly grow the pool if below cap;
     ///     block if at cap).
     ///  3. Validate every present input slice against its runtime
-    ///     buffer's capacity; copy bytes into the buffer's
-    ///     `contents()`.
-    ///  4. Allocate a fresh command buffer from `queue`, walk the
-    ///     bucket's plan via `worker.run_bucket`, commit, and wait
-    ///     until completed.
+    ///     buffer's capacity; copy bytes into the buffer's `contents()`.
+    ///  4. Encode the bucket's MTL4 steps, commit, and wait.
     ///  5. Run `with_output(&worker)` so the caller can read arena
-    ///     buffers (e.g. logits in the final slot) before the worker
-    ///     is checked back in.
+    ///     buffers (e.g. logits) before the worker is checked back in.
     ///  6. Drop the guard — the worker returns to the pool.
     ///
-    /// All validation runs *before* any GPU work is submitted, so a
-    /// malformed [`ForwardInputs`] never partially executes.
+    /// All validation runs before any GPU work is submitted.
     pub fn forward<R>(
         &self,
         weights: &W,
@@ -775,77 +755,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout(weights)?;
         write_runtime_inputs(&guard.runtime, inputs)?;
 
-        // Default execution: batched single-cmdbuf + ICB execute.
-        // One command buffer per forward, one encoder per step, one
-        // `executeCommandsInBuffer` per ICB range, commit once, wait
-        // once. The prior "ICB produces wrong output" issue was rooted
-        // in `RuntimeBindings` metadata buffers missing from the
-        // residency set — `MetalWorker::new_with_residency` now
-        // inserts them, so ICB-bound runtime reads see live pages
-        // instead of stale ones.
-        //
-        // Env-var diagnostic overrides:
-        //   `FERRITE_METAL_STEP_DEBUG=1` — per-step + eprintln dumps.
-        //   `FERRITE_METAL_PER_STEP_CMDBUF=1` — opt back into the
-        //     per-step cmdbuf + direct-dispatch fallback (4× slower
-        //     than the batched ICB path; kept for bisecting any
-        //     future ICB regression).
-        let mtl4_requested = std::env::var_os("FERRITE_METAL_MTL4").is_some();
-        if mtl4_requested {
-            assert!(
-                guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
-                "FERRITE_METAL_MTL4=1 set but bucket {} was not bake-eligible for MTL4 \
-                 (likely an MPS GEMM or a kernel exceeding 31 buffer bindings); \
-                 unset the env var to fall back to MTL3 for this model",
-                bucket_idx,
-            );
-            self.run_bucket_mtl4(&guard.worker, bucket_idx, inputs.num_tokens as usize)?;
-        } else if std::env::var_os("FERRITE_METAL_STEP_DEBUG").is_some() {
-            guard
-                .worker
-                .run_bucket_per_step_debug(bucket_idx, &self.device, queue)?;
-        } else if std::env::var_os("FERRITE_METAL_PER_STEP_CMDBUF").is_some() {
-            // Diagnostic fallback: per-step cmdbuf + direct dispatch.
-            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
-            let t0 = std::time::Instant::now();
-            guard
-                .worker
-                .run_bucket_per_step_silent(bucket_idx, &self.device, queue)?;
-            if trace {
-                eprintln!(
-                    "[forward bucket={} num_tokens={} per_step] total={:?}",
-                    bucket_idx,
-                    inputs.num_tokens,
-                    t0.elapsed(),
-                );
-            }
-        } else {
-            // Production default: batched ICB execute.
-            let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
-            let t_pre = std::time::Instant::now();
-            let cb = queue.commandBuffer().expect("commandBuffer returned nil");
-            guard.worker.run_bucket(bucket_idx, &self.device, &cb)?;
-            let encoded = t_pre.elapsed();
-            cb.commit();
-            let committed = t_pre.elapsed();
-            cb.waitUntilCompleted();
-            let waited = t_pre.elapsed();
-            let status = cb.status();
-            if trace {
-                eprintln!(
-                    "[forward bucket={} num_tokens={}] encode={:?} commit={:?} wait={:?} status={:?}",
-                    bucket_idx,
-                    inputs.num_tokens,
-                    encoded,
-                    committed - encoded,
-                    waited - committed,
-                    status,
-                );
-            }
-            if status != MTLCommandBufferStatus::Completed {
-                return Err(ForwardError::ExecutionFailed(status));
-            }
-        }
+        assert!(
+            guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
+            "bucket {} is not MTL4-eligible (contains an MPS f16 GEMM step or \
+             exceeds the 31-binding argument-table cap)",
+            bucket_idx,
+        );
+        self.run_bucket_mtl4(&guard.worker, bucket_idx, inputs.num_tokens as usize)?;
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
         // us where in the chain values transition from real to zero.

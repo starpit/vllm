@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Phase A.2/A.3 MTL4 bake artifacts + step type.
+//! MTL4 bake artifacts and step type.
 //!
-//! See `FERRITE_METAL_MTL4_MIGRATION.md`. One `Mtl4Step` is produced
-//! per `BucketStep::Icb` from a bucket's plan, holding the same
-//! pipeline state the MTL3 ICB path uses (MTL4's
-//! `setComputePipelineState` takes `dyn MTLComputePipelineState`),
-//! plus a pre-built `MTL4ArgumentTable` per coalesced sub-command
-//! (one per entry in `direct_bindings`).
+//! One `Mtl4Step` is produced per `BucketStep::Icb` from a bucket's
+//! plan, holding the pipeline state and a pre-built `MTL4ArgumentTable`
+//! per coalesced sub-command (one per entry in `direct_bindings`).
 //!
-//! `BucketStep::Gemm` (MPS f16 fast-path) is not representable on
-//! the MTL4 encoder surface yet, so any bucket containing a `Gemm`
-//! step falls back to MTL3 — `bake_mtl4_steps` returns `None` in
-//! that case and the pool's `FERRITE_METAL_MTL4` arm declines to
-//! take the bucket. Production int4 / bf16 paths emit only `Icb`
-//! steps, so the fallback is a paper safety net for the f16 path.
+//! `BucketStep::Gemm` (MPS f16 path) is not representable on the MTL4
+//! encoder surface; `bake_mtl4_steps` returns `None` for any bucket
+//! containing one, and the pool asserts eligibility at forward time.
+//! Production int4 / bf16 paths emit only `Icb` steps.
 
 #![cfg(feature = "metal")]
 

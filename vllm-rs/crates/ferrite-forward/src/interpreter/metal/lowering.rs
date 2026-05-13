@@ -1253,6 +1253,73 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── SynthGateUpSiluMul — fused gate+up GEMM + SiluMul (large-M) ─────
+        I::SynthGateUpSiluMul(
+            x_norm_slot,
+            out_slot,
+            layer,
+            gate_wt_fn,
+            up_wt_fn,
+            _group_size,
+            _bits,
+            symbol,
+        ) => {
+            let intermediate = W::INTERMEDIATE_SIZE as u32;
+            let tg_n = 32u32;
+            let tg_m = 32u32;
+            LoweredCommand {
+                kernel: KernelId::SynthGateUpSiluMul,
+                library: *symbol,
+                function: *symbol,
+                constants: vec![ConstantValue::uint(0, bucket_m)],
+                dispatch: DispatchShape {
+                    threadgroups: (intermediate.div_ceil(tg_n), bucket_m.div_ceil(tg_m), 1),
+                    threads_per_threadgroup: (128, 1, 1),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot { slot: *out_slot,    binding_index: 0 },
+                    Binding::ArenaSlot { slot: *x_norm_slot, binding_index: 1 },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*gate_wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 2,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*gate_wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: *layer + layer_offset,
+                        binding_index: 3,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*gate_wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: *layer + layer_offset,
+                        binding_index: 4,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*up_wt_fn),
+                        which: WeightTensor::Weight,
+                        layer: *layer + layer_offset,
+                        binding_index: 5,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*up_wt_fn),
+                        which: WeightTensor::AffineScales,
+                        layer: *layer + layer_offset,
+                        binding_index: 6,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer(*up_wt_fn),
+                        which: WeightTensor::AffineBiases,
+                        layer: *layer + layer_offset,
+                        binding_index: 7,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Decode-bucket attention (single query token / seq) ─────
         I::AttentionViaCache(q_slot, out_slot, layer, _cos_sin_fn, _is_decode) => {
             // 2D dispatch: (batch, num_q_heads). Each threadgroup

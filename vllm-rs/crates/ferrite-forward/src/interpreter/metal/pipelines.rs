@@ -322,7 +322,8 @@ mod tests {
                 | KernelId::SplitKReduceSum
                 | KernelId::FusedAffineQkvRopeCache
                 | KernelId::SynthPreAttn
-            | KernelId::SynthMlpPreDown,
+            | KernelId::SynthMlpPreDown
+            | KernelId::SynthGateUpSiluMul,
                 _,
             ) => {
                 unreachable!(
@@ -395,11 +396,9 @@ mod tests {
             | KernelId::SiluMul
             | KernelId::SplitKReduceSum
             | KernelId::FusedAffineQkvRopeCache
-            | KernelId::SynthPreAttn => {
-                // See `kernel_msl_names` for the matching gap — this
-                // helper isn't wired for the Affine*/SiluMul/SplitKReduce
-                // path. Production constants come from the lowering pass
-                // directly via `cmd.constants`.
+            | KernelId::SynthPreAttn
+            | KernelId::SynthMlpPreDown
+            | KernelId::SynthGateUpSiluMul => {
                 unreachable!(
                     "constants_for: Affine*/SiluMul/SplitKReduceSum not wired into the \
                      synthetic test helper — production constants ride on the LoweredCommand"

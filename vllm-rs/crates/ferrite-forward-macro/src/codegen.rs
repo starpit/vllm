@@ -4980,6 +4980,14 @@ fn emit_synthesized_kernel_sources_override(
     // (NOT `newLibraryWithSource`) so the resulting Metal binaries
     // are identical to the AOT-compiled shaders — same compiler
     // path, same behavior across Apple GPU generations.
+    let gate_up = ::ferrite_fusion_synth::fuse_pass::synthesize_gate_up_silu_mul_large_chunk(
+        ::ferrite_fusion_synth::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let gu_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(&gate_up.symbol, &gate_up.source);
+
     let pa_bytes =
         ::ferrite_fusion_synth::aot::aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
     let pi_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
@@ -4990,6 +4998,9 @@ fn emit_synthesized_kernel_sources_override(
         &mlp_pre_down.symbol,
         &mlp_pre_down.source,
     );
+
+    let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
+    let gu_bytes_lit  = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
 
     let pa_symbol_lit =
         syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
@@ -5007,10 +5018,12 @@ fn emit_synthesized_kernel_sources_override(
             const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
             const __SYNTH_PRE_ATTN_INIT_LIB: &[u8] = #pi_bytes_lit;
             const __SYNTH_MLP_PRE_DOWN_LIB: &[u8] = #md_bytes_lit;
+            const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
             &[
                 (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
                 (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
                 (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_LIB),
+                (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
             ]
         }
     }

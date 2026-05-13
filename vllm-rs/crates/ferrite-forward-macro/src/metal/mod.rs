@@ -9,6 +9,7 @@
 pub mod activation;
 pub mod add;
 pub mod dataflow;
+pub mod synth_gate_up_silu_mul;
 pub mod synth_mlp_pre_down;
 pub mod synth_pre_attn;
 pub mod affine_embed;

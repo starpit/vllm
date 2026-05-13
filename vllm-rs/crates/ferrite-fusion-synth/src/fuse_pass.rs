@@ -664,6 +664,253 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     }
 }
 
+/// Synthesize the fused gate+up+SiluMul large-M prefill kernel.
+///
+/// Claims gate_Gemm + up_Gemm + Silu + Mul (4 tiles). Uses simdgroup_matrix
+/// 8x8 GEMM tiles: BM=BN=BK=32, WM=WN=2, TM=TN=2, 128 threads per TG.
+/// Gate and up projections share a single __Ws buffer (sequential passes).
+/// Epilogue uses simdgroup_store to per-simdgroup scratch for SiluMul.
+/// Compiled at -O3 (simdgroup_store epilogue is correct at -O3).
+///
+/// NOTE: this kernel includes <metal_simdgroup_matrix> directly in its
+/// source. It does NOT add new code to metal_kittens.h — preserving
+/// the hashes of synth_pre_attn / synth_mlp_pre_down so their cached
+/// metallibs are never invalidated by changes to this kernel.
+pub fn synthesize_gate_up_silu_mul_large_chunk(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    assert_eq!(backend, SynthesisBackend::Metal, "Metal only");
+
+    let symbol = format!(
+        "synth_gate_up_silu_mul_large_{}_{}_gs{}",
+        t_act, t_scale, consts.group_size,
+    );
+
+    let gs = consts.group_size;
+    let silu_mul_out = "__silu_mul_out";
+    let x_norm       = "__x_norm";
+    let gate_wt      = "__gate_weight";
+    let gate_sc      = "__gate_scales";
+    let gate_bi      = "__gate_biases";
+    let up_wt        = "__up_weight";
+    let up_sc        = "__up_scales";
+    let up_bi        = "__up_biases";
+
+    let bk_pad = 40u32;  // BK(32) + 8 (bfloat bank-conflict pad)
+    let group_steps = consts.group_size / 32; // gs/BK; gs=64 → 2
+
+    let source_tail = format!(r#"
+// BM=BN=BK=32, WM=WN=2, TM=TN=2, TGP=128. Mirrors MLX affine_qmm_t.
+constant constexpr int BM_SG   = 32;
+constant constexpr int BN_SG   = 32;
+constant constexpr int BK_SG   = 32;
+constant constexpr int BK_PAD  = {bk_pad};
+constant constexpr int TGP_SG  = 128;
+constant constexpr int WM_SG   = 2;
+constant constexpr int WN_SG   = 2;
+constant constexpr int TM_SG   = 2;
+constant constexpr int TN_SG   = 2;
+constant constexpr int KFR_SG  = 4;   // BK / 8
+constant constexpr int GS_SG   = {gs};
+constant constexpr int GS_STEPS = {group_steps};
+
+constant constexpr uint  HIDDEN_LG       = {hidden}u;
+constant constexpr uint  INTERMEDIATE_LG = {intermediate}u;
+constant uint  M_LG [[function_constant(0)]];
+
+[[kernel, max_total_threads_per_threadgroup(TGP_SG)]]
+void {symbol}(
+    device       {t_act}*   {silu_mul_out}  [[buffer(0)]],
+    device const {t_act}*   {x_norm}        [[buffer(1)]],
+    device const uint32_t*  {gate_wt}       [[buffer(2)]],
+    device const {t_scale}* {gate_sc}       [[buffer(3)]],
+    device const {t_scale}* {gate_bi}       [[buffer(4)]],
+    device const uint32_t*  {up_wt}         [[buffer(5)]],
+    device const {t_scale}* {up_sc}         [[buffer(6)]],
+    device const {t_scale}* {up_bi}         [[buffer(7)]],
+    uint3 __tgid [[threadgroup_position_in_grid]],
+    uint  __simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid [[thread_index_in_simdgroup]])
+{{
+    const int __c_col = (int)__tgid.x * BN_SG;
+    const int __c_row = (int)__tgid.y * BM_SG;
+    if (__c_row >= (int)M_LG || __c_col >= (int)INTERMEDIATE_LG) return;
+
+    const int __K = (int)HIDDEN_LG;
+    const int __N = (int)INTERMEDIATE_LG;
+    const int __M = (int)M_LG;
+    const int __thread_idx = (int)(__simd_gid * 32u + __simd_lid);
+
+    const int __m_tile = min(BM_SG, __M - __c_row);
+    const int __n_tile = min(BN_SG, __N - __c_col);
+    const bool __m_full = (__m_tile == BM_SG);
+    const bool __n_full = (__n_tile == BN_SG);
+
+    const int __bi_x = __thread_idx / 4;
+    const int __bj_x = 8 * (__thread_idx % 4);
+    const int __bi_w = (4 * __thread_idx) / 16;
+    const int __bj_w = (4 * __thread_idx) % 16;
+
+    threadgroup {t_act} __Xs   [BM_SG * BK_PAD];
+    threadgroup {t_act} __Ws   [BN_SG * BK_PAD];
+    threadgroup float   __ep_g [WM_SG * WN_SG * 64];
+    threadgroup float   __ep_u [WM_SG * WN_SG * 64];
+
+    const int __K_w = __K / 2;
+    const int __K_g = __K / GS_SG;
+
+    const device {t_act}*   __x_base  = {x_norm}  + (int64_t)__c_row * __K;
+    const device uint8_t*   __wg_base = (const device uint8_t*){gate_wt} + (int64_t)__c_col * __K_w;
+    const device {t_scale}* __sg_base = {gate_sc} + (int64_t)__c_col * __K_g;
+    const device {t_scale}* __bg_base = {gate_bi} + (int64_t)__c_col * __K_g;
+    const device uint8_t*   __wu_base = (const device uint8_t*){up_wt}   + (int64_t)__c_col * __K_w;
+    const device {t_scale}* __su_base = {up_sc}   + (int64_t)__c_col * __K_g;
+    const device {t_scale}* __bu_base = {up_bi}   + (int64_t)__c_col * __K_g;
+
+    const device {t_act}*   __X_src  = __x_base  + __bi_x * __K + __bj_x;
+    const device uint8_t*   __Wg_src = __wg_base + __bi_w * __K_w + __bj_w;
+    const device {t_scale}* __Sg_row = __sg_base + __bi_w * __K_g;
+    const device {t_scale}* __Bg_row = __bg_base + __bi_w * __K_g;
+    const device uint8_t*   __Wu_src = __wu_base + __bi_w * __K_w + __bj_w;
+    const device {t_scale}* __Su_row = __su_base + __bi_w * __K_g;
+    const device {t_scale}* __Bu_row = __bu_base + __bi_w * __K_g;
+
+    simdgroup_float8x8 __gate_acc[TM_SG][TN_SG];
+    simdgroup_float8x8 __up_acc  [TM_SG][TN_SG];
+    for (int __i = 0; __i < TM_SG; ++__i)
+        for (int __j = 0; __j < TN_SG; ++__j) {{
+            __gate_acc[__i][__j] = simdgroup_float8x8(0.0f);
+            __up_acc  [__i][__j] = simdgroup_float8x8(0.0f);
+        }}
+
+    const int __sgM = (int)__simd_gid / WN_SG;
+    const int __sgN = (int)__simd_gid % WN_SG;
+    int __gs_cnt_g = 0, __gs_cnt_u = 0;
+
+    for (int __k = 0; __k < __K; __k += BK_SG) {{
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (__m_full || __bi_x < __m_tile) {{
+            *((threadgroup vec<{t_act}, 4>*)(__Xs + __bi_x * BK_PAD + __bj_x))     = *((const device vec<{t_act}, 4>*)(__X_src));
+            *((threadgroup vec<{t_act}, 4>*)(__Xs + __bi_x * BK_PAD + __bj_x + 4)) = *((const device vec<{t_act}, 4>*)(__X_src + 4));
+        }} else {{
+            *((threadgroup vec<{t_act}, 4>*)(__Xs + __bi_x * BK_PAD + __bj_x))     = vec<{t_act}, 4>(0);
+            *((threadgroup vec<{t_act}, 4>*)(__Xs + __bi_x * BK_PAD + __bj_x + 4)) = vec<{t_act}, 4>(0);
+        }}
+
+        {{
+            {t_act} __s0g = {t_act}(*__Sg_row), __b0g = {t_act}(*__Bg_row);
+            {t_act} __s1g = __s0g / {t_act}(16.0f);
+            if (__n_full || __bi_w < __n_tile) {{
+                for (int __i = 0; __i < 4; ++__i) {{
+                    uint8_t __b = __Wg_src[__i];
+                    __Ws[__bi_w * BK_PAD + __bj_w * 2 + __i * 2 + 0] = __s0g * {t_act}(__b & 0x0f) + __b0g;
+                    __Ws[__bi_w * BK_PAD + __bj_w * 2 + __i * 2 + 1] = __s1g * {t_act}(__b & 0xf0) + __b0g;
+                }}
+            }} else {{
+                for (int __i = 0; __i < 8; ++__i) __Ws[__bi_w * BK_PAD + __bj_w * 2 + __i] = {t_act}(0);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int __kf = 0; __kf < KFR_SG; ++__kf) {{
+            simdgroup_matrix<{t_act}, 8, 8> __A_frag[TM_SG];
+            for (int __i = 0; __i < TM_SG; ++__i)
+                simdgroup_load(__A_frag[__i], __Xs + (__sgM*16 + __i*8)*BK_PAD + __kf*8, BK_PAD);
+            simdgroup_matrix<{t_act}, 8, 8> __Bg[TN_SG];
+            for (int __j = 0; __j < TN_SG; ++__j)
+                simdgroup_load(__Bg[__j], __Ws + (__sgN*16 + __j*8)*BK_PAD + __kf*8, BK_PAD, ulong2(0,0), true);
+            for (int __i = 0; __i < TM_SG; ++__i)
+                for (int __j = 0; __j < TN_SG; ++__j)
+                    simdgroup_multiply_accumulate(__gate_acc[__i][__j], __A_frag[__i], __Bg[__j], __gate_acc[__i][__j]);
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {{
+            {t_act} __s0u = {t_act}(*__Su_row), __b0u = {t_act}(*__Bu_row);
+            {t_act} __s1u = __s0u / {t_act}(16.0f);
+            if (__n_full || __bi_w < __n_tile) {{
+                for (int __i = 0; __i < 4; ++__i) {{
+                    uint8_t __b = __Wu_src[__i];
+                    __Ws[__bi_w * BK_PAD + __bj_w * 2 + __i * 2 + 0] = __s0u * {t_act}(__b & 0x0f) + __b0u;
+                    __Ws[__bi_w * BK_PAD + __bj_w * 2 + __i * 2 + 1] = __s1u * {t_act}(__b & 0xf0) + __b0u;
+                }}
+            }} else {{
+                for (int __i = 0; __i < 8; ++__i) __Ws[__bi_w * BK_PAD + __bj_w * 2 + __i] = {t_act}(0);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int __kf = 0; __kf < KFR_SG; ++__kf) {{
+            simdgroup_matrix<{t_act}, 8, 8> __A_frag[TM_SG];
+            for (int __i = 0; __i < TM_SG; ++__i)
+                simdgroup_load(__A_frag[__i], __Xs + (__sgM*16 + __i*8)*BK_PAD + __kf*8, BK_PAD);
+            simdgroup_matrix<{t_act}, 8, 8> __Bu[TN_SG];
+            for (int __j = 0; __j < TN_SG; ++__j)
+                simdgroup_load(__Bu[__j], __Ws + (__sgN*16 + __j*8)*BK_PAD + __kf*8, BK_PAD, ulong2(0,0), true);
+            for (int __i = 0; __i < TM_SG; ++__i)
+                for (int __j = 0; __j < TN_SG; ++__j)
+                    simdgroup_multiply_accumulate(__up_acc[__i][__j], __A_frag[__i], __Bu[__j], __up_acc[__i][__j]);
+        }}
+
+        __X_src  += BK_SG;
+        __Wg_src += BK_SG / 2;  __Wu_src += BK_SG / 2;
+        if (++__gs_cnt_g == GS_STEPS) {{ __gs_cnt_g = 0; ++__Sg_row; ++__Bg_row; }}
+        if (++__gs_cnt_u == GS_STEPS) {{ __gs_cnt_u = 0; ++__Su_row; ++__Bu_row; }}
+    }}
+
+    const int __ep_row = (int)__simd_lid / 4;
+    const int __ep_c0  = ((int)__simd_lid % 4) * 2;
+    const int __sg_off = (int)__simd_gid * 64;
+    for (int __i = 0; __i < TM_SG; ++__i) {{
+        for (int __j = 0; __j < TN_SG; ++__j) {{
+            simdgroup_store(__gate_acc[__i][__j], __ep_g + __sg_off, 8);
+            simdgroup_store(__up_acc  [__i][__j], __ep_u + __sg_off, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            const int __m  = __c_row + __sgM*16 + __i*8 + __ep_row;
+            const int __n0 = __c_col + __sgN*16 + __j*8 + __ep_c0;
+            const int __n1 = __n0 + 1;
+            if (__m < __M) {{
+                if (__n0 < __N) {{
+                    float __g0 = __ep_g[__sg_off + __ep_row * 8 + __ep_c0];
+                    float __u0 = __ep_u[__sg_off + __ep_row * 8 + __ep_c0];
+                    float __sg0 = __g0 / (1.0f + exp(-__g0));
+                    {silu_mul_out}[(int64_t)__m * __N + __n0] = {t_act}(__sg0 * __u0);
+                }}
+                if (__n1 < __N) {{
+                    float __g1 = __ep_g[__sg_off + __ep_row * 8 + __ep_c0 + 1];
+                    float __u1 = __ep_u[__sg_off + __ep_row * 8 + __ep_c0 + 1];
+                    float __sg1 = __g1 / (1.0f + exp(-__g1));
+                    {silu_mul_out}[(int64_t)__m * __N + __n1] = {t_act}(__sg1 * __u1);
+                }}
+            }}
+        }}
+    }}
+}}
+"#,
+        symbol = symbol, t_act = t_act, t_scale = t_scale, gs = gs,
+        bk_pad = bk_pad, group_steps = group_steps,
+        silu_mul_out = silu_mul_out, x_norm = x_norm,
+        gate_wt = gate_wt, gate_sc = gate_sc, gate_bi = gate_bi,
+        up_wt = up_wt, up_sc = up_sc, up_bi = up_bi,
+        hidden = consts.hidden, intermediate = consts.intermediate,
+    );
+
+    // metal_kittens.h is included unchanged — do NOT add simdgroup_matrix
+    // code to that header or all synth kernels will be recompiled.
+    // This kernel includes <metal_simdgroup_matrix> directly in its header.
+    let mk_header = include_str!("../../ferrite-metal-kernels/shaders/metal_kittens.h");
+    let source = format!(
+        "// SPDX-License-Identifier: Apache-2.0\n// SYNTHESIZED KERNEL — do not hand-edit.\n\n\
+         #include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\n\
+         // === inlined metal_kittens.h ===\n{mk_header}\n// === end inlined metal_kittens.h ===\n\n{source_tail}",
+        mk_header = mk_header, source_tail = source_tail,
+    );
+
+    SynthesizedKernel { symbol, source, backend: SynthesisBackend::Metal }
+}
+
 /// Public helper for the synth-kernel dump probe (`bin/dump_synth.rs`).
 /// Returns the Metal source string for Llama-3.2-3B-4bit shape so we
 /// can run `xcrun metal` on it without standing up the full macro

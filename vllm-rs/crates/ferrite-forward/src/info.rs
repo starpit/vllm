@@ -1141,6 +1141,25 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
+            #[cfg(feature = "metal")]
+            Instruction::SynthGateUpSiluMul(
+                x_norm_slot,
+                out_slot,
+                layer,
+                _gate_wf,
+                _up_wf,
+                _group_size,
+                _bits,
+                _symbol,
+            ) => (
+                "SynthGateUpSiluMul",
+                vec![
+                    F::Slot(x_norm_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
             Instruction::SiluMul(gate_slot, up_slot, out_slot) => (
                 "SiluMul",
                 vec![F::Slot(gate_slot), F::Slot(up_slot), F::Slot(out_slot)],

@@ -158,6 +158,8 @@ pub enum KernelId {
     /// instruction follows immediately and consumes the device-buffer
     /// `silu_mul` output.
     SynthMlpPreDown,
+    /// Fused gate+up GEMM + SiluMul large-M prefill kernel.
+    SynthGateUpSiluMul,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source

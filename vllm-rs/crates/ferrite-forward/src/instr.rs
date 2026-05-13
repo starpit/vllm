@@ -683,6 +683,20 @@ pub enum Instruction<W> {
     /// output is the same shape. CUDA eval is `unreachable!` —
     /// metal-only (CUDA's q-MLP routes through Marlin/Bnb/etc).
     SiluMul(u32, u32, u32),
+    /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
+    /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
+    /// Fields: (x_norm_slot, out_slot, layer, gate_wt_fn, up_wt_fn, group_size, bits, kernel_symbol).
+    #[cfg(feature = "metal")]
+    SynthGateUpSiluMul(
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        &'static str,
+    ),
     /// MLX-affine int4 quantized embedding lookup (Metal-only).
     /// Replaces `Instruction::Embed` when `model.embed_tokens` ships
     /// as a quantized triple `(weight=U32, scales, biases)` — i.e.
@@ -3119,6 +3133,13 @@ impl<W: CanonicalParams> Instruction<W> {
                     "Instruction::SiluMul is metal-only — emitted by the \
                      decomposed q-MLP path on Affine; cuda's q-MLP routes \
                      through Marlin/Bnb/Fp8/etc fused kernels"
+                );
+            }
+            #[cfg(feature = "metal")]
+            Instruction::SynthGateUpSiluMul(..) => {
+                unreachable!(
+                    "Instruction::SynthGateUpSiluMul is metal-only — emitted by the \
+                     compiler-driven megakernel synthesis pass on the metal forward only"
                 );
             }
             #[cfg(feature = "metal")]

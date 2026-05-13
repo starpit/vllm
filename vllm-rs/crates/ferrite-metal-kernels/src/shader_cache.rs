@@ -76,6 +76,10 @@ impl ShaderCache {
                 &crate::embedded_metallib!("quantized_qmm")[..],
             ),
             (
+                "quantized_qmm_nax",
+                &crate::embedded_metallib!("quantized_qmm_nax")[..],
+            ),
+            (
                 "quantized_qvm",
                 &crate::embedded_metallib!("quantized_qvm")[..],
             ),
@@ -116,6 +120,13 @@ impl ShaderCache {
             // affine_embed reuses the dequant math under a gather
             // indirection (P6).
             self.libraries.get("quantized_dequantize")
+        } else if name.starts_with("affine_qmm_t_nax_") {
+            // NAX (Apple9 / M4+) qmm_t — lives in its own metallib
+            // since `quantized_qmm_nax.metal` pulls in the
+            // MetalPerformancePrimitives headers. Routed before the
+            // generic `affine_qmm_t_` prefix below since the prefixes
+            // overlap.
+            self.libraries.get("quantized_qmm_nax")
         } else if name.starts_with("affine_qmm_t_") || name.starts_with("affine_qmm_n_") {
             // Matches `affine_qmm_t_<dtype>_*`,
             // `affine_qmm_t_splitk_<dtype>_*`, and
@@ -270,7 +281,7 @@ impl ShaderCache {
 /// library. The bytes typically come from `include_bytes!` so we keep the
 /// destructor as no-op (default behavior of `DispatchData::from`'s
 /// implementation copies into a managed buffer).
-pub(crate) fn load_library_from_bytes(
+pub fn load_library_from_bytes(
     device: &Device,
     bytes: &'static [u8],
 ) -> Result<Library, String> {

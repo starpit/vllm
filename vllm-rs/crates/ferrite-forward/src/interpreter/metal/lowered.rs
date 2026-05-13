@@ -124,6 +124,11 @@ pub enum KernelId {
     /// emitted by the lowering pass (mirroring
     /// `quantized.cpp:861 strided_reduce_general_dispatch`).
     AffineQmmTSplitK,
+    /// NAX (Apple9 / M4+) prefill matmul — 64×64×64 MPP matmul2d tile.
+    /// Maps to `affine_qmm_t_nax_<dtype>_gs_<gs>_b_4_alN_<bool>_batch_0`
+    /// in `quantized_qmm_nax.metallib`. Only dispatched when
+    /// `is_nax_capable(profile.generation)` and `K % 64 == 0`.
+    AffineQmmTNax,
     /// Fused `silu(gate) * up` for the decomposed q-MLP path. The
     /// macro emits this after a pair of `AffineQmm` GEMMs when the
     /// gate/up Linears are MLX-affine quantized (plan P12 branch

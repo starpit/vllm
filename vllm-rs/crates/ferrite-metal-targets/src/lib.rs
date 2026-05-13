@@ -177,6 +177,27 @@ pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
     cost_table: BTreeMap::new(),
 };
 
+/// Returns `true` if the given generation has the NAX (Neural Accelerator
+/// eXtension) hardware MMA that MLX's `BaseNAXFrag` cooperative-tensor
+/// layout assumes.
+///
+/// NAX is **M5+ / A19+ only** — not M4. MLX's own gate is `arch_gen >= 17`
+/// (M5 is gen 17, M4 is gen 16; see `mlx/backend/metal/device.cpp:828`
+/// `is_nax_available`). `MetalPerformancePrimitives matmul2d` is callable
+/// on M4 but emulates via the standard simdgroup matmul with a
+/// cooperative-tensor per-thread layout that does NOT match
+/// `BaseNAXFrag`'s 2-row × 4-col assumption — see the diagnostic
+/// `nax_probe_dump_layout` reproducer in
+/// `crates/ferrite-metal-kernels/tests/quantized_qmm_test.rs` and the
+/// memo `project_metal_nax_layout_bug.md`.
+///
+/// Returns `false` for every generation currently modelled (M1–M4) —
+/// add an `M5` (or later) variant to [`AppleSiliconGen`] and return
+/// `true` for it once we have a chip to validate against.
+pub fn is_nax_capable(_gen: AppleSiliconGen) -> bool {
+    false
+}
+
 /// M4 device profile with measured costs loaded from
 /// `profiles/cost_m4.csv` (regenerate via
 /// `cargo run -p ferrite-metal-cost-sweep --release > profiles/cost_m4.csv`).

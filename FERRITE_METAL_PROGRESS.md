@@ -1,6 +1,8 @@
 # ferrite-metal — current state and remaining work
 
-Single-file pickup doc for any machine. Written 2026-05-12 at HEAD `8e576712d`. If you're a fresh agent, read this and the cited source files.
+Single-file pickup doc for any machine. Last updated 2026-05-13 at HEAD `dbab34b10` with uncommitted NAX-infrastructure changes (see "Then do this next"). If you're a fresh agent, read this and the cited source files.
+
+**Pickup quickstart:** there are uncommitted changes in the worktree wiring NAX end-to-end. Run `git status` and `git diff --stat` first to see them; nothing is half-wired (default `vllm chat` is coherent), but the NAX kernel itself produces wrong output and is gated behind `FERRITE_ENABLE_NAX=1`. The next action is fixing that one bug — see "Then do this next" below.
 
 ---
 
@@ -31,14 +33,7 @@ If chat produces a coherent poem and bench reports ~46 tok/s on M4 (or whatever 
 
 ## Then do this next
 
-**Track 1 below: NAX / MPP `matmul2d` on M4+.** The single biggest perf lever, ~16 % gap to `mlx_lm.generate` is largely hardware MMA we don't use. Concrete first action:
-
-1. Read `feedback_mpp_confirmed` (in source via `git log --all --oneline | grep -i mpp` for context commits) — MPP `matmul2d` works with per-simdgroup execution + `cooperative_tensor`.
-2. Open `vllm-rs/crates/ferrite-metal-kernels/include/metal_kittens.h` — `mk_qmv_fast` is the scalar dot-product loop to replace on M4.
-3. Add an `Apple9`-gated `mk_qmv_nax` variant; runtime checks `device.supportsFamily(MTLGPUFamily::Apple9)` and dispatches the NAX path on M4+ / falls back to `mk_qmv_fast` on M1–M3.
-4. Re-sweep `cost_m4.csv` so the solver sees the new costs; the synth Impls benefit for free.
-
-Skip if you're on M1–M3 (NAX hardware doesn't exist there); pick a different track below.
+The NAX track is **closed on M4** as of 2026-05-13 — MLX itself doesn't use NAX on M4 (`mlx/backend/metal/device.cpp:828` gates on `arch_gen >= 17` and M4 is gen 16). MPP `matmul2d` on M4 emulates via the standard simdgroup matmul with a cooperative-tensor per-thread layout that doesn't match MLX `BaseNAXFrag`. Infra stays in the tree dormant behind `is_nax_capable(_) == false` for all currently modelled gens — see `memory/project_metal_nax_layout_bug.md`. So: **pick a different track from §"Remaining work" below**. Track 2 (MLP synth redesign) and track 3 (MTL4 finish) are the next two perf levers on M4 and M1 Max respectively.
 
 ---
 
@@ -133,18 +128,34 @@ Filterable families: `rmsnorm`, `affine_qmv`, `affine_qmm`, `synth_pre_attn`, `s
 
 Tracks 1–3 are the high-leverage perf moves. 4–9 are correctness / coverage / cleanup. Pick by chip + interest:
 
-- **On M4+:** start with track 1 (NAX). Then track 2 (MLP synth redesign — pairs naturally with NAX).
-- **On M1 Max / M1–M3:** track 3. MTL3 crashes on M1 Max so you must run with `FERRITE_METAL_MTL4=1`; first move is to flip the default and stop relying on the env var, then land Phase B + remaining C. NAX (track 1) doesn't help these chips.
+- **On M4:** start with track 2 (MLP synth redesign). The ~3 % gap to vllm-mlx and ~16 % gap to `mlx_lm.generate` on M4 are NOT NAX-attributable (MLX itself doesn't use NAX on M4 either — see track 1) — they live in dispatch / kernel-selection / synth-shape tuning.
+- **On M1 Max / M1–M3:** track 3. MTL3 crashes on M1 Max so you must run with `FERRITE_METAL_MTL4=1`; first move is to flip the default and stop relying on the env var, then land Phase B + remaining C.
 - **Correctness or stuck on perf?** Tracks 4 (long-decode panic), 5 (safetensors zero-copy), or 8 (Phi-3 LongRoPE).
 
-### 1. NAX / MPP `matmul2d` (M4+ only) — biggest perf lever on M4
+### 1. NAX / MPP `matmul2d` — DORMANT, M5+/A19+ only
 
-About 16 % gap to `mlx_lm.generate` on Llama-3.2-1B-4bit is hardware MMA we don't use. MPP `matmul2d` + `cooperative_tensor` gives the same MMA path MLX NAX uses. Lives in the qmv/qmm_t primitive layer (`ferrite-metal-kernels/include/metal_kittens.h`), so it benefits every synth kernel for free.
+Status: infrastructure landed (shader, kernel cache, dispatcher, lowering, instantiations, reproducer test, layout-dump probe) but gated **off** for every Apple Silicon generation we currently model. `is_nax_capable(_)` returns `false` unconditionally — re-enable per-generation only after running the probe on that chip and confirming MPP returns the `BaseNAXFrag` layout.
 
-Constraints:
-- Apple Family 9 (M4 / A18 Pro+) only — needs runtime `device.supportsFamily(Apple9)` check + fallback to scalar `mk_qmv_fast` for M1–M3.
-- Subsumes Phase 5 of `METAL_KITTENS_SYNTHESIS_PLAN.md`.
-- MLP synth's wash on M4 today (see below) might flip to a win once gate/up use MMA.
+Why off: MLX's `is_nax_available()` in `mlx/backend/metal/device.cpp:828` requires `arch_gen >= 17` for the `'g'` arch class. M4 reports `applegpu_g16g` → arch_gen = 16, so **MLX never uses NAX on M4 either**. MPP `matmul2d` is callable on M4 but emulates via the standard simdgroup matmul, with a cooperative-tensor per-thread layout that doesn't match `BaseNAXFrag`'s 2-row × 4-col contiguous assumption — see the `nax_probe_dump_layout` test dump in `crates/ferrite-metal-kernels/tests/quantized_qmm_test.rs` and the bug memory `project_metal_nax_layout_bug.md`. The earlier framing of NAX as "the M4 perf lever" was wrong from the start.
+
+When M5+/A19+ work begins:
+1. Add a new variant to `AppleSiliconGen` (e.g., `M5`).
+2. Run the probe on the new chip:
+   ```bash
+   cargo test -p ferrite-metal-kernels --test quantized_qmm_test \
+     nax_probe_dump_layout -- --ignored --nocapture
+   ```
+   Confirm lane 0 covers rows ∈ {0, 8} × cols ∈ {0, 1, 2, 3, 8, 9, 10, 11} for ct_c — the `BaseNAXFrag` layout. Other lanes follow `get_coord`.
+3. If it matches, flip `is_nax_capable` true for that gen, remove `#[ignore]` from `affine_qmm_t_nax_b4_bf16_matches_cpu_reference`, and re-sweep `cost_<chip>.csv`.
+4. If it doesn't match, do NOT enable. Either MPP emulates on that chip too, or the layout has shifted. Rewrite `BaseNAXFrag::mma` in `shaders/metal_nax.h` to bridge via `get_multidimensional_index` rather than the per-index assumption.
+
+What's wired (dormant, ready for M5+):
+- `shaders/quantized_qmm_nax.metal` — BK=64 port of MLX's `qmm_t_nax_tgp_impl`, 12 instantiations across (f16/bf16) × (gs64/gs128) × (alN=true/false). Inlined `QuantizedBlockLoader` general-loader path.
+- `shaders/metal_nax.h` — vendored `BaseNAXFrag` / `NAXTile` / `tile_matmad_nax` + MPP internals.
+- `shaders/nax_probe.metal` — layout-dump diagnostic.
+- `pick_qmm_t_kernel(..., is_nax)` — gates on `K % 64 == 0 && gs != 32 && is_nax`.
+- `ShaderCache`/`SpecializedPipelineCache` route `affine_qmm_t_nax_*` → `quantized_qmm_nax` metallib.
+- `MetalAffineQmmT::execute_with_kernel(.., QmmTKernel::Nax, ..)` — test hook to force NAX (used by the reproducer test).
 
 ### 2. MLP synth kernel redesign
 

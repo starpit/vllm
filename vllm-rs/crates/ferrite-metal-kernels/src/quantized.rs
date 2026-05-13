@@ -777,6 +777,11 @@ pub enum QmmTKernel {
     /// `qmm_splitk` heuristic at `quantized.cpp:788-805` targets
     /// ~512 threadgroups; falls back to `Standard` if split_k ≤ 1).
     SplitK { split_k: u32, k_partition_size: u32 },
+    /// `affine_qmm_t_nax_*_alN_<bool>_batch_0` — NAX (Apple9 / M4+)
+    /// MMA path using `MetalPerformancePrimitives matmul2d`. Only
+    /// selected when `is_nax == true` AND `K % 64 == 0`.
+    /// 64×64×64 tile, no split-K (MLX NAX path at `quantized.cpp:695`).
+    Nax,
 }
 
 /// Compute the splitk plan per MLX `qmm_splitk` (`quantized.cpp:788-805`):
@@ -805,13 +810,25 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
 }
 
 /// Pick the right qmm_t variant per MLX's matmul-branch routing.
-/// Mirrors `quantized.cpp:1411-1424`:
+/// Mirrors `quantized.cpp:1411-1424` plus the NAX gate at `:695`:
 ///
 /// ```text
-/// if transpose && B == 1:                           qmm_splitk
+/// if is_nax && K % 64 == 0 && group_size != 32:    qmm_t_nax  (M4+)
+/// else if transpose && B == 1:                      qmm_splitk
 /// else if transpose:                                qmm (transpose=true)
 /// ```
-pub fn pick_qmm_t_kernel(m: u32, n: u32, k: u32, b: u32, group_size: u32) -> QmmTKernel {
+///
+/// `is_nax` should be `ferrite_metal_targets::is_nax_capable(profile.generation)`.
+///
+/// gs=32 is excluded from NAX dispatch because the BK=64 NAX shader
+/// violates `BCOLS <= group_size` for gs=32; MLX handles that with a
+/// specialized QuantizedBlockLoader path (different scale-indexing
+/// semantics) which we haven't ported. gs=32 quants fall through to
+/// the Standard qmm_t kernel instead.
+pub fn pick_qmm_t_kernel(m: u32, n: u32, k: u32, b: u32, group_size: u32, is_nax: bool) -> QmmTKernel {
+    if is_nax && k.is_multiple_of(64) && group_size != 32 {
+        return QmmTKernel::Nax;
+    }
     if b == 1 {
         let split_k = pick_qmm_t_split_k(m, n, k, group_size);
         if split_k > 1 {
@@ -837,11 +854,22 @@ pub fn qmm_t_dispatch_shape(
     n: u32,
     b: u32,
 ) -> ((u32, u32, u32), (u32, u32, u32)) {
-    let n_tiles = n.div_ceil(32);
-    let m_tiles = m.div_ceil(32);
     match kernel {
-        QmmTKernel::Standard => ((n_tiles, m_tiles, b), (32, 2, 2)),
-        QmmTKernel::SplitK { split_k, .. } => ((n_tiles, m_tiles, split_k), (32, 2, 2)),
+        QmmTKernel::Nax => {
+            // BM=BN=64 tile, TGP=128 = 4 simdgroups × 32 threads.
+            let n_tiles = n.div_ceil(64);
+            let m_tiles = m.div_ceil(64);
+            ((n_tiles, m_tiles, b), (128, 1, 1))
+        }
+        _ => {
+            let n_tiles = n.div_ceil(32);
+            let m_tiles = m.div_ceil(32);
+            match kernel {
+                QmmTKernel::Standard => ((n_tiles, m_tiles, b), (32, 2, 2)),
+                QmmTKernel::SplitK { split_k, .. } => ((n_tiles, m_tiles, split_k), (32, 2, 2)),
+                QmmTKernel::Nax => unreachable!(),
+            }
+        }
     }
 }
 
@@ -864,6 +892,9 @@ pub fn qmm_t_kernel_name(
         }
         QmmTKernel::SplitK { .. } => {
             format!("affine_qmm_t_splitk_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_alN_{aln}",)
+        }
+        QmmTKernel::Nax => {
+            format!("affine_qmm_t_nax_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_alN_{aln}_batch_0",)
         }
     }
 }
@@ -912,6 +943,22 @@ pub fn qmm_t_kernel_static_name(
         (QmmTKernel::SplitK { .. }, Bf16, S::F16, 64, false)  => "affine_qmm_t_splitk_bf16_s_f16_gs_64_b_4_alN_false",
         (QmmTKernel::SplitK { .. }, Bf16, S::F16, 128, true)  => "affine_qmm_t_splitk_bf16_s_f16_gs_128_b_4_alN_true",
         (QmmTKernel::SplitK { .. }, Bf16, S::F16, 128, false) => "affine_qmm_t_splitk_bf16_s_f16_gs_128_b_4_alN_false",
+        // ── qmm_t NAX (M4+) ───────────────────────────────────────
+        // gs=32 deliberately absent — `pick_qmm_t_kernel` falls back
+        // to Standard for gs=32 since BK=64 violates QuantizedBlockLoader's
+        // `BCOLS <= group_size`. Specialized gs=32 loader not ported.
+        (QmmTKernel::Nax, F16, S::F16, 64, true)    => "affine_qmm_t_nax_f16_s_f16_gs_64_b_4_alN_true_batch_0",
+        (QmmTKernel::Nax, F16, S::F16, 64, false)   => "affine_qmm_t_nax_f16_s_f16_gs_64_b_4_alN_false_batch_0",
+        (QmmTKernel::Nax, F16, S::F16, 128, true)   => "affine_qmm_t_nax_f16_s_f16_gs_128_b_4_alN_true_batch_0",
+        (QmmTKernel::Nax, F16, S::F16, 128, false)  => "affine_qmm_t_nax_f16_s_f16_gs_128_b_4_alN_false_batch_0",
+        (QmmTKernel::Nax, Bf16, S::F16, 64, true)   => "affine_qmm_t_nax_bf16_s_f16_gs_64_b_4_alN_true_batch_0",
+        (QmmTKernel::Nax, Bf16, S::F16, 64, false)  => "affine_qmm_t_nax_bf16_s_f16_gs_64_b_4_alN_false_batch_0",
+        (QmmTKernel::Nax, Bf16, S::F16, 128, true)  => "affine_qmm_t_nax_bf16_s_f16_gs_128_b_4_alN_true_batch_0",
+        (QmmTKernel::Nax, Bf16, S::F16, 128, false) => "affine_qmm_t_nax_bf16_s_f16_gs_128_b_4_alN_false_batch_0",
+        (QmmTKernel::Nax, _, _, 32, _) => panic!(
+            "qmm_t_kernel_static_name: NAX dispatched with gs=32 — \
+             `pick_qmm_t_kernel` should have routed to Standard"
+        ),
         (_, _, _, gs, _) => panic!(
             "qmm_t_kernel_static_name: unsupported group_size={gs} \
              — only 32, 64, 128 instantiated"
@@ -956,7 +1003,7 @@ impl MetalAffineQmmT {
     /// caller knows whether they need to allocate a splitk scratch
     /// `[split_k, M, N]` and emit the downstream sum-reduce).
     pub fn plan(&self, m: u32, n: u32, k: u32, b: u32, group_size: u32) -> QmmTKernel {
-        pick_qmm_t_kernel(m, n, k, b, group_size)
+        pick_qmm_t_kernel(m, n, k, b, group_size, /*is_nax=*/ false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -998,8 +1045,40 @@ impl MetalAffineQmmT {
             )));
         }
 
-        let aligned_n = n.is_multiple_of(32);
-        let kernel = pick_qmm_t_kernel(m, n, k, b, group_size);
+        let kernel = pick_qmm_t_kernel(m, n, k, b, group_size, /*is_nax=*/ false);
+        self.execute_with_kernel(
+            x, packed_w, scales, biases, y,
+            m, n, k, b, group_size, bits,
+            dtype, scale_dtype, kernel, encoder,
+        )
+    }
+
+    /// Like `execute`, but uses the caller-specified `kernel`
+    /// variant instead of consulting `pick_qmm_t_kernel`. Test/debug
+    /// path — production dispatch goes through the lowering pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_kernel(
+        &self,
+        x: &Buffer,
+        packed_w: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        y: &Buffer,
+        m: u32,
+        n: u32,
+        k: u32,
+        b: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        scale_dtype: ScaleDtype,
+        kernel: QmmTKernel,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<QmmTKernel, MetalStreamError> {
+        let aligned_n = match kernel {
+            QmmTKernel::Nax => n.is_multiple_of(64),
+            _ => n.is_multiple_of(32),
+        };
         let kernel_name = qmm_t_kernel_name(kernel, dtype, scale_dtype, group_size, bits, aligned_n);
         // K / N / M (and `k_partition_size` for splitk) ride as
         // function constants 0/1/2 (and 3) in `quantized_qmm.metal`

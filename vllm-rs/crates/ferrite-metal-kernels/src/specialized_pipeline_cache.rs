@@ -218,6 +218,10 @@ impl SpecializedPipelineCache {
                 ),
                 ("quantized_qmv", crate::embedded_metallib!("quantized_qmv")),
                 ("quantized_qmm", crate::embedded_metallib!("quantized_qmm")),
+                (
+                    "quantized_qmm_nax",
+                    crate::embedded_metallib!("quantized_qmm_nax"),
+                ),
                 ("quantized_qvm", crate::embedded_metallib!("quantized_qvm")),
                 (
                     "quantized_splitk_reduce",

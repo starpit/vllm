@@ -307,12 +307,15 @@ fn empirical_cost_us(
         );
         qmv_csv_kernel_name(kernel, dequant_dtype, group_size)
     } else {
-        let kernel = pick_qmm_t_kernel(m, n, k, 1, group_size);
+        let kernel = pick_qmm_t_kernel(m, n, k, 1, group_size, /*is_nax=*/ false);
         match kernel {
             QmmTKernel::Standard => format!("affine_qmm_t_{dtype_str}_gs{group_size}"),
             QmmTKernel::SplitK { split_k, .. } => {
                 format!("affine_qmm_t_splitk{split_k}_{dtype_str}_gs{group_size}")
             }
+            // NAX is never returned here (is_nax=false above), but the
+            // match must be exhaustive.
+            QmmTKernel::Nax => format!("affine_qmm_t_nax_{dtype_str}_gs{group_size}"),
         }
     };
     // For matvec the sweep emits M=1 rows; the AffineQmm tile's bucket

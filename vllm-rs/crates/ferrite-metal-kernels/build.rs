@@ -48,16 +48,12 @@ fn main() {
 
         // MSL → AIR. `-O3` and `-frecord-sources=flat` so debug
         // captures retain source mapping; matches what MLX ships.
-        // `-fno-fast-math` matches MLX (CMakeLists.txt:18) — fast-math
-        // reassociations can interact badly with MPP cooperative_tensor
-        // matmul2d on M4 (Apple-confirmed for accumulator order).
         let status = Command::new("xcrun")
             .args([
                 "-sdk",
                 "macosx",
                 "metal",
                 "-O3",
-                "-fno-fast-math",
                 "-frecord-sources=flat",
                 "-c",
             ])

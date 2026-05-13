@@ -74,7 +74,9 @@ impl Implementation for MetalSynthMlpPreDownImpl {
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        WorkloadConstraint::Any
+        // SynthMlpPreDown hangs on M1 Max at M=1 (threadgroup barrier deadlock).
+        // Only enable for M>=2 (prefill path); decode uses unfused AffineQmv.
+        WorkloadConstraint::NumTokensRange { min: 2, max: u32::MAX }
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {

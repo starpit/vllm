@@ -667,6 +667,69 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
     );
 }
 
+/// Diagnostic: time the qmm_t kernel at Llama-3.2-3B prefill shapes
+/// in isolation (one command buffer per call, sync between). Compares
+/// against the CSV's recorded numbers to see whether the in-isolation
+/// per-call time matches what the cost CSV says — if it does, the
+/// "5× slower than MLX" prefill gap must live in the *chain* of
+/// dispatches (per-dispatch overhead, barriers, scheduler), NOT in
+/// the kernel code itself.
+#[test]
+#[ignore = "Timing diagnostic — run manually with --ignored --nocapture"]
+fn qmm_t_timing_at_prefill_shapes() {
+    use std::time::Instant;
+    let device = ferrite_metal_kernels::device::detect_device().expect("Metal device").device;
+    let mut stream = ferrite_metal_kernels::stream::MetalStream::new(&device);
+    let qmm = ferrite_metal_kernels::quantized::MetalAffineQmmT::new(device.clone())
+        .expect("MetalAffineQmmT");
+
+    let shapes = [
+        ("Q/O (M=1024, N=3072, K=3072)", 1024_usize, 3072_usize, 3072_usize),
+        ("K/V (M=1024, N=1024, K=3072)", 1024,        1024,        3072),
+        ("Gate/Up (M=1024, N=8192, K=3072)", 1024,    8192,        3072),
+        ("Down (M=1024, N=3072, K=8192)",   1024,     3072,        8192),
+    ];
+    let gs: u32 = 64;
+    let warmups: u32 = 5;
+    let iters: u32 = 20;
+
+    for (label, m, n, k) in shapes {
+        let packed_bytes = (n * k) / 2;
+        let scales_elems = (n * k) / gs as usize;
+        let scales_bytes = scales_elems * 2;
+        let biases_bytes = scales_bytes;
+        let x_bytes = m * k * 2;
+        let y_bytes = m * n * 2 * 32; // worst-case SplitK 32-partition intermediate
+
+        let packed = zeroed_buffer(&device, packed_bytes);
+        let scales = zeroed_buffer(&device, scales_bytes);
+        let biases = zeroed_buffer(&device, biases_bytes);
+        let x = zeroed_buffer(&device, x_bytes);
+        let y = zeroed_buffer(&device, y_bytes);
+
+        let mut run = || {
+            let cb = stream.get_command_buffer().expect("cmd buf").clone();
+            let enc = cb.computeCommandEncoder().expect("encoder");
+            qmm.execute(
+                &x, &packed, &scales, &biases, &y,
+                m as u32, n as u32, k as u32, 1, gs, 4,
+                ferrite_metal_kernels::quantized::DequantDtype::Bf16,
+                ferrite_metal_kernels::quantized::ScaleDtype::F16,
+                &enc,
+            ).expect("qmm_t dispatch");
+            enc.endEncoding();
+            stream.commit().expect("commit");
+            stream.synchronize().expect("sync");
+        };
+
+        for _ in 0..warmups { run(); }
+        let t0 = Instant::now();
+        for _ in 0..iters { run(); }
+        let per_call_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        eprintln!("{label}: {per_call_us:>9.2} µs/call");
+    }
+}
+
 /// Diagnostic probe for MPP `matmul2d` cooperative-tensor per-thread
 /// layout. Dumps (capacity, is_valid, row, col) for the exact descriptor
 /// used by `affine_qmm_t_nax` so the layout MPP actually picks can be

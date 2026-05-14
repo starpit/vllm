@@ -230,6 +230,18 @@ impl Implementation for MetalSynthPreAttnImpl {
         let q_n = num_q.saturating_mul(head_dim);
         let kv_n = num_kv.saturating_mul(head_dim);
 
+        // SAFETY GATE — same M-direction bandwidth issue as
+        // SynthGateUpSiluMul: this synth was swept only at M ∈ {1, 2,
+        // 4, 8, 16} (see `cost_m4.csv` `synth_pre_attn_*` rows). At
+        // M=1024 the analytical fallback underestimates real cost by
+        // ~100×, and the actual kernel is ~8× slower than per-op
+        // AffineQmm + RmsNorm + RopeAppend. Gate it off above the
+        // validated range until the kernel is redesigned with
+        // M-blocked tiling.
+        if num_tokens > 64 {
+            return 1.0e15;
+        }
+
         let synth_name = format!(
             "synth_pre_attn_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,

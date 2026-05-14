@@ -122,6 +122,20 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
         let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
 
+        // SAFETY GATE — this fused-large-M kernel uses 32×32 simdgroup
+        // tiles per threadgroup without M-direction weight reuse, so its
+        // effective bandwidth is roughly `peak_bw / (M/32)` at large M.
+        // At M=1024 we measure ~8× slower than per-op AffineQmm + Silu +
+        // Mul. Until the kernel is redesigned with M-blocked tiling that
+        // amortizes weight reads across multiple M-tiles per TG, gate it
+        // off above the M ranges where it's been validated. Returning a
+        // very large finite cost (not INFINITY — the solver rejects
+        // non-finite costs as fatal, see `solver.rs:477`) lets the
+        // solver fall through to the unfused per-op chain at prefill.
+        if num_tokens > 64 {
+            return 1.0e15;
+        }
+
         let synth_name = format!(
             "synth_gate_up_silu_mul_large_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,

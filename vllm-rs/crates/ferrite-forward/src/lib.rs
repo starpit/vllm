@@ -823,12 +823,43 @@ mod dispatcher {
         // The inner `transpose` flips `Result<Option<W>>` →
         // `Option<Result<W>>` so `find_map` treats `Ok(None)` as
         // "keep looking" and any other shape as a hit.
+        let debug = std::env::var_os("FERRITE_TRY_LOAD_DEBUG").is_some();
+        if debug {
+            eprintln!(
+                "[ferrite::try_load] arch_hint={arch_hint:?} tp_world_size={tp_world_size}"
+            );
+            for reg in inventory::iter::<FerriteArchRegistration>() {
+                eprintln!(
+                    "[ferrite::try_load]   registered: arch_name={:?} hf_arches={:?} tp_world_size={} \
+                     match={}",
+                    reg.arch_name,
+                    reg.hf_arches,
+                    reg.tp_world_size,
+                    (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
+                        && reg.tp_world_size == tp_world_size
+                );
+            }
+        }
         inventory::iter::<FerriteArchRegistration>()
             .filter(|reg| {
                 (reg.hf_arches.contains(&arch_hint) || reg.gguf_archs.contains(&arch_hint))
                     && reg.tp_world_size == tp_world_size
             })
-            .find_map(|reg| (reg.try_load)(gw, stream, max_model_len, tp_rank, hf).transpose())
+            .find_map(|reg| {
+                let r = (reg.try_load)(gw, stream, max_model_len, tp_rank, hf).transpose();
+                if debug {
+                    eprintln!(
+                        "[ferrite::try_load]   walked {:?}: {}",
+                        reg.arch_name,
+                        match &r {
+                            Some(Ok(_)) => "Ok(Some(weights))",
+                            Some(Err(_)) => "Err(_)",
+                            None => "Ok(None) — no variant claimed",
+                        }
+                    );
+                }
+                r
+            })
             .transpose()
     }
 

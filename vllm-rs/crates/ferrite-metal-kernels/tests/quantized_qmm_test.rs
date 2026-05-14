@@ -730,6 +730,113 @@ fn qmm_t_timing_at_prefill_shapes() {
     }
 }
 
+/// Diagnostic: chain N qmm_t calls into ONE MTL3 command buffer with
+/// the SAME pipeline + buffers reused across calls. Measures average
+/// per-call time when the call is part of a back-to-back chain (vs.
+/// the existing `qmm_t_timing_at_prefill_shapes` test which measures
+/// isolated single-call timing with sync between calls).
+///
+/// If chain-per-call ≈ isolated-per-call: the chain isn't adding
+/// overhead; the prefill perf gap is in something else (e.g., MTL4
+/// vs MTL3 dispatch, scheduler).  If chain-per-call >> isolated:
+/// the chain itself is the bug — per-dispatch state-switching or
+/// cache-cold-start eating the time.
+#[test]
+#[ignore = "Chain-overhead diagnostic — run manually with --ignored --nocapture"]
+fn qmm_t_chain_per_call_timing() {
+    use std::time::Instant;
+    use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLDevice};
+    let device = ferrite_metal_kernels::device::detect_device().expect("Metal device").device;
+    let qmm = ferrite_metal_kernels::quantized::MetalAffineQmmT::new(device.clone())
+        .expect("MetalAffineQmmT");
+    let queue = device.newCommandQueue().expect("queue");
+
+    // Gate/up shape — the heaviest prefill GEMM in Llama-3.2-3B.
+    let m: u32 = 1024;
+    let n: u32 = 8192;
+    let k: u32 = 3072;
+    let gs: u32 = 64;
+
+    let packed = zeroed_buffer(&device, (n * k / 2) as usize);
+    let scales = zeroed_buffer(&device, (n * k / gs * 2) as usize);
+    let biases = zeroed_buffer(&device, (n * k / gs * 2) as usize);
+    let x = zeroed_buffer(&device, (m * k * 2) as usize);
+    let y = zeroed_buffer(&device, (m * n * 2 * 32) as usize);
+
+    // ── Isolated timing — one call per cmdbuf, sync between ────────
+    // 5 warmups + 20 iters.
+    for _ in 0..5 {
+        let cb = queue.commandBuffer().expect("cb");
+        let enc = cb.computeCommandEncoder().expect("enc");
+        qmm.execute(&x, &packed, &scales, &biases, &y,
+            m, n, k, 1, gs, 4,
+            ferrite_metal_kernels::quantized::DequantDtype::Bf16,
+            ferrite_metal_kernels::quantized::ScaleDtype::F16,
+            &enc).expect("dispatch");
+        enc.endEncoding();
+        cb.commit();
+        unsafe { cb.waitUntilCompleted(); }
+    }
+    let t0 = Instant::now();
+    let iters: usize = 20;
+    for _ in 0..iters {
+        let cb = queue.commandBuffer().expect("cb");
+        let enc = cb.computeCommandEncoder().expect("enc");
+        qmm.execute(&x, &packed, &scales, &biases, &y,
+            m, n, k, 1, gs, 4,
+            ferrite_metal_kernels::quantized::DequantDtype::Bf16,
+            ferrite_metal_kernels::quantized::ScaleDtype::F16,
+            &enc).expect("dispatch");
+        enc.endEncoding();
+        cb.commit();
+        unsafe { cb.waitUntilCompleted(); }
+    }
+    let iso_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    eprintln!("isolated (1 call / cmdbuf / sync): {iso_us:.2} µs/call");
+
+    // ── Chain timing — N calls in ONE cmdbuf, single sync at end ──
+    // Mimics what a forward does: many dispatches encoded into one
+    // command buffer, no per-call CPU sync. Apple's default MTL3
+    // compute encoder serial dispatch type means consecutive
+    // dispatches are auto-ordered, equivalent to MTL4 with a
+    // barrier between each.
+    for &chain_n in &[10_usize, 50, 100, 200] {
+        // Warmup
+        let cb = queue.commandBuffer().expect("cb");
+        let enc = cb.computeCommandEncoder().expect("enc");
+        for _ in 0..chain_n {
+            qmm.execute(&x, &packed, &scales, &biases, &y,
+                m, n, k, 1, gs, 4,
+                ferrite_metal_kernels::quantized::DequantDtype::Bf16,
+                ferrite_metal_kernels::quantized::ScaleDtype::F16,
+                &enc).expect("dispatch");
+        }
+        enc.endEncoding();
+        cb.commit();
+        unsafe { cb.waitUntilCompleted(); }
+
+        let t = Instant::now();
+        let cb = queue.commandBuffer().expect("cb");
+        let enc = cb.computeCommandEncoder().expect("enc");
+        for _ in 0..chain_n {
+            qmm.execute(&x, &packed, &scales, &biases, &y,
+                m, n, k, 1, gs, 4,
+                ferrite_metal_kernels::quantized::DequantDtype::Bf16,
+                ferrite_metal_kernels::quantized::ScaleDtype::F16,
+                &enc).expect("dispatch");
+        }
+        enc.endEncoding();
+        cb.commit();
+        unsafe { cb.waitUntilCompleted(); }
+        let elapsed_us = t.elapsed().as_secs_f64() * 1e6;
+        let per_call_us = elapsed_us / chain_n as f64;
+        let overhead_per_call_us = per_call_us - iso_us;
+        eprintln!(
+            "chain n={chain_n:>3}: {per_call_us:>9.2} µs/call  (overhead vs isolated: {overhead_per_call_us:>+9.2} µs)"
+        );
+    }
+}
+
 /// Diagnostic probe for MPP `matmul2d` cooperative-tensor per-thread
 /// layout. Dumps (capacity, is_valid, row, col) for the exact descriptor
 /// used by `affine_qmm_t_nax` so the layout MPP actually picks can be

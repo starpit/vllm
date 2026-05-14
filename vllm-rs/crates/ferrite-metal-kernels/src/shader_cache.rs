@@ -88,6 +88,18 @@ impl ShaderCache {
                 &crate::embedded_metallib!("quantized_splitk_reduce")[..],
             ),
             ("silu_mul", &crate::embedded_metallib!("silu_mul")[..]),
+            (
+                "moe_weighted_sum",
+                &crate::embedded_metallib!("moe_weighted_sum")[..],
+            ),
+            (
+                "slice_trailing_cols_u32",
+                &crate::embedded_metallib!("slice_trailing_cols_u32")[..],
+            ),
+            (
+                "top_k_renormalize",
+                &crate::embedded_metallib!("top_k_renormalize")[..],
+            ),
         ] {
             let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e}"))
@@ -133,9 +145,11 @@ impl ShaderCache {
             // `affine_qmm_n_<dtype>_*` by prefix — all live in
             // shaders/quantized_qmm.metal.
             self.libraries.get("quantized_qmm")
-        } else if name.starts_with("affine_qmv_") {
+        } else if name.starts_with("affine_qmv_") || name.starts_with("affine_gather_qmv_") {
             // Also matches `affine_qmv_quad_*` and `affine_qmv_fast_*`
-            // by prefix.
+            // by prefix. The `affine_gather_qmv_fast_*` MoE-decode
+            // variant lives in the same metallib (it reuses
+            // `qmv_fast_impl` from `quantized_qmv.metal`).
             self.libraries.get("quantized_qmv")
         } else if name.starts_with("affine_qvm_") {
             // Matches `affine_qvm_<dtype>_*` and
@@ -149,6 +163,12 @@ impl ShaderCache {
             self.libraries.get("quantized_splitk_reduce")
         } else if name.starts_with("silu_mul") {
             self.libraries.get("silu_mul")
+        } else if name.starts_with("moe_weighted_sum") {
+            self.libraries.get("moe_weighted_sum")
+        } else if name.starts_with("slice_trailing_cols_") {
+            self.libraries.get("slice_trailing_cols_u32")
+        } else if name.starts_with("top_k_renormalize") {
+            self.libraries.get("top_k_renormalize")
         } else {
             self.libraries.get("activation")
         };

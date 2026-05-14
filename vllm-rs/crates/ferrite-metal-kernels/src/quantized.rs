@@ -1684,6 +1684,135 @@ impl MetalAffineQvm {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// MetalAffineGatherQmv — MoE decode per-expert matvec (transpose=true).
+//
+// Port of `affine_gather_qmv_fast` (shaders/quantized_qmv.metal,
+// quantized.h:1900) specialized to ferrite's MoE call shape: one
+// (token, expert_slot) row per threadgroup, rhs gathered by
+// `rhs_indices[row]`. No `lhs_indices` (SwitchGLU never reuses x rows
+// in a permuted order beyond what the row-gather glue from Phase B
+// already materializes).
+//
+// Bindings (matches kernel signature in `quantized_qmv.metal`):
+//   buffer(0) = w           uint32  [num_experts, OUT, IN/pack_factor]
+//   buffer(1) = scales      T_scale [num_experts, OUT, IN/group_size]
+//   buffer(2) = biases      T_scale [num_experts, OUT, IN/group_size]
+//   buffer(3) = x           T_act   [N_tokens, IN]
+//   buffer(4) = rhs_indices uint32  [N_tokens * top_k]
+//   buffer(5) = y           T_act   [N_tokens * top_k, OUT]
+//   buffer(6) = top_k       int32   (setBytes)
+//   function constants: 0 = IN_VEC_SIZE (= k), 1 = OUT_VEC_SIZE (= n)
+//
+// Grid: (1, n.div_ceil(8), n_tokens * top_k); threadgroup (32, 2, 1).
+// ─────────────────────────────────────────────────────────────────
+
+pub struct MetalAffineGatherQmv {
+    shader_cache: Arc<ShaderCache>,
+}
+
+impl MetalAffineGatherQmv {
+    pub fn new(device: Device) -> Result<Self, MetalStreamError> {
+        Ok(Self {
+            shader_cache: Arc::new(ShaderCache::new(device)?),
+        })
+    }
+
+    pub fn with_shader_cache(shader_cache: Arc<ShaderCache>) -> Self {
+        Self { shader_cache }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        &self,
+        x: &Buffer,
+        packed_w: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        rhs_indices: &Buffer,
+        y: &Buffer,
+        n_tokens: u32,
+        top_k: u32,
+        n_out: u32,
+        k_in: u32,
+        group_size: u32,
+        bits: u32,
+        dtype: DequantDtype,
+        scale_dtype: ScaleDtype,
+        encoder: &ComputeCommandEncoderRef,
+    ) -> Result<(), MetalStreamError> {
+        use objc2_metal::MTLComputeCommandEncoder;
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        if bits != 4 {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_gather_qmv: only bits=4 wired, got {bits}"
+            )));
+        }
+        if !matches!(group_size, 32 | 64 | 128) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_gather_qmv: only group_size in {{32, 64, 128}} wired, got {group_size}"
+            )));
+        }
+        if !n_out.is_multiple_of(8) {
+            return Err(MetalStreamError::ShaderCompilationFailed(format!(
+                "affine_gather_qmv: N_out={n_out} must be a multiple of 8 (qmv tile)"
+            )));
+        }
+        // Pick `affine_gather_qmv_fast` when K%512==0 (matches mlx's
+        // `qmv_fast` predicate at quantized.cpp:84); fall back to the
+        // generic gather kernel otherwise (e.g. Qwen3-MoE-30B-A3B-4bit
+        // `down_proj` has K=768).
+        let variant = if k_in.is_multiple_of(512) {
+            "affine_gather_qmv_fast"
+        } else {
+            "affine_gather_qmv"
+        };
+        let kernel_name = format!(
+            "{variant}_{}_s_{}_gs_{group_size}_b_4",
+            dtype.symbol_infix(),
+            scale_dtype.symbol_infix(),
+        );
+        let constants = [
+            ConstantValue::int(0, k_in as i32),
+            ConstantValue::int(1, n_out as i32),
+        ];
+        let pipeline = self
+            .shader_cache
+            .get_pipeline_specialized(&kernel_name, &constants)?;
+        encoder.setComputePipelineState(&pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(packed_w), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(x), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(rhs_indices), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(y), 0, 5);
+            let top_k_i32: i32 = top_k as i32;
+            encoder.setBytes_length_atIndex(
+                NonNull::new(&top_k_i32 as *const i32 as *mut c_void).unwrap(),
+                std::mem::size_of::<i32>(),
+                6,
+            );
+        }
+
+        let threadgroups = MTLSize {
+            width: 1,
+            height: n_out.div_ceil(8) as usize,
+            depth: (n_tokens * top_k) as usize,
+        };
+        let threads_per_threadgroup = MTLSize {
+            width: 32,
+            height: 2,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

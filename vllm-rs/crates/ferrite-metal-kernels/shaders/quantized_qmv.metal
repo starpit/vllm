@@ -936,6 +936,123 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
 }
 
 // ─────────────────────────────────────────────────────────────────
+// affine_gather_qmv_fast — MLX `affine_gather_qmv_fast` (quantized.h:1900)
+//
+// Specialized to ferrite's MoE-decode use case (SwitchGLU per-expert
+// matvec, transpose=true). The full mlx kernel accepts general
+// `lhs_indices` + `rhs_indices` plus `adjust_matrix_offsets`
+// bookkeeping for arbitrary batch ndims; we collapse to:
+//
+//   x:            [N_tokens, IN_VEC_SIZE]      contiguous (T_act)
+//   rhs_indices:  [N_tokens * top_k]           uint32 (expert per slot)
+//   w:            [num_experts, OUT_VEC_SIZE, IN_VEC_SIZE/pack_factor]
+//                                              packed `bits`-bit
+//   scales:       [num_experts, OUT_VEC_SIZE, IN_VEC_SIZE/group_size]
+//   biases:       same shape as scales
+//   y:            [N_tokens * top_k, OUT_VEC_SIZE]   contiguous (T_act)
+//
+// Grid: (1, N_tile, N_tokens * top_k). One threadgroup per
+// (slot_row, output_tile) pair. Each tg looks up `expert =
+// rhs_indices[tid.z]`, pre-offsets w/scales/biases by `expert` and
+// x/y by `token = tid.z / top_k`, then defers to `qmv_fast_impl`
+// (which sees tid.x == 0 and computes y[row, tile] correctly).
+//
+// `top_k` rides as a setBytes runtime arg; ferrite doesn't bake it
+// into a pipeline constant because the same library serves multiple
+// MoE configs in the future.
+// ─────────────────────────────────────────────────────────────────
+
+template <typename T_act, typename T_scale, int group_size, int bits>
+[[kernel]] void affine_gather_qmv_fast(
+    const device uint32_t* w_base [[buffer(0)]],
+    const device T_scale* scales_base [[buffer(1)]],
+    const device T_scale* biases_base [[buffer(2)]],
+    const device T_act* x_base [[buffer(3)]],
+    const device uint32_t* rhs_indices [[buffer(4)]],
+    device T_act* y_base [[buffer(5)]],
+    const constant int& top_k [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+
+  const uint row = tid.z;
+  const uint token = row / uint(top_k);
+  const uint expert = rhs_indices[row];
+
+  // Per-expert strides (transpose=true layout):
+  //   w: u32 elements per expert
+  //     = OUT_VEC_SIZE * (IN_VEC_SIZE * bytes_per_pack / pack_factor) bytes
+  //     = OUT_VEC_SIZE * IN_VEC_SIZE * bytes_per_pack / pack_factor / 4 u32s
+  // For bits=4: pack_factor=8, bytes_per_pack=4, so u32/expert =
+  // OUT_VEC_SIZE * IN_VEC_SIZE / 8.
+  const size_t w_per_expert = size_t(OUT_VEC_SIZE) *
+      size_t(IN_VEC_SIZE) * size_t(bytes_per_pack) /
+      size_t(pack_factor) / size_t(sizeof(uint32_t));
+  const size_t s_per_expert =
+      size_t(OUT_VEC_SIZE) * size_t(IN_VEC_SIZE / group_size);
+
+  const device uint32_t* w = w_base + size_t(expert) * w_per_expert;
+  const device T_scale* scales = scales_base + size_t(expert) * s_per_expert;
+  const device T_scale* biases = biases_base + size_t(expert) * s_per_expert;
+  const device T_act* x = x_base + size_t(token) * size_t(IN_VEC_SIZE);
+  device T_act* y = y_base + size_t(row) * size_t(OUT_VEC_SIZE);
+
+  // qmv_fast_impl uses tid.x as M-row offset (`x += tid.x * in_vec_size`,
+  // `y += tid.x * out_vec_size`). We've already advanced x/y to the
+  // correct row above, so dispatch with tid.x == 0 (grid width = 1)
+  // and the impl's M-row offsets become no-ops.
+  qmv_fast_impl<T_act, T_scale, group_size, bits>(
+      w, scales, biases, x, y,
+      IN_VEC_SIZE, OUT_VEC_SIZE,
+      tid, simd_gid, simd_lid);
+}
+
+// affine_gather_qmv — generic qmv (no K%512 constraint) variant of the
+// gather-decode kernel. Same bindings as `affine_gather_qmv_fast`,
+// dispatches to `qmv_impl` instead of `qmv_fast_impl`. Used for MoE
+// projections where K_in is not a multiple of 512 (e.g.
+// Qwen3-MoE-30B-A3B-Instruct-4bit down_proj: K=768).
+
+template <typename T_act, typename T_scale, int group_size, int bits>
+[[kernel]] void affine_gather_qmv(
+    const device uint32_t* w_base [[buffer(0)]],
+    const device T_scale* scales_base [[buffer(1)]],
+    const device T_scale* biases_base [[buffer(2)]],
+    const device T_act* x_base [[buffer(3)]],
+    const device uint32_t* rhs_indices [[buffer(4)]],
+    device T_act* y_base [[buffer(5)]],
+    const constant int& top_k [[buffer(6)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+
+  const uint row = tid.z;
+  const uint token = row / uint(top_k);
+  const uint expert = rhs_indices[row];
+
+  const size_t w_per_expert = size_t(OUT_VEC_SIZE) *
+      size_t(IN_VEC_SIZE) * size_t(bytes_per_pack) /
+      size_t(pack_factor) / size_t(sizeof(uint32_t));
+  const size_t s_per_expert =
+      size_t(OUT_VEC_SIZE) * size_t(IN_VEC_SIZE / group_size);
+
+  const device uint32_t* w = w_base + size_t(expert) * w_per_expert;
+  const device T_scale* scales = scales_base + size_t(expert) * s_per_expert;
+  const device T_scale* biases = biases_base + size_t(expert) * s_per_expert;
+  const device T_act* x = x_base + size_t(token) * size_t(IN_VEC_SIZE);
+  device T_act* y = y_base + size_t(row) * size_t(OUT_VEC_SIZE);
+
+  qmv_impl<T_act, T_scale, group_size, bits>(
+      w, scales, biases, x, y,
+      IN_VEC_SIZE, OUT_VEC_SIZE,
+      tid, simd_gid, simd_lid);
+}
+
+// ─────────────────────────────────────────────────────────────────
 // affine_qmv — quantized.h:1547-1597
 // ─────────────────────────────────────────────────────────────────
 
@@ -1008,6 +1125,12 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
   [[kernel]] decltype(name<act_type, scale_type, gs, bits, D, batched>)                     \
       name<act_type, scale_type, gs, bits, D, batched>;
 
+#define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)           \
+  template [[host_name(                                                                     \
+      #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits)]]                         \
+  [[kernel]] decltype(name<act_type, scale_type, gs, bits>)                                 \
+      name<act_type, scale_type, gs, bits>;
+
 #define INST_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs)                          \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 0)     \
   INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4, 1)     \
@@ -1016,7 +1139,9 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 0) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 64, 1) \
   INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,0) \
-  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,1)
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 4, 128,1) \
+  INST_GATHER_QMV(affine_gather_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4)     \
+  INST_GATHER_QMV(affine_gather_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4)
 
 // Coverage: T_scale=half always (every sampled mlx-community 4bit ships
 // F16 scales — `INT4_PARITY_PROBES.md:73,287`). T_act per `torch_dtype`.

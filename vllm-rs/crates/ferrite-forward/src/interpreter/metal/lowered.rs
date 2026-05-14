@@ -165,6 +165,56 @@ pub enum KernelId {
     SynthMlpPreDown,
     /// Fused gate+up GEMM + SiluMul large-M prefill kernel.
     SynthGateUpSiluMul,
+    /// MLX `softmax_single_row` (precise variant). Used by the MoE
+    /// router: `mx.softmax(gate(x), axis=-1, precise=True)` over
+    /// `[N, num_experts]`. Maps to `softmax_<dtype>_specialized`
+    /// in `softmax.metallib`. Faithful port of MLX
+    /// `softmax_single_row_precise` (`mlx/.../softmax.metal`).
+    Softmax,
+    /// MLX `block_sort` in ARG_SORT mode, top-k along axis=-1.
+    /// Used by the MoE router: `mx.argpartition(probs, kth=-k)[..., -k:]`
+    /// over `[N, num_experts]` → `[N, top_k]` u32 indices. Maps to
+    /// `c_arg_block_sort_<dt>_uint32_bn{32,64,128}_tn4`. Faithful
+    /// port of MLX `block_sort` (`mlx/.../sort/sort.metal`).
+    ArgPartitionTopK,
+    /// MLX `gather_axis` specialized to 2D contiguous, axis=-1. Used
+    /// by the MoE router to read top-k scores given top-k indices:
+    /// `scores = mx.take_along_axis(probs, inds, axis=-1)`.
+    TakeAlongAxis,
+    /// MLX-affine int4 MoE per-expert matvec, transpose=true.
+    /// `K%512==0` fast variant. Maps to
+    /// `affine_gather_qmv_fast_<dt>_s_<scale>_gs_<gs>_b_4` in
+    /// `quantized_qmv.metallib`. Used by the MoE decomposition:
+    /// `mx.gather_qmm(x, W_expert, scales, biases, rhs_indices=inds,
+    /// transpose=True)` over `(token, slot)` flat rows.
+    AffineGatherQmvFast,
+    /// MLX-affine int4 MoE per-expert matvec, transpose=true,
+    /// generic K (non-multiple-of-512) variant. Maps to
+    /// `affine_gather_qmv_<dt>_s_<scale>_gs_<gs>_b_4`.
+    AffineGatherQmv,
+    /// Plain row-gather: `out[m, d] = src[idx[m] / divisor, d]`.
+    /// `divisor=1` is `_scatter_unsort` (`indices_flat[order]` and
+    /// `x[inv_order]`); `divisor=top_k` is the SwitchGLU
+    /// `x.flatten(0,-3)[order // K]` from `switch_layers.py:17`.
+    /// Maps to `row_gather_<dtype>` in `row_gather.metallib`.
+    RowGather,
+    /// MoE final reduction: `out[n, d] = sum_k(expert[n, k, d] * scores[n, k])`.
+    /// MLX expression: `(y * scores[..., None]).sum(axis=-2)` from
+    /// qwen3_moe.py:137. One thread per (n, d) output element.
+    /// Maps to `moe_weighted_sum_<dtype>` in `moe_weighted_sum.metallib`.
+    MoeWeightedSum,
+    /// Take trailing `top_k` columns of a 2D `[N, src_cols]` u32 buffer
+    /// into a contiguous `[N, top_k]` u32 buffer. MLX expresses this as
+    /// a strided view (`mx.argpartition(...)[..., -k:]` at
+    /// qwen3_moe.py:131); ferrite-metal materializes it because MoE
+    /// scratch regions are flat byte ranges. Maps to
+    /// `slice_trailing_cols_uint32` in `slice_trailing_cols_u32.metallib`.
+    SliceTrailingColsU32,
+    /// In-place L1 row-renormalize on `[N, top_k]` T_act scores:
+    /// `scores[n, k] /= sum(scores[n, :])`. Implements
+    /// `norm_topk_prob` from qwen3_moe.py:134. One thread per row.
+    /// Maps to `top_k_renormalize_<dtype>` in `top_k_renormalize.metallib`.
+    TopKRenormalize,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source
@@ -326,6 +376,30 @@ pub enum Binding<W: CanonicalParams> {
     /// serialized, so the writer/reader pair fully completes before
     /// the next AffineQmm overwrites the scratch.
     Scratch { binding_index: u8 },
+    /// Region inside the worker's shared **MoE scratch** buffer —
+    /// allocated once per `MetalWorker` at init time, sized to
+    /// `LoweredMetalTape::moe_scratch_bytes` (the max across all bucket
+    /// tapes). The lowering arm for `Instruction::SharedFusedMoe`
+    /// sub-divides the buffer into named regions (router probs, top-k
+    /// indices, top-k scores, per-expert gate/up/down intermediates)
+    /// by carving deterministic byte offsets — same trick as
+    /// `Binding::Scratch` for SplitK, but with multiple regions.
+    ///
+    /// One MoE scratch buffer suffices across many `Instruction::SharedFusedMoe`
+    /// (one per layer × num_layers): ICB commands inside a single
+    /// encoder are serialized, so each MoE call fully completes before
+    /// the next overwrites the regions.
+    MoeScratch { binding_index: u8, byte_offset: u32 },
+    /// Tiny inline scalar baked into a per-binding 4-byte MTLBuffer at
+    /// bake time. Used for kernels (softmax, argpartition,
+    /// take_along_axis, row_gather, affine_gather_qmv) whose `.metal`
+    /// signature exposes a `constant int& X [[buffer(N)]]` parameter
+    /// — the existing standalone dispatchers populate them via
+    /// `setBytes_length_atIndex`, but ICB commands cannot use
+    /// `setBytes`, so the baker allocates a tiny shared-storage
+    /// `MTLBuffer`, writes `value` into it, retains it on the
+    /// `BucketBaking`, and binds it at `binding_index`.
+    Inline { binding_index: u8, value: u32 },
 }
 
 /// Discriminator over the typed weight thunks `Instruction<W>` carries.
@@ -347,6 +421,15 @@ pub enum WeightBundleKind<W: CanonicalParams> {
     /// (U32 weight ⇒ AffineQuantEmbedding, else Embedding).
     #[cfg(feature = "metal")]
     AffineQuantEmbedding(crate::WtFn<W, ferrite_kernels::layers::AffineQuantEmbedding>),
+    /// Qwen-MoE / Qwen3-Next sparse MoE block bundle. Carries the
+    /// dense BF16 router gate, per-expert SwitchGLU gate/up/down
+    /// triples (4bit affine MLX layout), and an optional shared
+    /// expert (Qwen3-Next only). The worker resolves a single
+    /// `WeightTensor` per `Binding::Weight` against the layer's
+    /// `MetalSwitchGluMoeWeights` field — see the `SharedFusedMoe`
+    /// arm in `worker.rs::resolve_weight`.
+    #[cfg(feature = "metal")]
+    SharedFusedMoe(crate::WtFn<W, ferrite_kernels::layers_moe::SharedFusedMoELayer>),
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding
@@ -379,6 +462,44 @@ pub enum WeightTensor {
     /// Worker reports `MissingBias` if the layer's `linear_bias` is
     /// `None`. Only valid against `LinearLayer::AffineQuant`.
     AffineLinearBias,
+    // ── MoE bundle (`WeightBundleKind::SharedFusedMoe`) ───────────
+    //
+    // Per-expert SwitchGLU (4bit affine MLX layout): each variant
+    // names one `[E, *, *]` slab on the layer's
+    // `MetalSwitchGluMoeWeights`. The worker's `SharedFusedMoe`
+    // resolver matches on the variant and pulls the right field.
+    /// Dense `[num_experts, hidden_size]` router gate (`mlp.gate.weight`)
+    /// in `T_act` dtype. Used by the I::SharedFusedMoe lowering arm
+    /// for the router GEMM step.
+    MoeRouterGate,
+    /// Per-expert gate_proj packed u32 weight `[E, moe_inter, hidden / pack_factor]`.
+    MoeExpertGateW,
+    /// Per-expert gate_proj scales f16 `[E, moe_inter, hidden / group_size]`.
+    MoeExpertGateS,
+    /// Per-expert gate_proj affine biases f16 (per-group offset, NOT linear bias).
+    MoeExpertGateB,
+    MoeExpertUpW,
+    MoeExpertUpS,
+    MoeExpertUpB,
+    /// Per-expert down_proj packed u32 `[E, hidden, moe_inter / pack_factor]`.
+    MoeExpertDownW,
+    MoeExpertDownS,
+    MoeExpertDownB,
+    /// Optional Qwen3-Next shared expert `gate_proj` packed u32
+    /// `[shared_inter, hidden / pack_factor]`. Worker reports
+    /// `WeightLookupFailed` if the layer ships no shared expert.
+    MoeSharedGateW,
+    MoeSharedGateS,
+    MoeSharedGateB,
+    MoeSharedUpW,
+    MoeSharedUpS,
+    MoeSharedUpB,
+    MoeSharedDownW,
+    MoeSharedDownS,
+    MoeSharedDownB,
+    /// Dense `[1, hidden_size]` shared expert sigmoid gate
+    /// (`shared_expert_gate.weight`). `T_act` dtype. Optional.
+    MoeSharedExpertGate,
 }
 
 /// Categories of buffers the worker rebinds per forward call.
@@ -503,6 +624,16 @@ pub struct LoweredMetalTape<W: CanonicalParams> {
     /// case `Binding::Scratch` never appears and the worker skips
     /// the buffer allocation).
     pub splitk_scratch_bytes: u32,
+    /// Byte size of the worker's shared MoE scratch buffer — `max`
+    /// across every `Instruction::SharedFusedMoe` in the tape, taken
+    /// across all bucket tapes when the worker allocates. Zero when no
+    /// `Instruction::SharedFusedMoe` lowered to `Binding::MoeScratch`
+    /// (i.e. the model is not MoE), in which case the worker skips
+    /// allocation. Layout convention: regions are laid out as
+    /// `[router | up | indices | scores]`, each padded to 256-byte
+    /// alignment to satisfy Metal's MTLBuffer offset alignment for
+    /// shader access.
+    pub moe_scratch_bytes: u32,
 }
 
 /// Errors produced by the lowering pass.

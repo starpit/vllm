@@ -147,6 +147,15 @@ pub enum WorkerError {
         bucket_index: usize,
         command_index: usize,
     },
+    /// A command referenced `Binding::MoeScratch` but the worker has no
+    /// MoE scratch buffer allocated. Indicates a lowering /
+    /// `LoweredMetalTape::moe_scratch_bytes` accounting bug — either
+    /// lowering emitted MoeScratch without registering the scratch byte
+    /// count, or the worker discarded the buffer.
+    MoeScratchBufferMissing {
+        bucket_index: usize,
+        command_index: usize,
+    },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -196,6 +205,15 @@ impl std::fmt::Display for WorkerError {
                  Binding::Scratch with no splitk scratch buffer allocated \
                  (lowering / tape accounting bug)"
             ),
+            Self::MoeScratchBufferMissing {
+                bucket_index,
+                command_index,
+            } => write!(
+                f,
+                "MetalWorker: bucket {bucket_index} command {command_index}: \
+                 Binding::MoeScratch with no MoE scratch buffer allocated \
+                 (lowering / tape accounting bug)"
+            ),
         }
     }
 }
@@ -216,6 +234,15 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// successive `affine_qmm_t_splitk` calls inside a single ICB
     /// run sequentially and can reuse the same buffer.
     pub splitk_scratch: Option<Buffer>,
+    /// Shared MoE scratch buffer. `Some` when any bucket tape requested
+    /// a non-zero `moe_scratch_bytes` (i.e. at least one
+    /// `Instruction::SharedFusedMoe` lowered to `Binding::MoeScratch`);
+    /// `None` otherwise. Sized to the max `moe_scratch_bytes` across
+    /// all bucket tapes — successive `Instruction::SharedFusedMoe`
+    /// inside a single ICB run sequentially and can reuse the same
+    /// buffer (and its sub-regions, since the per-call region offsets
+    /// are deterministic from `bucket_m + W::*`).
+    pub moe_scratch: Option<Buffer>,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -325,6 +352,30 @@ impl<W: CanonicalParams> MetalWorker<W> {
             None
         };
 
+        // Shared MoE scratch buffer — same one-buffer-suffices argument
+        // as splitk_scratch, scaled across multiple sub-regions
+        // (router, indices, scores, per-expert intermediates) carved
+        // by deterministic byte offsets at lowering time.
+        let max_moe_scratch_bytes: u32 = bucket_tapes
+            .iter()
+            .map(|t| t.moe_scratch_bytes)
+            .max()
+            .unwrap_or(0);
+        let moe_scratch: Option<Buffer> = if max_moe_scratch_bytes > 0 {
+            let buf = device
+                .newBufferWithLength_options(
+                    max_moe_scratch_bytes as usize,
+                    MTLResourceOptions::StorageModePrivate,
+                )
+                .expect("newBufferWithLength_options returned nil (moe scratch)");
+            if let Some(r) = residency {
+                r.insert(&buf);
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
         // Runtime metadata buffers (`input_ids`, `positions`,
         // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
         // are allocated by the per-canonical `RuntimeFactory` closure
@@ -356,6 +407,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 tape,
                 &arena,
                 splitk_scratch.as_ref(),
+                moe_scratch.as_ref(),
                 pipelines,
                 weights,
                 allocator,
@@ -369,6 +421,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             arena,
             bucket_bakings,
             splitk_scratch,
+            moe_scratch,
             _marker: std::marker::PhantomData,
         })
     }
@@ -562,6 +615,7 @@ fn bake_bucket<W: CanonicalParams>(
     tape: &LoweredMetalTape<W>,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
+    moe_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
     weights: &W,
     allocator: &MetalAllocator,
@@ -588,9 +642,11 @@ fn bake_bucket<W: CanonicalParams>(
                 cmd_idx,
                 cmd,
                 arena,
+                moe_scratch,
                 weights,
                 allocator,
                 runtime,
+                &device,
             )?;
             if std::env::var_os("FERRITE_METAL_BAKE_DEBUG").is_some() {
                 eprintln!(
@@ -729,9 +785,11 @@ fn bake_bucket<W: CanonicalParams>(
             cmd,
             arena,
             splitk_scratch,
+            moe_scratch,
             weights,
             allocator,
             runtime,
+            &device,
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
@@ -831,26 +889,33 @@ fn bake_bucket<W: CanonicalParams>(
 /// arena slot, index 1 → input arena slot, index 2 → LinearLayer
 /// weight thunk. Anything else is a contract violation surfaced as
 /// [`WorkerError::GemmBindingsMalformed`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_buffers<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand<W>,
     arena: &[Buffer],
+    moe_scratch: Option<&Buffer>,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
+    device: &Device,
 ) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
-    // KernelId::Gemm never references the SplitK scratch buffer
-    // (Dense GEMM has its own dispatch path via MPS), so pass None.
+    // KernelId::Gemm never touches the SplitK scratch buffer (that's
+    // only AffineQmmTSplitK), but the MoE router GEMM writes to the
+    // MoE scratch's `router` region — so the MoE scratch pointer is
+    // threaded through.
     let bound = resolve_bindings(
         bucket_index,
         command_index,
         cmd,
         arena,
         /*splitk_scratch=*/ None,
+        moe_scratch,
         weights,
         allocator,
         runtime,
+        device,
     )?;
     if bound.len() != 3 {
         return Err(WorkerError::GemmBindingsMalformed {
@@ -956,6 +1021,14 @@ fn resolve_weight<W: CanonicalParams>(
                                  macro should only emit Dense or AffineQuant on metal",
                     });
                 }
+                // MoE WeightTensor variants are only valid against
+                // `WeightBundleKind::SharedFusedMoe`.
+                _ => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "MoE WeightTensor variant requested against \
+                                 LinearLayer bundle — lowering bug",
+                    });
+                }
             }
         }
         WeightBundleKind::CosSin(cosfn) => (cosfn)(weights, layer),
@@ -970,11 +1043,116 @@ fn resolve_weight<W: CanonicalParams>(
                 WeightTensor::Weight => e.weight,
                 WeightTensor::AffineScales => e.scales,
                 WeightTensor::AffineBiases => e.affine_biases,
-                WeightTensor::Bias
-                | WeightTensor::AffineLinearBias => {
+                WeightTensor::Bias | WeightTensor::AffineLinearBias => {
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "AffineQuantEmbedding has no linear-layer bias \
                                  — embeddings only carry (weight, scales, biases)",
+                    });
+                }
+                // MoE WeightTensor variants are only valid against
+                // `WeightBundleKind::SharedFusedMoe`, not embedding.
+                _ => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "MoE WeightTensor variant requested against \
+                                 AffineQuantEmbedding bundle — lowering bug",
+                    });
+                }
+            }
+        }
+        // ── MoE bundle (Qwen-MoE / Qwen3-Next sparse MoE) ───────────
+        //
+        // Mirrors `LinearLayer` resolver shape: call the WtFn against
+        // weights to get the per-layer `SharedFusedMoELayer`, then
+        // pull the requested tensor out of its `metal:
+        // MetalSwitchGluMoeWeights` field. The MoE weight tensors are
+        // ONLY valid against this bundle kind — every other arm above
+        // returns `WeightLookupFailed` if the lowering ever asks for
+        // a MoE WeightTensor on a non-MoE bundle.
+        #[cfg(feature = "metal")]
+        WeightBundleKind::SharedFusedMoe(wtfn) => {
+            let l = (wtfn)(weights, layer);
+            let m = &l.metal;
+            match which {
+                // ── Router (dense) ─────────────────────────────────
+                WeightTensor::MoeRouterGate => m.router_gate,
+                // ── Per-expert SwitchGLU ───────────────────────────
+                WeightTensor::MoeExpertGateW => m.gate_w,
+                WeightTensor::MoeExpertGateS => m.gate_s,
+                WeightTensor::MoeExpertGateB => m.gate_b,
+                WeightTensor::MoeExpertUpW => m.up_w,
+                WeightTensor::MoeExpertUpS => m.up_s,
+                WeightTensor::MoeExpertUpB => m.up_b,
+                WeightTensor::MoeExpertDownW => m.down_w,
+                WeightTensor::MoeExpertDownS => m.down_s,
+                WeightTensor::MoeExpertDownB => m.down_b,
+                // ── Optional shared expert (Qwen3-Next) ────────────
+                WeightTensor::MoeSharedGateW => {
+                    m.shared_gate_w.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "shared_expert.gate_proj.weight requested but \
+                                 layer ships no shared expert",
+                    })?
+                }
+                WeightTensor::MoeSharedGateS => {
+                    m.shared_gate_s.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "shared_expert.gate_proj.scales requested but \
+                                 layer ships no shared expert",
+                    })?
+                }
+                WeightTensor::MoeSharedGateB => {
+                    m.shared_gate_b.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "shared_expert.gate_proj.biases requested but \
+                                 layer ships no shared expert",
+                    })?
+                }
+                WeightTensor::MoeSharedUpW => m.shared_up_w.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "shared_expert.up_proj.weight requested but layer \
+                             ships no shared expert",
+                })?,
+                WeightTensor::MoeSharedUpS => m.shared_up_s.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "shared_expert.up_proj.scales requested but layer \
+                             ships no shared expert",
+                })?,
+                WeightTensor::MoeSharedUpB => m.shared_up_b.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "shared_expert.up_proj.biases requested but layer \
+                             ships no shared expert",
+                })?,
+                WeightTensor::MoeSharedDownW => {
+                    m.shared_down_w.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "shared_expert.down_proj.weight requested but \
+                                 layer ships no shared expert",
+                    })?
+                }
+                WeightTensor::MoeSharedDownS => {
+                    m.shared_down_s.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "shared_expert.down_proj.scales requested but \
+                                 layer ships no shared expert",
+                    })?
+                }
+                WeightTensor::MoeSharedDownB => {
+                    m.shared_down_b.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "shared_expert.down_proj.biases requested but \
+                                 layer ships no shared expert",
+                    })?
+                }
+                WeightTensor::MoeSharedExpertGate => {
+                    m.shared_expert_gate
+                        .ok_or(WorkerError::WeightLookupFailed {
+                            reason: "shared_expert_gate.weight requested but \
+                                     layer ships no shared expert",
+                        })?
+                }
+                // Non-MoE WeightTensor on a SharedFusedMoe bundle is a
+                // lowering bug: the Affine* and Bias arms make no sense
+                // here (the bundle's internal Linears have their own
+                // distinct accessor enum).
+                WeightTensor::Weight
+                | WeightTensor::Bias
+                | WeightTensor::AffineScales
+                | WeightTensor::AffineBiases
+                | WeightTensor::AffineLinearBias => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "non-MoE WeightTensor requested against \
+                                 SharedFusedMoe bundle — lowering bug",
                     });
                 }
             }
@@ -994,15 +1172,18 @@ fn resolve_weight<W: CanonicalParams>(
 /// don't have to thread the [`MetalAllocator`]'s arenas-`Mutex` lock
 /// guard through to the encoder.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn resolve_bindings<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
     cmd: &LoweredCommand<W>,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
+    moe_scratch: Option<&Buffer>,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
+    device: &Device,
 ) -> Result<Vec<(Buffer, u64, u64)>, WorkerError> {
     let mut out: Vec<(Buffer, u64, u64)> = Vec::with_capacity(cmd.bindings.len());
     for binding in &cmd.bindings {
@@ -1045,6 +1226,38 @@ fn resolve_bindings<W: CanonicalParams>(
                     command_index,
                 })?;
                 (scratch.clone(), 0u64, *binding_index as u64)
+            }
+            Binding::MoeScratch {
+                binding_index,
+                byte_offset,
+            } => {
+                let scratch = moe_scratch.ok_or(WorkerError::MoeScratchBufferMissing {
+                    bucket_index,
+                    command_index,
+                })?;
+                (scratch.clone(), *byte_offset as u64, *binding_index as u64)
+            }
+            Binding::Inline {
+                binding_index,
+                value,
+            } => {
+                // Allocate a fresh 4-byte buffer per binding instance.
+                // Total per-bake count is bounded by command count ×
+                // max bindings per command (~tens for the largest model)
+                // — well inside Metal's resource limits and cheaper than
+                // wiring a shared constants pool with byte-offset
+                // bookkeeping.
+                let val_bytes = value.to_ne_bytes();
+                let buf = unsafe {
+                    device.newBufferWithBytes_length_options(
+                        ::std::ptr::NonNull::new(val_bytes.as_ptr() as *mut std::ffi::c_void)
+                            .unwrap(),
+                        4,
+                        ::objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .expect("newBufferWithBytes_length_options returned nil");
+                (buf, 0u64, *binding_index as u64)
             }
         };
         out.push((buf, off, idx));

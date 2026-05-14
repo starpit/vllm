@@ -540,6 +540,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 spec.bucket_m,
                 spec.num_arena_slots,
                 target_profile.as_ref(),
+                weights,
             )
             .map_err(|e| PoolBuildError::BucketLower {
                 bucket_m: spec.bucket_m,

@@ -64,9 +64,24 @@ pub fn lower_pair<W: CanonicalParams>(
     bucket_m: u32,
     num_arena_slots: u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
+    weights: &W,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
-    let bb = lower(backbone, backbone_barriers, bucket_m, num_arena_slots, profile)?;
-    let lh = lower(lm_head, lm_head_barriers, bucket_m, num_arena_slots, profile)?;
+    let bb = lower(
+        backbone,
+        backbone_barriers,
+        bucket_m,
+        num_arena_slots,
+        profile,
+        weights,
+    )?;
+    let lh = lower(
+        lm_head,
+        lm_head_barriers,
+        bucket_m,
+        num_arena_slots,
+        profile,
+        weights,
+    )?;
     let mut commands = bb.commands;
     commands.extend(lh.commands);
     let mut barrier_before = bb.barrier_before;
@@ -77,6 +92,7 @@ pub fn lower_pair<W: CanonicalParams>(
         commands,
         barrier_before,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
+        moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
     })
 }
 
@@ -98,10 +114,12 @@ pub fn lower<W: CanonicalParams>(
     bucket_m: u32,
     num_arena_slots: u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
+    weights: &W,
 ) -> Result<LoweredMetalTape<W>, LoweringError> {
     let mut commands = Vec::with_capacity(instructions.len());
     let mut barrier_before: Vec<bool> = Vec::with_capacity(instructions.len());
     let mut splitk_scratch_bytes: u32 = 0;
+    let mut moe_scratch_bytes: u32 = 0;
     let mut i = 0usize;
     // Macro-static-aligned barrier accessor: the macro emits one bool
     // per `Instruction` (pre-loop-unrolling). Loop expansion at
@@ -147,7 +165,9 @@ pub fn lower<W: CanonicalParams>(
                             bucket_m,
                             iter as u32,
                             &mut splitk_scratch_bytes,
+                            &mut moe_scratch_bytes,
                             profile,
+                            weights,
                         )?;
                         let n_cmds = cmds.len();
                         commands.extend(cmds);
@@ -162,7 +182,16 @@ pub fn lower<W: CanonicalParams>(
                 i = body_end;
             }
             other => {
-                let cmds = lower_one(other, i, bucket_m, 0, &mut splitk_scratch_bytes, profile)?;
+                let cmds = lower_one(
+                    other,
+                    i,
+                    bucket_m,
+                    0,
+                    &mut splitk_scratch_bytes,
+                    &mut moe_scratch_bytes,
+                    profile,
+                    weights,
+                )?;
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
@@ -183,6 +212,7 @@ pub fn lower<W: CanonicalParams>(
         commands,
         barrier_before,
         splitk_scratch_bytes,
+        moe_scratch_bytes,
     })
 }
 
@@ -215,8 +245,19 @@ fn lower_one<W: CanonicalParams>(
     bucket_m: u32,
     layer_offset: u32,
     splitk_scratch_bytes: &mut u32,
+    moe_scratch_bytes: &mut u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
+    weights: &W,
 ) -> Result<Vec<LoweredCommand<W>>, LoweringError> {
+    // `weights` is only consulted by the `I::SharedFusedMoe` arm to
+    // read MoE dims (num_experts/top_k/moe_inter/group_size/bits) off
+    // the loaded `MetalSwitchGluMoeWeights`. The macro emits
+    // `Instruction::SharedFusedMoe(in, out, layer, weight_fn)` with no
+    // dim payload, so the lowering arm resolves `(weight_fn)(weights, layer)`
+    // to get them. Suppressed where `feature = "metal"` is off because
+    // the SharedFusedMoe arm itself is `cfg(metal)`-gated.
+    #[cfg(not(feature = "metal"))]
+    let _ = weights;
     use Instruction as I;
 
     let cmd = match inst {
@@ -1639,6 +1680,487 @@ fn lower_one<W: CanonicalParams>(
             gemm_dims: None,
         },
 
+        // ── Qwen3-MoE / Qwen3-Next SwitchGLU MoE block ────────────
+        //
+        // Faithful decomposition of `Qwen3MoeSparseMoeBlock.__call__`
+        // (qwen3_moe.py:123) plus the optional Qwen3-Next shared-expert
+        // tail (qwen3_next.py:308):
+        //
+        //   logits  = x @ router_gate^T                  [N, num_experts]
+        //   probs   = softmax(logits, precise=True)      [N, num_experts]
+        //   sorted  = argpartition(probs, axis=-1)       [N, num_experts] u32
+        //   top_k_ind = sorted[..., -top_k:]             [N, top_k]      u32
+        //   scores  = take_along_axis(probs, top_k_ind)  [N, top_k]
+        //   scores /= sum(scores, axis=-1, keepdims=1)   (norm_topk_prob)
+        //   gate    = gather_qmv(x, gate_w, top_k_ind)   [N*top_k, moe_inter]
+        //   up      = gather_qmv(x, up_w, top_k_ind)     [N*top_k, moe_inter]
+        //   act     = silu(gate) * up                    [N*top_k, moe_inter]
+        //   expert  = gather_qmv(act, down_w, top_k_ind) [N*top_k, hidden]
+        //     (down uses top_k=1 in the kernel — each (token,slot) row
+        //      already has its own activation, so the kernel's
+        //      `token = row / top_k` divider must collapse to identity.)
+        //   out     = sum_k(expert * scores[..., None])  [N, hidden]
+        //
+        // Shared-expert tail (Qwen3-Next only, gated on
+        // `m.shared_expert_gate.is_some()` — not exercised by the
+        // Qwen3-MoE Phase F validation target):
+        //   shared_gate = gather_qmv(x, shared_gate_w)
+        //   shared_up   = gather_qmv(x, shared_up_w)
+        //   shared_act  = silu(shared_gate) * shared_up
+        //   shared_out  = gather_qmv(shared_act, shared_down_w)
+        //   gate_logit  = x @ shared_expert_gate^T  → sigmoid scalar
+        //   final       = out + sigmoid(gate_logit) * shared_out
+        //
+        // MoE scratch layout (all regions 256-byte aligned):
+        //   [argpart | router | up | indices | scores]
+        // `router` is reused 3× over the kernel chain (router_logits →
+        // router_probs → gate_out → expert_out=down_out); `up` is
+        // reused 2× (up_out → silu*up = act_out).
+        //
+        // Bindings for the per-expert affine-int4 gather kernels match
+        // `quantized_qmv.metal::affine_gather_qmv[_fast]`:
+        //   buffer(0) packed weight [E, OUT, IN/pack]
+        //   buffer(1) scales f16    [E, OUT, IN/gs]
+        //   buffer(2) biases f16    [E, OUT, IN/gs]
+        //   buffer(3) x activations
+        //   buffer(4) rhs_indices u32 (per-row expert id, flat)
+        //   buffer(5) y output
+        //   buffer(6) top_k         int32 (Inline)
+        //   function constants: 0=IN_VEC_SIZE, 1=OUT_VEC_SIZE
+        //
+        // Issue D from the handoff: we route the prefill bucket through
+        // the same `affine_gather_qmv[_fast]` decode kernel rather than
+        // porting `affine_gather_qmm_rhs_nt` — correctness-first; the
+        // perf tile is a follow-up.
+        #[cfg(feature = "metal")]
+        I::SharedFusedMoe(in_slot, out_slot, layer, weight_fn) => {
+            let layer_idx = *layer + layer_offset;
+            let l = (weight_fn)(weights, layer_idx);
+            let m = &l.metal;
+
+            let n_experts = m.num_experts as u32;
+            let top_k = m.top_k as u32;
+            let hidden = m.hidden_size as u32;
+            let moe_inter = m.moe_intermediate_size as u32;
+            let gs = m.group_size;
+            let bits = m.bits;
+            assert_eq!(
+                bits, 4,
+                "SharedFusedMoe metal: only bits=4 affine wired (got {bits})"
+            );
+            assert!(
+                matches!(gs, 32 | 64 | 128),
+                "SharedFusedMoe metal: only gs ∈ {{32,64,128}} wired (got {gs})"
+            );
+            assert!(
+                m.shared_expert_gate.is_none(),
+                "SharedFusedMoe metal: shared-expert tail (Qwen3-Next) not yet \
+                 wired into the lowering arm; Qwen3-MoE is the Phase F target"
+            );
+
+            let dtype = dequant_dtype_for::<W>();
+            let scale_dtype = scale_dtype_for::<W>();
+            let elem = elem_size_bytes(dtype);
+            let n = bucket_m;
+
+            // Region sizes (bytes; un-aligned).
+            let sz_argpart = n.saturating_mul(n_experts).saturating_mul(4);
+            let sz_router = [
+                n.saturating_mul(n_experts).saturating_mul(elem),
+                n.saturating_mul(top_k).saturating_mul(moe_inter).saturating_mul(elem),
+                n.saturating_mul(top_k).saturating_mul(hidden).saturating_mul(elem),
+            ]
+            .into_iter()
+            .max()
+            .unwrap();
+            let sz_up = n
+                .saturating_mul(top_k)
+                .saturating_mul(moe_inter)
+                .saturating_mul(elem);
+            let sz_indices = n.saturating_mul(top_k).saturating_mul(4);
+            let sz_scores = n.saturating_mul(top_k).saturating_mul(elem);
+
+            let off_argpart: u32 = 0;
+            let off_router = align_256(off_argpart.saturating_add(sz_argpart));
+            let off_up = align_256(off_router.saturating_add(sz_router));
+            let off_indices = align_256(off_up.saturating_add(sz_up));
+            let off_scores = align_256(off_indices.saturating_add(sz_indices));
+            let scratch_total = align_256(off_scores.saturating_add(sz_scores));
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(scratch_total);
+
+            // Symbol names.
+            let dt_long = match dtype {
+                DequantDtype::F16 => "float16",
+                DequantDtype::Bf16 => "bfloat16",
+            };
+            let dt_short = match dtype {
+                DequantDtype::F16 => "f16",
+                DequantDtype::Bf16 => "bf16",
+            };
+            let scale_short = match scale_dtype {
+                ScaleDtype::F16 => "f16",
+            };
+
+            let mut cmds: Vec<LoweredCommand<W>> = Vec::with_capacity(11);
+
+            // ── step a: router GEMM x @ router_gate^T → region_router
+            //
+            // GemmDims (m=N, n=num_experts, k=hidden) routes the f16 path
+            // to MPSMatrixMultiplication and the bf16 path to
+            // `gemm_bf16_specialized`. The output binding is
+            // `Binding::MoeScratch { off: off_router }` — the worker's
+            // `resolve_gemm_buffers` now passes `moe_scratch` through
+            // (Issue A of the handoff).
+            cmds.push(LoweredCommand {
+                kernel: KernelId::Gemm,
+                library: "",
+                function: "",
+                constants: Vec::new(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m.div_ceil(GEMM_TILE_M), n_experts.div_ceil(GEMM_TILE_N), 1),
+                    threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
+                },
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_router },
+                    Binding::ArenaSlot { slot: *in_slot, binding_index: 1 },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeRouterGate,
+                        layer: layer_idx,
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: Some(GemmDims { m: bucket_m, n: n_experts, k: hidden }),
+            });
+
+            // ── step b: softmax(precise) over region_router, in-place
+            //
+            // Faithful MLX port — `mx.softmax(..., axis=-1, precise=True)`
+            // at qwen3_moe.py:128. `axis_size = n_experts` rides via
+            // Binding::Inline at buffer(2).
+            let softmax_fn: &'static str = match dtype {
+                DequantDtype::F16 => "block_softmax_precise_float16",
+                DequantDtype::Bf16 => "block_softmax_precise_bfloat16",
+            };
+            cmds.push(LoweredCommand {
+                kernel: KernelId::Softmax,
+                library: "softmax",
+                function: softmax_fn,
+                constants: Vec::new(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, 1, 1),
+                    threads_per_threadgroup: (softmax_tg_size(n_experts), 1, 1),
+                },
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_router },
+                    Binding::MoeScratch { binding_index: 1, byte_offset: off_router },
+                    Binding::Inline { binding_index: 2, value: n_experts },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step c: argpartition → region_argpart [N, n_experts] u32
+            //
+            // Reads T_act `region_router` (probs); writes u32 sorted
+            // indices to `region_argpart`. The shader is dtype-keyed on
+            // the input.
+            let bn = arg_sort_bn(n_experts);
+            let argpart_fn: &'static str = match (dtype, bn) {
+                (DequantDtype::F16, 32) => "c_arg_block_sort_float16_uint32_bn32_tn4",
+                (DequantDtype::F16, 64) => "c_arg_block_sort_float16_uint32_bn64_tn4",
+                (DequantDtype::F16, 128) => "c_arg_block_sort_float16_uint32_bn128_tn4",
+                (DequantDtype::Bf16, 32) => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
+                (DequantDtype::Bf16, 64) => "c_arg_block_sort_bfloat16_uint32_bn64_tn4",
+                (DequantDtype::Bf16, 128) => "c_arg_block_sort_bfloat16_uint32_bn128_tn4",
+                (dt, bn) => unreachable!(
+                    "argpartition kernel name: dtype={dt:?} bn={bn}; lowering bug"
+                ),
+            };
+            cmds.push(LoweredCommand {
+                kernel: KernelId::ArgPartitionTopK,
+                library: "argpartition",
+                function: argpart_fn,
+                constants: Vec::new(),
+                dispatch: DispatchShape {
+                    threadgroups: (1, bucket_m, 1),
+                    threads_per_threadgroup: (bn, 1, 1),
+                },
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_router },
+                    Binding::MoeScratch { binding_index: 1, byte_offset: off_argpart },
+                    Binding::Inline { binding_index: 2, value: n_experts },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step d: slice trailing top_k cols → region_indices
+            //
+            // Materializes the `[..., -k:]` view from qwen3_moe.py:131.
+            // top_k threads per row, one threadgroup per row.
+            cmds.push(LoweredCommand {
+                kernel: KernelId::SliceTrailingColsU32,
+                library: "slice_trailing_cols_u32",
+                function: "slice_trailing_cols_uint32",
+                constants: Vec::new(),
+                dispatch: DispatchShape {
+                    threadgroups: (1, bucket_m, 1),
+                    threads_per_threadgroup: (top_k, 1, 1),
+                },
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_argpart },
+                    Binding::MoeScratch { binding_index: 1, byte_offset: off_indices },
+                    Binding::Inline { binding_index: 2, value: n_experts },
+                    Binding::Inline { binding_index: 3, value: top_k },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step e: take_along_axis(probs, indices) → region_scores
+            let take_fn: &'static str = match dtype {
+                DequantDtype::F16 => "gather_axis_cc_float16_uint32",
+                DequantDtype::Bf16 => "gather_axis_cc_bfloat16_uint32",
+            };
+            let _ = dt_long; // silence unused if dtype keys diverge per kernel
+            cmds.push(LoweredCommand {
+                kernel: KernelId::TakeAlongAxis,
+                library: "take_along_axis",
+                function: take_fn,
+                constants: Vec::new(),
+                dispatch: DispatchShape {
+                    threadgroups: (1, 1, bucket_m),
+                    threads_per_threadgroup: (1, top_k, 1),
+                },
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_router },
+                    Binding::MoeScratch { binding_index: 1, byte_offset: off_indices },
+                    Binding::MoeScratch { binding_index: 2, byte_offset: off_scores },
+                    Binding::Inline { binding_index: 8, value: n_experts },
+                    Binding::Inline { binding_index: 9, value: 1 },
+                    Binding::Inline { binding_index: 10, value: 1 },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step f: norm_topk_prob — scores /= sum(scores)
+            //
+            // Always on for Qwen3-MoE (`norm_topk_prob = True`). One
+            // thread per token row.
+            let renorm_fn: &'static str = match dtype {
+                DequantDtype::F16 => "top_k_renormalize_f16",
+                DequantDtype::Bf16 => "top_k_renormalize_bf16",
+            };
+            cmds.push(LoweredCommand {
+                kernel: KernelId::TopKRenormalize,
+                library: "top_k_renormalize",
+                function: renorm_fn,
+                constants: vec![ConstantValue::uint(0, top_k)],
+                dispatch: DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP),
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_scores },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step g: gate gather_qmv (x [N, hidden] → [N*top_k, moe_inter])
+            //
+            // Kernel name picker mirrors `MetalAffineGatherQmv::execute`
+            // (quantized.rs:1767): `_fast` when k_in % 512 == 0, generic
+            // otherwise. Qwen3-MoE hidden_size=2048 → fast; moe_inter=768
+            // → generic for down_proj.
+            let (gate_kernel, gate_fn_owned) =
+                pick_affine_gather_qmv(dtype, scale_dtype, gs, /*k_in=*/ hidden);
+            let (up_kernel, up_fn_owned) =
+                pick_affine_gather_qmv(dtype, scale_dtype, gs, /*k_in=*/ hidden);
+            let (down_kernel, down_fn_owned) =
+                pick_affine_gather_qmv(dtype, scale_dtype, gs, /*k_in=*/ moe_inter);
+
+            let gate_dispatch = DispatchShape {
+                threadgroups: (1, moe_inter.div_ceil(8), bucket_m.saturating_mul(top_k)),
+                threads_per_threadgroup: (32, 2, 1),
+            };
+            cmds.push(LoweredCommand {
+                kernel: gate_kernel,
+                library: "quantized_qmv",
+                function: gate_fn_owned,
+                constants: vec![
+                    ConstantValue::int(0, hidden as i32),
+                    ConstantValue::int(1, moe_inter as i32),
+                ],
+                dispatch: gate_dispatch,
+                bindings: vec![
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertGateW,
+                        layer: layer_idx,
+                        binding_index: 0,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertGateS,
+                        layer: layer_idx,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertGateB,
+                        layer: layer_idx,
+                        binding_index: 2,
+                    },
+                    Binding::ArenaSlot { slot: *in_slot, binding_index: 3 },
+                    Binding::MoeScratch { binding_index: 4, byte_offset: off_indices },
+                    Binding::MoeScratch { binding_index: 5, byte_offset: off_router },
+                    Binding::Inline { binding_index: 6, value: top_k },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step h: up gather_qmv → region_up
+            cmds.push(LoweredCommand {
+                kernel: up_kernel,
+                library: "quantized_qmv",
+                function: up_fn_owned,
+                constants: vec![
+                    ConstantValue::int(0, hidden as i32),
+                    ConstantValue::int(1, moe_inter as i32),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (1, moe_inter.div_ceil(8), bucket_m.saturating_mul(top_k)),
+                    threads_per_threadgroup: (32, 2, 1),
+                },
+                bindings: vec![
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertUpW,
+                        layer: layer_idx,
+                        binding_index: 0,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertUpS,
+                        layer: layer_idx,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertUpB,
+                        layer: layer_idx,
+                        binding_index: 2,
+                    },
+                    Binding::ArenaSlot { slot: *in_slot, binding_index: 3 },
+                    Binding::MoeScratch { binding_index: 4, byte_offset: off_indices },
+                    Binding::MoeScratch { binding_index: 5, byte_offset: off_up },
+                    Binding::Inline { binding_index: 6, value: top_k },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step i: SiluMul(gate, up) → region_up (in-place)
+            //
+            // Reuses the SiluMul kernel with a custom element count.
+            // Dispatch element budget is bucket_m * top_k * moe_inter
+            // (vs the I::SiluMul arm's bucket_m * W::INTERMEDIATE_SIZE).
+            let silu_elems = bucket_m
+                .saturating_mul(top_k)
+                .saturating_mul(moe_inter);
+            cmds.push(LoweredCommand {
+                kernel: KernelId::SiluMul,
+                library: "silu_mul",
+                function: silu_mul_static_name(dtype),
+                constants: vec![ConstantValue::uint(0, silu_elems)],
+                dispatch: DispatchShape::dispatch_1d(silu_elems, THREADS_PER_GROUP),
+                bindings: vec![
+                    Binding::MoeScratch { binding_index: 0, byte_offset: off_up },
+                    Binding::MoeScratch { binding_index: 1, byte_offset: off_router },
+                    Binding::MoeScratch { binding_index: 2, byte_offset: off_up },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step j: down gather_qmv(act, indices) → region_router
+            //
+            // Critical: pass `top_k=1` in the kernel's buffer(6). Each
+            // (token, slot) row has its own activation row in `act`
+            // (`[N*top_k, moe_inter]`), so the kernel's `token = row /
+            // top_k` must collapse to identity — exactly what top_k=1
+            // produces. `rhs_indices` is still `region_indices` flat
+            // `[N*top_k]` (one expert id per (token, slot) row).
+            cmds.push(LoweredCommand {
+                kernel: down_kernel,
+                library: "quantized_qmv",
+                function: down_fn_owned,
+                constants: vec![
+                    ConstantValue::int(0, moe_inter as i32),
+                    ConstantValue::int(1, hidden as i32),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (1, hidden.div_ceil(8), bucket_m.saturating_mul(top_k)),
+                    threads_per_threadgroup: (32, 2, 1),
+                },
+                bindings: vec![
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertDownW,
+                        layer: layer_idx,
+                        binding_index: 0,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertDownS,
+                        layer: layer_idx,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::SharedFusedMoe(*weight_fn),
+                        which: WeightTensor::MoeExpertDownB,
+                        layer: layer_idx,
+                        binding_index: 2,
+                    },
+                    Binding::MoeScratch { binding_index: 3, byte_offset: off_up },
+                    Binding::MoeScratch { binding_index: 4, byte_offset: off_indices },
+                    Binding::MoeScratch { binding_index: 5, byte_offset: off_router },
+                    Binding::Inline { binding_index: 6, value: 1 },
+                ],
+                gemm_dims: None,
+            });
+
+            // ── step k: MoeWeightedSum: out[n, d] = Σ_k (down[n,k,d] * scores[n,k])
+            let mws_fn: &'static str = match dtype {
+                DequantDtype::F16 => "moe_weighted_sum_f16",
+                DequantDtype::Bf16 => "moe_weighted_sum_bf16",
+            };
+            let _ = dt_short;
+            let _ = scale_short;
+            cmds.push(LoweredCommand {
+                kernel: KernelId::MoeWeightedSum,
+                library: "moe_weighted_sum",
+                function: mws_fn,
+                constants: vec![
+                    ConstantValue::uint(0, top_k),
+                    ConstantValue::uint(1, hidden),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (
+                        hidden.div_ceil(THREADS_PER_GROUP),
+                        bucket_m,
+                        1,
+                    ),
+                    threads_per_threadgroup: (
+                        hidden.min(THREADS_PER_GROUP).max(1),
+                        1,
+                        1,
+                    ),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot { slot: *out_slot, binding_index: 0 },
+                    Binding::MoeScratch { binding_index: 1, byte_offset: off_router },
+                    Binding::MoeScratch { binding_index: 2, byte_offset: off_scores },
+                ],
+                gemm_dims: None,
+            });
+
+            return Ok(cmds);
+        }
+
         // ── Metadata-only: no Metal dispatch ───────────────────────
         I::Reshape(_, _, _, _, _, _) | I::Alias(_, _) | I::Free(_) => {
             // These rebind / drop slots in the dispatcher's logical
@@ -1835,6 +2357,104 @@ fn affine_qmm_splitk_bindings<W: CanonicalParams>(
 fn elem_size_bytes(dtype: DequantDtype) -> u32 {
     match dtype {
         DequantDtype::F16 | DequantDtype::Bf16 => 2,
+    }
+}
+
+/// 256-byte alignment for MoE scratch region offsets. Metal MTLBuffer
+/// offsets are required to be a multiple of the underlying texel size
+/// for some access patterns; 256 is a safe upper bound that matches
+/// the alignment Metal recommends for shared-storage buffers.
+fn align_256(x: u32) -> u32 {
+    (x + 255) & !255
+}
+
+/// MLX `softmax.cpp` dispatch sizing — see
+/// `ferrite_metal_kernels::softmax::softmax_tg_size`. Inlined here so
+/// the lowering pass doesn't take a dep on the standalone dispatcher.
+fn softmax_tg_size(axis_size: u32) -> u32 {
+    let n_reads: u32 = 4;
+    let n = axis_size.div_ceil(n_reads);
+    let rounded = n.div_ceil(32).saturating_mul(32);
+    rounded.max(32).min(1024)
+}
+
+/// MLX argsort block size pick — see
+/// `ferrite_metal_kernels::argpartition::arg_sort_bn`. axis_size
+/// (= num_experts) ≤ 512 on every shipped MoE model, so the
+/// multi-block argsort branch is unreachable.
+fn arg_sort_bn(axis_size: u32) -> u32 {
+    let potential_bn = axis_size.div_ceil(4);
+    if potential_bn > 128 {
+        panic!(
+            "arg_sort_bn: axis_size={axis_size} requires multi-block argsort, not ported"
+        );
+    } else if potential_bn > 64 {
+        128
+    } else if potential_bn > 32 {
+        64
+    } else {
+        32
+    }
+}
+
+/// Mirror of `MetalAffineGatherQmv::execute`'s variant pick
+/// (`quantized.rs:1767`): `affine_gather_qmv_fast` when `k_in % 512 == 0`
+/// (mlx's `qmv_fast` predicate at `quantized.cpp:84`), else the generic
+/// `affine_gather_qmv`. Returns the `KernelId` and the formatted symbol
+/// name. Symbol shape matches `INST_GATHER_QMV` in
+/// `shaders/quantized_qmv.metal:1128`.
+fn pick_affine_gather_qmv(
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+    k_in: u32,
+) -> (KernelId, &'static str) {
+    let act = dtype.symbol_infix();
+    let scale = scale_dtype.symbol_infix();
+    let is_fast = k_in.is_multiple_of(512);
+    // The kernel name is a function of (dtype, scale, gs); enumerate the
+    // shipped instantiations so we can return `&'static str`.
+    match (is_fast, dtype, scale_dtype, group_size) {
+        (true, DequantDtype::F16, ScaleDtype::F16, 32) => {
+            (KernelId::AffineGatherQmvFast, "affine_gather_qmv_fast_f16_s_f16_gs_32_b_4")
+        }
+        (true, DequantDtype::F16, ScaleDtype::F16, 64) => {
+            (KernelId::AffineGatherQmvFast, "affine_gather_qmv_fast_f16_s_f16_gs_64_b_4")
+        }
+        (true, DequantDtype::F16, ScaleDtype::F16, 128) => {
+            (KernelId::AffineGatherQmvFast, "affine_gather_qmv_fast_f16_s_f16_gs_128_b_4")
+        }
+        (true, DequantDtype::Bf16, ScaleDtype::F16, 32) => {
+            (KernelId::AffineGatherQmvFast, "affine_gather_qmv_fast_bf16_s_f16_gs_32_b_4")
+        }
+        (true, DequantDtype::Bf16, ScaleDtype::F16, 64) => {
+            (KernelId::AffineGatherQmvFast, "affine_gather_qmv_fast_bf16_s_f16_gs_64_b_4")
+        }
+        (true, DequantDtype::Bf16, ScaleDtype::F16, 128) => {
+            (KernelId::AffineGatherQmvFast, "affine_gather_qmv_fast_bf16_s_f16_gs_128_b_4")
+        }
+        (false, DequantDtype::F16, ScaleDtype::F16, 32) => {
+            (KernelId::AffineGatherQmv, "affine_gather_qmv_f16_s_f16_gs_32_b_4")
+        }
+        (false, DequantDtype::F16, ScaleDtype::F16, 64) => {
+            (KernelId::AffineGatherQmv, "affine_gather_qmv_f16_s_f16_gs_64_b_4")
+        }
+        (false, DequantDtype::F16, ScaleDtype::F16, 128) => {
+            (KernelId::AffineGatherQmv, "affine_gather_qmv_f16_s_f16_gs_128_b_4")
+        }
+        (false, DequantDtype::Bf16, ScaleDtype::F16, 32) => {
+            (KernelId::AffineGatherQmv, "affine_gather_qmv_bf16_s_f16_gs_32_b_4")
+        }
+        (false, DequantDtype::Bf16, ScaleDtype::F16, 64) => {
+            (KernelId::AffineGatherQmv, "affine_gather_qmv_bf16_s_f16_gs_64_b_4")
+        }
+        (false, DequantDtype::Bf16, ScaleDtype::F16, 128) => {
+            (KernelId::AffineGatherQmv, "affine_gather_qmv_bf16_s_f16_gs_128_b_4")
+        }
+        _ => unreachable!(
+            "pick_affine_gather_qmv: (dtype={dtype:?}, scale={scale_dtype:?}, gs={group_size}) \
+             not instantiated — got act={act} scale={scale}"
+        ),
     }
 }
 

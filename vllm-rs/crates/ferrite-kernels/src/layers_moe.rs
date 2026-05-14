@@ -402,15 +402,111 @@ impl FusedMoELayer {
 /// ```text
 /// output = moe(hidden_states) + shared_expert_gate(hidden_states).sigmoid() * shared_expert(hidden_states)
 /// ```
+///
+/// **Backend layout.** On cuda the dense BF16 fields (`moe`, `shared_*`)
+/// are populated and consumed by `forward()` directly. On metal those
+/// fields are absent — the lowering arm reads from `metal` which holds
+/// the MLX-native 4bit affine weight bundle (per-expert `[E, out, in/8]`
+/// u32 + per-group `[E, out, in/gs]` f16 scales/biases) plus the dense
+/// router gate and the optional shared expert. The two halves never
+/// overlap; the macro emits one `Instruction::SharedFusedMoe` whose
+/// interpretation diverges per backend.
 pub struct SharedFusedMoELayer {
+    #[cfg(feature = "cuda")]
     pub moe: FusedMoELayer,
     /// Shared expert: fused gate+up projection `[2*intermediate, hidden]`.
+    #[cfg(feature = "cuda")]
     pub shared_gate_up: Option<Linear>,
     /// Shared expert: down projection `[hidden, intermediate]`.
+    #[cfg(feature = "cuda")]
     pub shared_down: Option<Linear>,
     /// Shared expert gate: `[1, hidden]` — sigmoid gate for shared expert output.
+    #[cfg(feature = "cuda")]
     pub shared_expert_gate: Option<Linear>,
     pub intermediate_size: usize,
+    /// Metal-only MLX-affine 4bit MoE weights. Mirrors the
+    /// `SwitchGLU` + dense router gate + optional `Qwen3NextMLP` shared
+    /// expert + sigmoid gate layout from `mlx-lm/.../switch_layers.py`
+    /// and `mlx-lm/.../qwen3_next.py:308`. Populated by the
+    /// `#[cfg(feature = "metal")]` `load` impl below; consumed by the
+    /// `I::SharedFusedMoe` lowering arm in
+    /// `ferrite-forward/src/interpreter/metal/lowering.rs`.
+    #[cfg(feature = "metal")]
+    pub metal: MetalSwitchGluMoeWeights,
+}
+
+// ---------------------------------------------------------------------------
+// MetalSwitchGluMoeWeights — MLX-native 4bit affine MoE for ferrite-metal
+// ---------------------------------------------------------------------------
+
+/// Metal-only weight bundle for `SharedFusedMoELayer`. Holds the
+/// MLX-affine int4 representation of every tensor the lowered
+/// `I::SharedFusedMoe` arm needs: the dense router gate, the per-expert
+/// SwitchGLU `gate_proj` / `up_proj` / `down_proj` triplets, and the
+/// optional Qwen3-Next-style shared expert (`shared_expert.{gate,up,down}_proj`
+/// + dense `shared_expert_gate`).
+///
+/// On-disk shapes follow `QuantizedSwitchLinear` (switch_layers.py:75):
+/// per-expert weights are stacked along axis 0 with shape
+/// `[num_experts, output_dims, input_dims / pack_factor]` (u32 packed,
+/// `pack_factor = 32 / bits = 8` for bits=4). Scales and "biases" (MLX
+/// terminology — the per-group affine offset, NOT a linear-layer bias)
+/// match shape `[num_experts, output_dims, input_dims / group_size]`,
+/// dtype f16. Activation dtype is bf16 or f16 per `torch_dtype`; the
+/// `affine_gather_qmv_*` kernels cast scales to T_act in-register.
+///
+/// The router gate (`mlp.gate.weight`) is dense — single bf16 GEMM the
+/// lowering arm dispatches via `MetalGemm`/`KernelId::Gemm`. The
+/// `shared_expert_gate.weight` is similarly dense (1×hidden BF16) — the
+/// "sigmoid gate" for the shared expert output.
+#[cfg(feature = "metal")]
+pub struct MetalSwitchGluMoeWeights {
+    // ─── Router (dense BF16/F16) ────────────────────────────────────────
+    /// Router gate `[num_experts, hidden_size]`, dense `T_act`.
+    pub router_gate: GpuTensor,
+
+    // ─── Per-expert SwitchGLU (4bit affine MLX layout) ──────────────────
+    /// `gate_proj.weight` packed u32 `[E, moe_inter, hidden / pack_factor]`.
+    pub gate_w: GpuTensor,
+    /// `gate_proj.scales` f16 `[E, moe_inter, hidden / group_size]`.
+    pub gate_s: GpuTensor,
+    /// `gate_proj.biases` f16 (per-group affine offsets, NOT linear bias).
+    pub gate_b: GpuTensor,
+
+    pub up_w: GpuTensor,
+    pub up_s: GpuTensor,
+    pub up_b: GpuTensor,
+
+    /// `down_proj.weight` packed u32 `[E, hidden, moe_inter / pack_factor]`.
+    pub down_w: GpuTensor,
+    pub down_s: GpuTensor,
+    pub down_b: GpuTensor,
+
+    // ─── Optional shared expert (Qwen3-Next; absent on Qwen3-MoE) ───────
+    /// `shared_expert.gate_proj.weight` packed u32
+    /// `[shared_inter, hidden / pack_factor]`. `None` when
+    /// `shared_expert_intermediate_size == 0`.
+    pub shared_gate_w: Option<GpuTensor>,
+    pub shared_gate_s: Option<GpuTensor>,
+    pub shared_gate_b: Option<GpuTensor>,
+    pub shared_up_w: Option<GpuTensor>,
+    pub shared_up_s: Option<GpuTensor>,
+    pub shared_up_b: Option<GpuTensor>,
+    pub shared_down_w: Option<GpuTensor>,
+    pub shared_down_s: Option<GpuTensor>,
+    pub shared_down_b: Option<GpuTensor>,
+    /// `shared_expert_gate.weight` dense `[1, hidden]`, dtype `T_act`.
+    /// `None` mirrors the absence of the shared expert.
+    pub shared_expert_gate: Option<GpuTensor>,
+
+    // ─── Static shape / quant params (resolved at load) ─────────────────
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub hidden_size: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_intermediate_size: usize,
+    pub group_size: u32,
+    pub bits: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -780,21 +876,167 @@ impl SharedFusedMoELayer {
 
 #[cfg(feature = "metal")]
 impl SharedFusedMoELayer {
-    /// Metal stub — see `FusedMoELayer::load`.
+    /// Load an MLX-native int4 affine-quantized SwitchGLU MoE layer.
+    ///
+    /// Reads the per-expert stacked tensors written by mlx-lm's
+    /// `QuantizedSwitchLinear` quantizer (switch_layers.py:75) plus the
+    /// dense router gate and the optional Qwen3-Next-style shared
+    /// expert. Group size and bits come from the model's
+    /// `quantization_config` and arrive at this site through the macro
+    /// expansion (same path as `AffineQuantLinear::load`).
+    ///
+    /// Weight naming (matches mlx-community/Qwen3-MoE-30B-A3B-Instruct-4bit
+    /// and mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit):
+    ///   {prefix}.gate.weight                                — dense `T_act` `[E, hidden]`
+    ///   {prefix}.switch_mlp.gate_proj.{weight,scales,biases} — `[E, inter, hidden/{8,gs,gs}]`
+    ///   {prefix}.switch_mlp.up_proj.{weight,scales,biases}   — same
+    ///   {prefix}.switch_mlp.down_proj.{weight,scales,biases} — `[E, hidden, inter/{8,gs,gs}]`
+    ///   {prefix}.shared_expert.{gate,up,down}_proj.{...}     — optional per-Linear 4bit
+    ///   {prefix}.shared_expert_gate.weight                   — dense `[1, hidden]`
+    ///
+    /// `shared_expert_intermediate_size == 0` skips all `shared_*`
+    /// loads — that's the Qwen3-MoE case. Qwen3-Next ships a non-zero
+    /// shared inter and the Qwen3NextMLP shared expert is loaded.
+    ///
+    /// `_stream` is accepted for cuda-API symmetry and ignored on metal
+    /// (Metal H2D copies ride the `GpuWeights::take` path which encodes
+    /// against the metal allocator's residency set, not a CUstream).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        _gw: &mut ferrite_cuda_core::weights::GpuWeights,
-        _prefix: &str,
-        _num_experts: usize,
-        _top_k: usize,
-        _moe_intermediate_size: usize,
-        _shared_expert_intermediate_size: usize,
-        _hidden_size: usize,
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
         _stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!(
-            "SharedFusedMoELayer not supported on metal: port MoE GEMM + topk kernels first"
-        )
+        // ─── Router gate (dense T_act) ──────────────────────────────────
+        // `mlp.gate.weight` is left fp on mlx-community 4bit checkpoints
+        // (only the SwitchGLU experts and the embedding are quantized).
+        // Standard `take` path: cast to `target_dtype` on the way in.
+        let router_gate = gw.take(&format!("{prefix}.gate.weight"))?;
+
+        // ─── Per-expert SwitchGLU stacked 4bit weights ──────────────────
+        // Match `QuantizedSwitchLinear` (switch_layers.py:75): weight
+        // shape `[E, output_dims, input_dims/pack_factor]` u32; scales
+        // and biases `[E, output_dims, input_dims/group_size]` f16.
+        // `take_keep_dtype` skips the f16→bf16 cast — see
+        // `AffineQuantLinear::load` for the in-register-cast rationale
+        // referenced in `INT4_PARITY_PROBES.md §7`.
+        let load_expert_block = |gw: &mut ferrite_cuda_core::weights::GpuWeights,
+                                 leaf: &str|
+         -> anyhow::Result<(GpuTensor, GpuTensor, GpuTensor)> {
+            let w = gw.take(&format!("{prefix}.switch_mlp.{leaf}.weight"))?;
+            let s = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.{leaf}.scales"))?;
+            let b = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.{leaf}.biases"))?;
+            Ok((w, s, b))
+        };
+        let (gate_w, gate_s, gate_b) = load_expert_block(gw, "gate_proj")?;
+        let (up_w, up_s, up_b) = load_expert_block(gw, "up_proj")?;
+        let (down_w, down_s, down_b) = load_expert_block(gw, "down_proj")?;
+
+        // ─── Derive group_size / bits from gate_proj shape ──────────────
+        // gate_proj.weight: `[E, moe_inter, hidden / pack_factor]`
+        // pack_factor = 32 / bits. For mlx-community 4bit checkpoints
+        // pack_factor = 8 always — assert and refuse anything else here
+        // until non-4bit affine MoE actually ships in the wild
+        // (mlx-lm currently quantizes MoE blocks at bits=4 only).
+        let gate_w_packed_in = gate_w.dim(2);
+        anyhow::ensure!(
+            gate_w_packed_in.is_multiple_of(1) && hidden_size.is_multiple_of(gate_w_packed_in),
+            "SharedFusedMoELayer::load (metal): gate_proj.weight last dim {gate_w_packed_in} does not divide hidden_size {hidden_size}"
+        );
+        let pack_factor = hidden_size / gate_w_packed_in;
+        anyhow::ensure!(
+            pack_factor == 8,
+            "SharedFusedMoELayer::load (metal): unsupported pack_factor {pack_factor} (only bits=4 / pack=8 supported today)"
+        );
+        let bits: u32 = 4;
+        // gate_proj.scales: `[E, moe_inter, hidden / group_size]`
+        let gate_s_groups = gate_s.dim(2);
+        anyhow::ensure!(
+            hidden_size.is_multiple_of(gate_s_groups),
+            "SharedFusedMoELayer::load (metal): gate_proj.scales last dim {gate_s_groups} does not divide hidden_size {hidden_size}"
+        );
+        let group_size = (hidden_size / gate_s_groups) as u32;
+
+        // ─── Optional shared expert (Qwen3-Next only) ───────────────────
+        let (
+            shared_gate_w,
+            shared_gate_s,
+            shared_gate_b,
+            shared_up_w,
+            shared_up_s,
+            shared_up_b,
+            shared_down_w,
+            shared_down_s,
+            shared_down_b,
+            shared_expert_gate,
+        ) = if shared_expert_intermediate_size > 0 {
+            let load_shared = |gw: &mut ferrite_cuda_core::weights::GpuWeights,
+                               leaf: &str|
+             -> anyhow::Result<(GpuTensor, GpuTensor, GpuTensor)> {
+                let w = gw.take(&format!("{prefix}.shared_expert.{leaf}.weight"))?;
+                let s = gw.take_keep_dtype(&format!("{prefix}.shared_expert.{leaf}.scales"))?;
+                let b = gw.take_keep_dtype(&format!("{prefix}.shared_expert.{leaf}.biases"))?;
+                Ok((w, s, b))
+            };
+            let (gw_, gs, gb) = load_shared(gw, "gate_proj")?;
+            let (uw, us, ub) = load_shared(gw, "up_proj")?;
+            let (dw, ds, db) = load_shared(gw, "down_proj")?;
+            let sgate = gw.take(&format!("{prefix}.shared_expert_gate.weight"))?;
+            (
+                Some(gw_),
+                Some(gs),
+                Some(gb),
+                Some(uw),
+                Some(us),
+                Some(ub),
+                Some(dw),
+                Some(ds),
+                Some(db),
+                Some(sgate),
+            )
+        } else {
+            (
+                None, None, None, None, None, None, None, None, None, None,
+            )
+        };
+
+        Ok(SharedFusedMoELayer {
+            intermediate_size: shared_expert_intermediate_size,
+            metal: MetalSwitchGluMoeWeights {
+                router_gate,
+                gate_w,
+                gate_s,
+                gate_b,
+                up_w,
+                up_s,
+                up_b,
+                down_w,
+                down_s,
+                down_b,
+                shared_gate_w,
+                shared_gate_s,
+                shared_gate_b,
+                shared_up_w,
+                shared_up_s,
+                shared_up_b,
+                shared_down_w,
+                shared_down_s,
+                shared_down_b,
+                shared_expert_gate,
+                num_experts,
+                top_k,
+                hidden_size,
+                moe_intermediate_size,
+                shared_intermediate_size: shared_expert_intermediate_size,
+                group_size,
+                bits,
+            },
+        })
     }
 }
 

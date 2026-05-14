@@ -229,6 +229,25 @@ impl SpecializedPipelineCache {
                 ),
                 ("silu_mul", crate::embedded_metallib!("silu_mul")),
                 ("gemm", crate::embedded_metallib!("gemm")),
+                ("softmax", crate::embedded_metallib!("softmax")),
+                ("argpartition", crate::embedded_metallib!("argpartition")),
+                (
+                    "take_along_axis",
+                    crate::embedded_metallib!("take_along_axis"),
+                ),
+                ("row_gather", crate::embedded_metallib!("row_gather")),
+                (
+                    "moe_weighted_sum",
+                    crate::embedded_metallib!("moe_weighted_sum"),
+                ),
+                (
+                    "slice_trailing_cols_u32",
+                    crate::embedded_metallib!("slice_trailing_cols_u32"),
+                ),
+                (
+                    "top_k_renormalize",
+                    crate::embedded_metallib!("top_k_renormalize"),
+                ),
             ],
         )
     }

@@ -4839,7 +4839,11 @@ fn emit_layered_load_body(
             hidden_size,
             norm_topk_prob,
         } => {
-            let p = layer_templated_prefix_expr(prefix);
+            let p = layer_templated_prefix_expr(
+                prefix,
+                vision_zero_prefix_ref,
+                decoder_zero_prefix_ref,
+            );
             let num_experts = *num_experts;
             let top_k = *top_k;
             let moe_intermediate_size = *moe_intermediate_size;

@@ -571,3 +571,43 @@ impl Qwen3NextGdnLayer {
         result
     }
 }
+
+// Metal-side stubs. The full GDN kernel + state pool port lives in
+// follow-up commits; today the `load` / `clear_slot` entry points exist
+// only so the macro-generated `Weights::load_with` body compiles. Any
+// attempt to load a Qwen3-Next checkpoint on Metal therefore fails loud
+// at runtime — no silent-success, no NOOP forward. Mirrors the
+// `feedback_no_unimplemented_singletons` rule: the symbol resolves so
+// the build is total, but execution is a hard error until the real
+// kernel lands.
+#[cfg(feature = "metal")]
+impl GdnStatePool {
+    pub unsafe fn clear_slot(
+        &self,
+        _slot_idx: usize,
+        _stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("GdnStatePool::clear_slot not yet implemented on Metal")
+    }
+}
+
+#[cfg(feature = "metal")]
+impl Qwen3NextGdnLayer {
+    pub fn load(
+        _gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        _prefix: &str,
+        _num_k_heads: usize,
+        _num_v_heads: usize,
+        _head_k_dim: usize,
+        _head_v_dim: usize,
+        _conv_kernel_size: usize,
+        _rms_norm_eps: f32,
+        _gdn_layer_idx: usize,
+        _stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "Qwen3NextGdnLayer::load not yet implemented on Metal -- \
+             Metal port of GDN kernels + state pool is the next phase"
+        )
+    }
+}

@@ -2111,6 +2111,15 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
         lib.push(Box::new(FusedMoeRefImpl));
         lib.push(Box::new(SharedFusedMoeRefImpl));
+        // Qwen3-Next: GDN recurrent linear-attention + gated full-
+        // attention (output gate + partial RoPE + per-head QK RMSNorm).
+        // Target-agnostic RefImpls — claim is structural (single tile of
+        // OpKind::Gdn/GatedAttention) and `fan_out` emits
+        // `Instruction::GdnAttention` / `Instruction::GatedAttention` for
+        // the metal interpreter lowering pass to handle. Mirrors the
+        // pattern used for `MoeRefImpl` variants above.
+        lib.push(Box::new(GdnAttentionRefImpl));
+        lib.push(Box::new(GatedAttentionRefImpl));
         // Encoder/bidirectional attention — claims the 3-arg
         // `attention(q, k, v)` form (no kv_cache). ModernBERT and
         // Cohere encoder backbones rely on this.

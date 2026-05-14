@@ -372,3 +372,30 @@ impl Qwen3NextGatedAttentionLayer {
         result
     }
 }
+
+// Metal-side stub. The full gated-attention port (doubled-Q projection,
+// per-head Gemma-style QK RMSNorm, partial RoPE, sigmoid output gate)
+// lives in a follow-up commit; today the `load` symbol exists only so
+// the macro-generated `Weights::load_with` body compiles. Loading a
+// Qwen3-Next checkpoint on Metal therefore fails loud at runtime --
+// honors `feedback_no_unimplemented_singletons` by resolving the symbol
+// totally but refusing to silently produce wrong outputs.
+#[cfg(feature = "metal")]
+impl Qwen3NextGatedAttentionLayer {
+    pub fn load(
+        _gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        _prefix: &str,
+        _num_q_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _qk_norm_eps: f32,
+        _attn_output_gate: bool,
+        _stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "Qwen3NextGatedAttentionLayer::load not yet implemented on Metal -- \
+             port of the gated-attention variant (output gate, partial RoPE) \
+             is the next phase"
+        )
+    }
+}

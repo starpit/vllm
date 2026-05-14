@@ -303,8 +303,16 @@ METAL_FUNC void qmm_t_impl_inline(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ─── BlockMMA::mma — KFR = BK / 8 K-frag MMAs per BK iter ───
+    //   Inserts `simdgroup_barrier(mem_none)` fences between A/B
+    //   loads and the MMA to match MLX's `BlockMMA::mma`
+    //   (steel/gemm/mma.h:507-532). These are free at runtime but
+    //   tell the Apple compiler that loads and MMAs can be
+    //   independently scheduled across the fence — enabling
+    //   load-and-MMA software pipelining that's otherwise inhibited.
     MLX_MTL_PRAGMA_UNROLL
     for (int kf = 0; kf < KFR; ++kf) {
+      simdgroup_barrier(mem_flags::mem_none);
+
       // A frags: TM frags per simdgroup along M.
       simdgroup_matrix<T_act, 8, 8> A_frag[TM];
       MLX_MTL_PRAGMA_UNROLL
@@ -313,6 +321,8 @@ METAL_FUNC void qmm_t_impl_inline(
             Xs + (sgM * 16 + i * 8) * BK_padded + kf * 8;
         simdgroup_load(A_frag[i], a_ptr, BK_padded);
       }
+
+      simdgroup_barrier(mem_flags::mem_none);
 
       // B frags: TN frags per simdgroup along N.
       // W is stored row-major as [BN × BK_padded] (post-dequant);
@@ -329,6 +339,8 @@ METAL_FUNC void qmm_t_impl_inline(
         simdgroup_load(B_frag[j], b_ptr, BK_padded,
                        ulong2(0, 0), /*transpose=*/ true);
       }
+
+      simdgroup_barrier(mem_flags::mem_none);
 
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < TM; ++i) {
@@ -359,44 +371,54 @@ METAL_FUNC void qmm_t_impl_inline(
     }
   }
 
-  // ─── Epilogue: simdgroup_store to a `threadgroup float` scratch,
-  //   then per-thread cast to T and write to device memory. This is
-  //   the same pattern as `fused_gate_up_silu_mul_gemm_steel_*`'s
-  //   epilogue: `simdgroup_store` requires matching matrix-element
-  //   and pointer-element types, so we can't go float→half/bfloat
-  //   in a single simdgroup_store. MLX's BlockMMA::store_result
-  //   solves this through the templated `Epilogue::apply(...)` cast
-  //   inside MMATile::store; we open-code the cast loop here.
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
+  // ─── Epilogue: direct per-lane register→device write with inline
+  //   float→T_act cast. Matches MLX's `BlockMMA::store_result` +
+  //   `MMAFrag::store` (steel/gemm/mma.h:534-546, :100-112).
+  //
+  //   Previous version went through a `threadgroup float` scratch
+  //   buffer with a `simdgroup_store` + threadgroup_barrier + per-
+  //   thread cast loop. That required an extra 4 KB of threadgroup
+  //   memory, an extra barrier per output tile, and 2× the
+  //   threadgroup-memory traffic (write scratch + read scratch).
+  //   The direct path below uses Apple's `thread_elements()` MSL
+  //   extension to access the 2 per-lane floats of each
+  //   `simdgroup_float8x8` accumulator fragment in registers, casts
+  //   to T_act, and writes straight to device memory.
+  //
+  //   Per-lane element layout in an 8×8 simdgroup_matrix on Apple7+
+  //   (BaseMMAFrag<T, 8, 8>::get_coord):
+  //     qid = lane / 4
+  //     fm  = (qid & 4) | ((lane / 2) % 4)
+  //     fn  = (qid & 2) * 2 + (lane % 2) * 2
+  //   Each lane holds two consecutive elements at (fm, fn) and
+  //   (fm, fn+1) within the 8×8 frag.
+  const ushort qid    = simd_lane_id >> 2;
+  const ushort lane_fm = (qid & 4) | ((simd_lane_id >> 1) & 3);
+  const ushort lane_fn = (((qid & 2) << 1) | ((simd_lane_id & 1) << 1));
   MLX_MTL_PRAGMA_UNROLL
   for (int i = 0; i < TM; ++i) {
     MLX_MTL_PRAGMA_UNROLL
     for (int j = 0; j < TN; ++j) {
-      int row_base = sgM * 16 + i * 8;
-      int col_base = sgN * 16 + j * 8;
-      simdgroup_store(acc[i][j],
-                      out_scratch + row_base * BN + col_base,
-                      BN);
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (m_full && n_full) {
-    for (uint t = thread_idx; t < uint(BM * BN); t += uint(TGP)) {
-      uint r = t / uint(BN);
-      uint c = t % uint(BN);
-      y_block[r * N + c] = T_act(out_scratch[t]);
-    }
-  } else {
-    for (uint t = thread_idx; t < uint(BM * BN); t += uint(TGP)) {
-      uint r = t / uint(BN);
-      uint c = t % uint(BN);
-      if (r < m_tile && c < n_tile) {
-        y_block[r * N + c] = T_act(out_scratch[t]);
+      thread auto& elem = acc[i][j].thread_elements();
+      int row = sgM * 16 + i * 8 + int(lane_fm);
+      int col = sgN * 16 + j * 8 + int(lane_fn);
+      if (m_full && n_full) {
+        device T_act* p = y_block + row * N + col;
+        p[0] = T_act(elem[0]);
+        p[1] = T_act(elem[1]);
+      } else {
+        if (row < int(m_tile)) {
+          if (col + 0 < int(n_tile)) {
+            y_block[row * N + col + 0] = T_act(elem[0]);
+          }
+          if (col + 1 < int(n_tile)) {
+            y_block[row * N + col + 1] = T_act(elem[1]);
+          }
+        }
       }
     }
   }
+  (void)out_scratch;
 }
 
 // ─────────────────────────────────────────────────────────────────

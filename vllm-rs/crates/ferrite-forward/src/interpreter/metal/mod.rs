@@ -63,8 +63,11 @@ pub mod __re {
     // `device.newMTL4CommandQueue()` once and stores the result.
     pub use ::objc2_metal::{
         MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-        MTL4CommandQueue, MTL4ComputeCommandEncoder, MTLEvent, MTLSharedEvent,
+        MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap,
+        MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity,
+        MTLEvent, MTLSharedEvent,
     };
+    pub type Mtl4CounterHeap = Retained<ProtocolObject<dyn MTL4CounterHeap>>;
     pub type Mtl4Queue = Retained<ProtocolObject<dyn MTL4CommandQueue>>;
     pub type Mtl4Allocator = Retained<ProtocolObject<dyn MTL4CommandAllocator>>;
     pub type Mtl4CommandBuffer = Retained<ProtocolObject<dyn MTL4CommandBuffer>>;

@@ -38,6 +38,13 @@ pub struct Mtl4Step {
     pub pipeline: ComputePipelineState,
     pub tables: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
     pub dispatches: Vec<(MTLSize, MTLSize)>,
+    /// Parallel to `dispatches`: optional per-dispatch m-axis scaling
+    /// hint. When `Some`, the runtime patches the named axis of
+    /// `dispatches[i].0` proportionally with actual `num_tokens`
+    /// (see [`super::lowered::MScaling`]), shrinking the grid from
+    /// the `bucket_m`-baked baseline down to the actual M of this
+    /// forward.
+    pub m_scaling: Vec<Option<super::lowered::MScaling>>,
     /// One barrier-before flag per sub-dispatch (parallel to
     /// `tables` / `dispatches`). Sourced from the macro-emitted
     /// `LoweredMetalTape::barrier_before` — no runtime analysis.
@@ -59,10 +66,12 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                 pipeline,
                 direct_bindings,
                 direct_dispatch,
+                direct_m_scaling,
                 barrier_before,
                 ..
             } => {
                 debug_assert_eq!(direct_bindings.len(), direct_dispatch.len());
+                debug_assert_eq!(direct_bindings.len(), direct_m_scaling.len());
                 debug_assert_eq!(direct_bindings.len(), barrier_before.len());
                 let mut tables = Vec::with_capacity(direct_bindings.len());
                 for cmd_bindings in direct_bindings {
@@ -95,6 +104,7 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                     pipeline: pipeline.clone(),
                     tables,
                     dispatches: direct_dispatch.clone(),
+                    m_scaling: direct_m_scaling.clone(),
                     barrier_before: barrier_before.clone(),
                 });
             }

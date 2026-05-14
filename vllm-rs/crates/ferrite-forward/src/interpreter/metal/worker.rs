@@ -52,6 +52,14 @@ pub enum BucketStep {
         direct_bindings: Vec<Vec<(Buffer, u64, u64)>>,
         /// Per-command dispatch shape: (threadgroups, threads_per_tg).
         direct_dispatch: Vec<(MTLSize, MTLSize)>,
+        /// Per-sub-dispatch m-axis scaling hint, parallel to
+        /// `direct_dispatch`. When `Some`, the runtime rewrites
+        /// `threadgroups.{axis}` proportionally with actual
+        /// `num_tokens` (see
+        /// [`crate::interpreter::metal::lowered::MScaling`]),
+        /// shrinking the grid to the actual M instead of paying
+        /// the `bucket_m`-shaped over-dispatch cost.
+        direct_m_scaling: Vec<Option<super::lowered::MScaling>>,
         /// Per-sub-dispatch barrier-before flag, sourced from the
         /// compile-time DAG hazard analysis in `LoweredMetalTape`.
         /// Consumed by the MTL4 path via `Mtl4Step.barrier_before`.
@@ -365,6 +373,66 @@ impl<W: CanonicalParams> MetalWorker<W> {
         })
     }
 
+    /// MTL3 direct-dispatch fallback path. Uses MTL3 compute encoder
+    /// with `setBuffer/dispatchThreadgroups` (NOT ICB / NOT MTL4) —
+    /// the default Serial encoder auto-serializes dependent dispatches
+    /// without per-dispatch barrier overhead that MTL4 imposes on M4.
+    /// Same `BucketStep::Icb` execution plan; just a different
+    /// dispatch protocol. Returns an error on Gemm (MPS) buckets
+    /// since those have their own dispatch.
+    pub fn run_bucket_mtl3(
+        &self,
+        bucket: usize,
+        num_tokens: u32,
+        enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLComputeCommandEncoder>,
+    ) -> Result<(), WorkerError> {
+        use ::objc2_metal::{MTLCommandEncoder, MTLComputeCommandEncoder};
+        let baking = &self.bucket_bakings[bucket];
+        for step in &baking.steps {
+            match step {
+                BucketStep::Icb {
+                    pipeline,
+                    direct_bindings,
+                    direct_dispatch,
+                    direct_m_scaling,
+                    ..
+                } => {
+                    enc.setComputePipelineState(pipeline);
+                    for ((bindings, (tg, tpt)), scaling) in direct_bindings
+                        .iter()
+                        .zip(direct_dispatch.iter())
+                        .zip(direct_m_scaling.iter())
+                    {
+                        for (buf, off, idx) in bindings {
+                            unsafe {
+                                enc.setBuffer_offset_atIndex(Some(buf), *off as usize, *idx as usize);
+                            }
+                        }
+                        let tg_scaled = scale_tg_for_num_tokens(*tg, *scaling, num_tokens);
+                        enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+                    }
+                }
+                BucketStep::Gemm { .. } => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "MTL3 path cannot handle Gemm step (MPS dispatch). Use MTL4 path for Gemm buckets.",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Count total dispatches across all MTL4 steps in this bucket.
+    /// Used by `DispatchTimingState` to size the counter heap to
+    /// (dispatch_count + 1) timestamps.
+    pub fn count_dispatches(&self, bucket: usize) -> usize {
+        self.bucket_bakings
+            .get(bucket)
+            .and_then(|b| b.mtl4_steps.as_ref())
+            .map(|steps| steps.iter().map(|s| s.dispatches.len()).sum())
+            .unwrap_or(0)
+    }
+
     /// Phase A.3 MTL4 execution path. Encodes the
     /// bucket's `mtl4_steps` onto a caller-provided MTL4 compute
     /// encoder using pre-baked `MTL4ArgumentTable`s. The caller owns
@@ -375,9 +443,43 @@ impl<W: CanonicalParams> MetalWorker<W> {
     pub fn run_bucket_mtl4(
         &self,
         bucket: usize,
+        num_tokens: u32,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        use ::objc2_metal::{MTL4CommandEncoder, MTL4VisibilityOptions, MTLStages};
+        self.run_bucket_mtl4_inner(bucket, num_tokens, enc, None)
+    }
+
+    /// Variant with optional GPU-timestamp instrumentation.
+    ///
+    /// When `timing` is `Some`, this writes a timestamp into the
+    /// caller-provided counter heap immediately before each dispatch
+    /// AND once at the very end. After GPU completion the caller
+    /// resolves the heap to get N+1 GPU-timeline timestamps for N
+    /// dispatches; the i-th dispatch ran from `ts[i]` to `ts[i+1]`.
+    ///
+    /// Triggered via `MetalWorkerPool::forward` when
+    /// `FERRITE_METAL_DISPATCH_TIMING=1` is set.
+    pub fn run_bucket_mtl4_with_timing(
+        &self,
+        bucket: usize,
+        num_tokens: u32,
+        enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        timing: &super::pool::DispatchTimingState,
+    ) -> Result<(), WorkerError> {
+        self.run_bucket_mtl4_inner(bucket, num_tokens, enc, Some(timing))
+    }
+
+    fn run_bucket_mtl4_inner(
+        &self,
+        bucket: usize,
+        num_tokens: u32,
+        enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        mut timing: Option<&super::pool::DispatchTimingState>,
+    ) -> Result<(), WorkerError> {
+        use ::objc2_metal::{
+            MTL4CommandEncoder, MTL4ComputeCommandEncoder as _,
+            MTL4TimestampGranularity, MTL4VisibilityOptions, MTLStages,
+        };
         let baking = &self.bucket_bakings[bucket];
         let mtl4_steps =
             baking
@@ -393,23 +495,60 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // ::lower_bucket` from the FUF dataflow + `Implementation::
         // kv_layer_io`. Runtime does zero analysis — just emits a
         // `Dispatch→Dispatch` barrier wherever the flag fires.
+        let mut ts_idx: usize = 0;
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
-            for ((table, (tg, tpt)), need_barrier) in step
+            for (((table, (tg, tpt)), need_barrier), scaling) in step
                 .tables
                 .iter()
                 .zip(step.dispatches.iter())
                 .zip(step.barrier_before.iter())
+                .zip(step.m_scaling.iter())
             {
                 if *need_barrier {
-                    enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
-                        MTLStages::Dispatch,
-                        MTLStages::Dispatch,
-                        MTL4VisibilityOptions::Device,
-                    );
+                    let vis = if std::env::var_os("FERRITE_METAL_BARRIER_NONE").is_some() {
+                        MTL4VisibilityOptions::None
+                    } else {
+                        MTL4VisibilityOptions::Device
+                    };
+                    if std::env::var_os("FERRITE_METAL_NO_BARRIERS").is_none() {
+                        enc.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                            MTLStages::Dispatch,
+                            MTLStages::Dispatch,
+                            vis,
+                        );
+                    }
+                }
+                if let Some(t) = timing.as_mut() {
+                    if ts_idx < t.heap_capacity {
+                        unsafe {
+                            enc.writeTimestampWithGranularity_intoHeap_atIndex(
+                                MTL4TimestampGranularity::Precise,
+                                &t.heap,
+                                ts_idx,
+                            );
+                        }
+                        t.record_label(ts_idx, &step.pipeline);
+                        ts_idx += 1;
+                    }
                 }
                 enc.setArgumentTable(Some(table));
-                enc.dispatchThreadgroups_threadsPerThreadgroup(*tg, *tpt);
+                let tg_scaled = scale_tg_for_num_tokens(*tg, *scaling, num_tokens);
+                enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+            }
+        }
+        // Final closing timestamp so the last dispatch's GPU time =
+        // ts[N] - ts[N-1].
+        if let Some(t) = timing.as_mut() {
+            if ts_idx < t.heap_capacity {
+                unsafe {
+                    enc.writeTimestampWithGranularity_intoHeap_atIndex(
+                        MTL4TimestampGranularity::Precise,
+                        &t.heap,
+                        ts_idx,
+                    );
+                }
+                t.set_dispatch_count(ts_idx);
             }
         }
         Ok(())
@@ -534,16 +673,22 @@ fn bake_bucket<W: CanonicalParams>(
                         .get(cmd_idx)
                         .copied()
                         .unwrap_or(true);
+                    // MPS-shaped bf16 Gemm: M is the height axis but
+                    // the bake here is for a dense linear that always
+                    // dispatches at the actual M (no bucket_m baking),
+                    // so leave m_scaling as None.
                     match steps.last_mut() {
                         Some(BucketStep::Icb {
                             pipeline: prev,
                             direct_bindings,
                             direct_dispatch,
+                            direct_m_scaling,
                             barrier_before,
                             ..
                         }) if same_pipeline(prev, &pipeline) => {
                             direct_bindings.push(bindings_for_cmd);
                             direct_dispatch.push(dispatch_for_cmd);
+                            direct_m_scaling.push(None);
                             barrier_before.push(cmd_barrier);
                         }
                         _ => {
@@ -551,6 +696,7 @@ fn bake_bucket<W: CanonicalParams>(
                                 pipeline,
                                 direct_bindings: vec![bindings_for_cmd],
                                 direct_dispatch: vec![dispatch_for_cmd],
+                                direct_m_scaling: vec![None],
                                 barrier_before: vec![cmd_barrier],
                             });
                         }
@@ -644,16 +790,19 @@ fn bake_bucket<W: CanonicalParams>(
             .get(cmd_idx)
             .copied()
             .unwrap_or(true);
+        let cmd_m_scaling = cmd.dispatch.m_scaling;
         match steps.last_mut() {
             Some(BucketStep::Icb {
                 pipeline: prev,
                 direct_bindings,
                 direct_dispatch,
+                direct_m_scaling,
                 barrier_before,
                 ..
             }) if same_pipeline(prev, &pipeline) => {
                 direct_bindings.push(bindings_for_cmd);
                 direct_dispatch.push(dispatch_for_cmd);
+                direct_m_scaling.push(cmd_m_scaling);
                 barrier_before.push(cmd_barrier);
             }
             _ => {
@@ -661,6 +810,7 @@ fn bake_bucket<W: CanonicalParams>(
                     pipeline,
                     direct_bindings: vec![bindings_for_cmd],
                     direct_dispatch: vec![dispatch_for_cmd],
+                    direct_m_scaling: vec![cmd_m_scaling],
                     barrier_before: vec![cmd_barrier],
                 });
             }
@@ -903,6 +1053,42 @@ fn resolve_bindings<W: CanonicalParams>(
 }
 
 
+/// Rewrite the m-axis of a baked threadgroup grid to match the
+/// actual `num_tokens` of this forward, instead of the bucket_m the
+/// grid was baked against.
+///
+/// `scaling = None` means the kernel's grid doesn't scale with M
+/// (or the lowering pass hasn't yet been taught to emit a scaling
+/// hint for it) — return the baked grid unchanged. When `scaling =
+/// Some(MScaling { axis, tile })`, replace `tg.{axis}` with
+/// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
+/// baked value (guards against `num_tokens > bucket_m`, which the
+/// bucket picker already rules out but defense-in-depth).
+fn scale_tg_for_num_tokens(
+    mut tg: MTLSize,
+    scaling: Option<super::lowered::MScaling>,
+    num_tokens: u32,
+) -> MTLSize {
+    let Some(s) = scaling else {
+        return tg;
+    };
+    let bm = s.bucket_m.max(1) as u64;
+    let n = (num_tokens.max(1) as u64).min(bm);
+    let slot = match s.axis {
+        0 => &mut tg.width,
+        1 => &mut tg.height,
+        2 => &mut tg.depth,
+        _ => return tg,
+    };
+    // new = ceil(baseline * n / bucket_m). Clamped above to the
+    // baseline so accidental num_tokens > bucket_m can't grow the
+    // grid past what was baked.
+    let baseline = *slot as u64;
+    let scaled = (baseline.saturating_mul(n) + bm - 1) / bm;
+    *slot = scaled as usize;
+    tg
+}
+
 fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand<W>) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
@@ -1071,6 +1257,7 @@ mod tests {
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
+                m_scaling: None,
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -1102,6 +1289,7 @@ mod tests {
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
+                m_scaling: None,
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -1333,6 +1521,7 @@ mod tests {
             dispatch: DispatchShape {
                 threadgroups: (1, TestWeights::NUM_Q_HEADS, 1),
                 threads_per_threadgroup: (TestWeights::HEAD_DIM, 1, 1),
+                m_scaling: None,
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -1402,6 +1591,7 @@ mod tests {
             dispatch: DispatchShape {
                 threadgroups: (bucket_m.div_ceil(16), n.div_ceil(16), 1),
                 threads_per_threadgroup: (16, 16, 1),
+                m_scaling: None,
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -1507,6 +1697,7 @@ mod tests {
             dispatch: DispatchShape {
                 threadgroups: (1, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
+                m_scaling: None,
             },
             bindings: vec![
                 Binding::ArenaSlot {

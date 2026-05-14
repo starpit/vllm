@@ -282,6 +282,113 @@ struct PoolInner<W: CanonicalParams> {
     total_created: usize,
 }
 
+/// GPU per-dispatch timing instrumentation. Enabled by setting
+/// `FERRITE_METAL_DISPATCH_TIMING=1`. Allocates an MTL4CounterHeap
+/// sized for `(N_dispatches + 1)` timestamp entries, threads it
+/// through `run_bucket_mtl4_with_timing`, and resolves+prints the
+/// per-dispatch GPU times after the forward completes. Per-pipeline
+/// labels are derived from the pipeline pointer identity so the
+/// caller can correlate slow dispatches back to specific kernels.
+pub struct DispatchTimingState {
+    pub heap: super::__re::Mtl4CounterHeap,
+    pub heap_capacity: usize,
+    /// Pipeline pointer per dispatch index — used purely as an
+    /// opaque identifier so two dispatches sharing a pipeline get
+    /// grouped together in the report.
+    pipeline_ptr: std::cell::RefCell<Vec<usize>>,
+    /// Total recorded dispatches (set on the closing timestamp).
+    dispatch_count: std::cell::Cell<usize>,
+}
+
+impl DispatchTimingState {
+    fn new(device: &Device, count: usize) -> Option<Self> {
+        use super::__re::{MTL4CounterHeapDescriptor, MTL4CounterHeapType};
+        let desc = MTL4CounterHeapDescriptor::new();
+        desc.setType(MTL4CounterHeapType::Timestamp);
+        unsafe { desc.setCount(count); }
+        let heap = unsafe { device.newCounterHeapWithDescriptor_error(&desc).ok()? };
+        Some(Self {
+            heap,
+            heap_capacity: count,
+            pipeline_ptr: std::cell::RefCell::new(vec![0usize; count]),
+            dispatch_count: std::cell::Cell::new(0),
+        })
+    }
+
+    pub fn record_label(
+        &self,
+        idx: usize,
+        pipeline: &super::__re::ComputePipelineState,
+    ) {
+        let ptr =
+            ::objc2::rc::Retained::as_ptr(pipeline) as *const () as usize;
+        if let Some(slot) = self.pipeline_ptr.borrow_mut().get_mut(idx) {
+            *slot = ptr;
+        }
+    }
+
+    pub fn set_dispatch_count(&self, count: usize) {
+        self.dispatch_count.set(count);
+    }
+
+    fn resolve_and_print(&self, bucket_idx: usize, num_tokens: usize, _device: &Device) {
+        use objc2::AnyThread;
+        use objc2_foundation::{NSData, NSRange};
+        use objc2_metal::MTL4CounterHeap as _;
+        let n = self.dispatch_count.get();
+        if n == 0 { return; }
+        // Resolve [0, n+1) — n+1 timestamps for n dispatches.
+        let data: Option<::objc2::rc::Retained<NSData>> = unsafe {
+            self.heap.resolveCounterRange(NSRange { location: 0, length: n + 1 })
+        };
+        let Some(data) = data else {
+            eprintln!("[dispatch-timing] resolveCounterRange returned nil");
+            return;
+        };
+        let raw: &[u8] = unsafe { data.as_bytes_unchecked() };
+        let n_u64 = raw.len() / 8;
+        let bytes: &[u64] = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr() as *const u64, n_u64)
+        };
+        eprintln!(
+            "\n[dispatch-timing bucket={} num_tokens={}] {} dispatches",
+            bucket_idx, num_tokens, n
+        );
+        // Aggregate by pipeline_ptr so we get per-kernel totals + counts.
+        let mut by_pipe: std::collections::HashMap<usize, (u64, u32)> =
+            std::collections::HashMap::new();
+        let mut total_ns: u64 = 0;
+        let labels = self.pipeline_ptr.borrow();
+        for i in 0..n {
+            let dt = bytes[i + 1].wrapping_sub(bytes[i]);
+            total_ns = total_ns.wrapping_add(dt);
+            let pid = labels[i];
+            let entry = by_pipe.entry(pid).or_insert((0, 0));
+            entry.0 = entry.0.wrapping_add(dt);
+            entry.1 += 1;
+        }
+        let mut sorted: Vec<(usize, u64, u32)> = by_pipe
+            .into_iter()
+            .map(|(p, (sum, cnt))| (p, sum, cnt))
+            .collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!(
+            "    total GPU time (sum of dispatch deltas): {:>9.2} ms",
+            total_ns as f64 / 1e6
+        );
+        eprintln!("    per-pipeline breakdown:");
+        for (pid, sum, cnt) in &sorted {
+            let avg_us = (*sum as f64) / 1e3 / (*cnt as f64);
+            let total_ms = (*sum as f64) / 1e6;
+            let pct = (*sum as f64) / (total_ns as f64) * 100.0;
+            eprintln!(
+                "      pipe=0x{:016x}  count={:>3}  total={:>9.2} ms ({:>5.1}%)  avg/call={:>9.2} µs",
+                pid, cnt, total_ms, pct, avg_us
+            );
+        }
+    }
+}
+
 /// Probe MTL4 availability once at pool construction. Logs the
 /// result at info level so cold-start traces show whether the
 /// upcoming Phase A side-by-side path is reachable on this host.
@@ -619,6 +726,49 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 
     /// MTL4 forward path. Hard-asserts MTL4 availability on first use
     /// (see `ensure_mtl4`).
+    /// MTL3 fallback dispatch path. Uses MTL3 cmdbuf + default
+    /// `MTLComputeCommandEncoder` (auto-serial dispatch type).
+    /// Avoids MTL4's ~27 ms per-dispatch overhead on M4 at the
+    /// cost of the per-dispatch `setBuffer`-per-binding bind cost
+    /// (still cheap; ~140 dispatches × ~10 binds = 1.4 ms total).
+    fn run_bucket_mtl3(
+        &self,
+        worker: &MetalWorker<W>,
+        queue: &CommandQueue,
+        bucket_idx: usize,
+        num_tokens: usize,
+    ) -> Result<(), ForwardError> {
+        use ::objc2_metal::MTLCommandEncoder;
+        let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+        let t_pre = std::time::Instant::now();
+        let cb = queue.commandBuffer().expect("commandBuffer");
+        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
+        worker
+            .run_bucket_mtl3(bucket_idx, num_tokens as u32, &enc)
+            .map_err(ForwardError::Worker)?;
+        enc.endEncoding();
+        let encoded = t_pre.elapsed();
+        cb.commit();
+        let committed = t_pre.elapsed();
+        cb.waitUntilCompleted();
+        let waited = t_pre.elapsed();
+        let status = cb.status();
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(ForwardError::ExecutionFailed(status));
+        }
+        if trace {
+            eprintln!(
+                "[forward bucket={} num_tokens={} mtl3] encode={:?} commit={:?} wait={:?}",
+                bucket_idx,
+                num_tokens,
+                encoded,
+                committed - encoded,
+                waited - committed,
+            );
+        }
+        Ok(())
+    }
+
     fn run_bucket_mtl4(
         &self,
         worker: &MetalWorker<W>,
@@ -629,6 +779,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         use std::ptr::NonNull;
         self.ensure_mtl4();
         let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+        let timing_enabled = std::env::var_os("FERRITE_METAL_DISPATCH_TIMING").is_some();
+        let timing_state = if timing_enabled {
+            let n_dispatches = worker.count_dispatches(bucket_idx);
+            DispatchTimingState::new(&self.device, n_dispatches + 1)
+        } else {
+            None
+        };
         let t_pre = std::time::Instant::now();
         let cb = self
             .device
@@ -651,9 +808,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let enc = cb
                 .computeCommandEncoder()
                 .expect("MTL4 computeCommandEncoder returned nil");
-            worker
-                .run_bucket_mtl4(bucket_idx, &enc)
-                .map_err(ForwardError::Worker)?;
+            if let Some(ts) = timing_state.as_ref() {
+                worker
+                    .run_bucket_mtl4_with_timing(bucket_idx, num_tokens as u32, &enc, ts)
+                    .map_err(ForwardError::Worker)?;
+            } else {
+                worker
+                    .run_bucket_mtl4(bucket_idx, num_tokens as u32, &enc)
+                    .map_err(ForwardError::Worker)?;
+            }
             enc.endEncoding();
             cb.endCommandBuffer();
             mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
@@ -705,6 +868,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 waited - committed,
             );
         }
+        if let Some(ts) = timing_state {
+            ts.resolve_and_print(bucket_idx, num_tokens, &self.device);
+        }
         Ok(())
     }
 
@@ -755,13 +921,35 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout(weights)?;
         write_runtime_inputs(&guard.runtime, inputs)?;
 
-        assert!(
-            guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
-            "bucket {} is not MTL4-eligible (contains an MPS f16 GEMM step or \
-             exceeds the 31-binding argument-table cap)",
-            bucket_idx,
-        );
-        self.run_bucket_mtl4(&guard.worker, bucket_idx, inputs.num_tokens as usize)?;
+        // FERRITE_METAL_MTL3=1: use the MTL3 dispatch path (default
+        // Serial encoder, setBuffer/dispatchThreadgroups). On M4 this
+        // is ~3-4× faster end-to-end than the MTL4 path for prefill
+        // workloads because MTL4 carries a ~27 ms per-dispatch
+        // overhead that MTL3's auto-serial dispatch type avoids.
+        // Falls back to MTL4 for buckets that contain an MPS Gemm
+        // step (those can't be dispatched via the regular MTL3
+        // compute encoder).
+        let use_mtl3 = std::env::var_os("FERRITE_METAL_MTL3").is_some()
+            && guard.worker.bucket_bakings[bucket_idx]
+                .steps
+                .iter()
+                .all(|s| matches!(s, super::worker::BucketStep::Icb { .. }));
+        if use_mtl3 {
+            self.run_bucket_mtl3(
+                &guard.worker,
+                queue,
+                bucket_idx,
+                inputs.num_tokens as usize,
+            )?;
+        } else {
+            assert!(
+                guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
+                "bucket {} is not MTL4-eligible (contains an MPS f16 GEMM step or \
+                 exceeds the 31-binding argument-table cap)",
+                bucket_idx,
+            );
+            self.run_bucket_mtl4(&guard.worker, bucket_idx, inputs.num_tokens as usize)?;
+        }
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
         // us where in the chain values transition from real to zero.
@@ -1076,6 +1264,7 @@ mod tests {
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
+                m_scaling: None,
             },
             bindings: vec![
                 Binding::ArenaSlot {

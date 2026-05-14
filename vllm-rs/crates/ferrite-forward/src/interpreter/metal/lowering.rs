@@ -234,8 +234,13 @@ fn lower_one<W: CanonicalParams>(
                 ConstantValue::uint(1, W::Q_SIZE as u32),
             ],
             // 1D dispatch over the `bucket_m` tokens; one thread per
-            // token gathers a row from `embed_tokens.weight`.
-            dispatch: DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP),
+            // token gathers a row from `embed_tokens.weight`. Scales
+            // proportionally with actual M at dispatch time.
+            dispatch: {
+                let mut d = DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m });
+                d
+            },
             bindings: vec![
                 // out: arena[out_slot]
                 Binding::ArenaSlot {
@@ -283,6 +288,7 @@ fn lower_one<W: CanonicalParams>(
             dispatch: DispatchShape {
                 threadgroups: (bucket_m, 1, 1),
                 threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -321,6 +327,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     // residual: read+write (in-place add target,
@@ -366,6 +373,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (tg_x, tg_y, 1),
                     threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -458,6 +466,10 @@ fn lower_one<W: CanonicalParams>(
                     dispatch: DispatchShape {
                         threadgroups: tg,
                         threads_per_threadgroup: tpg,
+                        // qmv grid x-axis == M directly
+                        // (`qmv_dispatch_shape` returns `(m, ceil(N/bn), B)`);
+                        // shrinks linearly with actual num_tokens.
+                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                     },
                     bindings: affine_qmm_bindings(
                         *in_slot,
@@ -514,6 +526,8 @@ fn lower_one<W: CanonicalParams>(
                             dispatch: DispatchShape {
                                 threadgroups: tg,
                                 threads_per_threadgroup: tpg,
+                                // qmm_t NAX grid = (n_tiles, m_tiles=ceil(M/64), B)
+                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m }),
                             },
                             bindings: affine_qmm_bindings(
                                 *in_slot,
@@ -541,6 +555,8 @@ fn lower_one<W: CanonicalParams>(
                             dispatch: DispatchShape {
                                 threadgroups: tg,
                                 threads_per_threadgroup: tpg,
+                                // qmm_t Standard grid = (n_tiles, m_tiles=ceil(M/32), B)
+                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m }),
                             },
                             bindings: affine_qmm_bindings(
                                 *in_slot,
@@ -588,6 +604,8 @@ fn lower_one<W: CanonicalParams>(
                             dispatch: DispatchShape {
                                 threadgroups: tg,
                                 threads_per_threadgroup: tpg,
+                                // qmm_t SplitK grid = (n_tiles, m_tiles=ceil(M/32), split_k)
+                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m }),
                             },
                             bindings: affine_qmm_splitk_bindings(
                                 *in_slot,
@@ -611,7 +629,14 @@ fn lower_one<W: CanonicalParams>(
                                 ConstantValue::uint(1, n_v),
                                 ConstantValue::uint(2, split_k),
                             ],
-                            dispatch: DispatchShape::dispatch_1d(nthreads, THREADS_PER_GROUP),
+                            dispatch: {
+                                let mut d = DispatchShape::dispatch_1d(nthreads, THREADS_PER_GROUP);
+                                // groups = ceil(bucket_m * n_v / TPG) is linear
+                                // in M; proportional scaling shrinks it for
+                                // actual num_tokens.
+                                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m });
+                                d
+                            },
                             bindings: vec![
                                 Binding::ArenaSlot {
                                     slot: *out_slot,
@@ -648,8 +673,13 @@ fn lower_one<W: CanonicalParams>(
                 // one thread per element. Threadgroup width clamped to
                 // the pipeline's max at execute time would be cleaner;
                 // for now match the elementwise convention used by
-                // `KernelId::Add` / `KernelId::ScalarMul`.
-                dispatch: DispatchShape::dispatch_1d(n, THREADS_PER_GROUP),
+                // `KernelId::Add` / `KernelId::ScalarMul`. Scales
+                // proportionally with M at dispatch time.
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m });
+                    d
+                },
                 bindings: vec![
                     Binding::ArenaSlot {
                         slot: *out_slot,
@@ -724,6 +754,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (groups_x, bucket_m, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m }),
                 },
                 bindings: vec![
                     Binding::Weight {
@@ -834,6 +865,15 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups,
                     threads_per_threadgroup,
+                    // Decode branch is bucket_m == 1 (M never grows);
+                    // prefill branch baselines on y-axis as
+                    // `bucket_m.div_ceil(MLP_STEEL_TILE)` — proportional
+                    // scaling shrinks it to the actual M.
+                    m_scaling: if bucket_m == 1 {
+                        None
+                    } else {
+                        Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m })
+                    },
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -889,6 +929,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     // Q output (rotated)
@@ -981,6 +1022,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     // 0: q_out
@@ -1085,6 +1127,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     // 0: q_out
@@ -1239,6 +1282,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_tiles, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     // 0: silu_mul_out
@@ -1319,6 +1363,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (intermediate.div_ceil(tg_n), bucket_m.div_ceil(tg_m), 1),
                     threads_per_threadgroup: (128, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m }),
                 },
                 bindings: vec![
                     Binding::ArenaSlot { slot: *out_slot,    binding_index: 0 },
@@ -1398,6 +1443,10 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (1024, 1, 1),
+                    // AttentionViaCache (decode) — bucket_m == 1 here
+                    // (decode bucket). Scaling is a no-op but kept
+                    // for uniformity in case decode shares a bucket.
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m }),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -1487,6 +1536,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (n_q_heads, bucket_m, 1),
                     threads_per_threadgroup: (1024, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: 1, bucket_m }),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -1540,7 +1590,11 @@ fn lower_one<W: CanonicalParams>(
             constants: Vec::new(),
             // Token-parallel; reduction is per-element so the
             // dispatch covers `M * hidden_size` elements.
-            dispatch: DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP),
+            dispatch: {
+                let mut d = DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m });
+                d
+            },
             bindings: vec![
                 Binding::ArenaSlot {
                     slot: *residual_slot,
@@ -1564,7 +1618,11 @@ fn lower_one<W: CanonicalParams>(
                 W::METAL_DTYPE,
             ),
             constants: Vec::new(),
-            dispatch: DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP),
+            dispatch: {
+                let mut d = DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: 0, bucket_m });
+                d
+            },
             bindings: vec![
                 Binding::ArenaSlot {
                     slot: *out_slot,

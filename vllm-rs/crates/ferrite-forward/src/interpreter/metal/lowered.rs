@@ -213,10 +213,46 @@ impl MetalDtype {
 /// pure CPU code).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DispatchShape {
-    /// (x, y, z) threadgroup count.
+    /// (x, y, z) threadgroup count — baseline computed against
+    /// `bucket_m` at lowering time.
     pub threadgroups: (u32, u32, u32),
     /// (x, y, z) threads per threadgroup.
     pub threads_per_threadgroup: (u32, u32, u32),
+    /// If `Some`, the runtime rewrites the m-axis count using
+    /// `actual_num_tokens` instead of `bucket_m`. The baked
+    /// `threadgroups` field still holds the bucket_m-based count;
+    /// runtime computes `axis_count = num_tokens.div_ceil(tile)` and
+    /// patches `tg.{axis}` immediately before `dispatchThreadgroups`.
+    ///
+    /// Without this, GEMM-class kernels over-dispatch by up to 8×
+    /// when actual_M sits at the low end of a wide bucket
+    /// (e.g. bucket_m=4096 servicing num_tokens=1024) — every spare
+    /// threadgroup pays the full per-tile compute cost on garbage
+    /// rows in the arena past `num_tokens`.
+    pub m_scaling: Option<MScaling>,
+}
+
+/// Tells the runtime how to shrink the dispatch grid for the actual
+/// `num_tokens` of this forward pass. `axis` is 0/1/2 for x/y/z;
+/// `bucket_m` is the bucket-M the baseline `threadgroups` count was
+/// computed against.
+///
+/// Runtime formula:
+///
+/// ```text
+/// new_count = ceil(baseline_count * num_tokens / bucket_m)
+/// ```
+///
+/// Equivalent to "scale this axis proportionally with M". Works for
+/// every kernel — tile-based GEMM grids
+/// (`(n_tiles, ceil(M/tile), …)`), per-row dispatches
+/// (`(M, n_heads, …)`), and 1D-over-`M*K` elementwise kernels alike
+/// — because each is linear in M and the baseline is just that
+/// linear function evaluated at `bucket_m`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MScaling {
+    pub axis: u8,
+    pub bucket_m: u32,
 }
 
 impl DispatchShape {
@@ -227,6 +263,7 @@ impl DispatchShape {
         Self {
             threadgroups: (groups, 1, 1),
             threads_per_threadgroup: (threads_per_group, 1, 1),
+            m_scaling: None,
         }
     }
 }

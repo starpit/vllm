@@ -2,10 +2,18 @@
 //! Paged KV cache pool using `GpuTensor` — persistent GPU memory.
 //!
 //! Layout per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
-//! Paged KV cache pool for GPU inference.
+//! Backend-neutral: storage, sizing, slot decomposition, and span
+//! bookkeeping live here for both cuda and metal. The actual buffer
+//! allocation is a caller-supplied `alloc_buffer` closure — cuda
+//! passes one that wraps `driver::mem_alloc`, metal passes one that
+//! wraps `device.new_buffer`. FP8 scale machinery, the
+//! `gather_kv_contiguous` D2D copy path, and the GPU mirrors of the
+//! span flags use cudarc and stay `cfg(feature = "cuda")` *inside*
+//! this unified type.
 
 use anyhow::Result;
-use ferrite_cuda_core::alloc::RawGpuMem;
+use ferrite_cuda_core::RawGpuMem;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::driver;
 use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
@@ -18,6 +26,7 @@ use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
 ///
 /// When `cache_dtype` is `Fp8E4m3`, the cache stores 1 byte/element and
 /// per-layer scale factors are maintained for quantization/dequantization.
+/// FP8 is cuda-only: the scale machinery uses cudarc primitives.
 pub struct KvCachePool {
     /// K cache per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
     k_caches: Vec<GpuTensor>,
@@ -34,8 +43,11 @@ pub struct KvCachePool {
     /// The dtype stored in cache (may differ from model dtype when FP8).
     cache_dtype: DType,
     /// Per-layer K scale: GPU f32 scalar RAII wrappers. Only used when FP8.
+    /// Cuda-only: FP8 scale machinery is not implemented under metal.
+    #[cfg(feature = "cuda")]
     k_scale_ptrs: Vec<RawGpuMem>,
     /// Per-layer V scale: GPU f32 scalar RAII wrappers. Only used when FP8.
+    #[cfg(feature = "cuda")]
     v_scale_ptrs: Vec<RawGpuMem>,
 
     /// Per-physical-block flag: `true` = K is **currently** stored unrotated.
@@ -49,23 +61,43 @@ pub struct KvCachePool {
     pub block_is_span: Vec<bool>,
 
     /// GPU mirror of `block_is_unrotated` — for pre-attention forward rotation.
+    /// Cuda-only: span machinery hasn't been ported to metal.
+    #[cfg(feature = "cuda")]
     block_unrotated_gpu_ptr: Option<RawGpuMem>,
     /// GPU mirror of `block_is_span` — for post-attention inverse rotation.
+    #[cfg(feature = "cuda")]
     block_span_gpu_ptr: Option<RawGpuMem>,
 }
 
 // Safety: KvCachePool holds GPU device pointers (GpuTensor arrays and raw
-// *mut f32 scale pointers). These are allocated via the CUDA driver and are
-// accessible from any host thread after context setup. The pool is created
-// once and moved to the worker thread; no concurrent mutation occurs.
+// *mut f32 scale pointers). These are allocated via the backend's device
+// memory and are accessible from any host thread after backend setup. The
+// pool is created once and moved to the worker thread; no concurrent
+// mutation occurs.
 unsafe impl Send for KvCachePool {}
 unsafe impl Sync for KvCachePool {}
 
 impl KvCachePool {
     /// Allocate KV cache for all layers.
     ///
+    /// `alloc_buffer(bytes)` is the backend-neutral way to grab a
+    /// raw `bytes`-sized GPU allocation wrapped in a [`RawGpuMem`].
+    /// Cuda passes a closure that calls `driver::mem_alloc` and
+    /// wraps the result; metal passes one that calls
+    /// `device.new_buffer(StorageModeShared)`. Splitting this out
+    /// keeps every backend-specific call out of the constructor body
+    /// and lets the storage layout / sizing / span bookkeeping live
+    /// in one place.
+    ///
+    /// FP8 scale buffers are also allocated via the same closure, but
+    /// the scale-init H2D copy is cuda-only (FP8 cache is not
+    /// supported under metal); under metal an FP8 dtype here returns
+    /// an error.
+    ///
     /// # Safety
-    /// Requires valid CUDA context.
+    /// Caller must ensure the backend context is current on the
+    /// invoking thread (cuda: `ctx_set_current`; metal: any thread
+    /// after device init).
     pub unsafe fn new(
         num_layers: usize,
         num_blocks: usize,
@@ -73,6 +105,7 @@ impl KvCachePool {
         num_kv_heads: usize,
         head_dim: usize,
         dtype: DType,
+        mut alloc_buffer: impl FnMut(usize) -> Result<RawGpuMem>,
     ) -> Result<Self> {
         let elems_per_layer = num_blocks * block_size * num_kv_heads * head_dim;
         let bytes_per_layer = elems_per_layer * dtype.size_bytes();
@@ -81,45 +114,53 @@ impl KvCachePool {
         let mut v_caches = Vec::with_capacity(num_layers);
         let mut k_ptrs = Vec::with_capacity(num_layers);
         let mut v_ptrs = Vec::with_capacity(num_layers);
-        let mut k_scale_ptrs = Vec::new();
-        let mut v_scale_ptrs = Vec::new();
 
         let shape = [num_blocks, block_size, num_kv_heads, head_dim];
 
         for _ in 0..num_layers {
-            let k_ptr = driver::mem_alloc(bytes_per_layer)?;
-            let v_ptr = driver::mem_alloc(bytes_per_layer)?;
+            let k_mem = alloc_buffer(bytes_per_layer)?;
+            let v_mem = alloc_buffer(bytes_per_layer)?;
 
-            k_caches.push(GpuTensor::new(k_ptr, &shape, dtype));
-            v_caches.push(GpuTensor::new(v_ptr, &shape, dtype));
-            k_ptrs.push(RawGpuMem::new(k_ptr, bytes_per_layer));
-            v_ptrs.push(RawGpuMem::new(v_ptr, bytes_per_layer));
+            k_caches.push(GpuTensor::new(k_mem.ptr(), &shape, dtype));
+            v_caches.push(GpuTensor::new(v_mem.ptr(), &shape, dtype));
+            k_ptrs.push(k_mem);
+            v_ptrs.push(v_mem);
         }
 
-        // Allocate per-layer scale factors for FP8 cache.
-        if dtype.is_fp8() {
-            for _ in 0..num_layers {
-                // Allocate GPU f32 scalars, initialized to 1.0.
-                let k_scale_ptr = driver::mem_alloc(4)?;
-                let v_scale_ptr = driver::mem_alloc(4)?;
-                let one: f32 = 1.0;
-                // Use null stream (synchronous) for init-time copy.
-                let null_stream = std::ptr::null_mut();
-                driver::memcpy_htod_async(
-                    k_scale_ptr,
-                    &one as *const f32 as *const u8,
-                    4,
-                    null_stream,
-                )?;
-                driver::memcpy_htod_async(
-                    v_scale_ptr,
-                    &one as *const f32 as *const u8,
-                    4,
-                    null_stream,
-                )?;
-                k_scale_ptrs.push(RawGpuMem::new(k_scale_ptr, 4));
-                v_scale_ptrs.push(RawGpuMem::new(v_scale_ptr, 4));
+        // FP8 scales: cuda-only. Under metal, fail loudly rather
+        // than silently skip — model loaders should not reach here
+        // with an FP8 dtype on metal.
+        #[cfg(feature = "cuda")]
+        let (k_scale_ptrs, v_scale_ptrs) = {
+            let mut k_scale_ptrs = Vec::new();
+            let mut v_scale_ptrs = Vec::new();
+            if dtype.is_fp8() {
+                for _ in 0..num_layers {
+                    let k_scale = alloc_buffer(4)?;
+                    let v_scale = alloc_buffer(4)?;
+                    let one: f32 = 1.0;
+                    let null_stream = std::ptr::null_mut();
+                    driver::memcpy_htod_async(
+                        k_scale.ptr(),
+                        &one as *const f32 as *const u8,
+                        4,
+                        null_stream,
+                    )?;
+                    driver::memcpy_htod_async(
+                        v_scale.ptr(),
+                        &one as *const f32 as *const u8,
+                        4,
+                        null_stream,
+                    )?;
+                    k_scale_ptrs.push(k_scale);
+                    v_scale_ptrs.push(v_scale);
+                }
             }
+            (k_scale_ptrs, v_scale_ptrs)
+        };
+        #[cfg(not(feature = "cuda"))]
+        if dtype.is_fp8() {
+            anyhow::bail!("KvCachePool: FP8 cache dtype is cuda-only");
         }
 
         let total_mb = (2 * num_layers * bytes_per_layer) as f64 / (1024.0 * 1024.0);
@@ -143,11 +184,15 @@ impl KvCachePool {
             head_dim,
             num_layers,
             cache_dtype: dtype,
+            #[cfg(feature = "cuda")]
             k_scale_ptrs,
+            #[cfg(feature = "cuda")]
             v_scale_ptrs,
             block_is_unrotated: vec![false; num_blocks],
             block_is_span: vec![false; num_blocks],
+            #[cfg(feature = "cuda")]
             block_unrotated_gpu_ptr: None,
+            #[cfg(feature = "cuda")]
             block_span_gpu_ptr: None,
         })
     }
@@ -170,11 +215,15 @@ impl KvCachePool {
             head_dim: 0,
             num_layers: 0,
             cache_dtype: DType::BF16,
+            #[cfg(feature = "cuda")]
             k_scale_ptrs: Vec::new(),
+            #[cfg(feature = "cuda")]
             v_scale_ptrs: Vec::new(),
             block_is_unrotated: Vec::new(),
             block_is_span: Vec::new(),
+            #[cfg(feature = "cuda")]
             block_unrotated_gpu_ptr: None,
+            #[cfg(feature = "cuda")]
             block_span_gpu_ptr: None,
         }
     }
@@ -201,22 +250,41 @@ impl KvCachePool {
         self.cache_dtype.is_fp8()
     }
 
+    /// Per-layer K-cache backing memory. Metal callers use this to
+    /// reach into the underlying `metal::Buffer` (via
+    /// `RawGpuMem::buffer()`) for ICB binding without re-allocating.
+    /// One `RawGpuMem` per layer, shape `[num_layers]`.
+    #[cfg(feature = "metal")]
+    pub fn k_layer_mem(&self, layer: usize) -> &RawGpuMem {
+        &self._k_ptrs[layer]
+    }
+
+    /// Per-layer V-cache backing memory. See [`Self::k_layer_mem`].
+    #[cfg(feature = "metal")]
+    pub fn v_layer_mem(&self, layer: usize) -> &RawGpuMem {
+        &self._v_ptrs[layer]
+    }
+
     /// GPU pointer to K scale for a layer (only valid when FP8).
+    #[cfg(feature = "cuda")]
     pub fn k_scale_ptr(&self, layer: usize) -> *const f32 {
         self.k_scale_ptrs[layer].ptr() as *const f32
     }
 
     /// GPU pointer to V scale for a layer (only valid when FP8).
+    #[cfg(feature = "cuda")]
     pub fn v_scale_ptr(&self, layer: usize) -> *const f32 {
         self.v_scale_ptrs[layer].ptr() as *const f32
     }
 
     /// Mutable GPU pointer to K scale for a layer (for writing computed scales).
+    #[cfg(feature = "cuda")]
     pub fn k_scale_ptr_mut(&self, layer: usize) -> *mut f32 {
         self.k_scale_ptrs[layer].ptr() as *mut f32
     }
 
     /// Mutable GPU pointer to V scale for a layer (for writing computed scales).
+    #[cfg(feature = "cuda")]
     pub fn v_scale_ptr_mut(&self, layer: usize) -> *mut f32 {
         self.v_scale_ptrs[layer].ptr() as *mut f32
     }
@@ -225,6 +293,7 @@ impl KvCachePool {
     ///
     /// # Safety
     /// Requires valid CUDA context.
+    #[cfg(feature = "cuda")]
     pub unsafe fn set_k_scale(
         &self,
         layer: usize,
@@ -244,6 +313,7 @@ impl KvCachePool {
     ///
     /// # Safety
     /// Requires valid CUDA context.
+    #[cfg(feature = "cuda")]
     pub unsafe fn set_v_scale(
         &self,
         layer: usize,
@@ -266,7 +336,10 @@ impl KvCachePool {
     /// `is_key` selects K (true) or V (false) cache.
     ///
     /// This is a CPU-driven D2D copy per block — not fast but correct.
-    /// Used as a fallback when paged FA2 has issues.
+    /// Used as a fallback when paged FA2 has issues. Cuda-only: relies
+    /// on a `ScratchArena` and the driver D2D path that have no metal
+    /// counterpart yet.
+    #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather_kv_contiguous(
         &self,
@@ -333,7 +406,9 @@ impl KvCachePool {
     /// Upload both flag arrays to GPU.
     ///
     /// # Safety
-    /// Requires valid CUDA context and stream.
+    /// Requires valid CUDA context and stream. Cuda-only: span
+    /// machinery has no metal counterpart yet.
+    #[cfg(feature = "cuda")]
     pub unsafe fn sync_block_flags_to_gpu(&mut self, stream: cudarc::driver::sys::CUstream) {
         // Lazily allocate GPU flag buffers on first use.
         let num_blocks = self.block_is_unrotated.len();
@@ -365,6 +440,7 @@ impl KvCachePool {
     }
 
     /// GPU pointer to `block_is_unrotated` flags (for pre-attention rotation).
+    #[cfg(feature = "cuda")]
     pub fn block_unrotated_gpu(&self) -> *const u8 {
         self.block_unrotated_gpu_ptr
             .as_ref()
@@ -373,6 +449,7 @@ impl KvCachePool {
     }
 
     /// GPU pointer to `block_is_span` flags (for post-attention un-rotation).
+    #[cfg(feature = "cuda")]
     pub fn block_span_gpu(&self) -> *const u8 {
         self.block_span_gpu_ptr
             .as_ref()

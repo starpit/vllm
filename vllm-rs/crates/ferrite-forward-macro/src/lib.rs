@@ -27,22 +27,30 @@ use syn::parse::{Parse, ParseStream};
 use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
 
 mod ast;
+use ferrite_fusion_synth::atom;
+use ferrite_fusion_synth::atom_lib;
 mod cfg;
 mod classified;
 mod classify;
 mod codegen;
 mod concurrency;
 mod config;
+use ferrite_fusion_synth::fuse_pass;
 mod cost;
 mod emit;
 mod fuf;
 mod impl_lib;
 mod interpreter_codegen;
+#[cfg(feature = "metal")]
+mod metal;
+#[cfg(feature = "metal")]
+mod metal_bridge;
 mod parse;
 mod quantization;
 mod schedule;
 mod shape;
 mod solver;
+mod solver_metal_tests;
 mod target;
 mod tp_lowering;
 mod vision_lowering;
@@ -250,6 +258,9 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
             }
         }
         Some(crate::quantization::QuantMethod::Ggml) => "q:ggml".to_string(),
+        Some(crate::quantization::QuantMethod::Affine { bits, group_size }) => {
+            format!("q:affine-b{bits}-g{group_size}")
+        }
     }
 }
 
@@ -332,6 +343,17 @@ fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path:
 
 #[proc_macro_attribute]
 pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
+    // FERRITE_DUMP_SYNTH=<path> writes the MVP-synthesized pre-attn
+    // chunk kernel for Llama-3.2-3B-4bit shape to the given path, then
+    // proceeds with normal macro expansion. Lets us run `xcrun metal`
+    // on the generated source without standing up the full solver
+    // integration. Phase-2.5 verification hook — drops out once the
+    // full fuse pass + lowering integration lands.
+    if let Ok(path) = std::env::var("FERRITE_DUMP_SYNTH") {
+        let kernel = fuse_pass::dump_llama_3_2_3b_4bit_pre_attn();
+        let _ = std::fs::write(&path, &kernel.source);
+    }
+
     let args = parse_macro_input!(args as ForwardArgs);
     let carrier = parse_macro_input!(item as ItemFn);
 
@@ -383,7 +405,10 @@ struct CompileMode {
     /// True for `#[forward]`, false for `#[vision_forward]`. Gates
     /// the post-Embed multimodal splice pass — that splice belongs
     /// on the decoder's text-side hidden states, not the encoder's
-    /// patch hidden states.
+    /// patch hidden states. Only consulted under `cuda` (the splice
+    /// pass is cuda-specific); declared cuda-only so non-cuda builds
+    /// don't carry a dead field.
+    #[cfg(feature = "cuda")]
     apply_mm_splice: bool,
     /// True for `#[forward]` (which fans out over `{1, 2, 4, 8}` at
     /// nccl-enabled), false for `#[vision_forward]` (always tp=1).
@@ -406,6 +431,7 @@ impl CompileMode {
     const DECODER: Self = Self {
         prelude: classified::Prelude::Decoder,
         apply_tp_lowering: true,
+        #[cfg(feature = "cuda")]
         apply_mm_splice: true,
         enable_tp_fanout: true,
         emit_arch_dispatch: true,
@@ -413,6 +439,7 @@ impl CompileMode {
     const VISION: Self = Self {
         prelude: classified::Prelude::Vision,
         apply_tp_lowering: false,
+        #[cfg(feature = "cuda")]
         apply_mm_splice: false,
         enable_tp_fanout: false,
         emit_arch_dispatch: false,
@@ -528,15 +555,29 @@ fn compile_common(
         }
     };
 
-    let target_def =
-        ferrite_cuda_targets::detect().map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
-    let target_profile = target::from_profile_def(target_def);
+    // Backend selection via feature flags (compile-time, not runtime)
+    #[cfg(feature = "cuda")]
+    let target_profile = {
+        let target_def = ferrite_cuda_targets::detect()
+            .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
+        target::from_profile_def(target_def)
+    };
 
-    // CUTLASS GEMM kernels in the workspace are templatized over
-    // `<typename T>` — both `_bf16_launch` and `_f16_launch` symbols
-    // ship per tile. Rust-side dispatch (`ferrite-kernels::cutlass`)
-    // reads `activation.dtype()` and picks the matching launcher, so
-    // CUTLASS Impls register unconditionally (no dtype gate).
+    #[cfg(feature = "metal")]
+    let target_profile = {
+        use ferrite_metal_kernels::device::detect_device;
+        let metal_device = detect_device().ok_or_else(|| {
+            syn::Error::new(
+                carrier.sig.ident.span(),
+                "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
+            )
+        })?;
+        target::from_metal_profile(&metal_device.profile)
+    };
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    compile_error!("ferrite-forward-macro requires either 'cuda' or 'metal' feature");
+
     let library = impl_lib::starter_library();
 
     // Stable rebuild-on-JSON-change: emit `const _: &str =
@@ -772,6 +813,16 @@ fn compile_common(
             // splice inside `Instruction::Embed::eval` mistakenly
             // overwrote). Vision encoders skip — splice belongs on
             // the decoder side, not the encoder side.
+            // MmEmbedSplice's only matcher is the CUDA-only
+            // `MmEmbedSpliceImpl` (D2D-copy via cuMemcpyDtoDAsync). Under
+            // `--features metal` the impl pool can't claim the synthesized
+            // splice node, so the solver explodes with "no Impl matched
+            // tile … op MmEmbedSplice". Keep the splice insertion CUDA-
+            // only until a Metal MmEmbedSplice lands. Text-only models
+            // are unaffected at the runtime level — this splice is a
+            // no-op there in both backends. Multimodal Metal will need
+            // a Metal `MmEmbedSpliceImpl` and to flip this back on.
+            #[cfg(feature = "cuda")]
             if mode.apply_mm_splice {
                 tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
             }
@@ -891,6 +942,55 @@ fn compile_common(
                 "quick_gelu_inplace",
                 "gelu_erf_inplace",
                 "gelu_tanh_inplace",
+                // Metal kernels (Phase 5.F: the proc-macro now runs
+                // under `--features metal`, so the classifier sees
+                // these names alongside the CUDA ones). Hand-rolled
+                // norm / elementwise / fused-MLP / RoPE — same shape
+                // class as the CUDA `*_ref` siblings, just emitting
+                // MSL instead of CUDA. `metal_attention_*` and
+                // `metal_gemm_*` get their own prefix arms below
+                // (fa2 / cutlass-equivalent). Gated on `metal` so the
+                // CUDA build doesn't carry dead names in its classifier.
+                #[cfg(feature = "metal")]
+                "metal_add_f16",
+                #[cfg(feature = "metal")]
+                "metal_embed_f16",
+                #[cfg(feature = "metal")]
+                "metal_affine_embed_f16",
+                #[cfg(feature = "metal")]
+                "metal_affine_embed_bf16",
+                #[cfg(feature = "metal")]
+                "metal_reshape",
+                #[cfg(feature = "metal")]
+                "metal_bias_add_f16",
+                #[cfg(feature = "metal")]
+                "metal_rmsnorm_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_add_rmsnorm_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_gate_up_silu_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_gate_up_gelu_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_rope_append_f16",
+                // CommandR and other models use the interleaved rope
+                // variant; same shape class as the regular rope_append.
+                #[cfg(feature = "metal")]
+                "metal_rope_append_interleaved_f16",
+                #[cfg(feature = "metal")]
+                "metal_fatrelu_f16",
+                // Metal counterparts of the CUDA `scalar_mul_inplace`
+                // and `tanh_softcap_inplace` non-gemm in-place
+                // mutators. Same kernel class — bandwidth-bound
+                // elementwise unary.
+                #[cfg(feature = "metal")]
+                "metal_scalar_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_scalar_mul_bf16",
+                #[cfg(feature = "metal")]
+                "metal_tanh_softcap_f16",
+                #[cfg(feature = "metal")]
+                "metal_tanh_softcap_bf16",
                 // Vision-prelude pixels materialization (G.5.e.1).
                 // Synthesized by `vision_lowering::materialize_pixels`;
                 // emits a single D2D copy that wraps `ctx.fwd.pixels`
@@ -913,9 +1013,6 @@ fn compile_common(
                 // Reuses the decoder's `embedding_gather_masked` kernel;
                 // same memory-bound class as `embed_ref`.
                 "pos_embed_ref",
-                // Phase H: CLIP-class CLS-token strip. Drops row 0
-                // before the projector runs. Single D2D copy; non-gemm.
-                "strip_cls",
             ];
             let mut classes_used = [false; 8];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
@@ -923,36 +1020,67 @@ fn compile_common(
             for assignment in sfufs.per_workload.values() {
                 for impl_id in assignment.impls.values() {
                     let name = library.get(*impl_id).name();
-                    let bucket = if name.starts_with("flashinfer") {
+                    // Most kernel-name prefixes here are CUDA-specific
+                    // (flashinfer/mla/cutlass/marlin/fp8/bnb4/ggml/cublas-via-fused_/
+                    // NCCL collectives + the multimodal D2D splice).
+                    // Gating each behind `cfg!(feature = "cuda")` keeps
+                    // the metal-only build's classifier from carrying
+                    // dead arms and prevents a hypothetical
+                    // metal-emitted impl that happens to start with
+                    // `cutlass` etc. from being silently mis-classed.
+                    let bucket = if cfg!(feature = "cuda") && name.starts_with("flashinfer") {
                         Some(1) // fi
                     } else if name.starts_with("mla_") {
+                        // MLA singletons (`mla_split_ref`, `mla_attention_ref`)
+                        // and `DeepSeekMoeRefImpl`-family are registered under
+                        // both backends — runtime support diverges, but the
+                        // classifier just buckets by name for the build-time
+                        // mix line.
                         Some(2) // mla
                     } else if name.starts_with("attention_")
                         || name.starts_with("sliding_attention_")
                         || name.starts_with("fa2_")
                         || name == "encoder_attention"
+                        || (cfg!(feature = "metal") && name.starts_with("metal_attention_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_sliding_attention_"))
                     {
                         Some(0) // fa2
-                    } else if name.starts_with("marlin") {
+                    } else if cfg!(feature = "cuda") && name.starts_with("marlin") {
                         Some(5) // marlin
-                    } else if name.starts_with("fp8") {
+                    } else if cfg!(feature = "cuda") && name.starts_with("fp8") {
                         Some(4) // cutlass (fp8 uses cutlass_scaled_mm)
-                    } else if name.starts_with("bnb4") || name.starts_with("ggml") {
+                    } else if cfg!(feature = "cuda")
+                        && (name.starts_with("bnb4") || name.starts_with("ggml"))
+                    {
                         // cublas: bnb4 dequant + cuBLAS matmul; ggml
                         // dequant_mul_mat_vec at decode + cuBLAS at prefill.
                         Some(3)
-                    } else if name.starts_with("cutlass") {
+                    } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_synth_"))
+                    {
+                        // Metal GEMM is currently routed through MPS
+                        // matmul2d (see ferrite-metal-kernels::gemm);
+                        // metal int4 GEMM routes through the
+                        // qmv/qmm_t kernels (see ferrite-metal-kernels::
+                        // quantized). Both treated as cutlass-equivalent
+                        // for class accounting — same "specialized
+                        // matmul tile" shape from the cost-model's
+                        // perspective.
                         Some(4) // cutlass
                     } else if NON_GEMM_NAMES.contains(&name) {
                         Some(6) // non-gemm
-                    } else if name == "all_reduce" || name == "all_gather" {
+                    } else if cfg!(feature = "cuda")
+                        && (name == "all_reduce" || name == "all_gather")
+                    {
                         // Tensor-parallel collectives inserted by
                         // `tp_lowering` at tp>1 (AllReduce after
                         // row-parallel gemms + vocab-parallel embed;
                         // AllGather after lm_head). Maps to NCCL —
                         // semantically distinct from compute kernels.
                         Some(7) // comm
-                    } else if name == "mm_embed_splice" {
+                    } else if cfg!(feature = "cuda") && name == "mm_embed_splice" {
                         // Multimodal post-Embed D2D splice inserted by
                         // `tp_lowering::insert_mm_splices`. Not a
                         // compute kernel — runs a sequence of
@@ -962,7 +1090,14 @@ fn compile_common(
                         // per-token kernel" shape.
                         Some(7) // comm
                     } else if name.starts_with("fused_") || name == "gemm_ref" {
-                        Some(3) // cublas (LinearLayer::forward → cuBLAS gemm_bias)
+                        // `fused_gemm_bias` (qwen2 K/V) and the gemma
+                        // fusion families (`fused_add_rms_norm`,
+                        // `fused_add_rms_norm_with_offset`,
+                        // `scalar_offset_rms_norm`) live in both backends
+                        // now. cuda routes through cuBLAS gemm_bias; metal
+                        // routes through its own GEMM path. Same
+                        // build-time class for accounting.
+                        Some(3) // cublas / cublas-equivalent
                     } else {
                         None
                     };
@@ -1365,6 +1500,23 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
+    // emits this const from the macro's per-canonical metal_emission;
+    // shim variants re-export the canonical's. The trait impl below
+    // dispatches on `Weights` variant and returns the matched module's
+    // const so `determine_available_memory` reads the right per-arch
+    // peak rather than a 512 MiB placeholder.
+    let metal_arena_peak_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => #model_ident::METAL_ARENA_PEAK_BYTES,
+            }
+        })
+        .collect();
+
     // Accessor methods on Weights — each returns a per-variant
     // constant from the matched model's bounds. Consumers (e.g.
     // vllm-executor's CudaModel enum) delegate their own accessor
@@ -1470,7 +1622,7 @@ fn emit_arch_dispatcher(
         .map(|tp| {
             let tp_lit = proc_macro2::Literal::u8_unsuffixed(*tp);
             quote! {
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "metal"))]
                 ::ferrite_forward::inventory::submit! {
                     ::ferrite_forward::FerriteArchRegistration {
                         arch_name: #arch_name_lit,
@@ -1572,13 +1724,17 @@ fn emit_arch_dispatcher(
 
     Ok(quote! {
         /// One variant per compiled model config. Holds that
-        /// model's specialized `Weights`.
-        #[cfg(feature = "cuda")]
+        /// model's specialized `Weights`. Same shape under both
+        /// backends — the variant's per-canonical `Weights` struct
+        /// itself is cfg-mutex'd internally (cuda fields gated
+        /// `cfg(feature = "cuda")`, metal fields gated
+        /// `cfg(feature = "metal")`).
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub enum Weights {
             #(#variants),*
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         impl Weights {
             #(#accessor_methods)*
 
@@ -1612,19 +1768,23 @@ fn emit_arch_dispatcher(
         }
 
         /// Dispatching forward. Matches the `Weights` variant and
-        /// calls the per-model specialized `forward`.
+        /// calls the per-model specialized `forward`. Same body and
+        /// signature under both backends — the cfg-mutex'd
+        /// `GpuDevice` and `OwnedTensor` re-exports resolve to the
+        /// matching backend's struct, and per-canonical `forward`
+        /// fns now exist in both `cfg(cuda)` and `cfg(metal)` arms.
         ///
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
-        /// must be the live CUDA device.
-        #[cfg(feature = "cuda")]
+        /// must be the live backend device.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
             w: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+        ) -> ::ferrite_cuda_core::OwnedTensor {
             match w {
                 #(#forward_arms)*
             }
@@ -1633,7 +1793,10 @@ fn emit_arch_dispatcher(
         /// Dispatching backbone-only forward (no lm_head). Returns
         /// `[num_tokens, hidden_size]` as an independently-owned
         /// `OwnedTensor`. For pipeline-parallel intermediate ranks
-        /// that hand hidden states to the next rank.
+        /// that hand hidden states to the next rank — cuda-only
+        /// today; metal has no PP fanout, so the per-canonical
+        /// `forward_backbone` is cfg(cuda)-gated and this dispatcher
+        /// matches.
         ///
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
@@ -1658,7 +1821,7 @@ fn emit_arch_dispatcher(
         // `inventory::submit!` adds this arch to the global registry.
         // No hand-written central list anywhere.
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         impl ::ferrite_forward::FerriteWeights for Weights {
             fn arch_name(&self) -> &'static str { #arch_name_lit }
             fn num_hidden_layers(&self) -> u64 { self.num_hidden_layers() }
@@ -1672,19 +1835,35 @@ fn emit_arch_dispatcher(
             unsafe fn forward(
                 &self,
                 ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> ::ferrite_cuda_core::OwnedTensor {
                 unsafe { forward(self, ctx, device, num_tokens) }
             }
 
             unsafe fn forward_backbone(
                 &self,
                 ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-                unsafe { forward_backbone(self, ctx, device, num_tokens) }
+            ) -> ::ferrite_cuda_core::OwnedTensor {
+                #[cfg(feature = "cuda")]
+                { unsafe { forward_backbone(self, ctx, device, num_tokens) } }
+                #[cfg(feature = "metal")]
+                {
+                    let _ = (ctx, device, num_tokens);
+                    unimplemented!(
+                        "metal forward_backbone — pipeline-parallel intermediate \
+                         ranks aren't supported on metal yet (no PP fanout)"
+                    )
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_arena_peak_bytes(&self) -> u64 {
+                match self {
+                    #(#metal_arena_peak_arms)*
+                }
             }
         }
 
@@ -1700,8 +1879,9 @@ fn emit_arch_dispatcher(
         // every (model, tp) variant via `dump_rows`. Independent of
         // the per-tp `FerriteArchRegistration` above — `vllm ferrite
         // info` walks this registry separately, with no runtime GPU
-        // or weight loading.
-        #[cfg(feature = "cuda")]
+        // or weight loading. Gated on either backend feature so the
+        // metal CLI sees compiled-in metal arches too.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         ::ferrite_forward::inventory::submit! {
             ::ferrite_forward::BackboneDumpRegistration {
                 arch_name: #arch_name_lit,

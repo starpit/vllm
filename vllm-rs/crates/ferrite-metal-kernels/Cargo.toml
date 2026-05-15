@@ -1,0 +1,41 @@
+[package]
+name = "ferrite-metal-kernels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = [
+    "dispatch2",
+    # MTL4 surfaces for the migration off MTLCommandBuffer + ICB
+    # (see `FERRITE_METAL_MTL4_MIGRATION.md`). Runtime-probed via
+    # `device.newMTL4CommandQueue()`; absent on macOS 14, so kept as
+    # a side-by-side path.
+    "MTL4ArgumentTable",
+    "MTL4BufferRange",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+] }
+objc2-foundation = "0.3"
+dispatch2 = "0.3"
+ferrite-metal-targets = { path = "../ferrite-metal-targets" }
+half = "2.3"
+libm = "0.2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+# build.rs uses only `xcrun` via std::process::Command — no crate
+# dependencies needed.
+
+[[bench]]
+name = "attention_benchmark"
+harness = false
+
+[[bench]]
+name = "fused_kernels_benchmark"
+harness = false

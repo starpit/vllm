@@ -1939,7 +1939,15 @@ pub unsafe fn load_gguf_into_weights(
 ) -> anyhow::Result<ferrite_cuda_core::weights::GpuWeights> {
     let gguf =
         unsafe { GgufGpuWeights::load(path, model_dtype, alloc, stream, tp_rank, tp_world_size)? };
-    let mut gw = ferrite_cuda_core::weights::GpuWeights::empty(stream);
+    // Stage A's `GpuWeights::empty` takes a `BackendAllocator` (= `CudaAllocator` under
+    // cuda) instead of the raw stream — wrap to match. The fresh allocator is
+    // empty; the GGUF loader makes its allocations through the caller's
+    // `CachingAllocator`, not through this `GpuWeights::allocator`. Stays
+    // identical to the pre-Stage-A behavior since the allocator field was
+    // unused on this path.
+    let mut gw = ferrite_cuda_core::weights::GpuWeights::empty(
+        ferrite_cuda_core::CudaAllocator::new(stream),
+    );
 
     for (name, weight) in gguf.into_weights() {
         match weight {

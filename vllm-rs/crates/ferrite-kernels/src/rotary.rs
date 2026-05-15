@@ -3,9 +3,12 @@
 
 use anyhow::Result;
 
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::tensor::GpuTensor;
+use ferrite_cuda_core::weights::GpuWeights;
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -33,6 +36,7 @@ pub struct YarnRopeScaling {
     pub original_max_position_embeddings: usize,
 }
 
+#[cfg(feature = "cuda")]
 fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
     if scale <= 1.0 {
         1.0
@@ -41,6 +45,7 @@ fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn yarn_find_correction_range(
     beta_fast: f64,
     beta_slow: f64,
@@ -59,6 +64,7 @@ fn yarn_find_correction_range(
     )
 }
 
+#[cfg(feature = "cuda")]
 fn yarn_linear_ramp_mask(low: f64, high: f64, dim: usize) -> Vec<f64> {
     let len = dim / 2;
     (0..len)
@@ -145,12 +151,49 @@ pub struct RotaryCache {
     pub mrope_section: Option<[u32; 3]>,
 }
 
+/// Cast an f32 cos/sin buffer to `dtype` (F32 / F16 / BF16) and
+/// upload via [`GpuWeights::alloc_packed_from_host`]. Backend-neutral
+/// — used by [`RotaryCache::new_from_gpuweights`].
+fn upload_via_gpuweights(
+    weights: &mut GpuWeights,
+    cache: &[f32],
+    shape: &[usize],
+    dtype: DType,
+) -> Result<GpuTensor> {
+    let bytes: Vec<u8> = match dtype {
+        DType::F32 => {
+            let mut v = Vec::with_capacity(cache.len() * 4);
+            for &f in cache {
+                v.extend_from_slice(&f.to_ne_bytes());
+            }
+            v
+        }
+        DType::F16 => {
+            let mut v = Vec::with_capacity(cache.len() * 2);
+            for &f in cache {
+                v.extend_from_slice(&half::f16::from_f32(f).to_bits().to_ne_bytes());
+            }
+            v
+        }
+        DType::BF16 => {
+            let mut v = Vec::with_capacity(cache.len() * 2);
+            for &f in cache {
+                v.extend_from_slice(&half::bf16::from_f32(f).to_bits().to_ne_bytes());
+            }
+            v
+        }
+        _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
+    };
+    weights.alloc_packed_from_host(&bytes, shape, dtype)
+}
+
 /// Allocate + upload a `[max_pos, rotary_dim]` f32 cos|sin cache to
 /// GPU memory in the target dtype. Extracted so variants (standard,
 /// LongRoPE, partial) share one upload path.
 ///
 /// # Safety
 /// Requires valid CUDA context and stream.
+#[cfg(feature = "cuda")]
 unsafe fn upload_combined_cos_sin(
     cache: &[f32],
     max_pos: usize,
@@ -187,6 +230,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new(
         head_dim: usize,
         max_pos: usize,
@@ -209,6 +253,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new_from_stream(
         head_dim: usize,
         max_pos: usize,
@@ -303,6 +348,108 @@ impl RotaryCache {
         })
     }
 
+    /// Backend-neutral, stream-free counterpart to [`new_from_stream`].
+    /// Computes the cos/sin tables on CPU (identical math) and uploads
+    /// them via the [`GpuWeights`] active [`DeviceAllocator`]. Single
+    /// [`alloc_packed_from_host`] call per cache (combined / cos / sin).
+    ///
+    /// Currently covers the basic case: full rotary
+    /// (`rotary_dim == head_dim`), no scaling or Llama3 scaling. Other
+    /// variants (LongRoPE, partial-rotary, YaRN) are still cuda-only —
+    /// porting them follows the same pattern but lifts more host-math
+    /// helpers; deferred until a metal model needs them.
+    ///
+    /// [`new_from_stream`]: Self::new_from_stream
+    /// [`alloc_packed_from_host`]: GpuWeights::alloc_packed_from_host
+    /// [`DeviceAllocator`]: ferrite_cuda_core::DeviceAllocator
+    pub fn new_from_gpuweights(
+        weights: &mut GpuWeights,
+        head_dim: usize,
+        max_pos: usize,
+        rope_theta: f64,
+        llama3_scaling: Option<&Llama3RopeScaling>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let rotary_dim = head_dim;
+        let half = rotary_dim / 2;
+
+        let inv_freqs: Vec<f64> = (0..half)
+            .map(|i| {
+                let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                if let Some(scaling) = llama3_scaling {
+                    let old_context_len = scaling.original_max_position_embeddings as f64;
+                    let low_freq_wavelen = old_context_len / scaling.low_freq_factor;
+                    let high_freq_wavelen = old_context_len / scaling.high_freq_factor;
+                    let wavelen = 2.0 * std::f64::consts::PI / freq;
+                    if wavelen < high_freq_wavelen {
+                        freq
+                    } else if wavelen > low_freq_wavelen {
+                        freq / scaling.factor
+                    } else {
+                        let smooth = (old_context_len / wavelen - scaling.low_freq_factor)
+                            / (scaling.high_freq_factor - scaling.low_freq_factor);
+                        (1.0 - smooth) * freq / scaling.factor + smooth * freq
+                    }
+                } else {
+                    freq
+                }
+            })
+            .collect();
+
+        // Parallel cos/sin fill — `max_pos × rotary_dim` is millions of
+        // trig calls for long-context models (Llama-3.2 ships
+        // max_position_embeddings = 131072). Rayon par_chunks_mut over
+        // rows is safe (each pos writes its own row) and turns ~80ms of
+        // single-threaded math into ~10ms on a typical M-series core
+        // count.
+        let mut cache = vec![0f32; max_pos * rotary_dim];
+        cache
+            .par_chunks_mut(rotary_dim)
+            .enumerate()
+            .for_each(|(pos, row)| {
+                for i in 0..half {
+                    let angle = pos as f64 * inv_freqs[i];
+                    row[i] = angle.cos() as f32;
+                    row[half + i] = angle.sin() as f32;
+                }
+            });
+
+        let cos_sin_cache = upload_via_gpuweights(weights, &cache, &[max_pos, rotary_dim], dtype)?;
+
+        // Split `cos_cache` / `sin_cache` are wgpu-only — every cuda
+        // and metal kernel reads the unified `cos_sin_cache` above.
+        // Building + uploading two ~32 MB caches that nothing reads
+        // costs ~30-50ms on Llama-3.2-3B at max_pos = 131072. Skip
+        // them under the cuda + metal feature combos.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let (cos_cache, sin_cache) = (
+            unsafe { ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
+            unsafe { ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
+        );
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let (cos_cache, sin_cache) = {
+            let mut cos_data: Vec<f32> = Vec::with_capacity(max_pos * half);
+            let mut sin_data: Vec<f32> = Vec::with_capacity(max_pos * half);
+            for p in 0..max_pos {
+                for i in 0..half {
+                    cos_data.push(cache[p * rotary_dim + i]);
+                    sin_data.push(cache[p * rotary_dim + half + i]);
+                }
+            }
+            let cos_cache = upload_via_gpuweights(weights, &cos_data, &[max_pos, half], dtype)?;
+            let sin_cache = upload_via_gpuweights(weights, &sin_data, &[max_pos, half], dtype)?;
+            (cos_cache, sin_cache)
+        };
+
+        Ok(Self {
+            cos_sin_cache,
+            cos_cache,
+            sin_cache,
+            head_dim,
+            mrope_section: None,
+        })
+    }
+
     /// Phi-3 / Phi-3.5 LongRoPE (su-scaling) variant of
     /// `new_from_stream`. Builds a unified `[max_pos, rotary_dim]` cache
     /// that selects `short_factor` below
@@ -313,6 +460,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new_longrope_from_stream(
         head_dim: usize,
         max_pos: usize,
@@ -355,6 +503,7 @@ impl RotaryCache {
     /// - `use_long_rope = false` ⇒ cache[pos] uses `short_factor` + `short_mscale` for pos in 0..orig_max
     ///   (positions ≥ orig_max are unreachable when max_model_len ≤ orig_max; filled with the
     ///   short-factor extrapolation for safety.)
+    #[cfg(feature = "cuda")]
     unsafe fn build_longrope(
         head_dim: usize,
         rotary_dim: usize,
@@ -435,6 +584,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new_partial_longrope_from_stream(
         head_dim: usize,
         rotary_dim: usize,
@@ -471,6 +621,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new_yarn_from_stream(
         rope_head_dim: usize,
         max_pos: usize,
@@ -537,6 +688,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new_partial(
         head_dim: usize,
         rotary_dim: usize,
@@ -564,6 +716,7 @@ impl RotaryCache {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn new_partial_from_stream(
         head_dim: usize,
         rotary_dim: usize,
@@ -619,6 +772,7 @@ impl RotaryCache {
         })
     }
 
+    #[cfg(feature = "cuda")]
     unsafe fn build_separate_cos_sin(
         cache: &[f32],
         max_pos: usize,

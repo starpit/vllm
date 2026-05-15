@@ -83,7 +83,7 @@ pub struct MmMetadata {
     /// MM tokens carrying grid coords) or standard 1D RoPE positions
     /// `[n_tokens]` (Gemma3-MM, LLaVA, every other family).
     ///
-    /// `true` → cuda_worker overrides the per-token positions with the
+    /// `true` → ferrite_worker overrides the per-token positions with the
     /// 2D-grid build pass before model.forward.
     /// `false` → keeps the prebuilt 1D sequence positions verbatim.
     ///

@@ -16,6 +16,13 @@ use cudarc::driver::sys as cuda_sys;
 use std::collections::BTreeSet;
 use std::ptr;
 
+// `OwnedTensor` and `RawGpuMem` were moved to sibling modules so
+// they can be cfg-mutexed for cuda + metal. Re-export them at the
+// historic `crate::alloc::*` paths so existing call sites compile
+// unchanged.
+pub use crate::owned_tensor::OwnedTensor;
+pub use crate::raw_mem::RawGpuMem;
+
 // ---------------------------------------------------------------------------
 // Capture mode guard (matches PyTorch's CUDAStreamCaptureModeGuard)
 // ---------------------------------------------------------------------------
@@ -523,11 +530,16 @@ impl CachingAllocator {
         let size_bytes = numel * dtype.size_bytes();
         let ptr = self.alloc(size_bytes);
         let inner = unsafe { GpuTensor::new(ptr, shape, dtype) };
-        OwnedTensor {
-            inner,
-            alloc: self as *mut CachingAllocator,
-            size_bytes,
-        }
+        unsafe { OwnedTensor::from_caching_alloc(inner, self as *mut CachingAllocator, size_bytes) }
+    }
+
+    /// Remove a pointer from the active-blocks tracker without
+    /// freeing it. Used by [`OwnedTensor::into_gpu_tensor`] when the
+    /// caller wants to leak the GPU memory and detach it from the
+    /// caching allocator's bookkeeping. Pub-crate-scoped because
+    /// `OwnedTensor` lives in a sibling module.
+    pub(crate) fn unregister_active_block(&mut self, ptr: usize) {
+        self.active_blocks.remove(&ptr);
     }
 
     pub fn free_block_count(&self) -> usize {
@@ -711,155 +723,9 @@ impl std::ops::Deref for RawGpuAlloc {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RawGpuMem — RAII wrapper for raw GPU pointer + size (no tensor metadata)
-// ---------------------------------------------------------------------------
-
-/// RAII wrapper for a raw GPU allocation (pointer + size) without tensor metadata.
-///
-/// Used for weight memory tracked by `GpuWeights` — each allocation is a raw
-/// `driver::mem_alloc()` call, and this wrapper ensures `driver::mem_free()` is
-/// called on drop. If the memory should be kept alive beyond the wrapper's
-/// lifetime, call `leak()` to take ownership and prevent the Drop.
-pub struct RawGpuMem {
-    ptr: *mut u8,
-    size: usize,
-}
-
-// Safety: GPU device pointers are accessible from any host thread after the
-// CUDA context is established. No thread-local state.
-unsafe impl Send for RawGpuMem {}
-unsafe impl Sync for RawGpuMem {}
-
-impl RawGpuMem {
-    /// Create from a raw GPU pointer and size. The caller transfers ownership.
-    ///
-    /// # Safety
-    /// `ptr` must be a valid GPU allocation from `driver::mem_alloc()` with
-    /// the given `size`, and the caller must not free it separately.
-    pub unsafe fn new(ptr: *mut u8, size: usize) -> Self {
-        Self { ptr, size }
-    }
-
-    pub fn ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Take ownership of the raw pointer, preventing `Drop` from freeing it.
-    /// Returns `(ptr, size)`.
-    pub fn leak(mut self) -> (*mut u8, usize) {
-        let result = (self.ptr, self.size);
-        self.ptr = std::ptr::null_mut();
-        std::mem::forget(self);
-        result
-    }
-}
-
-impl Drop for RawGpuMem {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                let _ = driver::mem_free(self.ptr);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OwnedTensor
-// ---------------------------------------------------------------------------
-
-/// A GPU tensor that owns its memory via the caching allocator.
-/// When dropped, the underlying memory is returned to the allocator's free pool.
-pub struct OwnedTensor {
-    inner: GpuTensor,
-    alloc: *mut CachingAllocator,
-    size_bytes: usize,
-}
-
-// Safety: OwnedTensor contains a GpuTensor (raw GPU pointer, Copy) and a raw
-// pointer to its parent CachingAllocator. GPU device pointers are thread-safe
-// after CUDA context setup. The allocator pointer is only used on Drop (via
-// &mut), and OwnedTensor is always dropped on the same worker thread that
-// created it — the pointer is not dereferenced across threads.
-unsafe impl Send for OwnedTensor {}
-unsafe impl Sync for OwnedTensor {}
-
-impl OwnedTensor {
-    pub fn as_gpu_tensor(&self) -> GpuTensor {
-        self.inner
-    }
-
-    /// Consume self, return GpuTensor WITHOUT freeing. The block stays allocated
-    /// but is removed from active_blocks tracking (so free_leaked_blocks can find it).
-    pub fn into_gpu_tensor(self) -> GpuTensor {
-        let t = self.inner;
-        // Remove from active_blocks so free_leaked_blocks can detect this as leaked.
-        unsafe {
-            (*self.alloc).active_blocks.remove(&(t.raw_ptr() as usize));
-        }
-        std::mem::forget(self);
-        t
-    }
-
-    /// Reshape this tensor in-place, keeping the same underlying memory.
-    /// The caller must ensure the new shape is compatible with the allocated size.
-    pub unsafe fn reshape(&mut self, shape: &[usize], dtype: DType) {
-        self.inner = GpuTensor::new(self.inner.raw_ptr(), shape, dtype);
-    }
-
-    /// Borrow this tensor as a lifetime-checked `TensorView`.
-    ///
-    /// The returned view borrows `&self`, so the compiler guarantees the
-    /// `OwnedTensor` (and its GPU memory) outlives the view.
-    pub fn view(&self) -> TensorView<'_> {
-        // Safety: the OwnedTensor owns the memory; the view borrows &self.
-        unsafe { TensorView::from_raw(self.inner) }
-    }
-
-    /// Create a sub-view at a byte offset into this tensor's memory.
-    ///
-    /// Useful for the packed sampling parameter pattern where one `OwnedTensor`
-    /// backs multiple logical tensors at different offsets.
-    ///
-    /// # Safety
-    /// `byte_offset + numel(new_shape) * dtype.size_bytes()` must not exceed
-    /// the allocated size of this tensor.
-    pub unsafe fn view_offset(
-        &self,
-        byte_offset: usize,
-        new_shape: &[usize],
-        dtype: DType,
-    ) -> TensorView<'_> {
-        let inner = GpuTensor::new(self.inner.raw_ptr().add(byte_offset), new_shape, dtype);
-        TensorView::from_raw(inner)
-    }
-}
-
-impl Drop for OwnedTensor {
-    fn drop(&mut self) {
-        unsafe {
-            (*self.alloc).free(self.inner.raw_ptr(), self.size_bytes);
-        }
-    }
-}
-
-impl std::ops::Deref for OwnedTensor {
-    type Target = GpuTensor;
-    fn deref(&self) -> &GpuTensor {
-        &self.inner
-    }
-}
-
-impl std::fmt::Debug for OwnedTensor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OwnedTensor({:?})", self.inner)
-    }
-}
+// `OwnedTensor` and `RawGpuMem` live in `crate::owned_tensor` and
+// `crate::raw_mem` — both backend-neutral. Re-exported from the
+// crate root.
 
 // ---------------------------------------------------------------------------
 // Tests

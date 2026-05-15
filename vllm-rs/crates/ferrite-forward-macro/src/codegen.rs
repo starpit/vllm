@@ -36,7 +36,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::Ident;
 
-use crate::classified::{OpKind, Program, WeightId};
+use crate::classified::{Expr, OpKind, Program, Stmt, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
@@ -68,39 +68,11 @@ fn safetensors_prefix(
     // manifest; translate `_<digit>` suffixes back to `.<digit>`
     // for the on-disk safetensors key (which uses Python-attribute
     // dotted form, including numeric submodule indices).
-    //
-    // Vision-prelude only: if the per-arch
-    // `vision_safetensors_layout.verbatim_segments` list contains a
-    // raw segment, it's passed through unchanged. LLaVA-1.5's
-    // `multi_modal_projector.linear_1` / `linear_2` are real Python
-    // attribute names with literal underscores — the heuristic
-    // would mistranslate them to `linear.1` / `linear.2`.
-    let is_vision_for_verbatim = matches!(program.prelude, crate::classified::Prelude::Vision);
-    let qwen_default_layout = crate::config::VisionSafetensorsLayout::qwen_default();
-    let layout_for_verbatim = if is_vision_for_verbatim {
-        program
-            .vision_layout
-            .as_ref()
-            .unwrap_or(&qwen_default_layout)
-    } else {
-        &qwen_default_layout
-    };
     let segs: Vec<String> = program
         .weights
         .path(id)
         .iter()
-        .map(|seg| {
-            if is_vision_for_verbatim
-                && layout_for_verbatim
-                    .verbatim_segments
-                    .iter()
-                    .any(|v| v == seg)
-            {
-                seg.to_string()
-            } else {
-                translate_digit_suffix(seg)
-            }
-        })
+        .map(|seg| translate_digit_suffix(seg))
         .collect();
     let joined = segs.join(".");
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
@@ -172,6 +144,21 @@ fn translate_digit_suffix(seg: &str) -> String {
 enum FieldLoad {
     /// `Embedding::load(gw, prefix)`.
     Embedding(String),
+    /// MLX-affine int4 quantized embedding (Metal-only). Reads
+    /// `<prefix>.{weight,scales,biases}` and CPU-dequantizes to BF16
+    /// at load time so the rest of the forward path sees a normal
+    /// dense embedding. Used by every `mlx-community/*-4bit` checkpoint
+    /// in the int4 mandate's coverage matrix — they all ship the
+    /// embedding as an affine triple (`INT4_PARITY_PROBES.md` §2),
+    /// with the sole exception of Gemma-3-MM's language-model
+    /// embedding (Gemma-3-MM is currently absent from the int4 P2
+    /// gate). `group_size` / `bits` are taken from `quantization_config`
+    /// at compile time. Emits `Embedding::load_affine_dequant`.
+    EmbeddingAffine {
+        prefix: String,
+        group_size: u32,
+        bits: u32,
+    },
     /// `RmsNorm::load(gw, prefix, eps)`. `eps` is baked in from the
     /// model config (`rms_norm_eps`).
     RmsNorm(String, f32),
@@ -183,6 +170,28 @@ enum FieldLoad {
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
     LinearConcat(Vec<String>),
+    /// MLX-affine int4 quantized linear (Metal-only), single source.
+    /// `group_size` and `bits` come from `quantization_config`. Under
+    /// INT4 P2 emits `LinearLayer::load_affine_dequant_as_dense`
+    /// (CPU dequant at load → Dense BF16). Under P3 will flip to
+    /// `LinearLayer::load_affine_quant` for forward-time qmv.
+    LinearAffine {
+        prefix: String,
+        group_size: u32,
+        bits: u32,
+    },
+    /// Fused-concat MLX-affine int4 quantized linear (Metal-only).
+    /// `gate_proj` + `up_proj` (and q/k/v) ship as separate affine
+    /// triples in mlx-community 4bit repos; the forward DSL fuses
+    /// them into one `gate_up_proj` / `qkv_proj` linear so the metal
+    /// `FusedGateUpSiluMul` impl pool matches the standard pattern.
+    /// Emits `LinearLayer::load_affine_dequant_concat_as_dense`
+    /// (CPU dequant per prefix, byte-concat along dim 0, alloc once).
+    LinearAffineConcat {
+        prefixes: Vec<String>,
+        group_size: u32,
+        bits: u32,
+    },
     /// `LinearLayer::load_raw(gw, key)` — reads `<key>` verbatim
     /// (no `.weight` / `.bias` suffix). Used for `nn.Parameter` weights
     /// (e.g. Gemma3 MM projector's `mm_input_projection_weight`) declared
@@ -194,7 +203,16 @@ enum FieldLoad {
     /// its weight with `embed_tokens`. No safetensors read — build
     /// the `LinearLayer` from the already-loaded embedding field
     /// whose name is carried here.
-    LinearTiedToEmbedding(syn::Ident),
+    ///
+    /// `affine` captures whether the source embedding is MLX-affine
+    /// quantized (P6). When `Some((group_size, bits))`, the lm_head
+    /// emits `LinearLayer::AffineQuant(...)` reading the embed's
+    /// packed buffers; when `None`, it emits the legacy
+    /// `LinearLayer::Dense(Linear::new(embed.weight, None))`.
+    LinearTiedToEmbedding {
+        embed_ident: syn::Ident,
+        affine: Option<(u32, u32)>,
+    },
     /// 4-bit packed INT4 linear that feeds a Marlin GEMM. Single-
     /// source (one prefix) or fused (multiple prefixes concat along
     /// dim N → one wider `MarlinLinear`). `format` selects the
@@ -483,6 +501,15 @@ fn plan_field_load(
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
+    // P6: MLX-affine int4 quantized embedding. Distinct type from
+    // `Embedding` (carries packed U32 weight + F16 scales + F16
+    // affine offsets); the field_load arm always routes to
+    // `EmbeddingAffine` since the storage is known-Affine by
+    // construction (`MetalAffineEmbedImpl::matches` gates on
+    // `StorageFormat::Affine`).
+    let is_affine_quant_embedding = ty.ends_with("::AffineQuantEmbedding")
+        || ty == "AffineQuantEmbedding"
+        || ty.ends_with("layers::AffineQuantEmbedding");
     let is_rmsnorm =
         ty.ends_with("::RmsNorm") || ty == "RmsNorm" || ty.ends_with("layers::RmsNorm");
     let is_layer_norm =
@@ -986,13 +1013,35 @@ fn plan_field_load(
         };
     }
 
-    if is_embedding {
+    if is_embedding || is_affine_quant_embedding {
         assert_eq!(
             prefixes.len(),
             1,
             "Embedding accessor `{}` with {} sources",
             accessor.name,
             prefixes.len()
+        );
+        // MLX-affine int4 embedding: detect via the same
+        // `storage_format_for_weight` lookup the `is_linear` arm uses
+        // below. Single source by construction (assertion above).
+        let only_src = accessor.source_weights[0].0;
+        if let crate::quantization::StorageFormat::Affine { bits, group_size } =
+            crate::quantization::storage_format_for_weight(program, fuf, only_src, model)
+        {
+            return FieldLoad::EmbeddingAffine {
+                prefix: prefixes.into_iter().next().unwrap(),
+                group_size,
+                bits,
+            };
+        }
+        // If the accessor type is AffineQuantEmbedding but the source
+        // weight is NOT Affine, the macro / impl pairing is broken —
+        // MetalAffineEmbedImpl should only fire on Affine sources.
+        assert!(
+            !is_affine_quant_embedding,
+            "AffineQuantEmbedding accessor `{}` paired with non-Affine source storage — \
+             MetalAffineEmbedImpl::matches should have rejected this",
+            accessor.name,
         );
         FieldLoad::Embedding(prefixes.into_iter().next().unwrap())
     } else if is_rmsnorm {
@@ -1037,11 +1086,76 @@ fn plan_field_load(
             && (prefixes[0] == "lm_head" || prefixes[0].ends_with(".lm_head"))
             && tie_word_embeddings(model)
         {
-            return FieldLoad::LinearTiedToEmbedding(syn::Ident::new(
-                "embed_tokens",
-                proc_macro2::Span::call_site(),
-            ));
+            // P6: detect whether the source embedding is MLX-affine
+            // quantized. The tied lm_head's `source_weights` resolves
+            // to the embed_tokens weight ID — same lookup the
+            // non-tied Affine path at line 1075 does.
+            let mut affine: Option<(u32, u32)> = None;
+            for (wid, _idx) in &accessor.source_weights {
+                if let crate::quantization::StorageFormat::Affine { bits, group_size } =
+                    crate::quantization::storage_format_for_weight(program, fuf, *wid, model)
+                {
+                    affine = Some((group_size, bits));
+                    break;
+                }
+            }
+            return FieldLoad::LinearTiedToEmbedding {
+                embed_ident: syn::Ident::new("embed_tokens", proc_macro2::Span::call_site()),
+                affine,
+            };
         }
+        // MLX-affine int4 storage: every source weight resolves to
+        // `StorageFormat::Affine`. Single-source only — see the doc
+        // comment on `FieldLoad::LinearAffine` for why concat is
+        // excluded here. A mismatched fuse (e.g. one Affine, one
+        // Dense) is an upstream weights-manifest authoring error and
+        // panics so it surfaces at compile time, not at load time.
+        let mut affine_params: Option<(u32, u32)> = None;
+        let mut any_non_affine = false;
+        for (wid, _idx) in &accessor.source_weights {
+            let fmt = crate::quantization::storage_format_for_weight(program, fuf, *wid, model);
+            match fmt {
+                crate::quantization::StorageFormat::Affine { bits, group_size } => {
+                    if let Some((eg, eb)) = affine_params
+                        && (eg, eb) != (group_size, bits)
+                    {
+                        panic!(
+                            "accessor `{}` fuses Affine sources with mismatched (group_size, bits) \
+                                 ({eg}, {eb}) vs ({group_size}, {bits})",
+                            accessor.name,
+                        );
+                    }
+                    affine_params = Some((group_size, bits));
+                }
+                _ => any_non_affine = true,
+            }
+        }
+        if let Some((group_size, bits)) = affine_params {
+            if any_non_affine {
+                panic!(
+                    "accessor `{}` fuses Affine and non-Affine source weights — \
+                         the macro can't emit a unified Linear arm for mixed storage",
+                    accessor.name,
+                );
+            }
+            if prefixes.len() == 1 {
+                return FieldLoad::LinearAffine {
+                    prefix: prefixes.into_iter().next().unwrap(),
+                    group_size,
+                    bits,
+                };
+            }
+            // Multi-source fuse (gate_up_proj / qkv_proj on mlx-community
+            // 4bit repos): CPU-dequant per prefix, byte-concat along
+            // dim 0 at load time. Result is one Dense BF16 weight that
+            // FusedGateUpSiluMul / FusedQkv* claim normally.
+            return FieldLoad::LinearAffineConcat {
+                prefixes,
+                group_size,
+                bits,
+            };
+        }
+
         if prefixes.len() == 1 {
             // `kind: "raw_linear"` opt-in (per the per-arch
             // weights manifest): the underlying tensor is an
@@ -1238,6 +1352,11 @@ fn emit_fingerprint_check(
         // qweight_shape_gate) plus the absence of fp8/bnb4 markers
         // at `.weight_scale` / `.weight.absmax`.
         Some(crate::quantization::QuantMethod::Ggml) => ("weight", "qweight"),
+        // MLX-affine ships `.weight` (U32 packed) + `.scales` + `.biases`
+        // sibling triple. Dense's same `.weight` suffix is disjoint
+        // because the affine `tensor_info` shape gate above keys on
+        // `hidden_size / pack_factor` rather than `hidden_size`.
+        Some(crate::quantization::QuantMethod::Affine { .. }) => ("weight", "qweight"),
         Some(_) => ("qweight", "weight"),
         None => ("weight", "qweight"),
     };
@@ -1337,26 +1456,14 @@ fn emit_fingerprint_check(
 
     // HF-config disambiguator: variants of the same arch that share
     // on-disk tensor shapes (Phi-3-mini-4k vs Phi-3.5-mini-128k) only
-    // differ in `max_position_embeddings` and `rope_scaling.type`.
-    // Bake the manifest's values here and reject at fingerprint time
-    // when the caller-supplied `HfFingerprint` contradicts them.
-    // `None` in the runtime view is permissive (caller didn't supply
-    // the hint); a `Some(x)` that disagrees with the manifest's
-    // compile-time literal is a hard reject.
-    let max_pos_lit = model
-        .bounds
-        .get("max_position_embeddings")
-        .map(|&v| proc_macro2::Literal::u64_unsuffixed(v));
-    let max_pos_check: TokenStream = match max_pos_lit {
-        Some(lit) => quote! {
-            if let Some(mp) = hf.max_position_embeddings
-                && mp != #lit
-            {
-                return false;
-            }
-        },
-        None => quote! {},
-    };
+    // differ in `rope_scaling.type` / its short/long factors. Both
+    // are covered by `rope_scaling_type` + `rope_scaling_hash`
+    // (below); `max_position_embeddings` is NOT checked because
+    // mlx-community 4bit publishes a narrower context window than the
+    // upstream base (`32768` vs `131072` on Qwen2.5-1.5B), and the
+    // value doesn't drive forward-fn codegen — it's a runtime KV
+    // sizing input. See `HfFingerprint`'s doc-comment.
+    let max_pos_check: TokenStream = quote! {};
     let rope_scaling_expected: Option<&'static str> = match &model.rope_scaling {
         Some(crate::config::RopeScaling::Llama3 { .. }) => Some("llama3"),
         Some(crate::config::RopeScaling::LongRope { .. }) => Some("longrope"),
@@ -1485,6 +1592,17 @@ fn emit_fingerprint_check(
             quote! {}
         }
         Some(crate::quantization::QuantMethod::Ggml) | None => quote! {},
+        Some(crate::quantization::QuantMethod::Affine { .. }) => {
+            // MLX-affine fingerprint has no shape gate at the
+            // q_proj level — the per-tensor `.scales` / `.biases`
+            // sibling presence is the load-time signal that
+            // distinguishes it from Dense, and the `U32` dtype on
+            // `<prefix>.weight` distinguishes it from CT GPTQ which
+            // uses i32-packed `.weight_packed` of the same `[N, K/8]`
+            // shape. Both checks are at-load; nothing to fingerprint
+            // at compile time at the shape level.
+            quote! {}
+        }
     };
 
     // Backing-store reject: every non-Ggml variant must reject a
@@ -1670,10 +1788,29 @@ fn emit_fingerprint_check(
         .unwrap_or_else(|| format!("{dec_root}.embed_tokens.weight"));
     let embed_path_lit = proc_macro2::Literal::string(embed_path.as_str());
 
+    // Hidden-size shape gate for the embedding fingerprint sniff. Dense
+    // variants see `[vocab, hidden_size]`; MLX-affine variants ship the
+    // packed U32 embedding as `[vocab, hidden_size / pack_factor]`
+    // (pack_factor = 32 / bits = 8 for bits=4). Without this branch
+    // both variants reject the affine checkpoint at the very first
+    // shape check and `try_load` returns `Ok(None)`.
+    let embed_hidden_lit: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Affine { bits, .. }) => {
+            let pack_factor = 32u64 / (*bits as u64);
+            let packed = hidden_size / pack_factor;
+            let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
+            quote! { #lit }
+        }
+        _ => quote! { #hidden_lit },
+    };
+
     quote! {
         /// Per-variant compile-time fingerprint check. See
         /// macro's `emit_fingerprint_check` for the rules.
-        #[cfg(feature = "cuda")]
+        /// Backend-neutral — `gw` reads tensor shapes via the
+        /// shared `GpuWeights` API, so the same body sniffs cuda
+        /// and metal checkpoints identically.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub fn fingerprint_matches(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
             hf: ::ferrite_forward::HfFingerprint<'_>,
@@ -1682,7 +1819,7 @@ fn emit_fingerprint_check(
                 Some(ref shape)
                     if shape.len() >= 2
                         && shape[0] == #vocab_lit
-                        && shape[1] == #hidden_lit => {}
+                        && shape[1] == #embed_hidden_lit => {}
                 _ => return false,
             }
             if !gw.contains(#last_tensor) {
@@ -1830,6 +1967,19 @@ fn emit_weights_struct(
                     true
                 ) | (
                     crate::quantization::StorageFormat::Ggml,
+                    false,
+                    false,
+                    false
+                ) | (
+                    // MLX-affine pairs with the dense-style accessor
+                    // types (Embedding, LinearLayer, RmsNorm — though
+                    // RmsNorm is never quantized on disk). Under INT4
+                    // P2 the loader CPU-dequants at load time and
+                    // returns the dense runtime type, so the accessor
+                    // type stays `Embedding` / `LinearLayer` — no
+                    // separate AffineLinear runtime type is generated
+                    // by the macro.
+                    crate::quantization::StorageFormat::Affine { .. },
                     false,
                     false,
                     false
@@ -2187,20 +2337,6 @@ fn emit_weights_struct(
         })
     });
 
-    // Compute dtype the rotary cache must match the model's compute dtype:
-    // the rope kernel dispatches on Q/K activation dtype but reinterprets
-    // cos/sin bytes through that same plan, so a BF16 cos/sin against F16
-    // activations reads the table through the wrong exponent width
-    // (5 vs 8 bits). Source from the model's `torch_dtype`. Affects every
-    // F16 model (LLaVA's Vicuna, etc.); BF16 default preserves prior
-    // behavior for all other arches in the tree.
-    let rope_dtype: TokenStream = match model.torch_dtype.as_deref() {
-        Some("float16" | "fp16" | "f16" | "half") => {
-            quote! { ::ferrite_cuda_core::dtype::DType::F16 }
-        }
-        _ => quote! { ::ferrite_cuda_core::dtype::DType::BF16 },
-    };
-
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::ferrite_kernels::rotary::RotaryCache, }
     } else {
@@ -2232,10 +2368,42 @@ fn emit_weights_struct(
                     #max_pos,
                     #local_theta,
                     None,
-                    #rope_dtype,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
                     stream,
                 )
             }?;
+        }
+    } else {
+        quote! {}
+    };
+
+    let rotary_local_load_metal: TokenStream = if uses_rotary_local {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for RotaryLocal") as usize;
+        let max_pos = *model
+            .bounds
+            .get("max_position_embeddings")
+            .expect("model must have max_position_embeddings for RotaryLocal")
+            as usize;
+        let local_theta = model
+            .scalars
+            .get("rope_local_base_freq")
+            .copied()
+            .or_else(|| model.bounds.get("rope_local_base_freq").map(|&v| v as f64))
+            .or_else(|| model.scalars.get("rope_theta").copied())
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .expect("model must have rope_local_base_freq for RotaryLocal");
+        quote! {
+            let rotary_local = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                gw,
+                #head_dim,
+                #max_pos,
+                #local_theta,
+                None,
+                ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
+            )?;
         }
     } else {
         quote! {}
@@ -2327,7 +2495,7 @@ fn emit_weights_struct(
                     #max_pos,
                     #rope_theta,
                     None,
-                    #rope_dtype,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
                     stream,
                 )
             },
@@ -2352,7 +2520,7 @@ fn emit_weights_struct(
                             high_freq_factor: #high_freq_factor,
                             original_max_position_embeddings: #orig,
                         }),
-                        #rope_dtype,
+                        ::ferrite_cuda_core::dtype::DType::BF16,
                         stream,
                     )
                 }
@@ -2381,7 +2549,7 @@ fn emit_weights_struct(
                             short_mscale: #short_mscale,
                             long_mscale: #long_mscale,
                         },
-                        #rope_dtype,
+                        ::ferrite_cuda_core::dtype::DType::BF16,
                         stream,
                     )
                 }
@@ -2412,7 +2580,7 @@ fn emit_weights_struct(
                             mscale_all_dim: #mscale_all_dim,
                             original_max_position_embeddings: #orig,
                         },
-                        #rope_dtype,
+                        ::ferrite_cuda_core::dtype::DType::BF16,
                         stream,
                     )
                 }
@@ -2424,7 +2592,7 @@ fn emit_weights_struct(
                     #max_pos,
                     #rope_theta,
                     None,
-                    #rope_dtype,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
                     stream,
                 )
             },
@@ -2450,7 +2618,7 @@ fn emit_weights_struct(
                             high_freq_factor: #high_freq_factor,
                             original_max_position_embeddings: #orig,
                         }),
-                        #rope_dtype,
+                        ::ferrite_cuda_core::dtype::DType::BF16,
                         stream,
                     )
                 }
@@ -2480,7 +2648,7 @@ fn emit_weights_struct(
                             short_mscale: #short_mscale,
                             long_mscale: #long_mscale,
                         },
-                        #rope_dtype,
+                        ::ferrite_cuda_core::dtype::DType::BF16,
                         stream,
                     )
                 }
@@ -2488,6 +2656,122 @@ fn emit_weights_struct(
         };
         quote! {
             let rotary = unsafe { #body }?;
+        }
+    } else {
+        quote! {}
+    };
+
+    // Stream-free metal counterpart to `rotary_load`. `new_from_gpuweights`
+    // currently covers basic + Llama3 scaling; LongRoPE / Yarn /
+    // partial-rotary models hit a compile_error so the failure mode is
+    // an explicit "unsupported under metal" rather than a hidden
+    // runtime panic. Same scope decision as the per-arch metal feature
+    // gates landed in 5.F.5.
+    //
+    // Cache dtype is `BF16` to match the rest of the metal stack:
+    // `CanonicalParams::METAL_DTYPE` defaults to bf16, the
+    // `rope_append_bf16_specialized` shader binds `cos_sin` as
+    // `device const bfloat*`, and Llama-3.x weights ship bf16 on
+    // disk. (The previous codegen pinned this at BF16 too but the
+    // kernel only had an `_f16_specialized` variant — bytes lined
+    // up but the binding type didn't, so cosines/sines were
+    // reinterpreted as fp16 and attention never aligned. Fixed by
+    // landing the bf16 shader sibling.)
+    let rotary_load_metal: TokenStream = if uses_rotary {
+        let head_dim = *model
+            .bounds
+            .get("head_dim")
+            .expect("model must have head_dim for Rotary") as usize;
+        let max_pos = *model
+            .bounds
+            .get("max_position_embeddings")
+            .expect("model must have max_position_embeddings for Rotary")
+            as usize;
+        let rope_theta = model
+            .scalars
+            .get("rope_theta")
+            .copied()
+            .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+            .unwrap_or(10000.0);
+        let partial = model
+            .scalars
+            .get("partial_rotary_factor")
+            .copied()
+            .filter(|&f| (f - 1.0).abs() > 1e-9);
+        let scaling = model.rope_scaling.clone();
+        // Clamp the rotary cache size to the runtime `max_model_len`
+        // rather than the model's compile-time `max_position_embeddings`.
+        // For Llama-3.2 (max_position_embeddings = 131072) under chat
+        // workloads with the default 4-8K context, the unclamped path
+        // precomputed 16-32× more cos/sin pairs than any request can
+        // possibly index — pure waste of CPU + upload bandwidth.
+        // `max_model_len` is the function argument; the .min(...) caps
+        // it at the model's hard limit so a misconfigured larger value
+        // doesn't run past the rope shape.
+        match (partial, scaling) {
+            (None, None) => quote! {
+                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                    gw,
+                    #head_dim,
+                    rope_max_pos,
+                    #rope_theta,
+                    None,
+                    ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
+                )?;
+            },
+            (
+                None,
+                Some(crate::config::RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position_embeddings,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                    let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                        gw,
+                        #head_dim,
+                        rope_max_pos,
+                        #rope_theta,
+                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                            factor: #factor,
+                            low_freq_factor: #low_freq_factor,
+                            high_freq_factor: #high_freq_factor,
+                            original_max_position_embeddings: #orig,
+                        }),
+                        ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
+                    )?;
+                }
+            }
+            // LongRoPE / YaRN / partial-rotary scaling families: the
+            // macro can't emit a working metal init yet (no
+            // `*_from_gpuweights` counterpart in `ferrite-kernels::rotary`).
+            // Stub to a runtime panic so the build remains green for the
+            // metal-supported subset; arches that hit this won't load
+            // successfully under metal until the proper port lands.
+            //
+            // The panic lives inside an immediately-invoked closure so
+            // `rustc` doesn't propagate the `!` type through to the
+            // outer scope and warn `unreachable_code` on every line of
+            // generated code that follows the rotary load. Closure
+            // body has type `RotaryCache` (the never type coerces);
+            // the call-site sees a regular `RotaryCache` value.
+            _ => quote! {
+                let rotary: ::ferrite_kernels::rotary::RotaryCache =
+                    (|| -> ::ferrite_kernels::rotary::RotaryCache {
+                        ::core::panic!(
+                            "metal: rotary scaling variant not yet supported \
+                             (LongRoPE / Yarn / partial-rotary). Land a metal \
+                             counterpart to RotaryCache::new_from_gpuweights for \
+                             this scaling family before enabling this model \
+                             under --features metal."
+                        )
+                    })();
+            },
         }
     } else {
         quote! {}
@@ -2525,7 +2809,6 @@ fn emit_weights_struct(
         WeightsEmitMode::Canonical => {
             let main = if uses_rotary {
                 quote! {
-                    #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
                     pub fn rotary_cos_sin(&self, _layer: u32)
@@ -2539,7 +2822,6 @@ fn emit_weights_struct(
             };
             let local = if uses_rotary_local {
                 quote! {
-                    #[cfg(feature = "cuda")]
                     #[inline]
                     #[allow(dead_code)]
                     pub fn rotary_local_cos_sin(&self, _layer: u32)
@@ -2553,7 +2835,6 @@ fn emit_weights_struct(
             };
             if uses_rotary || uses_rotary_local {
                 quote! {
-                    #[cfg(feature = "cuda")]
                     impl Weights {
                         #main
                         #local
@@ -2569,20 +2850,39 @@ fn emit_weights_struct(
     };
 
     // Struct definition vs type alias per emit mode.
+    //
+    // Single emission used under either backend. After Stage E (the
+    // `MetalModelMeta` removal + WtFn-based weight resolution against
+    // a real `&Weights`), the metal worker resolves
+    // `Binding::Weight` by calling the same accessor fns the cuda
+    // path uses, then maps the resulting `GpuTensor.raw_ptr()` back
+    // to a `(&MTLBuffer, offset)` via `MetalAllocator::buffer_for`.
+    // Real fields are required under both backends.
     let weights_def: TokenStream = match &mode {
         WeightsEmitMode::Canonical => quote! {
             /// Every weight the forward needs, packed for the
             /// solver-picked Impls. Construct via `load`.
-            #[cfg(feature = "cuda")]
             pub struct Weights {
                 #(#fields)*
                 #rotary_field
                 #rotary_local_field
+                /// Lazy-initialized `MetalWorkerPool<Self>` used by
+                /// the metal `forward` body. Constructed on the
+                /// first call (caller-passed `ctx.kv_cache` provides
+                /// the per-layer KV buffers the runtime_factory
+                /// closure captures); after that every forward
+                /// reuses the same pool. The `OnceLock` lets the
+                /// pool live as a field on `Weights` without an
+                /// `Arc`-cycle — it borrows `&Weights` for each
+                /// `pool.forward(weights, ...)` call instead.
+                #[cfg(feature = "metal")]
+                pub metal_pool: ::std::sync::OnceLock<
+                    ::ferrite_forward::interpreter::metal::MetalWorkerPool<Self>,
+                >,
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
             /// Shim — shares canonical sibling's `Weights`.
-            #[cfg(feature = "cuda")]
             pub type Weights = super::#canonical::Weights;
         },
     };
@@ -2638,6 +2938,8 @@ fn emit_weights_struct(
                     #(#field_shorthand,)*
                     #rotary_init
                     #rotary_local_init
+                    #[cfg(feature = "metal")]
+                    metal_pool: ::std::sync::OnceLock::new(),
                 })
             }
 
@@ -2652,6 +2954,35 @@ fn emit_weights_struct(
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
                 load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
+            }
+
+            /// Metal entry — same signature as cuda's `load` so the
+            /// top-level dispatching `Weights::load` walks both
+            /// backends through the same arms. `stream` is an alias
+            /// for `()` under metal (`ferrite_cuda_core::CUstream`)
+            /// and is unused; the body shares the canonical's `lets`
+            /// and `field_shorthand` — `LinearConcat` arms route
+            /// through `LinearLayer::load_dense_concat_packed` and
+            /// the rotary load uses `RotaryCache::new_from_gpuweights`.
+            #[cfg(feature = "metal")]
+            #[allow(clippy::too_many_lines, unused_variables)]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
+                max_model_len: usize,
+                tp_rank: u8,
+            ) -> ::anyhow::Result<Weights> {
+                #packed_splits_prelude
+                #(#lets)*
+                #rotary_load_metal
+                #rotary_local_load_metal
+                Ok(#weights_ctor {
+                    #(#field_shorthand,)*
+                    #rotary_init
+                    #rotary_local_init
+                    #[cfg(feature = "metal")]
+                    metal_pool: ::std::sync::OnceLock::new(),
+                })
             }
         },
         WeightsEmitMode::Shim { canonical } => quote! {
@@ -2670,6 +3001,21 @@ fn emit_weights_struct(
                 tp_rank: u8,
             ) -> ::anyhow::Result<Weights> {
                 super::#canonical::load_with(gw, stream, max_model_len, #marlin_fmt, tp_rank)
+            }
+
+            /// Metal shim — delegates to canonical's metal `load`.
+            /// Same signature as cuda's shim above; `stream` is `()`
+            /// under metal and is forwarded to the canonical's
+            /// `load` (which also ignores it).
+            #[cfg(feature = "metal")]
+            #[inline]
+            pub fn load(
+                gw: &mut ::ferrite_cuda_core::weights::GpuWeights,
+                stream: ::ferrite_cuda_core::CUstream,
+                max_model_len: usize,
+                tp_rank: u8,
+            ) -> ::anyhow::Result<Weights> {
+                super::#canonical::load(gw, stream, max_model_len, tp_rank)
             }
         },
     }
@@ -2965,6 +3311,27 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 }
             }
         }
+        FieldLoad::EmbeddingAffine {
+            prefix,
+            group_size,
+            bits,
+        } => {
+            // MLX-affine int4 quantized embedding (Metal-only). P6 lift:
+            // load the packed U32 weight + F16 scales + F16 affine
+            // offsets verbatim into an `AffineQuantEmbedding` bundle;
+            // the forward path emits `Instruction::AffineEmbed`, which
+            // dispatches the fused `affine_embed_*_gs_*_b_4` gather +
+            // dequant kernel (saves ~vocab * hidden * 1.5 bytes of
+            // BF16 arena vs the old load-time CPU-dequant fallback).
+            // No sharded variant — single-GPU is the only metal target.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            quote! {
+                let #name = ::ferrite_kernels::layers::AffineQuantEmbedding::load(
+                    gw, #prefix, #gs_lit, #bits_lit,
+                )?;
+            }
+        }
         FieldLoad::RmsNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
         },
@@ -3004,11 +3371,20 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
         }
         FieldLoad::LinearConcat(prefixes) => {
             // Fused QKV / gate_up are always column-parallel — no
-            // row-parallel concat exists in any current arch. The
-            // sharded helper packs each source's per-rank slice into
-            // one contiguous buffer; biases follow column-parallel
-            // rule (sliced along dim 0 too).
-            if sharded {
+            // row-parallel concat exists in any current arch. Under
+            // metal the macro emits a stream-free `_concat_packed`
+            // path (CPU-concat then one allocator call); cuda keeps
+            // the GGUF/safetensors `_or_ggml` path with stream-based
+            // async DMA. Sharded variants stay cuda-only — single-
+            // GPU is the only metal target initially.
+            if cfg!(feature = "metal") {
+                quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat_packed(
+                        gw,
+                        &[ #(#prefixes),* ],
+                    )?;
+                }
+            } else if sharded {
                 quote! {
                     let #name = ::ferrite_kernels::layers::LinearLayer::load_dense_concat_sharded(
                         gw,
@@ -3041,19 +3417,104 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             // gemm op via `dense_weight()`.
             let #name = ::ferrite_kernels::layers::LinearLayer::load_raw(gw, #key)?;
         },
-        FieldLoad::LinearTiedToEmbedding(embed_ident) => quote! {
-            // Tied embedding: lm_head reuses the
-            // `#embed_ident` field's weight tensor. Shape
-            // [vocab_size, hidden_size] works for both
-            // Embedding (gather rows) and LinearLayer
-            // (matmul against hidden_size). No bias.
-            let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
-                ::ferrite_kernels::layers::Linear::new(
-                    #embed_ident.weight,
-                    None,
-                )
-            );
-        },
+        FieldLoad::LinearAffine {
+            prefix,
+            group_size,
+            bits,
+        } => {
+            // MLX-affine int4 (Metal-only). No sharded variant —
+            // single-GPU is the only metal target initially. No
+            // GGUF fallback — affine and ggml are disjoint storage
+            // formats.
+            //
+            // INT4 P3/P4 forward-time path (post-C4b): keeps the
+            // packed / scales / biases on device so the solver's
+            // `MetalAffineQmmImpl` can drive qmv (decode) / qmm_t
+            // (prefill) kernels per `Instruction::AffineQmm`.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            quote! {
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_quant(
+                    gw,
+                    #prefix,
+                    #gs_lit,
+                    #bits_lit,
+                )?;
+            }
+        }
+        FieldLoad::LinearAffineConcat {
+            prefixes,
+            group_size,
+            bits,
+        } => {
+            // Fused gate_up_proj / qkv_proj on mlx-community 4bit
+            // repos — see `FieldLoad::LinearAffineConcat` doc.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            let prefix_lits: Vec<TokenStream> = prefixes
+                .iter()
+                .map(|p| {
+                    let lit = syn::LitStr::new(p, proc_macro2::Span::call_site());
+                    quote! { #lit }
+                })
+                .collect();
+            quote! {
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_affine_dequant_concat_as_dense(
+                    gw,
+                    &[#(#prefix_lits),*],
+                    #gs_lit,
+                    #bits_lit,
+                )?;
+            }
+        }
+        FieldLoad::LinearTiedToEmbedding {
+            embed_ident,
+            affine,
+        } => {
+            if let Some((group_size, bits)) = affine {
+                // P6: tied lm_head + Affine source embedding. The
+                // embed_tokens field is an `AffineQuantEmbedding`
+                // carrying the packed U32 weight + F16 scales + F16
+                // affine offsets; the lm_head reads those same
+                // buffers via `LinearLayer::AffineQuant`. `GpuTensor`
+                // is Copy on metal (raw pointer wrapper), so the
+                // buffer triple is shared with the embedding's
+                // forward-time gather kernel without ownership
+                // gymnastics. `in_features = hidden_size`,
+                // `out_features = vocab_size` (Linear matmul reads
+                // hidden inputs and produces vocab logits).
+                let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+                let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+                quote! {
+                    let #name = ::ferrite_kernels::layers::LinearLayer::AffineQuant(
+                        Box::new(::ferrite_kernels::layers::AffineQuantLinear {
+                            weight: #embed_ident.weight,
+                            scales: #embed_ident.scales,
+                            affine_biases: #embed_ident.affine_biases,
+                            linear_bias: None,
+                            in_features: #embed_ident.hidden_size,
+                            out_features: #embed_ident.vocab_size,
+                            group_size: #gs_lit,
+                            bits: #bits_lit,
+                        })
+                    );
+                }
+            } else {
+                quote! {
+                    // Tied embedding (dense): lm_head reuses the
+                    // `#embed_ident` field's weight tensor. Shape
+                    // [vocab_size, hidden_size] works for both
+                    // Embedding (gather rows) and LinearLayer
+                    // (matmul against hidden_size). No bias.
+                    let #name = ::ferrite_kernels::layers::LinearLayer::Dense(
+                        ::ferrite_kernels::layers::Linear::new(
+                            #embed_ident.weight,
+                            None,
+                        )
+                    );
+                }
+            }
+        }
         FieldLoad::MarlinLinear { prefixes, .. } => {
             // Every Marlin accessor emits the SAME call shape
             // regardless of AWQ/GPTQ/CT: the runtime
@@ -3528,6 +3989,19 @@ fn emit_layered_load_body(
                 }
             }
         }
+        FieldLoad::EmbeddingAffine { .. } => {
+            // No per-arch model in the int4 P2 coverage matrix has a
+            // *layered* affine embedding — `embed_tokens` is top-level
+            // on every Llama / Qwen / Mistral / Gemma / DeepSeek-V3 4bit
+            // checkpoint. The unindexed `emit_unindexed_let` arm covers
+            // every concrete model; if a future arch surfaces a layered
+            // affine embedding, add `load_layered_affine_dequant_embedding`
+            // alongside the existing layered helpers.
+            panic!(
+                "codegen: layered FieldLoad::EmbeddingAffine is not wired — no model in the \
+                 int4 P2 coverage matrix exercises a per-layer affine embedding"
+            );
+        }
         FieldLoad::RmsNorm(prefix, eps) => {
             let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
             if is_vision {
@@ -3591,7 +4065,19 @@ fn emit_layered_load_body(
                 .map(|p| layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref))
                 .collect();
             // Always column-parallel — no row-parallel concat exists.
-            if sharded {
+            // Under metal the layered helper routes to the stream-free
+            // `_concat_packed` path; cuda keeps the existing stream-
+            // based GGUF / vision / sharded variants.
+            if cfg!(feature = "metal") {
+                quote! {
+                    ::ferrite_forward::load_layered_linear_dense_concat_packed(
+                        gw,
+                        #n_lit,
+                        #dec_root_lit,
+                        &[ #(#suffixes),* ],
+                    )?
+                }
+            } else if sharded {
                 quote! {
                     ::ferrite_forward::load_layered_linear_dense_concat_sharded(
                         gw,
@@ -3633,7 +4119,7 @@ fn emit_layered_load_body(
                 }
             }
         }
-        FieldLoad::LinearTiedToEmbedding(_) => panic!(
+        FieldLoad::LinearTiedToEmbedding { .. } => panic!(
             "LinearTiedToEmbedding is only ever used for the unindexed \
              `lm_head` accessor — should never appear in a layered group"
         ),
@@ -3641,6 +4127,43 @@ fn emit_layered_load_body(
             "RawLinear (nn.Parameter) is global by construction — \
              should never appear in a layered group"
         ),
+        FieldLoad::LinearAffine {
+            prefix,
+            group_size,
+            bits,
+        } => {
+            let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            // INT4 P3/P4 forward-time path (post-C4b): per-layer
+            // AffineQuant LinearLayers kept on device for the qmv /
+            // qmm_t dispatchers `MetalAffineQmmImpl` emits.
+            quote! {
+                ::ferrite_forward::load_layered_linear_affine_quant(
+                    gw, #n_lit, #dec_root_lit, #suffix, #gs_lit, #bits_lit,
+                )?
+            }
+        }
+        FieldLoad::LinearAffineConcat {
+            prefixes,
+            group_size,
+            bits,
+        } => {
+            let suffixes: Vec<TokenStream> = prefixes
+                .iter()
+                .map(|p| {
+                    let s = layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref);
+                    quote! { #s }
+                })
+                .collect();
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
+            quote! {
+                ::ferrite_forward::load_layered_linear_affine_dequant_concat_as_dense(
+                    gw, #n_lit, #dec_root_lit, &[ #(#suffixes),* ], #gs_lit, #bits_lit,
+                )?
+            }
+        }
         FieldLoad::MarlinLinear { prefixes, .. } => {
             if prefixes.len() == 1 {
                 let suffix = layered_suffix(
@@ -4051,7 +4574,6 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         })
         .collect();
     quote! {
-        #[cfg(feature = "cuda")]
         #[allow(dead_code)]
         impl Weights {
             #(#methods)*
@@ -4347,7 +4869,254 @@ fn impl_names_for(
 /// every column-parallel dim (KV replication when
 /// `num_kv_heads < tp_size` is task #6's loader-sharding work);
 /// `compile()` skips a `(variant, tp)` tuple when divisibility fails.
-fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenStream {
+/// Emit the `synthesized_kernel_sources()` override for the
+/// `CanonicalParams` impl when this model can use compiler-driven
+/// megakernel synthesis. Returns `quote! {}` (empty) when:
+///   - the model isn't quantized with MLX-affine int4 (no AffineQmv
+///     atoms to fuse), or
+///   - the model lacks the standard transformer-decoder shape we know
+///     how to synthesize for.
+///
+/// When emitting, calls `fuse_pass::synthesize_pre_attn_chunk` at
+/// macro-expansion time to generate the MSL source, then bakes the
+/// `(symbol, source)` pair into the generated arch as a `&'static
+/// [(&'static str, &'static str)]`.
+fn emit_synthesized_kernel_sources_override(
+    model: &ModelParams,
+    tp_world_size: u8,
+    has_linear_bias: bool,
+) -> TokenStream {
+    use crate::quantization::QuantMethod;
+    let (bits, group_size) = match model.quantization.as_ref().map(|q| &q.method) {
+        Some(QuantMethod::Affine { bits, group_size }) => (*bits, *group_size),
+        _ => return quote! {},
+    };
+    if bits != 4 {
+        return quote! {};
+    }
+    // bf16 activation is the default for every modern Llama / Qwen /
+    // Mistral / Gemma metal arch (per CanonicalParams::METAL_DTYPE).
+    // Future: thread W::METAL_DTYPE through and emit per-dtype variants.
+    let t_act = "bfloat";
+    let t_scale = "half";
+
+    // Model dims baked as MSL `constant constexpr` literals at synth
+    // time. Same TP-sharding rules as `emit_canonical_params_impl`:
+    // num_q / num_kv / intermediate split per-rank; hidden stays
+    // replicated (residual stream is post-allreduce).
+    let tp = tp_world_size as u32;
+    let tp_us = tp_world_size as usize;
+    let hidden = *model.bounds.get("hidden_size").unwrap_or(&0) as u32;
+    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
+    let num_q = (*model.bounds.get("num_attention_heads").unwrap_or(&0) as u32) / tp;
+    let num_kv = (*model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32) / tp;
+    let intermediate = (*model.bounds.get("intermediate_size").unwrap_or(&0) as u32) / tp;
+    let partial = model
+        .scalars
+        .get("partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9);
+    let rot_dim = match partial {
+        Some(f) => (f * head_dim as f64).round() as u32,
+        None => head_dim,
+    };
+    let eps = rms_norm_eps(model);
+    let _ = tp_us;
+
+    // Sanity-gate: if any required dim is zero, skip emission (the
+    // model isn't a standard transformer-decoder we can synthesize for).
+    if hidden == 0 || head_dim == 0 || num_q == 0 || num_kv == 0 || intermediate == 0 {
+        return quote! {};
+    }
+
+    let consts = crate::fuse_pass::ChunkConstants {
+        // Baked as `constant constexpr` literals in the emitted MSL.
+        // M is the only remaining function constant (varies per
+        // bucket; can't be baked).
+        hidden,
+        num_q_heads: num_q,
+        num_kv_heads: num_kv,
+        head_dim,
+        rot_dim,
+        block_size: 16, // ferrite_forward::CanonicalParams::BLOCK_SIZE default
+        intermediate,
+        m:            0,
+        group_size,
+        rms_norm_eps: eps,
+        // Pre-attn synth gains 3 extra `__{q,k,v}_linear_bias` buffer
+        // params + a bias epilogue inside each per-band AffineQmvAtom
+        // when this is `true`. Threaded down from
+        // `BackendCaps::has_bias_add` so Qwen2/Qwen2.5 (DSL emits
+        // `bias_add` on QKV) gets the biased variant; Llama (no DSL
+        // bias_add) keeps the existing one. MLP / gate-up synths
+        // ignore this — Qwen2 MLP has no biases.
+        has_linear_bias,
+    };
+    let pre_attn = crate::fuse_pass::synthesize_pre_attn_chunk(
+        crate::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let pre_attn_init = crate::fuse_pass::synthesize_pre_attn_init_chunk(
+        crate::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let mlp_pre_down = crate::fuse_pass::synthesize_mlp_pre_down_chunk(
+        crate::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    // AOT-compile each synth source to a `.metallib` blob at macro
+    // expansion time. Same `xcrun metal -c` + `xcrun metallib`
+    // pipeline used by `ferrite-metal-kernels/build.rs` for every
+    // hand-written shader. Runtime loads via `newLibraryWithData`
+    // (NOT `newLibraryWithSource`) so the resulting Metal binaries
+    // are identical to the AOT-compiled shaders — same compiler
+    // path, same behavior across Apple GPU generations.
+    let gate_up = ::ferrite_fusion_synth::fuse_pass::synthesize_gate_up_silu_mul_large_chunk(
+        ::ferrite_fusion_synth::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let gu_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(&gate_up.symbol, &gate_up.source);
+
+    let pa_bytes =
+        ::ferrite_fusion_synth::aot::aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
+    let pi_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &pre_attn_init.symbol,
+        &pre_attn_init.source,
+    );
+    let md_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &mlp_pre_down.symbol,
+        &mlp_pre_down.source,
+    );
+
+    let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
+    let gu_bytes_lit  = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
+
+    let pa_symbol_lit =
+        syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
+    let pi_symbol_lit =
+        syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
+    let md_symbol_lit =
+        syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
+
+    let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
+    let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
+    let md_bytes_lit = syn::LitByteStr::new(&md_bytes, proc_macro2::Span::call_site());
+
+    quote! {
+        fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
+            const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
+            const __SYNTH_PRE_ATTN_INIT_LIB: &[u8] = #pi_bytes_lit;
+            const __SYNTH_MLP_PRE_DOWN_LIB: &[u8] = #md_bytes_lit;
+            const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
+            &[
+                (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
+                (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
+                (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_LIB),
+                (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
+            ]
+        }
+    }
+}
+
+/// Backend-capability flags derived by walking the classified
+/// `Program` at macro-expand time. Each flag tells
+/// [`ferrite_forward::CanonicalParams`] whether the DSL emits a tile
+/// kind that requires a particular backend `Impl`. The values
+/// surface as `HAS_*` associated consts on the per-canonical
+/// `CanonicalParams` impl, where `ferrite_forward::BackendCompat`
+/// turns "DSL has it, backend doesn't claim it" into a compile-time
+/// `assert!` failure.
+///
+/// The struct's only consumer is [`emit_canonical_params_impl`].
+/// Add a field here when a new "this DSL tile kind needs a backend
+/// Impl that doesn't exist on every backend" axis surfaces.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct BackendCaps {
+    /// At least one `bias_add(...)` tile appears in the DSL.
+    pub has_bias_add: bool,
+    /// At least one `OpKind::Moe` tile (the unified MoE op covering
+    /// router softmax + top-k + experts gather + SwitchGLU) appears
+    /// in the DSL. Set true on every MoE arch (Mixtral, Qwen2-MoE,
+    /// Qwen3-MoE, DeepSeek-V2/V3).
+    pub has_moe: bool,
+}
+
+impl BackendCaps {
+    /// Derive capability flags from a classified DSL `Program`.
+    /// Walks every `Expr::Call`'s `op: OpKind` over the program's
+    /// statements (recursing through nested loops / if-arms) and
+    /// flips the matching field on the first hit.
+    pub fn from_program(program: &Program) -> Self {
+        let mut caps = Self::default();
+        for stmt in &program.statements {
+            Self::scan_stmt(stmt, &mut caps);
+        }
+        caps
+    }
+
+    fn scan_stmt(stmt: &Stmt, caps: &mut BackendCaps) {
+        match stmt {
+            Stmt::Assign { value, .. } => Self::scan_expr(value, caps),
+            Stmt::AssignTuple { value, .. } => Self::scan_expr(value, caps),
+            Stmt::For { body, .. } => {
+                for s in body {
+                    Self::scan_stmt(s, caps);
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body {
+                    Self::scan_stmt(s, caps);
+                }
+                for s in else_body {
+                    Self::scan_stmt(s, caps);
+                }
+            }
+        }
+    }
+
+    fn scan_expr(expr: &Expr, caps: &mut BackendCaps) {
+        match expr {
+            Expr::Call { op, args } => {
+                match op {
+                    OpKind::BiasAdd => caps.has_bias_add = true,
+                    OpKind::Moe => caps.has_moe = true,
+                    _ => {}
+                }
+                for a in args {
+                    Self::scan_expr(a, caps);
+                }
+            }
+            Expr::Add { lhs, rhs } | Expr::Mul { lhs, rhs } => {
+                Self::scan_expr(lhs, caps);
+                Self::scan_expr(rhs, caps);
+            }
+            Expr::Local(_)
+            | Expr::Extern { .. }
+            | Expr::Weight { .. }
+            | Expr::ScalarLit(_)
+            | Expr::SqrtBound(_)
+            | Expr::ConfigScalar { .. } => {}
+        }
+    }
+}
+
+fn emit_canonical_params_impl(
+    model: &ModelParams,
+    tp_world_size: u8,
+    caps: BackendCaps,
+) -> TokenStream {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
     let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
@@ -4498,8 +5267,24 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
         None => quote! {},
     };
 
+    // Synthesized-kernel sources override (Metal-only, affine-int4
+    // gated). Empty for cuda models and any model that doesn't ship
+    // an MLX-affine int4 quantization config; default `&[]` from the
+    // CanonicalParams trait kicks in there.
+    let synth_sources_override =
+        emit_synthesized_kernel_sources_override(model, tp_world_size, caps.has_bias_add);
+
+    let has_bias_add_lit = caps.has_bias_add;
+    let has_moe_lit = caps.has_moe;
+
     quote! {
-        #[cfg(feature = "cuda")]
+        // `CanonicalParams` is backend-agnostic — the trait, its
+        // associated `const`s, and every callsite (`<W as
+        // CanonicalParams>::HEAD_DIM`) live in `ferrite-forward` with
+        // no cuda gating. So this impl applies under either
+        // `cfg(feature = "cuda")` (where `Weights` is the loader
+        // struct) or `cfg(feature = "metal")` (where `Weights` is
+        // the ZST emitted in `emit_weights_struct`).
         impl ::ferrite_forward::CanonicalParams for Weights {
             const HEAD_DIM: u32 = #head_dim_lit;
             const NUM_Q_HEADS: u32 = #num_q_heads_lit;
@@ -4523,7 +5308,13 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
             const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
+            // Backend-capability flags derived by macro DSL inspection
+            // (`BackendCaps::from_program`). Drive
+            // `ferrite_forward::BackendCompat<B>::COMPAT_CHECK`.
+            const HAS_BIAS_ADD: bool = #has_bias_add_lit;
+            const HAS_MOE: bool = #has_moe_lit;
             #mrope_section_tokens
+            #synth_sources_override
         }
     }
 }
@@ -4547,6 +5338,12 @@ pub fn emit_model(
     // handles this naturally because `backbone_layout` reports
     // Encoder when the terminal isn't `gemm(_, lm_head)`. No
     // separate vision flag needed.
+
+    // Backend dispatch: route to Metal codegen if target is Metal
+    // Note: target_profile is not passed to emit_model, so we infer from lib
+    // For now, emit CUDA code (Metal codegen integration is Phase 3.2+)
+    // TODO: Add target_profile parameter and dispatch based on backend
+
     if let Some(canonical) = canonical_override {
         return emit_shim_model(
             program,
@@ -4609,6 +5406,12 @@ pub fn emit_model(
             /* num_slots */ u32,
             /* backbone_slot */ u32,
             /* terminal_slot */ u32,
+            /* slots: shared coloring across every bucket in this
+             * canonical's group. Per-bucket arena_bytes (below in
+             * the metal emission loop) computes its OWN sizes from
+             * this map + that bucket's bounds, so each bucket gets
+             * a tight arena sized for its own num_tokens. */
+            crate::impl_lib::SlotMap,
         ),
     > = BTreeMap::new();
     // `last_node_id` must be the lm_head Gemm (tp=1) or the post-lm_head
@@ -4724,15 +5527,30 @@ pub fn emit_model(
                 // Eval body lives in `ferrite_forward::Instruction::eval`
                 // — `arch_opcodes` keeps the shape registration for
                 // `emit_bucket_static_slice`'s shape-checking pass.
+                // `extra_opcode_shapes` covers storage-polymorphic
+                // impls (see the comment in `lower_bucket`).
                 arch_opcodes.register(term_imp.opcode_shape());
+                for extra in term_imp.extra_opcode_shapes() {
+                    arch_opcodes.register(extra);
+                }
+                let n = term_emits.len();
                 crate::interpreter_codegen::LoweredBucket {
                     instances: term_emits,
+                    // Terminal Impl (lm_head) is emitted ad-hoc here
+                    // outside the FUF walker, so we don't have its
+                    // dataflow. Conservative all-barriers — runtime
+                    // serializes the lm_head dispatches. Upgrading
+                    // this to a proper analysis means running the
+                    // same walker against the terminal Impl's
+                    // claimed tiles.
+                    barriers: vec![true; n],
                     num_slots,
                     final_slot: terminal_slot,
                 }
             }
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
                 instances: Vec::new(),
+                barriers: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
             },
@@ -4748,6 +5566,7 @@ pub fn emit_model(
                 num_slots,
                 backbone_slot,
                 terminal_slot,
+                slots,
             ),
         );
     }
@@ -4761,7 +5580,36 @@ pub fn emit_model(
     // detection picks the largest CONTIGUOUS run that genuinely
     // repeats — middle layers — and keeps the boundary residues as
     // straight-line code in prelude/suffix.
-    for (cl, _, _, _) in canonical_lowered.values_mut() {
+    // Pre-attention chain synthesis (compiler-driven). Detect the
+    // contiguous `(FusedAddRmsNorm, AffineQmm × 3, RopeAppend)` chain
+    // that spans the K→K+1 layer boundary in the unrolled per-claim
+    // op list and replace each match with one `SynthPreAttn` op
+    // backed by the synthesized MSL kernel emitted via
+    // `emit_synthesized_kernel_sources_override`. Must run BEFORE
+    // `apply_loop_compression` — once the loop body collapses we
+    // can't see the boundary chain anymore.
+    let synth_t_act: Option<&'static str> = {
+        use crate::quantization::QuantMethod;
+        match model.quantization.as_ref().map(|q| &q.method) {
+            Some(QuantMethod::Affine { bits: 4, .. }) => Some("bfloat"),
+            _ => None,
+        }
+    };
+    // Skip the synth fusion at bucket_m >= 2: the synth's
+    // `(M, num_heads_total)` threadgroup grid makes its AddRmsNorm
+    // phase redundantly process the residual+delta read once per
+    // (token, head) — work that scales as M*num_heads instead of M.
+    // At M=1 the redundancy is cheap relative to the saved qmv
+    // dispatch overhead and the synth wins. At M>=2 the redundant
+    // device reads dominate; the unfused chain (one norm dispatch
+    // per token + per-head qmv) is strictly cheaper.
+    //
+    // TODO: replace this hardcoded threshold with a solver-driven
+    // pick — `SynthPreAttnImpl::cost_us` vs `(FusedAddRmsNorm + 3
+    // AffineQmm)::cost_us` from the swept CSV.
+    for (wp, (cl, _, _, _, _)) in canonical_lowered.iter_mut() {
+        let _ = synth_t_act;
+        let _ = wp;
         crate::interpreter_codegen::apply_loop_compression(
             &arch_opcodes,
             &mut cl.backbone,
@@ -4775,18 +5623,23 @@ pub fn emit_model(
     // expanded source (without it prettyplease wraps
     // `::ferrite_forward::Instruction::<Weights>::Variant(…)` over
     // 3-4 lines per row).
-    let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size);
+    let backend_caps = BackendCaps::from_program(program);
+    let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size, backend_caps);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /
     // `RmsNorm(...)` instead of
     // `::ferrite_forward::Instruction::<Weights>::Embed(...)`
     // (which prettyplease wraps over 3-4 lines per row).
+    // The `__I` alias and the variant glob-import are backend-agnostic
+    // — `Instruction<W>` is defined in `ferrite-forward` without a
+    // backend gate. The per-bucket static slices reference both, so
+    // they compile under either `cfg(feature = "cuda")` (linking the
+    // cuda `Weights` struct) or `cfg(feature = "metal")` (linking the
+    // metal `Weights` ZST emitted in `emit_weights_struct`).
     let instruction_alias = quote! {
-        #[cfg(feature = "cuda")]
         #[allow(non_camel_case_types, dead_code)]
         type __I = ::ferrite_forward::Instruction<Weights>;
-        #[cfg(feature = "cuda")]
         use ::ferrite_forward::Instruction::*;
     };
     let shapes_by_name = arch_opcodes.shapes_by_name();
@@ -4799,7 +5652,7 @@ pub fn emit_model(
         if bucket_canonical[i] != *wp {
             continue;
         }
-        let (lowered, _, _, _) = &canonical_lowered[wp];
+        let (lowered, _, _, _, _) = &canonical_lowered[wp];
         let backbone_static_ident = bucket_static_ident("BACKBONE_M", *wp);
         let lm_head_static_ident = bucket_static_ident("LM_HEAD_M", *wp);
         static_slices.push(emit_bucket_static_slice(
@@ -4811,6 +5664,20 @@ pub fn emit_model(
             &lm_head_static_ident,
             &shapes_by_name,
             &lowered.lm_head.instances,
+        ));
+        // Metal MTL4 barrier flags, computed at FUF/SlotMap level
+        // by `lower_bucket` (one bool per `OpInstance`). Length
+        // tracks the corresponding instructions static. Runtime
+        // consumes via `MetalBucketSpec.{backbone,lm_head}_barriers`.
+        let bb_barriers_ident = bucket_static_ident("BACKBONE_BARRIERS_M", *wp);
+        let lh_barriers_ident = bucket_static_ident("LM_HEAD_BARRIERS_M", *wp);
+        static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
+            &bb_barriers_ident,
+            &lowered.backbone.barriers,
+        ));
+        static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
+            &lh_barriers_ident,
+            &lowered.lm_head.barriers,
         ));
     }
 
@@ -4863,7 +5730,7 @@ pub fn emit_model(
         // prefill, freeing a slot vs the decode-bucket's separate
         // Add). The non-canonical buckets share their canonical's
         // slot metadata since they share its static slices.
-        let (_, num_slots_b, backbone_slot_b, terminal_slot_b) = &canonical_lowered[&canonical];
+        let (_, num_slots_b, backbone_slot_b, terminal_slot_b, _) = &canonical_lowered[&canonical];
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
         let backbone_slot_lit = proc_macro2::Literal::u32_unsuffixed(*backbone_slot_b);
         let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
@@ -4926,15 +5793,465 @@ pub fn emit_model(
 
     // FORWARD_TABLE — one row per bucket. `__B` aliases the
     // `BucketEntry` tuple-struct constructor so each row stays on a
-    // single line in expanded source.
+    // single line in expanded source. Available under either backend
+    // — `vllm ferrite info`'s per-variant `dump()` walks it on both
+    // cuda and metal. The cuda runtime additionally drives `forward`
+    // / `forward_backbone` from it; metal's pool uses `METAL_BUCKETS`
+    // instead and ignores the runtime fields here.
     let forward_table = quote! {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         static FORWARD_TABLE: &[::ferrite_forward::BucketEntry<__I>] = {
             use ::ferrite_forward::BucketEntry as __B;
             &[
                 #(#bucket_table_entries)*
             ]
         };
+    };
+
+    // METAL_BUCKETS — one row per distinct `num_tokens` point. The
+    // metal pool dispatches on `num_tokens` only (no sk axis); for
+    // models that declared `sk_buckets` we pick the `sk_bucket == 0`
+    // canonical at each `m`, falling back to whichever wp exists for
+    // that `m` if the model elided the sk=0 entry. TinyLlama-class
+    // models have no sk axis, so this is a 1:1 enumeration of
+    // `num_tokens_points`.
+    //
+    // Each row's `backbone` / `lm_head` ride on the per-canonical
+    // static slices the cuda emission already produced — under both
+    // backends the slices are unconditionally emitted (the
+    // `instruction_alias` and `Weights` definitions are now
+    // mutually-exclusive cfg-gated, but the slice statics
+    // themselves are backend-agnostic).
+    let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
+    let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
+    for &m in &num_tokens_points {
+        // Prefer the sk=0 canonical for this `m`; fall back to any wp
+        // at `m` if the model never declared sk=0 explicitly.
+        let wp = bucket_points
+            .iter()
+            .find(|wp| wp.num_tokens == m && wp.sk_bucket == 0)
+            .copied()
+            .or_else(|| bucket_points.iter().find(|wp| wp.num_tokens == m).copied())
+            .expect("every num_tokens point has at least one wp");
+        let i = bucket_points
+            .iter()
+            .position(|w| *w == wp)
+            .expect("wp came from bucket_points");
+        let canonical = bucket_canonical[i];
+        let bb_static = bucket_static_ident("BACKBONE_M", canonical);
+        let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
+        let bb_barriers_static = bucket_static_ident("BACKBONE_BARRIERS_M", canonical);
+        let lh_barriers_static = bucket_static_ident("LM_HEAD_BARRIERS_M", canonical);
+        let (_, num_slots_b, _, terminal_slot_b, slots_b) = &canonical_lowered[&canonical];
+        let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
+        let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
+        let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
+
+        // Per-bucket arena_bytes: register-coloring tells us which
+        // (tile, output_slot) pairs share an arena slot; for THIS
+        // bucket M we evaluate each tile's output shape against this
+        // bucket's bounds and take the per-color max. Each bucket
+        // gets a tight arena sized exactly for its own num_tokens —
+        // the worker pool elementwise-maxes across MetalBucketSpec
+        // entries once at init time to size the per-worker arena
+        // (init-time alloc, reused across every forward).
+        let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
+        let mut bucket_arena_bytes: Vec<u64> = vec![0u64; *num_slots_b as usize];
+        for ((tile_id, out_slot), color) in slots_b.iter() {
+            let node = fuf.get(tile_id);
+            let shape = &node.outputs[out_slot as usize];
+            let elems: u64 = crate::impl_lib::eval_shape_with(shape, &bp_bounds)
+                .expect("shape inference left a Var in a tile output — codegen invariant")
+                .into_iter()
+                .product();
+            // f16 = 2 bytes/element; metal kernels are f16-only.
+            let bytes = elems.saturating_mul(2);
+            let slot_idx = color as usize;
+            if bytes > bucket_arena_bytes[slot_idx] {
+                bucket_arena_bytes[slot_idx] = bytes;
+            }
+        }
+        // Every color must have at least one (tile, slot) pair; if
+        // the worker ever sees a 0-byte arena slot it'll fail the
+        // ICB residency. Guarantee a 1-byte minimum so unused colors
+        // (none expected, but defensive) still allocate a valid
+        // `MTLBuffer`.
+        for b in &mut bucket_arena_bytes {
+            if *b == 0 {
+                *b = 1;
+            }
+        }
+
+        let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", wp);
+        let arena_bytes_lits = bucket_arena_bytes
+            .iter()
+            .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+        metal_arena_bytes_statics.push(quote! {
+            #[cfg(feature = "metal")]
+            static #arena_static_ident: &[u64] = &[ #(#arena_bytes_lits),* ];
+        });
+        metal_bucket_entries.push(quote! {
+            ::ferrite_forward::interpreter::metal::MetalBucketSpec {
+                bucket_m: #bucket_m_lit,
+                num_arena_slots: #num_slots_lit,
+                terminal_slot: #terminal_slot_lit,
+                arena_bytes: #arena_static_ident,
+                backbone: #bb_static,
+                lm_head: #lm_static,
+                backbone_barriers: #bb_barriers_static,
+                lm_head_barriers: #lh_barriers_static,
+            },
+        });
+    }
+
+    // Largest `num_tokens` across all buckets — drives runtime
+    // buffer sizing in the metal forward body's `RuntimeFactory`.
+    let max_bucket_m_lit = {
+        let max_m = num_tokens_points
+            .iter()
+            .copied()
+            .max()
+            .expect("at least one num_tokens point per canonical");
+        proc_macro2::Literal::u32_unsuffixed(max_m as u32)
+    };
+
+    // Vocab size — baked from `model.bounds["vocab_size"]` at
+    // macro-expansion time. The metal forward body needs it to
+    // shape the `OwnedTensor` it returns from the bucket's terminal
+    // arena slot ([num_tokens, vocab_size] f16 logits).
+    let vocab_size_lit = {
+        let vocab = model
+            .bounds
+            .get("vocab_size")
+            .copied()
+            .expect("model.bounds must carry `vocab_size`");
+        proc_macro2::Literal::u64_unsuffixed(vocab)
+    };
+
+    // Per-worker arena peak in bytes — sum across every slot of the
+    // worker's arena layout, where each slot is sized to fit the
+    // largest bucket's claim on that color. The pool computes this
+    // exact layout at runtime via elementwise-max across each
+    // `MetalBucketSpec.arena_bytes`; we mirror that calculation here
+    // at compile time so the metal worker can pre-declare its
+    // resident-arena bytes via the FerriteWeights trait (used to
+    // size the `peak_activation_bytes` argument to
+    // `compute_available_kv_bytes`).
+    let metal_arena_peak_bytes_lit = {
+        let mut layout: Vec<u64> = Vec::new();
+        for &m in &num_tokens_points {
+            let wp = bucket_points
+                .iter()
+                .find(|wp| wp.num_tokens == m && wp.sk_bucket == 0)
+                .copied()
+                .or_else(|| bucket_points.iter().find(|wp| wp.num_tokens == m).copied())
+                .expect("every num_tokens point has at least one wp");
+            let i = bucket_points
+                .iter()
+                .position(|w| *w == wp)
+                .expect("wp came from bucket_points");
+            let canonical = bucket_canonical[i];
+            let (_, num_slots_b, _, _, slots_b) = &canonical_lowered[&canonical];
+            if layout.len() < *num_slots_b as usize {
+                layout.resize(*num_slots_b as usize, 0);
+            }
+            let bp_bounds = bounds_for_wp(model, wp, tp_world_size);
+            for ((tile_id, out_slot), color) in slots_b.iter() {
+                let node = fuf.get(tile_id);
+                let shape = &node.outputs[out_slot as usize];
+                let elems: u64 = crate::impl_lib::eval_shape_with(shape, &bp_bounds)
+                    .expect("shape inference left a Var in a tile output")
+                    .into_iter()
+                    .product();
+                let bytes = elems.saturating_mul(2);
+                let slot_idx = color as usize;
+                if bytes > layout[slot_idx] {
+                    layout[slot_idx] = bytes;
+                }
+            }
+        }
+        let total: u64 = layout.iter().sum();
+        proc_macro2::Literal::u64_unsuffixed(total)
+    };
+
+    let metal_emission = quote! {
+        // ── BackendCompat<Metal> gate ────────────────────────────
+        //
+        // Forces `<Weights as BackendCompat<Metal>>::COMPAT_CHECK`
+        // to monomorphize at this crate's compile time. The const's
+        // body asserts `!HAS_BIAS_ADD && !HAS_OUTPUT_GATE &&
+        // !HAS_MOE`; an arch whose DSL contains a tile the metal
+        // backend can't claim fails build with a clear error,
+        // before any runtime garbage-output bug can fire. Pre-
+        // BackendCompat instance: mlx-community/Qwen2.5-1.5B-
+        // Instruct-4bit produced "valid-tokens-in-random-order"
+        // output because Qwen2's QKV `bias_add` tiles were silently
+        // dropped on the metal-affine-int4 path.
+        #[cfg(feature = "metal")]
+        const _: () = <Weights as ::ferrite_forward::BackendCompat<
+            ::ferrite_forward::Metal,
+        >>::COMPAT_CHECK;
+
+        #(#metal_arena_bytes_statics)*
+
+        /// Per-canonical bucket plan for the Metal pool. One row per
+        /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`
+        /// is a linear smallest-fit scan, so order matters.
+        #[cfg(feature = "metal")]
+        pub static METAL_BUCKETS:
+            &[::ferrite_forward::interpreter::metal::MetalBucketSpec<Weights>]
+            = &[
+                #(#metal_bucket_entries)*
+            ];
+
+        /// Largest `num_tokens` bucket across [`METAL_BUCKETS`]. The
+        /// metal forward body's `RuntimeFactory` allocates per-worker
+        /// runtime buffers (input_ids/positions/slot_mapping/...) at
+        /// `METAL_MAX_BUCKET_M * sizeof(u32)`; block_table at
+        /// `METAL_MAX_BUCKET_M * MAX_BLOCKS_PER_SEQ * sizeof(u32)`.
+        #[cfg(feature = "metal")]
+        pub const METAL_MAX_BUCKET_M: u32 = #max_bucket_m_lit;
+
+        /// Vocab size — baked from `model.bounds["vocab_size"]`. The
+        /// metal forward shapes its returned `OwnedTensor` as
+        /// `[num_tokens, METAL_VOCAB_SIZE]` f16.
+        #[cfg(feature = "metal")]
+        pub const METAL_VOCAB_SIZE: u64 = #vocab_size_lit;
+
+        /// Per-worker arena peak in bytes for this canonical. The
+        /// pool's `arena_layout` is the elementwise-max across every
+        /// bucket spec's `arena_bytes`; per-canonical that's the
+        /// shared `METAL_ARENA_BYTES_M_<m>` static (every bucket in
+        /// one canonical points at the same row), so the sum equals
+        /// the worker's resident-arena byte footprint. Read by
+        /// `FerriteWorker(metal)::determine_available_memory` to
+        /// replace the 512 MiB peak-activation placeholder.
+        #[cfg(feature = "metal")]
+        pub const METAL_ARENA_PEAK_BYTES: u64 = #metal_arena_peak_bytes_lit;
+
+        /// Build a [`MetalWorkerPool`] for this canonical. Thin
+        /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
+        /// the per-canonical [`METAL_BUCKETS`] static so callers don't
+        /// have to construct the bucket plan by hand. The arena layout
+        /// is derived from each bucket's `arena_bytes` field — taking
+        /// the elementwise max so the single per-worker arena fits the
+        /// largest activation across every bucket.
+        ///
+        /// `weights` is borrowed; the pool stores no back-reference,
+        /// caller passes `&weights` again at every `forward` /
+        /// `checkout` so the pool can live as a field on the
+        /// `Weights` struct without an `Arc`-cycle.
+        ///
+        /// [`MetalWorkerPool`]: ::ferrite_forward::interpreter::metal::MetalWorkerPool
+        /// [`MetalWorkerPool::for_buckets`]: ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets
+        #[cfg(feature = "metal")]
+        pub fn metal_pool(
+            device: ::std::sync::Arc<
+                ::ferrite_forward::interpreter::metal::__re::Device,
+            >,
+            weights: &Weights,
+            allocator: ::std::sync::Arc<::ferrite_cuda_core::MetalAllocator>,
+            runtime_factory: ::ferrite_forward::interpreter::metal::RuntimeFactory,
+            max_workers: usize,
+        ) -> ::core::result::Result<
+            ::ferrite_forward::interpreter::metal::MetalWorkerPool<Weights>,
+            ::ferrite_forward::interpreter::metal::PoolBuildError,
+        > {
+            ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
+                device,
+                weights,
+                allocator,
+                METAL_BUCKETS,
+                runtime_factory,
+                max_workers,
+            )
+        }
+
+        /// Per-canonical metal forward dispatch. Lazy-inits
+        /// `weights.metal_pool` on the first call (factory closure
+        /// captures the per-layer `metal::Buffer` Arc-handles from
+        /// `ctx.kv_cache` and the `MAX_BLOCKS_PER_SEQ` block-table
+        /// stride from `<Weights as CanonicalParams>`); on every call
+        /// reads the runtime input slices off the host-visible
+        /// `ctx.<input>` `TensorView`s — under metal those raw_ptrs
+        /// are `metal::Buffer.contents()` so the slice borrow lives
+        /// as long as the call — hands them to
+        /// `MetalWorkerPool::forward`, and copies the bucket's
+        /// terminal arena slot out as a fresh `OwnedTensor` of
+        /// `[num_tokens, vocab_size]` f16 logits.
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
+            num_tokens: u64,
+        ) -> ::ferrite_cuda_core::OwnedTensor {
+            use ::ferrite_forward::CanonicalParams as _;
+            use ::ferrite_forward::interpreter::metal::__re::{Buffer, MTLResourceOptions};
+
+            // ── Lazy pool init ────────────────────────────────────
+            //
+            // Factory closure captures (a) the metal device handle
+            // for runtime-buffer allocation, (b) `MAX_BLOCKS_PER_SEQ`
+            // from the canonical's `CanonicalParams` (compile-time
+            // const), (c) Arc-handle clones of the per-layer KV
+            // buffers from `ctx.kv_cache` so worker spawns inherit
+            // them without re-allocation. The closure is invoked
+            // once per worker spawn — the pool starts at size 1 so
+            // the first `pool.forward` call below triggers the only
+            // factory invocation in single-worker configs.
+            let pool = wm.metal_pool.get_or_init(|| {
+                let num_layers = ctx.kv_cache.num_layers;
+                let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
+                    .map(|l| ctx.kv_cache.k_layer_mem(l).buffer().clone())
+                    .collect();
+                let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
+                    .map(|l| ctx.kv_cache.v_layer_mem(l).buffer().clone())
+                    .collect();
+                let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
+                    ::std::sync::Arc::new(move |dev| {
+                        let max_m = METAL_MAX_BUCKET_M as u64;
+                        let max_bps =
+                            <Weights as ::ferrite_forward::CanonicalParams>::MAX_BLOCKS_PER_SEQ
+                                as u64;
+                        let alloc = |bytes: u64| {
+                            use ::ferrite_forward::interpreter::metal::__re::MTLDevice as _;
+                            dev.newBufferWithLength_options(
+                                bytes.max(16) as usize,
+                                MTLResourceOptions::StorageModeShared,
+                            )
+                            .expect("newBufferWithLength_options returned nil")
+                        };
+                        ::ferrite_forward::interpreter::metal::RuntimeBindings {
+                            input_ids: alloc(max_m * 4),
+                            positions: alloc(max_m * 4),
+                            slot_mapping: alloc(max_m * 4),
+                            cu_seqlens_q: alloc((max_m + 1) * 4),
+                            seq_used_k: alloc(max_m * 4),
+                            block_table: alloc(max_m * max_bps * 4),
+                            kv_cache_k: kv_k.clone(),
+                            kv_cache_v: kv_v.clone(),
+                            // 4 bytes — worker writes the current
+                            // forward()'s `num_tokens` here before
+                            // dispatch so KernelId::GatherLastToken
+                            // can compute the source row.
+                            num_tokens_u32: alloc(4),
+                        }
+                    });
+                ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
+                    device.device.clone(),
+                    wm,
+                    device.allocator.clone(),
+                    METAL_BUCKETS,
+                    factory,
+                    1,
+                )
+                .expect("MetalWorkerPool::for_buckets: pool init failed")
+            });
+
+            // ── Read host-visible input slices off ctx ────────────
+            //
+            // Under metal, every `TensorView` in `ctx` resolves to a
+            // pointer inside a `StorageModeShared` `MTLBuffer.contents()`,
+            // so reading as `&[u32]` is a direct CPU borrow. The
+            // shared buffer keeps backing the slice until the worker
+            // memcopies through `write_runtime_inputs`.
+            let n = num_tokens as usize;
+            let input_ids = ::std::slice::from_raw_parts(
+                ctx.input_ids.as_raw().raw_ptr() as *const u32,
+                n,
+            );
+            let positions = ::std::slice::from_raw_parts(
+                ctx.positions.as_raw().raw_ptr() as *const u32,
+                n,
+            );
+            let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
+                    n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let cu_seqlens_q = if !ctx.cu_seqlens_q.as_raw().raw_ptr().is_null() {
+                let cu_n = ctx.cu_seqlens_q.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.cu_seqlens_q.as_raw().raw_ptr() as *const u32,
+                    cu_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let seq_used_k = if !ctx.seqused_k.as_raw().raw_ptr().is_null() {
+                let su_n = ctx.seqused_k.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.seqused_k.as_raw().raw_ptr() as *const u32,
+                    su_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let block_table = if !ctx.block_table.as_raw().raw_ptr().is_null() {
+                let bt_n = ctx.block_table.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.block_table.as_raw().raw_ptr() as *const u32,
+                    bt_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+
+            let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
+                num_tokens: num_tokens as u32,
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seq_used_k,
+                block_table,
+            };
+
+            // ── Run forward + copy logits out ─────────────────────
+            //
+            // The pool picks the bucket from `num_tokens`, runs
+            // `executeCommandsInBuffer` (interleaved with MPS GEMMs
+            // on <M4 hardware), waits for completion, then invokes
+            // the closure with `&MetalWorker` + `bucket_idx`. The
+            // bucket's terminal arena slot holds the lm_head output;
+            // we wrap that buffer in a fresh `OwnedTensor` (Arc-
+            // handle clone — no copy) so the caller can read
+            // `[num_tokens, vocab_size]` f16 logits without taking
+            // ownership of the worker's arena.
+            pool.forward(
+                wm,
+                &device.queue,
+                &inputs,
+                |worker, bucket_idx| {
+                    let spec = &METAL_BUCKETS[bucket_idx];
+                    let buf = worker.arena[spec.terminal_slot as usize].clone();
+                    let vocab = METAL_VOCAB_SIZE as usize;
+                    let shape = [n, vocab];
+                    let bytes = n * vocab * 2; // bf16/f16 — both 2 bytes
+                    let dtype = match <Weights as ::ferrite_forward::CanonicalParams>::METAL_DTYPE {
+                        ::ferrite_forward::interpreter::metal::MetalDtype::F16 =>
+                            ::ferrite_cuda_core::dtype::DType::F16,
+                        ::ferrite_forward::interpreter::metal::MetalDtype::Bf16 =>
+                            ::ferrite_cuda_core::dtype::DType::BF16,
+                        ::ferrite_forward::interpreter::metal::MetalDtype::Int4 =>
+                            ::core::unreachable!("Int4 has no logits dtype"),
+                    };
+                    use ::ferrite_forward::interpreter::metal::__re::MTLBuffer as _;
+                    let inner = ::ferrite_cuda_core::tensor::GpuTensor::new(
+                        buf.contents().as_ptr() as *mut u8,
+                        &shape,
+                        dtype,
+                    );
+                    ::ferrite_cuda_core::OwnedTensor::from_metal_buffer(inner, buf, bytes)
+                },
+            )
+            .expect("MetalWorkerPool::forward")
+        }
     };
 
     // Encoder layouts have no lm_head split — `forward_backbone` is
@@ -4990,6 +6307,8 @@ pub fn emit_model(
 
         #forward_table
 
+        #metal_emission
+
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
         /// run the universal interpreter.
         #[cfg(feature = "cuda")]
@@ -5013,8 +6332,10 @@ pub fn emit_model(
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
         /// row, with backbone + lm_head normalized for non-generic
         /// inspection (no `&Weights`, no GPU). Used by
-        /// `vllm ferrite info` via the inventory registry.
-        #[cfg(feature = "cuda")]
+        /// `vllm ferrite info` via the inventory registry. Available
+        /// under either backend so the CLI subcommand can dump
+        /// metal-compiled arches too.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub fn dump() -> ::std::vec::Vec<::ferrite_forward::BucketDump> {
             FORWARD_TABLE
                 .iter()
@@ -5087,13 +6408,27 @@ fn emit_shim_model(
 
     // Per-bucket fn surfaces are gone — dispatch lives on the
     // canonical's `FORWARD_TABLE` + `find_bucket`. Re-export the
-    // arch-level dispatchers only.
+    // arch-level dispatchers only. Under `metal` the shim shares the
+    // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
+    // — variant-specific differences (quant format, fingerprint) are
+    // load-time only; static bucket plans are byte-identical.
     let _ = sfufs;
     quote! {
         #weights
 
+        // `dump` is the per-variant `vllm ferrite info` accessor —
+        // available under either backend so shim variants register
+        // under metal too.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        pub use super::#canonical::dump;
+
         #[cfg(feature = "cuda")]
-        pub use super::#canonical::{dump, forward, forward_backbone};
+        pub use super::#canonical::{forward, forward_backbone};
+
+        #[cfg(feature = "metal")]
+        pub use super::#canonical::{
+            forward, METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
+        };
     }
 }
 
@@ -5137,9 +6472,6 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
-            vision_class_embedding_fold: None,
-            decoder_safetensors_prefix: None,
-            torch_dtype: None,
         }
     }
 
@@ -5153,7 +6485,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 1).to_string();
+        let ts = emit_canonical_params_impl(&m, 1, super::BackendCaps::default()).to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 32"),
@@ -5181,7 +6513,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 2).to_string();
+        let ts = emit_canonical_params_impl(&m, 2, super::BackendCaps::default()).to_string();
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 16"),
             "tp=2 must shard NUM_Q_HEADS to 16; got {ts}"
@@ -5221,7 +6553,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let ts = emit_canonical_params_impl(&m, 8).to_string();
+        let ts = emit_canonical_params_impl(&m, 8, super::BackendCaps::default()).to_string();
         // 32 / 8 = 4
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 4"),
@@ -5857,7 +7189,6 @@ mod fingerprint_tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
-            decoder_safetensors_prefix: None,
         }
     }
 

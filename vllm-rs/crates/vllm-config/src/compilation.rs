@@ -149,7 +149,7 @@ impl CudaGraphConfig {
     /// Parse a comma-separated list of batch sizes (e.g. "1,2,4,8").
     pub fn parse_sizes(s: &str) -> Vec<usize> {
         if s.trim().eq_ignore_ascii_case("auto") {
-            return Vec::new(); // empty → cuda_worker computes Python-matching sizes
+            return Vec::new(); // empty → ferrite_worker computes Python-matching sizes
         }
         let mut sizes: Vec<usize> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         sizes.sort();

@@ -1,0 +1,18 @@
+[package]
+name = "microbench_int4_cast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["dispatch2"] }
+objc2-foundation = "0.3"
+half = "2.3"
+
+[[bin]]
+name = "microbench_int4_cast"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

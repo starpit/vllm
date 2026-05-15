@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! CUTLASS standalone GEMM kernel FFI.
 //!
-//! Each `cutlass_gemm_<TB_M>x<TB_N>_s<STAGES>_<DT>_launch` is a
-//! specialised CUTLASS GEMM kernel compiled from
-//! `vllm-cuda/csrc/cutlass_standalone_gemm.cu`. `<DT>` is `bf16` or
-//! `f16` — one symbol pair per tile, since both share the HMMA
-//! tensor-core path on sm80/sm89/sm90 and same alignment-8 layout.
-//! All variants share the same signature:
+//! Each `cutlass_gemm_<TB_M>x<TB_N>_s<STAGES>_launch` is a specialised
+//! CUTLASS GEMM kernel compiled from
+//! `vllm-cuda/csrc/cutlass_standalone_gemm.cu`. They all share the
+//! same signature:
 //!
 //! ```text
-//! int cutlass_gemm_..._<bf16|f16>_launch(
+//! int cutlass_gemm_..._launch(
 //!     uint16* C, const uint16* A, const uint16* B,
 //!     int M, int N, int K,
 //!     float alpha, float beta, uint64_t stream,
@@ -21,8 +19,8 @@
 //! `C` is `[M, N]`, and the computation is `C = alpha * A @ B^T +
 //! beta * C` in BF16 / FP16.
 //!
-//! `cutlass_gemv_<bf16|f16>_launch` is the M=1 specialisation
-//! (SIMT GEMV) with the same prototype.
+//! `cutlass_gemv_launch` is the M=1 specialisation (SIMT GEMV) with
+//! the same prototype.
 //!
 //! These symbols are defined by `vllm-cuda`'s C++ build; the final
 //! binary (`vllm-cli`) links both crates so the ferrite-forward-
@@ -32,9 +30,6 @@
 //! workload bucket from the calibrated `target_profiles/cost_*.csv`
 //! tables; the macro-emitted forward calls the corresponding launch
 //! fn directly — no runtime tile-variant dispatch.
-
-#[cfg(feature = "cuda")]
-use ferrite_cuda_core::DType;
 
 /// The cutlass tile size + pipeline stages — the `(tile_m, tile_n,
 /// stages)` triple uniquely identifies one kernel variant in the
@@ -65,262 +60,10 @@ impl CutlassTile {
 // Every tile variant compiled by `cutlass_standalone_gemm.cu` that
 // is covered by the calibrated CSV tables. When the .cu file gains
 // a variant, regenerate the CSV via `gpu_cost_sweep` and add the
-// entry here. Each `gemm_pair!(bf16_name, f16_name)` invocation
-// declares both the bf16 and f16 launchers — they share the calibrated
-// CSV row (HMMA path, identical microseconds).
-#[cfg(feature = "cuda")]
-macro_rules! gemm_pair {
-    ($bf16:ident, $f16:ident) => {
-        pub fn $bf16(
-            c: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            beta: f32,
-            stream: u64,
-        ) -> i32;
-        pub fn $f16(
-            c: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            beta: f32,
-            stream: u64,
-        ) -> i32;
-    };
-}
-
-#[cfg(feature = "cuda")]
-macro_rules! splitk_pair {
-    ($bf16:ident, $f16:ident) => {
-        pub fn $bf16(
-            c: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            beta: f32,
-            workspace: *mut u8,
-            stream: u64,
-        ) -> i32;
-        pub fn $f16(
-            c: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            alpha: f32,
-            beta: f32,
-            workspace: *mut u8,
-            stream: u64,
-        ) -> i32;
-    };
-}
-
-#[cfg(feature = "cuda")]
-macro_rules! bias_pair {
-    ($bf16:ident, $f16:ident) => {
-        pub fn $bf16(
-            d: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            bias: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            stream: u64,
-        ) -> i32;
-        pub fn $f16(
-            d: *mut u16,
-            a: *const u16,
-            b: *const u16,
-            bias: *const u16,
-            m: i32,
-            n: i32,
-            k: i32,
-            stream: u64,
-        ) -> i32;
-    };
-}
-
+// entry here.
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
-    gemm_pair!(
-        cutlass_gemm_16x64_s3_bf16_launch,
-        cutlass_gemm_16x64_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_16x64_s4_bf16_launch,
-        cutlass_gemm_16x64_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_16x128_s3_bf16_launch,
-        cutlass_gemm_16x128_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_16x128_s4_bf16_launch,
-        cutlass_gemm_16x128_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_32x64_s3_bf16_launch,
-        cutlass_gemm_32x64_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_32x64_s4_bf16_launch,
-        cutlass_gemm_32x64_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_32x128_s3_bf16_launch,
-        cutlass_gemm_32x128_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_32x128_s4_bf16_launch,
-        cutlass_gemm_32x128_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_32x256_s3_bf16_launch,
-        cutlass_gemm_32x256_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_64x64_s3_bf16_launch,
-        cutlass_gemm_64x64_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_64x64_s4_bf16_launch,
-        cutlass_gemm_64x64_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_64x128_s3_bf16_launch,
-        cutlass_gemm_64x128_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_64x128_s4_bf16_launch,
-        cutlass_gemm_64x128_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_128x64_s3_bf16_launch,
-        cutlass_gemm_128x64_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_128x64_s4_bf16_launch,
-        cutlass_gemm_128x64_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_128x128_s3_bf16_launch,
-        cutlass_gemm_128x128_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_128x128_s4_bf16_launch,
-        cutlass_gemm_128x128_s4_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_128x256_s3_bf16_launch,
-        cutlass_gemm_128x256_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_256x64_s3_bf16_launch,
-        cutlass_gemm_256x64_s3_f16_launch
-    );
-    gemm_pair!(
-        cutlass_gemm_256x64_s4_bf16_launch,
-        cutlass_gemm_256x64_s4_f16_launch
-    );
-
-    // ── SplitK parallel variants ──
-    //
-    // `cutlass_gemm_<WxH>_s<STAGES>_sk<SLICES>_<dt>_launch`: same
-    // signature as the standard GEMM launchers plus a caller-owned
-    // `workspace` pointer. The kernel splits the K dim across `SLICES`
-    // CTAs and reduces via a separate reduction kernel.
-    //
-    // Workspace contract (GemmSplitKParallel): f32 scratch sized
-    // `SLICES × M × N × 4` bytes. The Rust safe wrapper allocates this
-    // via the ferrite CachingAllocator.
-    splitk_pair!(
-        cutlass_gemm_64x64_s4_sk2_bf16_launch,
-        cutlass_gemm_64x64_s4_sk2_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_64x64_s4_sk4_bf16_launch,
-        cutlass_gemm_64x64_s4_sk4_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_64x64_s4_sk8_bf16_launch,
-        cutlass_gemm_64x64_s4_sk8_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_64x128_s4_sk2_bf16_launch,
-        cutlass_gemm_64x128_s4_sk2_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_64x128_s4_sk4_bf16_launch,
-        cutlass_gemm_64x128_s4_sk4_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_64x128_s4_sk8_bf16_launch,
-        cutlass_gemm_64x128_s4_sk8_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_128x64_s4_sk2_bf16_launch,
-        cutlass_gemm_128x64_s4_sk2_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_128x64_s4_sk4_bf16_launch,
-        cutlass_gemm_128x64_s4_sk4_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_128x64_s4_sk8_bf16_launch,
-        cutlass_gemm_128x64_s4_sk8_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_128x128_s4_sk2_bf16_launch,
-        cutlass_gemm_128x128_s4_sk2_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_128x128_s4_sk4_bf16_launch,
-        cutlass_gemm_128x128_s4_sk4_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_128x128_s4_sk8_bf16_launch,
-        cutlass_gemm_128x128_s4_sk8_f16_launch
-    );
-
-    // tile_m=16 splitK — small-M long-K regime (M=8 + K≥8192).
-    splitk_pair!(
-        cutlass_gemm_16x64_s4_sk2_bf16_launch,
-        cutlass_gemm_16x64_s4_sk2_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_16x64_s4_sk4_bf16_launch,
-        cutlass_gemm_16x64_s4_sk4_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_16x64_s4_sk8_bf16_launch,
-        cutlass_gemm_16x64_s4_sk8_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_16x128_s4_sk2_bf16_launch,
-        cutlass_gemm_16x128_s4_sk2_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_16x128_s4_sk4_bf16_launch,
-        cutlass_gemm_16x128_s4_sk4_f16_launch
-    );
-    splitk_pair!(
-        cutlass_gemm_16x128_s4_sk8_bf16_launch,
-        cutlass_gemm_16x128_s4_sk8_f16_launch
-    );
-
-    pub fn cutlass_gemv_bf16_launch(
+    pub fn cutlass_gemm_16x64_s3_launch(
         c: *mut u16,
         a: *const u16,
         b: *const u16,
@@ -331,7 +74,446 @@ unsafe extern "C" {
         beta: f32,
         stream: u64,
     ) -> i32;
-    pub fn cutlass_gemv_f16_launch(
+    pub fn cutlass_gemm_16x64_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_32x64_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_32x64_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_32x128_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_32x128_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_32x256_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x64_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x64_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x256_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_256x64_s3_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_256x64_s4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: u64,
+    ) -> i32;
+
+    // ── SplitK parallel variants ──
+    //
+    // `cutlass_gemm_<WxH>_s<STAGES>_sk<SLICES>_launch`: same signature
+    // as the standard GEMM launchers plus a caller-owned `workspace`
+    // pointer. The kernel splits the K dim across `SLICES` CTAs and
+    // reduces via a separate reduction kernel.
+    //
+    // Workspace contract (GemmSplitKParallel): f32 scratch sized
+    // `SLICES × M × N × 4` bytes. The Rust safe wrapper allocates this
+    // via the ferrite CachingAllocator.
+    pub fn cutlass_gemm_64x64_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x64_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x64_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_64x128_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x64_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_128x128_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+
+    // tile_m=16 splitK — small-M long-K regime (M=8 + K≥8192).
+    pub fn cutlass_gemm_16x64_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x64_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x64_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_sk2_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_sk4_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_16x128_s4_sk8_launch(
+        c: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        workspace: *mut u8,
+        stream: u64,
+    ) -> i32;
+
+    pub fn cutlass_gemv_launch(
         c: *mut u16,
         a: *const u16,
         b: *const u16,
@@ -347,17 +529,7 @@ unsafe extern "C" {
     /// Computes `D[M,N] = silu(A[M,K] @ B_gate[N,K]^T) * C_up[M,N]`,
     /// where `C_up` is the separately-computed up-projection output
     /// (aux-loaded from GMEM). Internal 3-way tile dispatch on `m`.
-    pub fn cutlass_gemm_silu_mul_bf16_launch(
-        d: *mut u16,
-        a: *const u16,
-        b_gate: *const u16,
-        c_up: *mut u16,
-        m: i32,
-        n: i32,
-        k: i32,
-        stream: u64,
-    ) -> i32;
-    pub fn cutlass_gemm_silu_mul_f16_launch(
+    pub fn cutlass_gemm_silu_mul_launch(
         d: *mut u16,
         a: *const u16,
         b_gate: *const u16,
@@ -370,207 +542,250 @@ unsafe extern "C" {
 
     // ── Bias-add GEMM zoo ──
     //
-    // `cutlass_gemm_bias_<TB_M>x<TB_N>_s<STAGES>_<dt>_launch`. Computes
+    // `cutlass_gemm_bias_<TB_M>x<TB_N>_s<STAGES>_launch`. Computes
     // `D[M,N] = A[M,K] @ B[N,K]^T + bias[N]` in one launch, where
-    // `bias` is `[N]` activation-dtype broadcast across rows.
+    // `bias` is `[N]` bf16 broadcast across rows.
     //
     // Backed by `cutlass::gemm::device::Gemm` (same template family
     // as the standalone tile zoo) with `LinearCombination` epilogue +
     // ldc=0 broadcast — the bias rides as the C operand at stride 0.
     // Tile zoo mirrors `CUTLASS_TILE_ZOO` in
     // ferrite-forward-macro/src/impl_lib.rs.
-    bias_pair!(
-        cutlass_gemm_bias_16x64_s3_bf16_launch,
-        cutlass_gemm_bias_16x64_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_16x64_s4_bf16_launch,
-        cutlass_gemm_bias_16x64_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_16x128_s3_bf16_launch,
-        cutlass_gemm_bias_16x128_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_16x128_s4_bf16_launch,
-        cutlass_gemm_bias_16x128_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_32x64_s3_bf16_launch,
-        cutlass_gemm_bias_32x64_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_32x64_s4_bf16_launch,
-        cutlass_gemm_bias_32x64_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_32x128_s3_bf16_launch,
-        cutlass_gemm_bias_32x128_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_32x128_s4_bf16_launch,
-        cutlass_gemm_bias_32x128_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_32x256_s3_bf16_launch,
-        cutlass_gemm_bias_32x256_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_64x64_s3_bf16_launch,
-        cutlass_gemm_bias_64x64_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_64x64_s4_bf16_launch,
-        cutlass_gemm_bias_64x64_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_64x128_s3_bf16_launch,
-        cutlass_gemm_bias_64x128_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_64x128_s4_bf16_launch,
-        cutlass_gemm_bias_64x128_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_128x64_s3_bf16_launch,
-        cutlass_gemm_bias_128x64_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_128x64_s4_bf16_launch,
-        cutlass_gemm_bias_128x64_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_128x128_s3_bf16_launch,
-        cutlass_gemm_bias_128x128_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_128x128_s4_bf16_launch,
-        cutlass_gemm_bias_128x128_s4_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_128x256_s3_bf16_launch,
-        cutlass_gemm_bias_128x256_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_256x64_s3_bf16_launch,
-        cutlass_gemm_bias_256x64_s3_f16_launch
-    );
-    bias_pair!(
-        cutlass_gemm_bias_256x64_s4_bf16_launch,
-        cutlass_gemm_bias_256x64_s4_f16_launch
-    );
+    pub fn cutlass_gemm_bias_16x64_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_16x64_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_16x128_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_16x128_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_32x64_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_32x64_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_32x128_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_32x128_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_32x256_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_64x64_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_64x64_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_64x128_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_64x128_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_128x64_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_128x64_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_128x128_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_128x128_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_128x256_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_256x64_s3_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
+    pub fn cutlass_gemm_bias_256x64_s4_launch(
+        d: *mut u16,
+        a: *const u16,
+        b: *const u16,
+        bias: *const u16,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> i32;
 }
 
 type CutlassLaunchFn =
     unsafe extern "C" fn(*mut u16, *const u16, *const u16, i32, i32, i32, f32, f32, u64) -> i32;
 
-/// Pick `(bf16, f16)` pair → one fn pointer based on activation dtype.
-/// Panics for non-half-precision dtypes — CUTLASS HMMA path is bf16/f16
-/// only here; F32/F8 take dedicated kernels (scaled_mm_*).
+/// Resolve the `(tile_m, tile_n, stages)` triple to its specialized
+/// launch fn. Panics if the triple isn't in the zoo.
 #[cfg(feature = "cuda")]
-#[inline]
-fn select_dtype<F: Copy>(pair: (F, F), dtype: DType) -> F {
-    match dtype {
-        DType::BF16 => pair.0,
-        DType::F16 => pair.1,
-        other => panic!(
-            "cutlass: unsupported activation dtype {:?} — bf16/f16 only",
-            other
-        ),
-    }
-}
-
-/// Resolve the `(tile_m, tile_n, stages, dtype)` quadruple to its
-/// specialized launch fn. Panics if the triple isn't in the zoo.
-#[cfg(feature = "cuda")]
-fn launch_fn_for(tile: CutlassTile, dtype: DType) -> CutlassLaunchFn {
-    let pair: (CutlassLaunchFn, CutlassLaunchFn) = match (tile.tile_m, tile.tile_n, tile.stages) {
-        (16, 64, 3) => (
-            cutlass_gemm_16x64_s3_bf16_launch,
-            cutlass_gemm_16x64_s3_f16_launch,
-        ),
-        (16, 64, 4) => (
-            cutlass_gemm_16x64_s4_bf16_launch,
-            cutlass_gemm_16x64_s4_f16_launch,
-        ),
-        (16, 128, 3) => (
-            cutlass_gemm_16x128_s3_bf16_launch,
-            cutlass_gemm_16x128_s3_f16_launch,
-        ),
-        (16, 128, 4) => (
-            cutlass_gemm_16x128_s4_bf16_launch,
-            cutlass_gemm_16x128_s4_f16_launch,
-        ),
-        (32, 64, 3) => (
-            cutlass_gemm_32x64_s3_bf16_launch,
-            cutlass_gemm_32x64_s3_f16_launch,
-        ),
-        (32, 64, 4) => (
-            cutlass_gemm_32x64_s4_bf16_launch,
-            cutlass_gemm_32x64_s4_f16_launch,
-        ),
-        (32, 128, 3) => (
-            cutlass_gemm_32x128_s3_bf16_launch,
-            cutlass_gemm_32x128_s3_f16_launch,
-        ),
-        (32, 128, 4) => (
-            cutlass_gemm_32x128_s4_bf16_launch,
-            cutlass_gemm_32x128_s4_f16_launch,
-        ),
-        (32, 256, 3) => (
-            cutlass_gemm_32x256_s3_bf16_launch,
-            cutlass_gemm_32x256_s3_f16_launch,
-        ),
-        (64, 64, 3) => (
-            cutlass_gemm_64x64_s3_bf16_launch,
-            cutlass_gemm_64x64_s3_f16_launch,
-        ),
-        (64, 64, 4) => (
-            cutlass_gemm_64x64_s4_bf16_launch,
-            cutlass_gemm_64x64_s4_f16_launch,
-        ),
-        (64, 128, 3) => (
-            cutlass_gemm_64x128_s3_bf16_launch,
-            cutlass_gemm_64x128_s3_f16_launch,
-        ),
-        (64, 128, 4) => (
-            cutlass_gemm_64x128_s4_bf16_launch,
-            cutlass_gemm_64x128_s4_f16_launch,
-        ),
-        (128, 64, 3) => (
-            cutlass_gemm_128x64_s3_bf16_launch,
-            cutlass_gemm_128x64_s3_f16_launch,
-        ),
-        (128, 64, 4) => (
-            cutlass_gemm_128x64_s4_bf16_launch,
-            cutlass_gemm_128x64_s4_f16_launch,
-        ),
-        (128, 128, 3) => (
-            cutlass_gemm_128x128_s3_bf16_launch,
-            cutlass_gemm_128x128_s3_f16_launch,
-        ),
-        (128, 128, 4) => (
-            cutlass_gemm_128x128_s4_bf16_launch,
-            cutlass_gemm_128x128_s4_f16_launch,
-        ),
-        (128, 256, 3) => (
-            cutlass_gemm_128x256_s3_bf16_launch,
-            cutlass_gemm_128x256_s3_f16_launch,
-        ),
-        (256, 64, 3) => (
-            cutlass_gemm_256x64_s3_bf16_launch,
-            cutlass_gemm_256x64_s3_f16_launch,
-        ),
-        (256, 64, 4) => (
-            cutlass_gemm_256x64_s4_bf16_launch,
-            cutlass_gemm_256x64_s4_f16_launch,
-        ),
+fn launch_fn_for(tile: CutlassTile) -> CutlassLaunchFn {
+    match (tile.tile_m, tile.tile_n, tile.stages) {
+        (16, 64, 3) => cutlass_gemm_16x64_s3_launch,
+        (16, 64, 4) => cutlass_gemm_16x64_s4_launch,
+        (16, 128, 3) => cutlass_gemm_16x128_s3_launch,
+        (16, 128, 4) => cutlass_gemm_16x128_s4_launch,
+        (32, 64, 3) => cutlass_gemm_32x64_s3_launch,
+        (32, 64, 4) => cutlass_gemm_32x64_s4_launch,
+        (32, 128, 3) => cutlass_gemm_32x128_s3_launch,
+        (32, 128, 4) => cutlass_gemm_32x128_s4_launch,
+        (32, 256, 3) => cutlass_gemm_32x256_s3_launch,
+        (64, 64, 3) => cutlass_gemm_64x64_s3_launch,
+        (64, 64, 4) => cutlass_gemm_64x64_s4_launch,
+        (64, 128, 3) => cutlass_gemm_64x128_s3_launch,
+        (64, 128, 4) => cutlass_gemm_64x128_s4_launch,
+        (128, 64, 3) => cutlass_gemm_128x64_s3_launch,
+        (128, 64, 4) => cutlass_gemm_128x64_s4_launch,
+        (128, 128, 3) => cutlass_gemm_128x128_s3_launch,
+        (128, 128, 4) => cutlass_gemm_128x128_s4_launch,
+        (128, 256, 3) => cutlass_gemm_128x256_s3_launch,
+        (256, 64, 3) => cutlass_gemm_256x64_s3_launch,
+        (256, 64, 4) => cutlass_gemm_256x64_s4_launch,
         other => panic!(
             "cutlass: unsupported tile {:?} — add its extern declaration + csv entry",
             other,
         ),
-    };
-    select_dtype(pair, dtype)
+    }
 }
 
 /// Safe wrapper: allocate output `[M, N]` and invoke the tile
@@ -595,7 +810,7 @@ pub unsafe fn cutlass_gemm(
     let n = b.dim(0);
     let k = a.dim(1);
     let out = alloc.alloc_tensor(&[m, n], a.dtype());
-    let launch = launch_fn_for(tile, a.dtype());
+    let launch = launch_fn_for(tile);
     let rc = unsafe {
         launch(
             out.as_mut_ptr::<u16>(),
@@ -665,87 +880,31 @@ type CutlassSplitKLaunchFn = unsafe extern "C" fn(
 ) -> i32;
 
 #[cfg(feature = "cuda")]
-fn launch_fn_for_splitk(tile: CutlassSplitKTile, dtype: DType) -> CutlassSplitKLaunchFn {
-    let pair: (CutlassSplitKLaunchFn, CutlassSplitKLaunchFn) =
-        match (tile.tile_m, tile.tile_n, tile.stages, tile.split_k) {
-            (64, 64, 4, 2) => (
-                cutlass_gemm_64x64_s4_sk2_bf16_launch,
-                cutlass_gemm_64x64_s4_sk2_f16_launch,
-            ),
-            (64, 64, 4, 4) => (
-                cutlass_gemm_64x64_s4_sk4_bf16_launch,
-                cutlass_gemm_64x64_s4_sk4_f16_launch,
-            ),
-            (64, 64, 4, 8) => (
-                cutlass_gemm_64x64_s4_sk8_bf16_launch,
-                cutlass_gemm_64x64_s4_sk8_f16_launch,
-            ),
-            (64, 128, 4, 2) => (
-                cutlass_gemm_64x128_s4_sk2_bf16_launch,
-                cutlass_gemm_64x128_s4_sk2_f16_launch,
-            ),
-            (64, 128, 4, 4) => (
-                cutlass_gemm_64x128_s4_sk4_bf16_launch,
-                cutlass_gemm_64x128_s4_sk4_f16_launch,
-            ),
-            (64, 128, 4, 8) => (
-                cutlass_gemm_64x128_s4_sk8_bf16_launch,
-                cutlass_gemm_64x128_s4_sk8_f16_launch,
-            ),
-            (128, 64, 4, 2) => (
-                cutlass_gemm_128x64_s4_sk2_bf16_launch,
-                cutlass_gemm_128x64_s4_sk2_f16_launch,
-            ),
-            (128, 64, 4, 4) => (
-                cutlass_gemm_128x64_s4_sk4_bf16_launch,
-                cutlass_gemm_128x64_s4_sk4_f16_launch,
-            ),
-            (128, 64, 4, 8) => (
-                cutlass_gemm_128x64_s4_sk8_bf16_launch,
-                cutlass_gemm_128x64_s4_sk8_f16_launch,
-            ),
-            (128, 128, 4, 2) => (
-                cutlass_gemm_128x128_s4_sk2_bf16_launch,
-                cutlass_gemm_128x128_s4_sk2_f16_launch,
-            ),
-            (128, 128, 4, 4) => (
-                cutlass_gemm_128x128_s4_sk4_bf16_launch,
-                cutlass_gemm_128x128_s4_sk4_f16_launch,
-            ),
-            (128, 128, 4, 8) => (
-                cutlass_gemm_128x128_s4_sk8_bf16_launch,
-                cutlass_gemm_128x128_s4_sk8_f16_launch,
-            ),
-            (16, 64, 4, 2) => (
-                cutlass_gemm_16x64_s4_sk2_bf16_launch,
-                cutlass_gemm_16x64_s4_sk2_f16_launch,
-            ),
-            (16, 64, 4, 4) => (
-                cutlass_gemm_16x64_s4_sk4_bf16_launch,
-                cutlass_gemm_16x64_s4_sk4_f16_launch,
-            ),
-            (16, 64, 4, 8) => (
-                cutlass_gemm_16x64_s4_sk8_bf16_launch,
-                cutlass_gemm_16x64_s4_sk8_f16_launch,
-            ),
-            (16, 128, 4, 2) => (
-                cutlass_gemm_16x128_s4_sk2_bf16_launch,
-                cutlass_gemm_16x128_s4_sk2_f16_launch,
-            ),
-            (16, 128, 4, 4) => (
-                cutlass_gemm_16x128_s4_sk4_bf16_launch,
-                cutlass_gemm_16x128_s4_sk4_f16_launch,
-            ),
-            (16, 128, 4, 8) => (
-                cutlass_gemm_16x128_s4_sk8_bf16_launch,
-                cutlass_gemm_16x128_s4_sk8_f16_launch,
-            ),
-            other => panic!(
-                "cutlass splitk: unsupported tile {:?} — add its extern + csv entry",
-                other,
-            ),
-        };
-    select_dtype(pair, dtype)
+fn launch_fn_for_splitk(tile: CutlassSplitKTile) -> CutlassSplitKLaunchFn {
+    match (tile.tile_m, tile.tile_n, tile.stages, tile.split_k) {
+        (64, 64, 4, 2) => cutlass_gemm_64x64_s4_sk2_launch,
+        (64, 64, 4, 4) => cutlass_gemm_64x64_s4_sk4_launch,
+        (64, 64, 4, 8) => cutlass_gemm_64x64_s4_sk8_launch,
+        (64, 128, 4, 2) => cutlass_gemm_64x128_s4_sk2_launch,
+        (64, 128, 4, 4) => cutlass_gemm_64x128_s4_sk4_launch,
+        (64, 128, 4, 8) => cutlass_gemm_64x128_s4_sk8_launch,
+        (128, 64, 4, 2) => cutlass_gemm_128x64_s4_sk2_launch,
+        (128, 64, 4, 4) => cutlass_gemm_128x64_s4_sk4_launch,
+        (128, 64, 4, 8) => cutlass_gemm_128x64_s4_sk8_launch,
+        (128, 128, 4, 2) => cutlass_gemm_128x128_s4_sk2_launch,
+        (128, 128, 4, 4) => cutlass_gemm_128x128_s4_sk4_launch,
+        (128, 128, 4, 8) => cutlass_gemm_128x128_s4_sk8_launch,
+        (16, 64, 4, 2) => cutlass_gemm_16x64_s4_sk2_launch,
+        (16, 64, 4, 4) => cutlass_gemm_16x64_s4_sk4_launch,
+        (16, 64, 4, 8) => cutlass_gemm_16x64_s4_sk8_launch,
+        (16, 128, 4, 2) => cutlass_gemm_16x128_s4_sk2_launch,
+        (16, 128, 4, 4) => cutlass_gemm_16x128_s4_sk4_launch,
+        (16, 128, 4, 8) => cutlass_gemm_16x128_s4_sk8_launch,
+        other => panic!(
+            "cutlass splitk: unsupported tile {:?} — add its extern + csv entry",
+            other,
+        ),
+    }
 }
 
 /// SplitK GEMM: `C[M, N] = A[M, K] @ B[N, K]^T` with the K dim split
@@ -779,7 +938,7 @@ pub unsafe fn cutlass_gemm_splitk(
     let ws_elems = (tile.split_k as usize) * m * n;
     let workspace = alloc.alloc_tensor(&[ws_elems], ferrite_cuda_core::DType::F32);
 
-    let launch = launch_fn_for_splitk(tile, a.dtype());
+    let launch = launch_fn_for_splitk(tile);
     let rc = unsafe {
         launch(
             out.as_mut_ptr::<u16>(),
@@ -835,7 +994,7 @@ pub unsafe fn cutlass_gemm_add(
     let m = a.dim(0);
     let n = b.dim(0);
     let k = a.dim(1);
-    let launch = launch_fn_for(tile, a.dtype());
+    let launch = launch_fn_for(tile);
     let rc = unsafe {
         launch(
             residual.as_mut_ptr::<u16>(),
@@ -870,13 +1029,8 @@ pub unsafe fn cutlass_gemv(
     let n = b.dim(0);
     let k = a.dim(1);
     let out = alloc.alloc_tensor(&[m, n], a.dtype());
-    // fn items of distinct extern fns have unique types — coerce to a
-    // shared fn-pointer type before tupling.
-    let pair: (CutlassLaunchFn, CutlassLaunchFn) =
-        (cutlass_gemv_bf16_launch, cutlass_gemv_f16_launch);
-    let launch = select_dtype(pair, a.dtype());
     let rc = unsafe {
-        launch(
+        cutlass_gemv_launch(
             out.as_mut_ptr::<u16>(),
             a.as_ptr::<u16>(),
             b.as_ptr::<u16>(),
@@ -899,95 +1053,33 @@ type CutlassBiasLaunchFn =
     unsafe extern "C" fn(*mut u16, *const u16, *const u16, *const u16, i32, i32, i32, u64) -> i32;
 
 #[cfg(feature = "cuda")]
-fn launch_fn_for_bias(tile: CutlassTile, dtype: DType) -> CutlassBiasLaunchFn {
-    let pair: (CutlassBiasLaunchFn, CutlassBiasLaunchFn) =
-        match (tile.tile_m, tile.tile_n, tile.stages) {
-            (16, 64, 3) => (
-                cutlass_gemm_bias_16x64_s3_bf16_launch,
-                cutlass_gemm_bias_16x64_s3_f16_launch,
-            ),
-            (16, 64, 4) => (
-                cutlass_gemm_bias_16x64_s4_bf16_launch,
-                cutlass_gemm_bias_16x64_s4_f16_launch,
-            ),
-            (16, 128, 3) => (
-                cutlass_gemm_bias_16x128_s3_bf16_launch,
-                cutlass_gemm_bias_16x128_s3_f16_launch,
-            ),
-            (16, 128, 4) => (
-                cutlass_gemm_bias_16x128_s4_bf16_launch,
-                cutlass_gemm_bias_16x128_s4_f16_launch,
-            ),
-            (32, 64, 3) => (
-                cutlass_gemm_bias_32x64_s3_bf16_launch,
-                cutlass_gemm_bias_32x64_s3_f16_launch,
-            ),
-            (32, 64, 4) => (
-                cutlass_gemm_bias_32x64_s4_bf16_launch,
-                cutlass_gemm_bias_32x64_s4_f16_launch,
-            ),
-            (32, 128, 3) => (
-                cutlass_gemm_bias_32x128_s3_bf16_launch,
-                cutlass_gemm_bias_32x128_s3_f16_launch,
-            ),
-            (32, 128, 4) => (
-                cutlass_gemm_bias_32x128_s4_bf16_launch,
-                cutlass_gemm_bias_32x128_s4_f16_launch,
-            ),
-            (32, 256, 3) => (
-                cutlass_gemm_bias_32x256_s3_bf16_launch,
-                cutlass_gemm_bias_32x256_s3_f16_launch,
-            ),
-            (64, 64, 3) => (
-                cutlass_gemm_bias_64x64_s3_bf16_launch,
-                cutlass_gemm_bias_64x64_s3_f16_launch,
-            ),
-            (64, 64, 4) => (
-                cutlass_gemm_bias_64x64_s4_bf16_launch,
-                cutlass_gemm_bias_64x64_s4_f16_launch,
-            ),
-            (64, 128, 3) => (
-                cutlass_gemm_bias_64x128_s3_bf16_launch,
-                cutlass_gemm_bias_64x128_s3_f16_launch,
-            ),
-            (64, 128, 4) => (
-                cutlass_gemm_bias_64x128_s4_bf16_launch,
-                cutlass_gemm_bias_64x128_s4_f16_launch,
-            ),
-            (128, 64, 3) => (
-                cutlass_gemm_bias_128x64_s3_bf16_launch,
-                cutlass_gemm_bias_128x64_s3_f16_launch,
-            ),
-            (128, 64, 4) => (
-                cutlass_gemm_bias_128x64_s4_bf16_launch,
-                cutlass_gemm_bias_128x64_s4_f16_launch,
-            ),
-            (128, 128, 3) => (
-                cutlass_gemm_bias_128x128_s3_bf16_launch,
-                cutlass_gemm_bias_128x128_s3_f16_launch,
-            ),
-            (128, 128, 4) => (
-                cutlass_gemm_bias_128x128_s4_bf16_launch,
-                cutlass_gemm_bias_128x128_s4_f16_launch,
-            ),
-            (128, 256, 3) => (
-                cutlass_gemm_bias_128x256_s3_bf16_launch,
-                cutlass_gemm_bias_128x256_s3_f16_launch,
-            ),
-            (256, 64, 3) => (
-                cutlass_gemm_bias_256x64_s3_bf16_launch,
-                cutlass_gemm_bias_256x64_s3_f16_launch,
-            ),
-            (256, 64, 4) => (
-                cutlass_gemm_bias_256x64_s4_bf16_launch,
-                cutlass_gemm_bias_256x64_s4_f16_launch,
-            ),
-            other => panic!(
-                "cutlass_gemm_bias: unsupported tile {:?} — add its extern + csv entry",
-                other,
-            ),
-        };
-    select_dtype(pair, dtype)
+fn launch_fn_for_bias(tile: CutlassTile) -> CutlassBiasLaunchFn {
+    match (tile.tile_m, tile.tile_n, tile.stages) {
+        (16, 64, 3) => cutlass_gemm_bias_16x64_s3_launch,
+        (16, 64, 4) => cutlass_gemm_bias_16x64_s4_launch,
+        (16, 128, 3) => cutlass_gemm_bias_16x128_s3_launch,
+        (16, 128, 4) => cutlass_gemm_bias_16x128_s4_launch,
+        (32, 64, 3) => cutlass_gemm_bias_32x64_s3_launch,
+        (32, 64, 4) => cutlass_gemm_bias_32x64_s4_launch,
+        (32, 128, 3) => cutlass_gemm_bias_32x128_s3_launch,
+        (32, 128, 4) => cutlass_gemm_bias_32x128_s4_launch,
+        (32, 256, 3) => cutlass_gemm_bias_32x256_s3_launch,
+        (64, 64, 3) => cutlass_gemm_bias_64x64_s3_launch,
+        (64, 64, 4) => cutlass_gemm_bias_64x64_s4_launch,
+        (64, 128, 3) => cutlass_gemm_bias_64x128_s3_launch,
+        (64, 128, 4) => cutlass_gemm_bias_64x128_s4_launch,
+        (128, 64, 3) => cutlass_gemm_bias_128x64_s3_launch,
+        (128, 64, 4) => cutlass_gemm_bias_128x64_s4_launch,
+        (128, 128, 3) => cutlass_gemm_bias_128x128_s3_launch,
+        (128, 128, 4) => cutlass_gemm_bias_128x128_s4_launch,
+        (128, 256, 3) => cutlass_gemm_bias_128x256_s3_launch,
+        (256, 64, 3) => cutlass_gemm_bias_256x64_s3_launch,
+        (256, 64, 4) => cutlass_gemm_bias_256x64_s4_launch,
+        other => panic!(
+            "cutlass_gemm_bias: unsupported tile {:?} — add its extern + csv entry",
+            other,
+        ),
+    }
 }
 
 /// Fused GEMM + bias broadcast.
@@ -1022,7 +1114,7 @@ pub unsafe fn cutlass_gemm_bias(
     let n = weight.dim(0);
     let k = a.dim(1);
     let out = alloc.alloc_tensor(&[m, n], a.dtype());
-    let launch = launch_fn_for_bias(tile, a.dtype());
+    let launch = launch_fn_for_bias(tile);
     let rc = unsafe {
         launch(
             out.as_mut_ptr::<u16>(),
@@ -1078,18 +1170,8 @@ pub unsafe fn cutlass_gemm_silu_mul(
     let n = gate_weight.dim(0);
     let k = a.dim(1);
     let out = alloc.alloc_tensor(&[m, n], a.dtype());
-    // SiLU-mul launchers have a distinct prototype (no alpha/beta,
-    // four pointer args): define a local fn-pointer type so the
-    // bf16/f16 fn items coerce into the same `let` binding.
-    type SiluMulFn =
-        unsafe extern "C" fn(*mut u16, *const u16, *const u16, *mut u16, i32, i32, i32, u64) -> i32;
-    let pair: (SiluMulFn, SiluMulFn) = (
-        cutlass_gemm_silu_mul_bf16_launch,
-        cutlass_gemm_silu_mul_f16_launch,
-    );
-    let launch = select_dtype(pair, a.dtype());
     let rc = unsafe {
-        launch(
+        cutlass_gemm_silu_mul_launch(
             out.as_mut_ptr::<u16>(),
             a.as_ptr::<u16>(),
             gate_weight.as_ptr::<u16>(),

@@ -241,7 +241,7 @@ async fn test_lora_synthetic_output_differs() {
 }
 
 // ===========================================================================
-// CUDA LoRA tests (CudaWorker backend)
+// CUDA LoRA tests (FerriteWorker backend)
 // ===========================================================================
 
 /// Test that a CUDA server with a synthetic LoRA adapter starts and serves.

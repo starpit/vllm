@@ -19,7 +19,6 @@ arch-gemma3        = ["dep:ferrite-model-gemma3"]
 arch-gemma3-mm     = ["arch-gemma3", "dep:ferrite-model-gemma3-mm"]
 arch-granite       = ["dep:ferrite-model-granite"]
 arch-llama         = ["dep:ferrite-model-llama"]
-arch-llava         = ["arch-llama", "dep:ferrite-model-llava"]
 arch-mistral       = ["dep:ferrite-model-mistral"]
 arch-mixtral       = ["dep:ferrite-model-mixtral"]
 arch-modernbert    = ["dep:ferrite-model-modernbert"]
@@ -41,7 +40,6 @@ all-arches = [
     "arch-gemma3-mm",
     "arch-granite",
     "arch-llama",
-    "arch-llava",
     "arch-mistral",
     "arch-mixtral",
     "arch-modernbert",
@@ -61,7 +59,6 @@ cuda = [
     "ferrite-model-gemma3-mm?/cuda",
     "ferrite-model-granite?/cuda",
     "ferrite-model-llama?/cuda",
-    "ferrite-model-llava?/cuda",
     "ferrite-model-mistral?/cuda",
     "ferrite-model-mixtral?/cuda",
     "ferrite-model-modernbert?/cuda",
@@ -77,6 +74,22 @@ cuda = [
     "ferrite-model-deepseek-v3-flat?/cuda",
 ]
 
+# Metal umbrella. Forwards `metal` to every per-arch crate whose
+# Cargo.toml advertises a `metal` feature; the per-arch crate itself
+# is the source-of-truth compatibility checker. Per-arch metal feature
+# absent ⇒ the `?/metal` line is a no-op (cargo silently drops it).
+metal = [
+    "ferrite-model-commandr?/metal",
+    "ferrite-model-gemma2?/metal",
+    "ferrite-model-gemma3?/metal",
+    "ferrite-model-granite?/metal",
+    "ferrite-model-llama?/metal",
+    "ferrite-model-mistral?/metal",
+    "ferrite-model-modernbert?/metal",
+    "ferrite-model-qwen2?/metal",
+    "ferrite-model-qwen3?/metal",
+]
+
 # Tensor-parallel umbrella. Forwards `nccl` through to every per-arch
 # crate so a single `--features nccl` on this crate flips the whole
 # tree onto the TP-aware build. Until task #7's compile() outer-loop
@@ -90,7 +103,6 @@ nccl = [
     "ferrite-model-gemma3-mm?/nccl",
     "ferrite-model-granite?/nccl",
     "ferrite-model-llama?/nccl",
-    "ferrite-model-llava?/nccl",
     "ferrite-model-mistral?/nccl",
     "ferrite-model-mixtral?/nccl",
     "ferrite-model-modernbert?/nccl",
@@ -115,7 +127,6 @@ ferrite-model-gemma3       = { path = "../ferrite-model-gemma3",       optional 
 ferrite-model-gemma3-mm    = { path = "../ferrite-model-gemma3-mm",    optional = true }
 ferrite-model-granite      = { path = "../ferrite-model-granite",      optional = true }
 ferrite-model-llama        = { path = "../ferrite-model-llama",        optional = true }
-ferrite-model-llava        = { path = "../ferrite-model-llava",        optional = true }
 ferrite-model-mistral      = { path = "../ferrite-model-mistral",      optional = true }
 ferrite-model-mixtral      = { path = "../ferrite-model-mixtral",      optional = true }
 ferrite-model-modernbert   = { path = "../ferrite-model-modernbert",   optional = true }

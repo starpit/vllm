@@ -16,14 +16,19 @@
 //! load shape at call time.
 
 use anyhow::Result;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::CUstream;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::DType;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
+#[cfg(feature = "cuda")]
 use ferrite_kernels::layers::{
-    Bnb4bitLinear, Embedding, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear, LayerNorm, LinearLayer,
-    MarlinLinear, RmsNorm,
+    Bnb4bitLinear, Fp8AnyLinear, Fp8BlockLinear, Fp8Linear, MarlinLinear,
 };
+use ferrite_kernels::layers::{Embedding, LayerNorm, LinearLayer, RmsNorm};
+#[cfg(feature = "cuda")]
 use ferrite_kernels::layers_quant::MarlinFormat;
 
 use crate::{layer_weight_path_with_root, vision_block_weight_path};
@@ -64,6 +69,7 @@ pub fn load_layered_embedding(
 /// and so the codegen macro can route every layered FieldLoad
 /// through a `_sharded` variant uniformly. Per Python vLLM's
 /// `VocabParallelEmbedding`.
+#[cfg(feature = "cuda")]
 pub fn load_layered_embedding_sharded(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -181,10 +187,84 @@ pub fn load_layered_linear_dense(
         .collect()
 }
 
+/// MLX-affine int4 layered linear load (Metal-only). Reads the
+/// `<root>.<layer>.<suffix>.{weight,scales,biases,bias?}` triple per
+/// decoder layer. Produces AffineQuant LinearLayers — forward-time
+/// qmv path consumer (P3+).
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_affine_quant(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffix: &str,
+    group_size: u32,
+    bits: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            LinearLayer::load_affine_quant(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                group_size,
+                bits,
+            )
+        })
+        .collect()
+}
+
+/// MLX-affine int4 layered dequant-as-dense load (Metal-only). INT4
+/// P2 slow-reference path: CPU-dequantize each per-layer affine
+/// triple into a BF16 Dense Linear. Mirrors
+/// [`load_layered_linear_affine_quant`] but the macro emits this
+/// (not the AffineQuant variant) so the forward path stays on the
+/// existing dense Gemm impls.
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_affine_dequant_as_dense(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffix: &str,
+    group_size: u32,
+    bits: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            LinearLayer::load_affine_dequant_as_dense(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                group_size,
+                bits,
+            )
+        })
+        .collect()
+}
+
+/// Fused-concat sibling of [`load_layered_linear_affine_dequant_as_dense`].
+/// One Dense per layer, each containing the byte-concat of the per-layer
+/// affine prefixes (gate / up, or q / k / v).
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_affine_dequant_concat_as_dense(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffixes: &[&str],
+    group_size: u32,
+    bits: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(root, layer, suffixes);
+            let refs = as_str_refs(&paths);
+            LinearLayer::load_affine_dequant_concat_as_dense(gw, &refs, group_size, bits)
+        })
+        .collect()
+}
+
 /// Tensor-parallel layered dense Linear load. See
 /// [`ferrite_kernels::layers::Linear::load_sharded`] for the per-
 /// dim bias semantics. Used by codegen at tp>1: column-parallel
 /// (q/k/v/gate/up) → `dim = 0`; row-parallel (o/down) → `dim = 1`.
+#[cfg(feature = "cuda")]
 pub fn load_layered_linear_dense_sharded(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -207,6 +287,7 @@ pub fn load_layered_linear_dense_sharded(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 pub fn load_layered_linear_dense_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -235,6 +316,7 @@ pub fn load_layered_linear_dense_concat(
 /// `#[vision_forward]` (the SwiGLU MLP fusion concatenates
 /// `mlp.gate_proj` + `mlp.up_proj` weights at load time so the fused
 /// kernel runs against a single packed `[K, 2*N]` linear).
+#[cfg(feature = "cuda")]
 pub fn load_layered_linear_dense_concat_vision(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -257,6 +339,7 @@ pub fn load_layered_linear_dense_concat_vision(
 /// Tensor-parallel column-parallel concat (no `dim` arg — fused
 /// QKV / gate_up are always column-parallel; see
 /// [`ferrite_kernels::layers::LinearLayer::load_dense_concat_sharded`]).
+#[cfg(feature = "cuda")]
 pub fn load_layered_linear_dense_concat_sharded(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -275,6 +358,26 @@ pub fn load_layered_linear_dense_concat_sharded(
         .collect()
 }
 
+/// Stream-free counterpart to [`load_layered_linear_dense_concat`] —
+/// CPU-concat then one allocator call per layer via
+/// [`LinearLayer::load_dense_concat_packed`]. Reachable under either
+/// backend; metal callers route here.
+pub fn load_layered_linear_dense_concat_packed(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffixes: &[&str],
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(root, layer, suffixes);
+            let refs = as_str_refs(&paths);
+            LinearLayer::load_dense_concat_packed(gw, &refs)
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn load_layered_marlin_linear(
     gw: &mut GpuWeights,
@@ -298,6 +401,7 @@ pub fn load_layered_marlin_linear(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn load_layered_marlin_linear_concat(
     gw: &mut GpuWeights,
@@ -317,6 +421,7 @@ pub fn load_layered_marlin_linear_concat(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 pub fn load_layered_fp8_linear(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -336,6 +441,7 @@ pub fn load_layered_fp8_linear(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 pub fn load_layered_fp8_linear_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -352,6 +458,7 @@ pub fn load_layered_fp8_linear_concat(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 pub fn load_layered_fp8_block_linear(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -371,6 +478,7 @@ pub fn load_layered_fp8_block_linear(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 pub fn load_layered_fp8_block_linear_concat(
     gw: &mut GpuWeights,
     n_layers: u32,
@@ -387,6 +495,7 @@ pub fn load_layered_fp8_block_linear_concat(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn load_layered_bnb4(
     gw: &mut GpuWeights,
@@ -414,6 +523,7 @@ pub fn load_layered_bnb4(
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn load_layered_bnb4_concat(
     gw: &mut GpuWeights,

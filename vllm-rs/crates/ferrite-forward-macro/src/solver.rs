@@ -450,7 +450,9 @@ fn solve_one(
         fuf,
         profile: target,
         bounds,
+        expected_calls_per_load: CostCtx::default_expected_calls_per_load(target.backend),
     };
+    let amortization_n = ctx.expected_calls_per_load as f64;
 
     for (i, node) in fuf.nodes.iter().enumerate() {
         for (imp_id, info) in &match_cache[i] {
@@ -461,7 +463,17 @@ fn solve_one(
             {
                 continue;
             }
-            let cost = imp.cost_us(info, &ctx);
+            // Amortized cost = startup + N × per_call. Defaults to
+            // pure per-call (startup_us = 0.0 trait default), so any
+            // impl that doesn't override `startup_us` ranks identically
+            // to before. Impls with packed weight accessors (e.g.
+            // `MetalFusedGateUpSiluMulImpl`) override `startup_us`
+            // with the load-time CPU memcpy cost; the solver picks
+            // the unpacked alternative when N is small enough that
+            // the per-call savings can't pay for the pack.
+            let per_call = imp.cost_us(info, &ctx);
+            let startup = imp.startup_us(info, &ctx);
+            let cost = startup + amortization_n * per_call;
             if !cost.is_finite() {
                 return Err(SolveError::UnreachableCost {
                     tile: node.id,

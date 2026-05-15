@@ -9,36 +9,76 @@ pub use ferrite_forward_macro::{forward, vision_forward};
 
 #[cfg(feature = "cuda")]
 pub mod attack_surface;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod backend_compat;
 pub mod cpu_golden;
-#[cfg(feature = "cuda")]
+pub mod paged_kv_layout;
+// `info` is the non-generic, hashable backbone view used by
+// `vllm ferrite info`. The whole pipeline (BackboneDumpRegistration
+// inventory + Instruction::normalize) is backend-agnostic — opened to
+// both `cuda` and `metal` so the CLI subcommand walks compiled metal
+// arches too.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod info;
-#[cfg(feature = "cuda")]
+// `instr` is dual-mode: the `Instruction<W>` enum + `CanonicalParams` trait +
+// `WtFn`/`CosSinFn` aliases compile under either `cuda` or `metal`. The
+// CUDA-only eval/run/run_backbone fns inside are individually
+// `#[cfg(feature = "cuda")]`-gated.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod instr;
-#[cfg(feature = "cuda")]
+// Layered-load helpers are dual-mode like `layers` / `rotary`: stream-free
+// helpers (Embedding, RmsNorm, LinearDense, plus the new `_concat_packed`
+// variant) compile under metal too; cuda-stream-using and quant variants are
+// individually `#[cfg(feature = "cuda")]`-gated inside the file.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
 #[cfg(feature = "cuda")]
 pub mod vision_arch;
 
-#[cfg(feature = "cuda")]
+// Metal interpreter: lowering pass + worker pool. Phase 5.A lands the
+// lowering data model and `From<&[Instruction<W>]>` impl.
+#[cfg(feature = "metal")]
+pub mod interpreter;
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use info::{
     BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep, VariantDump,
     normalize_slice,
 };
 
+// Backend-agnostic frontend types. Available under either backend feature.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use instr::{CanonicalParams, CosSinFn, Instruction, WtFn};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use backend_compat::{BackendCompat, Cuda, Metal, Wgpu};
+// CUDA-only runtime entry points.
 #[cfg(feature = "cuda")]
-pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone};
+pub use instr::{InterpreterCtx, run, run_backbone};
+// Stream-free / quant-free helpers — reachable under either backend.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use loaders::{
+    load_layered_embedding, load_layered_layer_norm, load_layered_layer_norm_vision,
+    load_layered_linear_dense, load_layered_linear_dense_concat_packed,
+    load_layered_linear_dense_vision, load_layered_rms_norm, load_layered_rms_norm_vision,
+};
+// MLX-affine helpers — Metal-only. Macro-emitted code uses these
+// against `mlx-community/*-4bit` checkpoints.
+#[cfg(feature = "metal")]
+pub use loaders::{
+    load_layered_linear_affine_dequant_as_dense,
+    load_layered_linear_affine_dequant_concat_as_dense, load_layered_linear_affine_quant,
+};
+// Stream-using and quant helpers — cuda-only.
 #[cfg(feature = "cuda")]
 pub use loaders::{
-    load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,
-    load_layered_embedding_sharded, load_layered_fp8_block_linear,
-    load_layered_fp8_block_linear_concat, load_layered_fp8_linear, load_layered_fp8_linear_concat,
-    load_layered_layer_norm, load_layered_layer_norm_vision, load_layered_linear_dense,
-    load_layered_linear_dense_concat, load_layered_linear_dense_concat_sharded,
-    load_layered_linear_dense_concat_vision, load_layered_linear_dense_sharded,
-    load_layered_linear_dense_vision, load_layered_marlin_linear,
-    load_layered_marlin_linear_concat, load_layered_rms_norm, load_layered_rms_norm_vision,
+    load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding_sharded,
+    load_layered_fp8_block_linear, load_layered_fp8_block_linear_concat, load_layered_fp8_linear,
+    load_layered_fp8_linear_concat, load_layered_linear_dense_concat,
+    load_layered_linear_dense_concat_sharded, load_layered_linear_dense_concat_vision,
+    load_layered_linear_dense_sharded, load_layered_marlin_linear,
+    load_layered_marlin_linear_concat,
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
@@ -71,7 +111,14 @@ pub use vision_arch::{VisionArchWeights, VisionWrapper};
 ///   6 = num_slots      — tile-table size for `run`/`run_backbone`
 ///   7 = backbone_slot  — slot `forward_backbone` returns
 ///   8 = terminal_slot  — slot `forward` returns (after lm_head)
-#[cfg(feature = "cuda")]
+// `BucketEntry` is a plain tuple struct — no backend deps. Lifted to
+// `any(cuda, metal)` so the metal-side macro emits `FORWARD_TABLE`
+// too and `vllm ferrite info`'s `dump()` walks it. The cuda runtime
+// uses fields 6/7/8 (num_slots / backbone_slot / terminal_slot) to
+// size the tile table and pick return slots; the metal pool uses
+// `METAL_BUCKETS` instead, so those fields stay populated but
+// untouched on metal.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct BucketEntry<Op: 'static>(
     pub u64,
     pub u64,
@@ -218,11 +265,12 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
     h.finish()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod ctx {
     use ferrite_cuda_core::tensor::TensorView;
     use ferrite_kernels::kv_cache::KvCachePool;
 
+    #[cfg(feature = "cuda")]
     use super::EmbedPatch;
 
     /// Ambient runtime args the emitted forward fn needs. The
@@ -243,7 +291,7 @@ mod ctx {
         ///   the rope kernel reads each rotary index from the row that
         ///   `mrope_section` assigns it to. Must be set up by whoever
         ///   constructs the `ForwardCtx` (currently the `Self::Ferrite`
-        ///   arm in `vllm-executor::cuda_worker`); ferrite-forward
+        ///   arm in `vllm-executor::ferrite_worker`); ferrite-forward
         ///   itself is shape-agnostic past the kernel boundary.
         pub positions: TensorView<'a>,
         pub slot_mapping: TensorView<'a>,
@@ -263,7 +311,9 @@ mod ctx {
         /// text-only batch, no splice — byte-identical to pre-MM
         /// behavior. `mm_embeds = None` is only valid when
         /// `embed_patches` is empty.
+        #[cfg(feature = "cuda")]
         pub mm_embeds: Option<TensorView<'a>>,
+        #[cfg(feature = "cuda")]
         pub embed_patches: &'a [EmbedPatch],
         /// Vision-tower 2D RoPE cos table, shape `[total_L, head_dim/2]`,
         /// bf16. Built host-side from `grid_thw` per vision-encoder call;
@@ -272,9 +322,11 @@ mod ctx {
         /// forward calls — the `Instruction::VisionRope` arm panics on
         /// `expect` if reached without these set, mirroring the
         /// `tp_group` contract for `Instruction::AllReduce` at tp>1.
+        #[cfg(feature = "cuda")]
         pub vision_rope_cos: Option<TensorView<'a>>,
         /// Vision-tower 2D RoPE sin table. Same shape / population /
         /// invariants as [`Self::vision_rope_cos`].
+        #[cfg(feature = "cuda")]
         pub vision_rope_sin: Option<TensorView<'a>>,
         /// Vision-tower input patches buffer, shape `[num_tokens,
         /// vision_in_features]`, bf16. The vision encoder's
@@ -294,6 +346,7 @@ mod ctx {
         /// counterpart copies this view into a tile-table OwnedTensor
         /// the rest of the encoder consumes. See
         /// [`crate::Instruction::LoadPixels`] for the eval body.
+        #[cfg(feature = "cuda")]
         pub pixels: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-image **full-frame**
         /// segmentation. Populated by the vision wrapper for arches
@@ -301,28 +354,34 @@ mod ctx {
         /// max_seqlen_full)` at fullatt-layer indices; `None` for
         /// every text-side call and for vision arches that use a
         /// single `cu_seqlens_q` (Qwen2-VL).
+        #[cfg(feature = "cuda")]
         pub vision_cu_seqlens_full: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-window segmentation.
         /// Populated by the vision wrapper for windowed-attention
         /// layers; same `None` semantics as
         /// [`Self::vision_cu_seqlens_full`].
+        #[cfg(feature = "cuda")]
         pub vision_cu_seqlens_window: Option<TensorView<'a>>,
         /// Qwen2.5-VL: max segment length under
         /// [`Self::vision_cu_seqlens_full`]. `None` when not in use.
+        #[cfg(feature = "cuda")]
         pub vision_max_seqlen_full: Option<usize>,
         /// Qwen2.5-VL: max segment length under
         /// [`Self::vision_cu_seqlens_window`]. `None` when not in use.
+        #[cfg(feature = "cuda")]
         pub vision_max_seqlen_window: Option<usize>,
         /// Qwen2.5-VL: per-merged-cell natural→window-grouped
         /// permutation `[L / spatial_merge_size²]` u32. Drives the
         /// entry-side `embedding_gather(x, window_index)` (and the
         /// matching `embedding_gather(cos/sin, window_index)`) so
         /// every windowed-attention layer reads contiguous segments.
+        #[cfg(feature = "cuda")]
         pub vision_window_index: Option<TensorView<'a>>,
         /// Qwen2.5-VL: inverse of [`Self::vision_window_index`] —
         /// per-merged-cell window-grouped→natural permutation that
         /// undoes the entry permute on the merger output before
         /// splice into the language-model embedding stream.
+        #[cfg(feature = "cuda")]
         pub vision_reverse_indices: Option<TensorView<'a>>,
         /// SigLIP-style learned positional embedding indices, shape
         /// `[num_tokens]` u32. Built host-side as `[0..num_pos,
@@ -332,20 +391,21 @@ mod ctx {
         /// text-side forward calls and for vision arches that don't
         /// need a positional embedding (Qwen2-VL / Qwen2.5-VL use
         /// 2D RoPE via `vision_rope` instead).
+        #[cfg(feature = "cuda")]
         pub vision_position_ids: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when
         // built with `--features nccl` AND the worker constructed an
-        // NCCL group for this rank — see vllm-executor::cuda_worker.
+        // NCCL group for this rank — see vllm-executor::ferrite_worker.
         #[cfg(feature = "nccl")]
         pub tp_group: Option<&'a std::sync::Arc<ferrite_cuda_core::NcclGroup>>,
     }
 }
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use ctx::ForwardCtx;
 
-// ── Cross-arch dispatcher (cuda only) ────────────────────────────
+// ── Cross-arch dispatcher ────────────────────────────────────────
 //
 // Every `#[forward] fn <arch>()` macro invocation auto-emits an
 // `impl FerriteWeights for Weights` + an `inventory::submit!`
@@ -353,12 +413,21 @@ pub use ctx::ForwardCtx;
 // without a hand-written central list. Adding a new arch touches
 // only its source file plus a single `pub mod <arch>;` in the
 // calling crate's lib.rs (Rust module system requirement).
+//
+// Same trait + registration + walk under both backends. The trait
+// method signatures are identical character-for-character — the
+// types they reference (`GpuDevice`, `OwnedTensor`, `ForwardCtx`)
+// are cfg-mutex'd to their cuda or metal incarnation, so a single
+// signature serves both. Per-arch `impl FerriteWeights` bodies
+// (macro-emitted) cfg-mutex'd internally where the call shape
+// genuinely differs (cuda calls cuda's `forward(weights, ctx,
+// device, num_tokens)`; metal goes through `MetalWorkerPool::forward`).
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod dispatcher {
     use ferrite_cuda_core::CUstream;
-    use ferrite_cuda_core::alloc::OwnedTensor;
-    use ferrite_cuda_core::device::GpuDevice;
+    use ferrite_cuda_core::GpuDevice;
+    use ferrite_cuda_core::OwnedTensor;
     use ferrite_cuda_core::weights::GpuWeights;
 
     use super::ForwardCtx;
@@ -402,6 +471,35 @@ mod dispatcher {
             device: &mut GpuDevice,
             num_tokens: u64,
         ) -> OwnedTensor;
+
+        /// Per-worker arena peak in bytes (metal only).
+        ///
+        /// `MetalWorkerPool::for_buckets` derives the per-worker arena
+        /// layout as the elementwise-max across [`METAL_BUCKETS`]'
+        /// `arena_bytes` rows; the peak resident bytes per worker is
+        /// the sum of that elementwise-max. The metal worker reads
+        /// this to size `peak_activation_bytes` in
+        /// `determine_available_memory`, replacing the 512 MiB
+        /// placeholder from Step 3.B.
+        ///
+        /// Default returns 512 MiB so cuda-backed arches that never
+        /// override this still surface a sane placeholder if the
+        /// trait method is reached on a non-metal build path.
+        #[cfg(feature = "metal")]
+        fn metal_arena_peak_bytes(&self) -> u64 {
+            512 * 1024 * 1024
+        }
+
+        /// Per-canonical metal dtype. The macro emits an override
+        /// returning `<Self as CanonicalParams>::METAL_DTYPE` so the
+        /// worker can route argmax / weight-loader / etc. between
+        /// the f16 and bf16 paths without monomorphizing on `W`.
+        /// Default `Bf16` matches the trait-level default and the
+        /// modern HF checkpoint dtype.
+        #[cfg(feature = "metal")]
+        fn metal_dtype(&self) -> crate::interpreter::metal::MetalDtype {
+            crate::interpreter::metal::MetalDtype::Bf16
+        }
     }
 
     /// Minimal HF-config view threaded into `try_load` so per-variant
@@ -419,16 +517,26 @@ mod dispatcher {
     /// disambiguate.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct HfFingerprint<'a> {
-        pub max_position_embeddings: Option<u64>,
         pub rope_scaling_type: Option<&'a str>,
         /// Deterministic hash of the full `rope_scaling` JSON
         /// subobject (or `None` when the checkpoint has no
         /// rope_scaling). Discriminates checkpoints that share
-        /// `type` + `max_position_embeddings` but differ in
-        /// `short_factor` / `long_factor` values — e.g.
-        /// Phi-3.5-mini vs Phi-3-mini-128k, Phi-4-mini-instruct
-        /// vs Phi-4-mini-reasoning. Computed with
-        /// [`crate::hash_json_value`].
+        /// `rope_scaling_type` but differ in `short_factor` /
+        /// `long_factor` / `original_max_position_embeddings`
+        /// values — e.g. Phi-3.5-mini vs Phi-3-mini-128k,
+        /// Phi-4-mini-instruct vs Phi-4-mini-reasoning. Computed
+        /// with [`crate::hash_json_value`].
+        ///
+        /// `max_position_embeddings` is intentionally not on this
+        /// fingerprint. It doesn't affect forward-fn codegen (MPE
+        /// is a runtime KV-cache sizing input), and including it
+        /// rejected checkpoints whose published `config.json` has
+        /// a context window narrower than the upstream base
+        /// (e.g. mlx-community 4bit Qwen2.5-1.5B publishes
+        /// `max_position_embeddings: 32768` against the upstream
+        /// `131072`). The rope-scaling-type and rope-scaling-hash
+        /// disambiguation already catches every Phi-3-style
+        /// long/short fork — `MPE` was redundant.
         pub rope_scaling_hash: Option<u64>,
     }
 
@@ -492,7 +600,7 @@ mod dispatcher {
     // extension on `FerriteWeights`. Text-only arches don't
     // implement it. Discovery uses a sibling inventory row so the
     // text-side `FerriteArchRegistration` stays untouched and
-    // text-only arches never need to know MM exists. cuda_worker
+    // text-only arches never need to know MM exists. ferrite_worker
     // calls `try_load_mm` after `try_load` succeeds; an arch with
     // no MM submission yields `Ok(None)` and the worker proceeds
     // text-only. Phase B of the multimodal plan
@@ -504,6 +612,7 @@ mod dispatcher {
     /// `MultimodalData` (`vllm-common::ImageData`) is the boundary
     /// type the engine plumbs in, this is the interior shape the
     /// vision encoder consumes.
+    #[cfg(feature = "cuda")]
     #[derive(Debug)]
     pub struct PixelInput<'a> {
         /// Flat normalized pixels in CHW layout, length =
@@ -519,7 +628,7 @@ mod dispatcher {
     /// it. The slice is `[token_offset .. token_offset + length]`
     /// of `vision_forward`'s returned `OwnedTensor`. Mirrors
     /// `vllm-common::PlaceholderRange` but in token-space (post-
-    /// expansion); cuda_worker's splice consumes these directly.
+    /// expansion); ferrite_worker's splice consumes these directly.
     ///
     /// `grid_t` / `grid_h_merged` / `grid_w_merged` carry the
     /// per-image grid dimensions (post spatial-merge) so the
@@ -527,13 +636,14 @@ mod dispatcher {
     /// bearing batches on Qwen2-VL-class arches: image tokens
     /// scan in `(t, h, w)` row-major order with each row of the
     /// positions tensor holding the corresponding axis's coordinate.
-    /// Caller (cuda_worker) initializes these to zero when
+    /// Caller (ferrite_worker) initializes these to zero when
     /// constructing the input `placeholders`; `vision_forward` fills
     /// them on the returned `Vec<EmbedPatch>` by zipping its
     /// per-image `grid_thw` with `placeholders`. Text-only arches
     /// that never call `vision_forward` leave them at zero —
     /// `length == grid_t * grid_h_merged * grid_w_merged` is the
     /// post-merger invariant for filled patches.
+    #[cfg(feature = "cuda")]
     #[derive(Debug, Clone, Default)]
     pub struct EmbedPatch {
         /// Position in the input-id sequence where this image's
@@ -564,6 +674,7 @@ mod dispatcher {
     /// Phase D of the multimodal plan lands the first impl
     /// (qwen2 vision encoder). Until then this trait has zero
     /// callers and `try_load_mm` always returns `Ok(None)`.
+    #[cfg(feature = "cuda")]
     pub trait MultimodalForward: Send + Sync {
         /// Encode one or more pixel batches and project into the
         /// language model's hidden space.
@@ -574,7 +685,7 @@ mod dispatcher {
         ///   order they appear in the input batch.
         /// - A `Vec<EmbedPatch>` of the same length as `pixel_batches`
         ///   recording where each image's slice lands in the token
-        ///   sequence. `cuda_worker`'s splice consumes these to D2D-
+        ///   sequence. `ferrite_worker`'s splice consumes these to D2D-
         ///   copy each slice into the corresponding `Embed` tile rows.
         ///
         /// # Safety
@@ -598,7 +709,7 @@ mod dispatcher {
         /// req: vision encoder already ran on a prior step and the
         /// projected embeds live in cached KV blocks) uses this to
         /// reconstruct the same per-image grid info that
-        /// `cuda_worker::build_mrope_positions_2d` needs to compute
+        /// `ferrite_worker::build_mrope_positions_2d` needs to compute
         /// MRoPE positions for the cached tokens. Without it, fall-back
         /// 1D positions for the trailing new tokens disagree with the
         /// 3D MRoPE positions used to encode the cached KV → attention
@@ -621,6 +732,7 @@ mod dispatcher {
     /// `Ok(None)` when the arch claims the HF arch string but the
     /// live checkpoint has no vision tensors (text-only checkpoint
     /// loaded through an MM-capable arch entry — falls through).
+    #[cfg(feature = "cuda")]
     pub type MmTryLoadFn = fn(
         &mut GpuWeights,
         CUstream,
@@ -643,6 +755,7 @@ mod dispatcher {
     /// arch-specific knob (placeholder token id key, size policy,
     /// tokens-per-image policy, preprocess fn) is data on this row,
     /// not a switch in ferrite or the macro.
+    #[cfg(feature = "cuda")]
     pub struct FerriteMmRegistration {
         pub arch_name: &'static str,
         pub hf_arches: &'static [&'static str],
@@ -652,6 +765,7 @@ mod dispatcher {
         pub mm_metadata: ferrite_vision::MmMetadata,
     }
 
+    #[cfg(feature = "cuda")]
     inventory::collect!(FerriteMmRegistration);
 
     /// Walk the [`FerriteMmRegistration`] inventory and return the
@@ -664,6 +778,7 @@ mod dispatcher {
     /// MM metadata is identical across the tp variants of an arch
     /// (preprocessing is host-side and replicated), so the first
     /// hit is sufficient.
+    #[cfg(feature = "cuda")]
     pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static FerriteMmRegistration> {
         inventory::iter::<FerriteMmRegistration>().find(|reg| {
             hf_arches
@@ -684,7 +799,7 @@ mod dispatcher {
     /// Until task #7's outer-loop fanout lands, every emitted
     /// registration is at `tp_world_size = 1`, so callers passing
     /// `tp_world_size > 1` always see `Ok(None)` (and fall back) —
-    /// matching the current behavior, since cuda_worker already gates
+    /// matching the current behavior, since ferrite_worker already gates
     /// ferrite eligibility on `!use_tp`.
     pub fn try_load(
         gw: &mut GpuWeights,
@@ -722,9 +837,10 @@ mod dispatcher {
     /// [`FerriteMmRegistration`] rows for the same
     /// `(arch_hint, tp_world_size)` filter. Returns `Ok(None)`
     /// when no MM-capable arch claims the HF identifier — the
-    /// expected case for text-only checkpoints, where cuda_worker
+    /// expected case for text-only checkpoints, where ferrite_worker
     /// proceeds with `embed_patches: &[]`. Phase D of the
     /// multimodal plan lands the first row.
+    #[cfg(feature = "cuda")]
     pub fn try_load_mm(
         gw: &mut GpuWeights,
         stream: CUstream,
@@ -744,14 +860,20 @@ mod dispatcher {
     }
 }
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
+// Multimodal sibling surface — text-side only crates (every metal
+// arch today) skip; cuda owns the vision pipeline.
 #[cfg(feature = "cuda")]
 pub use dispatcher::{
-    EmbedPatch, FerriteArchRegistration, FerriteMmRegistration, FerriteWeights, HfFingerprint,
-    MmTryLoadFn, MultimodalForward, PixelInput, resolve_mm_metadata, try_load, try_load_mm,
+    EmbedPatch, FerriteMmRegistration, MmTryLoadFn, MultimodalForward, PixelInput,
+    resolve_mm_metadata, try_load_mm,
 };
 
 /// Re-export `inventory` so the `#[forward]`-macro-emitted
 /// `inventory::submit!` block resolves without the consuming crate
-/// having to add its own `inventory` dep.
-#[cfg(feature = "cuda")]
+/// having to add its own `inventory` dep. Available under either
+/// backend feature — the macro emits the same `inventory::submit!{
+/// FerriteArchRegistration{ ... }}` shape under both.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use inventory;

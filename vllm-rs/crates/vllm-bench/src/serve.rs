@@ -64,11 +64,14 @@ async fn send_request(
     request_id: &str,
     bench_start: Instant,
 ) -> RequestResult {
+    // NOTE: `logprobs` omitted (rather than sent as null) so this bench
+    // works against servers with strict OpenAI-schema validation
+    // (mlx_lm.server, in particular, rejects `logprobs: null` because
+    // it only accepts a bool). vLLM tolerates either.
     let mut body = serde_json::json!({
         "model": model,
         "prompt": prompt,
         "max_tokens": output_len,
-        "logprobs": null,
         "stream": true,
         "stream_options": {"include_usage": true},
         "repetition_penalty": 1.0,
@@ -552,6 +555,18 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
 
     let total_output_tokens: usize = successful.iter().map(|r| r.output_tokens).sum();
     let total_input_tokens: usize = num_success * args.input_len;
+
+    // Diagnostic: per-request TTFT in launch order, for spotting warmup tails.
+    // Triggered by FERRITE_BENCH_PER_REQ_TTFT=1.
+    if std::env::var_os("FERRITE_BENCH_PER_REQ_TTFT").is_some() {
+        let mut by_start: Vec<&RequestResult> = successful.iter().copied().collect();
+        by_start.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+        eprintln!("\n--- per-request TTFT (ms) in launch order ---");
+        for (i, r) in by_start.iter().enumerate() {
+            eprintln!("  req {:>3}: TTFT = {:>9.2} ms", i, r.ttft * 1000.0);
+        }
+        eprintln!();
+    }
 
     let mut ttfts: Vec<f64> = successful.iter().map(|r| r.ttft).collect();
     ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap());

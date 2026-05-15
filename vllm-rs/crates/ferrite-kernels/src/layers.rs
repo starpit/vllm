@@ -5,12 +5,23 @@
 //! `GpuTensor` (raw GPU pointers). Forward passes use cuBLAS GEMM from
 //! the `GpuDevice` and fused CUDA kernels.
 
+// Always-available imports: `GpuTensor` lives in the unconditional
+// `ferrite_cuda_core::tensor` module (pure metadata, no CUDA calls). The
+// layer struct *definitions* below only reference `GpuTensor` and primitives,
+// so they compile on every backend (including Metal on macOS). Methods that
+// invoke CUDA kernels are gated below.
 use anyhow::Result;
-
-use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
-use ferrite_cuda_core::cublas::CublasHandle;
-use ferrite_cuda_core::tensor::{GpuTensor, TensorView};
+#[cfg(feature = "metal")]
+use ferrite_cuda_core::DType;
+use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_cuda_core::weights::GpuWeights;
+
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::cublas::CublasHandle;
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::tensor::TensorView;
 
 #[cfg(feature = "nccl")]
 use ferrite_cuda_core::nccl::NcclGroup;
@@ -31,6 +42,7 @@ use std::sync::Arc;
 /// `gguf_dense` first and returns the GpuTensor; we then D2D-copy
 /// each [rows, cols] slab into a packed [sum(rows), cols] buffer.
 /// Bias follows the same path.
+#[cfg(feature = "cuda")]
 fn load_gguf_dense_concat(
     weights: &mut GpuWeights,
     prefixes: &[&str],
@@ -141,6 +153,7 @@ fn load_gguf_dense_concat(
 ///
 /// `per_rank_out` is the weight's per-rank out-feature count (storage
 /// row count for quantized, or `dim(0)` for dense).
+#[cfg(feature = "cuda")]
 fn per_rank_bias_slice(
     full: ferrite_cuda_core::tensor::GpuTensor,
     rank: usize,
@@ -250,6 +263,7 @@ impl Linear {
     /// `world == 1` is supported and degrades to the unsharded
     /// `Self::load` semantics (bias is loaded on rank 0, which is
     /// the only rank). `dim` must be 0 or 1 — anything else panics.
+    #[cfg(feature = "cuda")]
     pub fn load_sharded(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -297,6 +311,7 @@ impl Linear {
     ///
     /// # Safety
     /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -368,6 +383,7 @@ impl MarlinLinear {
     ///
     /// `x`: `[num_tokens, size_k]` (F16 or BF16)
     /// Returns: `[num_tokens, size_n]`
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -455,6 +471,7 @@ impl Bnb4bitLinear {
     ///
     /// `x`: `[num_tokens, in_features]`
     /// Returns: `[num_tokens, out_features]`
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -506,7 +523,7 @@ impl Bnb4bitLinear {
 /// - BS=1: `dequantize_mul_mat_vec` (fused dequant + dot product)
 /// - BS>1: quantize activations to Q8_1, then integer dot products
 pub struct GgmlLinear {
-    pub storage: crate::ggml::GgmlStorage,
+    pub storage: ferrite_cuda_core::ggml_quant::GgmlStorage,
     pub bias: Option<GpuTensor>,
 }
 
@@ -515,6 +532,7 @@ impl GgmlLinear {
     ///
     /// Activations must be f32 (GGML kernels operate on f32).
     /// Output is f32 `[num_tokens, out_features]`.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -620,6 +638,7 @@ impl Fp8Linear {
     /// Uses fused CUTLASS `cutlass_scaled_mm` (single kernel launch) with per-row
     /// activation scales and per-tensor weight scale in the epilogue.
     /// Matches Python vLLM's `cutlass_scaled_mm` exactly.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -711,10 +730,193 @@ impl Fp8Linear {
 }
 
 // ---------------------------------------------------------------------------
-// LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, or Fp8)
+// AffineQuantLinear (MLX-native int4 affine — Metal-only)
 // ---------------------------------------------------------------------------
 
-/// Unified linear layer — dense (cuBLAS), Marlin INT4, GGML quantized, BNB 4-bit, or FP8.
+/// MLX-native affine INT4 quantized linear layer (Metal backend only).
+///
+/// Storage layout matches `mlx-community/*-4bit` checkpoints exactly:
+/// weights packed `[N, K / pack_factor]` U32 (`pack_factor = 32 / bits =
+/// 8` for bits=4); per-group affine offset (`scales`, `biases`) stored
+/// `[N, K / group_size]` F16. Activation dtype is bf16 or f16 per
+/// `torch_dtype`. The kernel reads scales/biases as `T_scale = half`
+/// and casts to float in registers — see `INT4_PARITY_PROBES.md` §7.
+///
+/// "biases" here is MLX's per-group affine offset, NOT the linear-layer
+/// bias. The optional fp linear-layer bias (when models like Phi-3 / some
+/// Qwen2 variants ship it) lives in `linear_bias` separately.
+///
+/// No `forward()` method on this type — Metal forwards go through the
+/// macro-emitted `Instruction<W>` stream and dispatch via the worker
+/// resolver, not direct method calls.
+#[cfg(feature = "metal")]
+pub struct AffineQuantLinear {
+    /// Packed 4-bit weights, shape `[N, K / pack_factor]`, dtype `U32`.
+    pub weight: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group scales, shape `[N, K / group_size]`, dtype `F16`.
+    pub scales: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group affine offsets ("biases" in MLX terminology — NOT the
+    /// linear-layer bias). Shape `[N, K / group_size]`, dtype `F16`.
+    pub affine_biases: ferrite_cuda_core::tensor::GpuTensor,
+    /// Optional fp linear-layer bias `[N]` (when present in the
+    /// safetensors as `<prefix>.bias`; absent on Llama-3.2 family).
+    pub linear_bias: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    pub in_features: usize,
+    pub out_features: usize,
+    pub group_size: u32,
+    pub bits: u32,
+}
+
+#[cfg(feature = "metal")]
+impl AffineQuantLinear {
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
+    /// (`U32`, `[N, K/pack_factor]`), `<prefix>.scales` (`F16`,
+    /// `[N, K/group_size]`), `<prefix>.biases` (`F16`, same shape),
+    /// and optional `<prefix>.bias` (model dtype, `[N]`).
+    ///
+    /// `group_size` and `bits` come from the model's
+    /// `quantization_config` (parsed at compile time by the macro);
+    /// `in_features` / `out_features` are derived from the weight
+    /// tensor's shape.
+    pub fn load(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+        // Scales / biases ship F16 on every mlx-community 4bit repo
+        // sampled in P0; ferrite-metal's qmv / qmm_t / qvm / qmm_n
+        // kernels now read them as `T_scale = half` regardless of the
+        // activation dtype and cast to `T_act` in-register (per
+        // `INT4_PARITY_PROBES.md` §7 `Decision: in-register cast`).
+        // Use `take_keep_dtype` to skip the loader-side F16→BF16 cast
+        // that P1-P6 silently inherited from `set_target_dtype(BF16)`
+        // — that path truncated 3 mantissa bits per scale (10→7) and
+        // was the P10 late-token drift contributor this repair fixes.
+        let scales = weights.take_keep_dtype(&format!("{prefix}.scales"))?;
+        let affine_biases = weights.take_keep_dtype(&format!("{prefix}.biases"))?;
+        let bias_name = format!("{prefix}.bias");
+        let linear_bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        let pack_factor = (32 / bits) as usize;
+        let out_features = weight.dim(0);
+        let in_features = weight.dim(1) * pack_factor;
+        Ok(Self {
+            weight,
+            scales,
+            affine_biases,
+            linear_bias,
+            in_features,
+            out_features,
+            group_size,
+            bits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AffineQuantEmbedding — MLX-affine int4 quantized token embedding (Metal-only)
+// ---------------------------------------------------------------------------
+
+/// MLX-affine int4 quantized token-embedding table. Mirrors
+/// `AffineQuantLinear` (the int4 Linear) but for an embedding's
+/// `[vocab_size, hidden_size]` layout. Stored as packed U32 weights
+/// (`[vocab, hidden / pack_factor]`, `pack_factor = 32 / bits = 8` for
+/// bits=4) plus per-group `scales` / `affine_biases`
+/// (`[vocab, hidden / group_size]` F16). MLX terminology: "biases" is
+/// the per-group affine offset, NOT a linear-layer bias — embeddings
+/// have no fp bias term at all.
+///
+/// Used by P6's `Instruction::AffineEmbed`: forward-time gather +
+/// dequant via `affine_embed_<dtype>_gs_<gs>_b_4`. The macro emits this
+/// type instead of `Embedding` when `model.embed_tokens` carries
+/// `(weight=U32, scales, biases)` safetensors keys. Tied lm_head reuses
+/// the same buffer triple (GpuTensor is Copy under metal — it's a thin
+/// pointer wrapper) via `LinearLayer::AffineQuant`.
+#[cfg(feature = "metal")]
+pub struct AffineQuantEmbedding {
+    /// Packed 4-bit weights, shape `[vocab_size, hidden_size / pack_factor]`,
+    /// dtype `U32`.
+    pub weight: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group scales, shape `[vocab_size, hidden_size / group_size]`,
+    /// dtype `F16`.
+    pub scales: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group affine offsets, shape `[vocab_size, hidden_size / group_size]`,
+    /// dtype `F16`. NOT a linear-layer bias — MLX-terminology naming.
+    pub affine_biases: ferrite_cuda_core::tensor::GpuTensor,
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub group_size: u32,
+    pub bits: u32,
+}
+
+#[cfg(feature = "metal")]
+impl AffineQuantEmbedding {
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight`
+    /// (`U32`, `[vocab, hidden / pack_factor]`), `<prefix>.scales`
+    /// (`F16`, `[vocab, hidden / group_size]`), `<prefix>.biases`
+    /// (`F16`, same shape).
+    ///
+    /// `group_size` and `bits` come from the model's
+    /// `quantization_config` (parsed at compile time by the macro);
+    /// `vocab_size` / `hidden_size` are derived from the weight
+    /// tensor's shape.
+    pub fn load(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+        // Scales / biases ship F16 on every mlx-community 4bit repo
+        // sampled in P0; ferrite-metal's affine_embed kernel reads
+        // them as `T_scale = half` and casts to T_act in-register
+        // (`INT4_PARITY_PROBES.md` §7). `take_keep_dtype` skips the
+        // loader-side F16→BF16 cast — see `AffineQuantLinear::load`
+        // for the full reasoning.
+        let scales = weights.take_keep_dtype(&format!("{prefix}.scales"))?;
+        let affine_biases = weights.take_keep_dtype(&format!("{prefix}.biases"))?;
+        let pack_factor = (32 / bits) as usize;
+        let vocab_size = weight.dim(0);
+        let hidden_size = weight.dim(1) * pack_factor;
+        Ok(Self {
+            weight,
+            scales,
+            affine_biases,
+            vocab_size,
+            hidden_size,
+            group_size,
+            bits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, Fp8, AffineQuant)
+// ---------------------------------------------------------------------------
+
+/// Unified linear layer — dense (cuBLAS), Marlin INT4, GGML quantized,
+/// BNB 4-bit, FP8, or MLX-affine INT4 (Metal-only).
 ///
 /// Models use this everywhere they currently use `Linear`. The factory decides
 /// at load time which variant to create based on weight format.
@@ -735,10 +937,16 @@ pub enum LinearLayer {
     Bnb4bit(Box<Bnb4bitLinear>),
     Fp8(Box<Fp8Linear>),
     Fp8Block(Box<Fp8BlockLinear>),
+    /// MLX-native int4 affine quantization (Metal-only). The CUDA
+    /// stack uses Marlin/AWQ/GPTQ/Bnb/Fp8 instead — affine is exclusive
+    /// to the Metal backend.
+    #[cfg(feature = "metal")]
+    AffineQuant(Box<AffineQuantLinear>),
 }
 
 impl LinearLayer {
     /// Forward: y = x @ W^T (dense) or quantized GEMM variant.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -834,6 +1042,9 @@ impl LinearLayer {
 
     /// Access the raw dense weight tensor. Panics if quantized —
     /// CUTLASS standalone GEMM only works with dense bf16 weights.
+    /// Quant variants are unreachable under metal (the macro only
+    /// emits Dense `LinearLayer`s on that path), so the panic arms
+    /// matter only on cuda.
     pub fn dense_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
         match self {
             Self::Dense(l) => l.weight,
@@ -865,6 +1076,11 @@ impl LinearLayer {
             Self::Bnb4bit(_) => panic!("dense_weight() called on Bnb4bit LinearLayer"),
             Self::Fp8(_) => panic!("dense_weight() called on Fp8 LinearLayer"),
             Self::Fp8Block(_) => panic!("dense_weight() called on Fp8Block LinearLayer"),
+            #[cfg(feature = "metal")]
+            Self::AffineQuant(_) => panic!(
+                "dense_weight() called on AffineQuant LinearLayer — \
+                 use affine_weight() / affine_scales() / affine_biases() instead"
+            ),
         }
     }
 
@@ -890,24 +1106,103 @@ impl LinearLayer {
     pub fn out_features(&self) -> usize {
         match self {
             Self::Dense(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Marlin(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Ggml(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::GgmlConcat(branches) => branches.iter().map(|b| b.out_features()).sum(),
+            #[cfg(feature = "cuda")]
             Self::Bnb4bit(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8(l) => l.out_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8Block(l) => l.out_features(),
+            #[cfg(feature = "metal")]
+            Self::AffineQuant(l) => l.out_features(),
+            #[cfg(not(feature = "cuda"))]
+            _ => panic!("out_features: non-Dense LinearLayer not supported on this backend"),
         }
     }
 
     pub fn in_features(&self) -> usize {
         match self {
             Self::Dense(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Marlin(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Ggml(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::GgmlConcat(branches) => branches[0].in_features(),
+            #[cfg(feature = "cuda")]
             Self::Bnb4bit(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8(l) => l.in_features(),
+            #[cfg(feature = "cuda")]
             Self::Fp8Block(l) => l.in_features(),
+            #[cfg(feature = "metal")]
+            Self::AffineQuant(l) => l.in_features(),
+            #[cfg(not(feature = "cuda"))]
+            _ => panic!("in_features: non-Dense LinearLayer not supported on this backend"),
+        }
+    }
+
+    /// Access the affine-quantized packed weight tensor (`[N, K / pack_factor]`
+    /// U32). Panics on every other LinearLayer arm — affine accessors
+    /// are gated to Metal builds and Affine layers.
+    #[cfg(feature = "metal")]
+    pub fn affine_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::AffineQuant(l) => l.weight,
+            _ => panic!("affine_weight() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    /// Per-group scales (`[N, K / group_size]` F16). See `affine_weight`.
+    #[cfg(feature = "metal")]
+    pub fn affine_scales(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::AffineQuant(l) => l.scales,
+            _ => panic!("affine_scales() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    /// Per-group affine offsets (MLX-terminology "biases" — NOT the
+    /// linear-layer bias). `[N, K / group_size]` F16. See `affine_weight`.
+    #[cfg(feature = "metal")]
+    pub fn affine_biases(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::AffineQuant(l) => l.affine_biases,
+            _ => panic!("affine_biases() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    /// Optional fp linear-layer bias on an affine-quantized layer
+    /// (distinct from the per-group affine offsets). `[N]` in the
+    /// model's activation dtype. Most mlx-community 4bit checkpoints
+    /// don't have one (Llama-3.2 family has neither attention_bias nor
+    /// mlp_bias); some Phi-3 / Qwen2 variants do.
+    #[cfg(feature = "metal")]
+    pub fn affine_linear_bias(&self) -> Option<ferrite_cuda_core::tensor::GpuTensor> {
+        match self {
+            Self::AffineQuant(l) => l.linear_bias,
+            _ => panic!("affine_linear_bias() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn affine_group_size(&self) -> u32 {
+        match self {
+            Self::AffineQuant(l) => l.group_size,
+            _ => panic!("affine_group_size() called on non-AffineQuant LinearLayer"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn affine_bits(&self) -> u32 {
+        match self {
+            Self::AffineQuant(l) => l.bits,
+            _ => panic!("affine_bits() called on non-AffineQuant LinearLayer"),
         }
     }
 
@@ -935,6 +1230,83 @@ impl LinearLayer {
     pub fn load_raw(weights: &mut GpuWeights, key: &str) -> Result<Self> {
         weights.transpose_2d_in_place(key)?;
         let weight = weights.take(key)?;
+        Ok(Self::Dense(Linear::new(weight, None)))
+    }
+
+    /// Load an MLX-affine int4 quantized linear layer (Metal-only).
+    /// Reads `<prefix>.weight` + `<prefix>.scales` + `<prefix>.biases`
+    /// (and optional `<prefix>.bias`) from the safetensors. Wraps
+    /// `AffineQuantLinear::load`. Forward-time qmv dispatch consumer
+    /// (P3+) — the macro currently emits `load_affine_dequant_as_dense`
+    /// instead, which dequantizes at load time and returns `Dense`.
+    #[cfg(feature = "metal")]
+    pub fn load_affine_quant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        Ok(Self::AffineQuant(Box::new(AffineQuantLinear::load(
+            weights, prefix, group_size, bits,
+        )?)))
+    }
+
+    /// MLX-affine int4 → BF16 dequantize-at-load (Metal-only).
+    ///
+    /// CPU-dequantizes `<prefix>.{weight,scales,biases}` directly out
+    /// of the mmap'd safetensors via
+    /// [`GpuWeights::take_affine_dequant_b4`], producing a single
+    /// `[N, K]` BF16 tensor that the rest of the forward path consumes
+    /// as a normal `Dense` linear. This is INT4 P2's slow-reference
+    /// path — kernel-validated against the Metal
+    /// `affine_dequantize` shader in
+    /// `ferrite-metal-kernels/tests/quantized_dequantize_test.rs`.
+    /// P3 will introduce forward-time qmv dispatch and the macro will
+    /// switch back to [`Self::load_affine_quant`].
+    ///
+    /// The optional fp linear-layer bias (`<prefix>.bias`, absent on
+    /// Llama-3.2 / Qwen3-bf16) is loaded as-is into the Dense layer's
+    /// bias slot.
+    #[cfg(feature = "metal")]
+    pub fn load_affine_dequant_as_dense(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
+        let bias_name = format!("{prefix}.bias");
+        let bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+        Ok(Self::Dense(Linear::new(weight, bias)))
+    }
+
+    /// Fused-concat sibling of [`Self::load_affine_dequant_as_dense`]
+    /// for `gate_up_proj` / `qkv_proj` accessors whose source weights
+    /// are MLX-affine on disk (Metal-only).
+    ///
+    /// mlx-community 4bit repos ship gate_proj / up_proj (and
+    /// q_proj / k_proj / v_proj) as separate affine triples; the
+    /// forward DSL fuses them into a single linear so the metal
+    /// `FusedGateUpSiluMul` impl can match. We CPU-dequant each
+    /// prefix, byte-concat the resulting `[N, K]` BF16 chunks along
+    /// dim 0, and wrap the fused `[sum(N), K]` weight as Dense. No
+    /// per-prefix bias is supported here — every affine accessor in
+    /// the int4 P2 coverage matrix has bias=false at the fused level
+    /// (matches the dense `load_dense_concat_packed` no-bias case
+    /// for these same fuses).
+    #[cfg(feature = "metal")]
+    pub fn load_affine_dequant_concat_as_dense(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight =
+            weights.take_affine_dequant_b4_concat(prefixes, group_size, bits, DType::BF16)?;
         Ok(Self::Dense(Linear::new(weight, None)))
     }
 
@@ -983,6 +1355,7 @@ impl LinearLayer {
     /// quantizers ship gate/up with identical layouts) but the
     /// guard prevents silent corruption if an arch ever pairs
     /// different quants.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_concat_or_ggml(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -1100,6 +1473,7 @@ impl LinearLayer {
     /// (`dim = 0`) or row-parallel (`dim = 1`). Pass `(rank, world)`
     /// from the runtime; `world == 1` short-circuits to the same
     /// behavior as `load_dense` plus shard-kind-aware bias rules.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_sharded(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -1167,6 +1541,157 @@ impl LinearLayer {
         )?))
     }
 
+    /// Backend-neutral, stream-free counterpart to [`load_dense_concat`].
+    ///
+    /// Reads each source's CPU bytes via `take_cpu`, concatenates them
+    /// along dim 0 into a single packed buffer, and uploads via the
+    /// active [`DeviceAllocator`]. No precast pipeline / async DMA —
+    /// callers pay one CPU memcpy per prefix in exchange for not
+    /// needing a `CUstream`. Acceptable on the load-once path; metal
+    /// has no DMA either way (`StorageModeShared` is unified memory).
+    ///
+    /// All sources must share `in_features` (dim 1) and dtype. If any
+    /// source has a bias, every source must — biases concat in the
+    /// same order. Refuses any source with quantized storage (callers
+    /// route GGUF through `load_dense_concat_or_ggml` under cuda; metal
+    /// never sees quantized variants per the macro's quant-skip).
+    ///
+    /// [`load_dense_concat`]: Self::load_dense_concat
+    pub fn load_dense_concat_packed(weights: &mut GpuWeights, prefixes: &[&str]) -> Result<Self> {
+        if prefixes.is_empty() {
+            anyhow::bail!("load_dense_concat_packed: empty prefix list");
+        }
+
+        for p in prefixes {
+            if !weights.contains(&format!("{p}.weight")) {
+                try_synthesize_packed_slice(weights, p)?;
+            }
+        }
+
+        let mut shapes_dtypes: Vec<(Vec<usize>, ferrite_cuda_core::dtype::DType)> =
+            Vec::with_capacity(prefixes.len());
+        for p in prefixes {
+            let weight_name = format!("{p}.weight");
+            let (shape, dtype) = weights
+                .tensor_info(&weight_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {weight_name}"))?;
+            anyhow::ensure!(
+                shape.len() == 2,
+                "load_dense_concat_packed: `{weight_name}` has rank {}, expected 2",
+                shape.len(),
+            );
+            shapes_dtypes.push((shape.to_vec(), dtype));
+        }
+
+        let hidden = shapes_dtypes[0].0[1];
+        let dtype = shapes_dtypes[0].1;
+        for (i, (shape, dt)) in shapes_dtypes.iter().enumerate() {
+            anyhow::ensure!(
+                shape[1] == hidden,
+                "load_dense_concat_packed: `{}` has in_features {}, expected {}",
+                prefixes[i],
+                shape[1],
+                hidden,
+            );
+            anyhow::ensure!(
+                *dt == dtype,
+                "load_dense_concat_packed: `{}` has dtype {:?}, expected {:?}",
+                prefixes[i],
+                dt,
+                dtype,
+            );
+        }
+
+        let total_out: usize = shapes_dtypes.iter().map(|(s, _)| s[0]).sum();
+        let elem = dtype.size_bytes();
+        let total_bytes = total_out * hidden * elem;
+
+        // Direct-write packing: pre-allocate the destination MTLBuffer
+        // and stream each source tensor's bytes straight into it. The
+        // older path went mmap → heap Vec → arena MTLBuffer (two
+        // memcpies, each ~100 MB/layer for Llama-3.2-3B's gate_up
+        // pack — the dominant chunk of init engine time after the
+        // zero-copy weight load fix).
+        //
+        // CUDA still uses `take_cpu` + heap `Vec` because its async
+        // H2D copy needs the bytes pinned, and the existing batched
+        // pinned-pool pipeline already handles the staging — there's
+        // no "second memcpy" to elide on cuda's path.
+        #[cfg(feature = "metal")]
+        let packed_weight = {
+            let dst = weights
+                .metal_allocator()
+                .alloc_uninit(total_bytes)
+                .map_err(|e| anyhow::anyhow!("alloc_uninit({total_bytes}) failed: {e}"))?;
+            let mut offset = 0usize;
+            for p in prefixes {
+                let weight_name = format!("{p}.weight");
+                let (written, _shape, dt) =
+                    unsafe { weights.take_into_metal(&weight_name, dst.add(offset))? };
+                anyhow::ensure!(
+                    dt == dtype,
+                    "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
+                    weight_name,
+                    dt,
+                    dtype,
+                );
+                offset += written;
+            }
+            anyhow::ensure!(
+                offset == total_bytes,
+                "load_dense_concat_packed: wrote {offset} bytes, expected {total_bytes}",
+            );
+            unsafe { ferrite_cuda_core::GpuTensor::new(dst, &[total_out, hidden], dtype) }
+        };
+        #[cfg(not(feature = "metal"))]
+        let packed_weight = {
+            let mut packed: Vec<u8> = Vec::with_capacity(total_bytes);
+            for p in prefixes {
+                let weight_name = format!("{p}.weight");
+                let (data, _shape, dt) = weights.take_cpu(&weight_name)?;
+                anyhow::ensure!(
+                    dt == dtype,
+                    "load_dense_concat_packed: `{}` cpu dtype drift {:?} vs {:?}",
+                    weight_name,
+                    dt,
+                    dtype,
+                );
+                packed.extend_from_slice(&data);
+            }
+            weights.alloc_packed_from_host(&packed, &[total_out, hidden], dtype)?
+        };
+
+        // Biases: either all-or-none across the source set.
+        let bias_names: Vec<String> = prefixes.iter().map(|p| format!("{p}.bias")).collect();
+        let any_bias = bias_names.iter().any(|n| weights.contains(n));
+        let all_bias = bias_names.iter().all(|n| weights.contains(n));
+        anyhow::ensure!(
+            !any_bias || all_bias,
+            "load_dense_concat_packed: inconsistent biases across prefixes {:?}",
+            prefixes,
+        );
+        let packed_bias = if all_bias {
+            let mut bias_bytes: Vec<u8> = Vec::new();
+            let mut total_bias_elems: usize = 0;
+            for bn in &bias_names {
+                let (data, shape, bdt) = weights.take_cpu(bn)?;
+                anyhow::ensure!(
+                    bdt == dtype,
+                    "load_dense_concat_packed: bias `{bn}` dtype {:?} != weight dtype {:?}",
+                    bdt,
+                    dtype,
+                );
+                total_bias_elems += shape.iter().product::<usize>();
+                bias_bytes.extend_from_slice(&data);
+            }
+            Some(weights.alloc_packed_from_host(&bias_bytes, &[total_bias_elems], dtype)?)
+        } else {
+            None
+        };
+
+        Ok(Self::Dense(Linear::new(packed_weight, packed_bias)))
+    }
+
     /// Load several dense linear layers and concatenate along the
     /// out-feature dim (dim 0 of the weight matrix), returning one
     /// packed `LinearLayer::Dense`.
@@ -1180,6 +1705,7 @@ impl LinearLayer {
     /// If any source weight has a bias, all of them must — the biases
     /// are concatenated in the same order as the weights. Otherwise
     /// the returned layer has no bias.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_concat(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -1318,6 +1844,7 @@ impl LinearLayer {
     /// `skip`s indivisible (variant, tp) tuples (per the activation
     /// commit `889c44b2f`), so this is a runtime invariant the
     /// compile-time set guarantees, not a per-call assertion.
+    #[cfg(feature = "cuda")]
     pub fn load_dense_concat_sharded(
         weights: &mut GpuWeights,
         prefixes: &[&str],
@@ -1597,6 +2124,7 @@ impl Fp8BlockLinear {
     ///
     /// Current implementation: CPU-side dequant-then-GEMM for correctness.
     /// TODO: CUTLASS block-scaled FP8 GEMM for perf parity.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -1667,6 +2195,7 @@ impl Fp8AnyLinear {
     /// All tensors must be valid GPU memory; `cublas` / `alloc` /
     /// `stream` must be live. Inner `forward`s carry the same
     /// invariants.
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
@@ -1720,6 +2249,26 @@ impl Embedding {
         Ok(Self::new(weight))
     }
 
+    /// MLX-affine int4 → BF16 dequantize-at-load (Metal-only).
+    ///
+    /// Sibling of [`LinearLayer::load_affine_dequant_as_dense`] for
+    /// quantized token embeddings. CPU-dequantizes `<prefix>.{weight,
+    /// scales,biases}` via [`GpuWeights::take_affine_dequant_b4`] and
+    /// wraps the resulting `[vocab_size, hidden_size]` BF16 tensor in
+    /// an `Embedding`. Used by every `mlx-community/*-4bit` checkpoint
+    /// in the int4 mandate's coverage matrix — they all ship the
+    /// embedding as an affine triple (`INT4_PARITY_PROBES.md` §2).
+    #[cfg(feature = "metal")]
+    pub fn load_affine_dequant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+    ) -> Result<Self> {
+        let weight = weights.take_affine_dequant_b4(prefix, group_size, bits, DType::BF16)?;
+        Ok(Self::new(weight))
+    }
+
     /// Vocab-parallel sharded load — slices the embedding table
     /// along dim 0 (`vocab_size`) so each rank holds
     /// `[vocab_size / world, hidden_size]`. Mirrors Python vLLM's
@@ -1727,6 +2276,7 @@ impl Embedding {
     /// inherits, which is what makes `tie_weights` self-consistent
     /// at tp>1 — both sharded slices come from the same dim-0 cut).
     /// `world == 1` degrades to the same shape `Self::load` produces.
+    #[cfg(feature = "cuda")]
     pub fn load_sharded(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -1764,6 +2314,7 @@ impl Embedding {
     /// # Safety
     /// All tensors must be valid GPU memory. Stream must be valid.
     /// This currently uses a simple gather kernel (TODO: implement via CUDA kernel).
+    #[cfg(feature = "cuda")]
     pub unsafe fn forward(
         &self,
         _input_ids: TensorView<'_>,
@@ -1798,8 +2349,28 @@ impl RmsNorm {
     }
 
     /// Load from `GpuWeights` by prefix.
+    ///
+    /// Metal: route through `take_keep_dtype` so the on-disk gain
+    /// dtype (F16 on every sampled mlx-community / Llama-3.x
+    /// checkpoint) reaches the device verbatim. The
+    /// `<T_act, T_scale>` rmsnorm kernel (`shaders/rmsnorm.metal`,
+    /// picked by `interpreter::metal::lowering::rmsnorm_kernel_static_name`)
+    /// casts the gain to the activation dtype in registers. Mirrors
+    /// the P10b in-register cast applied to affine quant scales; the
+    /// pre-P10c bf16-stack `take()` truncated the F16 gain to BF16 at
+    /// load (10→7 bit mantissa).
+    ///
+    /// CUDA: keep the existing `take()` path — `rms_norm_bf16` /
+    /// `rms_norm_f16` (`kernels.rs:26-46`) take a single typed
+    /// weight pointer, so the loader cast is what makes the
+    /// dtype-matched dispatcher (`rms_norm_with_offset`) work today.
+    /// Extending the kernel signature is its own thread; out of P10c
+    /// scope.
     pub fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
         let weight_name = format!("{prefix}.weight");
+        #[cfg(feature = "metal")]
+        let weight = weights.take_keep_dtype(&weight_name)?;
+        #[cfg(not(feature = "metal"))]
         let weight = weights.take(&weight_name)?;
         Ok(Self::new(weight, eps))
     }
@@ -1864,6 +2435,7 @@ pub struct ColumnParallelLinear {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl ColumnParallelLinear {
     pub fn new(inner: LinearLayer, gather_output: bool) -> Self {
         Self {
@@ -1922,6 +2494,7 @@ pub struct RowParallelLinear {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl RowParallelLinear {
     pub fn new(inner: LinearLayer, bias: Option<GpuTensor>) -> Self {
         Self {
@@ -1981,6 +2554,7 @@ pub struct VocabParallelEmbedding {
     pub tp_group: Option<Arc<NcclGroup>>,
 }
 
+#[cfg(feature = "cuda")]
 impl VocabParallelEmbedding {
     pub fn new(inner: Embedding, vocab_start: usize, vocab_end: usize) -> Self {
         Self {
@@ -2017,6 +2591,7 @@ pub struct CohereLayerNorm {
     pub eps: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl CohereLayerNorm {
     pub fn new(weight: GpuTensor, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -2052,6 +2627,7 @@ pub struct LayerNormBias {
     pub eps: f32,
 }
 
+#[cfg(feature = "cuda")]
 impl LayerNormBias {
     pub fn new(weight: GpuTensor, bias: GpuTensor, eps: f32) -> Self {
         debug_assert_eq!(weight.ndim(), 1);
@@ -2077,6 +2653,7 @@ impl LayerNormBias {
 // layer where the quantized path diverges from dense. Off by default.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "cuda")]
 mod ggml_probe {
     use super::*;
     use ferrite_cuda_core::dtype::DType;

@@ -9,10 +9,27 @@ description = "Core GPU types for the ferrite inference framework"
 default = []
 cuda = ["dep:cudarc"]
 nccl = ["cuda", "cudarc/nccl"]
+# Metal backend: routes through `ferrite-metal-kernels` (which owns the
+# `objc2-metal` dep + types) for the `MetalAllocator` impl of
+# `DeviceAllocator`. Mutually exclusive with `cuda` at build time.
+# `ferrite-metal-kernels` is needed for the `MetalResidencySet` wrapper
+# the allocator pins arena buffers into so Apple's lazy paging doesn't
+# inject non-deterministic stale-page reads on Llama-3.2-class working
+# sets. Lives in `ferrite-metal-kernels` (not here) because it only
+# matters once kernels are firing — but the allocator owns the set so
+# both the pool and the KV-cache wiring share a single residency
+# handle (MLX layout). No cycle: ferrite-metal-kernels has no
+# ferrite-cuda-core dep.
+metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
 half = { workspace = true }
+rayon = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
 serde_json = { workspace = true }

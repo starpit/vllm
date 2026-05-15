@@ -25,27 +25,43 @@ pub mod forward_output;
 pub mod ggml;
 #[cfg(feature = "cuda")]
 pub mod kernels;
-#[cfg(feature = "cuda")]
+// `kv_cache` is dual-mode: storage layout, sizing, and span
+// bookkeeping live in one place. The buffer-allocation closure
+// that callers pass into `KvCachePool::new` is what differs per
+// backend; FP8 scale machinery + the D2D gather + GPU mirror flags
+// stay `cfg(feature = "cuda")` *inside* the unified type.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod kv_cache;
-#[cfg(feature = "cuda")]
+// `layers` and `layers_moe` are dual-mode: the struct *definitions* compile
+// without the `cuda` feature (they reference only `GpuTensor`, which lives in
+// the always-available `ferrite_cuda_core::tensor` module), so the
+// `Instruction<W>` enum the frontend produces resolves on Apple Silicon Metal
+// builds. The `impl` blocks that use cudarc / `CachingAllocator` / etc. are
+// individually `#[cfg(feature = "cuda")]`-gated inside each file.
 pub mod layers;
-#[cfg(feature = "cuda")]
 pub mod layers_moe;
 #[cfg(feature = "cuda")]
 pub mod layers_quant;
-#[cfg(feature = "cuda")]
+// `rotary` is dual-mode like `layers`: the struct *definitions* and CPU-side
+// math helpers compile without `cuda`; the cudarc-using stream constructors
+// are individually `#[cfg(feature = "cuda")]`-gated inside the file. Under
+// metal the [`new_from_gpuweights`] constructor builds the same cache via
+// the active `DeviceAllocator`.
+//
+// [`new_from_gpuweights`]: rotary::RotaryCache::new_from_gpuweights
 pub mod rotary;
 
 #[cfg(feature = "cuda")]
 pub use forward_output::ForwardOutput;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use kv_cache::KvCachePool;
-#[cfg(feature = "cuda")]
+// Layer struct types compile without `cuda` (see comment above the module
+// declarations). Re-export them ungated so consumers (notably the
+// `Instruction<W>` enum in ferrite-forward) can name them without the cuda
+// feature.
 pub use layers::{
     Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
-#[cfg(feature = "cuda")]
 pub use layers_moe::{DeepSeekV2MoELayer, MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
-#[cfg(feature = "cuda")]
 pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling};

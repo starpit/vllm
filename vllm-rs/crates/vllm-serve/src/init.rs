@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::info;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use vllm_config::CudaGraphMode;
 use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
@@ -214,9 +214,75 @@ fn create_worker(
 ) -> Result<WorkerCreationResult> {
     let is_pooling = config.runner == "pooling";
 
-    // Try MLX backend first when metal feature is enabled.
+    // Try ferrite-metal first under the metal feature; the
+    // per-arch metal forward is the preferred fast path. If
+    // ferrite-forward has no metal variant for the architecture
+    // (`ExecutorError::ArchNotSupported`), fall back to MlxWorker —
+    // the same fall-through pattern cuda already uses inside
+    // FerriteWorker::load_model, surfaced here at the worker-creation
+    // boundary because metal has no in-FerriteWorker legacy fallback.
     #[cfg(feature = "metal")]
     if should_use_mlx(&config.device) {
+        use vllm_executor::error::ExecutorError;
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
+
+        let ferrite_config = FerriteWorkerConfig {
+            model_path: model_path.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            block_size: config.block_size,
+            device_id: 0,
+            enforce_eager: config.enforce_eager,
+            cuda_graph_mode: config
+                .cuda_graph_mode
+                .parse()
+                .unwrap_or(CudaGraphMode::Auto),
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            cuda_graph_sizes: config
+                .cuda_graph_config
+                .as_ref()
+                .map(|c| c.capture_sizes.clone())
+                .unwrap_or_default(),
+            cublas_autotune: config.cublas_autotune,
+            gpu_memory_utilization: config.gpu_memory_utilization,
+            pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
+            tp_rank: 0,
+            tp_world_size: 1,
+            pp_rank: 0,
+            pp_size: 1,
+            gguf_file: config.gguf_file.clone(),
+            lora_adapter: config.lora_adapter.clone(),
+            kv_cache_dtype: config.kv_cache_dtype.clone(),
+            calculate_kv_scales: config.calculate_kv_scales,
+            eos_token_ids: vec![],
+            max_model_len: config.max_model_len,
+        };
+
+        let mut ferrite = FerriteWorker::new(ferrite_config);
+        ferrite
+            .init_device()
+            .context("failed to initialize Metal device for FerriteWorker")?;
+        match ferrite.load_model() {
+            Ok(()) => {
+                info!("Using ferrite-metal backend (Apple Silicon GPU)");
+                let hf_config = ferrite
+                    .hf_config()
+                    .context("model config not available after ferrite-metal load")?
+                    .clone();
+                let model_dir = ferrite.model_dir().map(|p| p.to_path_buf());
+                let dtype_elem_bytes = ferrite.resolved_dtype_elem_bytes();
+                return Ok((Box::new(ferrite), hf_config, model_dir, dtype_elem_bytes));
+            }
+            Err(ExecutorError::ArchNotSupported(arch)) => {
+                info!(
+                    "ferrite-metal has no variant for arch `{arch}` — falling back to MLX backend"
+                );
+                drop(ferrite);
+            }
+            Err(e) => return Err(e).context("failed to load ferrite-metal model"),
+        }
+
         info!("Using MLX backend (Apple Silicon GPU)");
         let mlx_config = MlxWorkerConfig {
             model_path: model_path.clone(),
@@ -254,7 +320,7 @@ fn create_worker(
     // Try the purpose-built CUDA backend when feature is enabled and device is CUDA.
     #[cfg(feature = "cuda")]
     if config.device.starts_with("cuda") || config.device == "auto" {
-        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
 
         // Parse device ID (e.g. "cuda:1" → 1, "cuda" → 0, "auto" → 0).
         let device_id = if config.device.starts_with("cuda:") {
@@ -264,7 +330,7 @@ fn create_worker(
         };
 
         info!("Using vllm-cuda backend (device={})", device_id);
-        let cuda_config = CudaWorkerConfig {
+        let cuda_config = FerriteWorkerConfig {
             model_path: model_path.clone(),
             dtype: config.dtype.clone(),
             hf_token: config.hf_token.clone(),
@@ -275,7 +341,7 @@ fn create_worker(
                 .cuda_graph_mode
                 .parse()
                 .unwrap_or(CudaGraphMode::Auto),
-            // Default 1024 (not 8192 like Python). Our CudaWorker splits mixed
+            // Default 1024 (not 8192 like Python). Our FerriteWorker splits mixed
             // batches into a decode CUDA-graph pass + a prefill eager pass.
             // Smaller prefill chunks keep the eager pass fast (~25ms for 1024
             // tokens) while decode runs through the captured graph (~5ms).
@@ -303,7 +369,7 @@ fn create_worker(
             max_model_len: config.max_model_len,
         };
 
-        let mut worker = CudaWorker::new(cuda_config);
+        let mut worker = FerriteWorker::new(cuda_config);
         worker
             .init_device()
             .context("failed to initialize CUDA device")?;
@@ -369,7 +435,7 @@ fn init_cache(
         || (device == "auto" && !cfg!(feature = "cuda") && !cfg!(feature = "metal"));
 
     let (kv_cache_bytes, utilization) = if is_cuda {
-        // CudaWorker already computed: total * util - non_kv_cache
+        // FerriteWorker already computed: total * util - non_kv_cache
         (available_memory, gpu_memory_utilization)
     } else if is_cpu {
         const DEFAULT_CPU_MEM_UTILIZATION: f64 = 0.5;
@@ -431,6 +497,34 @@ fn initialize_core(
     if let Some(pb) = progress {
         pb.set_stage("Loading model");
     }
+
+    // Resolve the model dir up-front so we can load the tokenizer in
+    // parallel with the worker's heavy weight upload. `try_load_tokenizer`
+    // is the canonical loader (init.rs::try_load_tokenizer) and lives
+    // here in vllm-serve — workers shouldn't be re-implementing it.
+    // For cached models `resolve_model_path` is sub-ms; for HF download
+    // it does the download once, then `worker.load_model` re-resolves
+    // the same cached path (cheap). Returns `None` for `.gguf` sources
+    // (no sibling tokenizer.json) — that path falls through to the
+    // worker's `take_preloaded_tokenizer` (cuda/mlx GGUF builds the
+    // tokenizer from file metadata via `ferrite_gguf::gguf_tokenizer`,
+    // the only reason any worker still touches tokenizers).
+    let prefetched_model_dir = vllm_executor::ferrite_worker::resolve_model_path(
+        &model_path,
+        config.hf_token.as_deref(),
+        config.gguf_file.as_deref(),
+    )
+    .ok();
+    let parallel_tokenizer_handle = prefetched_model_dir.as_ref().and_then(|dir| {
+        let tok_path = dir.join("tokenizer.json");
+        if !tok_path.exists() {
+            return None;
+        }
+        Some(std::thread::spawn(move || {
+            tokenizers::Tokenizer::from_file(&tok_path).ok()
+        }))
+    });
+
     let (mut worker, hf_config, model_dir, model_dtype) =
         create_worker(config, model_path, progress)?;
 
@@ -438,7 +532,9 @@ fn initialize_core(
         info!("Resolved model architecture: {}", arch);
     }
 
-    let preloaded_tokenizer = worker.take_preloaded_tokenizer();
+    let preloaded_tokenizer = worker
+        .take_preloaded_tokenizer()
+        .or_else(|| parallel_tokenizer_handle.and_then(|h| h.join().ok().flatten()));
 
     let max_model_len = config
         .max_model_len
@@ -604,7 +700,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 
     #[cfg(feature = "nccl")]
     {
-        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
         use vllm_executor::parallel::ResolvedParallelConfig;
         use vllm_executor::threadpool::ThreadPoolExecutor;
 
@@ -616,8 +712,8 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 
         let nccl_id = vllm_cuda::NcclId::new().context("failed to generate NCCL unique ID")?;
 
-        let worker_configs: Vec<CudaWorkerConfig> = (0..tp_size)
-            .map(|rank| CudaWorkerConfig {
+        let worker_configs: Vec<FerriteWorkerConfig> = (0..tp_size)
+            .map(|rank| FerriteWorkerConfig {
                 model_path: config.model.clone(),
                 dtype: config.dtype.clone(),
                 hf_token: config.hf_token.clone(),
@@ -658,8 +754,8 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
             .enumerate()
             .map(|(local_rank, cfg)| {
                 let barrier = download_barrier.clone();
-                std::thread::spawn(move || -> Result<CudaWorker> {
-                    let mut worker = CudaWorker::new(cfg);
+                std::thread::spawn(move || -> Result<FerriteWorker> {
+                    let mut worker = FerriteWorker::new(cfg);
                     worker.init_device().context("init_device failed")?;
                     if local_rank == 0 {
                         worker.load_model().context("load_model failed")?;
@@ -673,12 +769,12 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
             })
             .collect();
 
-        let mut cuda_workers: Vec<CudaWorker> = Vec::with_capacity(tp_size);
+        let mut ferrite_workers: Vec<FerriteWorker> = Vec::with_capacity(tp_size);
         let mut hf_config = None;
         let mut model_dir = None;
         let mut dtype_elem_bytes: usize = 2;
         // GGUF sources carry the tokenizer in the file's metadata, not as
-        // a sibling `tokenizer.json` on disk. `CudaWorker::load_model`
+        // a sibling `tokenizer.json` on disk. `FerriteWorker::load_model`
         // reconstructs it and stashes it in `preloaded_tokenizer`. The
         // tp=1 path (`initialize_core`) harvests this via
         // `take_preloaded_tokenizer()` and falls back to
@@ -702,7 +798,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
                 preloaded_tokenizer = worker.take_preloaded_tokenizer();
             }
-            cuda_workers.push(worker);
+            ferrite_workers.push(worker);
         }
 
         let hf_config = hf_config.context("model config not available after load")?;
@@ -717,12 +813,12 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
         );
 
         // NCCL init + memory profiling on persistent threads.
-        let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = cuda_workers
+        let init_results: Vec<Result<(usize, FerriteWorker)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ferrite_workers
                 .into_iter()
                 .enumerate()
                 .map(|(rank, mut worker)| {
-                    s.spawn(move || -> Result<(usize, CudaWorker)> {
+                    s.spawn(move || -> Result<(usize, FerriteWorker)> {
                         let device = worker.device_ref().expect("device not initialized");
                         unsafe {
                             vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
@@ -991,6 +1087,7 @@ pub fn initialize_stack(
     // ferrite-vision::MmMetadata (collected via ferrite-forward's
     // inventory). vllm-serve names no arch; if no MM arch claims the
     // current HF architectures, the engine stays text-only.
+    #[cfg(all(feature = "multimodal", feature = "cuda"))]
     let hf_config = &core.hf_config;
     #[cfg(all(feature = "multimodal", feature = "cuda"))]
     if let Some(processor) = crate::multimodal::resolve(
@@ -1027,7 +1124,7 @@ pub fn initialize_stack(
 /// broadcasts scheduler output via TCP. Follower runs headless, receiving
 /// commands via TCP and participating in NCCL collectives during forward.
 ///
-/// - Leader (node_rank=0): Creates CudaWorker, NCCL comm, cache init,
+/// - Leader (node_rank=0): Creates FerriteWorker, NCCL comm, cache init,
 ///   warmup, wraps in `MultiNodeExecutor`, returns `InitializedStack`.
 /// - Follower (node_rank>0): Handled by [`initialize_and_run_follower`].
 fn initialize_stack_multinode(
@@ -1046,7 +1143,7 @@ fn initialize_stack_multinode(
 
     #[cfg(feature = "nccl")]
     {
-        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
         use vllm_executor::multinode::MultiNodeExecutor;
 
         let tp_size = config.tensor_parallel_size;
@@ -1078,8 +1175,8 @@ fn initialize_stack_multinode(
         let nccl_id = vllm_cuda::NcclId::from_raw(nccl_id_bytes);
         info!("Leader: NCCL ID exchanged");
 
-        // Step 2: Create CudaWorker for this node's GPU (rank 0).
-        let cuda_config = CudaWorkerConfig {
+        // Step 2: Create FerriteWorker for this node's GPU (rank 0).
+        let cuda_config = FerriteWorkerConfig {
             model_path: config.model.clone(),
             dtype: config.dtype.clone(),
             hf_token: config.hf_token.clone(),
@@ -1112,7 +1209,7 @@ fn initialize_stack_multinode(
             max_model_len: config.max_model_len,
         };
 
-        let mut worker = CudaWorker::new(cuda_config);
+        let mut worker = FerriteWorker::new(cuda_config);
         worker
             .init_device()
             .context("failed to initialize CUDA device")?;
@@ -1328,7 +1425,7 @@ fn initialize_stack_multinode(
 /// Called from the CLI when `node_rank > 0` and `num_nodes > 1`.
 #[cfg(feature = "nccl")]
 pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
-    use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+    use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
 
     let tp_size = config.tensor_parallel_size;
     let node_rank = config.node_rank;
@@ -1350,8 +1447,8 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
     let nccl_id = vllm_cuda::NcclId::from_raw(nccl_id_bytes);
     info!("Follower {}: NCCL ID exchanged", node_rank);
 
-    // Step 2: Create CudaWorker for this node's GPU.
-    let cuda_config = CudaWorkerConfig {
+    // Step 2: Create FerriteWorker for this node's GPU.
+    let cuda_config = FerriteWorkerConfig {
         model_path: config.model.clone(),
         dtype: config.dtype.clone(),
         hf_token: config.hf_token.clone(),
@@ -1384,7 +1481,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         max_model_len: config.max_model_len,
     };
 
-    let mut worker = CudaWorker::new(cuda_config);
+    let mut worker = FerriteWorker::new(cuda_config);
     worker
         .init_device()
         .context("failed to initialize CUDA device")?;
@@ -1472,7 +1569,7 @@ fn initialize_stack_tp_pp(
 
     #[cfg(feature = "nccl")]
     {
-        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
         use vllm_executor::parallel::ResolvedParallelConfig;
         use vllm_executor::threadpool::ThreadPoolExecutor;
 
@@ -1498,11 +1595,11 @@ fn initialize_stack_tp_pp(
 
         // Build per-rank configs.
         // Rank layout: global_rank = pp_rank * tp_size + tp_rank.
-        let worker_configs: Vec<CudaWorkerConfig> = (0..world_size)
+        let worker_configs: Vec<FerriteWorkerConfig> = (0..world_size)
             .map(|global_rank| {
                 let tp_rank = global_rank % tp_size;
                 let pp_rank = global_rank / tp_size;
-                CudaWorkerConfig {
+                FerriteWorkerConfig {
                     model_path: config.model.clone(),
                     dtype: config.dtype.clone(),
                     hf_token: config.hf_token.clone(),
@@ -1546,8 +1643,8 @@ fn initialize_stack_tp_pp(
             .enumerate()
             .map(|(global_rank, cfg)| {
                 let barrier = download_barrier.clone();
-                std::thread::spawn(move || -> Result<CudaWorker> {
-                    let mut worker = CudaWorker::new(cfg);
+                std::thread::spawn(move || -> Result<FerriteWorker> {
+                    let mut worker = FerriteWorker::new(cfg);
                     worker.init_device().context("init_device failed")?;
 
                     // Rank 0 loads first (downloads model files to cache).
@@ -1565,7 +1662,7 @@ fn initialize_stack_tp_pp(
             .collect();
 
         // Collect workers.
-        let mut cuda_workers: Vec<CudaWorker> = Vec::with_capacity(world_size);
+        let mut ferrite_workers: Vec<FerriteWorker> = Vec::with_capacity(world_size);
         let mut hf_config = None;
         let mut model_dir = None;
         let mut dtype_elem_bytes: usize = 2; // BF16 default
@@ -1581,7 +1678,7 @@ fn initialize_stack_tp_pp(
                 model_dir = worker.model_dir().map(|p| p.to_path_buf());
                 dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
             }
-            cuda_workers.push(worker);
+            ferrite_workers.push(worker);
         }
 
         let hf_config = hf_config.context("model config not available after load")?;
@@ -1604,14 +1701,14 @@ fn initialize_stack_tp_pp(
         // We create TP comms first (all ranks in each TP group sync), then PP
         // comms (all ranks in each PP group sync). This ordering ensures no
         // deadlock since all ranks follow the same order.
-        let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = cuda_workers
+        let init_results: Vec<Result<(usize, FerriteWorker)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ferrite_workers
                 .into_iter()
                 .enumerate()
                 .map(|(global_rank, mut worker)| {
                     let tp_nccl_ids = &tp_nccl_ids;
                     let pp_nccl_ids = &pp_nccl_ids;
-                    s.spawn(move || -> Result<(usize, CudaWorker)> {
+                    s.spawn(move || -> Result<(usize, FerriteWorker)> {
                         let tp_rank = global_rank % tp_size;
                         let pp_rank = global_rank / tp_size;
 
@@ -1827,7 +1924,7 @@ fn initialize_stack_tp_pp(
 
 /// (via ColumnParallelLinear/RowParallelLinear sharding at load time).
 ///
-/// TODO: Port to CudaWorker.
+/// TODO: Port to FerriteWorker.
 fn initialize_stack_tp(
     config: &VllmConfig,
     model_name: String,
@@ -1844,7 +1941,7 @@ fn initialize_stack_tp(
 
     #[cfg(feature = "nccl")]
     {
-        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
         use vllm_executor::parallel::ResolvedParallelConfig;
         use vllm_executor::threadpool::ThreadPoolExecutor;
 
@@ -1857,8 +1954,8 @@ fn initialize_stack_tp(
         let nccl_id = vllm_cuda::NcclId::new().context("failed to generate NCCL unique ID")?;
 
         // Build per-rank configs.
-        let worker_configs: Vec<CudaWorkerConfig> = (0..tp_size)
-            .map(|rank| CudaWorkerConfig {
+        let worker_configs: Vec<FerriteWorkerConfig> = (0..tp_size)
+            .map(|rank| FerriteWorkerConfig {
                 model_path: config.model.clone(),
                 dtype: config.dtype.clone(),
                 hf_token: config.hf_token.clone(),
@@ -1902,8 +1999,8 @@ fn initialize_stack_tp(
             .map(|(local_rank, cfg)| {
                 let barrier = download_barrier.clone();
 
-                std::thread::spawn(move || -> Result<CudaWorker> {
-                    let mut worker = CudaWorker::new(cfg);
+                std::thread::spawn(move || -> Result<FerriteWorker> {
+                    let mut worker = FerriteWorker::new(cfg);
                     worker.init_device().context("init_device failed")?;
 
                     // Rank 0 loads first (downloads model files to cache).
@@ -1920,8 +2017,8 @@ fn initialize_stack_tp(
             })
             .collect();
 
-        // Collect concrete CudaWorkers (not yet boxed as dyn Worker).
-        let mut cuda_workers: Vec<CudaWorker> = Vec::with_capacity(tp_size);
+        // Collect concrete FerriteWorkers (not yet boxed as dyn Worker).
+        let mut ferrite_workers: Vec<FerriteWorker> = Vec::with_capacity(tp_size);
         let mut hf_config = None;
         let mut model_dir = None;
         let mut dtype_elem_bytes: usize = 2; // BF16 default
@@ -1937,7 +2034,7 @@ fn initialize_stack_tp(
                 model_dir = worker.model_dir().map(|p| p.to_path_buf());
                 dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
             }
-            cuda_workers.push(worker);
+            ferrite_workers.push(worker);
         }
 
         let hf_config = hf_config.context("model config not available after load")?;
@@ -1957,12 +2054,12 @@ fn initialize_stack_tp(
         // NCCL collectives require all ranks to participate simultaneously, so all
         // TP operations (NCCL init, profiling forward, CUDA graph capture) run on
         // dedicated per-rank threads that persist throughout init.
-        let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = cuda_workers
+        let init_results: Vec<Result<(usize, FerriteWorker)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = ferrite_workers
                 .into_iter()
                 .enumerate()
                 .map(|(rank, mut worker)| {
-                    s.spawn(move || -> Result<(usize, CudaWorker)> {
+                    s.spawn(move || -> Result<(usize, FerriteWorker)> {
                         // Create NCCL communicator (collective — all ranks participate).
                         let device = worker.device_ref().expect("device not initialized");
                         unsafe {
@@ -2232,7 +2329,7 @@ impl ExternalLauncherEnv {
 /// 1. Reads RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT from env.
 /// 2. Sets CUDA device to LOCAL_RANK.
 /// 3. Exchanges NCCL unique ID via TCP store (rank 0 serves, others connect).
-/// 4. Creates a single CudaWorker with TP sharding for this rank.
+/// 4. Creates a single FerriteWorker with TP sharding for this rank.
 /// 5. Coordinates memory allocation via TCP all-reduce MIN.
 /// 6. Wraps in UniProcExecutor (one worker per process).
 /// 7. Builds AsyncEngine and returns the stack.
@@ -2254,7 +2351,7 @@ fn initialize_stack_external(
 
     #[cfg(feature = "nccl")]
     {
-        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
 
         let env = ExternalLauncherEnv::from_env(config)
             .context("failed to read external launcher env vars")?;
@@ -2278,8 +2375,8 @@ fn initialize_stack_external(
         let nccl_id = vllm_cuda::NcclId::from_raw(nccl_id_bytes);
         info!("Rank {}: NCCL ID exchanged", rank);
 
-        // Step 2: Create CudaWorker for this rank's GPU.
-        let cuda_config = CudaWorkerConfig {
+        // Step 2: Create FerriteWorker for this rank's GPU.
+        let cuda_config = FerriteWorkerConfig {
             model_path: config.model.clone(),
             dtype: config.dtype.clone(),
             hf_token: config.hf_token.clone(),
@@ -2312,7 +2409,7 @@ fn initialize_stack_external(
             max_model_len: config.max_model_len,
         };
 
-        let mut worker = CudaWorker::new(cuda_config);
+        let mut worker = FerriteWorker::new(cuda_config);
         worker
             .init_device()
             .context("failed to initialize CUDA device")?;
@@ -2516,7 +2613,7 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
 /// `expand_image_placeholders` finds zero occurrences. Idempotent;
 /// no-op when `tokenizer_config.json` is absent or has no
 /// `additional_special_tokens` field. Applied to every tokenizer
-/// path (preloaded via cuda_worker's bare HfTokenizer load AND
+/// path (preloaded via ferrite_worker's bare HfTokenizer load AND
 /// `try_load_tokenizer`'s fallback path) so configurations converge.
 fn patch_additional_special_tokens(tok: &mut Tokenizer, model_dir: &Path) {
     let config_path = model_dir.join("tokenizer_config.json");
@@ -2678,40 +2775,8 @@ fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     match ChatTemplate::from_tokenizer_config(&config_path) {
         Ok(Some(tpl)) => Some(tpl),
         Ok(None) => {
-            // Fallback chain for models that don't embed the template
-            // in `tokenizer_config.json`:
-            //   1. `chat_template.json` — LLaVA-1.5-class processors
-            //      put a JSON wrapper `{ "chat_template": "..." }` in
-            //      this file. HF transformers' `from_pretrained` looks
-            //      here when the tokenizer config is silent.
-            //   2. `chat_template.jinja` — some AWQ-quantized mirrors.
-            let json_path = model_dir.join("chat_template.json");
-            if json_path.exists() {
-                match std::fs::read_to_string(&json_path) {
-                    Ok(body) => {
-                        let template_str = serde_json::from_str::<serde_json::Value>(&body)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("chat_template")
-                                    .and_then(|x| x.as_str().map(String::from))
-                            });
-                        if let Some(s) = template_str {
-                            match ChatTemplate::new(s) {
-                                Ok(tpl) => {
-                                    info!("Chat template loaded from chat_template.json");
-                                    return Some(tpl);
-                                }
-                                Err(e) => {
-                                    info!("Failed to parse chat_template.json: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        info!("Failed to read chat_template.json: {e}");
-                    }
-                }
-            }
+            // Fallback: some models (e.g. AWQ quantized) store the template in a
+            // separate Jinja file instead of embedding it in tokenizer_config.json.
             let jinja_path = model_dir.join("chat_template.jinja");
             if jinja_path.exists() {
                 match std::fs::read_to_string(&jinja_path) {

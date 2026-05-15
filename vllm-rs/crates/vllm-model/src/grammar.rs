@@ -15,7 +15,7 @@ use toktrie::TokenId;
 use toktrie_hf_tokenizers::ByteTokenizer;
 use vllm_common::sampling::GuidedGrammar;
 
-// Re-export for consumers (cuda_worker, mlx_worker).
+// Re-export for consumers (ferrite_worker, mlx_worker).
 pub use llguidance::ParserFactory as LlgParserFactory;
 
 /// A compiled grammar guide that tracks parser state for constrained decoding.

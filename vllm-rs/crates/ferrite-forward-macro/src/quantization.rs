@@ -105,6 +105,17 @@ pub enum StorageFormat {
     /// `take_quantized_linear`. The runtime `GgmlLinear` kernel
     /// dispatcher already handles dtype variation.
     Ggml,
+    /// MLX-native affine INT4 quantization. Carries `bits`
+    /// (currently always 4 for `mlx-community/*-4bit` checkpoints)
+    /// and `group_size` (32, 64, or 128 — uniformly 64 across the
+    /// canonical Llama/Qwen/Gemma/Mistral/Mixtral/Phi/DeepSeek 4bit
+    /// repos sampled in P0). Per-output-row scales + biases are
+    /// stored as `<prefix>.scales` / `<prefix>.biases` (`F16`
+    /// dtype) alongside the packed weight `<prefix>.weight`
+    /// (`U32` dtype, `[N, K/8]` shape for bits=4). The kernel
+    /// reads scales/biases as `T_scale = half` and casts to float
+    /// in registers — see `INT4_PARITY_PROBES.md` §7.
+    Affine { bits: u32, group_size: u32 },
 }
 
 /// FP8 activation quantization scheme. Matches
@@ -203,6 +214,12 @@ pub enum QuantMethod {
     /// GGML/GGUF block-quantized weights. No knobs at compile time —
     /// per-tensor dtype is read from the GGUF file at load time.
     Ggml,
+    /// MLX-native affine INT4 quantization. MLX-format `config.json`
+    /// has no `quant_method` field — the parser detects this method
+    /// via the absence of `quant_method` plus presence of `bits` +
+    /// `group_size` directly under `quantization_config` (or the
+    /// alternative top-level `quantization` key MLX also writes).
+    Affine { bits: u32, group_size: u32 },
 }
 
 /// Errors from [`QuantizationConfig::parse`]. All variants preserve
@@ -256,25 +273,38 @@ impl QuantizationConfig {
     /// on a recognized method; `Err` on a present-but-malformed or
     /// not-yet-supported config.
     pub fn parse(root: &serde_json::Value) -> Result<Option<Self>, ParseError> {
-        let Some(qc) = root.get("quantization_config") else {
+        // MLX-format checkpoints write the same payload under both
+        // `quantization_config` (HF-canonical) and `quantization`
+        // (MLX-only) — accept either. HF-transformers checkpoints
+        // only write `quantization_config`.
+        let qc_value = root
+            .get("quantization_config")
+            .or_else(|| root.get("quantization"));
+        let Some(qc) = qc_value else {
             return Ok(None);
         };
         let obj = qc.as_object().ok_or(ParseError::NotAnObject)?;
 
-        let method_str = obj
-            .get("quant_method")
-            .and_then(|v| v.as_str())
-            .ok_or(ParseError::MissingMethod)?;
-
-        let method = match method_str {
-            "awq" => parse_awq(obj)?,
-            "gptq" => parse_gptq(obj)?,
-            "compressed-tensors" => parse_compressed_tensors(obj)?,
-            "bitsandbytes" => parse_bitsandbytes(obj)?,
-            "fp8" => parse_fp8(obj)?,
-            // GGML/GGUF block-quantized — no compile-time knobs.
-            "ggml" | "gguf" => QuantMethod::Ggml,
-            other => return Err(ParseError::UnsupportedMethod(other.to_string())),
+        // HF-canonical configs carry `quant_method`; MLX-affine
+        // checkpoints have no `quant_method`, just `{bits,
+        // group_size}` at the root of the section. Distinguish on
+        // presence of `quant_method` first; fall through to MLX-
+        // affine only when neither path matches.
+        let method = if let Some(method_str) = obj.get("quant_method").and_then(|v| v.as_str()) {
+            match method_str {
+                "awq" => parse_awq(obj)?,
+                "gptq" => parse_gptq(obj)?,
+                "compressed-tensors" => parse_compressed_tensors(obj)?,
+                "bitsandbytes" => parse_bitsandbytes(obj)?,
+                "fp8" => parse_fp8(obj)?,
+                // GGML/GGUF block-quantized — no compile-time knobs.
+                "ggml" | "gguf" => QuantMethod::Ggml,
+                other => return Err(ParseError::UnsupportedMethod(other.to_string())),
+            }
+        } else if obj.contains_key("bits") && obj.contains_key("group_size") {
+            parse_affine_no_method(obj)?
+        } else {
+            return Err(ParseError::MissingMethod);
         };
 
         // AWQ/GPTQ carry `modules_to_not_convert`; compressed-tensors
@@ -296,6 +326,42 @@ impl QuantizationConfig {
             modules_to_not_convert,
         }))
     }
+}
+
+/// Parse the MLX-native affine quantization payload — `{bits,
+/// group_size}` directly under `quantization_config` (or
+/// `quantization`), with no `quant_method` field. MLX writes this
+/// shape on every `mlx-community/*-4bit` repo on HF.
+fn parse_affine_no_method(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<QuantMethod, ParseError> {
+    let bits = obj
+        .get("bits")
+        .and_then(|v| v.as_u64())
+        .ok_or(ParseError::BadField {
+            field: "bits",
+            reason: "missing or not a u64",
+        })? as u32;
+    let group_size = obj
+        .get("group_size")
+        .and_then(|v| v.as_u64())
+        .ok_or(ParseError::BadField {
+            field: "group_size",
+            reason: "missing or not a u64",
+        })? as u32;
+    if bits != 4 {
+        return Err(ParseError::BadField {
+            field: "bits",
+            reason: "MLX-affine ferrite path only handles 4-bit today",
+        });
+    }
+    if !matches!(group_size, 32 | 64 | 128) {
+        return Err(ParseError::BadField {
+            field: "group_size",
+            reason: "MLX-affine supports group_size ∈ {32, 64, 128}",
+        });
+    }
+    Ok(QuantMethod::Affine { bits, group_size })
 }
 
 fn parse_awq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMethod, ParseError> {
@@ -702,8 +768,30 @@ pub fn storage_format_for_weight(
     }
 
     // Tied lm_head: no on-disk `lm_head.*`; the codegen FieldLoad
-    // shares the embedding buffer as a dense LinearLayer.
+    // shares the embedding buffer.
+    //
+    // For AWQ/GPTQ/Bnb/Fp8/Ggml the shared buffer is dense (those
+    // formats keep the embedding in fp), so the lm_head Gemm sees
+    // a Dense tensor.
+    //
+    // For MLX-affine the on-disk embed_tokens is itself quantized
+    // (`model.embed_tokens.{weight,scales,biases}` is the affine
+    // triple — confirmed across every mlx-community 4bit repo
+    // sampled in P0). Pre-P6, the load path CPU-dequantized the
+    // embedding (`Embedding::load_affine_dequant` → BF16 Dense),
+    // so the tied lm_head saw a Dense tensor and routed through
+    // MetalGemmImpl. P6 lifts the embedding to forward-time gather
+    // + dequant (`Instruction::AffineEmbed`), which means the
+    // embed buffer triple stays quantized at runtime — the tied
+    // lm_head must now also see Affine storage so the solver
+    // picks `MetalAffineQmmImpl` and the codegen
+    // `LinearTiedToEmbedding { affine: Some((gs, bits)) }` arm
+    // emits `LinearLayer::AffineQuant(...)` sharing the embed's
+    // packed buffers.
     if dotted == "lm_head" && model.tie_word_embeddings {
+        if let QuantMethod::Affine { bits, group_size } = qc.method {
+            return StorageFormat::Affine { bits, group_size };
+        }
         return StorageFormat::Dense;
     }
 
@@ -752,9 +840,19 @@ pub fn storage_format_for_weight(
     // `OpKind::Moe` carries one logical `moe[layer]` weight whose
     // underlying experts are matmul-quantizable in V3/Kimi K2 FP8
     // checkpoints, so it counts as reaching a matmul.
+    //
+    // MLX-affine additionally quantizes the embedding table on the
+    // disk (`model.embed_tokens.{weight,scales,biases}` triple —
+    // verified across every mlx-community 4bit repo in P0 except
+    // the Gemma-3-MM vision multimodal). For Affine, an Embedding
+    // op consumer is also a quantized consumer.
     let mut reached_by_matmul = false;
+    let affine_method = matches!(qc.method, QuantMethod::Affine { .. });
     for node in &fuf.nodes {
-        if node.op != OpKind::Gemm && node.op != OpKind::Moe {
+        let consumer = node.op == OpKind::Gemm
+            || node.op == OpKind::Moe
+            || (affine_method && node.op == OpKind::Embed);
+        if !consumer {
             continue;
         }
         for input in &node.inputs {
@@ -807,6 +905,7 @@ pub fn storage_format_for_weight(
         },
         QuantMethod::Fp8 { scheme, block_size } => StorageFormat::Fp8 { scheme, block_size },
         QuantMethod::Ggml => StorageFormat::Ggml,
+        QuantMethod::Affine { bits, group_size } => StorageFormat::Affine { bits, group_size },
     }
 }
 

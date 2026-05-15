@@ -14,12 +14,18 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
+#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
+#[cfg(feature = "cuda")]
 use cudarc::driver::sys::CUstream;
 
+use crate::DeviceAllocator;
+#[cfg(feature = "cuda")]
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
@@ -152,12 +158,24 @@ impl CpuTensorRef {
 /// This is a free function (not `&mut self`) so it can be called from parallel
 /// threads during multi-shard loading.
 fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)> {
+    let _t_total = std::time::Instant::now();
+    let _t_open = std::time::Instant::now();
     let file = std::fs::File::open(path)?;
     let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }?);
+    let _dt_open = _t_open.elapsed();
 
     // Tell the kernel to start paging in the entire shard from disk.
-    // This overlaps disk I/O with header parsing and subsequent shard loads.
-    #[cfg(unix)]
+    // Cuda backend wants the async readahead — overlaps disk I/O
+    // with header parsing and subsequent shard loads, and the H2D
+    // copy that follows reads from the mmap pages.
+    //
+    // Metal skips this: macOS's MADV_WILLNEED is **synchronous** for
+    // large ranges (measured 152ms for a 5GB shard, vs 30µs for the
+    // mmap itself). MLX doesn't call it either; the kernel's own
+    // demand-paging handles first-touch on the gate_up pack memcpy
+    // and shader bindings without measurable cost.
+    let _t_madv = std::time::Instant::now();
+    #[cfg(all(unix, feature = "cuda"))]
     unsafe {
         libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
@@ -171,10 +189,14 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
             libc::MADV_SEQUENTIAL,
         );
     }
+    let _dt_madv = _t_madv.elapsed();
 
     // Parse safetensors header to find tensor offsets.
+    let _t_des = std::time::Instant::now();
     let st = safetensors::SafeTensors::deserialize(&mmap)
         .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
+    let _dt_des = _t_des.elapsed();
+    let _t_iter = std::time::Instant::now();
 
     let mut tensors = HashMap::new();
     for name in st.names() {
@@ -202,9 +224,14 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
     }
 
     tracing::info!(
-        "Parsed shard {}: {} tensors (mmap + madvise WILLNEED)",
+        "Parsed shard {}: {} tensors in {:?} (open+mmap {:?}, madvise {:?}, deserialize {:?}, iterate {:?})",
         path.display(),
         tensors.len(),
+        _t_total.elapsed(),
+        _dt_open,
+        _dt_madv,
+        _dt_des,
+        _t_iter.elapsed(),
     );
 
     Ok((tensors, mmap))
@@ -217,6 +244,11 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 
 /// Background worker: iterates through tensors, pre-faults mmap pages, casts
 /// float data into per-tensor pinned buffers, and stores results in `state.ready`.
+///
+/// CUDA-only: uses `mem_alloc_host` for pinned-host destinations. The
+/// Metal path (unified memory) doesn't need pinning and skips this
+/// pipeline entirely.
+#[cfg(feature = "cuda")]
 fn precast_worker(
     state: Arc<PrecastState>,
     target_dtype: Option<DType>,
@@ -270,6 +302,8 @@ fn precast_worker(
 
 /// Pre-fault mmap pages by reading through the data at page-stride intervals.
 /// This triggers page faults now so take() doesn't block on disk I/O later.
+/// CUDA-only — invoked from the precast pipeline.
+#[cfg(feature = "cuda")]
 fn prefault_pages(data: &[u8]) {
     // Read one byte per page (4KB) to fault each page into the page cache.
     // The volatile read prevents the compiler from optimizing this away.
@@ -283,7 +317,8 @@ fn prefault_pages(data: &[u8]) {
     }
 }
 
-/// Cast tensor data into a new pinned host buffer.
+/// Cast tensor data into a new pinned host buffer. CUDA-only.
+#[cfg(feature = "cuda")]
 fn cast_into_pinned(data: &[u8], src_dtype: DType, target: DType) -> Result<PrecastEntry> {
     let numel = data.len() / src_dtype.size_bytes();
     let cast_size = numel * target.size_bytes();
@@ -351,6 +386,8 @@ fn cast_into_pinned(data: &[u8], src_dtype: DType, target: DType) -> Result<Prec
 }
 
 /// A pre-cast tensor ready for H2D DMA. Data lives in a pinned host buffer.
+/// CUDA-only.
+#[cfg(feature = "cuda")]
 struct PrecastEntry {
     /// Pinned host buffer containing the (possibly cast) tensor data.
     pinned_ptr: *mut u8,
@@ -361,9 +398,11 @@ struct PrecastEntry {
 }
 
 // Safety: pinned host memory is accessible from any thread.
+#[cfg(feature = "cuda")]
 unsafe impl Send for PrecastEntry {}
 
-/// Shared state for the pre-cast pipeline.
+/// Shared state for the pre-cast pipeline. CUDA-only.
+#[cfg(feature = "cuda")]
 struct PrecastState {
     /// Pre-cast tensors ready for take(). Protected by mutex — contention is
     /// low because the producer adds entries one at a time and the consumer
@@ -386,23 +425,29 @@ struct PrecastState {
 pub struct GpuWeights {
     /// Per-tensor CPU references, keyed by tensor name.
     tensors: HashMap<String, CpuTensorRef>,
-    /// Stream used for H2D copies.
-    stream: CUstream,
     /// Target dtype for floating-point weights. When set, F32 weights are cast
     /// to this dtype on CPU before H2D copy.
     target_dtype: Option<DType>,
-    /// Reusable pinned host buffer for synchronous dtype casting (fallback
-    /// when precast pipeline hasn't processed a tensor yet).
-    /// (ptr, capacity_bytes). Grown as needed, never shrunk.
-    cast_pinned: (*mut u8, usize),
+    /// Reusable host scratch for the synchronous-cast slow path
+    /// (fallback when the precast pipeline hasn't processed a
+    /// tensor yet). Pageable; CUDA's `memcpy_htod_async` from
+    /// pageable memory blocks the CPU but correctness is fine, and
+    /// the slow path is rare (precast handles the hot path).
+    /// Grows as needed, never shrinks.
+    cast_scratch: Vec<u8>,
     /// Pre-cast pipeline state, shared with background thread.
+    /// CUDA-only optimization (uses pinned host memory for DMA);
+    /// `None` under non-CUDA backends.
+    #[cfg(feature = "cuda")]
     precast: Option<Arc<PrecastState>>,
-    /// Join handle for the background precast thread.
+    /// Join handle for the background precast thread (CUDA-only).
+    #[cfg(feature = "cuda")]
     precast_handle: Option<std::thread::JoinHandle<()>>,
-    /// All GPU allocations made by `take()` / `take_into()` / `take_shard()`.
-    /// Tracked so the caller can free weight memory on sleep without walking
-    /// model structs. RAII: `RawGpuMem` calls `driver::mem_free` on drop.
-    gpu_allocs: Vec<crate::alloc::RawGpuMem>,
+    /// Backend allocator: device memory + H2D primitive. The
+    /// concrete type is `CudaAllocator` under cuda or
+    /// `MetalAllocator` under metal — see [`BackendAllocator`]
+    /// (`crate::BackendAllocator`).
+    allocator: crate::BackendAllocator,
     /// Keep mmaps alive for the lifetime of GpuWeights.
     ///
     /// `take()` and `take_into()` use `memcpy_htod_async` which reads from
@@ -441,15 +486,16 @@ impl GpuWeights {
     /// `gguf_dense` directly via `quantized_map_mut` /
     /// `gguf_dense_map_mut`. Safetensors callers should use
     /// `from_dir` / `from_index` / `from_single_file` instead.
-    pub fn empty(stream: CUstream) -> Self {
+    pub fn empty(allocator: crate::BackendAllocator) -> Self {
         Self {
             tensors: HashMap::new(),
-            stream,
             target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
+            cast_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
             precast: None,
+            #[cfg(feature = "cuda")]
             precast_handle: None,
-            gpu_allocs: Vec::new(),
+            allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -459,25 +505,26 @@ impl GpuWeights {
     /// Push a `RawGpuMem` allocation onto the lifetime tracker. Used
     /// by the GGUF loader so quantized-weight GPU memory is freed
     /// alongside the rest of the `GpuWeights` allocations.
+    #[cfg(feature = "cuda")]
     pub fn push_gpu_alloc(&mut self, alloc: crate::alloc::RawGpuMem) {
-        self.gpu_allocs.push(alloc);
+        self.allocator.push_alloc(alloc);
     }
 
     /// Load all weights from a model directory (CPU-only — no GPU allocation).
     ///
     /// Handles both single-file (`model.safetensors`) and sharded
     /// (`model.safetensors.index.json`) models.
-    pub fn from_dir(dir: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
+    pub fn from_dir(dir: impl AsRef<Path>, allocator: crate::BackendAllocator) -> Result<Self> {
         let dir = dir.as_ref();
         let index_path = dir.join("model.safetensors.index.json");
         let single_path = dir.join("model.safetensors");
 
         if index_path.exists() {
-            Self::from_index(&index_path, stream)
+            Self::from_index(&index_path, allocator)
         } else if single_path.exists() {
-            Self::from_single_file(&single_path, stream)
+            Self::from_single_file(&single_path, allocator)
         } else {
-            bail!("No safetensors files found in {}", dir.display());
+            anyhow::bail!("No safetensors files found in {}", dir.display());
         }
     }
 
@@ -493,6 +540,7 @@ impl GpuWeights {
     ///
     /// # Safety
     /// Caller must hold a valid CUDA context and stream.
+    #[cfg(feature = "cuda")]
     pub unsafe fn from_path(
         path: impl AsRef<Path>,
         stream: CUstream,
@@ -538,7 +586,7 @@ impl GpuWeights {
                 )
             };
         }
-        let mut gw = Self::from_dir(path, stream)?;
+        let mut gw = Self::from_dir(path, crate::CudaAllocator::new(stream))?;
         gw.set_target_dtype(target_dtype);
         Ok(gw)
     }
@@ -556,6 +604,7 @@ impl GpuWeights {
     /// Caller must hold a valid CUDA context and stream. The
     /// returned `GpuWeights` retains GGUF tensor pointers for the
     /// lifetime of the model.
+    #[cfg(feature = "cuda")]
     pub unsafe fn from_gguf_file(
         path: impl AsRef<Path>,
         model_dtype: DType,
@@ -575,16 +624,20 @@ impl GpuWeights {
     }
 
     /// Load from a single safetensors file (CPU-only).
-    pub fn from_single_file(path: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
+    pub fn from_single_file(
+        path: impl AsRef<Path>,
+        allocator: crate::BackendAllocator,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let mut gw = Self {
             tensors: HashMap::new(),
-            stream,
             target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
+            cast_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
             precast: None,
+            #[cfg(feature = "cuda")]
             precast_handle: None,
-            gpu_allocs: Vec::new(),
+            allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -598,7 +651,10 @@ impl GpuWeights {
     /// Multiple shards are loaded in parallel — each thread mmaps a shard,
     /// issues madvise(WILLNEED) to start readahead, and parses the header.
     /// This overlaps disk I/O across shards.
-    pub fn from_index(index_path: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
+    pub fn from_index(
+        index_path: impl AsRef<Path>,
+        allocator: crate::BackendAllocator,
+    ) -> Result<Self> {
         let index_path = index_path.as_ref();
         let dir = index_path
             .parent()
@@ -625,12 +681,13 @@ impl GpuWeights {
             // Single shard — no need for threading.
             let mut gw = Self {
                 tensors: HashMap::new(),
-                stream,
                 target_dtype: None,
-                cast_pinned: (std::ptr::null_mut(), 0),
+                cast_scratch: Vec::new(),
+                #[cfg(feature = "cuda")]
                 precast: None,
+                #[cfg(feature = "cuda")]
                 precast_handle: None,
-                gpu_allocs: Vec::new(),
+                allocator,
                 _mmaps: Vec::new(),
                 quantized: HashMap::new(),
                 gguf_dense: HashMap::new(),
@@ -665,17 +722,24 @@ impl GpuWeights {
         for result in shard_results {
             let (shard_tensors, mmap) = result?;
             tensors.extend(shard_tensors);
+            // Register every shard's mmap with the allocator so
+            // metal `take()` can alias the safetensors pages directly
+            // (zero-copy weight load). No-op under cuda — only the
+            // `MetalAllocator` exposes `register_mmap`.
+            #[cfg(feature = "metal")]
+            allocator.register_mmap(Arc::clone(&mmap));
             mmaps.push(mmap);
         }
 
         Ok(Self {
             tensors,
-            stream,
             target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
+            cast_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
             precast: None,
+            #[cfg(feature = "cuda")]
             precast_handle: None,
-            gpu_allocs: Vec::new(),
+            allocator,
             _mmaps: mmaps,
             quantized: HashMap::new(),
             gguf_dense: HashMap::new(),
@@ -686,29 +750,19 @@ impl GpuWeights {
     fn load_shard(&mut self, path: &Path) -> Result<()> {
         let (shard_tensors, mmap) = load_shard_into_map(path)?;
         self.tensors.extend(shard_tensors);
+        // Register the mmap with the allocator so metal `take()` can
+        // alias the safetensors pages directly. No-op under cuda.
+        #[cfg(feature = "metal")]
+        self.allocator.register_mmap(Arc::clone(&mmap));
         self._mmaps.push(mmap);
         Ok(())
     }
 
     /// Ensure the pinned cast buffer has at least `needed` bytes.
     /// Grows by freeing + reallocating (pinned memory can't realloc).
-    fn ensure_pinned_buf(&mut self, needed: usize) {
-        if needed <= self.cast_pinned.1 {
-            return;
-        }
-        // Free old buffer if any.
-        if !self.cast_pinned.0.is_null() {
-            unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
-        }
-        // Allocate new pinned buffer. Round up to 1MB alignment for reuse.
-        let alloc_size = needed.next_power_of_two().max(1 << 20);
-        let ptr = unsafe { driver::mem_alloc_host(alloc_size) }
-            .expect("failed to allocate pinned host memory for dtype cast");
-        self.cast_pinned = (ptr, alloc_size);
-    }
-
     /// If target_dtype is set and the weight needs casting, cast on CPU into
-    /// pinned host memory. Returns (data_ptr, size_bytes, effective_dtype).
+    /// the reusable host scratch buffer. Returns (data_ptr, size_bytes,
+    /// effective_dtype).
     ///
     /// Only floating-point weights (F32, BF16, F16) are cast. Integer dtypes
     /// (I32, U32, I64) are left untouched — they're used for indices/metadata.
@@ -726,57 +780,112 @@ impl GpuWeights {
 
         let numel = cpu_ref.size_bytes / cpu_ref.dtype.size_bytes();
         let cast_size = numel * target.size_bytes();
-        self.ensure_pinned_buf(cast_size);
+        // Vec::resize is grow-only-cheap when capacity already
+        // satisfies; the slow path is rare, so an occasional realloc
+        // is fine.
+        if self.cast_scratch.len() < cast_size {
+            self.cast_scratch.resize(cast_size, 0);
+        }
 
         let src = cpu_ref.data();
-        let dst = self.cast_pinned.0;
+        let dst = self.cast_scratch.as_mut_ptr();
 
-        // Dispatch cast. The common case is F32 → BF16/F16.
+        // Dispatch cast. The common case is F32 → BF16/F16. Each
+        // float-pair path uses (1) the `half` crate's SIMD-accelerated
+        // `convert_from_f32_slice` / `convert_to_f32_slice` where
+        // available (NEON on aarch64, F16C on x86_64 with the right
+        // target features), and (2) rayon to parallelize across cores.
+        // The threshold below avoids rayon overhead on tiny tensors.
+        use half::slice::HalfFloatSliceExt;
+        use rayon::prelude::*;
+        const PAR_THRESHOLD: usize = 256 * 1024; // ~256K elements before splitting.
+
         match (cpu_ref.dtype, target) {
             (DType::F32, DType::BF16) => {
                 let src_f32 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_f32.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::bf16::from_f32(*s).to_bits();
+                let dst_bf16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel) };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_f32
+                        .par_chunks(chunk)
+                        .zip(dst_bf16.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| d.convert_from_f32_slice(s));
+                } else {
+                    dst_bf16.convert_from_f32_slice(src_f32);
                 }
             }
             (DType::F32, DType::F16) => {
                 let src_f32 =
                     unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_f32.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::f16::from_f32(*s).to_bits();
+                let dst_f16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_f32
+                        .par_chunks(chunk)
+                        .zip(dst_f16.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| d.convert_from_f32_slice(s));
+                } else {
+                    dst_f16.convert_from_f32_slice(src_f32);
                 }
             }
             (DType::F16, DType::BF16) => {
-                let src_u16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_u16.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
-                }
+                let src_f16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
+                let dst_bf16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::bf16, numel) };
+                // Two-step: f16 → f32 (SIMD via convert_to_f32_slice) → bf16.
+                src_f16
+                    .par_chunks(PAR_THRESHOLD.max(1))
+                    .zip(dst_bf16.par_chunks_mut(PAR_THRESHOLD.max(1)))
+                    .for_each(|(s, d)| {
+                        let mut tmp = vec![0.0_f32; s.len()];
+                        s.convert_to_f32_slice(&mut tmp);
+                        d.convert_from_f32_slice(&tmp);
+                    });
             }
             (DType::BF16, DType::F16) => {
-                let src_u16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
-                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
-                for (s, d) in src_u16.iter().zip(dst_u16.iter_mut()) {
-                    *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
+                let src_bf16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel) };
+                let dst_f16 =
+                    unsafe { std::slice::from_raw_parts_mut(dst as *mut half::f16, numel) };
+                src_bf16
+                    .par_chunks(PAR_THRESHOLD.max(1))
+                    .zip(dst_f16.par_chunks_mut(PAR_THRESHOLD.max(1)))
+                    .for_each(|(s, d)| {
+                        let mut tmp = vec![0.0_f32; s.len()];
+                        s.convert_to_f32_slice(&mut tmp);
+                        d.convert_from_f32_slice(&tmp);
+                    });
+            }
+            (DType::BF16, DType::F32) => {
+                let src_bf16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::bf16, numel) };
+                let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_bf16
+                        .par_chunks(chunk)
+                        .zip(dst_f32.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| s.convert_to_f32_slice(d));
+                } else {
+                    src_bf16.convert_to_f32_slice(dst_f32);
                 }
             }
-            (DType::BF16 | DType::F16, DType::F32) => {
-                let src_u16 =
-                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+            (DType::F16, DType::F32) => {
+                let src_f16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const half::f16, numel) };
                 let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
-                if cpu_ref.dtype == DType::BF16 {
-                    for (s, d) in src_u16.iter().zip(dst_f32.iter_mut()) {
-                        *d = half::bf16::from_bits(*s).to_f32();
-                    }
+                if numel >= PAR_THRESHOLD {
+                    let chunk = numel.div_ceil(rayon::current_num_threads().max(1));
+                    src_f16
+                        .par_chunks(chunk)
+                        .zip(dst_f32.par_chunks_mut(chunk))
+                        .for_each(|(s, d)| s.convert_to_f32_slice(d));
                 } else {
-                    for (s, d) in src_u16.iter().zip(dst_f32.iter_mut()) {
-                        *d = half::f16::from_bits(*s).to_f32();
-                    }
+                    src_f16.convert_to_f32_slice(dst_f32);
                 }
             }
             _ => unreachable!("unhandled cast: {:?} → {:?}", cpu_ref.dtype, target),
@@ -825,6 +934,11 @@ impl GpuWeights {
     ///
     /// Must be called after `set_target_dtype()`. Safe to call multiple times
     /// (subsequent calls are no-ops if already running).
+    ///
+    /// CUDA-only: pre-casts into pinned host buffers for async DMA. The
+    /// Metal path uses unified-memory `MTLBuffer`s — no DMA, no
+    /// pinning, no precast pipeline.
+    #[cfg(feature = "cuda")]
     pub fn start_precast(&mut self) {
         if self.precast.is_some() {
             return; // Already running.
@@ -882,55 +996,76 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        // Fast path: check if precast pipeline has this tensor ready.
+        // Fast path: check if precast pipeline has this tensor
+        // ready. Cuda-only — Metal has no precast.
+        #[cfg(feature = "cuda")]
         if let Some(entry) = self.take_precast(name) {
-            let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
-            self.gpu_allocs
-                .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, entry.size_bytes) });
+            // The allocator's `alloc_and_copy_host` synchronizes
+            // before returning, so the entry's pinned buffer is safe
+            // to free immediately after.
+            let gpu_ptr = unsafe {
+                self.allocator
+                    .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
+            };
             unsafe {
-                driver::memcpy_htod_async(
-                    gpu_ptr,
-                    entry.pinned_ptr as *const u8,
-                    entry.size_bytes,
-                    self.stream,
-                )?;
-            }
-            let tensor = unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, entry.dtype) };
-            // Free pinned buffer after DMA completes. We synchronize the stream
-            // to ensure the DMA has finished reading from the pinned buffer.
-            unsafe {
-                driver::stream_synchronize(self.stream)?;
                 driver::mem_free_host(entry.pinned_ptr).ok();
             }
-            return Ok(tensor);
+            return Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, entry.dtype) });
         }
 
         // Slow path: synchronous pre-fault + cast + DMA.
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
-
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-
-        // The cast destination is `self.cast_pinned`, a SHARED pinned
-        // buffer reused across calls (see `ensure_pinned_buf`). Without
-        // a sync here, the next `take` would overwrite this buffer
-        // BEFORE the GPU has actually drained the async memcpy — every
-        // queued copy then reads whichever cast we wrote last, and
-        // many distinct GPU pointers end up with the same payload.
-        // (The fast/precast path already syncs before freeing its
-        // per-tensor pinned buffer; the slow path needs the same
-        // serialization because it reuses one shared buffer.)
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
-            if used_shared_pinned {
-                driver::stream_synchronize(self.stream)?;
-            }
-        }
-
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
     }
+
+    /// Like [`take`] but skips the `target_dtype` cast — bytes go to
+    /// the device exactly as they were stored on disk.
+    ///
+    /// Used by `AffineQuantLinear::load` / `AffineQuantEmbedding::load`
+    /// (Metal int4 path) for `*.scales` / `*.biases`: those ship F16
+    /// on disk and the ferrite-metal int4 kernels read them as `F16`
+    /// `T_scale` pointers, casting to the activation dtype in-register
+    /// (`INT4_PARITY_PROBES.md` §7 `Decision: in-register cast`).
+    /// Routing through `take()` would F16→BF16 truncate the scales at
+    /// load on the bf16 stack — that's the P10b regression site.
+    ///
+    /// Routes through [`alloc_and_copy_host_aligned`] with the
+    /// dtype's scalar size as `min_align`. On Metal this unlocks the
+    /// mmap-zero-copy fast path for F16/BF16 scales/biases/RMSNorm
+    /// gains in `mlx-community` 4bit safetensors (whose data section
+    /// lands at file-offset `mod 16 = 2`, permanently failing the
+    /// strict 16-byte `MetalAllocator::MIN_BIND_ALIGN` gate). On
+    /// CUDA the call is forwarded to `alloc_and_copy_host` — the
+    /// alignment hint is a no-op there.
+    ///
+    /// [`take`]: Self::take
+    /// [`alloc_and_copy_host_aligned`]: crate::device_allocator::DeviceAllocator::alloc_and_copy_host_aligned
+    pub fn take_keep_dtype(&mut self, name: &str) -> Result<GpuTensor> {
+        if let Some(t) = self.gguf_dense.remove(name) {
+            return Ok(t);
+        }
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        // CUDA precast path would have produced cast bytes; consume the
+        // precast slot so it's not leaked, but ignore the cast and use
+        // the on-disk view. (Metal has no precast.)
+        #[cfg(feature = "cuda")]
+        if let Some(entry) = self.take_precast(name) {
+            unsafe { driver::mem_free_host(entry.pinned_ptr).ok(); }
+        }
+        let gpu_ptr = unsafe {
+            self.allocator.alloc_and_copy_host_aligned(
+                cpu_ref.data().as_ptr(),
+                cpu_ref.size_bytes,
+                cpu_ref.dtype.size_bytes(),
+            )?
+        };
+        Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, cpu_ref.dtype) })
+    }
+
 
     /// Same as [`take`] but creates the returned `GpuTensor` with a
     /// caller-provided shape instead of the on-disk shape. The two
@@ -968,36 +1103,20 @@ impl GpuWeights {
             shape,
         );
 
+        #[cfg(feature = "cuda")]
         if let Some(entry) = self.take_precast(name) {
-            let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
-            self.gpu_allocs
-                .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, entry.size_bytes) });
+            let gpu_ptr = unsafe {
+                self.allocator
+                    .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
+            };
             unsafe {
-                driver::memcpy_htod_async(
-                    gpu_ptr,
-                    entry.pinned_ptr as *const u8,
-                    entry.size_bytes,
-                    self.stream,
-                )?;
-            }
-            let tensor = unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) };
-            unsafe {
-                driver::stream_synchronize(self.stream)?;
                 driver::mem_free_host(entry.pinned_ptr).ok();
             }
-            return Ok(tensor);
+            return Ok(unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) });
         }
 
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
-
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
-        }
-
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
     }
 
@@ -1005,6 +1124,7 @@ impl GpuWeights {
     ///
     /// Used for fused weight loading (QKV, gate_up) — pre-allocate the fused
     /// tensor, then copy each component directly from CPU to the right offset.
+    #[cfg(feature = "cuda")]
     pub unsafe fn take_into(
         &mut self,
         name: &str,
@@ -1034,20 +1154,52 @@ impl GpuWeights {
         // Slow path.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
+        // If the cast wrote into our shared `cast_scratch`, sync the
+        // stream before returning so the next `take_into` doesn't
+        // overwrite the buffer mid-DMA. (No-op when `data` points at
+        // the original mmap — that memory isn't reused.)
+        let used_shared_scratch = data == self.cast_scratch.as_ptr();
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
-        if used_shared_pinned {
-            // Same race as `take`'s slow path — the next `take_into`
-            // would overwrite `cast_pinned` before this async memcpy
-            // drains. Sync to make this call effectively synchronous
-            // when the cast destination is the shared buffer.
+        if used_shared_scratch {
             driver::stream_synchronize(stream)?;
         }
 
         Ok(size_bytes)
     }
 
-    /// Try to take a pre-cast entry for the given tensor name.
+    /// Allocate a single GPU buffer and copy `data` into it via the
+    /// active [`DeviceAllocator`]. Returns a fresh `GpuTensor` of the
+    /// given `shape` and `dtype` over that buffer.
+    ///
+    /// Backend-neutral: under cuda this does `mem_alloc` + sync H2D;
+    /// under metal it allocates a `StorageModeShared` arena slice and
+    /// memcpys into it. Used by stream-free fused loaders (e.g.
+    /// `LinearLayer::load_dense_concat_packed`) that pre-concatenate
+    /// CPU bytes and need a single packed device buffer.
+    pub fn alloc_packed_from_host(
+        &mut self,
+        data: &[u8],
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<GpuTensor> {
+        let elem = dtype.size_bytes();
+        let expected = shape.iter().product::<usize>() * elem;
+        anyhow::ensure!(
+            data.len() == expected,
+            "alloc_packed_from_host: bytes {} != shape {:?} × {}",
+            data.len(),
+            shape,
+            elem,
+        );
+        let gpu_ptr = unsafe {
+            self.allocator
+                .alloc_and_copy_host(data.as_ptr(), data.len())?
+        };
+        Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
+    }
+
+    /// Try to take a pre-cast entry for the given tensor name. CUDA-only.
+    #[cfg(feature = "cuda")]
     fn take_precast(&self, name: &str) -> Option<PrecastEntry> {
         let state = self.precast.as_ref()?;
         let mut ready = state.ready.lock().ok()?;
@@ -1090,6 +1242,236 @@ impl GpuWeights {
         }
 
         Ok(result)
+    }
+
+    /// MLX-affine int4 dequantize-then-upload, Metal-only.
+    ///
+    /// Reads three safetensors entries straight from the mmap'd backing
+    /// store — `<prefix>.weight` (U32, `[N, K/8]`), `<prefix>.scales`
+    /// (F16, `[N, K/group_size]`), `<prefix>.biases` (F16, same shape) —
+    /// dequantizes on CPU into `dtype_out` (F16 or BF16) without ever
+    /// uploading the packed / scales / biases bytes to the device
+    /// allocator, then `alloc_packed_from_host`s the dequantized
+    /// `[N, K]` weight.
+    ///
+    /// This is the load-time slow-reference for INT4 P2 (kernel-validated
+    /// against `cpu_golden::affine_dequantize_b4_*` in the metal-kernels
+    /// crate). Forward-time `qmv_*` dispatch lands in P3 — at which point
+    /// the macro flips back to `LinearLayer::load_affine_quant` and the
+    /// packed/scales/biases get uploaded as separate tensors that the
+    /// qmv kernels consume directly.
+    ///
+    /// Memory impact: only the dequantized `[N, K]` `dtype_out` weight
+    /// hits the device arena. The packed/scales/biases bytes stay in
+    /// mmap'd OS-page cache until the `Arc<Mmap>` ref count drops
+    /// (typically when `GpuWeights` is itself dropped post-load).
+    pub fn take_affine_dequant_b4(
+        &mut self,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+        dtype_out: DType,
+    ) -> Result<GpuTensor> {
+        let (out_bytes, n, k) =
+            self.take_affine_dequant_b4_bytes(prefix, group_size, bits, dtype_out)?;
+        self.alloc_packed_from_host(&out_bytes, &[n, k], dtype_out)
+    }
+
+    /// Sibling of [`take_affine_dequant_b4`] for fused-concat accessors
+    /// (`gate_up_proj`, `qkv_proj`). CPU-dequantizes each prefix's
+    /// affine triple in turn, byte-concats the `[N, K]` results along
+    /// dim 0 into one packed buffer, then `alloc_packed_from_host`s the
+    /// fused `[sum(N), K]` Dense weight. All sources must share `K`
+    /// (in_features), `group_size`, `bits`, and `dtype_out`.
+    ///
+    /// This is how MLX-affine `gate_proj` / `up_proj` get fused into a
+    /// single `gate_up_proj` Dense linear at load time so the metal
+    /// `FusedGateUpSiluMul` impl pool can match the standard
+    /// `Gemm(packed_gate_up) → silu * mul` pattern. mlx-community 4bit
+    /// repos ship the two prefixes separately; without this concat the
+    /// solver leaves the resulting standalone `Silu` tile unclaimed
+    /// (the metal pool has no per-op `Silu` impl).
+    pub fn take_affine_dequant_b4_concat(
+        &mut self,
+        prefixes: &[&str],
+        group_size: u32,
+        bits: u32,
+        dtype_out: DType,
+    ) -> Result<GpuTensor> {
+        anyhow::ensure!(
+            !prefixes.is_empty(),
+            "take_affine_dequant_b4_concat: empty prefix list"
+        );
+        let elem_size = match dtype_out {
+            DType::F16 | DType::BF16 => 2,
+            _ => anyhow::bail!(
+                "take_affine_dequant_b4_concat: dtype_out must be F16 or BF16, got {dtype_out}"
+            ),
+        };
+
+        let mut packed: Vec<u8> = Vec::new();
+        let mut total_n: usize = 0;
+        let mut k_shared: Option<usize> = None;
+        for prefix in prefixes {
+            let (bytes, n, k) =
+                self.take_affine_dequant_b4_bytes(prefix, group_size, bits, dtype_out)?;
+            if let Some(prev_k) = k_shared {
+                anyhow::ensure!(
+                    prev_k == k,
+                    "take_affine_dequant_b4_concat: in_features mismatch across prefixes \
+                     ({prev_k} vs {k} at `{prefix}`)"
+                );
+            } else {
+                k_shared = Some(k);
+            }
+            total_n += n;
+            // Sanity: byte length matches [N, K] dtype_out layout.
+            anyhow::ensure!(
+                bytes.len() == n * k * elem_size,
+                "take_affine_dequant_b4_concat: `{prefix}` produced {} bytes; expected {}",
+                bytes.len(),
+                n * k * elem_size,
+            );
+            packed.extend_from_slice(&bytes);
+        }
+        let k = k_shared.expect("take_affine_dequant_b4_concat: prefixes non-empty above");
+        self.alloc_packed_from_host(&packed, &[total_n, k], dtype_out)
+    }
+
+    /// Inner half of [`take_affine_dequant_b4`] that returns
+    /// `(dequantized_bytes, n, k)` instead of allocating a device
+    /// buffer. Shared by the single + concat-fused load paths.
+    fn take_affine_dequant_b4_bytes(
+        &mut self,
+        prefix: &str,
+        group_size: u32,
+        bits: u32,
+        dtype_out: DType,
+    ) -> Result<(Vec<u8>, usize, usize)> {
+        anyhow::ensure!(
+            bits == 4,
+            "take_affine_dequant_b4: only bits=4 is wired in P2, got bits={bits}"
+        );
+        anyhow::ensure!(
+            matches!(dtype_out, DType::F16 | DType::BF16),
+            "take_affine_dequant_b4: dtype_out must be F16 or BF16, got {dtype_out}"
+        );
+
+        let weight_name = format!("{prefix}.weight");
+        let scales_name = format!("{prefix}.scales");
+        let biases_name = format!("{prefix}.biases");
+
+        let w_ref = self.tensors.remove(&weight_name).ok_or_else(|| {
+            anyhow::anyhow!("take_affine_dequant_b4: packed weight `{weight_name}` not found")
+        })?;
+        let s_ref = self.tensors.remove(&scales_name).ok_or_else(|| {
+            anyhow::anyhow!("take_affine_dequant_b4: scales `{scales_name}` not found")
+        })?;
+        let b_ref = self.tensors.remove(&biases_name).ok_or_else(|| {
+            anyhow::anyhow!("take_affine_dequant_b4: biases `{biases_name}` not found")
+        })?;
+
+        anyhow::ensure!(
+            w_ref.dtype == DType::U32,
+            "take_affine_dequant_b4: `{weight_name}` dtype is {} (expected U32)",
+            w_ref.dtype,
+        );
+        anyhow::ensure!(
+            s_ref.dtype == DType::F16,
+            "take_affine_dequant_b4: `{scales_name}` dtype is {} (expected F16)",
+            s_ref.dtype,
+        );
+        anyhow::ensure!(
+            b_ref.dtype == DType::F16,
+            "take_affine_dequant_b4: `{biases_name}` dtype is {} (expected F16)",
+            b_ref.dtype,
+        );
+        anyhow::ensure!(
+            w_ref.shape.len() == 2,
+            "take_affine_dequant_b4: packed weight shape rank {} (expected 2)",
+            w_ref.shape.len(),
+        );
+
+        // pack_factor = 32 / bits = 8 for bits=4 (U32-packed nibbles).
+        let n = w_ref.shape[0];
+        let k = w_ref.shape[1] * 8;
+        anyhow::ensure!(
+            k % group_size as usize == 0,
+            "take_affine_dequant_b4: K={k} not divisible by group_size={group_size}"
+        );
+        let n_groups = (n * k) / group_size as usize;
+        anyhow::ensure!(
+            s_ref.shape == [n, k / group_size as usize],
+            "take_affine_dequant_b4: scales shape {:?} != [{n}, {}]",
+            s_ref.shape,
+            k / group_size as usize,
+        );
+        anyhow::ensure!(
+            b_ref.shape == s_ref.shape,
+            "take_affine_dequant_b4: biases shape {:?} != scales shape {:?}",
+            b_ref.shape,
+            s_ref.shape,
+        );
+
+        let w_bytes = w_ref.data();
+        let n_packed_bytes = n * k / 2;
+        anyhow::ensure!(
+            w_bytes.len() == n_packed_bytes,
+            "take_affine_dequant_b4: packed weight bytes {} != expected {}",
+            w_bytes.len(),
+            n_packed_bytes,
+        );
+
+        let s_bytes = s_ref.data();
+        let b_bytes = b_ref.data();
+        anyhow::ensure!(
+            s_bytes.len() == n_groups * 2 && b_bytes.len() == n_groups * 2,
+            "take_affine_dequant_b4: scales/biases byte length mismatch \
+             (scales={} biases={} expected={})",
+            s_bytes.len(),
+            b_bytes.len(),
+            n_groups * 2,
+        );
+        let s_halves =
+            unsafe { std::slice::from_raw_parts(s_bytes.as_ptr() as *const u16, n_groups) };
+        let b_halves =
+            unsafe { std::slice::from_raw_parts(b_bytes.as_ptr() as *const u16, n_groups) };
+
+        // f32-intermediate FMA single-rounding matches the kernel's
+        // hardware fp16/bf16 FMA — see the matching note on
+        // `cpu_golden::affine_dequantize_b4_*` in ferrite-forward.
+        let mut out_bytes = vec![0u8; n * k * 2];
+        let gs = group_size as usize;
+        let out_halves =
+            unsafe { std::slice::from_raw_parts_mut(out_bytes.as_mut_ptr() as *mut u16, n * k) };
+        for (offset, &byte) in w_bytes.iter().enumerate() {
+            let oindex = offset * 2;
+            let gindex = oindex / gs;
+            let scale = half::f16::from_bits(s_halves[gindex]).to_f32();
+            let bias = half::f16::from_bits(b_halves[gindex]).to_f32();
+            let lo = (byte & 0x0f) as f32;
+            let hi = ((byte >> 4) & 0x0f) as f32;
+            match dtype_out {
+                DType::F16 => {
+                    out_halves[oindex] = half::f16::from_f32(scale * lo + bias).to_bits();
+                    out_halves[oindex + 1] = half::f16::from_f32(scale * hi + bias).to_bits();
+                }
+                DType::BF16 => {
+                    // MLX casts F16 → BF16 inline at kernel time
+                    // (`T scale = scales[gindex]` with `T = bfloat`);
+                    // we do the same here at dequant time. The f32
+                    // intermediate covers the cross-dtype expansion
+                    // exactly (F16 fits in f32 mantissa).
+                    out_halves[oindex] = half::bf16::from_f32(scale * lo + bias).to_bits();
+                    out_halves[oindex + 1] = half::bf16::from_f32(scale * hi + bias).to_bits();
+                }
+                _ => unreachable!("dtype_out guarded above"),
+            }
+        }
+
+        // Drop the CpuTensorRefs; mmap pages will be reclaimed by the OS.
+        drop((w_ref, s_ref, b_ref));
+        Ok((out_bytes, n, k))
     }
 
     /// Get the shape and effective dtype of a tensor without loading it to GPU.
@@ -1256,120 +1638,6 @@ impl GpuWeights {
         Ok(())
     }
 
-    /// CPU-side broadcast add: `target[target_row, :] += source[:]`.
-    ///
-    /// `source` must be a rank-1 tensor of length matching the
-    /// trailing dim of `target` (a rank-2 tensor). After the add,
-    /// `source` is removed from the manifest tracking — the loader
-    /// must not pull it again, and any downstream code that referenced
-    /// it must read its contribution off `target` row `target_row`.
-    /// Used by CLIP-class CLS-token folds (LLaVA-1.5 family): the
-    /// learnable `class_embedding` is added into `position_embedding`
-    /// row 0 at load time so the DSL body can collapse "concat CLS,
-    /// add positional" into one `add` against the pre-folded position
-    /// table.
-    ///
-    /// Dtype-dispatches across F32 / F16 / BF16 — both tensors must
-    /// share a dtype. Materializes `target`'s buffer as owned bytes
-    /// (mirroring `pad_axis_to_mult8`); the original mmap is dropped.
-    pub fn fold_row_add(&mut self, target: &str, target_row: usize, source: &str) -> Result<()> {
-        let src_ref = self
-            .tensors
-            .get(source)
-            .ok_or_else(|| anyhow::anyhow!("fold_row_add: source weight not found: {source}"))?;
-        anyhow::ensure!(
-            src_ref.shape.len() == 1,
-            "fold_row_add: source {source} must be rank-1, got {:?}",
-            src_ref.shape,
-        );
-        let cols = src_ref.shape[0];
-        let src_dtype = src_ref.dtype;
-        // Snapshot source bytes before mutating `target`; both tensors
-        // are borrowed off `self.tensors`.
-        let src_bytes = src_ref.data().to_vec();
-
-        let dst_ref = self
-            .tensors
-            .get_mut(target)
-            .ok_or_else(|| anyhow::anyhow!("fold_row_add: target weight not found: {target}"))?;
-        anyhow::ensure!(
-            dst_ref.shape.len() == 2,
-            "fold_row_add: target {target} must be rank-2, got {:?}",
-            dst_ref.shape,
-        );
-        anyhow::ensure!(
-            dst_ref.shape[1] == cols,
-            "fold_row_add: target {target} trailing dim {} != source {source} length {cols}",
-            dst_ref.shape[1],
-        );
-        anyhow::ensure!(
-            target_row < dst_ref.shape[0],
-            "fold_row_add: target_row {target_row} out of bounds for {target} shape {:?}",
-            dst_ref.shape,
-        );
-        anyhow::ensure!(
-            dst_ref.dtype == src_dtype,
-            "fold_row_add: dtype mismatch — target {target} is {:?}, source {source} is {:?}",
-            dst_ref.dtype,
-            src_dtype,
-        );
-
-        let elem = dst_ref.dtype.size_bytes();
-        let row_bytes = cols * elem;
-        let dst_total_bytes = dst_ref.shape.iter().product::<usize>() * elem;
-        let dst_data = dst_ref.data();
-        let mut buf = dst_data.to_vec();
-        anyhow::ensure!(
-            buf.len() == dst_total_bytes,
-            "fold_row_add: target {target} size mismatch: {} vs expected {dst_total_bytes}",
-            buf.len(),
-        );
-        let row_off = target_row * row_bytes;
-        let dst_row = &mut buf[row_off..row_off + row_bytes];
-
-        match dst_ref.dtype {
-            DType::F32 => {
-                anyhow::ensure!(src_bytes.len() == cols * 4, "F32 src size");
-                for i in 0..cols {
-                    let s = f32::from_le_bytes(src_bytes[i * 4..i * 4 + 4].try_into().unwrap());
-                    let d = f32::from_le_bytes(dst_row[i * 4..i * 4 + 4].try_into().unwrap());
-                    dst_row[i * 4..i * 4 + 4].copy_from_slice(&(d + s).to_le_bytes());
-                }
-            }
-            DType::F16 => {
-                use half::f16;
-                anyhow::ensure!(src_bytes.len() == cols * 2, "F16 src size");
-                for i in 0..cols {
-                    let s = f16::from_le_bytes(src_bytes[i * 2..i * 2 + 2].try_into().unwrap());
-                    let d = f16::from_le_bytes(dst_row[i * 2..i * 2 + 2].try_into().unwrap());
-                    let sum = f16::from_f32(d.to_f32() + s.to_f32());
-                    dst_row[i * 2..i * 2 + 2].copy_from_slice(&sum.to_le_bytes());
-                }
-            }
-            DType::BF16 => {
-                use half::bf16;
-                anyhow::ensure!(src_bytes.len() == cols * 2, "BF16 src size");
-                for i in 0..cols {
-                    let s = bf16::from_le_bytes(src_bytes[i * 2..i * 2 + 2].try_into().unwrap());
-                    let d = bf16::from_le_bytes(dst_row[i * 2..i * 2 + 2].try_into().unwrap());
-                    let sum = bf16::from_f32(d.to_f32() + s.to_f32());
-                    dst_row[i * 2..i * 2 + 2].copy_from_slice(&sum.to_le_bytes());
-                }
-            }
-            other => anyhow::bail!("fold_row_add: unsupported dtype {other:?} for {target}"),
-        }
-
-        dst_ref.mmap = None;
-        dst_ref.data_offset = 0;
-        dst_ref.size_bytes = dst_total_bytes;
-        dst_ref.owned = Some(Arc::new(buf));
-
-        // Drop source from manifest tracking — the loader must not pull
-        // it; its contribution now lives in target row `target_row`.
-        self.tensors.remove(source);
-        Ok(())
-    }
-
     /// Tensor shape lookup that checks all three backing maps —
     /// safetensors `tensors`, `gguf_dense`, and `quantized`. Used by
     /// the per-variant fingerprint sniff which needs to verify
@@ -1400,18 +1668,7 @@ impl GpuWeights {
         // Remove temporarily to satisfy borrow checker, then re-insert.
         let cpu_ref = self.tensors.remove(name)?;
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
-
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes).ok()? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
-            if used_shared_pinned {
-                driver::stream_synchronize(self.stream).ok()?;
-            }
-        }
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes).ok()? };
 
         let shape = cpu_ref.shape.clone();
         self.tensors.insert(name.to_string(), cpu_ref);
@@ -1860,25 +2117,25 @@ impl GpuWeights {
     ///
     /// Called by quantized weight loaders (AWQ, GPTQ, Marlin, etc.) that
     /// allocate GPU memory via `driver::mem_alloc` outside of `take()`.
+    #[cfg(feature = "cuda")]
     pub fn record_alloc(&mut self, ptr: *mut u8, size_bytes: usize) {
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(ptr, size_bytes) });
+        self.allocator
+            .push_alloc(unsafe { crate::alloc::RawGpuMem::new(ptr, size_bytes) });
     }
 
     /// Remove a previously-recorded allocation from tracking (e.g. after repack
     /// frees it separately). The removed `RawGpuMem` is leaked — caller is
     /// responsible for freeing the GPU memory.
+    #[cfg(feature = "cuda")]
     pub fn unrecord_alloc(&mut self, ptr: *mut u8) {
-        if let Some(pos) = self.gpu_allocs.iter().position(|m| m.ptr() == ptr) {
-            let removed = self.gpu_allocs.swap_remove(pos);
-            removed.leak(); // prevent Drop from freeing — caller will free
-        }
+        self.allocator.unrecord_alloc(ptr);
     }
 
     /// Drain all tracked GPU allocations. The caller takes ownership of the
     /// `RawGpuMem` wrappers — dropping them frees the GPU memory.
+    #[cfg(feature = "cuda")]
     pub fn take_gpu_allocs(&mut self) -> Vec<crate::alloc::RawGpuMem> {
-        std::mem::take(&mut self.gpu_allocs)
+        self.allocator.take_allocations()
     }
 
     /// Iterator over all tensor names.
@@ -1899,9 +2156,10 @@ impl GpuWeights {
         self.tensors = stripped;
     }
 
-    /// Get the stream used for H2D copies.
+    /// Get the stream used for H2D copies. CUDA-only.
+    #[cfg(feature = "cuda")]
     pub fn stream(&self) -> CUstream {
-        self.stream
+        self.allocator.stream()
     }
 
     // -----------------------------------------------------------------------
@@ -2105,12 +2363,7 @@ impl GpuWeights {
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
         dump_shard_head(name, dim, rank, world_size, &shard_shape, dtype, data);
-        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs
-            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
-        unsafe {
-            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
-        }
+        let gpu_ptr = unsafe { self.allocator.alloc_and_copy_host(data, size_bytes)? };
 
         Ok(unsafe { GpuTensor::new(gpu_ptr, &shard_shape, dtype) })
     }
@@ -2119,6 +2372,7 @@ impl GpuWeights {
     ///
     /// Used for fused TP weight loading (e.g. QKV shards concatenated into one buffer).
     /// Returns the number of bytes written.
+    #[cfg(feature = "cuda")]
     pub unsafe fn take_shard_into(
         &mut self,
         name: &str,
@@ -2185,9 +2439,10 @@ impl GpuWeights {
             let col_start = rank * shard_size;
             let shard_row_bytes = shard_size * elem_size;
             let needed = rows * shard_row_bytes;
-            self.ensure_pinned_buf(needed);
-
-            let dst = self.cast_pinned.0;
+            if self.cast_scratch.len() < needed {
+                self.cast_scratch.resize(needed, 0);
+            }
+            let dst = self.cast_scratch.as_mut_ptr();
             for r in 0..rows {
                 let src_offset = (r * cols + col_start) * elem_size;
                 let dst_offset = r * shard_row_bytes;
@@ -2210,13 +2465,94 @@ impl GpuWeights {
 
     /// Take a tensor's raw CPU bytes without uploading to GPU.
     /// Returns (data_bytes, shape, dtype).
+    ///
+    /// Routes through [`Self::maybe_cast_cpu`] so the bytes match
+    /// `target_dtype` when one is set — same cast surface cuda's
+    /// `take_into` uses, so callers don't have to track the dtype
+    /// drift between disk and target separately. Under metal this is
+    /// the only on-the-way-in cast path; under cuda it's available to
+    /// pre-allocated-host loaders that don't run on a stream.
     pub fn take_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {
         let cpu_ref = self
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
-        let data = cpu_ref.data().to_vec();
-        Ok((data, cpu_ref.shape, cpu_ref.dtype))
+        let (ptr, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+        // SAFETY: `ptr` points into either `cpu_ref.data()` (if no cast
+        // happened) or `self.cast_scratch` (filled by `maybe_cast_cpu`).
+        // We immediately copy out before either source is reused.
+        let data = unsafe { std::slice::from_raw_parts(ptr, size_bytes) }.to_vec();
+        Ok((data, cpu_ref.shape, dtype))
+    }
+
+    /// Metal-only: copy a tensor's bytes (cast-aware) directly into
+    /// `dst` without an intermediate `Vec<u8>`. Returns
+    /// `(bytes_written, shape, dtype)`.
+    ///
+    /// Companion to [`crate::MetalAllocator::alloc_uninit`]: lets
+    /// `load_dense_concat_packed` pre-allocate the packed
+    /// destination buffer once and stream each source tensor
+    /// directly into it (one memcpy from mmap → MTLBuffer instead
+    /// of two — mmap → heap Vec → MTLBuffer).
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of at least `cpu_ref.size_bytes`
+    /// (post-cast); the caller is responsible for sizing. The cast
+    /// scratch is shared across `take_*` calls, so callers must not
+    /// hold a borrow into it across this call's return.
+    #[cfg(feature = "metal")]
+    pub unsafe fn take_into_metal(
+        &mut self,
+        name: &str,
+        dst: *mut u8,
+    ) -> Result<(usize, Vec<usize>, DType)> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let (ptr, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+        // Parallel memcpy via rayon — single-threaded copy of a
+        // 50 MB tensor on Apple Silicon caps at ~9 GB/s, leaving
+        // memory bandwidth on the floor (peak is ~50 GB/s system
+        // wide). Splitting into 4 MB chunks across rayon's pool
+        // saturates bandwidth and cuts per-call cost ~3x for the
+        // gate_up pack hot path. 16 MB tested ≈ 4 MB, so picking
+        // the smaller value to keep the threshold gate (next line)
+        // reasonable for medium tensors. SAFETY: `ptr` and `dst`
+        // are valid for `size_bytes`; chunks are non-overlapping
+        // by construction.
+        const CHUNK: usize = 4 * 1024 * 1024;
+        if size_bytes >= 2 * CHUNK {
+            use rayon::prelude::*;
+            let src_addr = ptr as usize;
+            let dst_addr = dst as usize;
+            (0..size_bytes)
+                .into_par_iter()
+                .step_by(CHUNK)
+                .for_each(|off| {
+                    let len = (size_bytes - off).min(CHUNK);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (src_addr + off) as *const u8,
+                            (dst_addr + off) as *mut u8,
+                            len,
+                        );
+                    }
+                });
+        } else {
+            unsafe { std::ptr::copy_nonoverlapping(ptr, dst, size_bytes) };
+        }
+        Ok((size_bytes, cpu_ref.shape, dtype))
+    }
+
+    /// Metal-only: returns the underlying `MetalAllocator` so
+    /// loaders can call `alloc_uninit` directly. Kept narrow — the
+    /// `BackendAllocator` typedef is `MetalAllocator` under cfg(metal),
+    /// but the loader code lives in a backend-neutral crate
+    /// (`ferrite-kernels`) so this accessor is the cleanest seam.
+    #[cfg(feature = "metal")]
+    pub fn metal_allocator(&self) -> &crate::MetalAllocator {
+        &self.allocator
     }
 }
 
@@ -2302,26 +2638,29 @@ fn dump_shard_head(
 
 impl Drop for GpuWeights {
     fn drop(&mut self) {
-        // Signal precast thread to stop and wait for it.
-        if let Some(state) = &self.precast {
-            state.shutdown.store(true, Ordering::Relaxed);
-        }
-        if let Some(handle) = self.precast_handle.take() {
-            handle.join().ok();
-        }
-        // Free any unconsumed precast pinned buffers.
-        if let Some(state) = &self.precast
-            && let Ok(mut ready) = state.ready.lock()
+        // Signal precast thread to stop and wait for it (cuda only).
+        #[cfg(feature = "cuda")]
         {
-            for (_name, entry) in ready.drain() {
-                unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
+            if let Some(state) = &self.precast {
+                state.shutdown.store(true, Ordering::Relaxed);
+            }
+            if let Some(handle) = self.precast_handle.take() {
+                handle.join().ok();
+            }
+            // Free any unconsumed precast pinned buffers.
+            if let Some(state) = &self.precast
+                && let Ok(mut ready) = state.ready.lock()
+            {
+                for (_name, entry) in ready.drain() {
+                    unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
+                }
             }
         }
-        // Free the synchronous pinned cast buffer if allocated.
-        if !self.cast_pinned.0.is_null() {
-            unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
-        }
-        // GPU memory allocated by take()/take_into() is owned by model layers.
+        // `cast_scratch: Vec<u8>` drops itself.
+        // `allocator` drops itself (CUDA: frees GPU mem; Metal: frees MTLBuffers).
+        // GPU memory allocated by take()/take_into() is owned by model layers
+        //   on the cuda path (transferred via take_gpu_allocs); on metal it's
+        //   held by the allocator's MetalBuffer arenas.
         // CPU mmaps are dropped automatically when Arc<Mmap> refcounts reach zero.
     }
 }

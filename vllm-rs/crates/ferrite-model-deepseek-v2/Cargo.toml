@@ -8,6 +8,7 @@ description = "Ferrite DeepSeek V2 architecture (one #[forward] body)"
 [features]
 default = []
 cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+metal = ["ferrite-forward/metal"]
 # Tensor-parallel: forwards through to ferrite-forward/nccl, which gates the
 # `Instruction::AllReduce` variant + `ForwardCtx::tp_group` field. Until task
 # #7 emits tp>1 variants, enabling this feature still produces a tp=1 build —

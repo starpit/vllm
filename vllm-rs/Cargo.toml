@@ -39,7 +39,6 @@ members = [
     "crates/ferrite-model-qwen2-vl",
     "crates/ferrite-model-qwen2-5-vl",
     "crates/ferrite-model-gemma3-mm",
-    "crates/ferrite-model-llava",
     "crates/ferrite-model-qwen3",
     "crates/ferrite-model-qwen3-moe",
     "crates/ferrite-model-deepseek-v2",
@@ -49,9 +48,13 @@ members = [
     "crates/ferrite-cuda-targets",
     "crates/ferrite-cuda-builder",
     "crates/ferrite-forward",
+    "crates/ferrite-fusion-synth",
     "crates/ferrite-forward-macro",
     "crates/ferrite-cost-sweep",
     "crates/ferrite-gguf",
+    "crates/ferrite-metal-targets",
+    "crates/ferrite-metal-kernels",
+    "crates/ferrite-metal-impl-lib", "crates/ferrite-metal-cost-sweep",
 ]
 exclude = []
 

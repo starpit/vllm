@@ -473,9 +473,6 @@ pub fn apply_signature(
         // `Embed` but anchored on `vision_num_positions` /
         // `vision_embed_dim`.
         OpKind::PosEmbed => sig_pos_embed(solver, inputs),
-        // CLIP-class CLS-strip: drop row 0, [vision_num_positions, e]
-        // → [vision_in_seq_len, e]. Trailing dim preserved.
-        OpKind::StripCls => sig_strip_cls(solver, inputs),
     }
 }
 
@@ -732,30 +729,6 @@ fn sig_embedding_gather(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig,
     Ok(OpSig { output: x.clone() })
 }
 
-/// `strip_cls(x: [L, e])` → `[vision_in_seq_len, e]`. Drops row 0
-/// (CLS slot) and copies rows `1..L` into a fresh buffer. Input
-/// leading dim is symbolic — the encoder typically carries
-/// `num_tokens` rather than `vision_num_positions`, since the wrapper
-/// uploads pixels at `L = vision_num_positions` for CLIP-class
-/// arches (the solver doesn't tie the two bound names together; the
-/// runtime invariant `L = vision_in_seq_len + 1` is the variant /
-/// wrapper's responsibility, with the kernel's `L >= 2` assert as a
-/// last line of defense). Same loose-input shape contract as
-/// `avg_pool_2d`. Trailing dim preserved.
-fn sig_strip_cls(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
-    expect_args(OpKind::StripCls, inputs, 1)?;
-    let x = &inputs[0];
-    if x.len() != 2 {
-        return Err(ShapeError::BadArgs {
-            op: OpKind::StripCls,
-            reason: format!("input must have rank 2 ([L, e]), got rank {}", x.len()),
-        });
-    }
-    Ok(OpSig {
-        output: vec![Dim::Bound("vision_in_seq_len".into()), x[1].clone()],
-    })
-}
-
 /// `avg_pool_2d(x: [L, e])` → `[L / vision_pool_factor, e]`. The
 /// leading dim is divided by the bake-time `vision_pool_factor`
 /// (`= vision_pool_kernel * vision_pool_kernel`); the trailing dim is
@@ -946,9 +919,6 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // assertion via this table — the extern_shape arm handles it),
         // arg 1 is the rank-2 weight table.
         OpKind::PosEmbed => &[(1, 2)],
-        // StripCls takes one activation input ([vision_num_positions, e])
-        // and produces [vision_in_seq_len, e]; no tensor weight args.
-        OpKind::StripCls => &[],
     }
 }
 
@@ -2420,36 +2390,6 @@ mod tests {
     fn avg_pool_2d_round_trips_through_op_name() {
         assert_eq!(OpKind::AvgPool2d.as_str(), "avg_pool_2d");
         assert_eq!(OpKind::from_name("avg_pool_2d"), Some(OpKind::AvgPool2d));
-    }
-
-    #[test]
-    fn strip_cls_drops_leading_dim_to_in_seq_len() {
-        // Phase H contract: `strip_cls([L, e]) -> [vision_in_seq_len, e]`.
-        // The input leading dim is symbolic (the encoder carries
-        // `num_tokens`, not `vision_num_positions`, because the pixels
-        // extern anchors on `num_tokens`). Trailing dim preserved
-        // verbatim. The numeric invariant `L = vision_in_seq_len + 1`
-        // is the wrapper's responsibility, NOT the dim solver's.
-        let mut solver = Solver::new();
-        let x = vec![bound("num_tokens"), bound("vision_embed_dim")];
-        let sig = apply_signature(&mut solver, OpKind::StripCls, &[x]).expect("strip_cls sig");
-        assert_eq!(sig.output.len(), 2);
-        assert_eq!(sig.output[0], bound("vision_in_seq_len"));
-        assert_eq!(sig.output[1], bound("vision_embed_dim"));
-    }
-
-    #[test]
-    fn strip_cls_requires_rank_2_input() {
-        let mut solver = Solver::new();
-        let x = vec![bound("num_tokens")];
-        let err = apply_signature(&mut solver, OpKind::StripCls, &[x]);
-        assert!(matches!(err, Err(ShapeError::BadArgs { .. })));
-    }
-
-    #[test]
-    fn strip_cls_round_trips_through_op_name() {
-        assert_eq!(OpKind::StripCls.as_str(), "strip_cls");
-        assert_eq!(OpKind::from_name("strip_cls"), Some(OpKind::StripCls));
     }
 
     #[test]

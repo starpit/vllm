@@ -104,6 +104,10 @@ impl BenchStats {
 fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     use vllm_serve::llm::{ChatMessage, LLM};
 
+    if let Ok(level) = std::env::var("RUST_LOG") {
+        vllm_common::telemetry::init_tracing(&level);
+    }
+
     let t0 = std::time::Instant::now();
 
     let mut builder = LLM::builder(model).device(&args.device).dtype(&args.dtype);
@@ -115,6 +119,14 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     }
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
+    }
+    // VLLM_GPU_MEMORY_UTILIZATION env override: lets perf-debugging
+    // workflows shrink the KV cache without touching the API. Defaults
+    // to 0.9 (LLM builder default) when unset.
+    if let Ok(s) = std::env::var("VLLM_GPU_MEMORY_UTILIZATION") {
+        if let Ok(f) = s.parse::<f64>() {
+            builder = builder.gpu_memory_utilization(f);
+        }
     }
     builder = builder.tensor_parallel_size(args.tensor_parallel_size);
     builder = builder.enforce_eager(args.enforce_eager);
@@ -177,6 +189,18 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
                 }
             })?;
             println!();
+
+            // DIAGNOSTIC: print token IDs + finish reason so we can
+            // see what the model actually produced (vs garbage tokens
+            // or EOS).
+            if std::env::var_os("VLLM_PRINT_TOKEN_IDS").is_some() {
+                eprintln!(
+                    "[diag] token_ids={:?} text={:?} finish_reason={:?}",
+                    output.outputs[0].token_ids,
+                    output.outputs[0].text,
+                    output.outputs[0].finish_reason,
+                );
+            }
 
             if let Some(s) = stats {
                 s.print(output.outputs[0].token_ids.len());

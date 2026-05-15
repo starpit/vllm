@@ -156,12 +156,12 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
 
         let pixels = device.alloc_gpu_tensor_from_host(
             &[total_l, feat],
-            cfg.compute_dtype,
+            DType::BF16,
             bf16_slice_as_bytes(&all_patches),
         );
 
         let half_rot = cfg.half_rot();
-        let (cos_host, sin_host) = cfg.build_rope_cos_sin(&grid_thw, total_l);
+        let (cos_host, sin_host) = cfg.build_rope_cos_sin_bf16(&grid_thw, total_l);
 
         let (cu_seqlens_host, max_seqlen) = build_cu_seqlens_i32(&grid_thw);
         let cu_seqlens = device.alloc_gpu_tensor_from_host(
@@ -212,12 +212,12 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         }
         let cos = device.alloc_gpu_tensor_from_host(
             &[total_l, half_rot],
-            cfg.compute_dtype,
+            DType::BF16,
             bf16_slice_as_bytes(cos_to_upload),
         );
         let sin = device.alloc_gpu_tensor_from_host(
             &[total_l, half_rot],
-            cfg.compute_dtype,
+            DType::BF16,
             bf16_slice_as_bytes(sin_to_upload),
         );
 

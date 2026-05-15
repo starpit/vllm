@@ -57,6 +57,19 @@ struct TokenizerConfig {
 fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     let mut env = Environment::new();
 
+    // HuggingFace's `apply_chat_template` renders with `trim_blocks=True`
+    // and `lstrip_blocks=True`. Templates are written assuming both —
+    // block tags `{% ... %}` live on their own lines and the surrounding
+    // whitespace is expected to be stripped. Without these the trailing
+    // `\n` after every `{% ... %}` line leaks into the rendered prompt,
+    // which then re-tokenizes differently than the model's training
+    // distribution. For TinyLlama-Chat-v1.0 the bare `<` of `<|user|>`
+    // is token 529 in the trained tokenization but lands as 29966 once a
+    // stray `\n` runs precede it; the model has effectively never seen
+    // that input, so generation produces nonsense fragments.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+
     // Enable Python string/dict/list methods (startswith, endswith, etc.)
     // that HuggingFace Jinja2 chat templates commonly use.
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -68,100 +81,15 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     // (e.g. granite, llama4) to inject the current date/time.
     env.add_function("strftime_now", strftime_now);
 
-    // Identity filter for HF's `{% generation %}` ... `{% endgeneration %}`
-    // markers. The Python implementation
-    // (`transformers/utils/chat_template_utils.py:399 AssistantTracker`)
-    // is registered as a `jinja2.ext.Extension` with custom `tags =
-    // {"generation"}` — minijinja has no equivalent statement-extension
-    // API. The standard workaround is to rewrite each pair into a
-    // `{% filter generation %}...{% endfilter %}` block (see
-    // `strip_generation_markers`); this filter is the registered hook
-    // the rewritten template lands on. Today it's identity (return the
-    // body verbatim, matching HF's behavior — the extension's `parse`
-    // doesn't transform render output, only records span indices for
-    // `return_assistant_tokens_mask`); future code can grow it into a
-    // proper assistant-token tracker by accumulating offsets here.
-    env.add_filter("generation", |s: String| s);
-
     env.add_template_owned("chat", template_str.to_owned())
         .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;
 
     Ok(env)
 }
 
-/// Rewrite HuggingFace `{% generation %}` / `{% endgeneration %}`
-/// pairs into `{% filter generation %}` / `{% endfilter %}` so the
-/// `generation` filter registered in [`build_env`] is the runtime
-/// hook for the body content.
-///
-/// **Why a rewrite is needed.** `{% generation %}` is a Jinja2 tag
-/// that HF's `AssistantTracker` extension
-/// (`transformers/utils/chat_template_utils.py:399`) registers via
-/// `tags = {"generation"}` for `return_assistant_tokens_mask`. The
-/// extension's `parse` doesn't transform render output; it only
-/// records span indices. minijinja has no equivalent
-/// statement-extension API — its parser has a closed keyword set and
-/// errors with `unknown statement generation` before any user
-/// callback can run (`pycompat::unknown_method_callback` only fires
-/// for unknown METHOD calls on values at evaluation time, not for
-/// unknown tags at parse time).
-///
-/// **Why filter blocks.** Jinja's built-in `{% filter NAME %}...{%
-/// endfilter %}` *is* a statement minijinja parses, and `add_filter`
-/// is a real extension surface. The rewrite preserves render output
-/// exactly — the filter is identity today (matching HF's
-/// no-render-side-effect behavior) — and exposes a hook that future
-/// code could grow into a proper assistant-token tracker by
-/// accumulating output offsets in the closure. This puts the work
-/// on a supported API rather than parse-suppression.
-///
-/// LLaVA-1.5's `chat_template.json` (and Llama-3.2's, and a growing
-/// number of HF chat templates) use these markers; without the
-/// rewrite, the loader falls back to "plain concatenation",
-/// multimodal content lands in the prompt as JSON-ish text, the
-/// prompt blows past `max_model_len`, and the scheduler hangs.
-fn strip_generation_markers(template_str: &str) -> String {
-    let mut out = String::with_capacity(template_str.len());
-    let bytes = template_str.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'%' {
-            // Find the matching `%}`.
-            let block_start = i;
-            let mut j = i + 2;
-            while j + 1 < bytes.len() && !(bytes[j] == b'%' && bytes[j + 1] == b'}') {
-                j += 1;
-            }
-            if j + 1 < bytes.len() {
-                let inner = &template_str[i + 2..j];
-                let trimmed = inner.trim_matches(|c: char| c == '-' || c.is_whitespace());
-                if trimmed == "generation" {
-                    out.push_str("{% filter generation %}");
-                    i = j + 2;
-                    continue;
-                }
-                if trimmed == "endgeneration" {
-                    out.push_str("{% endfilter %}");
-                    i = j + 2;
-                    continue;
-                }
-                // Not our tag — copy through verbatim.
-                out.push_str(&template_str[block_start..j + 2]);
-                i = j + 2;
-                continue;
-            }
-        }
-        let ch = template_str[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
 impl ChatTemplate {
     /// Create a `ChatTemplate` from a raw Jinja2 template string.
     pub fn new(template_str: String) -> Result<Self, ServeError> {
-        let template_str = strip_generation_markers(&template_str);
         let env = build_env(&template_str)?;
         Ok(Self {
             env,
@@ -431,84 +359,6 @@ fn strftime_now(format: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_strip_generation_markers_passthrough() {
-        // No `{% generation %}` tags → identity transform.
-        let src = "{% for m in messages %}{{ m.content }}{% endfor %}";
-        assert_eq!(strip_generation_markers(src), src);
-    }
-
-    #[test]
-    fn test_strip_generation_markers_basic() {
-        // HF AssistantTracker pair → minijinja `{% filter %}` block.
-        // Body content between markers renders verbatim through the
-        // identity `generation` filter registered in build_env.
-        let src = "{% generation %}{{ x }}{% endgeneration %}";
-        let out = strip_generation_markers(src);
-        assert_eq!(out, "{% filter generation %}{{ x }}{% endfilter %}");
-    }
-
-    #[test]
-    fn test_strip_generation_markers_with_whitespace_trim() {
-        // `{%- generation -%}` whitespace-trim form must also be
-        // recognized (HF chat templates use both forms).
-        let src = "{%- generation -%}body{%- endgeneration -%}";
-        let out = strip_generation_markers(src);
-        assert_eq!(out, "{% filter generation %}body{% endfilter %}");
-    }
-
-    #[test]
-    fn test_strip_generation_markers_renders_body_through_filter() {
-        // End-to-end: rewritten template parses, renders, and the
-        // body inside the `{% filter generation %}` block ends up in
-        // the output verbatim (because the filter is identity).
-        let tpl = ChatTemplate::new(
-            "{% for m in messages %}{{ m.role }}: \
-             {% generation %}{{ m.content }}{% endgeneration %}\n\
-             {% endfor %}"
-                .to_string(),
-        )
-        .expect("rewritten template must parse");
-        let messages = vec![TemplateMessage {
-            role: "assistant".to_string(),
-            content: "hello".to_string(),
-        }];
-        let result = tpl.apply_simple(&messages, false).unwrap();
-        assert!(
-            result.contains("assistant: hello"),
-            "filter-generation body must render verbatim: got {result:?}",
-        );
-    }
-
-    #[test]
-    fn test_strip_generation_markers_llava_template_compiles() {
-        // The actual LLaVA-1.5 chat template (from
-        // `llava-hf/llava-1.5-7b-hf/chat_template.json`) uses
-        // `{% generation %}` blocks. Without the rewrite, minijinja
-        // rejects with `unknown statement generation`; after the
-        // rewrite, ChatTemplate::new must accept it cleanly.
-        let llava_template = "{% for message in messages %}\
-            {% if message['role'] != 'system' %}\
-            {{ message['role'].upper() + ': '}}\
-            {% endif %}\
-            {% for content in message['content'] | selectattr('type', 'equalto', 'image') %}\
-            {{ '<image>\\n' }}\
-            {% endfor %}\
-            {% if message['role'] != 'assistant' %}\
-            {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}\
-            {{ content['text'] + ' '}}\
-            {% endfor %}\
-            {% else %}\
-            {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}\
-            {% generation %}{{ content['text'] + ' '}}{% endgeneration %}\
-            {% endfor %}\
-            {% endif %}\
-            {% endfor %}\
-            {% if add_generation_prompt %}{{ 'ASSISTANT:' }}{% endif %}";
-        ChatTemplate::new(llava_template.to_string())
-            .expect("rewritten LLaVA template must parse under minijinja");
-    }
 
     #[test]
     fn test_simple_template() {

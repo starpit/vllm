@@ -10,6 +10,14 @@ pub enum ExecutorError {
     #[error("worker initialization failed: {0}")]
     WorkerInit(String),
 
+    /// The worker backend has no implementation for this model
+    /// architecture. Distinct from `WorkerInit` so a caller can
+    /// fall back to a different backend (e.g. metal `FerriteWorker`
+    /// → `MlxWorker` for arches without a ferrite-forward metal
+    /// variant) without parsing the failure string.
+    #[error("architecture `{0}` not supported by this backend")]
+    ArchNotSupported(String),
+
     /// Worker execution failed.
     #[error("worker execution failed: {0}")]
     WorkerExecution(String),

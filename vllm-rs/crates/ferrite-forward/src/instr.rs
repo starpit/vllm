@@ -22,17 +22,21 @@
 //! bucket, and a 1-line forward shim that delegates to [`run`].
 //! No `__dispatch_one`, no `__interpret`, no per-canonical `Op`.
 
-#![cfg(feature = "cuda")]
+// File compiles under either `cuda` or `metal`:
+// - The `Instruction<W>` enum, `CanonicalParams` trait, and `WtFn`/`CosSinFn`
+//   type aliases are backend-agnostic — only `GpuTensor` (always available)
+//   plus the layer struct *type names* (also always available; methods are
+//   cuda-gated inside `ferrite-kernels/src/layers.rs`).
+// - The `eval`/`run`/`run_backbone` fns and `InterpreterCtx` are cuda-only;
+//   each is individually `#[cfg(feature = "cuda")]`-gated below.
+//
+// Layer type names referenced by the enum variants come from
+// `ferrite_kernels::layers`/`layers_moe`; those modules and their re-exports
+// are now ungated at the lib.rs level (see `ferrite-kernels/src/lib.rs`).
 
-use crate::ForwardCtx;
-use crate::tile_table::{TileEntry, take_owned, tile_ref, view};
-use ferrite_cuda_core::alloc::OwnedTensor;
-use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::tensor::{GpuTensor, MAX_DIMS};
-use ferrite_kernels::attention_helpers as ah;
-use ferrite_kernels::cutlass;
-use ferrite_kernels::flashinfer;
-use ferrite_kernels::kernels;
+#[cfg(feature = "metal")]
+use ferrite_kernels::layers::AffineQuantEmbedding;
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
@@ -40,6 +44,23 @@ use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
     SharedFusedMoELayer,
 };
+
+#[cfg(feature = "cuda")]
+use crate::ForwardCtx;
+#[cfg(feature = "cuda")]
+use crate::tile_table::{TileEntry, take_owned, tile_ref, view};
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::alloc::OwnedTensor;
+#[cfg(feature = "cuda")]
+use ferrite_cuda_core::device::GpuDevice;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::attention_helpers as ah;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::cutlass;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::flashinfer;
+#[cfg(feature = "cuda")]
+use ferrite_kernels::kernels;
 
 /// Per-canonical model parameters. Implemented by each canonical's
 /// `Weights` so the universal `Instruction::eval` body can read
@@ -81,6 +102,22 @@ pub trait CanonicalParams {
     /// matching `Instruction` variants stay registered but unreachable.
     /// Set by `#[vision_forward]` from the vision config.
     const VISION_NUM_HEADS: u32 = 0;
+
+    /// Metal-only: list of compiler-synthesized kernel sources (per
+    /// `ferrite-forward-macro::fuse_pass`). Each entry is
+    /// `(symbol_name, precompiled .metallib bytes)`. The proc-macro
+    /// AOT-compiles synthesized MSL via `xcrun metal -c` +
+    /// `xcrun metallib` at macro-expansion time and embeds the
+    /// resulting bytes as `&'static [u8]`. The MetalWorkerPool
+    /// registers each via
+    /// `SpecializedPipelineCache::register_metallib_library`
+    /// (`newLibraryWithData`) — same path used by every hand-written
+    /// shader, NOT `newLibraryWithSource`. Default empty — the macro
+    /// overrides this per Metal arch with the actual synthesized
+    /// metallibs from the FUF analysis.
+    fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
+        &[]
+    }
     /// Vision-tower attention head dimension. Same defaults / set-by
     /// rule as [`Self::VISION_NUM_HEADS`].
     const VISION_HEAD_DIM: u32 = 0;
@@ -101,21 +138,100 @@ pub trait CanonicalParams {
     /// projector: k=4 over a 64×64 patch grid → 16×16 = 256 tokens). The
     /// pool is non-overlapping, so stride == kernel. Defaults to 0.
     const VISION_POOL_KERNEL: u32 = 0;
+
+    /// RmsNorm epsilon — read from `rms_norm_eps` in the model
+    /// config at macro-expand time. The metal `rmsnorm_*_specialized`
+    /// kernels consume this via `[[function_constant]]` baked into
+    /// the compiled pipeline; cuda's interpreter still reads it
+    /// from `RmsNorm.eps` on the loaded layer struct (same value,
+    /// same source). Default is the value Llama / Qwen / Phi
+    /// canonically use; per-canonical macro impls override.
+    const RMS_NORM_EPS: f32 = 1e-5;
+
+    /// Paged-KV-cache block stride (the `block_size` function
+    /// constant `attention_via_cache_*_specialized` and
+    /// `rope_append_*_specialized` consume). Backend-fixed at 16
+    /// (vLLM's default); per-canonical override only if a model
+    /// chooses a different paging size.
+    const BLOCK_SIZE: u32 = 16;
+
+    /// Block-table row stride (in u32s), equal to
+    /// `ceil(MAX_SEQ_LEN / BLOCK_SIZE)`. Baked into
+    /// `attention_via_cache_*_specialized` so the kernel can index
+    /// `block_table[seq * MAX_BLOCKS_PER_SEQ + logical_block]`
+    /// without a runtime divide. Default sized for ~2k tokens; per-
+    /// canonical macro impls override for longer-context models.
+    const MAX_BLOCKS_PER_SEQ: u32 = 128;
+
+    /// Q-axis tile size for the cuda contiguous-prefill kernel — the
+    /// kernel processes this many query tokens per threadgroup.
+    /// Metal post-Phase B always emits `Instruction::AttentionPrefillPaged`
+    /// (1 Q per TG via `sdpa_vector` port) so this constant is
+    /// cuda-only; backend-fixed and tuning requires kernel co-evolution.
+    const PREFILL_TILE_Q: u32 = 16;
+
+    /// Partial-rope rotation dim — for models where only the first
+    /// `ROT_DIM` of `HEAD_DIM` get rotary applied (Qwen2-VL, GPT-J).
+    /// Default equals `HEAD_DIM` (full rope, the common case).
+    const ROT_DIM: u32 = Self::HEAD_DIM;
+
+    /// Element dtype the metal backend should run this canonical in.
+    /// Picks between the `_f16_specialized` / `_bf16_specialized`
+    /// shader symbols and matching MPS GEMM data type. Default
+    /// `MetalDtype::Bf16` matches every modern HF Llama / Qwen /
+    /// Phi / Mistral checkpoint (`torch_dtype: bfloat16` on disk)
+    /// and the cuda backend's native dtype. Per-canonical macro
+    /// overrides set this from the model config's `torch_dtype`.
+    ///
+    /// Pre-bf16-rollout default was `F16`; that path lost exponent
+    /// range over deep layer chains and produced incoherent outputs
+    /// on Llama-3.x. The default is `Bf16` now; arches that ship
+    /// fp16 on disk (rare) override.
+    #[cfg(feature = "metal")]
+    const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
+        crate::interpreter::metal::MetalDtype::Bf16;
+
+    // ── Backend-capability flags ────────────────────────────────
+    //
+    // Each `HAS_*` flag tells [`crate::backend_compat::BackendCompat`]
+    // whether the arch's DSL emits a tile that requires a particular
+    // backend-side `Impl`. The macro derives these by walking the
+    // classified `Program` at expansion time — they're never
+    // hand-set per canonical, and never read at runtime.
+    //
+    // Flags exist to make a missing-Impl-on-backend bug a compile
+    // error instead of silent garbage output. See
+    // `FERRITE_METAL_TYPE_SAFETY_PLAN.md` and
+    // `crates/ferrite-forward/src/backend_compat.rs`.
+
+    /// True iff the arch's DSL body emits `bias_add(...)` tile(s)
+    /// (Qwen-family QKV biases, ModernBERT-style LayerNorm post-add,
+    /// etc.). Set by the macro via DSL inspection; never written
+    /// by hand.
+    ///
+    /// On CUDA the `(Gemm, BiasAdd)` and `(AffineQmm, BiasAdd)`
+    /// fusions absorb every shipping pattern; on Metal the matching
+    /// fused Impls (`MetalBiasAddImpl::matches() → None`,
+    /// `FusedGemmBiasImpl` Affine-storage gate, missing
+    /// `FusedAffineQkvRopeCacheWithBias`) leave bias_add tiles
+    /// unclaimed, so a `true` value blocks
+    /// `BackendCompat<Metal>` at compile time.
+    const HAS_BIAS_ADD: bool = false;
+
+    /// True iff the arch's DSL emits `OpKind::Moe` (router softmax
+    /// + top-k + experts gather + SwitchGLU bundled into one tile).
+    /// MoE-on-Metal isn't landed yet — the router prereqs (softmax
+    /// + argpartition + take_along_axis) ported in
+    /// `project_metal_moe_router_kernels`, but `gather_qmm_rhs` and
+    /// the pure-ICB SwitchGLU decomposition
+    /// (`project_metal_moe_switchglu`) are open. MoE arches block
+    /// `BackendCompat<Metal>` until those land.
+    const HAS_MOE: bool = false;
 }
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
 /// Constants live on `W: CanonicalParams`, NOT here.
-///
-/// **Reshape / RopeAppend `out_slot != in_slot` invariant.** Both
-/// instructions write `TileEntry::Reshaped { ref_slot, tensor }` at
-/// `out_slot`. The codegen `colored_slot_map` guarantees `out_slot !=
-/// in_slot` for every Impl that declares `output_alias_is_view = true`
-/// (today: `ReshapeRefImpl`, `RopeAppendRefImpl`) — so the overwrite
-/// at `tiles[out_slot]` never drops the upstream's `OwnedTensor` at
-/// `tiles[in_slot]`. The G.7(e.tail.2) bug fix had a runtime safety
-/// net (`pinned_owned: Vec<OwnedTensor>`) that pinned the prior Owned
-/// past the overwrite; once the codegen invariant is in place, the
-/// safety net is unnecessary and was deleted in this commit.
+#[cfg(feature = "cuda")]
 pub struct InterpreterCtx<'a, W> {
     pub wm: &'a W,
     pub tiles: &'a mut Vec<Option<TileEntry>>,
@@ -123,6 +239,29 @@ pub struct InterpreterCtx<'a, W> {
     pub device: &'a mut GpuDevice,
     /// Iter index of the enclosing `Op::Loop`, else 0.
     pub layer_offset: u32,
+    /// `OwnedTensor`s removed from `tiles` to make room for a
+    /// `Reshaped` at the same slot index. Keeping them here pins
+    /// the underlying GPU memory for the rest of the run, so any
+    /// `Reshaped { ref_slot, tensor }` that aliases this storage
+    /// continues to point at live memory.
+    ///
+    /// **Why this exists.** When `Instruction::Reshape(in_slot,
+    /// out_slot, ...)` is emitted with `out_slot == in_slot`, the
+    /// previous `TileEntry::Owned(OwnedTensor)` at that slot would
+    /// be dropped on overwrite — freeing its block back to the
+    /// caching allocator. The new `TileEntry::Reshaped` still holds
+    /// the original GPU pointer in its `tensor` field, but that
+    /// memory is now in the free pool; subsequent `alloc_tensor`
+    /// calls in the same forward (e.g., a downstream attention
+    /// kernel's output) hand the same address back, the kernel
+    /// writes there while still reading the Reshaped, and the
+    /// supposedly-still-live "input" tile sees torn writes (NaN /
+    /// extreme magnitudes). Pinning here is the minimum-invasive
+    /// fix: the codegen contract that `Reshaped::ref_slot` "pins
+    /// the slot whose `OwnedTensor` actually owns the storage" only
+    /// works when the OwnedTensor still lives at `ref_slot`; in the
+    /// in-place case it has already been overwritten. Stash it.
+    pub pinned_owned: Vec<OwnedTensor>,
 }
 
 // Type aliases for variant fields.
@@ -259,6 +398,24 @@ pub enum Instruction<W> {
     /// the codegen prelude); no `out_slot` payload.
     FusedCublasGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
     FusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
+    /// Metal-only per-row bias broadcast add. Emitted by
+    /// `MetalBiasAddImpl` when the synth-pre-attn megakernel doesn't
+    /// claim the biased QKV chain (today: M ≥ 2 prefill, where the
+    /// cost CSV picks unfused — see `project_metal_synth_solver_handoff`).
+    /// CUDA's analogue is `FusedGemmBias`, which folds the bias into
+    /// cuBLAS's gemm_bias epilog. On Metal the singleton path
+    /// dispatches a separate `KernelId::BiasAdd` after the AffineQmm
+    /// / Gemm; once the synth path absorbs biases the solver will
+    /// prefer that over this singleton on decode workloads.
+    ///
+    /// Fields: `(in_slot, out_slot, layer, weight_fn, n, is_affine)`.
+    /// `weight_fn` resolves to a `LinearLayer` whose `.bias` (Dense)
+    /// or `.linear_bias` (AffineQuant) is bound at the kernel's
+    /// `buffer(1)`; `is_affine` discriminates so the worker resolves
+    /// the right `WeightTensor` arm. `n` is the bias's broadcast
+    /// dimension — baked into the specialized pipeline as
+    /// `function_constant(0)`.
+    MetalBiasAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, bool),
     FusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
     FusedQkvRopeCache(u32, u32, u32, WtFn<W, LinearLayer>, CosSinFn<W>, bool, bool),
@@ -288,6 +445,22 @@ pub enum Instruction<W> {
     ),
     AttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
     AttentionPrefillContiguous(u32, u32, u32, u32, bool),
+    /// Prefill attention reading K/V from the paged KV cache via
+    /// block_table indirection. `(q_slot, out_slot, layer, interleaved)`.
+    /// Drops the (k_slot, v_slot) pair that
+    /// [`Instruction::AttentionPrefillContiguous`] carries — the
+    /// upstream `RopeAppend` already wrote rotated K + raw V into the
+    /// per-layer paged cache slots, and the kernel reads them through
+    /// `block_table` with the K-axis covering the FULL `seqused_k[seq]`
+    /// (prefix + new). The per-Q causal mask shifts by
+    /// `(seqused_k[seq] - new_q_for_seq)` so prior cached prefix
+    /// contributes to attention. Required for chunked prefill, prefix
+    /// caching, mixed prefill+decode batches, and multi-turn chat —
+    /// scenarios `AttentionPrefillContiguous` cannot handle because
+    /// its K-axis is bounded by `cu_seqlens_q` (new tokens only).
+    /// Currently emitted only by the metal adapter; cuda continues to
+    /// route prefill through `flash_attn_contiguous`.
+    AttentionPrefillPaged(u32, u32, u32, bool),
     /// Bidirectional / encoder attention. Reads contiguous Q/K/V from
     /// the upstream tile slots; calls `flash_attn_contiguous` with
     /// `is_causal=false` and a null cos_sin pointer (RoPE applied
@@ -386,18 +559,6 @@ pub enum Instruction<W> {
     /// fresh `OwnedTensor` of shape `[(ph/k)², e]`. Used by Gemma3-MM's
     /// SigLIP→text projector. Stride == kernel (non-overlapping).
     AvgPool2d(u32, u32),
-    /// CLIP-class CLS-token strip: `(in_slot, out_slot)`. Reads the
-    /// rank-2 tile `[L, e]` from `in_slot` (where the CLS row has been
-    /// run through the encoder at row 0), copies rows `1..L` into a
-    /// fresh `OwnedTensor` of shape `[L - 1, e]`, and publishes that
-    /// at `out_slot`. No baked-in constant — input dims are read off
-    /// the source tile at runtime, so a misconfigured `vision_in_seq_len
-    /// = vision_num_positions - 1` invariant in the variant config
-    /// surfaces as a downstream shape mismatch (caught at expansion
-    /// time by the bound-resolved sig), not as a kernel panic. Used by
-    /// LLaVA-1.5 family with `vision_feature_select_strategy =
-    /// "default"`.
-    StripCls(u32, u32),
     FlashInferAttentionDecode(u32, u32, u32, CosSinFn<W>, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, CosSinFn<W>, bool),
@@ -482,6 +643,139 @@ pub enum Instruction<W> {
     Fp8FusedGateUpGeluMul(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
     Fp8FusedQkvRopeCache(u32, u32, u32, WtFn<W, Fp8AnyLinear>, CosSinFn<W>),
     Fp8FusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, Fp8AnyLinear>, CosSinFn<W>),
+    /// MLX-affine int4 matmul (transpose=true). Metal-only. The
+    /// `LinearLayer` resolved by `wt_fn` must be `AffineQuant` —
+    /// `lower_one` reads the quant accessors (packed weight, scales,
+    /// per-group affine biases, optional fp linear bias) through the
+    /// `WeightTensor::Affine*` arms in the worker resolver.
+    ///
+    /// Tuple fields: `(in_slot, out_slot, layer, wt_fn, n, k,
+    /// group_size, bits, vector_limit)`. `vector_limit` is the
+    /// matvec/matmul boundary from `get_qmv_batch_limit(K, N,
+    /// arch_gen)` (mirrors MLX `quantized.cpp:84`); the macro bakes
+    /// it at codegen time so `lower_one` can compare against
+    /// `bucket_m` without reaching for the target profile. M < limit
+    /// → qmv (decode-matvec); M ≥ limit → qmm_t (prefill-matmul,
+    /// SplitK heuristic deferred to C3).
+    ///
+    /// CUDA eval is `unreachable!` — emit only on the metal forward.
+    AffineQmm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
+    /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
+    /// write) into one dispatch. The kernel itself is generated at
+    /// macro-expansion time by
+    /// `ferrite-forward-macro/src/fuse_pass.rs` stitching MK primitive
+    /// calls; the symbol name carried here resolves at runtime against
+    /// a per-arch source-compiled library registered into the
+    /// `SpecializedPipelineCache` at worker-pool init.
+    ///
+    /// Tuple fields: `(residual_slot, delta_slot, q_out_slot, layer,
+    /// q_weight_fn, k_weight_fn, v_weight_fn, rms_weight_fn,
+    /// cos_sin_fn, group_size, bits, kernel_symbol)`.
+    ///
+    /// Three separate `WtFn<W, LinearLayer>`s (Q, K, V) instead of a
+    /// packed concat — each AffineQmm in the detected chain
+    /// contributes its own LinearLayer accessor. Avoids the load-time
+    /// packed-concat infrastructure that Phase 0's revert dropped.
+    ///
+    /// CUDA eval is `unreachable!`.
+    SynthPreAttn(
+        u32,
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
+        WtFn<W, ferrite_kernels::layers::RmsNorm>,
+        CosSinFn<W>,
+        u32,
+        u32,
+        &'static str,
+        /// `has_linear_bias`. When `true`, the lowering arm appends 3
+        /// extra `Binding::Weight { which: AffineLinearBias, .. }`
+        /// entries for Q/K/V at buffers 18/19/20 and picks the
+        /// `_bias` synth kernel symbol (set by `fan_out`). Qwen2/2.5
+        /// quantized chains land here; Llama stays `false`.
+        bool,
+    ),
+    /// Compiler-synthesized MLP pre-down chunk megakernel. Metal-only.
+    /// Combines (FusedAddRmsNorm → AffineQmv gate → AffineQmv up →
+    /// SiluMul) into one dispatch, leaving the down-projection as a
+    /// standalone `AffineQmm` consumer of the synthesized output. The
+    /// kernel itself is generated at macro-expansion time by
+    /// `ferrite-forward-macro::fuse_pass::synthesize_mlp_pre_down_chunk`;
+    /// the symbol name carried here resolves at runtime against a
+    /// per-arch source-compiled library registered into the
+    /// `SpecializedPipelineCache` at worker-pool init.
+    ///
+    /// Tuple fields: `(residual_slot, delta_slot, silu_mul_out_slot,
+    /// layer, gate_weight_fn, up_weight_fn, rms_weight_fn, group_size,
+    /// bits, kernel_symbol)`.
+    ///
+    /// Two separate `WtFn<W, LinearLayer>`s (gate, up) — each
+    /// AffineQmm in the detected chain contributes its own LinearLayer
+    /// accessor. The standalone `AffineQmm` for down_proj follows
+    /// directly in the instruction stream as before.
+    ///
+    /// CUDA eval is `unreachable!`.
+    SynthMlpPreDown(
+        u32,
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
+        WtFn<W, ferrite_kernels::layers::RmsNorm>,
+        u32,
+        u32,
+        &'static str,
+    ),
+    /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
+    /// path (plan P12 branch (i)). The macro emits this after a pair
+    /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
+    /// MLX-affine quantized — `MetalFusedGateUpSiluMulImpl::fan_out`
+    /// produces (AffineQmm, AffineQmm, SiluMul) in that case rather
+    /// than a single fused `FusedGateUpSiluMul` (which assumes Dense
+    /// storage).
+    ///
+    /// Tuple fields: `(gate_slot, up_slot, out_slot)`. Both inputs
+    /// must be `[M, intermediate_size]` in the activation dtype;
+    /// output is the same shape. CUDA eval is `unreachable!` —
+    /// metal-only (CUDA's q-MLP routes through Marlin/Bnb/etc).
+    SiluMul(u32, u32, u32),
+    /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
+    /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
+    /// Fields: (x_norm_slot, out_slot, layer, gate_wt_fn, up_wt_fn, group_size, bits, kernel_symbol).
+    #[cfg(feature = "metal")]
+    SynthGateUpSiluMul(
+        u32,
+        u32,
+        u32,
+        WtFn<W, LinearLayer>,
+        WtFn<W, LinearLayer>,
+        u32,
+        u32,
+        &'static str,
+    ),
+    /// MLX-affine int4 quantized embedding lookup (Metal-only).
+    /// Replaces `Instruction::Embed` when `model.embed_tokens` ships
+    /// as a quantized triple `(weight=U32, scales, biases)` — i.e.
+    /// every `mlx-community/*-4bit` checkpoint.
+    ///
+    /// Faithful port of MLX's `nn.QuantizedEmbedding.__call__`
+    /// (`python/mlx/nn/layers/quantized.py:144`), fused into one
+    /// dispatch via `affine_embed_<dtype>_gs_<gs>_b_4` in
+    /// `quantized_dequantize.metal`. Without this lift the embedding
+    /// would CPU-dequantize at load (P2 deviation), burning ~2 GB of
+    /// arena on Llama-3.2-1B.
+    ///
+    /// Tuple fields: `(out_slot, weight_fn, group_size, bits)`. The
+    /// hidden_size rides through `W::Q_SIZE` (function constant baked
+    /// at lower time). Metal-only — `AffineQuantEmbedding` is cfg-gated
+    /// to the metal backend (mirrors `LinearLayer::AffineQuant`).
+    #[cfg(feature = "metal")]
+    AffineEmbed(u32, WtFn<W, AffineQuantEmbedding>, u32, u32),
     /// Re-run the next `body_len` instructions `count` times.
     Loop(u32, u32),
     /// `tiles[dst] = Some(View(src))`.
@@ -517,6 +811,7 @@ impl<W> Clone for Instruction<W> {
 /// the kernel itself uses the runtime tensor's shapes directly,
 /// so the assertion is purely a sanity check that's only sound at
 /// tp=1.
+#[cfg(feature = "cuda")]
 #[track_caller]
 fn assert_weight_shape(
     op: &'static str,
@@ -545,6 +840,7 @@ fn assert_weight_shape(
 /// runtime per-rank shapes legitimately disagree with the codegen's
 /// unified-bounds shapes.
 #[inline]
+#[cfg(feature = "cuda")]
 fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     #[cfg(feature = "nccl")]
     {
@@ -556,6 +852,7 @@ fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl<W: CanonicalParams> Instruction<W> {
     /// Evaluate one instruction. Closed match (no `_` arm).
     /// `Loop` is dispatched by [`run`] — never reaches here.
@@ -704,24 +1001,16 @@ impl<W: CanonicalParams> Instruction<W> {
                     shape[i] = d / div;
                 }
                 let reshaped = upstream.reshape(&shape[..nd]);
-                // The codegen `colored_slot_map` guarantees
-                // `out_slot != in_slot` for every Impl that declares
-                // `output_alias_is_view = true` (here:
-                // ReshapeRefImpl). With that invariant in place,
-                // overwriting `tiles[out_slot]` cannot drop the
-                // upstream `Owned` at `tiles[in_slot]`. Whatever was
-                // at `tiles[out_slot]` (a stale `View` from the alias
-                // prelude, an old slot's spill in a reused color)
-                // either has no GPU storage of its own (`View` /
-                // `Reshaped`) or is a freed slot whose drop here is
-                // the natural deallocation point for that color.
-                debug_assert_ne!(
-                    in_slot, out_slot,
-                    "Reshape: codegen invariant violated — \
-                     `output_alias_is_view = true` Impl had its \
-                     output collapsed onto its input's slot. \
-                     `colored_slot_map`'s view-alias guard is broken."
-                );
+                // Pin overwritten Owned: if `out_slot == in_slot`, the
+                // existing `TileEntry::Owned` would otherwise drop here,
+                // freeing the very memory the new `Reshaped` aliases.
+                // See `pinned_owned` doc on `InterpreterCtx`. Take the
+                // old entry out first so we can stash any Owned without
+                // double-borrowing `ctx.tiles`.
+                let prev = std::mem::take(&mut ctx.tiles[out_slot as usize]);
+                if let Some(TileEntry::Owned(t)) = prev {
+                    ctx.pinned_owned.push(t);
+                }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Reshaped {
                     ref_slot: in_slot,
                     tensor: reshaped,
@@ -1327,6 +1616,12 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             }
+            Instruction::AttentionPrefillPaged(_q_slot, _out_slot, _layer, _interleaved) => {
+                unimplemented!(
+                    "AttentionPrefillPaged is metal-only — cuda routes prefill through \
+                     `Instruction::AttentionPrefillContiguous` (flash_attn_contiguous)."
+                );
+            }
             Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => {
                 // Encoder/bidirectional self-attention: same FA2 kernel
                 // as the prefill prefill path but with `is_causal=false`
@@ -1639,13 +1934,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
-            Instruction::StripCls(in_slot, out_slot) => {
-                let owned = unsafe {
-                    let in_view = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    kernels::strip_cls(*in_view, &mut ctx.device.caching, ctx.device.compute_stream)
-                };
-                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
-            }
             Instruction::LoadPixels(out_slot) => unsafe {
                 let view = ctx.fwd.pixels.expect(
                     "Instruction::LoadPixels invoked without ForwardCtx::pixels — \
@@ -1854,27 +2142,14 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 let nt_q = (*q_view).dim(0);
                 let q_3d = q_view.reshape(&[nt_q, W::NUM_Q_HEADS as usize, W::HEAD_DIM as usize]);
-                // `colored_slot_map`'s view-alias guard
-                // (`output_alias_is_view = true` on
-                // `RopeAppendRefImpl`) makes `q/k/v_out_slot !=
-                // q/k/v_slot` a codegen-time invariant — see the
-                // matching debug_assert + comment in
-                // `Instruction::Reshape::eval`. Without that
-                // invariant the writes below would drop the
-                // upstream Q/K/V `OwnedTensor`s while the new
-                // `Reshaped` entries still alias their GPU storage.
-                debug_assert_ne!(
-                    q_slot, q_out_slot,
-                    "RopeAppend: q output collapsed onto q input"
-                );
-                debug_assert_ne!(
-                    k_slot, k_out_slot,
-                    "RopeAppend: k output collapsed onto k input"
-                );
-                debug_assert_ne!(
-                    v_slot, v_out_slot,
-                    "RopeAppend: v output collapsed onto v input"
-                );
+                // Pin any Owned overwritten by these three Reshaped
+                // writes. See InterpreterCtx::pinned_owned for the why.
+                for slot in [q_out_slot, k_out_slot, v_out_slot] {
+                    let prev = std::mem::take(&mut ctx.tiles[slot as usize]);
+                    if let Some(TileEntry::Owned(t)) = prev {
+                        ctx.pinned_owned.push(t);
+                    }
+                }
                 ctx.tiles[q_out_slot as usize] = Some(TileEntry::Reshaped {
                     ref_slot: q_slot,
                     tensor: *q_3d,
@@ -2895,6 +3170,55 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
+            Instruction::AffineQmm(..) => {
+                unreachable!(
+                    "Instruction::AffineQmm is metal-only — the macro must \
+                     not emit it on the cuda forward (Affine weights stay \
+                     in StorageFormat::Dense on cuda by the FUF downgrade)"
+                );
+            }
+            Instruction::SynthPreAttn(..) => {
+                unreachable!(
+                    "Instruction::SynthPreAttn is metal-only — emitted by the \
+                     compiler-driven megakernel synthesis pass on the metal forward only"
+                );
+            }
+            Instruction::SynthMlpPreDown(..) => {
+                unreachable!(
+                    "Instruction::SynthMlpPreDown is metal-only — emitted by the \
+                     compiler-driven megakernel synthesis pass on the metal forward only"
+                );
+            }
+            Instruction::SiluMul(..) => {
+                unreachable!(
+                    "Instruction::SiluMul is metal-only — emitted by the \
+                     decomposed q-MLP path on Affine; cuda's q-MLP routes \
+                     through Marlin/Bnb/Fp8/etc fused kernels"
+                );
+            }
+            Instruction::MetalBiasAdd(..) => {
+                unreachable!(
+                    "Instruction::MetalBiasAdd is metal-only — emitted by \
+                     MetalBiasAddImpl for QKV biases on the singleton \
+                     (non-synth) path. cuda folds biases into cuBLAS \
+                     gemm_bias via FusedGemmBias instead"
+                );
+            }
+            #[cfg(feature = "metal")]
+            Instruction::SynthGateUpSiluMul(..) => {
+                unreachable!(
+                    "Instruction::SynthGateUpSiluMul is metal-only — emitted by the \
+                     compiler-driven megakernel synthesis pass on the metal forward only"
+                );
+            }
+            #[cfg(feature = "metal")]
+            Instruction::AffineEmbed(..) => {
+                unreachable!(
+                    "Instruction::AffineEmbed is metal-only — emitted by the \
+                     P6 quantized embedding lift; cuda's quantized embeddings \
+                     never lift to forward-time (Marlin/Bnb keep dense embed)"
+                );
+            }
             Instruction::Loop(_, _) => {
                 unreachable!("Instruction::Loop should be handled by run(), not eval()");
             }
@@ -2908,6 +3232,7 @@ impl<W: CanonicalParams> Instruction<W> {
     }
 }
 
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn mla_attention_eval<W: CanonicalParams>(
     ctx: &mut InterpreterCtx<'_, W>,
@@ -3062,6 +3387,7 @@ unsafe fn mla_attention_eval<W: CanonicalParams>(
 /// Walk one slice in-place against ctx. `Instruction::Loop(count,
 /// body_len)` re-runs the next `body_len` instructions `count`
 /// times with `ctx.layer_offset` set to the iter index.
+#[cfg(feature = "cuda")]
 unsafe fn run_slice<W: CanonicalParams>(
     instructions: &[Instruction<W>],
     ctx: &mut InterpreterCtx<'_, W>,
@@ -3121,6 +3447,7 @@ unsafe fn run_slice<W: CanonicalParams>(
 /// Cost: one D2H + stream sync per slot per instruction. Useful
 /// only for single-request bisection runs; never enable in
 /// production.
+#[cfg(feature = "cuda")]
 mod debug_dump {
     use super::TileEntry;
     use ferrite_cuda_core::CUstream;
@@ -3211,6 +3538,7 @@ mod debug_dump {
 /// # Safety
 /// Both slices well-formed; tile slot indices in range; weight
 /// accessor fns produce live GPU memory.
+#[cfg(feature = "cuda")]
 pub unsafe fn run<W: CanonicalParams>(
     backbone: &[Instruction<W>],
     lm_head: &[Instruction<W>],
@@ -3227,6 +3555,7 @@ pub unsafe fn run<W: CanonicalParams>(
         fwd,
         device,
         layer_offset: 0,
+        pinned_owned: Vec::new(),
     };
     unsafe {
         run_slice(backbone, &mut ctx);
@@ -3240,6 +3569,7 @@ pub unsafe fn run<W: CanonicalParams>(
 ///
 /// # Safety
 /// Same as [`run`].
+#[cfg(feature = "cuda")]
 pub unsafe fn run_backbone<W: CanonicalParams>(
     backbone: &[Instruction<W>],
     wm: &W,
@@ -3255,6 +3585,7 @@ pub unsafe fn run_backbone<W: CanonicalParams>(
         fwd,
         device,
         layer_offset: 0,
+        pinned_owned: Vec::new(),
     };
     unsafe {
         run_slice(backbone, &mut ctx);

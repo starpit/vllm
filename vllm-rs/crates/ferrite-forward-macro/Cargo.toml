@@ -8,7 +8,17 @@ license.workspace = true
 proc-macro = true
 
 [features]
+# No default backend. Consumer must opt into exactly one of `cuda`
+# or `metal` via their own feature graph (see `ferrite-forward`'s
+# Cargo.toml — its `cuda` and `metal` features explicitly enable the
+# matching macro feature). Picking a default here was previously
+# convenient but made it impossible to build the macro under a pure
+# `--features metal` graph: cargo would unify `default` ∪ `metal`,
+# and the macro's `compile_error!` rejected having both at once.
 default = []
+# Backend selection: exactly one must be enabled
+cuda = ["dep:ferrite-cuda-targets"]
+metal = ["dep:ferrite-metal-targets", "dep:ferrite-metal-kernels"]
 # Tensor-parallel fanout. When any consumer crate forwards its `nccl`
 # feature into `ferrite-forward-macro/nccl` (every per-arch crate
 # does — see their `nccl = [..., "ferrite-forward-macro/nccl"]`),
@@ -21,13 +31,18 @@ default = []
 nccl = []
 
 [dependencies]
+ferrite-fusion-synth = { path = "../ferrite-fusion-synth" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 prettyplease = "0.2"
 serde_json = { workspace = true }
 rayon = { workspace = true }
-ferrite-cuda-targets = { path = "../ferrite-cuda-targets" }
+
+# Backend-specific dependencies (enabled by features)
+ferrite-cuda-targets = { path = "../ferrite-cuda-targets", optional = true }
+ferrite-metal-targets = { path = "../ferrite-metal-targets", optional = true }
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
 
 [dev-dependencies]
 trybuild = "1"

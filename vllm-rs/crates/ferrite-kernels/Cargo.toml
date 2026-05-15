@@ -7,16 +7,26 @@ description = "GPU kernel wrappers and layer types for the ferrite inference fra
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda"]
+# `cuda` pulls in the cudarc dep (whose build script requires `nvcc`)
+# alongside `ferrite-cuda-core/cuda`. Without it, the crate compiles
+# the layer struct *types* (RmsNorm, LinearLayer, …) but no kernel
+# wrappers — sufficient for backends that consume `Instruction<W>`
+# (e.g. ferrite-metal) on machines without a CUDA toolkit.
+cuda = ["dep:cudarc", "ferrite-cuda-core/cuda"]
 nccl = ["cuda", "ferrite-cuda-core/nccl"]
+# Metal backend: layer struct *types* (RmsNorm, LinearLayer, …) + the
+# platform-neutral `load(...)` methods compile under metal too. Quant
+# kernel wrappers and cuBLAS forwards stay cuda-only.
+metal = ["ferrite-cuda-core/metal"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
-cudarc = { workspace = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
 half = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+rayon = { workspace = true }
 vllm-model = { path = "../vllm-model" }
 ferrite-gguf = { path = "../ferrite-gguf" }
 inventory = { workspace = true }

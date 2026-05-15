@@ -18,17 +18,22 @@
 //! stdout is a tty, headers print in bold and trailing metadata in
 //! a dim style — set `NO_COLOR` to opt out.
 
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 use std::io::{self, BufWriter, IsTerminal, Write};
 
-use ferrite_forward::attack_surface::{AttackSurfaceReport, CostTable};
 use ferrite_forward::{BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep};
+// `attack_surface` builds against `ferrite_cuda_targets` for GPU
+// profile selection — kept cuda-only. The `--cublas-analysis` flag
+// is hidden on metal (see `args.rs`), so the surrounding body code
+// never reaches these types under `not(feature = "cuda")`.
+#[cfg(feature = "cuda")]
+use ferrite_forward::attack_surface::{AttackSurfaceReport, CostTable};
 
 use crate::args::{ColorWhen, FerriteInfoArgs};
 
 // Inventory submissions for `ferrite_models` are kept alive by
-// `vllm-executor::cuda_worker`'s `extern crate ferrite_models as _;`,
+// `vllm-executor::ferrite_worker`'s `extern crate ferrite_models as _;`,
 // which the CLI binary transitively pulls in.
 
 pub async fn run_info(args: FerriteInfoArgs) -> anyhow::Result<()> {
@@ -52,6 +57,10 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
     // Resolve the active GPU profile + parse its cost CSV ONCE before
     // the per-arch walk. The `attack_surface` aggregator threads it
     // through every bucket; the normal info dump ignores it.
+    // `--cublas-analysis` is cuda-only — the field doesn't exist on
+    // the metal flavor of `FerriteInfoArgs`, so the surrounding code
+    // can't even reference it under `not(feature = "cuda")`.
+    #[cfg(feature = "cuda")]
     let cost_table = if args.cublas_analysis {
         let profile = ferrite_cuda_targets::detect()
             .map(|p| (p.name, p.cost_csv))
@@ -63,6 +72,7 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
     } else {
         None
     };
+    #[cfg(feature = "cuda")]
     let mut surface = AttackSurfaceReport::new(3);
 
     let mut shown = 0usize;
@@ -84,8 +94,13 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
             }
             // Backbone print is suppressed in --attack-surface mode so
             // the analysis report isn't buried under tens of thousands
-            // of step lines.
-            if !args.cublas_analysis {
+            // of step lines. On metal the flag doesn't exist, so the
+            // print path is always taken.
+            #[cfg(feature = "cuda")]
+            let should_print_backbone = !args.cublas_analysis;
+            #[cfg(not(feature = "cuda"))]
+            let should_print_backbone = true;
+            if should_print_backbone {
                 print_variant(
                     out,
                     arch,
@@ -95,6 +110,7 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
                     &style,
                 )?;
             }
+            #[cfg(feature = "cuda")]
             if let Some((_, cost_table)) = &cost_table {
                 let arch_label = format!(
                     "{arch} / {} · tp={}",
@@ -119,6 +135,7 @@ fn run_info_inner<W: Write>(out: &mut W, args: &FerriteInfoArgs) -> io::Result<(
             )?;
         }
     }
+    #[cfg(feature = "cuda")]
     if let Some((profile_name, _)) = &cost_table {
         writeln!(
             out,

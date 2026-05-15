@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// CUTLASS 2.x GEMM with bias broadcast — templatized over T (bf16 / f16).
+// CUTLASS 2.x BF16 GEMM with bias broadcast.
 //
 // Computes: D[M, N] = A[M, K] @ B[N, K]^T + bias[N]
 //
@@ -9,10 +9,10 @@
 // ldc=0), so every M-row indexes the same bias[0..N] — built-in row
 // broadcast via the standard GEMM API, no EVT visitor tree.
 //
-// One launcher per (TB_M, TB_N, STAGES, dtype) tuple in
-// CUTLASS_TILE_ZOO. The DP solver picks per (workload M, weight N, K)
-// from the calibrated CSV; the macro-emitted forward calls the
-// matching launch fn directly via `launch_fn_for_bias`.
+// One launcher per (TB_M, TB_N, STAGES) tuple in CUTLASS_TILE_ZOO.
+// The DP solver picks per (workload M, weight N, K) from the
+// calibrated CSV; the macro-emitted forward calls the matching
+// launch fn directly via `launch_fn_for_bias`.
 
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm.h>
@@ -25,14 +25,14 @@ static int run_gemm_bias(
     int M, int N, int K,
     cudaStream_t stream
 ) {
-    using T = typename GemmOp::ElementA;
+    using BF16 = cutlass::bfloat16_t;
     typename GemmOp::Arguments args(
         {M, N, K},
-        {(T const*)a, K},        // A [M, K] row-major,  lda=K
-        {(T const*)b, K},        // B [N, K] col-major,  ldb=K
-        {(T const*)bias, 0},     // C row-major, ldc=0 → broadcast bias[N]
-        {(T*)d, N},              // D [M, N] row-major,  ldd=N
-        {1.0f, 1.0f}             // alpha=1, beta=1 → D = A@B^T + bias
+        {(BF16 const*)a, K},        // A [M, K] row-major,  lda=K
+        {(BF16 const*)b, K},        // B [N, K] col-major,  ldb=K
+        {(BF16 const*)bias, 0},     // C row-major, ldc=0 → broadcast bias[N]
+        {(BF16*)d, N},              // D [M, N] row-major,  ldd=N
+        {1.0f, 1.0f}                // alpha=1, beta=1 → D = A@B^T + bias
     );
 
     GemmOp op;
@@ -46,41 +46,36 @@ static int run_gemm_bias(
     return (status == cutlass::Status::kSuccess) ? 0 : -3;
 }
 
-#define BIAS_GEMM_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
-    using GemmBias_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES =                  \
-        cutlass::gemm::device::Gemm<                                                     \
-            T, cutlass::layout::RowMajor,                                                \
-            T, cutlass::layout::ColumnMajor,                                             \
-            T, cutlass::layout::RowMajor,                                                \
-            float,                                                                       \
-            cutlass::arch::OpClassTensorOp,                                              \
-            cutlass::arch::Sm80,                                                         \
-            cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                                 \
-            cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                           \
-            cutlass::gemm::GemmShape<16, 8, 16>,                                        \
-            cutlass::epilogue::thread::LinearCombination<                                \
-                T, 8, float, float>,                                                     \
-            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,                \
-            STAGES                                                                       \
-        >;
+#define BIAS_GEMM_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)        \
+    using GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES = cutlass::gemm::device::Gemm< \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                           \
+        cutlass::bfloat16_t, cutlass::layout::ColumnMajor,                        \
+        cutlass::bfloat16_t, cutlass::layout::RowMajor,                           \
+        float,                                                                    \
+        cutlass::arch::OpClassTensorOp,                                           \
+        cutlass::arch::Sm80,                                                      \
+        cutlass::gemm::GemmShape<TB_M, TB_N, TB_K>,                               \
+        cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>,                         \
+        cutlass::gemm::GemmShape<16, 8, 16>,                                      \
+        cutlass::epilogue::thread::LinearCombination<                             \
+            cutlass::bfloat16_t, 8, float, float>,                                \
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,             \
+        STAGES                                                                    \
+    >;
 
-#define BIAS_GEMM_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)                                 \
-    extern "C" int cutlass_gemm_bias_##TB_M##x##TB_N##_s##STAGES##_##DTYPE_TAG##_launch(      \
-        void* d, const void* a, const void* b, const void* bias,                              \
-        int M, int N, int K,                                                                  \
-        uint64_t stream                                                                       \
-    ) {                                                                                       \
-        return run_gemm_bias<GemmBias_##DTYPE_TAG##_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(    \
-            d, a, b, bias, M, N, K, (cudaStream_t)stream);                                    \
+#define BIAS_GEMM_LAUNCH(TB_M, TB_N, TB_K, STAGES)                                \
+    extern "C" int cutlass_gemm_bias_##TB_M##x##TB_N##_s##STAGES##_launch(        \
+        void* d, const void* a, const void* b, const void* bias,                  \
+        int M, int N, int K,                                                      \
+        uint64_t stream                                                           \
+    ) {                                                                           \
+        return run_gemm_bias<GemmBias_##TB_M##x##TB_N##x##TB_K##_s##STAGES>(      \
+            d, a, b, bias, M, N, K, (cudaStream_t)stream);                        \
     }
 
-#define BIAS_GEMM_TYPED(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)       \
-    BIAS_GEMM_CONFIG(DTYPE_TAG, T, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)          \
-    BIAS_GEMM_LAUNCH(DTYPE_TAG, TB_M, TB_N, TB_K, STAGES)
-
-#define BIAS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)                           \
-    BIAS_GEMM_TYPED(bf16, cutlass::bfloat16_t, TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES) \
-    BIAS_GEMM_TYPED(f16,  cutlass::half_t,    TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)
+#define BIAS_GEMM(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)               \
+    BIAS_GEMM_CONFIG(TB_M, TB_N, TB_K, WARP_M, WARP_N, WARP_K, STAGES)            \
+    BIAS_GEMM_LAUNCH(TB_M, TB_N, TB_K, STAGES)
 
 // Tile zoo — must match `CUTLASS_TILE_ZOO` in
 // ferrite-forward-macro/src/impl_lib.rs and the extern-decl block in

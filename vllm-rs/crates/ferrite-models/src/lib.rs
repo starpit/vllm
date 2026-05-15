@@ -28,8 +28,6 @@ extern crate ferrite_model_gemma3_mm as _keep_gemma3_mm;
 extern crate ferrite_model_granite as _keep_granite;
 #[cfg(feature = "arch-llama")]
 extern crate ferrite_model_llama as _keep_llama;
-#[cfg(feature = "arch-llava")]
-extern crate ferrite_model_llava as _keep_llava;
 #[cfg(feature = "arch-mistral")]
 extern crate ferrite_model_mistral as _keep_mistral;
 #[cfg(feature = "arch-mixtral")]
@@ -69,8 +67,6 @@ pub use ferrite_model_gemma3_mm as gemma3_mm;
 pub use ferrite_model_granite as granite;
 #[cfg(feature = "arch-llama")]
 pub use ferrite_model_llama as llama;
-#[cfg(feature = "arch-llava")]
-pub use ferrite_model_llava as llava;
 #[cfg(feature = "arch-mistral")]
 pub use ferrite_model_mistral as mistral;
 #[cfg(feature = "arch-mixtral")]

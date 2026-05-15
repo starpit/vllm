@@ -134,32 +134,16 @@ pub fn colored_slot_map(
     // points at the *flattened* owner, so we resolve chains for the
     // last-use extension below; for the color-distinction constraint
     // we use the resolved owner since that's what the View holds.
-    //
-    // `view_alias` parallel-tracks dst keys whose producing Impl
-    // declares `output_alias_is_view = true` — Reshape and RopeAppend
-    // today. Those dst slots are EXCLUDED from same-shape collapse
-    // (the next-block decision): the eval body writes
-    // `TileEntry::Reshaped { ref_slot, tensor }` at dst, which would
-    // overwrite-and-drop the owner's `OwnedTensor` if dst shared the
-    // owner's color. Forcing dst to its own color guarantees
-    // `out_slot != in_slot` at the runtime level — the precondition
-    // that lets `Instruction::Reshape::eval` and `RopeAppend::eval`
-    // drop their `pinned_owned` runtime safety net.
     let mut alias_to_owner: HashMap<(TileId, u8), (TileId, u8)> = HashMap::new();
-    let mut view_alias: HashSet<(TileId, u8)> = HashSet::new();
     for &sg in &order_arr {
         let imp_id = sfuf
             .impl_of(sg)
             .expect("every scheduled subgraph has an Impl");
         let imp = lib.get(imp_id);
         let claimed = sfuf.tiles_in_subgraph(sg);
-        let is_view = imp.output_alias_is_view();
         for (dst, src_opt) in imp.output_alias(&claimed, fuf) {
             if let Some(src) = src_opt {
                 alias_to_owner.insert(dst, src);
-                if is_view {
-                    view_alias.insert(dst);
-                }
             }
         }
     }
@@ -189,66 +173,89 @@ pub fn colored_slot_map(
         }
     }
 
-    // Last use per OWNER (resolving alias chains): the latest
-    // subgraph that reads this owner's storage, directly or via a
-    // View. Last use of a non-owner (a View slot itself) is computed
+    // Per-tile sub-positions. Each tile gets a unique flat index by
+    // walking subgraphs in execution order, then tiles within each
+    // subgraph in claim order. Coarser per-subgraph positions would
+    // collapse every tile in a subgraph to the same `dp`, so a
+    // producer tile whose only reader sits in the SAME subgraph's
+    // claim ends up freed at its own def — and the next tile in the
+    // subgraph reuses its color. Fine for single-kernel claims (the
+    // producer's output is never materialized in the arena), but
+    // wrong for storage-polymorphic impls whose `fan_out` emits
+    // multiple kernels per subgraph (MetalFusedGateUpSiluMulImpl's
+    // affine path: AffineQmm gate, AffineQmm up, SiluMul). Per-tile
+    // sub-positions let the within-subgraph read walk below record
+    // the consumer's sub-position as the producer's `last_use`, so
+    // gate's slot stays distinct from up's slot across the SiluMul
+    // read.
+    //
+    // Layer-template byte-equivalence: per-tile positions increment
+    // monotonically. Each layer body's tiles occupy the same
+    // relative offset range, so per-layer color assignments stay
+    // byte-equivalent (the linear-scan reg allocation runs against
+    // the same free-pool state at the same relative positions).
+    let mut tile_position: HashMap<TileId, usize> = HashMap::new();
+    let mut next_pos: usize = 0;
+    for &sg in &order_arr {
+        for tile in sfuf.tiles_in_subgraph(sg) {
+            tile_position.insert(tile, next_pos);
+            next_pos += 1;
+        }
+    }
+
+    // Last use per OWNER (resolving alias chains): the latest tile-
+    // position that reads this owner's storage, directly or via a
+    // View. Within-subgraph reads count too (the impl's fan_out may
+    // emit a kernel chain whose intermediate outputs hit the arena).
+    // Last use of a non-owner (a View slot itself) is computed
     // separately below.
     let mut owner_last_use: HashMap<(TileId, u8), usize> = HashMap::new();
     for &sg in &order_arr {
-        let pos = order[&sg];
-        let claimed: HashSet<TileId> = sfuf.tiles_in_subgraph(sg).into_iter().collect();
-        for tile in &claimed {
-            for input in &fuf.get(*tile).inputs {
+        for tile in sfuf.tiles_in_subgraph(sg) {
+            let consumer_pos = tile_position[&tile];
+            for input in &fuf.get(tile).inputs {
                 if let FufInput::Tile { id, slot } = input {
-                    if claimed.contains(id) {
-                        continue;
-                    }
                     let owner = resolve((*id, *slot));
                     owner_last_use
                         .entry(owner)
-                        .and_modify(|p| *p = (*p).max(pos))
-                        .or_insert(pos);
+                        .and_modify(|p| *p = (*p).max(consumer_pos))
+                        .or_insert(consumer_pos);
                 }
             }
         }
     }
     // View slots' last_use: when is the View itself read? A View is
     // read whenever its dst slot appears as a Tile input to some
-    // downstream subgraph. Same walk but without alias resolution.
+    // downstream tile. Same walk but without alias resolution.
     let mut view_last_use: HashMap<(TileId, u8), usize> = HashMap::new();
     for &sg in &order_arr {
-        let pos = order[&sg];
-        let claimed: HashSet<TileId> = sfuf.tiles_in_subgraph(sg).into_iter().collect();
-        for tile in &claimed {
-            for input in &fuf.get(*tile).inputs {
+        for tile in sfuf.tiles_in_subgraph(sg) {
+            let consumer_pos = tile_position[&tile];
+            for input in &fuf.get(tile).inputs {
                 if let FufInput::Tile { id, slot } = input {
-                    if claimed.contains(id) {
-                        continue;
-                    }
                     if alias_to_owner.contains_key(&(*id, *slot)) {
                         view_last_use
                             .entry((*id, *slot))
-                            .and_modify(|p| *p = (*p).max(pos))
-                            .or_insert(pos);
+                            .and_modify(|p| *p = (*p).max(consumer_pos))
+                            .or_insert(consumer_pos);
                     }
                 }
             }
         }
     }
 
-    // Collect every (tile, output_slot) pair, sorted by def position.
+    // Collect every (tile, output_slot) pair, sorted by per-tile
+    // sub-position.
     let mut def_pos: HashMap<TileId, usize> = HashMap::new();
-    for &sg in &order_arr {
-        for tile in sfuf.tiles_in_subgraph(sg) {
-            def_pos.insert(tile, order[&sg]);
-        }
+    for (&tile, &pos) in &tile_position {
+        def_pos.insert(tile, pos);
     }
     let mut pairs: Vec<(usize, TileId, u8)> = Vec::new();
     for &sg in &order_arr {
         for tile in sfuf.tiles_in_subgraph(sg) {
             let n_out = fuf.get(tile).outputs.len().max(1) as u8;
             for slot in 0..n_out {
-                pairs.push((order[&sg], tile, slot));
+                pairs.push((tile_position[&tile], tile, slot));
             }
         }
     }
@@ -303,20 +310,7 @@ pub fn colored_slot_map(
         // Same-shape alias collapse: dst pins to owner's color.
         // No active entry (the owner's already covers the combined
         // lifetime via `owner_last_use` resolution).
-        //
-        // EXCEPT for view aliases (Reshape, RopeAppend): the eval
-        // body writes `TileEntry::Reshaped { ref_slot, tensor }` at
-        // dst's color, which — if collapsed to owner's color — would
-        // overwrite-and-drop the owner's `OwnedTensor`, freeing the
-        // GPU memory the new `Reshaped` aliases. The
-        // `Implementation::output_alias_is_view` discriminant marks
-        // these; force them down the different-color path. Since
-        // shape pools partition by shape, dst still gets its own
-        // color, the prelude emits an `Op::Alias` row writing
-        // `View { ref_slot: owner_color }`, and the eval body's
-        // overwrite drops only that View — the owner stays alive at
-        // its own slot.
-        if is_alias && !view_alias.contains(&(tile, slot)) {
+        if is_alias {
             let owner = resolve((tile, slot));
             let owner_shape = fuf.get(owner.0).outputs[owner.1 as usize].clone();
             if owner_shape == tile_shape {
@@ -381,6 +375,13 @@ pub struct LoweredBucket {
     /// Slot index whose `Owned` entry is the bucket fn's return
     /// value.
     pub final_slot: u32,
+    /// One `barrier_before` flag per entry in `instances`. `true`
+    /// means a concurrency-aware backend (today: metal MTL4
+    /// encoder) must serialize the dispatched instance against
+    /// every prior instance in the bucket. Computed at macro time
+    /// from the FUF dependency graph + per-`Implementation` KV-
+    /// layer-IO declarations — runtime never re-derives.
+    pub barriers: Vec<bool>,
 }
 
 /// Variant shapes the macro accumulates across every bucket of one
@@ -557,6 +558,56 @@ fn parse_u32_literal(ts: &TokenStream) -> Option<u32> {
     s.parse::<u32>().ok()
 }
 
+
+/// OpcodeShape for `Instruction::SynthPreAttn`. Must match the
+/// variant declared in `ferrite-forward::instr` field-for-field
+/// (codegen panics on shape disagreement).
+fn synth_pre_attn_opcode_shape() -> OpcodeShape {
+    OpcodeShape::new(
+        "SynthPreAttn",
+        vec![
+            ("residual_slot", syn::parse_quote!(u32)),
+            ("delta_slot", syn::parse_quote!(u32)),
+            ("out_slot", syn::parse_quote!(u32)),
+            ("layer", syn::parse_quote!(u32)),
+            (
+                "q_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "k_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "v_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                ),
+            ),
+            (
+                "rms_weight_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                ),
+            ),
+            (
+                "cos_sin_fn",
+                syn::parse_quote!(
+                    for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
+                ),
+            ),
+            ("group_size", syn::parse_quote!(u32)),
+            ("bits", syn::parse_quote!(u32)),
+            ("kernel_symbol", syn::parse_quote!(&'static str)),
+            ("has_linear_bias", syn::parse_quote!(bool)),
+        ],
+    )
+}
+
 /// Apply loop compression to `lowered.instances` in place. When
 /// [`detect_repeating_run`] finds a contiguous run, replace it
 /// with one `Op::Loop` row plus a single iteration's body. The
@@ -620,6 +671,24 @@ pub fn apply_loop_compression(
         new_instances.push(copy);
     }
     new_instances.extend_from_slice(&lowered.instances[span_end..]);
+    // Compress barriers in lockstep with instances. The body is
+    // byte-equivalent across iterations (that's the precondition
+    // for loop compression to apply at all), so per-iteration
+    // barrier flags also repeat — keep iter-0's body slice. The
+    // Loop row inserted ahead of the body gets `false` (no
+    // dispatch). Body row 0's flag covers the boundary between
+    // the last pre-loop instance (iter 0 case) AND the last
+    // body instance of the previous iteration (iter N>0 case);
+    // both transitions have the same hazard footprint when the
+    // body is byte-equivalent, so the saved flag is correct.
+    if !lowered.barriers.is_empty() {
+        let mut new_barriers: Vec<bool> = Vec::new();
+        new_barriers.extend_from_slice(&lowered.barriers[..start]);
+        new_barriers.push(false);
+        new_barriers.extend_from_slice(&lowered.barriers[start..start + period]);
+        new_barriers.extend_from_slice(&lowered.barriers[span_end..]);
+        lowered.barriers = new_barriers;
+    }
     lowered.instances = new_instances;
 }
 
@@ -925,6 +994,17 @@ pub fn lower_bucket(
     // equivalence). So we don't emit Free here at all.
     let mut instances: Vec<OpInstance> =
         aliases.iter().map(|&(d, s)| alias_instance(d, s)).collect();
+    // Alias rows are metadata only — they don't dispatch on any
+    // backend — so they get `barrier_before = false`.
+    let mut barriers: Vec<bool> = vec![false; instances.len()];
+
+    // Hazard-analysis state, shared across waves (one logical MTL4
+    // encoder per bucket; barriers flush all pending sets).
+    let mut pending_writes: HashSet<u32> = HashSet::new();
+    let mut pending_reads: HashSet<u32> = HashSet::new();
+    let mut pending_kv_writes: HashSet<u32> = HashSet::new();
+    let mut pending_kv_reads: HashSet<u32> = HashSet::new();
+    let mut first_dispatch = true;
 
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
@@ -953,15 +1033,102 @@ pub fn lower_bucket(
             // Eval bodies live in `ferrite_forward::Instruction::eval`
             // — register only the shape, used for static-slice
             // emission and `apply_loop_compression`'s per-variant
-            // iter-index field discovery.
+            // iter-index field discovery. `extra_opcode_shapes`
+            // covers storage-polymorphic impls that fan out a
+            // multi-variant mix (e.g. metal int4's decomposed q-MLP
+            // emits `AffineQmm`/`SiluMul` from the same Impl whose
+            // primary `opcode_shape` is `FusedGateUpSiluMul`).
             arch_opcodes.register(imp.opcode_shape());
+            for extra in imp.extra_opcode_shapes() {
+                arch_opcodes.register(extra);
+            }
+
+            // Per-subgraph dataflow signature, sourced from the
+            // exact same primitives `colored_slot_map` uses:
+            // claimed-tile outputs (alias-resolved) for writes,
+            // FufInput::Tile boundary edges (alias-resolved) for
+            // reads, plus the impl's `kv_layer_io` declaration for
+            // the runtime-ambient KV cache.
+            let mut sg_writes: Vec<u32> = Vec::new();
+            let mut sg_writes_set: HashSet<u32> = HashSet::new();
+            for &t in &claimed {
+                let n_out = fuf.get(t).outputs.len().max(1) as u8;
+                for s in 0..n_out {
+                    let owner = resolve_owner((t, s));
+                    let slot = slots.of(owner.0, owner.1);
+                    if sg_writes_set.insert(slot) {
+                        sg_writes.push(slot);
+                    }
+                }
+            }
+            let claimed_set: HashSet<TileId> = claimed.iter().copied().collect();
+            let mut sg_reads: Vec<u32> = Vec::new();
+            let mut sg_reads_set: HashSet<u32> = HashSet::new();
+            for &t in &claimed {
+                for input in &fuf.get(t).inputs {
+                    if let crate::fuf::FufInput::Tile { id, slot } = input
+                        && !claimed_set.contains(id)
+                    {
+                        let owner = resolve_owner((*id, *slot));
+                        let s = slots.of(owner.0, owner.1);
+                        if sg_reads_set.insert(s) {
+                            sg_reads.push(s);
+                        }
+                    }
+                }
+            }
+            let (kv_w, kv_r) = imp.kv_layer_io(&claimed, fuf);
+
+            // Hazard check against pending sets. RAW (my reads ∩
+            // pending writes) + WAW (my writes ∩ pending writes) +
+            // WAR (my writes ∩ pending reads) + KV-layer
+            // equivalents.
+            let arena_conflict = sg_reads.iter().any(|s| pending_writes.contains(s))
+                || sg_writes.iter().any(|s| pending_writes.contains(s))
+                || sg_writes.iter().any(|s| pending_reads.contains(s));
+            let kv_conflict = kv_r
+                .map(|l| pending_kv_writes.contains(&l))
+                .unwrap_or(false)
+                || kv_w
+                    .map(|l| pending_kv_writes.contains(&l) || pending_kv_reads.contains(&l))
+                    .unwrap_or(false);
+            let need_barrier = !first_dispatch && (arena_conflict || kv_conflict);
+            if need_barrier {
+                pending_writes.clear();
+                pending_reads.clear();
+                pending_kv_writes.clear();
+                pending_kv_reads.clear();
+            }
+            // Per-emit barrier flag. The first emit of an Impl's
+            // fan_out picks up the hazard flag we computed; any
+            // subsequent emits (e.g. AffineQmmTSplitK's qmm_t →
+            // reduce pair sharing scratch) are conservatively
+            // serialized — Impls that need internal concurrency
+            // can refine this later.
+            for (i, _emit) in emits.iter().enumerate() {
+                barriers.push(if i == 0 { need_barrier } else { true });
+            }
+            // Update pending sets after recording the flag.
+            pending_writes.extend(sg_writes.iter().copied());
+            pending_reads.extend(sg_reads.iter().copied());
+            if let Some(l) = kv_w {
+                pending_kv_writes.insert(l);
+            }
+            if let Some(l) = kv_r {
+                pending_kv_reads.insert(l);
+            }
+            if !emits.is_empty() {
+                first_dispatch = false;
+            }
             instances.extend(emits);
         }
     }
 
+    debug_assert_eq!(barriers.len(), instances.len());
     let final_slot = slots.of(final_tile.0, final_tile.1);
 
     LoweredBucket {
+        barriers,
         instances,
         num_slots,
         final_slot,
@@ -1151,7 +1318,6 @@ mod tests {
         name: &'static str,
         alias_to: Option<(TileId, u8)>,
         consumes: Vec<(TileId, u8)>,
-        view_alias: bool,
     }
 
     impl crate::impl_lib::Implementation for StubImpl {
@@ -1210,9 +1376,6 @@ mod tests {
         }
         fn consumes_input_tiles(&self, _claimed: &[TileId], _fuf: &Fuf) -> Vec<(TileId, u8)> {
             self.consumes.clone()
-        }
-        fn output_alias_is_view(&self) -> bool {
-            self.view_alias
         }
     }
 
@@ -1274,7 +1437,6 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(&[TileId(0), TileId(1), TileId(2)], &[id_plain; 3]);
         let lp = linear_loop(3);
@@ -1305,7 +1467,6 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2), TileId(3)],
@@ -1343,7 +1504,6 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(&[TileId(0), TileId(1), TileId(2)], &[id_plain; 3]);
         let lp = linear_loop(3);
@@ -1385,13 +1545,11 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let id_alias = lib.push(Box::new(StubImpl {
             name: "stub_alias",
             alias_to: Some((TileId(0), 0)),
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2)],
@@ -1465,14 +1623,12 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let id_all_reduce = lib.push(Box::new(StubImpl {
             name: "all_reduce",
             // Same-shape in-place: dst slot 0 aliases gemm output.
             alias_to: Some((TileId(0), 0)),
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2)],
@@ -1524,13 +1680,11 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let id_alias = lib.push(Box::new(StubImpl {
             name: "stub_reshape",
             alias_to: Some((TileId(0), 0)),
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(
             &[TileId(0), TileId(1), TileId(2)],
@@ -1544,142 +1698,6 @@ mod tests {
             sm.of(TileId(0), 0),
             sm.of(TileId(1), 0),
             "different-shape alias dst needs its own slot for the View entry",
-        );
-    }
-
-    /// Same-shape *view* alias (Reshape / RopeAppend) MUST get its
-    /// own color, never collapse onto the owner's. The eval body
-    /// writes `TileEntry::Reshaped { ref_slot, tensor }` at the dst;
-    /// if dst shared the owner's color, the overwrite would drop the
-    /// owner's `OwnedTensor` and free the GPU memory the new
-    /// `Reshaped` aliases — silent UAF when a downstream
-    /// `caching.alloc_tensor` reuses the freed block.
-    ///
-    /// Witness for the G.7(e.tail.2) gemma3-mm "second image returns
-    /// NaN logits / `<pad>` tokens" bug: in real bodies the dst and
-    /// owner shapes differ and the prior same-shape collapse path
-    /// didn't fire, but a future arch with a same-shape Reshape (or
-    /// a Reshape synthesized by `apply_reshape_hints` whose target
-    /// shape happens to match the producer's structurally — e.g.,
-    /// `Dim`-equal vectors over the same bound names) would. The
-    /// `Implementation::output_alias_is_view` discriminant marks the
-    /// hazard at the codegen layer; this test pins that
-    /// `colored_slot_map` honors it.
-    #[test]
-    fn coloring_same_shape_view_alias_keeps_own_slot() {
-        // Synthetic body: `add → reshape (same-shape) → add`. Only
-        // path that gets dst.shape == owner.shape from a Reshape is
-        // an identity-shape reshape; this is the worst case the
-        // colorer must defend against.
-        let f = Fuf {
-            nodes: vec![
-                FufNode {
-                    id: TileId(0),
-                    op: OpKind::Add,
-                    inputs: vec![],
-                    outputs: vec![vec![Dim::Lit(6)]],
-                },
-                FufNode {
-                    id: TileId(1),
-                    op: OpKind::Reshape,
-                    inputs: vec![FufInput::Tile {
-                        id: TileId(0),
-                        slot: 0,
-                    }],
-                    // Identity-shape reshape: structurally `[6]`, same
-                    // as upstream. Pre-fix this triggered same-shape
-                    // collapse and `out_slot == in_slot`.
-                    outputs: vec![vec![Dim::Lit(6)]],
-                },
-                add_tile(2, &[(TileId(1), 0)]),
-            ],
-        };
-        let mut lib = ImplementationLibrary::new();
-        let id_plain = lib.push(Box::new(StubImpl {
-            name: "stub",
-            alias_to: None,
-            consumes: vec![],
-            view_alias: false,
-        }));
-        let id_view_alias = lib.push(Box::new(StubImpl {
-            name: "stub_reshape_view",
-            alias_to: Some((TileId(0), 0)),
-            consumes: vec![],
-            view_alias: true,
-        }));
-        let sfuf = linear_assignment(
-            &[TileId(0), TileId(1), TileId(2)],
-            &[id_plain, id_view_alias, id_plain],
-        );
-        let lp = linear_loop(3);
-        let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
-
-        assert_ne!(
-            sm.of(TileId(0), 0),
-            sm.of(TileId(1), 0),
-            "view alias (output_alias_is_view = true) must get its \
-             own color even when dst.shape == owner.shape — runtime \
-             eval body writes Reshaped at dst, which would UAF the \
-             owner's OwnedTensor on overwrite if collapsed",
-        );
-    }
-
-    /// Counterexample to `coloring_same_shape_view_alias_keeps_own_slot`:
-    /// the SAME synthetic FUF, but the alias-producing Impl declares
-    /// `output_alias_is_view = false` (in-place mutation semantics).
-    /// Same-shape collapse fires; dst shares the owner's color.
-    /// Pins that the discriminant flips behavior cleanly without
-    /// regressing the in-place AllReduce / FusedAddRmsNorm path.
-    #[test]
-    fn coloring_same_shape_inplace_alias_collapses() {
-        let f = Fuf {
-            nodes: vec![
-                FufNode {
-                    id: TileId(0),
-                    op: OpKind::Add,
-                    inputs: vec![],
-                    outputs: vec![vec![Dim::Lit(6)]],
-                },
-                FufNode {
-                    id: TileId(1),
-                    op: OpKind::Add,
-                    inputs: vec![FufInput::Tile {
-                        id: TileId(0),
-                        slot: 0,
-                    }],
-                    outputs: vec![vec![Dim::Lit(6)]],
-                },
-                add_tile(2, &[(TileId(1), 0)]),
-            ],
-        };
-        let mut lib = ImplementationLibrary::new();
-        let id_plain = lib.push(Box::new(StubImpl {
-            name: "stub",
-            alias_to: None,
-            consumes: vec![],
-            view_alias: false,
-        }));
-        let id_inplace = lib.push(Box::new(StubImpl {
-            name: "stub_inplace",
-            alias_to: Some((TileId(0), 0)),
-            consumes: vec![],
-            view_alias: false,
-        }));
-        let sfuf = linear_assignment(
-            &[TileId(0), TileId(1), TileId(2)],
-            &[id_plain, id_inplace, id_plain],
-        );
-        let lp = linear_loop(3);
-        let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
-
-        assert_eq!(
-            sm.of(TileId(0), 0),
-            sm.of(TileId(1), 0),
-            "in-place same-shape alias still collapses to owner's \
-             color — the kernel mutates the owner's buffer, downstream \
-             reads find the mutated data at the same slot",
         );
     }
 
@@ -1718,7 +1736,6 @@ mod tests {
             name: "stub",
             alias_to: None,
             consumes: vec![],
-            view_alias: false,
         }));
         let sfuf = linear_assignment(&[TileId(0), TileId(1)], &[id_plain; 2]);
         let lp = linear_loop(2);
@@ -1844,6 +1861,7 @@ mod tests {
                 op("Norm", &["7u32", "1u32"]),
                 op("Norm", &["7u32", "2u32"]),
             ],
+            barriers: vec![false; 3],
             num_slots: 1,
             final_slot: 0,
         };
@@ -1889,6 +1907,7 @@ mod tests {
                 op("A", &["2u32"]),
                 op("B", &["3u32"]),
             ],
+            barriers: vec![false; 6],
             num_slots: 1,
             final_slot: 0,
         };
@@ -1920,6 +1939,7 @@ mod tests {
         let original = vec![op("A", &["0u32"])];
         let mut lb = LoweredBucket {
             instances: original.clone(),
+            barriers: vec![false; original.len()],
             num_slots: 1,
             final_slot: 0,
         };

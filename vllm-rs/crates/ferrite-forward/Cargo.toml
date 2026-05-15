@@ -10,11 +10,22 @@ default = []
 # code's type references resolve. Without this feature, only the
 # numeric pipeline observations (NUM_TILES etc) are available;
 # the emitted runtime types stay gated out.
-cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda"]
+cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:ferrite-vision", "ferrite-forward-macro/cuda"]
 # Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
 # `ForwardCtx::tp_group` field). At tp=1 the lowering pass never
 # emits AllReduce, so this feature is a strict superset of `cuda`.
-nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forward-macro/nccl"]
+nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forward-macro/nccl", "ferrite-vision/nccl"]
+# Metal backend on Apple Silicon. Surfaces the `Instruction<W>` enum +
+# `CanonicalParams` trait + `WtFn`/`CosSinFn` aliases so the Metal
+# interpreter (`interpreter::metal`) can lower a per-bucket tape into
+# `LoweredMetalTape` for ICB recording. Phase 5.A's lowering pass is
+# pure CPU — but Phase 5.B's `pipelines.rs` (specialized pipeline
+# cache) and the upcoming worker/pool pieces (5.C/5.D/5.E) wrap
+# metal-rs types, so this feature pulls in `ferrite-metal-kernels` to
+# bring those in. The cfg gate inside `interpreter::metal::pipelines`
+# also requires `target_os = "macos"` so non-Apple builds with the
+# `metal` feature still compile (lowering only).
+metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-forward-macro/metal", "ferrite-cuda-core/metal", "ferrite-kernels/metal"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -22,10 +33,35 @@ nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forwa
 probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 
 [dependencies]
-ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-forward-macro = { path = "../ferrite-forward-macro", default-features = false }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
-ferrite-vision = { path = "../ferrite-vision" }
+# `ferrite-vision` is gated on `cuda` because its lib.rs uses
+# `cudarc::CUstream` unconditionally; the Metal path doesn't touch it.
+ferrite-vision = { path = "../ferrite-vision", optional = true }
+# Optional Metal backend; only depended on under `feature = "metal"`.
+# The dep itself only compiles on macOS — its `metal-rs` transitive
+# dep is gated there. Don't add a `cfg(target_os = "macos")` here in
+# the workspace; let cargo handle it via the feature flag and let
+# downstream callers gate their consuming code.
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true, features = [
+    # MTL4 surfaces for the in-progress migration off the
+    # MTLCommandBuffer + Serial-encoder + ICB pattern. Probed at
+    # runtime via `device.newMTL4CommandQueue()`; falls back to MTL3
+    # on macOS 14 or absent driver support. See
+    # `FERRITE_METAL_MTL4_MIGRATION.md`.
+    "MTL4ArgumentTable",
+    "MTL4BufferRange",
+    "MTL4CommandAllocator",
+    "MTL4CommandBuffer",
+    "MTL4CommandEncoder",
+    "MTL4CommandQueue",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ComputePipeline",
+] }
+objc2-foundation = { version = "0.3", optional = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
@@ -38,6 +74,11 @@ clap = { workspace = true, optional = true }
 ureq = { version = "2", optional = true, features = ["tls"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
+# `half::f16` / `half::bf16` are part of the `cpu_golden::affine_dequantize_b4_*`
+# public surface (Metal int4 reference path); also used by metal interpreter
+# tests for f32 ↔ f16 conversion when allocating + reading back Metal buffers
+# in numerical-correctness checks.
+half = { workspace = true }
 
 [[bin]]
 name = "probe-weights"

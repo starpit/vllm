@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferrite-metal-cost-sweep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Calibration sweep that emits kernel,M,N,K,cost_us rows for Metal targets"
+
+# Single binary, no library surface. Cost-sweep is a one-off calibration
+# tool run per (Apple Silicon chip × kernel library) — nothing else depends on it.
+[[bin]]
+name = "metal_cost_sweep"
+path = "src/main.rs"
+
+[dependencies]
+ferrite-fusion-synth = { path = "../ferrite-fusion-synth" }
+ferrite-metal-kernels = { path = "../ferrite-metal-kernels" }
+ferrite-metal-targets = { path = "../ferrite-metal-targets" }
+dispatch2 = "0.3"
+half = "2.3"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+core-foundation = "0.10"

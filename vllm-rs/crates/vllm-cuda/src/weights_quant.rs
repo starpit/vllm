@@ -2909,20 +2909,14 @@ mod tests {
         .unwrap();
 
         // Load weights (no GPU needed — merge is CPU-only).
-        let mut gw = GpuWeights {
-            tensors: HashMap::new(),
-            stream: std::ptr::null_mut(),
-            target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
-            precast: None,
-            precast_handle: None,
-            gpu_allocs: Vec::new(),
-            _mmaps: Vec::new(),
-        };
-        gw.load_shard(&dir.path().join("model.safetensors"))
-            .unwrap();
+        // LoRA merge is CPU-only; null stream is fine.
+        let mut gw = GpuWeights::from_single_file(
+            dir.path().join("model.safetensors"),
+            std::ptr::null_mut(),
+        )
+        .unwrap();
 
-        // Strip "model." prefix to match what CudaWorker does.
+        // Strip "model." prefix to match what FerriteWorker does.
         // Actually, merge_lora looks for "{prefix}.weight" keys, so let's check
         // what keys we have.
         let keys: Vec<String> = gw.tensors.keys().cloned().collect();
@@ -3017,18 +3011,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut gw = GpuWeights {
-            tensors: HashMap::new(),
-            stream: std::ptr::null_mut(),
-            target_dtype: None,
-            cast_pinned: (std::ptr::null_mut(), 0),
-            precast: None,
-            precast_handle: None,
-            gpu_allocs: Vec::new(),
-            _mmaps: Vec::new(),
-        };
-        gw.load_shard(&dir.path().join("model.safetensors"))
-            .unwrap();
+        // LoRA merge is CPU-only; null stream is fine.
+        let mut gw = GpuWeights::from_single_file(
+            dir.path().join("model.safetensors"),
+            std::ptr::null_mut(),
+        )
+        .unwrap();
 
         let merged = gw.merge_lora(adapter_dir.path()).unwrap();
         assert_eq!(merged, 1);

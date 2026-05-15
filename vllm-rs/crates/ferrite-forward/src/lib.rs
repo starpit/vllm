@@ -28,7 +28,9 @@ pub use info::{
 };
 
 #[cfg(feature = "cuda")]
-pub use instr::{CanonicalParams, Instruction, InterpreterCtx, run, run_backbone};
+pub use instr::{
+    CanonicalParams, Instruction, InterpreterCtx, WeightAccessors, run, run_backbone,
+};
 #[cfg(feature = "cuda")]
 pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,
@@ -81,6 +83,14 @@ pub struct BucketEntry<Op: 'static>(
     pub &'static [Op],
     pub u32,
     pub u32,
+    pub u32,
+    /// Field 9: bucket id passed to `run_slice` for this row's
+    /// backbone slice. The proc-macro emits a unique id per
+    /// canonical lowered entry so the per-arch
+    /// [`crate::instr::WeightAccessors`] match can disambiguate
+    /// "same op_idx, different canonical".
+    pub u32,
+    /// Field 10: bucket id for this row's lm_head slice. See field 9.
     pub u32,
 );
 

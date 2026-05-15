@@ -767,18 +767,80 @@ impl OpcodeShape {
 /// codegen drops verbatim into the constructor expression — useful
 /// when a value is e.g. `slots.of(tile, slot) as u32` or a
 /// pre-resolved literal.
+/// Kind of weight a tape position consumes. The variant of
+/// [`OpInstance`] determines the *count* and *kind list*; what the
+/// proc-macro records per-instance is the per-arch base name(s) so
+/// the per-arch [`WeightAccessors`] impl can emit the right match
+/// arm.
+///
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WeightKind {
+    RmsNorm,
+    Embedding,
+    Linear,
+    LayerNorm,
+    Marlin,
+    Bnb4,
+    Fp8,
+    DeepSeekMoe,
+    DeepSeekMoeFp8,
+    DeepSeekMoeGgml,
+    FusedMoe,
+    SharedFusedMoe,
+    CosSin,
+}
+
+/// One weight slot consumed by an `OpInstance`. The `kind` selects
+/// which `WeightAccessors` method the per-arch match arm goes
+/// under; the `base` is the user-source `Weights` accessor method
+/// name (e.g. `input_layernorm`) the match arm calls with the
+/// runtime `layer` argument.
+#[derive(Clone, Debug)]
+pub struct WeightSlot {
+    pub kind: WeightKind,
+    pub base: syn::Ident,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpInstance {
     pub name: syn::Ident,
     pub field_values: Vec<TokenStream>,
+    /// Weight slots this op consumes, in the variant's declared
+    /// kind order. The proc-macro walks every bucket × position at
+    /// codegen time and emits per-arch [`WeightAccessors`] match
+    /// arms keyed on `(bucket, op_idx)` — nothing about weights is
+    /// stored on the runtime `Instruction` variant.
+    ///
+    /// One entry per accessor the variant consumes — one for
+    /// single-accessor ops (RmsNorm), N for multi-accessor ops
+    /// (`FusedQkvRopeCache` = 2, `FusedQkvQkNormRopeCache` = 6, …).
+    /// Empty for ops that consume no weight (Add, AllReduce, Reshape).
+    pub weight_slots: Vec<WeightSlot>,
 }
 
 impl OpInstance {
     /// Build with the variant ident matching `opcode_shape().name`
     /// and a vector of field-value token streams in declaration
-    /// order.
+    /// order. Defaults `weight_slots` to empty; weight-bearing ops
+    /// override via [`OpInstance::with_weight_slot`].
     pub fn new(name: syn::Ident, field_values: Vec<TokenStream>) -> Self {
-        Self { name, field_values }
+        Self {
+            name,
+            field_values,
+            weight_slots: Vec::new(),
+        }
+    }
+
+    /// Replace the weight-slot list with `slots`, in the variant's
+    /// declared kind order.
+    pub fn with_weight_slots(mut self, slots: Vec<WeightSlot>) -> Self {
+        self.weight_slots = slots;
+        self
+    }
+
+    /// Convenience for single-accessor ops.
+    pub fn with_weight_slot(self, slot: WeightSlot) -> Self {
+        self.with_weight_slots(vec![slot])
     }
 }
 
@@ -1283,15 +1345,7 @@ impl Implementation for EmbedRefImpl {
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
             "Embed",
-            vec![
-                ("out_slot", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Embedding
-                    ),
-                ),
-            ],
+            vec![("out_slot", syn::parse_quote!(u32))],
         )
     }
 
@@ -1313,8 +1367,12 @@ impl Implementation for EmbedRefImpl {
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         Some(vec![OpInstance::new(
             syn::Ident::new("Embed", proc_macro2::Span::call_site()),
-            vec![quote! { #out_slot }, quote! { Weights::#base_ident }],
-        )])
+            vec![quote! { #out_slot }],
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Embedding,
+            base: base_ident,
+        })])
     }
 }
 /// Reference HostCallback impl for `OpKind::RmsNorm`. Hand-written
@@ -1385,12 +1443,6 @@ impl Implementation for RmsNormRefImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
             ],
         )
     }
@@ -1421,15 +1473,25 @@ impl Implementation for RmsNormRefImpl {
         let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+        // Typed-fanout: weight accessor lives at the TAPE level,
+        // not as an Instruction variant field, AND not as a parallel
+        // index array. The variant determines the *kind*; the per-
+        // arch `WeightAccessors` impl matches on (bucket, op_idx)
+        // and resolves to the right `Weights` field. We just record
+        // the base name here — the codegen walks every position at
+        // emission time and aggregates them into match arms.
         Some(vec![OpInstance::new(
             syn::Ident::new("RmsNorm", proc_macro2::Span::call_site()),
             vec![
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: base_ident,
+        })])
     }
 }
 /// Reference HostCallback impl for `OpKind::Gemm`. Hand-written
@@ -1502,12 +1564,6 @@ impl Implementation for GemmRefImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("n", syn::parse_quote!(u32)),
                 ("k", syn::parse_quote!(u32)),
             ],
@@ -1548,11 +1604,14 @@ impl Implementation for GemmRefImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -2445,12 +2504,6 @@ impl Implementation for FusedGemmBiasImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
             ],
         )
     }
@@ -2493,9 +2546,12 @@ impl Implementation for FusedGemmBiasImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -2633,12 +2689,6 @@ impl Implementation for CutlassFusedGemmBiasImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -2693,14 +2743,17 @@ impl Implementation for CutlassFusedGemmBiasImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -2980,12 +3033,6 @@ impl Implementation for FusedGateUpSiluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
             ],
         )
     }
@@ -3040,9 +3087,12 @@ impl Implementation for FusedGateUpSiluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -3218,12 +3268,6 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -3280,12 +3324,15 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -3434,12 +3481,6 @@ impl Implementation for CutlassFusedGateUpGeluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -3505,14 +3546,17 @@ impl Implementation for CutlassFusedGateUpGeluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #packed_n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -3726,12 +3770,6 @@ impl Implementation for FusedGateUpGeluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
             ],
         )
     }
@@ -3782,9 +3820,12 @@ impl Implementation for FusedGateUpGeluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -4509,12 +4550,6 @@ impl Implementation for FusedAddRmsNormImpl {
                 ("delta_slot", syn::parse_quote!(u32)),
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
             ],
         )
     }
@@ -4558,9 +4593,12 @@ impl Implementation for FusedAddRmsNormImpl {
                 quote! { #delta_idx },
                 quote! { #residual_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: base_ident,
+        })])
     }
 }
 
@@ -4706,12 +4744,6 @@ impl Implementation for MeanSubRmsNormImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
             ],
         )
     }
@@ -4758,9 +4790,12 @@ impl Implementation for MeanSubRmsNormImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: base_ident,
+        })])
     }
 }
 
@@ -4933,12 +4968,6 @@ impl Implementation for MeanSubRmsNormBiasAddImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LayerNorm
-                    ),
-                ),
             ],
         )
     }
@@ -4982,9 +5011,12 @@ impl Implementation for MeanSubRmsNormBiasAddImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::LayerNorm,
+            base: base_ident,
+        })])
     }
 }
 
@@ -5254,18 +5286,6 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "norm_wf",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-                (
-                    "gemm_wf",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -5331,15 +5351,23 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#norm_ident },
-                quote! { Weights::#gemm_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::RmsNorm,
+                base: norm_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: gemm_ident,
+            },
+        ])])
     }
 }
 
@@ -5528,18 +5556,6 @@ impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "norm_wf",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-                (
-                    "gemm_wf",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -5602,15 +5618,23 @@ impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#norm_ident },
-                quote! { Weights::#gemm_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::RmsNorm,
+                base: norm_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: gemm_ident,
+            },
+        ])])
     }
 }
 
@@ -5809,18 +5833,6 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "norm_wf",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-                (
-                    "gemm_wf",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -5892,15 +5904,23 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
                 quote! { #residual_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#norm_ident },
-                quote! { Weights::#gemm_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::RmsNorm,
+                base: norm_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: gemm_ident,
+            },
+        ])])
     }
 }
 
@@ -6144,12 +6164,6 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
                 ("offset", syn::parse_quote!(f32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
             ],
         )
     }
@@ -6221,9 +6235,12 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
                 quote! { #residual_idx },
                 quote! { #layer },
                 quote! { #offset },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: base_ident,
+        })])
     }
 }
 
@@ -6400,12 +6417,6 @@ impl Implementation for ScalarOffsetRmsNormImpl {
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
                 ("offset", syn::parse_quote!(f32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
             ],
         )
     }
@@ -6460,9 +6471,12 @@ impl Implementation for ScalarOffsetRmsNormImpl {
                 quote! { #out_slot_idx },
                 quote! { #layer },
                 quote! { #offset },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: base_ident,
+        })])
     }
 }
 
@@ -6898,18 +6912,6 @@ impl Implementation for FusedQkvRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("biased", syn::parse_quote!(bool)),
                 ("interleaved", syn::parse_quote!(bool)),
             ],
@@ -7012,12 +7014,20 @@ impl Implementation for FusedQkvRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #biased },
                 quote! { #interleaved },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -7524,42 +7534,6 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "q_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "k_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "v_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "q_norm_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-                (
-                    "k_norm_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("q_offset", syn::parse_quote!(f32)),
                 ("k_offset", syn::parse_quote!(f32)),
             ],
@@ -7700,16 +7674,36 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#q_w_ident },
-                quote! { Weights::#k_w_ident },
-                quote! { Weights::#v_w_ident },
-                quote! { Weights::#q_n_ident },
-                quote! { Weights::#k_n_ident },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #q_offset },
                 quote! { #k_offset },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: q_w_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: k_w_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: v_w_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::RmsNorm,
+                base: q_n_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::RmsNorm,
+                base: k_n_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -7814,12 +7808,6 @@ impl Implementation for AttentionViaCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("interleaved", syn::parse_quote!(bool)),
             ],
         )
@@ -7878,10 +7866,13 @@ impl Implementation for AttentionViaCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #interleaved },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::CosSin,
+            base: cos_sin_ident,
+        })])
     }
 }
 
@@ -8080,12 +8071,6 @@ impl Implementation for RopeAppendRefImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("interleaved", syn::parse_quote!(bool)),
             ],
         )
@@ -8156,10 +8141,13 @@ impl Implementation for RopeAppendRefImpl {
                 quote! { #k_out_slot },
                 quote! { #v_out_slot },
                 quote! { #layer },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #interleaved },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::CosSin,
+            base: cos_sin_ident,
+        })])
     }
 }
 
@@ -8267,18 +8255,6 @@ impl Implementation for FusedQkvRopePrefillImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("biased", syn::parse_quote!(bool)),
                 ("interleaved", syn::parse_quote!(bool)),
             ],
@@ -8370,12 +8346,20 @@ impl Implementation for FusedQkvRopePrefillImpl {
                 quote! { #k_out },
                 quote! { #v_out },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #biased },
                 quote! { #interleaved },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -8574,18 +8558,6 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("interleaved", syn::parse_quote!(bool)),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
@@ -8698,8 +8670,6 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #interleaved },
                 quote! { #tile_m },
                 quote! { #tile_n },
@@ -8707,7 +8677,17 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
                 quote! { #packed_n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -8809,18 +8789,6 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("interleaved", syn::parse_quote!(bool)),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
@@ -8930,8 +8898,6 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
                 quote! { #k_out },
                 quote! { #v_out },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #interleaved },
                 quote! { #tile_m },
                 quote! { #tile_n },
@@ -8939,7 +8905,17 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
                 quote! { #packed_n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -9311,12 +9287,6 @@ impl Implementation for SlidingAttentionViaCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("interleaved", syn::parse_quote!(bool)),
             ],
         )
@@ -9373,10 +9343,13 @@ impl Implementation for SlidingAttentionViaCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #interleaved },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::CosSin,
+            base: cos_sin_ident,
+        })])
     }
 }
 
@@ -9751,12 +9724,6 @@ impl Implementation for CutlassGemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -9800,14 +9767,17 @@ impl Implementation for CutlassGemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -9964,12 +9934,6 @@ impl Implementation for CutlassGemmSplitKImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -10015,7 +9979,6 @@ impl Implementation for CutlassGemmSplitKImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
@@ -10023,7 +9986,11 @@ impl Implementation for CutlassGemmSplitKImpl {
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -10240,12 +10207,6 @@ impl Implementation for CutlassGemmAddImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("tile_m", syn::parse_quote!(u32)),
                 ("tile_n", syn::parse_quote!(u32)),
                 ("stages", syn::parse_quote!(u32)),
@@ -10307,14 +10268,17 @@ impl Implementation for CutlassGemmAddImpl {
                 quote! { #in_slot_idx },
                 quote! { #residual_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #tile_m },
                 quote! { #tile_n },
                 quote! { #stages },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -10502,12 +10466,6 @@ impl Implementation for FusedCublasGemmAddImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("n", syn::parse_quote!(u32)),
                 ("k", syn::parse_quote!(u32)),
             ],
@@ -10563,11 +10521,14 @@ impl Implementation for FusedCublasGemmAddImpl {
                 quote! { #in_slot_idx },
                 quote! { #residual_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -10651,12 +10612,6 @@ impl Implementation for CutlassGemvImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("n", syn::parse_quote!(u32)),
                 ("k", syn::parse_quote!(u32)),
             ],
@@ -10694,11 +10649,14 @@ impl Implementation for CutlassGemvImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #n },
                 quote! { #k },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -11002,12 +10960,6 @@ impl Implementation for MarlinGemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::MarlinLinear
-                    ),
-                ),
             ],
         )
     }
@@ -11041,9 +10993,12 @@ impl Implementation for MarlinGemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Marlin,
+            base: base_ident,
+        })])
     }
 }
 
@@ -11172,12 +11127,6 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::MarlinLinear
-                    ),
-                ),
             ],
         )
     }
@@ -11228,9 +11177,12 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Marlin,
+            base: base_ident,
+        })])
     }
 }
 
@@ -11360,12 +11312,6 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::MarlinLinear
-                    ),
-                ),
             ],
         )
     }
@@ -11416,9 +11362,12 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Marlin,
+            base: base_ident,
+        })])
     }
 }
 
@@ -11616,18 +11565,6 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::MarlinLinear
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -11708,10 +11645,18 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Marlin,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -11796,18 +11741,6 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::MarlinLinear
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -11892,10 +11825,18 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
                 quote! { #k_out },
                 quote! { #v_out },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Marlin,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -12006,16 +11947,6 @@ impl Implementation for Bnb4GemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::Bnb4bitLinear
-                    ),
-                ),
             ],
         )
     }
@@ -12049,9 +11980,12 @@ impl Implementation for Bnb4GemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Bnb4,
+            base: base_ident,
+        })])
     }
 }
 
@@ -12157,12 +12091,6 @@ impl Implementation for GgmlGemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
             ],
         )
     }
@@ -12196,9 +12124,12 @@ impl Implementation for GgmlGemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -12322,12 +12253,6 @@ impl Implementation for GgmlFusedGateUpSiluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
             ],
         )
     }
@@ -12376,9 +12301,12 @@ impl Implementation for GgmlFusedGateUpSiluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -12500,12 +12428,6 @@ impl Implementation for GgmlFusedGateUpGeluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
             ],
         )
     }
@@ -12554,9 +12476,12 @@ impl Implementation for GgmlFusedGateUpGeluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -12744,18 +12669,6 @@ impl Implementation for GgmlFusedQkvRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("interleaved", syn::parse_quote!(bool)),
             ],
         )
@@ -12836,11 +12749,19 @@ impl Implementation for GgmlFusedQkvRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #interleaved },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -12931,18 +12852,6 @@ impl Implementation for GgmlFusedQkvRopePrefillImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -13027,10 +12936,18 @@ impl Implementation for GgmlFusedQkvRopePrefillImpl {
                 quote! { #k_out },
                 quote! { #v_out },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Linear,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -13125,12 +13042,6 @@ impl Implementation for Fp8GemmImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
-                    ),
-                ),
             ],
         )
     }
@@ -13164,9 +13075,12 @@ impl Implementation for Fp8GemmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Fp8,
+            base: base_ident,
+        })])
     }
 }
 
@@ -13300,12 +13214,6 @@ impl Implementation for Fp8FusedGemmBiasImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
-                    ),
-                ),
             ],
         )
     }
@@ -13348,9 +13256,12 @@ impl Implementation for Fp8FusedGemmBiasImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Fp8,
+            base: base_ident,
+        })])
     }
 }
 
@@ -13479,12 +13390,6 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
-                    ),
-                ),
             ],
         )
     }
@@ -13533,9 +13438,12 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Fp8,
+            base: base_ident,
+        })])
     }
 }
 
@@ -13659,16 +13567,6 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::Bnb4bitLinear
-                    ),
-                ),
             ],
         )
     }
@@ -13717,9 +13615,12 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Bnb4,
+            base: base_ident,
+        })])
     }
 }
 
@@ -13840,16 +13741,6 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::Bnb4bitLinear
-                    ),
-                ),
             ],
         )
     }
@@ -13898,9 +13789,12 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Bnb4,
+            base: base_ident,
+        })])
     }
 }
 
@@ -14027,12 +13921,6 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
-                    ),
-                ),
             ],
         )
     }
@@ -14081,9 +13969,12 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Fp8,
+            base: base_ident,
+        })])
     }
 }
 
@@ -14279,18 +14170,6 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -14369,10 +14248,18 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Fp8,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -14454,18 +14341,6 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Fp8AnyLinear
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -14550,10 +14425,18 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
                 quote! { #k_out },
                 quote! { #v_out },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Fp8,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -14734,22 +14617,6 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::Bnb4bitLinear
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -14828,10 +14695,18 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Bnb4,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -14913,22 +14788,6 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
                 ("k_out_slot", syn::parse_quote!(u32)),
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers::Bnb4bitLinear
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -15013,10 +14872,18 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
                 quote! { #k_out },
                 quote! { #v_out },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slots(vec![
+            WeightSlot {
+                kind: WeightKind::Bnb4,
+                base: base_ident,
+            },
+            WeightSlot {
+                kind: WeightKind::CosSin,
+                base: cos_sin_ident,
+            },
+        ])])
     }
 }
 
@@ -15172,12 +15039,6 @@ impl Implementation for FlashInferAttentionDecodeImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("head_dim", syn::parse_quote!(u32)),
                 ("use_logits_soft_cap", syn::parse_quote!(bool)),
             ],
@@ -15238,11 +15099,14 @@ impl Implementation for FlashInferAttentionDecodeImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#cos_sin_ident },
                 quote! { #head_dim },
                 quote! { #softcap },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::CosSin,
+            base: cos_sin_ident,
+        })])
     }
 }
 
@@ -15584,12 +15448,6 @@ impl Implementation for MlaAttentionImpl {
                 ("k_pe_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
             ],
         )
     }
@@ -15653,9 +15511,12 @@ impl Implementation for MlaAttentionImpl {
                 quote! { #k_pe_slot },
                 quote! { #out_slot },
                 quote! { #layer },
-                quote! { Weights::#cos_sin_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::CosSin,
+            base: cos_sin_ident,
+        })])
     }
 }
 
@@ -15777,16 +15638,6 @@ impl Implementation for DeepSeekMoeRefImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers_moe::DeepSeekV2MoELayer
-                    ),
-                ),
             ],
         )
     }
@@ -15820,9 +15671,12 @@ impl Implementation for DeepSeekMoeRefImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::DeepSeekMoe,
+            base: base_ident,
+        })])
     }
 }
 
@@ -15923,16 +15777,6 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer
-                    ),
-                ),
             ],
         )
     }
@@ -15966,9 +15810,12 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::DeepSeekMoeFp8,
+            base: base_ident,
+        })])
     }
 }
 
@@ -16067,16 +15914,6 @@ impl Implementation for DeepSeekGgmlMoeImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer
-                    ),
-                ),
             ],
         )
     }
@@ -16110,9 +15947,12 @@ impl Implementation for DeepSeekGgmlMoeImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::DeepSeekMoeGgml,
+            base: base_ident,
+        })])
     }
 }
 
@@ -16226,16 +16066,6 @@ impl Implementation for FusedMoeRefImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers_moe::FusedMoELayer
-                    ),
-                ),
             ],
         )
     }
@@ -16269,9 +16099,12 @@ impl Implementation for FusedMoeRefImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::FusedMoe,
+            base: base_ident,
+        })])
     }
 }
 
@@ -16389,16 +16222,6 @@ impl Implementation for SharedFusedMoeRefImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(
-                            &'a Weights,
-                            u32,
-                        )
-                            -> &'a ::ferrite_kernels::layers_moe::SharedFusedMoELayer
-                    ),
-                ),
             ],
         )
     }
@@ -16432,9 +16255,12 @@ impl Implementation for SharedFusedMoeRefImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::SharedFusedMoe,
+            base: base_ident,
+        })])
     }
 }
 
@@ -19314,15 +19140,7 @@ impl Implementation for PosEmbedRefImpl {
     fn opcode_shape(&self) -> OpcodeShape {
         OpcodeShape::new(
             "PosEmbed",
-            vec![
-                ("out_slot", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::Embedding
-                    ),
-                ),
-            ],
+            vec![("out_slot", syn::parse_quote!(u32))],
         )
     }
 
@@ -19344,8 +19162,12 @@ impl Implementation for PosEmbedRefImpl {
         let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         Some(vec![OpInstance::new(
             syn::Ident::new("PosEmbed", proc_macro2::Span::call_site()),
-            vec![quote! { #out_slot }, quote! { Weights::#base_ident }],
-        )])
+            vec![quote! { #out_slot }],
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Embedding,
+            base: base_ident,
+        })])
     }
 }
 

@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Non-generic, hashable view of an [`Instruction<W>`] for backbone
-//! introspection (`vllm ferrite info`).
+//! Hashable view of an [`Instruction`] for backbone introspection
+//! (`vllm ferrite info`).
 //!
-//! `Instruction<W>` is generic, carries function pointers, and lives
-//! behind `cfg(feature = "cuda")`. None of that is useful when the
-//! consumer wants to:
+//! `Instruction` lives behind `cfg(feature = "cuda")`. None of that
+//! is useful when the consumer wants to:
 //! - tell two backbones apart for fusion-hunting
 //! - hash a backbone for equivalence-class grouping
-//! - print a backbone as ASCII without needing a live `&W`
+//! - print a backbone as ASCII without needing a live `&Weights`
 //!
 //! [`Instruction::normalize`] runs once per row to produce a
 //! [`NormalizedStep`]: the variant tag as `&'static str`, plus a
 //! flat field list with semantic kinds (slot / layer / const /
-//! kernel-class). Function pointers (`WtFn<W, L>`, `CosSinFn<W>`)
-//! collapse to `LayerKind(L_name)` / `RopeCosSin` — what they *call*,
-//! not their address.
+//! kernel-class). The kinds and counts of weight slots a variant
+//! consumes — historically encoded as `WtFn<W, L>` / `CosSinFn<W>`
+//! variant fields, now resolved at the tape level via
+//! [`crate::WeightAccessors`] — collapse here to
+//! `LayerKind(L_name)` / `RopeCosSin` markers.
 //!
 //! The `match` is closed (no `_` arm). Adding a new
-//! [`Instruction<W>`] variant fails the build until normalize is
+//! [`Instruction`] variant fails the build until normalize is
 //! taught the new arm — same closed-emitter invariant the
 //! interpreter `eval` already enforces.
 
@@ -38,11 +39,11 @@ pub struct NormalizedStep {
     /// PascalCase variant ident — e.g. `"FusedAddRmsNorm"`.
     pub kind: &'static str,
     /// Field values in declaration order (matches the
-    /// [`Instruction<W>`] tuple-variant order).
+    /// [`Instruction`] tuple-variant order).
     pub fields: Vec<NormalizedField>,
 }
 
-/// Kinded view of a single [`Instruction<W>`] field.
+/// Kinded view of a single [`Instruction`] field.
 ///
 /// `f32` consts stored as `u32` bits so this enum stays `Eq + Hash`
 /// — the renderer reconstructs via `f32::from_bits`.
@@ -68,10 +69,12 @@ pub enum NormalizedField {
     ConstU32Array(Vec<u32>),
     /// Same, but the underlying field type was `[u8; N]`.
     ConstU8Array(Vec<u8>),
-    /// `WtFn<W, L>` collapsed to the layer-kernel-class name (`L`'s
-    /// type name) — e.g. `"RmsNorm"`, `"LinearLayer"`,
-    /// `"MarlinLinear"`, `"Bnb4bitLinear"`, `"Fp8AnyLinear"`,
-    /// `"CohereLayerNorm"`, `"Embedding"`, `"DeepSeekV2MoELayer"`.
+    /// One weight slot's kernel-class name (`L`'s type name) —
+    /// e.g. `"RmsNorm"`, `"LinearLayer"`, `"MarlinLinear"`,
+    /// `"Bnb4bitLinear"`, `"Fp8AnyLinear"`, `"CohereLayerNorm"`,
+    /// `"Embedding"`, `"DeepSeekV2MoELayer"`. Replaces the historical
+    /// `WtFn<W, L>` field projection — multi-accessor variants emit
+    /// one `LayerKind` per slot in declaration order.
     LayerKind(&'static str),
     /// Static weight matrix shape for a GEMM-class step, captured at
     /// codegen time from the FUF's `eval_shape`. `n` is output dim
@@ -84,9 +87,11 @@ pub enum NormalizedField {
     /// `CutlassGemmAdd`, `CutlassGemv`. Fused QKV / GateUp variants
     /// have multiple participating shapes and don't emit this.
     WeightShape { n: u32, k: u32 },
-    /// `CosSinFn<W>` — the rotary cos/sin table accessor. Carries
-    /// no other identity at this layer (different rope tables come
-    /// from per-variant `CanonicalParams` consts, not the slice).
+    /// Rotary cos/sin table accessor marker. Carries no other
+    /// identity at this layer — the per-arch `WeightAccessors`
+    /// `cos_sin_at` resolves it from the tape position; different
+    /// rope tables come from per-variant `CanonicalParams` consts,
+    /// not from this slice.
     RopeCosSin,
     /// `Loop(count, body_len)` — count of iterations.
     LoopCount(u32),
@@ -95,21 +100,21 @@ pub enum NormalizedField {
     LoopBodyLen(u32),
 }
 
-impl<W> Instruction<W> {
+impl Instruction {
     /// Project this row to a [`NormalizedStep`]. Pure data — no
     /// `&W` needed, no GPU work, no allocator beyond the field
     /// `Vec`.
     ///
-    /// The match is closed (no catch-all). Every `Instruction<W>`
+    /// The match is closed (no catch-all). Every `Instruction`
     /// variant has exactly one arm.
     #[must_use]
     pub fn normalize(&self) -> NormalizedStep {
         use NormalizedField as F;
         let (kind, fields): (&'static str, Vec<NormalizedField>) = match *self {
-            Instruction::Embed(out_slot, _wf) => {
+            Instruction::Embed(out_slot) => {
                 ("Embed", vec![F::Slot(out_slot), F::LayerKind("Embedding")])
             }
-            Instruction::RmsNorm(in_slot, out_slot, layer, _wf) => (
+            Instruction::RmsNorm(in_slot, out_slot, layer) => (
                 "RmsNorm",
                 vec![
                     F::Slot(in_slot),
@@ -118,7 +123,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::MeanSubRmsNorm(in_slot, out_slot, layer, _wf) => (
+            Instruction::MeanSubRmsNorm(in_slot, out_slot, layer) => (
                 "MeanSubRmsNorm",
                 vec![
                     F::Slot(in_slot),
@@ -127,7 +132,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer, _wf) => (
+            Instruction::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer) => (
                 "MeanSubRmsNormBiasAdd",
                 vec![
                     F::Slot(in_slot),
@@ -170,7 +175,7 @@ impl<W> Instruction<W> {
             Instruction::TanhSoftCap(in_slot, out_slot) => {
                 ("TanhSoftCap", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
-            Instruction::FusedAddRmsNorm(in_slot, out_slot, layer, _wf) => (
+            Instruction::FusedAddRmsNorm(in_slot, out_slot, layer) => (
                 "FusedAddRmsNorm",
                 vec![
                     F::Slot(in_slot),
@@ -179,7 +184,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::FusedAddRmsNormWithOffset(in_slot, out_slot, layer, offset, _wf) => (
+            Instruction::FusedAddRmsNormWithOffset(in_slot, out_slot, layer, offset) => (
                 "FusedAddRmsNormWithOffset",
                 vec![
                     F::Slot(in_slot),
@@ -189,7 +194,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset, _wf) => (
+            Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => (
                 "ScalarOffsetRmsNorm",
                 vec![
                     F::Slot(in_slot),
@@ -203,8 +208,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _nwf,
-                _gwf,
                 tile_m,
                 tile_n,
                 stages,
@@ -228,8 +231,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _nwf,
-                _gwf,
                 tile_m,
                 tile_n,
                 stages,
@@ -254,8 +255,6 @@ impl<W> Instruction<W> {
                 residual_slot,
                 out_slot,
                 layer,
-                _nwf,
-                _gwf,
                 tile_m,
                 tile_n,
                 stages,
@@ -276,7 +275,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::Gemm(in_slot, out_slot, layer, _wf, n, k) => (
+            Instruction::Gemm(in_slot, out_slot, layer, n, k) => (
                 "Gemm",
                 vec![
                     F::Slot(in_slot),
@@ -286,7 +285,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, _wf, n, k) => (
+            Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k) => (
                 "FusedCublasGemmAdd",
                 vec![
                     F::Slot(in_slot),
@@ -296,7 +295,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::FusedGemmBias(in_slot, out_slot, layer, _wf) => (
+            Instruction::FusedGemmBias(in_slot, out_slot, layer) => (
                 "FusedGemmBias",
                 vec![
                     F::Slot(in_slot),
@@ -305,7 +304,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer) => (
                 "FusedGateUpSiluMul",
                 vec![
                     F::Slot(in_slot),
@@ -314,7 +313,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer) => (
                 "FusedGateUpGeluMul",
                 vec![
                     F::Slot(in_slot),
@@ -327,8 +326,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
-                _cs,
                 biased,
                 interleaved,
             ) => (
@@ -347,12 +344,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _qw,
-                _kw,
-                _vw,
-                _qn,
-                _kn,
-                _cs,
                 q_offset,
                 k_offset,
             ) => (
@@ -377,8 +368,6 @@ impl<W> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                _wf,
-                _cs,
                 biased,
                 interleaved,
             ) => (
@@ -395,7 +384,7 @@ impl<W> Instruction<W> {
                     F::ConstBool(interleaved),
                 ],
             ),
-            Instruction::AttentionViaCache(in_slot, out_slot, layer, _cs, interleaved) => (
+            Instruction::AttentionViaCache(in_slot, out_slot, layer, interleaved) => (
                 "AttentionViaCache",
                 vec![
                     F::Slot(in_slot),
@@ -430,7 +419,7 @@ impl<W> Instruction<W> {
                     F::Slot(out_slot),
                 ],
             ),
-            Instruction::SlidingAttentionViaCache(in_slot, out_slot, layer, _cs, interleaved) => (
+            Instruction::SlidingAttentionViaCache(in_slot, out_slot, layer, interleaved) => (
                 "SlidingAttentionViaCache",
                 vec![
                     F::Slot(in_slot),
@@ -484,7 +473,7 @@ impl<W> Instruction<W> {
             Instruction::Gelu(in_slot, out_slot) => {
                 ("Gelu", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
-            Instruction::PosEmbed(out_slot, _wf) => (
+            Instruction::PosEmbed(out_slot) => (
                 "PosEmbed",
                 vec![F::Slot(out_slot), F::LayerKind("Embedding")],
             ),
@@ -507,7 +496,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _cs,
                 head_dim,
                 use_logits_soft_cap,
             ) => (
@@ -549,7 +537,6 @@ impl<W> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                _cs,
                 interleaved,
             ) => (
                 "RopeAppend",
@@ -573,7 +560,7 @@ impl<W> Instruction<W> {
                     F::Slot(k_pe_slot),
                 ],
             ),
-            Instruction::MlaAttention(q_slot, kv_b_slot, k_pe_slot, out_slot, layer, _cs) => (
+            Instruction::MlaAttention(q_slot, kv_b_slot, k_pe_slot, out_slot, layer) => (
                 "MlaAttention",
                 vec![
                     F::Slot(q_slot),
@@ -584,7 +571,7 @@ impl<W> Instruction<W> {
                     F::RopeCosSin,
                 ],
             ),
-            Instruction::DeepSeekMoe(in_slot, out_slot, layer, _wf) => (
+            Instruction::DeepSeekMoe(in_slot, out_slot, layer) => (
                 "DeepSeekMoe",
                 vec![
                     F::Slot(in_slot),
@@ -593,7 +580,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("DeepSeekV2MoELayer"),
                 ],
             ),
-            Instruction::DeepSeekMoeFp8Block(in_slot, out_slot, layer, _wf) => (
+            Instruction::DeepSeekMoeFp8Block(in_slot, out_slot, layer) => (
                 "DeepSeekMoeFp8Block",
                 vec![
                     F::Slot(in_slot),
@@ -602,7 +589,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("DeepSeekV2Fp8BlockMoELayer"),
                 ],
             ),
-            Instruction::DeepSeekMoeGgml(in_slot, out_slot, layer, _wf) => (
+            Instruction::DeepSeekMoeGgml(in_slot, out_slot, layer) => (
                 "DeepSeekMoeGgml",
                 vec![
                     F::Slot(in_slot),
@@ -611,7 +598,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("DeepSeekV2GgmlMoELayer"),
                 ],
             ),
-            Instruction::FusedMoe(in_slot, out_slot, layer, _wf) => (
+            Instruction::FusedMoe(in_slot, out_slot, layer) => (
                 "FusedMoe",
                 vec![
                     F::Slot(in_slot),
@@ -620,7 +607,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("FusedMoELayer"),
                 ],
             ),
-            Instruction::SharedFusedMoe(in_slot, out_slot, layer, _wf) => (
+            Instruction::SharedFusedMoe(in_slot, out_slot, layer) => (
                 "SharedFusedMoe",
                 vec![
                     F::Slot(in_slot),
@@ -633,7 +620,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -656,7 +642,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -681,7 +666,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 residual_slot,
                 layer,
-                _wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -700,7 +684,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n, k },
                 ],
             ),
-            Instruction::CutlassGemv(in_slot, out_slot, layer, _wf, n, k) => (
+            Instruction::CutlassGemv(in_slot, out_slot, layer, n, k) => (
                 "CutlassGemv",
                 vec![
                     F::Slot(in_slot),
@@ -714,7 +698,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -737,7 +720,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -757,7 +739,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -780,8 +761,6 @@ impl<W> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                _wf,
-                _cs,
                 interleaved,
                 tile_m,
                 tile_n,
@@ -809,8 +788,6 @@ impl<W> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                _wf,
-                _cs,
                 interleaved,
                 tile_m,
                 tile_n,
@@ -834,7 +811,7 @@ impl<W> Instruction<W> {
                     F::WeightShape { n: packed_n, k },
                 ],
             ),
-            Instruction::MarlinGemm(in_slot, out_slot, layer, _wf) => (
+            Instruction::MarlinGemm(in_slot, out_slot, layer) => (
                 "MarlinGemm",
                 vec![
                     F::Slot(in_slot),
@@ -843,7 +820,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("MarlinLinear"),
                 ],
             ),
-            Instruction::MarlinFusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::MarlinFusedGateUpSiluMul(in_slot, out_slot, layer) => (
                 "MarlinFusedGateUpSiluMul",
                 vec![
                     F::Slot(in_slot),
@@ -852,7 +829,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("MarlinLinear"),
                 ],
             ),
-            Instruction::MarlinFusedGateUpGeluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::MarlinFusedGateUpGeluMul(in_slot, out_slot, layer) => (
                 "MarlinFusedGateUpGeluMul",
                 vec![
                     F::Slot(in_slot),
@@ -861,7 +838,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("MarlinLinear"),
                 ],
             ),
-            Instruction::MarlinFusedQkvRopeCache(in_slot, out_slot, layer, _wf, _cs) => (
+            Instruction::MarlinFusedQkvRopeCache(in_slot, out_slot, layer) => (
                 "MarlinFusedQkvRopeCache",
                 vec![
                     F::Slot(in_slot),
@@ -877,8 +854,6 @@ impl<W> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                _wf,
-                _cs,
             ) => (
                 "MarlinFusedQkvRopePrefill",
                 vec![
@@ -891,7 +866,7 @@ impl<W> Instruction<W> {
                     F::RopeCosSin,
                 ],
             ),
-            Instruction::GgmlGemm(in_slot, out_slot, layer, _wf) => (
+            Instruction::GgmlGemm(in_slot, out_slot, layer) => (
                 "GgmlGemm",
                 vec![
                     F::Slot(in_slot),
@@ -900,7 +875,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer) => (
                 "GgmlFusedGateUpSiluMul",
                 vec![
                     F::Slot(in_slot),
@@ -909,7 +884,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer) => (
                 "GgmlFusedGateUpGeluMul",
                 vec![
                     F::Slot(in_slot),
@@ -918,7 +893,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, _wf, _cs, _i) => (
+            Instruction::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, _i) => (
                 "GgmlFusedQkvRopeCache",
                 vec![
                     F::Slot(in_slot),
@@ -928,7 +903,7 @@ impl<W> Instruction<W> {
                     F::RopeCosSin,
                 ],
             ),
-            Instruction::GgmlFusedQkvRopePrefill(in_slot, q_out, k_out, v_out, layer, _wf, _cs) => {
+            Instruction::GgmlFusedQkvRopePrefill(in_slot, q_out, k_out, v_out, layer) => {
                 (
                     "GgmlFusedQkvRopePrefill",
                     vec![
@@ -942,7 +917,7 @@ impl<W> Instruction<W> {
                     ],
                 )
             }
-            Instruction::Bnb4Gemm(in_slot, out_slot, layer, _wf) => (
+            Instruction::Bnb4Gemm(in_slot, out_slot, layer) => (
                 "Bnb4Gemm",
                 vec![
                     F::Slot(in_slot),
@@ -951,7 +926,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Bnb4bitLinear"),
                 ],
             ),
-            Instruction::Bnb4FusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::Bnb4FusedGateUpSiluMul(in_slot, out_slot, layer) => (
                 "Bnb4FusedGateUpSiluMul",
                 vec![
                     F::Slot(in_slot),
@@ -960,7 +935,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Bnb4bitLinear"),
                 ],
             ),
-            Instruction::Bnb4FusedGateUpGeluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::Bnb4FusedGateUpGeluMul(in_slot, out_slot, layer) => (
                 "Bnb4FusedGateUpGeluMul",
                 vec![
                     F::Slot(in_slot),
@@ -969,7 +944,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Bnb4bitLinear"),
                 ],
             ),
-            Instruction::Bnb4FusedQkvRopeCache(in_slot, out_slot, layer, _wf, _cs) => (
+            Instruction::Bnb4FusedQkvRopeCache(in_slot, out_slot, layer) => (
                 "Bnb4FusedQkvRopeCache",
                 vec![
                     F::Slot(in_slot),
@@ -985,8 +960,6 @@ impl<W> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                _wf,
-                _cs,
             ) => (
                 "Bnb4FusedQkvRopePrefill",
                 vec![
@@ -999,7 +972,7 @@ impl<W> Instruction<W> {
                     F::RopeCosSin,
                 ],
             ),
-            Instruction::Fp8Gemm(in_slot, out_slot, layer, _wf) => (
+            Instruction::Fp8Gemm(in_slot, out_slot, layer) => (
                 "Fp8Gemm",
                 vec![
                     F::Slot(in_slot),
@@ -1008,7 +981,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Fp8AnyLinear"),
                 ],
             ),
-            Instruction::Fp8FusedGemmBias(in_slot, out_slot, layer, _wf) => (
+            Instruction::Fp8FusedGemmBias(in_slot, out_slot, layer) => (
                 "Fp8FusedGemmBias",
                 vec![
                     F::Slot(in_slot),
@@ -1017,7 +990,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Fp8AnyLinear"),
                 ],
             ),
-            Instruction::Fp8FusedGateUpSiluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::Fp8FusedGateUpSiluMul(in_slot, out_slot, layer) => (
                 "Fp8FusedGateUpSiluMul",
                 vec![
                     F::Slot(in_slot),
@@ -1026,7 +999,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Fp8AnyLinear"),
                 ],
             ),
-            Instruction::Fp8FusedGateUpGeluMul(in_slot, out_slot, layer, _wf) => (
+            Instruction::Fp8FusedGateUpGeluMul(in_slot, out_slot, layer) => (
                 "Fp8FusedGateUpGeluMul",
                 vec![
                     F::Slot(in_slot),
@@ -1035,7 +1008,7 @@ impl<W> Instruction<W> {
                     F::LayerKind("Fp8AnyLinear"),
                 ],
             ),
-            Instruction::Fp8FusedQkvRopeCache(in_slot, out_slot, layer, _wf, _cs) => (
+            Instruction::Fp8FusedQkvRopeCache(in_slot, out_slot, layer) => (
                 "Fp8FusedQkvRopeCache",
                 vec![
                     F::Slot(in_slot),
@@ -1051,8 +1024,6 @@ impl<W> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                _wf,
-                _cs,
             ) => (
                 "Fp8FusedQkvRopePrefill",
                 vec![
@@ -1076,12 +1047,12 @@ impl<W> Instruction<W> {
     }
 }
 
-/// Walk a `&[Instruction<W>]` slice and collect [`NormalizedStep`]s
+/// Walk a `&[Instruction]` slice and collect [`NormalizedStep`]s
 /// in source order. `Loop` rows stay in-line — consumers that want
 /// to render them as scoped blocks scan for `kind == "Loop"` and
 /// take the next `LoopBodyLen` rows.
 #[must_use]
-pub fn normalize_slice<W>(slice: &[Instruction<W>]) -> Vec<NormalizedStep> {
+pub fn normalize_slice(slice: &[Instruction]) -> Vec<NormalizedStep> {
     slice.iter().map(Instruction::normalize).collect()
 }
 
@@ -1127,45 +1098,10 @@ inventory::collect!(BackboneDumpRegistration);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instr::CanonicalParams;
-    use ferrite_kernels::layers::{Embedding, LinearLayer, RmsNorm};
-
-    /// Stub Weights — `normalize` doesn't invoke any of these
-    /// pointers, so unimplemented bodies are fine.
-    struct W;
-
-    impl CanonicalParams for W {
-        const HEAD_DIM: u32 = 0;
-        const NUM_Q_HEADS: u32 = 0;
-        const NUM_KV_HEADS: u32 = 0;
-        const Q_SIZE: usize = 0;
-        const KV_SIZE: usize = 0;
-        const INTERMEDIATE_SIZE: usize = 0;
-        const ATTN_SCALE: f32 = 0.0;
-        const ATTN_SOFTCAP: f32 = 0.0;
-        const SLIDING_WINDOW: i32 = -1;
-        const KV_LORA_RANK: usize = 0;
-        const QK_NOPE_HEAD_DIM: usize = 0;
-        const QK_ROPE_HEAD_DIM: usize = 0;
-        const V_HEAD_DIM: usize = 0;
-        const FINAL_LOGIT_SOFTCAPPING: f32 = 0.0;
-        const QK_HEAD_DIM: usize = 0;
-        const MLA_ATTN_SCALE: f32 = 0.0;
-    }
-
-    fn embed_wf(_: &W, _: u32) -> &Embedding {
-        unimplemented!()
-    }
-    fn rmsnorm_wf(_: &W, _: u32) -> &RmsNorm {
-        unimplemented!()
-    }
-    fn linear_wf(_: &W, _: u32) -> &LinearLayer {
-        unimplemented!()
-    }
 
     #[test]
     fn embed_normalizes() {
-        let i: Instruction<W> = Instruction::Embed(7, embed_wf);
+        let i: Instruction =Instruction::Embed(7);
         let n = i.normalize();
         assert_eq!(n.kind, "Embed");
         assert_eq!(
@@ -1179,7 +1115,7 @@ mod tests {
 
     #[test]
     fn fused_add_rmsnorm_carries_layer_and_kernel_class() {
-        let i: Instruction<W> = Instruction::FusedAddRmsNorm(3, 4, 12, rmsnorm_wf);
+        let i: Instruction =Instruction::FusedAddRmsNorm(3, 4, 12);
         let n = i.normalize();
         assert_eq!(n.kind, "FusedAddRmsNorm");
         assert_eq!(
@@ -1195,8 +1131,8 @@ mod tests {
 
     #[test]
     fn cutlass_gemm_add_keeps_tile_consts() {
-        let i: Instruction<W> =
-            Instruction::CutlassGemmAdd(5, 6, 0, linear_wf, 128, 128, 3, 4096, 11008);
+        let i: Instruction =
+            Instruction::CutlassGemmAdd(5, 6, 0, 128, 128, 3, 4096, 11008);
         let n = i.normalize();
         assert_eq!(n.kind, "CutlassGemmAdd");
         assert_eq!(
@@ -1216,7 +1152,7 @@ mod tests {
 
     #[test]
     fn loop_count_and_body_len_are_distinguishable() {
-        let i: Instruction<W> = Instruction::Loop(32, 9);
+        let i: Instruction =Instruction::Loop(32, 9);
         let n = i.normalize();
         assert_eq!(n.kind, "Loop");
         assert_eq!(
@@ -1230,10 +1166,7 @@ mod tests {
 
     #[test]
     fn flashinfer_decode_keeps_head_dim_and_softcap_flag() {
-        fn cs(_: &W, _: u32) -> ferrite_cuda_core::tensor::GpuTensor {
-            unimplemented!()
-        }
-        let i: Instruction<W> = Instruction::FlashInferAttentionDecode(0, 1, 0, cs, 128, true);
+        let i: Instruction =Instruction::FlashInferAttentionDecode(0, 1, 0, 128, true);
         let n = i.normalize();
         assert_eq!(n.kind, "FlashInferAttentionDecode");
         assert_eq!(

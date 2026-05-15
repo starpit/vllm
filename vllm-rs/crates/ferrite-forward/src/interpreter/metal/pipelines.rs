@@ -118,7 +118,7 @@ impl SpecializedPipelines {
     /// [`SpecializedPipelineCache::get_or_build`]: ferrite_metal_kernels::specialized_pipeline_cache::SpecializedPipelineCache::get_or_build
     pub fn pipeline_for_command<W: CanonicalParams>(
         &self,
-        cmd: &LoweredCommand<W>,
+        cmd: &LoweredCommand,
     ) -> Result<ComputePipelineState, PipelineLookupError> {
         if matches!(cmd.kernel, KernelId::Gemm) {
             return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));

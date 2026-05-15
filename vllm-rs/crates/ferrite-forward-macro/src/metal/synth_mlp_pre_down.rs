@@ -24,8 +24,8 @@ use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     consumes_tile, default_required_weights, CostCtx, Handoff, Implementation, LaunchKind,
-    Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor,
-    WorkloadConstraint,
+    Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor, WeightKind,
+    WeightSlot, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -275,24 +275,6 @@ impl Implementation for MetalSynthMlpPreDownImpl {
                 ("delta_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "gate_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "up_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "rms_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
                 ("group_size", syn::parse_quote!(u32)),
                 ("bits", syn::parse_quote!(u32)),
                 ("kernel_symbol", syn::parse_quote!(&'static str)),
@@ -396,14 +378,13 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         let up_acc = acc_for(up_tile)?;
         let rms_acc = acc_for(rmsnorm_tile)?;
 
-        let to_weights_path = |acc: &WeightAccessor| -> proc_macro2::TokenStream {
+        let to_base = |acc: &WeightAccessor| -> syn::Ident {
             let (base, _layer) = split_base_layer(&acc.name.to_string());
-            let ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-            quote! { Weights::#ident }
+            syn::Ident::new(&base, proc_macro2::Span::call_site())
         };
-        let gate_wt = to_weights_path(&gate_acc);
-        let up_wt = to_weights_path(&up_acc);
-        let rms_wt = to_weights_path(&rms_acc);
+        let gate_base = to_base(&gate_acc);
+        let up_base = to_base(&up_acc);
+        let rms_base = to_base(&rms_acc);
 
         let (gs, bits) = match weight_storage_of(fuf.get(gate_tile)) {
             Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
@@ -428,14 +409,23 @@ impl Implementation for MetalSynthMlpPreDownImpl {
                 quote! { #delta_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer_lit },
-                gate_wt,
-                up_wt,
-                rms_wt,
                 quote! { #gs_lit },
                 quote! { #bits_lit },
                 quote! { #symbol_lit },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: gate_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: up_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: rms_base,
+        })])
     }
 
     fn required_weights(

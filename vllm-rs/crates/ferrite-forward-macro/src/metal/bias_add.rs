@@ -12,8 +12,8 @@ use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, SlotMap, WeightAccessor, WorkloadConstraint, first_weight_ref, fused_accessor_name,
-    gemm_nk_from_fuf, weight_storage_of,
+    Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint,
+    first_weight_ref, fused_accessor_name, gemm_nk_from_fuf, weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -211,12 +211,6 @@ impl Implementation for MetalBiasAddImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("n", syn::parse_quote!(u32)),
                 ("is_affine", syn::parse_quote!(bool)),
             ],
@@ -270,11 +264,14 @@ impl Implementation for MetalBiasAddImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #n },
                 quote! { #is_affine },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 

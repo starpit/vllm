@@ -20,11 +20,10 @@
 //! the per-kernel struct boilerplate isn't pulling its weight at that
 //! size, and the visual inspection is trivial.
 
-use crate::CanonicalParams;
-use crate::CosSinFn;
-
 use super::ids::{ArenaSlotIdx, LayerId};
-use super::lowered::{Binding, RuntimeBindingKind, WeightBundleKind, WeightTensor};
+use super::lowered::{
+    Binding, RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor,
+};
 
 // ── AttentionPrefillSdpaPaged (both sdpa_vector and steel variants) ─
 
@@ -38,8 +37,8 @@ pub struct AttentionPrefillPagedBindingSet {
     pub kv_layer: LayerId,
 }
 
-impl<W: CanonicalParams> From<AttentionPrefillPagedBindingSet> for Vec<Binding<W>> {
-    fn from(s: AttentionPrefillPagedBindingSet) -> Vec<Binding<W>> {
+impl From<AttentionPrefillPagedBindingSet> for Vec<Binding> {
+    fn from(s: AttentionPrefillPagedBindingSet) -> Vec<Binding> {
         vec![
             Binding::ArenaSlot {
                 slot: s.output.get(),
@@ -88,8 +87,8 @@ pub struct AttentionViaCacheBindingSet {
     pub kv_layer: LayerId,
 }
 
-impl<W: CanonicalParams> From<AttentionViaCacheBindingSet> for Vec<Binding<W>> {
-    fn from(s: AttentionViaCacheBindingSet) -> Vec<Binding<W>> {
+impl From<AttentionViaCacheBindingSet> for Vec<Binding> {
+    fn from(s: AttentionViaCacheBindingSet) -> Vec<Binding> {
         vec![
             Binding::ArenaSlot {
                 slot: s.output.get(),
@@ -130,16 +129,16 @@ impl<W: CanonicalParams> From<AttentionViaCacheBindingSet> for Vec<Binding<W>> {
 /// The `layer` on the cos/sin table MUST match the layer on the
 /// KvCache* slots — single-field `layer` on the BindingSet enforces
 /// it.
-pub struct RopeAppendBindingSet<W: CanonicalParams> {
+pub struct RopeAppendBindingSet {
     pub q_out: ArenaSlotIdx,
     pub k_out: ArenaSlotIdx,
     pub v_out: ArenaSlotIdx,
-    pub cos_sin_fn: CosSinFn<W>,
+    pub cos_sin_locator: WeightLocator,
     pub layer: LayerId,
 }
 
-impl<W: CanonicalParams> From<RopeAppendBindingSet<W>> for Vec<Binding<W>> {
-    fn from(s: RopeAppendBindingSet<W>) -> Vec<Binding<W>> {
+impl From<RopeAppendBindingSet> for Vec<Binding> {
+    fn from(s: RopeAppendBindingSet) -> Vec<Binding> {
         vec![
             Binding::ArenaSlot {
                 slot: s.q_out.get(),
@@ -154,9 +153,10 @@ impl<W: CanonicalParams> From<RopeAppendBindingSet<W>> for Vec<Binding<W>> {
                 binding_index: 2,
             },
             Binding::Weight {
-                kind: WeightBundleKind::CosSin(s.cos_sin_fn),
+                kind: WeightBundleKind::CosSin,
                 which: WeightTensor::Weight,
                 layer: s.layer,
+                locator: s.cos_sin_locator,
                 binding_index: 3,
             },
             Binding::Runtime {
@@ -187,16 +187,16 @@ impl<W: CanonicalParams> From<RopeAppendBindingSet<W>> for Vec<Binding<W>> {
 /// 3 = CosSin\[layer\] (weight), 4 = Positions (runtime),
 /// 5 = SlotMapping (runtime), 6 = KvCacheK\[layer\] (runtime),
 /// 7 = KvCacheV\[layer\] (runtime).
-pub struct FusedQkvRopeCacheBindingSet<W: CanonicalParams> {
+pub struct FusedQkvRopeCacheBindingSet {
     pub q_out: ArenaSlotIdx,
     pub input: ArenaSlotIdx,
-    pub qkv_wt_fn: crate::WtFn<W, ferrite_kernels::layers::LinearLayer>,
-    pub cos_sin_fn: CosSinFn<W>,
+    pub qkv_locator: WeightLocator,
+    pub cos_sin_locator: WeightLocator,
     pub layer: LayerId,
 }
 
-impl<W: CanonicalParams> From<FusedQkvRopeCacheBindingSet<W>> for Vec<Binding<W>> {
-    fn from(s: FusedQkvRopeCacheBindingSet<W>) -> Vec<Binding<W>> {
+impl From<FusedQkvRopeCacheBindingSet> for Vec<Binding> {
+    fn from(s: FusedQkvRopeCacheBindingSet) -> Vec<Binding> {
         vec![
             Binding::ArenaSlot {
                 slot: s.q_out.get(),
@@ -207,15 +207,17 @@ impl<W: CanonicalParams> From<FusedQkvRopeCacheBindingSet<W>> for Vec<Binding<W>
                 binding_index: 1,
             },
             Binding::Weight {
-                kind: WeightBundleKind::LinearLayer(s.qkv_wt_fn),
+                kind: WeightBundleKind::LinearLayer,
                 which: WeightTensor::Weight,
                 layer: s.layer,
+                locator: s.qkv_locator,
                 binding_index: 2,
             },
             Binding::Weight {
-                kind: WeightBundleKind::CosSin(s.cos_sin_fn),
+                kind: WeightBundleKind::CosSin,
                 which: WeightTensor::Weight,
                 layer: s.layer,
+                locator: s.cos_sin_locator,
                 binding_index: 3,
             },
             Binding::Runtime {

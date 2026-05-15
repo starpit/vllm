@@ -48,12 +48,19 @@ pub use info::{
     normalize_slice,
 };
 
-// Backend-agnostic frontend types. Available under either backend feature.
+// Backend-agnostic frontend types. The lift dropped `WtFn`/`CosSinFn`
+// — every variant now resolves weights through the per-arch
+// `WeightAccessors` impl. `Instruction` and `CanonicalParams` stay
+// cross-backend because the metal interpreter still walks the same
+// `&[Instruction]` slices the cuda eval body matches on.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub use instr::{CanonicalParams, CosSinFn, Instruction, WtFn};
+pub use instr::{CanonicalParams, Instruction, WeightAccessors};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use backend_compat::{BackendCompat, Cuda, Metal, Wgpu};
-// CUDA-only runtime entry points.
+// CUDA-only runtime entry points. `WeightAccessors` is the per-arch
+// tape-level weight-resolution trait emitted by the macro (cuda eval
+// body and the metal worker call into it instead of unpacking
+// fn-pointers from variant fields).
 #[cfg(feature = "cuda")]
 pub use instr::{InterpreterCtx, run, run_backbone};
 // Stream-free / quant-free helpers — reachable under either backend.
@@ -128,6 +135,14 @@ pub struct BucketEntry<Op: 'static>(
     pub &'static [Op],
     pub u32,
     pub u32,
+    pub u32,
+    /// Field 9: bucket id passed to `run_slice` for this row's
+    /// backbone slice. The proc-macro emits a unique id per
+    /// canonical lowered entry so the per-arch
+    /// [`crate::instr::WeightAccessors`] match can disambiguate
+    /// "same op_idx, different canonical".
+    pub u32,
+    /// Field 10: bucket id for this row's lm_head slice. See field 9.
     pub u32,
 );
 

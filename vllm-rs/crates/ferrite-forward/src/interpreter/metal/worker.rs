@@ -237,7 +237,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
     pub fn new(
         device: Arc<Device>,
         arena_layout: &ArenaLayout,
-        bucket_tapes: &[LoweredMetalTape<W>],
+        bucket_tapes: &[LoweredMetalTape],
         pipelines: &SpecializedPipelines,
         weights: &W,
         allocator: &MetalAllocator,
@@ -264,7 +264,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
     pub fn new_with_residency(
         device: Arc<Device>,
         arena_layout: &ArenaLayout,
-        bucket_tapes: &[LoweredMetalTape<W>],
+        bucket_tapes: &[LoweredMetalTape],
         pipelines: &SpecializedPipelines,
         weights: &W,
         allocator: &MetalAllocator,
@@ -609,7 +609,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
 #[allow(clippy::too_many_arguments)]
 fn bake_bucket<W: CanonicalParams>(
     bucket_index: usize,
-    tape: &LoweredMetalTape<W>,
+    tape: &LoweredMetalTape,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
@@ -771,7 +771,7 @@ fn bake_bucket<W: CanonicalParams>(
         // symbol picks happen at lowering time, so this layer is a
         // thin cache lookup.
         let pipeline = pipelines
-            .pipeline_for_command(cmd)
+            .pipeline_for_command::<W>(cmd)
             .map_err(WorkerError::PipelineLookup)?;
 
         let bound = resolve_bindings(
@@ -786,7 +786,7 @@ fn bake_bucket<W: CanonicalParams>(
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
-        let (tg, tpt) = mtl_size_pair(cmd);
+        let (tg, tpt) = mtl_size_pair::<W>(cmd);
 
         // Coalesce with the previous step iff (a) it's an ICB step
         // (a Gemm step forces an encoder boundary) and (b) its
@@ -886,7 +886,7 @@ fn bake_bucket<W: CanonicalParams>(
 fn resolve_gemm_buffers<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
-    cmd: &LoweredCommand<W>,
+    cmd: &LoweredCommand,
     arena: &[Buffer],
     weights: &W,
     allocator: &MetalAllocator,
@@ -938,26 +938,33 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
 /// Resolve a `Binding::Weight` against the loaded model `weights`
 /// and the allocator that owns the underlying `MTLBuffer` arenas.
 ///
-/// Calls the typed `WtFn` thunk in `kind` to get a reference to the
-/// layer struct (`&RmsNorm`, `&LinearLayer`, `&Embedding`), pulls
+/// Calls into the per-arch [`crate::WeightAccessors`] impl (emitted by
+/// `ferrite-forward-macro::codegen::emit_weight_accessors_impl`) using
+/// the binding's `(bucket, op_idx, slot, layer)` locator to recover the
+/// `&Layer` struct (`&RmsNorm`, `&LinearLayer`, `&Embedding`), pulls
 /// out the raw GpuTensor pointer matching `which`, and asks the
 /// allocator which buffer + offset that pointer belongs to.
 ///
-/// Same shape CUDA's interpreter uses: WtFn → layer struct →
-/// `GpuTensor`. The Metal-side delta is just the final pointer →
-/// `(&Buffer, offset)` reverse lookup against the arena allocator.
-fn resolve_weight<W: CanonicalParams>(
+/// Same shape CUDA's interpreter uses: `WeightAccessors` → layer
+/// struct → `GpuTensor`. The Metal-side delta is just the final
+/// pointer → `(&Buffer, offset)` reverse lookup against the arena
+/// allocator.
+fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
     weights: &W,
     allocator: &MetalAllocator,
-    kind: &WeightBundleKind<W>,
+    kind: &WeightBundleKind,
     layer: u32,
     which: WeightTensor,
+    locator: super::lowered::WeightLocator,
 ) -> Result<(Buffer, u64), WorkerError> {
+    let bucket = locator.bucket;
+    let op_idx = locator.op_idx;
+    let slot = locator.slot;
     let tensor = match kind {
-        WeightBundleKind::RmsNorm(wtfn) => (wtfn)(weights, layer).weight,
-        WeightBundleKind::Embedding(wtfn) => (wtfn)(weights, layer).weight,
-        WeightBundleKind::LinearLayer(wtfn) => {
-            let l = (wtfn)(weights, layer);
+        WeightBundleKind::RmsNorm => weights.rms_norm_at(bucket, op_idx, slot, layer).weight,
+        WeightBundleKind::Embedding => weights.embedding_at(bucket, op_idx, slot, layer).weight,
+        WeightBundleKind::LinearLayer => {
+            let l = weights.linear_at(bucket, op_idx, slot, layer);
             match (which, l) {
                 // Dense path
                 (WeightTensor::Weight, ferrite_kernels::layers::LinearLayer::Dense(_)) => {
@@ -1010,14 +1017,14 @@ fn resolve_weight<W: CanonicalParams>(
                 }
             }
         }
-        WeightBundleKind::CosSin(cosfn) => (cosfn)(weights, layer),
+        WeightBundleKind::CosSin => weights.cos_sin_at(bucket, op_idx, slot, layer),
         // MLX-affine int4 quantized embedding (P6). The lowering's
         // `AffineEmbed` arm always uses `layer = 0` (embed_tokens is
         // not a layered weight) and the kernel expects three buffer
         // bindings: packed weight, scales, biases.
         #[cfg(feature = "metal")]
-        WeightBundleKind::AffineQuantEmbedding(wtfn) => {
-            let e = (wtfn)(weights, layer);
+        WeightBundleKind::AffineQuantEmbedding => {
+            let e = weights.affine_quant_embedding_at(bucket, op_idx, slot, layer);
             match which {
                 WeightTensor::Weight => e.weight,
                 WeightTensor::AffineScales => e.scales,
@@ -1049,7 +1056,7 @@ fn resolve_weight<W: CanonicalParams>(
 fn resolve_bindings<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
-    cmd: &LoweredCommand<W>,
+    cmd: &LoweredCommand,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
     weights: &W,
@@ -1078,9 +1085,17 @@ fn resolve_bindings<W: CanonicalParams>(
                 kind,
                 which,
                 layer,
+                locator,
                 binding_index,
             } => {
-                let (b, off) = resolve_weight(weights, allocator, kind, layer.get(), *which)?;
+                let (b, off) = resolve_weight(
+                    weights,
+                    allocator,
+                    kind,
+                    layer.get(),
+                    *which,
+                    *locator,
+                )?;
                 (b, off, *binding_index as u64)
             }
             Binding::Runtime {
@@ -1140,7 +1155,7 @@ fn scale_tg_for_num_tokens(
     tg
 }
 
-fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand<W>) -> (MTLSize, MTLSize) {
+fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
         height: cmd.dispatch.threadgroups.1 as usize,

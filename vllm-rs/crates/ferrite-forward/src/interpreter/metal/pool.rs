@@ -49,7 +49,7 @@ use ferrite_cuda_core::MetalAllocator;
 /// solved bucket per canonical model. The macro materializes:
 ///  - `bucket_m` — the workload point this bucket was specialized for;
 ///  - `num_arena_slots` — colored slot count from `colored_slot_map()`;
-///  - `backbone` / `lm_head` — the bucket's `Instruction<W>` static
+///  - `backbone` / `lm_head` — the bucket's `Instruction` static
 ///    slices, identical to the cuda-side `BACKBONE_M_<wp>` /
 ///    `LM_HEAD_M_<wp>` statics.
 ///
@@ -63,8 +63,8 @@ use ferrite_cuda_core::MetalAllocator;
 ///
 /// The slices are `&'static` because the macro emits them as static
 /// items; the spec is `Copy` so callers can drop the bucket plan into
-/// an `Arc<[MetalBucketSpec<W>]>` cheaply.
-pub struct MetalBucketSpec<W: CanonicalParams + 'static> {
+/// an `Arc<[MetalBucketSpec]>` cheaply.
+pub struct MetalBucketSpec {
     pub bucket_m: u32,
     pub num_arena_slots: u32,
     /// Index in the colored arena where this bucket's terminal
@@ -79,8 +79,8 @@ pub struct MetalBucketSpec<W: CanonicalParams + 'static> {
     /// pool takes the elementwise max across every bucket to size
     /// the single per-worker arena.
     pub arena_bytes: &'static [u64],
-    pub backbone: &'static [Instruction<W>],
-    pub lm_head: &'static [Instruction<W>],
+    pub backbone: &'static [Instruction],
+    pub lm_head: &'static [Instruction],
     /// MTL4 encoder barrier flags computed at macro time from the
     /// FUF dataflow graph (one bool per `Instruction` in
     /// `backbone`/`lm_head`). `true` means the MTL4 path must emit a
@@ -93,13 +93,13 @@ pub struct MetalBucketSpec<W: CanonicalParams + 'static> {
     pub lm_head_barriers: &'static [bool],
 }
 
-impl<W: CanonicalParams + 'static> Clone for MetalBucketSpec<W> {
+impl Clone for MetalBucketSpec {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<W: CanonicalParams + 'static> Copy for MetalBucketSpec<W> {}
+impl Copy for MetalBucketSpec {}
 
 /// Errors surfaced by [`MetalWorkerPool::for_buckets`] before the pool
 /// reaches its first eager-spawn `WorkerError` path.
@@ -210,7 +210,7 @@ impl<W: CanonicalParams> Drop for WorkerGuard<'_, W> {
 /// [`CanonicalParams`] — one pool per loaded model variant.
 ///
 /// The pool stays parameterized over `W` for the per-bucket
-/// `LoweredMetalTape<W>` (workers bake ICBs from these), but it
+/// `LoweredMetalTape` (workers bake ICBs from these), but it
 /// does *not* hold a back-reference to the loaded `Weights`
 /// itself — callers pass `&W` into `forward`/`checkout` so the
 /// pool can be stored as a field on the `Weights` struct without
@@ -232,7 +232,7 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     /// the first `forward()`.
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
-    bucket_tapes: Arc<[LoweredMetalTape<W>]>,
+    bucket_tapes: Arc<[LoweredMetalTape]>,
     arena_layout: Arc<ArenaLayout>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
@@ -454,7 +454,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         weights: &W,
         allocator: Arc<MetalAllocator>,
         pipelines: Arc<SpecializedPipelines>,
-        bucket_tapes: Arc<[LoweredMetalTape<W>]>,
+        bucket_tapes: Arc<[LoweredMetalTape]>,
         arena_layout: ArenaLayout,
         runtime_factory: RuntimeFactory,
         max_workers: usize,
@@ -502,7 +502,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(pool)
     }
 
-    /// Build the pool from a flat `&[MetalBucketSpec<W>]` plus the
+    /// Build the pool from a flat `&[MetalBucketSpec]` plus the
     /// loaded model + its allocator + arena layout + runtime factory.
     ///
     /// This is the runtime-side prerequisite the `#[forward]` macro's
@@ -517,7 +517,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         device: Arc<Device>,
         weights: &W,
         allocator: Arc<MetalAllocator>,
-        bucket_specs: &[MetalBucketSpec<W>],
+        bucket_specs: &[MetalBucketSpec],
         runtime_factory: RuntimeFactory,
         max_workers: usize,
     ) -> Result<Self, PoolBuildError> {
@@ -570,9 +570,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // table for everything else.
         let target_profile =
             ferrite_metal_kernels::detect_device().map(|d| d.profile);
-        let mut tapes: Vec<LoweredMetalTape<W>> = Vec::with_capacity(bucket_specs.len());
+        let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
-            let tape = lower_pair(
+            let tape = lower_pair::<W>(
                 spec.backbone,
                 spec.lm_head,
                 spec.backbone_barriers,
@@ -587,7 +587,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             })?;
             tapes.push(tape);
         }
-        let bucket_tapes: Arc<[LoweredMetalTape<W>]> = Arc::from(tapes);
+        let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
 
         Self::new(
             device,
@@ -1787,7 +1787,7 @@ mod tests {
 
     /// Empty backbone + lm_head per bucket — exercises the
     /// constructor's lower→pool-build path without requiring a real
-    /// `Instruction<W>` to be constructible at the test site (the
+    /// `Instruction` to be constructible at the test site (the
     /// macro emits those at codegen time; pool tests stay structural).
     /// The resulting tape carries zero commands; the worker still
     /// bakes a (trivially empty) ICB per bucket and the pool still

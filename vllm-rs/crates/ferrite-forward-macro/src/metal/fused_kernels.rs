@@ -15,8 +15,9 @@ use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     CostCtx, FusedAddRmsNormImpl, FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl, Handoff,
     Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap,
-    WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights, first_tile_input,
-    first_weight_ref, gemm_nk_from_fuf, weight_storage_of,
+    WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint, consumes_tile,
+    default_required_weights, first_tile_input, first_weight_ref, gemm_nk_from_fuf,
+    weight_storage_of,
 };
 use crate::metal::affine_qmm::{affine_qmm_opcode_shape, affine_qmm_vector_limit};
 use crate::quantization::StorageFormat;
@@ -696,28 +697,34 @@ fn affine_decomposed_fan_out(
             quote! { #in_slot_idx },
             quote! { #gate_out_idx },
             quote! { #gate_layer_lit },
-            quote! { Weights::#gate_base_ident },
             quote! { #gate_n },
             quote! { #gate_k },
             quote! { #gate_gs },
             quote! { #gate_bits },
             quote! { #gate_vl },
         ],
-    );
+    )
+    .with_weight_slot(WeightSlot {
+        kind: WeightKind::Linear,
+        base: gate_base_ident.clone(),
+    });
     let up_inst = OpInstance::new(
         affine_qmm_ident(),
         vec![
             quote! { #in_slot_idx },
             quote! { #up_out_idx },
             quote! { #up_layer_lit },
-            quote! { Weights::#up_base_ident },
             quote! { #up_n },
             quote! { #up_k },
             quote! { #up_gs },
             quote! { #up_bits },
             quote! { #up_vl },
         ],
-    );
+    )
+    .with_weight_slot(WeightSlot {
+        kind: WeightKind::Linear,
+        base: up_base_ident.clone(),
+    });
     let silu_mul_inst = OpInstance::new(
         silu_mul_ident(),
         vec![

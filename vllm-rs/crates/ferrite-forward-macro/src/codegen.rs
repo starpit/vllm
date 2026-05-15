@@ -39,7 +39,7 @@ use syn::Ident;
 use crate::classified::{Expr, OpKind, Program, Stmt, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, WeightAccessor};
+use crate::impl_lib::{ImplementationLibrary, OpInstance, SlotMap, WeightAccessor};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
@@ -4522,7 +4522,7 @@ fn emit_layered_load_body(
 fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
     let groups = group_accessors_by_base(accessors);
     if groups.is_empty() {
-        return quote! {};
+        return TokenStream::new();
     }
     // Per-method `#[cfg]` / `#[inline]` / `#[allow(dead_code)]` are
     // redundant — the impl block carries the cfg, the methods are
@@ -4577,6 +4577,212 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
         #[allow(dead_code)]
         impl Weights {
             #(#methods)*
+        }
+    }
+}
+
+/// Emit `impl ::ferrite_forward::WeightAccessors for Weights { ... }`
+/// keyed on `(bucket, op_idx)` per the typed-fanout design.
+///
+/// The variant of an `Instruction` at position `op_idx` in `bucket`
+/// fixes the *kind* of weight needed; the per-arch impl resolves
+/// `(bucket, op_idx)` → which named field on `Weights`. We walk
+/// every bucket × position, look up the recorded `weight_slots`,
+/// and emit one match arm per (bucket, op_idx, kind) triple.
+///
+/// Sprint 1 scope: `rms_norm_at` only. Sibling methods (`linear_at`,
+/// `embedding_at`, `cos_sin_at`, MoE getters) land per sprint as
+/// the matching `Instruction<W>` variants migrate off
+/// `WtFn`/`CosSinFn`.
+fn emit_weight_accessors_impl(
+    canonical_lowered: &BTreeMap<
+        crate::solver::WorkloadPoint,
+        (CanonicalLowered, u32, u32, u32, SlotMap),
+    >,
+) -> TokenStream {
+    use crate::impl_lib::WeightKind;
+
+    // Walk every BUCKET × position in declaration order. The bucket
+    // index in FORWARD_TABLE matches the (m, sk) row order we emit;
+    // we use a synthetic "bucket id" of `2 * row_idx + slice_idx`
+    // where `slice_idx` is 0 for backbone, 1 for lm_head — matching
+    // `BUCKET_BACKBONE` / `BUCKET_LM_HEAD` for the simple
+    // single-bucket case.
+    //
+    // For now (Sprint 1 + simple model lowering): every bucket row
+    // shares the same canonical's instruction stream, so the match
+    // table only needs entries for `(BUCKET_BACKBONE, op_idx)` and
+    // `(BUCKET_LM_HEAD, op_idx)` from any one bucket row. We use
+    // the first canonical entry's lowered slices as the source.
+    //
+    // When per-bucket variation lands (different Impls per workload
+    // point), this becomes per-bucket-row and the bucket_id encoding
+    // expands; the runtime caller of `rms_norm_at` will pass the
+    // matching encoded id from the FORWARD_TABLE row it dispatched
+    // through.
+    // For each kind, collect `(bucket, op_idx, slot) => self.<base>(layer)`
+    // match arms across every canonical's backbone and lm_head. `slot` is
+    // the per-(bucket, op_idx, kind) ordinal, derived by walking
+    // `weight_slots` in declaration order and counting prior occurrences
+    // of the same kind at the same op.
+    use std::collections::HashMap;
+    let mut by_kind: HashMap<&'static str, Vec<TokenStream>> = HashMap::new();
+
+    // Walk EVERY canonical lowered entry. Each distinct bucket
+    // (workload point) gets a pair of bucket ids: 2*ci (backbone)
+    // and 2*ci+1 (lm_head). FORWARD_TABLE rows pass these ids into
+    // run/run_backbone, which forward them to run_slice → eval →
+    // the per-arch WeightAccessors match arms.
+    let emit_for = |bucket_id: u32, instances: &[OpInstance], by_kind: &mut HashMap<&'static str, Vec<TokenStream>>| {
+        let bucket_lit = proc_macro2::Literal::u32_unsuffixed(bucket_id);
+        for (op_idx, inst) in instances.iter().enumerate() {
+            let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
+            let mut counts: HashMap<&'static str, u32> = HashMap::new();
+            for slot in &inst.weight_slots {
+                let key = match slot.kind {
+                    WeightKind::RmsNorm => "rms_norm_at",
+                    WeightKind::Embedding => "embedding_at",
+                    WeightKind::Linear => "linear_at",
+                    WeightKind::LayerNorm => "layer_norm_at",
+                    WeightKind::Marlin => "marlin_at",
+                    WeightKind::Bnb4 => "bnb4_at",
+                    WeightKind::Fp8 => "fp8_at",
+                    WeightKind::DeepSeekMoe => "deepseek_moe_at",
+                    WeightKind::DeepSeekMoeFp8 => "deepseek_moe_fp8_at",
+                    WeightKind::DeepSeekMoeGgml => "deepseek_moe_ggml_at",
+                    WeightKind::FusedMoe => "fused_moe_at",
+                    WeightKind::SharedFusedMoe => "shared_fused_moe_at",
+                    WeightKind::CosSin => "cos_sin_at",
+                    WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
+                };
+                let n = counts.entry(key).or_insert(0);
+                let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
+                *n += 1;
+                let base = &slot.base;
+                by_kind.entry(key).or_default().push(quote! {
+                    (#bucket_lit, #op_lit, #slot_lit) => self.#base(layer),
+                });
+            }
+        }
+    };
+    for (ci, (_wp, (cl, _, _, _, _))) in canonical_lowered.iter().enumerate() {
+        let bb_id = (ci as u32) * 2;
+        let lm_id = bb_id + 1;
+        emit_for(bb_id, &cl.backbone.instances, &mut by_kind);
+        emit_for(lm_id, &cl.lm_head.instances, &mut by_kind);
+    }
+
+    let method_emit = |method: &str, ret_ty: TokenStream| -> TokenStream {
+        let method_id = syn::Ident::new(method, proc_macro2::Span::call_site());
+        let arms = by_kind.get(method).cloned().unwrap_or_default();
+        if arms.is_empty() {
+            // Default trait body already returns `unreachable!()`. No
+            // override needed when the arch never consumes this kind.
+            return quote! {};
+        }
+        quote! {
+            fn #method_id(
+                &self,
+                bucket: u32,
+                op_idx: u32,
+                slot: u32,
+                layer: u32,
+            ) -> #ret_ty {
+                match (bucket, op_idx, slot) {
+                    #(#arms)*
+                    _ => unreachable!(
+                        "WeightAccessors::{}: no match for (bucket={}, op_idx={}, slot={})",
+                        stringify!(#method_id), bucket, op_idx, slot,
+                    ),
+                }
+            }
+        }
+    };
+
+    let rms_norm = method_emit("rms_norm_at", quote! { &::ferrite_kernels::layers::RmsNorm });
+    let embedding = method_emit(
+        "embedding_at",
+        quote! { &::ferrite_kernels::layers::Embedding },
+    );
+    let linear = method_emit("linear_at", quote! { &::ferrite_kernels::layers::LinearLayer });
+    let layer_norm = method_emit(
+        "layer_norm_at",
+        quote! { &::ferrite_kernels::layers::LayerNorm },
+    );
+    let marlin = method_emit("marlin_at", quote! { &::ferrite_kernels::layers::MarlinLinear });
+    let bnb4 = method_emit("bnb4_at", quote! { &::ferrite_kernels::layers::Bnb4bitLinear });
+    let fp8 = method_emit("fp8_at", quote! { &::ferrite_kernels::layers::Fp8AnyLinear });
+    let dsmoe = method_emit(
+        "deepseek_moe_at",
+        quote! { &::ferrite_kernels::layers_moe::DeepSeekV2MoELayer },
+    );
+    let dsmoe_fp8 = method_emit(
+        "deepseek_moe_fp8_at",
+        quote! { &::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer },
+    );
+    let dsmoe_ggml = method_emit(
+        "deepseek_moe_ggml_at",
+        quote! { &::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer },
+    );
+    let fused_moe = method_emit(
+        "fused_moe_at",
+        quote! { &::ferrite_kernels::layers_moe::FusedMoELayer },
+    );
+    let shared_moe = method_emit(
+        "shared_fused_moe_at",
+        quote! { &::ferrite_kernels::layers_moe::SharedFusedMoELayer },
+    );
+    let cos_sin = method_emit("cos_sin_at", quote! { ::ferrite_cuda_core::tensor::GpuTensor });
+    // `affine_quant_embedding_at` is gated `#[cfg(feature = "metal")]`
+    // on the trait so we must emit the cfg attribute together with the
+    // method body, or skip both when the arch never resolves an
+    // `AffineQuantEmbedding` — otherwise a bare `#[cfg]` with no item
+    // would surface as "expected item after attributes".
+    let aqe_arms = by_kind
+        .get("affine_quant_embedding_at")
+        .cloned()
+        .unwrap_or_default();
+    let affine_quant_embedding = if aqe_arms.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #[cfg(feature = "metal")]
+            fn affine_quant_embedding_at(
+                &self,
+                bucket: u32,
+                op_idx: u32,
+                slot: u32,
+                layer: u32,
+            ) -> &::ferrite_kernels::layers::AffineQuantEmbedding {
+                match (bucket, op_idx, slot) {
+                    #(#aqe_arms)*
+                    _ => unreachable!(
+                        "WeightAccessors::affine_quant_embedding_at: no match for \
+                         (bucket={}, op_idx={}, slot={})",
+                        bucket, op_idx, slot,
+                    ),
+                }
+            }
+        }
+    };
+
+    quote! {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        impl ::ferrite_forward::WeightAccessors for Weights {
+            #rms_norm
+            #embedding
+            #linear
+            #layer_norm
+            #marlin
+            #bnb4
+            #fp8
+            #dsmoe
+            #dsmoe_fp8
+            #dsmoe_ggml
+            #fused_moe
+            #shared_moe
+            #cos_sin
+            #affine_quant_embedding
         }
     }
 }
@@ -5625,6 +5831,7 @@ pub fn emit_model(
     // 3-4 lines per row).
     let backend_caps = BackendCaps::from_program(program);
     let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size, backend_caps);
+    let weight_accessors_impl = emit_weight_accessors_impl(&canonical_lowered);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /
@@ -5639,7 +5846,7 @@ pub fn emit_model(
     // metal `Weights` ZST emitted in `emit_weights_struct`).
     let instruction_alias = quote! {
         #[allow(non_camel_case_types, dead_code)]
-        type __I = ::ferrite_forward::Instruction<Weights>;
+        type __I = ::ferrite_forward::Instruction;
         use ::ferrite_forward::Instruction::*;
     };
     let shapes_by_name = arch_opcodes.shapes_by_name();
@@ -5718,11 +5925,27 @@ pub fn emit_model(
         .enumerate()
         .map(|(i, &m)| (m, i))
         .collect();
+    // Bucket-id assignment for the per-arch `WeightAccessors` impl:
+    // canonical_lowered.iter() ordering pairs each canonical with
+    // bucket ids `(2*ci, 2*ci+1)` for backbone and lm_head. This
+    // mapping must match the iteration order in
+    // `emit_weight_accessors_impl` so the match-arm keys line up.
+    let canonical_to_bucket_id: HashMap<_, u32> = canonical_lowered
+        .iter()
+        .enumerate()
+        .map(|(ci, (wp, _))| (*wp, (ci as u32) * 2))
+        .collect();
+
     let mut bucket_table_entries: Vec<TokenStream> = Vec::new();
     for (i, wp) in bucket_points.iter().enumerate() {
         let canonical = bucket_canonical[i];
         let bb_static = bucket_static_ident("BACKBONE_M", canonical);
         let lm_static = bucket_static_ident("LM_HEAD_M", canonical);
+        let bb_bucket_id = *canonical_to_bucket_id
+            .get(&canonical)
+            .expect("canonical_to_bucket_id missing entry for canonical workload point");
+        let bb_bucket_lit = proc_macro2::Literal::u32_unsuffixed(bb_bucket_id);
+        let lm_bucket_lit = proc_macro2::Literal::u32_unsuffixed(bb_bucket_id + 1);
         // Per-bucket slot metadata. The colored slot map is built
         // per workload point (the solver may pick Impls that need
         // different intermediate-tile counts per bucket — e.g.
@@ -5787,6 +6010,7 @@ pub fn emit_model(
                 #m_min_lit, #m_max_lit, #sk_min_lit, #sk_max_lit,
                 #bb_static, #lm_static,
                 #num_slots_lit, #backbone_slot_lit, #terminal_slot_lit,
+                #bb_bucket_lit, #lm_bucket_lit,
             ),
         });
     }
@@ -5999,7 +6223,7 @@ pub fn emit_model(
         /// is a linear smallest-fit scan, so order matters.
         #[cfg(feature = "metal")]
         pub static METAL_BUCKETS:
-            &[::ferrite_forward::interpreter::metal::MetalBucketSpec<Weights>]
+            &[::ferrite_forward::interpreter::metal::MetalBucketSpec]
             = &[
                 #(#metal_bucket_entries)*
             ];
@@ -6275,7 +6499,7 @@ pub fn emit_model(
                     FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
                 );
                 unsafe {
-                    ::ferrite_forward::run_backbone(e.4, wm, ctx, device, e.6, e.7)
+                    ::ferrite_forward::run_backbone(e.4, e.9, wm, ctx, device, e.6, e.7)
                 }
             }
         },
@@ -6301,6 +6525,8 @@ pub fn emit_model(
 
         #canonical_params_impl
 
+        #weight_accessors_impl
+
         #instruction_alias
 
         #(#static_slices)*
@@ -6323,7 +6549,7 @@ pub fn emit_model(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
             unsafe {
-                ::ferrite_forward::run(e.4, e.5, wm, ctx, device, e.6, e.8)
+                ::ferrite_forward::run(e.4, e.9, e.5, e.10, wm, ctx, device, e.6, e.8)
             }
         }
 

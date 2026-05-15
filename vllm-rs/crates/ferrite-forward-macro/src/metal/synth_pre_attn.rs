@@ -28,7 +28,8 @@ use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     consumes_tile, default_required_weights, first_tile_input, kv_cache_extern_layer,
     weight_storage_of, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
-    OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
+    OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot,
+    WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -441,36 +442,6 @@ impl Implementation for MetalSynthPreAttnImpl {
                 ("delta_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
-                (
-                    "q_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "k_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "v_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "rms_weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                    ),
-                ),
-                (
-                    "cos_sin_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                    ),
-                ),
                 ("group_size", syn::parse_quote!(u32)),
                 ("bits", syn::parse_quote!(u32)),
                 ("kernel_symbol", syn::parse_quote!(&'static str)),
@@ -666,16 +637,14 @@ impl Implementation for MetalSynthPreAttnImpl {
             syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
         };
 
-        let to_weights_path = |acc: &WeightAccessor| -> proc_macro2::TokenStream {
+        let to_base_ident = |acc: &WeightAccessor| -> syn::Ident {
             let (base, _layer) = split_base_layer(&acc.name.to_string());
-            let ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-            quote! { Weights::#ident }
+            syn::Ident::new(&base, proc_macro2::Span::call_site())
         };
-        let q_wt = to_weights_path(&q_acc);
-        let k_wt = to_weights_path(&k_acc);
-        let v_wt = to_weights_path(&v_acc);
-        let rms_wt = to_weights_path(&rms_acc);
-        let cs_fn = quote! { Weights::#cos_sin_ident };
+        let q_base = to_base_ident(&q_acc);
+        let k_base = to_base_ident(&k_acc);
+        let v_base = to_base_ident(&v_acc);
+        let rms_base = to_base_ident(&rms_acc);
 
         // group_size + bits from the Affine storage on any Gemm.
         let (gs, bits) = match weight_storage_of(fuf.get(q_tile)) {
@@ -705,6 +674,13 @@ impl Implementation for MetalSynthPreAttnImpl {
         let layer_lit = layer;
         let has_linear_bias_lit = has_linear_bias;
 
+        // Weight resolution moves to the tape-level `WeightAccessors`
+        // impl: record three `Linear` slots (Q/K/V at the same op_idx,
+        // disambiguated by sub-slot 0/1/2 inside the codegen), one
+        // `RmsNorm`, one `CosSin`. The macro's
+        // `emit_weight_accessors_impl` walks `weight_slots` in order
+        // and synthesises the `(bucket, op_idx, sub_slot) => self.<base>(layer)`
+        // match arms.
         Some(vec![OpInstance::new(
             syn::Ident::new("SynthPreAttn", proc_macro2::Span::call_site()),
             vec![
@@ -712,17 +688,32 @@ impl Implementation for MetalSynthPreAttnImpl {
                 quote! { #delta_slot_idx },
                 quote! { #q_out_slot_idx },
                 quote! { #layer_lit },
-                q_wt,
-                k_wt,
-                v_wt,
-                rms_wt,
-                cs_fn,
                 quote! { #gs_lit },
                 quote! { #bits_lit },
                 quote! { #symbol_lit },
                 quote! { #has_linear_bias_lit },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: q_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: k_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: v_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::RmsNorm,
+            base: rms_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::CosSin,
+            base: cos_sin_ident,
+        })])
     }
 
     fn required_weights(

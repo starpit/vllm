@@ -18,8 +18,8 @@ use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
-    gemm_nk_from_fuf, weight_storage_of,
+    Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint,
+    default_required_weights, gemm_nk_from_fuf, weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -246,14 +246,17 @@ impl Implementation for MetalAffineQmmImpl {
                 quote! { #in_slot_idx },
                 quote! { #out_slot_idx },
                 quote! { #layer },
-                quote! { Weights::#base_ident },
                 quote! { #n },
                 quote! { #k },
                 quote! { #group_size },
                 quote! { #bits },
                 quote! { #vector_limit },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: base_ident,
+        })])
     }
 }
 
@@ -345,12 +348,6 @@ pub(crate) fn affine_qmm_opcode_shape() -> OpcodeShape {
             ("in_slot", syn::parse_quote!(u32)),
             ("out_slot", syn::parse_quote!(u32)),
             ("layer", syn::parse_quote!(u32)),
-            (
-                "weight_fn",
-                syn::parse_quote!(
-                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                ),
-            ),
             ("n", syn::parse_quote!(u32)),
             ("k", syn::parse_quote!(u32)),
             ("group_size", syn::parse_quote!(u32)),

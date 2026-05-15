@@ -25,7 +25,8 @@ use crate::codegen::split_base_layer;
 use crate::emit::weight_field_name;
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, SlotMap, WeightAccessor, WorkloadConstraint, weight_storage_of,
+    Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint,
+    weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -194,12 +195,6 @@ impl Implementation for MetalAffineEmbedImpl {
             "AffineEmbed",
             vec![
                 ("out_slot", syn::parse_quote!(u32)),
-                (
-                    "weight_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::AffineQuantEmbedding
-                    ),
-                ),
                 ("group_size", syn::parse_quote!(u32)),
                 ("bits", syn::parse_quote!(u32)),
             ],
@@ -237,15 +232,22 @@ impl Implementation for MetalAffineEmbedImpl {
         let gs_lit = proc_macro2::Literal::u32_unsuffixed(group_size);
         let bits_lit = proc_macro2::Literal::u32_unsuffixed(bits);
 
+        // Weight resolution moves to the tape-level WeightAccessors
+        // impl (see `ferrite-forward::instr::WeightAccessors::
+        // affine_quant_embedding_at`); record the named accessor so
+        // the macro emits the right match arm at this op position.
         Some(vec![OpInstance::new(
             syn::Ident::new("AffineEmbed", proc_macro2::Span::call_site()),
             vec![
                 quote! { #out_slot },
-                quote! { Weights::#base_ident },
                 quote! { #gs_lit },
                 quote! { #bits_lit },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::AffineQuantEmbedding,
+            base: base_ident,
+        })])
     }
 }
 

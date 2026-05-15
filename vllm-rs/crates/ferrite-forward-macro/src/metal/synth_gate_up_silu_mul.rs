@@ -20,7 +20,7 @@ use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     consumes_tile, default_required_weights, weight_storage_of, CostCtx, Handoff, Implementation,
     LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor,
-    WorkloadConstraint,
+    WeightKind, WeightSlot, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -190,18 +190,6 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
                 ("x_norm_slot", syn::parse_quote!(u32)),
                 ("out_slot",    syn::parse_quote!(u32)),
                 ("layer",       syn::parse_quote!(u32)),
-                (
-                    "gate_wt_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
-                (
-                    "up_wt_fn",
-                    syn::parse_quote!(
-                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                    ),
-                ),
                 ("group_size", syn::parse_quote!(u32)),
                 ("bits",       syn::parse_quote!(u32)),
                 ("kernel_symbol", syn::parse_quote!(&'static str)),
@@ -255,13 +243,12 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         let gate_acc = acc_for(gate_tile)?;
         let up_acc   = acc_for(up_tile)?;
 
-        let to_wt = |acc: &WeightAccessor| -> proc_macro2::TokenStream {
+        let to_base = |acc: &WeightAccessor| -> syn::Ident {
             let (base, _) = split_base_layer(&acc.name.to_string());
-            let ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-            quote! { Weights::#ident }
+            syn::Ident::new(&base, proc_macro2::Span::call_site())
         };
-        let gate_wt = to_wt(&gate_acc);
-        let up_wt   = to_wt(&up_acc);
+        let gate_base = to_base(&gate_acc);
+        let up_base   = to_base(&up_acc);
 
         let (gs, bits) = match weight_storage_of(fuf.get(gate_tile)) {
             Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
@@ -299,12 +286,18 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
                 quote! { #x_norm_slot },
                 quote! { #out_slot },
                 quote! { #layer_lit },
-                gate_wt,
-                up_wt,
                 quote! { #gs_lit },
                 quote! { #bits_lit },
                 quote! { #symbol_lit },
             ],
-        )])
+        )
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: gate_base,
+        })
+        .with_weight_slot(WeightSlot {
+            kind: WeightKind::Linear,
+            base: up_base,
+        })])
     }
 }

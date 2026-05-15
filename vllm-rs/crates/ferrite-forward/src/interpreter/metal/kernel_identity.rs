@@ -40,21 +40,20 @@ use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 use super::kernel_bindings::AttentionPrefillPagedBindingSet;
 use super::kernel_constants::AttentionPrefillPagedConstants;
 use super::lowered::{Binding, KernelId};
-use crate::CanonicalParams;
 
 /// One-of identifier for a single kernel pipeline + its parameter
 /// shape. Each `MetalKernel` impl wires the static
 /// `(library, function, KernelId)` trio that the worker walks at
 /// dispatch time, plus the per-call typed `Constants` and `BindingSet`
 /// types it accepts.
-pub trait MetalKernel<W: CanonicalParams> {
+pub trait MetalKernel {
     /// Per-call function-constants struct (Phase 2). The trait's
     /// `for_kernel` constructor calls `.into()` to lower to the
     /// existing `Vec<ConstantValue>` wire format.
     type Constants: Into<Vec<ConstantValue>>;
 
     /// Per-call binding-set struct (Phase 3).
-    type BindingSet: Into<Vec<Binding<W>>>;
+    type BindingSet: Into<Vec<Binding>>;
 
     /// `.metallib` file (matches the keys
     /// `SpecializedPipelineCache::with_standard_shaders` registers).
@@ -75,7 +74,7 @@ pub trait MetalKernel<W: CanonicalParams> {
 /// steel template).
 pub struct AttentionSteelPagedBf16;
 
-impl<W: CanonicalParams> MetalKernel<W> for AttentionSteelPagedBf16 {
+impl MetalKernel for AttentionSteelPagedBf16 {
     type Constants = AttentionPrefillPagedConstants;
     type BindingSet = AttentionPrefillPagedBindingSet;
     const LIBRARY: &'static str = "attention_steel_paged";
@@ -87,7 +86,7 @@ impl<W: CanonicalParams> MetalKernel<W> for AttentionSteelPagedBf16 {
 /// `attention_steel_paged_f16_bq32_bk16_bd128_wm4_wn1_bs16`.
 pub struct AttentionSteelPagedF16;
 
-impl<W: CanonicalParams> MetalKernel<W> for AttentionSteelPagedF16 {
+impl MetalKernel for AttentionSteelPagedF16 {
     type Constants = AttentionPrefillPagedConstants;
     type BindingSet = AttentionPrefillPagedBindingSet;
     const LIBRARY: &'static str = "attention_steel_paged";
@@ -101,7 +100,7 @@ impl<W: CanonicalParams> MetalKernel<W> for AttentionSteelPagedF16 {
 /// `FERRITE_METAL_STEEL_ATTN=0`).
 pub struct AttentionSdpaPagedBf16;
 
-impl<W: CanonicalParams> MetalKernel<W> for AttentionSdpaPagedBf16 {
+impl MetalKernel for AttentionSdpaPagedBf16 {
     type Constants = AttentionPrefillPagedConstants;
     type BindingSet = AttentionPrefillPagedBindingSet;
     const LIBRARY: &'static str = "attention";
@@ -112,7 +111,7 @@ impl<W: CanonicalParams> MetalKernel<W> for AttentionSdpaPagedBf16 {
 /// `attention_prefill_sdpa_v2_paged_f16_specialized`.
 pub struct AttentionSdpaPagedF16;
 
-impl<W: CanonicalParams> MetalKernel<W> for AttentionSdpaPagedF16 {
+impl MetalKernel for AttentionSdpaPagedF16 {
     type Constants = AttentionPrefillPagedConstants;
     type BindingSet = AttentionPrefillPagedBindingSet;
     const LIBRARY: &'static str = "attention";

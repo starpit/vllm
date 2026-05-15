@@ -16,7 +16,6 @@
 //! the per-bucket ICB is fully baked).
 
 use super::ids::{BucketM, LayerId};
-use crate::CanonicalParams;
 use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
 /// One-of identifier for the kernel a `LoweredCommand` invokes.
@@ -313,36 +312,30 @@ impl DispatchShape {
 /// Where the worker should source the buffer for a binding at worker
 /// init time.
 ///
-/// `LoweredMetalTape` is parameterized by `W: CanonicalParams` so the
-/// lowering pass can carry weight-resolution thunks (`WtFn<W, L>`)
-/// through to the worker without committing to a specific Metal weight
-/// representation here. The worker resolves these thunks at ICB-record
-/// time: it calls the `WtFn` against the loaded `&Weights` to get a
-/// `&Layer` struct, pulls out the requested `GpuTensor`, and asks the
-/// `MetalAllocator` which arena buffer + offset that pointer belongs
-/// to.
-pub enum Binding<W: CanonicalParams> {
+/// Weight bindings carry a `(bucket, op_idx, slot, kind)` locator the
+/// worker passes into the per-arch [`crate::WeightAccessors`] impl at
+/// ICB-record time to recover the `&Layer` struct (`linear_at`,
+/// `rms_norm_at`, etc.). The resolved tensor's pointer is then looked
+/// up against the `MetalAllocator`'s arena registry. No fn pointers
+/// live here, so `Binding` is fully backend-neutral.
+pub enum Binding {
     /// `MetalWorker.arena[slot]` — the worker's private tile-arena
     /// buffer for this slot. The arena is sized for the colored
     /// `NUM_TILES` post-FUF coloring (linear-scan reg allocation
     /// performed by `colored_slot_map()` in
     /// `ferrite-forward-macro/src/interpreter_codegen.rs`).
     ArenaSlot { slot: u32, binding_index: u8 },
-    /// A weight bundle resolved at ICB-record time by calling the
-    /// `WtFn` against `&Weights` and looking the resulting tensor's
-    /// raw pointer up in the `MetalAllocator`'s arena registry. The
-    /// thunk + layer index are carried verbatim from the source
-    /// `Instruction<W>` variant; the worker walks them once and
-    /// records the resulting buffer pointers into the ICB.
-    ///
-    /// `which` selects which of the bundle's tensors this binding
-    /// targets — RmsNorm has only `weight`, but `LinearLayer` exposes
-    /// `weight` + optional `bias`, and `RopeAppend` consumes the
-    /// per-layer cos/sin pair. The worker resolves it.
+    /// A weight bundle resolved at ICB-record time through the per-arch
+    /// [`crate::WeightAccessors`] impl. `locator` is the
+    /// `(bucket, op_idx, slot)` triple the macro baked at codegen time;
+    /// the trait method picked by `kind` returns the named field on
+    /// `Weights`. `which` then selects which tensor inside the bundle
+    /// to bind (e.g. weight vs bias vs affine scales).
     Weight {
-        kind: WeightBundleKind<W>,
+        kind: WeightBundleKind,
         which: WeightTensor,
         layer: LayerId,
+        locator: WeightLocator,
         binding_index: u8,
     },
     /// A buffer drawn from `ForwardCtx`-equivalent runtime state at
@@ -370,25 +363,47 @@ pub enum Binding<W: CanonicalParams> {
     Scratch { binding_index: u8 },
 }
 
-/// Discriminator over the typed weight thunks `Instruction<W>` carries.
+/// Per-bundle locator for the macro-emitted `WeightAccessors` impl.
+/// The worker invokes the matching `<kind>_at(bucket, op_idx, slot,
+/// layer)` method to recover the `&Layer` reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WeightLocator {
+    /// Bucket id baked at codegen — matches the bucket axis of the
+    /// per-arch `WeightAccessors` match arm.
+    pub bucket: u32,
+    /// Flat tape position of the source `Instruction` (post loop
+    /// unrolling for backbone slices; absolute index in the lm_head
+    /// slice for lm_head).
+    pub op_idx: u32,
+    /// Sub-position within the same `(bucket, op_idx)` for variants
+    /// that resolve multiple accessors of the same kind — e.g.
+    /// `SynthPreAttn` consumes 3 `LinearLayer`s (Q/K/V at slots 0/1/2).
+    pub slot: u32,
+}
+
+/// Discriminator selecting which per-arch [`crate::WeightAccessors`]
+/// method the worker should call to resolve this binding.
 ///
-/// Stays generic over `W` so the lowering pass doesn't have to convert
-/// `WtFn<W, RmsNorm>` to a backend-neutral type; the worker (Phase
-/// 5.C) handles the bridge to Metal weight buffers.
-pub enum WeightBundleKind<W: CanonicalParams> {
-    Embedding(crate::WtFn<W, ferrite_kernels::layers::Embedding>),
-    RmsNorm(crate::WtFn<W, ferrite_kernels::layers::RmsNorm>),
-    LinearLayer(crate::WtFn<W, ferrite_kernels::layers::LinearLayer>),
-    /// RoPE cos/sin table lookup: `CosSinFn<W>` returns the per-layer
-    /// table directly (no struct wrapper).
-    CosSin(crate::CosSinFn<W>),
-    /// MLX-affine int4 quantized embedding (Metal-only). Carries the
-    /// packed U32 weight + F16 scales + F16 affine offsets the
-    /// `affine_embed` kernel reads. P6 macro emission decides between
-    /// this and `Embedding` per-layer based on safetensors layout
-    /// (U32 weight ⇒ AffineQuantEmbedding, else Embedding).
+/// Pure tag — fn pointers are gone after the lift; weight resolution
+/// lives at the tape level via `(bucket, op_idx, slot)` keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightBundleKind {
+    /// Calls `WeightAccessors::embedding_at` → `&Embedding`.
+    Embedding,
+    /// Calls `WeightAccessors::rms_norm_at` → `&RmsNorm`.
+    RmsNorm,
+    /// Calls `WeightAccessors::linear_at` → `&LinearLayer`.
+    LinearLayer,
+    /// Calls `WeightAccessors::cos_sin_at` → `GpuTensor` (per-layer
+    /// RoPE table; no struct wrapper).
+    CosSin,
+    /// MLX-affine int4 quantized embedding (Metal-only). Calls
+    /// `WeightAccessors::affine_quant_embedding_at` →
+    /// `&AffineQuantEmbedding`. P6 macro emission decides between this
+    /// and `Embedding` per-layer based on safetensors layout (U32
+    /// weight ⇒ AffineQuantEmbedding, else Embedding).
     #[cfg(feature = "metal")]
-    AffineQuantEmbedding(crate::WtFn<W, ferrite_kernels::layers::AffineQuantEmbedding>),
+    AffineQuantEmbedding,
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding
@@ -476,7 +491,7 @@ pub enum RuntimeBindingKind {
 /// dims-keyed builder).
 ///
 /// [`PipelineKey`]: ferrite_metal_kernels::specialized_pipeline_cache::PipelineKey
-pub struct LoweredCommand<W: CanonicalParams> {
+pub struct LoweredCommand {
     pub kernel: KernelId,
     /// Compiled-metallib name the kernel symbol lives in (matches the
     /// `&'static str` keys [`SpecializedPipelineCache::with_standard_shaders`]
@@ -495,7 +510,7 @@ pub struct LoweredCommand<W: CanonicalParams> {
     /// name signals "this is the opaque GEMM path."
     pub constants: Vec<ConstantValue>,
     pub dispatch: DispatchShape,
-    pub bindings: Vec<Binding<W>>,
+    pub bindings: Vec<Binding>,
     /// Dense-GEMM dimensions when `kernel == KernelId::Gemm`; `None`
     /// for every other kernel. The worker reads `(m, n, k)` from
     /// here when encoding the MPS dispatch (5.C.5 routing).
@@ -505,7 +520,7 @@ pub struct LoweredCommand<W: CanonicalParams> {
     pub gemm_dims: Option<GemmDims>,
 }
 
-impl<W: CanonicalParams> LoweredCommand<W> {
+impl LoweredCommand {
     /// Construct from a [`MetalKernel`] ZST. The trait carries
     /// `LIBRARY`, `FUNCTION`, and `KERNEL_ID` so the trio can't drift
     /// out of sync. The typed Constants / BindingSet structs from
@@ -516,7 +531,7 @@ impl<W: CanonicalParams> LoweredCommand<W> {
     /// str` — attention, etc. Kernels whose symbol is composed at
     /// lowering time (qmv / qmm_t / synth_*) keep the struct-literal
     /// `LoweredCommand { kernel, library, function, ... }` form.
-    pub fn for_kernel<K: super::kernel_identity::MetalKernel<W>>(
+    pub fn for_kernel<K: super::kernel_identity::MetalKernel>(
         constants: K::Constants,
         bindings: K::BindingSet,
         dispatch: DispatchShape,
@@ -550,7 +565,7 @@ pub struct GemmDims {
 
 /// One bucket's lowered tape — the input the `MetalWorker` walks at
 /// init time to record its per-bucket ICB.
-pub struct LoweredMetalTape<W: CanonicalParams> {
+pub struct LoweredMetalTape {
     /// Bucket M (number of tokens this tape was specialized for).
     /// Used by the worker to pick the right specialized pipeline
     /// (Phase 5.B) and the right runtime-buffer shapes.
@@ -559,7 +574,7 @@ pub struct LoweredMetalTape<W: CanonicalParams> {
     /// count). The worker allocates exactly this many arena buffers
     /// per shape class.
     pub num_arena_slots: u32,
-    pub commands: Vec<LoweredCommand<W>>,
+    pub commands: Vec<LoweredCommand>,
     /// MTL4 encoder barrier-before flag per command, mirroring
     /// `commands.len()`. Sourced from the macro-emitted
     /// `MetalBucketSpec::{backbone,lm_head}_barriers` slice (one

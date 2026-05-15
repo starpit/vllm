@@ -570,36 +570,6 @@ fn synth_pre_attn_opcode_shape() -> OpcodeShape {
             ("delta_slot", syn::parse_quote!(u32)),
             ("out_slot", syn::parse_quote!(u32)),
             ("layer", syn::parse_quote!(u32)),
-            (
-                "q_weight_fn",
-                syn::parse_quote!(
-                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                ),
-            ),
-            (
-                "k_weight_fn",
-                syn::parse_quote!(
-                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                ),
-            ),
-            (
-                "v_weight_fn",
-                syn::parse_quote!(
-                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
-                ),
-            ),
-            (
-                "rms_weight_fn",
-                syn::parse_quote!(
-                    for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
-                ),
-            ),
-            (
-                "cos_sin_fn",
-                syn::parse_quote!(
-                    for<'a> fn(&'a Weights, u32) -> ::ferrite_cuda_core::tensor::GpuTensor
-                ),
-            ),
             ("group_size", syn::parse_quote!(u32)),
             ("bits", syn::parse_quote!(u32)),
             ("kernel_symbol", syn::parse_quote!(&'static str)),

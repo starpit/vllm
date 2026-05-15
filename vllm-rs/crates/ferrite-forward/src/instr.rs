@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Universal interpreter instruction set.
 //!
-//! `Instruction<W>` is a closed enum over every kernel-call shape
-//! any solver-picked `Implementation` produces. The match on
-//! `Instruction<W>::eval` lives ONCE in this module — not per
-//! canonical, not per arch. Each arm calls existing kernels in
-//! `ferrite-kernels` directly. Per-canonical specialization flows
-//! through:
+//! `Instruction` is a closed enum over every kernel-call shape any
+//! solver-picked `Implementation` produces. The match in
+//! `Instruction::eval` lives ONCE in this module — not per canonical,
+//! not per arch. Each arm calls existing kernels in `ferrite-kernels`
+//! directly. Per-canonical specialization flows through method-level
+//! generics:
 //!
-//! 1. `W` — the per-canonical `Weights` type. Each variant's
-//!    `weight_fn` field is `for<'a> fn(&'a W, u32) -> &'a Layer`,
-//!    so the same enum dispatches against any concrete `Weights`.
-//! 2. [`CanonicalParams`] — trait implemented per canonical with
-//!    associated `const`s for model-wide values (head_dim,
-//!    intermediate_size, attn_scale, …). Eval bodies read these
-//!    as `W::HEAD_DIM` etc., never as runtime fields.
+//! 1. `eval<W: CanonicalParams>` reads model constants via
+//!    `W::HEAD_DIM` etc. and weight tensors via the
+//!    [`WeightAccessors`] trait — `ctx.wm.<kind>_at(bucket, op_idx,
+//!    slot, layer)`. The proc-macro emits a per-arch
+//!    `WeightAccessors` impl whose body matches on
+//!    `(bucket, op_idx, slot)` to resolve the named field on
+//!    `Weights`. The variant itself carries no weight info.
+//! 2. [`CanonicalParams`] supertype — trait implemented per
+//!    canonical with associated `const`s for model-wide values
+//!    (`HEAD_DIM`, `INTERMEDIATE_SIZE`, `ATTN_SCALE`, …).
 //!
-//! Per canonical the macro emits ONLY: a `Weights` struct,
-//! `impl CanonicalParams for Weights { … }`, static
-//! `&[Instruction<Weights>]` slices for backbone + lm_head per
-//! bucket, and a 1-line forward shim that delegates to [`run`].
-//! No `__dispatch_one`, no `__interpret`, no per-canonical `Op`.
+//! Per canonical the macro emits: a `Weights` struct,
+//! `impl CanonicalParams for Weights { … }`,
+//! `impl WeightAccessors for Weights { … }`, static
+//! `&[Instruction]` slices for backbone + lm_head per bucket, and a
+//! 1-line forward shim that delegates to [`run`].
 
 // File compiles under either `cuda` or `metal`:
 // - The `Instruction<W>` enum, `CanonicalParams` trait, and `WtFn`/`CosSinFn`
@@ -34,6 +37,9 @@
 // `ferrite_kernels::layers`/`layers_moe`; those modules and their re-exports
 // are now ungated at the lib.rs level (see `ferrite-kernels/src/lib.rs`).
 
+// Cross-backend imports — layer types appear in `WeightAccessors`
+// trait signatures (return types) and `Instruction` variant doc
+// references; both need them under cuda AND metal.
 use ferrite_cuda_core::tensor::{GpuTensor, MAX_DIMS};
 #[cfg(feature = "metal")]
 use ferrite_kernels::layers::AffineQuantEmbedding;
@@ -44,6 +50,9 @@ use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
     SharedFusedMoELayer,
 };
+// Cuda-only imports (eval body, runtime entry points) — gated
+// individually below so the metal-feature build only pulls in the
+// cross-backend pieces above.
 
 #[cfg(feature = "cuda")]
 use crate::ForwardCtx;
@@ -66,7 +75,7 @@ use ferrite_kernels::kernels;
 /// `Weights` so the universal `Instruction::eval` body can read
 /// model constants without storing them on every variant instance.
 /// Defaults to 0 / 0.0 / -1 for fields the canonical doesn't use.
-pub trait CanonicalParams {
+pub trait CanonicalParams: WeightAccessors {
     const HEAD_DIM: u32;
     const NUM_Q_HEADS: u32;
     const NUM_KV_HEADS: u32;
@@ -229,6 +238,175 @@ pub trait CanonicalParams {
     const HAS_MOE: bool = false;
 }
 
+/// Per-arch weight-accessor dispatch trait.
+///
+/// Each per-`L` method matches on `(bucket, op_idx)` against the
+/// closed set of weight-consuming positions the proc-macro emitted
+/// for this arch. Replaces the `WtFn<W, L>` / `CosSinFn<W>` fn-
+/// pointer fields previously stored on `Instruction<W>` variants
+/// AND the parallel `WeightAccessorIdx` array.
+///
+/// Why `(bucket, op_idx)`: the `Instruction` variant determines the
+/// *kind* of weight (RmsNorm always consumes an RmsNorm). What
+/// varies per call site is *which named field* on `Weights` the per-
+/// arch impl returns. The bucket id + position-in-bucket fully
+/// identify the call site; the layer disambiguates the slice.
+///
+/// Per-arch impls are macro-generated — see
+/// `ferrite-forward-macro::codegen::emit_weight_accessors_impl`.
+///
+/// Sibling methods cover every weight kind: `rms_norm_at`,
+/// `embedding_at`, `linear_at`, `layer_norm_at`, `marlin_at`,
+/// `bnb4_at`, `fp8_at`, the four MoE getters, and `cos_sin_at`.
+/// Default bodies all `unreachable!()` so per-arch impls only
+/// override the methods their generated tape actually exercises.
+/// Each method matches on `(bucket, op_idx, slot)` to resolve the
+/// named weight at this tape call site. `slot` disambiguates
+/// multiple accessors of the same kind at the same position
+/// (e.g. `FusedQkvQkNormRopeCache` consumes 3 LinearLayers — q_proj,
+/// k_proj, v_proj — all at the same `op_idx`; their `slot`s are
+/// 0, 1, 2). For variants with one accessor per kind, `slot` is
+/// always 0.
+///
+/// Default bodies all `unreachable!()` so per-arch impls only
+/// override the methods their generated tape actually calls.
+///
+/// Cross-backend: both the cuda eval body and the metal worker call
+/// into the same per-arch impl emitted by
+/// `ferrite-forward-macro::codegen::emit_weight_accessors_impl`.
+pub trait WeightAccessors {
+    fn rms_norm_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::RmsNorm {
+        unreachable!("rms_norm_at not implemented for this arch")
+    }
+    fn embedding_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::Embedding {
+        unreachable!("embedding_at not implemented for this arch")
+    }
+    fn linear_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::LinearLayer {
+        unreachable!("linear_at not implemented for this arch")
+    }
+    fn layer_norm_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::LayerNorm {
+        unreachable!("layer_norm_at not implemented for this arch")
+    }
+    fn marlin_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::MarlinLinear {
+        unreachable!("marlin_at not implemented for this arch")
+    }
+    fn bnb4_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::Bnb4bitLinear {
+        unreachable!("bnb4_at not implemented for this arch")
+    }
+    fn fp8_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::Fp8AnyLinear {
+        unreachable!("fp8_at not implemented for this arch")
+    }
+    fn deepseek_moe_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers_moe::DeepSeekV2MoELayer {
+        unreachable!("deepseek_moe_at not implemented for this arch")
+    }
+    fn deepseek_moe_fp8_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers_moe::DeepSeekV2Fp8BlockMoELayer {
+        unreachable!("deepseek_moe_fp8_at not implemented for this arch")
+    }
+    fn deepseek_moe_ggml_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer {
+        unreachable!("deepseek_moe_ggml_at not implemented for this arch")
+    }
+    fn fused_moe_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers_moe::FusedMoELayer {
+        unreachable!("fused_moe_at not implemented for this arch")
+    }
+    fn shared_fused_moe_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers_moe::SharedFusedMoELayer {
+        unreachable!("shared_fused_moe_at not implemented for this arch")
+    }
+    fn cos_sin_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> ::ferrite_cuda_core::tensor::GpuTensor {
+        unreachable!("cos_sin_at not implemented for this arch")
+    }
+    /// Metal-only: MLX-affine int4 quantized embedding. Resolves the
+    /// `AffineQuantEmbedding` field on `Weights` for the
+    /// `Instruction::AffineEmbed` lowering.
+    #[cfg(feature = "metal")]
+    fn affine_quant_embedding_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::AffineQuantEmbedding {
+        unreachable!("affine_quant_embedding_at not implemented for this arch")
+    }
+}
+
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
 /// Constants live on `W: CanonicalParams`, NOT here.
 #[cfg(feature = "cuda")]
@@ -264,25 +442,30 @@ pub struct InterpreterCtx<'a, W> {
     pub pinned_owned: Vec<OwnedTensor>,
 }
 
-// Type aliases for variant fields.
-pub type WtFn<W, L> = for<'a> fn(&'a W, u32) -> &'a L;
-pub type CosSinFn<W> = for<'a> fn(&'a W, u32) -> GpuTensor;
-
 /// Universal opcode set. Tuple variants throughout — keeps each
 /// row in a per-canonical static slice on a single line of cargo
 /// expand. Field order per variant matches the per-Impl
 /// `OpcodeShape::fields` order in `impl_lib.rs`.
+///
+/// No longer generic over `W` — every variant lost its `WtFn<W, L>` /
+/// `CosSinFn<W>` field when fan_out moved weight resolution to the
+/// per-arch `WeightAccessors` trait at the tape level. `W` lives only
+/// on `eval<W: CanonicalParams>` and `run<W>` / `run_backbone<W>` as
+/// method-level generics, parameterizing the interpreter's access to
+/// per-canonical model constants without polluting every static row.
 #[allow(clippy::type_complexity)]
-pub enum Instruction<W> {
-    Embed(u32, WtFn<W, Embedding>),
-    RmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
+pub enum Instruction {
+    Embed(u32),
+    /// `RmsNorm(in_slot, out_slot, layer)`. Weight accessor lives
+    /// at the tape level — see [`Tape`].
+    RmsNorm(u32, u32, u32),
     /// CohereLayerNorm-flavored norm (subtracts mean before scaling).
     /// Claimed from the `(mean, sub, rmsnorm)` math trio in the DSL.
     /// Weight is typed `RmsNorm` because the DSL author writes
     /// `rmsnorm(centered, w)`; the wrapper struct is structurally
     /// identical to the now-retired `CohereLayerNorm` (one `weight`
     /// + one `eps`), and the kernel reads only those two fields.
-    MeanSubRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
+    MeanSubRmsNorm(u32, u32, u32),
     /// Torch-style LayerNorm with bias. Claimed from the 4-tile pattern
     /// `(mean, sub, rmsnorm, bias_add)` in the DSL — extends the
     /// `MeanSubRmsNorm` math trio with a learned bias addition. Weight
@@ -294,7 +477,7 @@ pub enum Instruction<W> {
     /// dense `(Gemm, BiasAdd)` fusion plays via `LinearLayer`.
     /// Used by encoder models like ModernBERT and vision towers like
     /// Qwen2-VL.
-    MeanSubRmsNormBiasAdd(u32, u32, u32, WtFn<W, LayerNorm>),
+    MeanSubRmsNormBiasAdd(u32, u32, u32),
     /// `Reshape(in_slot, out_slot, dims_lit, dims_nt_pow, dims_div_lit, ndim)`.
     /// Output axis i is computed as
     /// `(dims_lit[i] * num_tokens^dims_nt_pow[i]) / dims_div_lit[i]`.
@@ -335,42 +518,20 @@ pub enum Instruction<W> {
     SpliceMmEmbeds(u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
-    FusedAddRmsNorm(u32, u32, u32, WtFn<W, RmsNorm>),
-    FusedAddRmsNormWithOffset(u32, u32, u32, f32, WtFn<W, RmsNorm>),
-    ScalarOffsetRmsNorm(u32, u32, u32, f32, WtFn<W, RmsNorm>),
+    FusedAddRmsNorm(u32, u32, u32),
+    FusedAddRmsNormWithOffset(u32, u32, u32, f32),
+    ScalarOffsetRmsNorm(u32, u32, u32, f32),
     /// Norm→Gemm fusion: `cutlass_gemm(rms_norm(in), gemm_w)`. The
     /// CUTLASS tile is bucket-pickable per `CUTLASS_TILE_ZOO` entry.
     /// Reuses existing `kernels::rms_norm` + `cutlass::cutlass_gemm`
     /// — no new .cu file. Matches body norms whose only downstream
     /// consumer is a single dense Gemm.
-    CutlassFusedRmsNormGemm(
-        u32,
-        u32,
-        u32,
-        WtFn<W, RmsNorm>,
-        WtFn<W, LinearLayer>,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
+    CutlassFusedRmsNormGemm(u32, u32, u32, u32, u32, u32, u32, u32),
     /// Norm→Gemm fusion for CohereLayerNorm-flavored norms.
     /// Claimed from the `(mean, sub, rmsnorm, gemm)` 4-tile pattern
     /// where the Gemm is the sole consumer of the rmsnorm output.
     /// Runs `cohere_layer_norm` then `cutlass_gemm` sequentially.
-    CutlassFusedMeanSubRmsNormGemm(
-        u32,
-        u32,
-        u32,
-        WtFn<W, RmsNorm>,
-        WtFn<W, LinearLayer>,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
+    CutlassFusedMeanSubRmsNormGemm(u32, u32, u32, u32, u32, u32, u32, u32),
     /// (Add, RmsNorm, Gemm) 3-tile fusion. Claim shape captures
     /// the lm_head canonical pattern `x = x + delta; logits =
     /// lm_head(rmsnorm(x))`. Runtime: `fused_add_rms_norm_inplace`
@@ -378,26 +539,14 @@ pub enum Instruction<W> {
     /// a TensorView aliasing the residual upstream OwnedTensor (same
     /// alias semantics as `FusedAddRmsNorm`); the Gemm output is a
     /// fresh OwnedTensor.
-    CutlassFusedAddRmsNormGemm(
-        u32,
-        u32,
-        u32,
-        u32,
-        WtFn<W, RmsNorm>,
-        WtFn<W, LinearLayer>,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
-    Gemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
+    CutlassFusedAddRmsNormGemm(u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    Gemm(u32, u32, u32, u32, u32),
     /// cuBLAS-side peer to `CutlassGemmAdd`. cuBLAS GEMM produces a
     /// delta; `add_inplace` then folds it into the residual buffer.
     /// Output is the residual upstream's OwnedTensor (aliased via
     /// the codegen prelude); no `out_slot` payload.
-    FusedCublasGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
-    FusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>),
+    FusedCublasGemmAdd(u32, u32, u32, u32, u32),
+    FusedGemmBias(u32, u32, u32),
     /// Metal-only per-row bias broadcast add. Emitted by
     /// `MetalBiasAddImpl` when the synth-pre-attn megakernel doesn't
     /// claim the biased QKV chain (today: M ≥ 2 prefill, where the
@@ -408,42 +557,20 @@ pub enum Instruction<W> {
     /// / Gemm; once the synth path absorbs biases the solver will
     /// prefer that over this singleton on decode workloads.
     ///
-    /// Fields: `(in_slot, out_slot, layer, weight_fn, n, is_affine)`.
-    /// `weight_fn` resolves to a `LinearLayer` whose `.bias` (Dense)
-    /// or `.linear_bias` (AffineQuant) is bound at the kernel's
-    /// `buffer(1)`; `is_affine` discriminates so the worker resolves
-    /// the right `WeightTensor` arm. `n` is the bias's broadcast
-    /// dimension — baked into the specialized pipeline as
-    /// `function_constant(0)`.
-    MetalBiasAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, bool),
-    FusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
-    FusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
-    FusedQkvRopeCache(u32, u32, u32, WtFn<W, LinearLayer>, CosSinFn<W>, bool, bool),
-    FusedQkvQkNormRopeCache(
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        WtFn<W, LinearLayer>,
-        WtFn<W, LinearLayer>,
-        WtFn<W, RmsNorm>,
-        WtFn<W, RmsNorm>,
-        CosSinFn<W>,
-        f32,
-        f32,
-    ),
-    FusedQkvRopePrefill(
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        CosSinFn<W>,
-        bool,
-        bool,
-    ),
-    AttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
+    /// Fields: `(in_slot, out_slot, layer, n, is_affine)`. Bias is
+    /// resolved through the tape-level `WeightAccessors::linear_at`
+    /// at the macro-emitted `(bucket, op_idx, slot=0, layer)` site;
+    /// `is_affine` tells the worker whether to pull `LinearLayer::Dense
+    /// .bias` or `LinearLayer::AffineQuant.linear_bias`. `n` is the
+    /// bias's broadcast dimension — baked into the specialized
+    /// pipeline as `function_constant(0)`.
+    MetalBiasAdd(u32, u32, u32, u32, bool),
+    FusedGateUpSiluMul(u32, u32, u32),
+    FusedGateUpGeluMul(u32, u32, u32),
+    FusedQkvRopeCache(u32, u32, u32, bool, bool),
+    FusedQkvQkNormRopeCache(u32, u32, u32, f32, f32),
+    FusedQkvRopePrefill(u32, u32, u32, u32, u32, bool, bool),
+    AttentionViaCache(u32, u32, u32, bool),
     AttentionPrefillContiguous(u32, u32, u32, u32, bool),
     /// Prefill attention reading K/V from the paged KV cache via
     /// block_table indirection. `(q_slot, out_slot, layer, interleaved)`.
@@ -469,7 +596,7 @@ pub enum Instruction<W> {
     /// must already be 3D `[T, heads, head_dim]` from the upstream
     /// projection chain. Output is reshaped to `[T, Q_SIZE]`.
     EncoderAttention(u32, u32, u32, u32),
-    SlidingAttentionViaCache(u32, u32, u32, CosSinFn<W>, bool),
+    SlidingAttentionViaCache(u32, u32, u32, bool),
     SlidingAttentionPrefillContiguous(u32, u32, u32, u32, bool),
     /// Vision-tower variable-length attention: `(q_slot, k_slot,
     /// v_slot, out_slot, cu_seqlens_kind)`. The `cu_seqlens_kind`
@@ -518,7 +645,7 @@ pub enum Instruction<W> {
     /// table dim 0 is `vision_num_positions` (not `vocab_size`); the
     /// `OpKind::PosEmbed` shape sig anchors on the vision bound names
     /// so the macro emits a `Weights` field of the right type.
-    PosEmbed(u32, WtFn<W, Embedding>),
+    PosEmbed(u32),
     /// Materialize the vision-prelude `pixels` extern as a tile:
     /// `(out_slot)`. Reads `ctx.fwd.pixels` (the rank-2
     /// `[num_tokens, vision_in_features]` view the
@@ -559,107 +686,85 @@ pub enum Instruction<W> {
     /// fresh `OwnedTensor` of shape `[(ph/k)², e]`. Used by Gemma3-MM's
     /// SigLIP→text projector. Stride == kernel (non-overlapping).
     AvgPool2d(u32, u32),
-    FlashInferAttentionDecode(u32, u32, u32, CosSinFn<W>, u32, bool),
+    /// CLIP-class CLS-token strip: `(in_slot, out_slot)`. Reads the
+    /// rank-2 tile `[L, e]` from `in_slot` (where the CLS row has been
+    /// run through the encoder at row 0), copies rows `1..L` into a
+    /// fresh `OwnedTensor` of shape `[L - 1, e]`, and publishes that
+    /// at `out_slot`. No baked-in constant — input dims are read off
+    /// the source tile at runtime, so a misconfigured `vision_in_seq_len
+    /// = vision_num_positions - 1` invariant in the variant config
+    /// surfaces as a downstream shape mismatch (caught at expansion
+    /// time by the bound-resolved sig), not as a kernel panic. Used by
+    /// LLaVA-1.5 family with `vision_feature_select_strategy =
+    /// "default"`.
+    StripCls(u32, u32),
+    FlashInferAttentionDecode(u32, u32, u32, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
-    RopeAppend(u32, u32, u32, u32, u32, u32, u32, CosSinFn<W>, bool),
+    RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool),
     MlaSplit(u32, u32, u32),
-    MlaAttention(u32, u32, u32, u32, u32, CosSinFn<W>),
-    DeepSeekMoe(u32, u32, u32, WtFn<W, DeepSeekV2MoELayer>),
-    DeepSeekMoeFp8Block(u32, u32, u32, WtFn<W, DeepSeekV2Fp8BlockMoELayer>),
-    DeepSeekMoeGgml(u32, u32, u32, WtFn<W, DeepSeekV2GgmlMoELayer>),
+    MlaAttention(u32, u32, u32, u32, u32),
+    DeepSeekMoe(u32, u32, u32),
+    DeepSeekMoeFp8Block(u32, u32, u32),
+    DeepSeekMoeGgml(u32, u32, u32),
     /// Mixtral-style BF16 fused MoE (no shared expert). Top-k routing
     /// via softmax; experts are stacked `[E, 2*inter, hidden]` /
     /// `[E, hidden, inter]` and dispatched through the fused-MoE GEMM.
-    FusedMoe(u32, u32, u32, WtFn<W, FusedMoELayer>),
+    FusedMoe(u32, u32, u32),
     /// Qwen-MoE-style BF16 fused MoE PLUS shared expert with sigmoid
     /// gate. Routed experts use the same fused-MoE pipeline as
     /// `FusedMoe` (with `renormalize=true`); the shared expert is a
     /// SwiGLU MLP gated by `sigmoid(shared_expert_gate(x))`.
-    SharedFusedMoe(u32, u32, u32, WtFn<W, SharedFusedMoELayer>),
-    CutlassGemm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassGemmSplitK(
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
-    CutlassGemmAdd(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassGemv(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32),
-    CutlassFusedGemmBias(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32),
-    CutlassFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
-    CutlassFusedQkvRopeCache(
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        CosSinFn<W>,
-        bool,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
-    CutlassFusedQkvRopePrefill(
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        CosSinFn<W>,
-        bool,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-    ),
-    MarlinGemm(u32, u32, u32, WtFn<W, MarlinLinear>),
-    MarlinFusedGateUpSiluMul(u32, u32, u32, WtFn<W, MarlinLinear>),
-    MarlinFusedGateUpGeluMul(u32, u32, u32, WtFn<W, MarlinLinear>),
-    MarlinFusedQkvRopeCache(u32, u32, u32, WtFn<W, MarlinLinear>, CosSinFn<W>),
-    MarlinFusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, MarlinLinear>, CosSinFn<W>),
-    Bnb4Gemm(u32, u32, u32, WtFn<W, Bnb4bitLinear>),
-    Bnb4FusedGateUpSiluMul(u32, u32, u32, WtFn<W, Bnb4bitLinear>),
-    Bnb4FusedGateUpGeluMul(u32, u32, u32, WtFn<W, Bnb4bitLinear>),
-    Bnb4FusedQkvRopeCache(u32, u32, u32, WtFn<W, Bnb4bitLinear>, CosSinFn<W>),
-    Bnb4FusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, Bnb4bitLinear>, CosSinFn<W>),
-    GgmlGemm(u32, u32, u32, WtFn<W, LinearLayer>),
-    GgmlFusedGateUpSiluMul(u32, u32, u32, WtFn<W, LinearLayer>),
-    GgmlFusedGateUpGeluMul(u32, u32, u32, WtFn<W, LinearLayer>),
-    GgmlFusedQkvRopeCache(u32, u32, u32, WtFn<W, LinearLayer>, CosSinFn<W>, bool),
-    GgmlFusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, LinearLayer>, CosSinFn<W>),
-    Fp8Gemm(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
-    Fp8FusedGemmBias(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
-    Fp8FusedGateUpSiluMul(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
-    Fp8FusedGateUpGeluMul(u32, u32, u32, WtFn<W, Fp8AnyLinear>),
-    Fp8FusedQkvRopeCache(u32, u32, u32, WtFn<W, Fp8AnyLinear>, CosSinFn<W>),
-    Fp8FusedQkvRopePrefill(u32, u32, u32, u32, u32, WtFn<W, Fp8AnyLinear>, CosSinFn<W>),
+    SharedFusedMoe(u32, u32, u32),
+    CutlassGemm(u32, u32, u32, u32, u32, u32, u32, u32),
+    CutlassGemmSplitK(u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    CutlassGemmAdd(u32, u32, u32, u32, u32, u32, u32, u32),
+    CutlassGemv(u32, u32, u32, u32, u32),
+    CutlassFusedGemmBias(u32, u32, u32, u32, u32, u32, u32, u32),
+    CutlassFusedGateUpSiluMul(u32, u32, u32, u32, u32, u32),
+    CutlassFusedGateUpGeluMul(u32, u32, u32, u32, u32, u32, u32, u32),
+    CutlassFusedQkvRopeCache(u32, u32, u32, bool, u32, u32, u32, u32, u32),
+    CutlassFusedQkvRopePrefill(u32, u32, u32, u32, u32, bool, u32, u32, u32, u32, u32),
+    MarlinGemm(u32, u32, u32),
+    MarlinFusedGateUpSiluMul(u32, u32, u32),
+    MarlinFusedGateUpGeluMul(u32, u32, u32),
+    MarlinFusedQkvRopeCache(u32, u32, u32),
+    MarlinFusedQkvRopePrefill(u32, u32, u32, u32, u32),
+    Bnb4Gemm(u32, u32, u32),
+    Bnb4FusedGateUpSiluMul(u32, u32, u32),
+    Bnb4FusedGateUpGeluMul(u32, u32, u32),
+    Bnb4FusedQkvRopeCache(u32, u32, u32),
+    Bnb4FusedQkvRopePrefill(u32, u32, u32, u32, u32),
+    GgmlGemm(u32, u32, u32),
+    GgmlFusedGateUpSiluMul(u32, u32, u32),
+    GgmlFusedGateUpGeluMul(u32, u32, u32),
+    GgmlFusedQkvRopeCache(u32, u32, u32, bool),
+    GgmlFusedQkvRopePrefill(u32, u32, u32, u32, u32),
+    Fp8Gemm(u32, u32, u32),
+    Fp8FusedGemmBias(u32, u32, u32),
+    Fp8FusedGateUpSiluMul(u32, u32, u32),
+    Fp8FusedGateUpGeluMul(u32, u32, u32),
+    Fp8FusedQkvRopeCache(u32, u32, u32),
+    Fp8FusedQkvRopePrefill(u32, u32, u32, u32, u32),
     /// MLX-affine int4 matmul (transpose=true). Metal-only. The
-    /// `LinearLayer` resolved by `wt_fn` must be `AffineQuant` —
-    /// `lower_one` reads the quant accessors (packed weight, scales,
-    /// per-group affine biases, optional fp linear bias) through the
-    /// `WeightTensor::Affine*` arms in the worker resolver.
+    /// `LinearLayer` resolved through `WeightAccessors::linear_at`
+    /// must be `AffineQuant` — the metal worker reads the quant
+    /// accessors (packed weight, scales, per-group affine biases,
+    /// optional fp linear bias) through the `WeightTensor::Affine*`
+    /// arms.
     ///
-    /// Tuple fields: `(in_slot, out_slot, layer, wt_fn, n, k,
-    /// group_size, bits, vector_limit)`. `vector_limit` is the
-    /// matvec/matmul boundary from `get_qmv_batch_limit(K, N,
-    /// arch_gen)` (mirrors MLX `quantized.cpp:84`); the macro bakes
-    /// it at codegen time so `lower_one` can compare against
-    /// `bucket_m` without reaching for the target profile. M < limit
-    /// → qmv (decode-matvec); M ≥ limit → qmm_t (prefill-matmul,
-    /// SplitK heuristic deferred to C3).
+    /// Tuple fields: `(in_slot, out_slot, layer, n, k, group_size,
+    /// bits, vector_limit)`. Weight comes from
+    /// `WeightAccessors::linear_at(bucket, op_idx, slot=0, layer)`.
+    /// `vector_limit` is the matvec/matmul boundary from
+    /// `get_qmv_batch_limit(K, N, arch_gen)` (mirrors MLX
+    /// `quantized.cpp:84`); the macro bakes it at codegen time so
+    /// `lower_one` can compare against `bucket_m` without reaching
+    /// for the target profile. M < limit → qmv (decode-matvec);
+    /// M ≥ limit → qmm_t (prefill-matmul, SplitK heuristic deferred
+    /// to C3).
     ///
     /// CUDA eval is `unreachable!` — emit only on the metal forward.
-    AffineQmm(u32, u32, u32, WtFn<W, LinearLayer>, u32, u32, u32, u32, u32),
+    AffineQmm(u32, u32, u32, u32, u32, u32, u32, u32),
     /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
     /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
     /// write) into one dispatch. The kernel itself is generated at
@@ -670,13 +775,12 @@ pub enum Instruction<W> {
     /// `SpecializedPipelineCache` at worker-pool init.
     ///
     /// Tuple fields: `(residual_slot, delta_slot, q_out_slot, layer,
-    /// q_weight_fn, k_weight_fn, v_weight_fn, rms_weight_fn,
-    /// cos_sin_fn, group_size, bits, kernel_symbol)`.
-    ///
-    /// Three separate `WtFn<W, LinearLayer>`s (Q, K, V) instead of a
-    /// packed concat — each AffineQmm in the detected chain
-    /// contributes its own LinearLayer accessor. Avoids the load-time
-    /// packed-concat infrastructure that Phase 0's revert dropped.
+    /// group_size, bits, kernel_symbol, has_linear_bias)`. Q/K/V
+    /// LinearLayer accessors and the RmsNorm/CosSin pair resolve
+    /// through `WeightAccessors::{linear_at, rms_norm_at, cos_sin_at}`
+    /// at slots 0..3 of the same `(bucket, op_idx)` — avoiding the
+    /// load-time packed-concat infrastructure that Phase 0's revert
+    /// dropped.
     ///
     /// CUDA eval is `unreachable!`.
     SynthPreAttn(
@@ -684,11 +788,6 @@ pub enum Instruction<W> {
         u32,
         u32,
         u32,
-        WtFn<W, LinearLayer>,
-        WtFn<W, LinearLayer>,
-        WtFn<W, LinearLayer>,
-        WtFn<W, ferrite_kernels::layers::RmsNorm>,
-        CosSinFn<W>,
         u32,
         u32,
         &'static str,
@@ -710,27 +809,14 @@ pub enum Instruction<W> {
     /// `SpecializedPipelineCache` at worker-pool init.
     ///
     /// Tuple fields: `(residual_slot, delta_slot, silu_mul_out_slot,
-    /// layer, gate_weight_fn, up_weight_fn, rms_weight_fn, group_size,
-    /// bits, kernel_symbol)`.
-    ///
-    /// Two separate `WtFn<W, LinearLayer>`s (gate, up) — each
-    /// AffineQmm in the detected chain contributes its own LinearLayer
-    /// accessor. The standalone `AffineQmm` for down_proj follows
-    /// directly in the instruction stream as before.
+    /// layer, group_size, bits, kernel_symbol)`. Gate/up `LinearLayer`s
+    /// and the RmsNorm resolve through `WeightAccessors::{linear_at,
+    /// rms_norm_at}` at slots 0/1/2 of the same `(bucket, op_idx)`.
+    /// The standalone `AffineQmm` for down_proj follows directly in
+    /// the instruction stream as before.
     ///
     /// CUDA eval is `unreachable!`.
-    SynthMlpPreDown(
-        u32,
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        WtFn<W, LinearLayer>,
-        WtFn<W, ferrite_kernels::layers::RmsNorm>,
-        u32,
-        u32,
-        &'static str,
-    ),
+    SynthMlpPreDown(u32, u32, u32, u32, u32, u32, &'static str),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
@@ -746,18 +832,12 @@ pub enum Instruction<W> {
     SiluMul(u32, u32, u32),
     /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
     /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
-    /// Fields: (x_norm_slot, out_slot, layer, gate_wt_fn, up_wt_fn, group_size, bits, kernel_symbol).
+    /// Fields: `(x_norm_slot, out_slot, layer, group_size, bits,
+    /// kernel_symbol)`. Gate/up LinearLayer accessors resolve through
+    /// `WeightAccessors::linear_at` at slots 0/1 of the same
+    /// `(bucket, op_idx)`.
     #[cfg(feature = "metal")]
-    SynthGateUpSiluMul(
-        u32,
-        u32,
-        u32,
-        WtFn<W, LinearLayer>,
-        WtFn<W, LinearLayer>,
-        u32,
-        u32,
-        &'static str,
-    ),
+    SynthGateUpSiluMul(u32, u32, u32, u32, u32, &'static str),
     /// MLX-affine int4 quantized embedding lookup (Metal-only).
     /// Replaces `Instruction::Embed` when `model.embed_tokens` ships
     /// as a quantized triple `(weight=U32, scales, biases)` — i.e.
@@ -770,12 +850,15 @@ pub enum Instruction<W> {
     /// would CPU-dequantize at load (P2 deviation), burning ~2 GB of
     /// arena on Llama-3.2-1B.
     ///
-    /// Tuple fields: `(out_slot, weight_fn, group_size, bits)`. The
-    /// hidden_size rides through `W::Q_SIZE` (function constant baked
-    /// at lower time). Metal-only — `AffineQuantEmbedding` is cfg-gated
-    /// to the metal backend (mirrors `LinearLayer::AffineQuant`).
+    /// Tuple fields: `(out_slot, group_size, bits)`. The
+    /// `AffineQuantEmbedding` weight resolves through a dedicated
+    /// `WeightAccessors::affine_quant_embedding_at` accessor (mirrors
+    /// `embedding_at` for dense embeds). The hidden_size rides
+    /// through `W::Q_SIZE` (function constant baked at lower time).
+    /// Metal-only — `AffineQuantEmbedding` is cfg-gated to the metal
+    /// backend (mirrors `LinearLayer::AffineQuant`).
     #[cfg(feature = "metal")]
-    AffineEmbed(u32, WtFn<W, AffineQuantEmbedding>, u32, u32),
+    AffineEmbed(u32, u32, u32),
     /// Re-run the next `body_len` instructions `count` times.
     Loop(u32, u32),
     /// `tiles[dst] = Some(View(src))`.
@@ -784,8 +867,8 @@ pub enum Instruction<W> {
     Free(u32),
 }
 
-impl<W> Copy for Instruction<W> {}
-impl<W> Clone for Instruction<W> {
+impl Copy for Instruction {}
+impl Clone for Instruction {
     #[inline]
     fn clone(&self) -> Self {
         *self
@@ -795,7 +878,7 @@ impl<W> Clone for Instruction<W> {
 /// Assert a runtime weight tensor's `[N, K]` shape matches the
 /// codegen-time constants the `Instruction` was emitted with. The
 /// constants come from the FUF's `eval_shape` at solve time; the
-/// runtime tensor is whatever `WtFn` resolved to from the loaded
+/// runtime tensor is whatever `WeightAccessors` resolved to from the loaded
 /// safetensors. A mismatch means the loader produced a weight whose
 /// shape disagrees with the model the solver compiled against —
 /// silent shape drift here corrupts every output. Real `assert!`,
@@ -853,18 +936,33 @@ fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
 }
 
 #[cfg(feature = "cuda")]
-impl<W: CanonicalParams> Instruction<W> {
+impl Instruction {
     /// Evaluate one instruction. Closed match (no `_` arm).
     /// `Loop` is dispatched by [`run`] — never reaches here.
+    ///
+    /// `acc` is the weight accessor index for this op position in
+    /// the [`Tape`]. Variants that don't consume a weight (e.g.
+    /// `Add`, `BarrierSignal`, `Reshape`) ignore it; the
+    /// proc-macro emits a sentinel value at the matching tape
+    /// position so the parallel arrays stay aligned.
     ///
     /// # Safety
     /// Tile slot indices in range; weight accessors produce live
     /// GPU memory; `ctx.device.compute_stream` is live.
     #[allow(clippy::too_many_lines)]
-    pub unsafe fn eval(&self, ctx: &mut InterpreterCtx<'_, W>) {
+    /// `bucket` and `op_idx` together identify the call site so the
+    /// per-arch [`WeightAccessors`] impl can resolve which named
+    /// weight to return. Variants that consume no weight ignore both.
+    pub unsafe fn eval<W: CanonicalParams>(
+        &self,
+        ctx: &mut InterpreterCtx<'_, W>,
+        bucket: u32,
+        op_idx: u32,
+    ) {
+        let _ = (bucket, op_idx); // unused for variants that consume no weight
         match *self {
-            Instruction::Embed(out_slot, weight_fn) => unsafe {
-                let weight = (weight_fn)(ctx.wm, 0u32).weight;
+            Instruction::Embed(out_slot) => unsafe {
+                let weight = ctx.wm.embedding_at(bucket, op_idx, 0, 0u32).weight;
                 // At tp=1 the embed weight covers the full vocab and
                 // vocab_offset is 0 — the mask never trips. At tp>1
                 // the weight is the per-rank `[vocab/tp, hidden]`
@@ -926,10 +1024,10 @@ impl<W: CanonicalParams> Instruction<W> {
                     src_row += length;
                 }
             },
-            Instruction::RmsNorm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::RmsNorm(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
                 let out = kernels::rms_norm(
                     *v,
                     w.weight,
@@ -939,10 +1037,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::MeanSubRmsNorm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::MeanSubRmsNorm(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
                 let out = kernels::cohere_layer_norm(
                     *v,
                     w.weight,
@@ -952,7 +1050,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer) => unsafe {
                 // `LayerNorm`'s `bias` is `Option<GpuTensor>`; this Impl
                 // is only emitted when the DSL has a downstream
                 // `bias_add`, which means the loader is expected to
@@ -962,7 +1060,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 // numerics.
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let ln = (weight_fn)(ctx.wm, layer);
+                let ln = ctx.wm.layer_norm_at(bucket, op_idx, 0, layer);
                 let bias = ln
                     .bias
                     .expect("MeanSubRmsNormBiasAdd: LayerNorm.bias must be Some");
@@ -1062,11 +1160,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
-            Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer, weight_fn) => unsafe {
+            Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
                 let _ = kernels::fused_add_rms_norm_inplace(
                     *delta,
                     *residual,
@@ -1080,12 +1178,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 residual_slot,
                 layer,
                 offset,
-                weight_fn,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
                 let _ = kernels::fused_add_rms_norm_inplace_with_offset(
                     *delta,
                     *residual,
@@ -1095,10 +1192,10 @@ impl<W: CanonicalParams> Instruction<W> {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset, weight_fn) => unsafe {
+            Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
                 let out = kernels::rms_norm_with_offset(
                     *v,
                     w.weight,
@@ -1113,8 +1210,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                norm_wf,
-                gemm_wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -1123,8 +1218,8 @@ impl<W: CanonicalParams> Instruction<W> {
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let nw = (norm_wf)(ctx.wm, layer);
-                let gw = (gemm_wf)(ctx.wm, layer);
+                let nw = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
+                let gw = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape(
                     "CutlassFusedRmsNormGemm",
                     gw.dense_weight(),
@@ -1152,8 +1247,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                norm_wf,
-                gemm_wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -1162,8 +1255,8 @@ impl<W: CanonicalParams> Instruction<W> {
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let nw = (norm_wf)(ctx.wm, layer);
-                let gw = (gemm_wf)(ctx.wm, layer);
+                let nw = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
+                let gw = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape(
                     "CutlassFusedMeanSubRmsNormGemm",
                     gw.dense_weight(),
@@ -1192,8 +1285,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 residual_slot,
                 out_slot,
                 layer,
-                norm_wf,
-                gemm_wf,
                 tile_m,
                 tile_n,
                 stages,
@@ -1203,8 +1294,8 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
-                let nw = (norm_wf)(ctx.wm, layer);
-                let gw = (gemm_wf)(ctx.wm, layer);
+                let nw = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
+                let gw = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape(
                     "CutlassFusedAddRmsNormGemm",
                     gw.dense_weight(),
@@ -1232,10 +1323,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Gemm(in_slot, out_slot, layer, weight_fn, n, k) => unsafe {
+            Instruction::Gemm(in_slot, out_slot, layer, n, k) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("Gemm", w.dense_weight(), n, k, tp_active(ctx));
                 let out = ctx
                     .device
@@ -1243,7 +1334,7 @@ impl<W: CanonicalParams> Instruction<W> {
                     .gemm(*v, w.dense_weight(), &mut ctx.device.caching);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, weight_fn, n, k) => unsafe {
+            Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k) => unsafe {
                 // cuBLAS gemm(activation, weight) → delta; then
                 // add_inplace folds delta into the residual buffer.
                 // The residual upstream's OwnedTensor is aliased to
@@ -1252,7 +1343,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("FusedCublasGemmAdd", w.dense_weight(), n, k, tp_active(ctx));
                 let delta = ctx
                     .device
@@ -1260,10 +1351,10 @@ impl<W: CanonicalParams> Instruction<W> {
                     .gemm(*v, w.dense_weight(), &mut ctx.device.caching);
                 kernels::add_inplace(*residual, delta.as_gpu_tensor(), ctx.device.compute_stream);
             },
-            Instruction::FusedGemmBias(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::FusedGemmBias(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 debug_assert!(
                     w.dense_bias().is_some(),
                     "FusedGemmBias: DSL `bias_add` claimed but \
@@ -1277,10 +1368,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -1295,10 +1386,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -1317,14 +1408,12 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
                 biased,
                 interleaved,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 if biased {
                     debug_assert!(
                         w.dense_bias().is_some(),
@@ -1338,7 +1427,7 @@ impl<W: CanonicalParams> Instruction<W> {
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let out = if interleaved {
                     kernels::fused_qkv_interleaved_rope_cache(
                         *qkv_packed,
@@ -1394,23 +1483,24 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                q_weight_fn,
-                k_weight_fn,
-                v_weight_fn,
-                q_norm_fn,
-                k_norm_fn,
-                cos_sin_fn,
                 q_offset,
                 k_offset,
             ) => {
                 let layer = ctx.layer_offset + layer;
                 let mut q_out = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let qw = (q_weight_fn)(ctx.wm, layer);
-                    let kw = (k_weight_fn)(ctx.wm, layer);
-                    let vw = (v_weight_fn)(ctx.wm, layer);
-                    let qnorm = (q_norm_fn)(ctx.wm, layer);
-                    let knorm = (k_norm_fn)(ctx.wm, layer);
+                    // FusedQkvQkNormRopeCache consumes 6 weights at this
+                    // tape position: q_proj / k_proj / v_proj LinearLayers,
+                    // q_norm / k_norm RmsNorms, and one CosSin. The per-
+                    // arch impl returns each via its kind getter; the
+                    // proc-macro records all 6 weight_slots in fan_out
+                    // order so the per-(bucket, op_idx) match arms wire
+                    // up to the right named accessors.
+                    let qw = ctx.wm.linear_at(bucket, op_idx, 0, layer);
+                    let kw = ctx.wm.linear_at(bucket, op_idx, 1, layer);
+                    let vw = ctx.wm.linear_at(bucket, op_idx, 2, layer);
+                    let qnorm = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
+                    let knorm = ctx.wm.rms_norm_at(bucket, op_idx, 1, layer);
                     let nt = (*ctx.fwd.input_ids).dim(0);
                     let q = qw.forward(
                         view_in,
@@ -1435,7 +1525,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         (*k).reshape(&[nt, W::NUM_KV_HEADS as usize, W::HEAD_DIM as usize]);
                     let v_view =
                         (*v_proj).reshape(&[nt, W::NUM_KV_HEADS as usize, W::HEAD_DIM as usize]);
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     kernels::qk_norm_rope_inplace(
                         q_view,
                         k_view,
@@ -1475,15 +1565,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
                 biased,
                 interleaved,
             ) => {
                 let layer = ctx.layer_offset + layer;
                 let (q, k, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let w = (weight_fn)(ctx.wm, layer);
+                    let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                     if biased {
                         debug_assert!(
                             w.dense_bias().is_some(),
@@ -1497,7 +1585,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     );
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     if interleaved {
                         kernels::fused_qkv_interleaved_rope(
                             *qkv_packed,
@@ -1541,11 +1629,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
-            Instruction::AttentionViaCache(in_slot, out_slot, layer, cos_sin_fn, interleaved) => {
+            Instruction::AttentionViaCache(in_slot, out_slot, layer, interleaved) => {
                 let layer = ctx.layer_offset + layer;
                 let mut out = unsafe {
                     let q = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     let has_spans = !ctx.fwd.kv_cache.block_unrotated_gpu().is_null();
                     let (cos_sin_ptr, rotary_dim) = if has_spans {
                         (cos_sin.raw_ptr() as *const u8, cos_sin.dim(1))
@@ -1662,17 +1750,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             }
-            Instruction::SlidingAttentionViaCache(
-                in_slot,
-                out_slot,
-                layer,
-                cos_sin_fn,
-                interleaved,
-            ) => {
+            Instruction::SlidingAttentionViaCache(in_slot, out_slot, layer, interleaved) => {
                 let layer = ctx.layer_offset + layer;
                 let mut out = unsafe {
                     let q = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     let has_spans = !ctx.fwd.kv_cache.block_unrotated_gpu().is_null();
                     let (cos_sin_ptr, rotary_dim) = if has_spans {
                         (cos_sin.raw_ptr() as *const u8, cos_sin.dim(1))
@@ -1850,8 +1932,8 @@ impl<W: CanonicalParams> Instruction<W> {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
-            Instruction::PosEmbed(out_slot, weight_fn) => unsafe {
-                let weight = (weight_fn)(ctx.wm, 0u32).weight;
+            Instruction::PosEmbed(out_slot) => unsafe {
+                let weight = ctx.wm.embedding_at(bucket, op_idx, 0, 0u32).weight;
                 let position_ids = ctx.fwd.vision_position_ids.expect(
                     "Instruction::PosEmbed reached eval but \
                      ForwardCtx::vision_position_ids is None — caller \
@@ -1958,7 +2040,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                cos_sin_fn,
                 head_dim,
                 use_logits_soft_cap,
             ) => {
@@ -1991,7 +2072,7 @@ impl<W: CanonicalParams> Instruction<W> {
                     match fi {
                         Some(t) => t,
                         None => {
-                            let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                            let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                             let has_spans = !ctx.fwd.kv_cache.block_unrotated_gpu().is_null();
                             let (cos_sin_ptr, rotary_dim) = if has_spans {
                                 (cos_sin.raw_ptr() as *const u8, cos_sin.dim(1))
@@ -2101,11 +2182,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                cos_sin_fn,
                 interleaved,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let q_view = tile_ref(ctx.tiles, q_slot).as_view(ctx.tiles);
                 let k_view = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
                 let v_view = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
@@ -2183,52 +2263,45 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[kv_latent_slot as usize] = Some(TileEntry::Owned(kv_latent));
                 ctx.tiles[k_pe_slot as usize] = Some(TileEntry::Owned(k_pe));
             },
-            Instruction::MlaAttention(
-                q_slot,
-                kv_b_slot,
-                k_pe_slot,
-                out_slot,
-                layer,
-                cos_sin_fn,
-            ) => {
+            Instruction::MlaAttention(q_slot, kv_b_slot, k_pe_slot, out_slot, layer) => {
                 let layer = ctx.layer_offset + layer;
                 let out = unsafe {
-                    mla_attention_eval(ctx, q_slot, kv_b_slot, k_pe_slot, layer, cos_sin_fn)
+                    mla_attention_eval(ctx, q_slot, kv_b_slot, k_pe_slot, layer, bucket, op_idx)
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             }
-            Instruction::DeepSeekMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::DeepSeekMoe(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.deepseek_moe_at(bucket, op_idx, 0, layer);
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::DeepSeekMoeFp8Block(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::DeepSeekMoeFp8Block(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.deepseek_moe_fp8_at(bucket, op_idx, 0, layer);
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::DeepSeekMoeGgml(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::DeepSeekMoeGgml(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.deepseek_moe_ggml_at(bucket, op_idx, 0, layer);
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::FusedMoe(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.fused_moe_at(bucket, op_idx, 0, layer);
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::SharedFusedMoe(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::SharedFusedMoe(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.shared_fused_moe_at(bucket, op_idx, 0, layer);
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
@@ -2236,7 +2309,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
                 tile_m,
                 tile_n,
                 stages,
@@ -2245,7 +2317,7 @@ impl<W: CanonicalParams> Instruction<W> {
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("CutlassGemm", w.dense_weight(), n, k, tp_active(ctx));
                 let out = cutlass::cutlass_gemm(
                     *v,
@@ -2260,7 +2332,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
                 tile_m,
                 tile_n,
                 stages,
@@ -2270,7 +2341,7 @@ impl<W: CanonicalParams> Instruction<W> {
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("CutlassGemmSplitK", w.dense_weight(), n, k, tp_active(ctx));
                 let out = cutlass::cutlass_gemm_splitk(
                     *v,
@@ -2285,7 +2356,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 residual_slot,
                 layer,
-                weight_fn,
                 tile_m,
                 tile_n,
                 stages,
@@ -2295,7 +2365,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("CutlassGemmAdd", w.dense_weight(), n, k, tp_active(ctx));
                 cutlass::cutlass_gemm_add(
                     *v,
@@ -2305,10 +2375,10 @@ impl<W: CanonicalParams> Instruction<W> {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::CutlassGemv(in_slot, out_slot, layer, weight_fn, n, k) => unsafe {
+            Instruction::CutlassGemv(in_slot, out_slot, layer, n, k) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("CutlassGemv", w.dense_weight(), n, k, tp_active(ctx));
                 let out = cutlass::cutlass_gemv(
                     *v,
@@ -2322,7 +2392,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
                 tile_m,
                 tile_n,
                 stages,
@@ -2331,7 +2400,7 @@ impl<W: CanonicalParams> Instruction<W> {
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape(
                     "CutlassFusedGemmBias",
                     w.dense_weight(),
@@ -2356,14 +2425,13 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
                 tile_m,
                 tile_n,
                 stages,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let packed = w.dense_weight();
                 let gate_w = packed.narrow_dim0(0, W::INTERMEDIATE_SIZE);
                 let up_w = packed.narrow_dim0(W::INTERMEDIATE_SIZE, W::INTERMEDIATE_SIZE);
@@ -2387,7 +2455,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
                 tile_m,
                 tile_n,
                 stages,
@@ -2401,7 +2468,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 // instead of cuBLAS; the elementwise step is identical.
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape(
                     "CutlassFusedGateUpGeluMul",
                     w.dense_weight(),
@@ -2428,8 +2495,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
                 interleaved,
                 tile_m,
                 tile_n,
@@ -2449,7 +2514,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 // gains shape-swept rows.
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape(
                     "CutlassFusedQkvRopeCache",
                     w.dense_weight(),
@@ -2464,7 +2529,7 @@ impl<W: CanonicalParams> Instruction<W> {
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let out = if interleaved {
                     kernels::fused_qkv_interleaved_rope_cache(
                         *qkv_packed,
@@ -2522,8 +2587,6 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
                 interleaved,
                 tile_m,
                 tile_n,
@@ -2534,7 +2597,7 @@ impl<W: CanonicalParams> Instruction<W> {
                 let layer = ctx.layer_offset + layer;
                 let (q, k_tensor, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let w = (weight_fn)(ctx.wm, layer);
+                    let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                     assert_weight_shape(
                         "CutlassFusedQkvRopePrefill",
                         w.dense_weight(),
@@ -2549,7 +2612,7 @@ impl<W: CanonicalParams> Instruction<W> {
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     );
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     if interleaved {
                         kernels::fused_qkv_interleaved_rope(
                             *qkv_packed,
@@ -2593,17 +2656,17 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k_tensor));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
-            Instruction::MarlinGemm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::MarlinGemm(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.marlin_at(bucket, op_idx, 0, layer);
                 let out = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::MarlinFusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::MarlinFusedGateUpSiluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.marlin_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 let out = kernels::silu_and_mul_fused(
                     *gate_up,
@@ -2613,10 +2676,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::MarlinFusedGateUpGeluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::MarlinFusedGateUpGeluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.marlin_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
                 let out = kernels::gelu_and_mul_fused(
                     *gate_up,
@@ -2626,18 +2689,12 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::MarlinFusedQkvRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                weight_fn,
-                cos_sin_fn,
-            ) => unsafe {
+            Instruction::MarlinFusedQkvRopeCache(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.marlin_at(bucket, op_idx, 0, layer);
                 let qkv_packed = w.forward(v, &mut ctx.device.caching, ctx.device.compute_stream);
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let out = if ctx.fwd.kv_cache.is_fp8() {
                     kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
@@ -2680,16 +2737,14 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
             ) => {
                 let layer = ctx.layer_offset + layer;
                 let (q, k, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let w = (weight_fn)(ctx.wm, layer);
+                    let w = ctx.wm.marlin_at(bucket, op_idx, 0, layer);
                     let qkv_packed =
                         w.forward(view_in, &mut ctx.device.caching, ctx.device.compute_stream);
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     kernels::fused_qkv_rope(
                         *qkv_packed,
                         *ctx.fwd.positions,
@@ -2718,10 +2773,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
-            Instruction::GgmlGemm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::GgmlGemm(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let out = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -2730,10 +2785,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -2748,10 +2803,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -2770,20 +2825,18 @@ impl<W: CanonicalParams> Instruction<W> {
                 in_slot,
                 out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
                 interleaved,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 let qkv_packed = w.forward(
                     v,
                     &mut ctx.device.cublas,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let out = if interleaved {
                     kernels::fused_qkv_interleaved_rope_cache(
                         *qkv_packed,
@@ -2841,20 +2894,18 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
             ) => {
                 let layer = ctx.layer_offset + layer;
                 let (q, k, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let w = (weight_fn)(ctx.wm, layer);
+                    let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                     let qkv_packed = w.forward(
                         view_in,
                         &mut ctx.device.cublas,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     );
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     kernels::fused_qkv_rope(
                         *qkv_packed,
                         *ctx.fwd.positions,
@@ -2883,10 +2934,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
-            Instruction::Bnb4Gemm(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Bnb4Gemm(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.bnb4_at(bucket, op_idx, 0, layer);
                 let out = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -2895,10 +2946,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Bnb4FusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Bnb4FusedGateUpSiluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.bnb4_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -2913,10 +2964,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Bnb4FusedGateUpGeluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Bnb4FusedGateUpGeluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.bnb4_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -2931,17 +2982,17 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Bnb4FusedQkvRopeCache(in_slot, out_slot, layer, weight_fn, cos_sin_fn) => unsafe {
+            Instruction::Bnb4FusedQkvRopeCache(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.bnb4_at(bucket, op_idx, 0, layer);
                 let qkv_packed = w.forward(
                     v,
                     &mut ctx.device.cublas,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let out = if ctx.fwd.kv_cache.is_fp8() {
                     kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
@@ -2984,20 +3035,18 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
             ) => {
                 let layer = ctx.layer_offset + layer;
                 let (q, k, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let w = (weight_fn)(ctx.wm, layer);
+                    let w = ctx.wm.bnb4_at(bucket, op_idx, 0, layer);
                     let qkv_packed = w.forward(
                         view_in,
                         &mut ctx.device.cublas,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     );
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     kernels::fused_qkv_rope(
                         *qkv_packed,
                         *ctx.fwd.positions,
@@ -3026,11 +3075,11 @@ impl<W: CanonicalParams> Instruction<W> {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
-            Instruction::Fp8Gemm(in_slot, out_slot, layer, weight_fn)
-            | Instruction::Fp8FusedGemmBias(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Fp8Gemm(in_slot, out_slot, layer)
+            | Instruction::Fp8FusedGemmBias(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.fp8_at(bucket, op_idx, 0, layer);
                 let out = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -3039,10 +3088,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Fp8FusedGateUpSiluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Fp8FusedGateUpSiluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.fp8_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -3057,10 +3106,10 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Fp8FusedGateUpGeluMul(in_slot, out_slot, layer, weight_fn) => unsafe {
+            Instruction::Fp8FusedGateUpGeluMul(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.fp8_at(bucket, op_idx, 0, layer);
                 let gate_up = w.forward(
                     v,
                     &mut ctx.device.cublas,
@@ -3075,17 +3124,17 @@ impl<W: CanonicalParams> Instruction<W> {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::Fp8FusedQkvRopeCache(in_slot, out_slot, layer, weight_fn, cos_sin_fn) => unsafe {
+            Instruction::Fp8FusedQkvRopeCache(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                let w = (weight_fn)(ctx.wm, layer);
+                let w = ctx.wm.fp8_at(bucket, op_idx, 0, layer);
                 let qkv_packed = w.forward(
                     v,
                     &mut ctx.device.cublas,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
-                let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                 let out = if ctx.fwd.kv_cache.is_fp8() {
                     kernels::fused_qkv_rope_cache_fp8(
                         *qkv_packed,
@@ -3128,20 +3177,18 @@ impl<W: CanonicalParams> Instruction<W> {
                 k_out_slot,
                 v_out_slot,
                 layer,
-                weight_fn,
-                cos_sin_fn,
             ) => {
                 let layer = ctx.layer_offset + layer;
                 let (q, k, v_out) = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
-                    let w = (weight_fn)(ctx.wm, layer);
+                    let w = ctx.wm.fp8_at(bucket, op_idx, 0, layer);
                     let qkv_packed = w.forward(
                         view_in,
                         &mut ctx.device.cublas,
                         &mut ctx.device.caching,
                         ctx.device.compute_stream,
                     );
-                    let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+                    let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
                     kernels::fused_qkv_rope(
                         *qkv_packed,
                         *ctx.fwd.positions,
@@ -3240,13 +3287,14 @@ unsafe fn mla_attention_eval<W: CanonicalParams>(
     kv_b_slot: u32,
     k_pe_slot: u32,
     layer: u32,
-    cos_sin_fn: CosSinFn<W>,
+    bucket: u32,
+    op_idx: u32,
 ) -> OwnedTensor {
     unsafe {
         let q_tv = tile_ref(ctx.tiles, q_slot).as_view(ctx.tiles);
         let kv_b_tv = tile_ref(ctx.tiles, kv_b_slot).as_view(ctx.tiles);
         let k_pe_tv = tile_ref(ctx.tiles, k_pe_slot).as_view(ctx.tiles);
-        let cos_sin = (cos_sin_fn)(ctx.wm, layer);
+        let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
         let nt = (*q_tv).dim(0);
         let dt = (*q_tv).dtype();
 
@@ -3387,9 +3435,20 @@ unsafe fn mla_attention_eval<W: CanonicalParams>(
 /// Walk one slice in-place against ctx. `Instruction::Loop(count,
 /// body_len)` re-runs the next `body_len` instructions `count`
 /// times with `ctx.layer_offset` set to the iter index.
+///
+/// `bucket` is the static bucket id (e.g. `BACKBONE`, `LM_HEAD`)
+/// the proc-macro emits; it is forwarded together with each op's
+/// flat position in the bucket to `Instruction::eval`, which
+/// passes both to the per-arch [`WeightAccessors`] impl.
+///
+/// Loop bodies use their absolute position in the bucket (not the
+/// position within the body), so the per-arch match table is keyed
+/// uniformly on `(bucket, flat_position)` regardless of whether
+/// the op sits inside a `Loop` body.
 #[cfg(feature = "cuda")]
 unsafe fn run_slice<W: CanonicalParams>(
-    instructions: &[Instruction<W>],
+    instructions: &[Instruction],
+    bucket: u32,
     ctx: &mut InterpreterCtx<'_, W>,
 ) {
     let dump = debug_dump::DumpHook::from_env();
@@ -3403,8 +3462,9 @@ unsafe fn run_slice<W: CanonicalParams>(
                 for l in 0..count {
                     ctx.layer_offset = l;
                     for (j, instr) in body.iter().enumerate() {
+                        let body_op_idx = (body_start + j) as u32;
                         unsafe {
-                            instr.eval(ctx);
+                            instr.eval(ctx, bucket, body_op_idx);
                         }
                         if let Some(d) = dump.as_ref() {
                             d.dump(
@@ -3420,7 +3480,7 @@ unsafe fn run_slice<W: CanonicalParams>(
             }
             instr => {
                 unsafe {
-                    instr.eval(ctx);
+                    instr.eval(ctx, bucket, i as u32);
                 }
                 if let Some(d) = dump.as_ref() {
                     d.dump(
@@ -3539,9 +3599,12 @@ mod debug_dump {
 /// Both slices well-formed; tile slot indices in range; weight
 /// accessor fns produce live GPU memory.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn run<W: CanonicalParams>(
-    backbone: &[Instruction<W>],
-    lm_head: &[Instruction<W>],
+    backbone: &[Instruction],
+    backbone_bucket: u32,
+    lm_head: &[Instruction],
+    lm_head_bucket: u32,
     wm: &W,
     fwd: &ForwardCtx,
     device: &mut GpuDevice,
@@ -3558,8 +3621,8 @@ pub unsafe fn run<W: CanonicalParams>(
         pinned_owned: Vec::new(),
     };
     unsafe {
-        run_slice(backbone, &mut ctx);
-        run_slice(lm_head, &mut ctx);
+        run_slice(backbone, backbone_bucket, &mut ctx);
+        run_slice(lm_head, lm_head_bucket, &mut ctx);
     }
     take_owned(&mut tiles, terminal_slot)
 }
@@ -3570,8 +3633,10 @@ pub unsafe fn run<W: CanonicalParams>(
 /// # Safety
 /// Same as [`run`].
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn run_backbone<W: CanonicalParams>(
-    backbone: &[Instruction<W>],
+    backbone: &[Instruction],
+    backbone_bucket: u32,
     wm: &W,
     fwd: &ForwardCtx,
     device: &mut GpuDevice,
@@ -3588,7 +3653,7 @@ pub unsafe fn run_backbone<W: CanonicalParams>(
         pinned_owned: Vec::new(),
     };
     unsafe {
-        run_slice(backbone, &mut ctx);
+        run_slice(backbone, backbone_bucket, &mut ctx);
     }
     let bb_view = unsafe { tile_ref(&tiles, backbone_slot).as_view(&tiles) };
     let bb_shape_u32: &[u32] = bb_view.shape();

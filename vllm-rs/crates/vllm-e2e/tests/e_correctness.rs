@@ -1168,12 +1168,13 @@ async fn test_cuda_correctness_mixtral_tiny_dpo() {
 ///   1. pins `--device metal` so the test fails loudly on a CUDA-only
 ///      machine instead of silently falling back via `--device auto`,
 ///   2. compares **output text** rather than top-N logprobs — the
-///      `vllm-mlx` worker doesn't yet populate per-token logprobs
-///      (`worker.rs:1359` `logprobs_map` is declared but never
-///      written), so `extract_engine_output` would panic on the
-///      missing `logprobs` field. Token-stream parity through ≥ N
-///      tokens at temp=0 (P10 deliverable bar) is enforced by
-///      requiring an exact text-prefix match up to the cumulative
+///      metal `FerriteWorker` path doesn't yet populate per-token
+///      logprobs (the historical `vllm-mlx` worker had the same gap;
+///      vllm-mlx was removed — see `project_vllm_mlx_nuke_plan`).
+///      `extract_engine_output` would panic on the missing `logprobs`
+///      field. Token-stream parity through ≥ N tokens at temp=0 (P10
+///      deliverable bar) is enforced by requiring an exact text-prefix
+///      match up to the cumulative
 ///      character length of the golden's first `prefix_token_match`
 ///      decoded segments.
 #[cfg(feature = "metal")]

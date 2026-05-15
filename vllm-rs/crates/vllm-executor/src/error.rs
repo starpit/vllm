@@ -11,10 +11,13 @@ pub enum ExecutorError {
     WorkerInit(String),
 
     /// The worker backend has no implementation for this model
-    /// architecture. Distinct from `WorkerInit` so a caller can
-    /// fall back to a different backend (e.g. metal `FerriteWorker`
-    /// → `MlxWorker` for arches without a ferrite-forward metal
-    /// variant) without parsing the failure string.
+    /// architecture. Surfaced by `FerriteWorker::load_model` when
+    /// `ferrite_forward::try_load` returns `Ok(None)` — the variant
+    /// registry has no compiled match for the checkpoint's
+    /// `(arch_name, fingerprint)` pair. Callers (today: only
+    /// `vllm-serve::init::create_worker`) convert this into a hard
+    /// error pointing at `quantizations.json`; there is no longer a
+    /// silent fallback to another backend.
     #[error("architecture `{0}` not supported by this backend")]
     ArchNotSupported(String),
 

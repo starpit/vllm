@@ -2,7 +2,9 @@
 //! Quantization config types for AWQ, BitsAndBytes, and GPTQ.
 //!
 //! The actual model layers (Linear, RmsNorm, Embedding, RoPE, activations)
-//! live in each backend crate (vllm-cuda, vllm-mlx).
+//! live in `vllm-cuda` for CUDA and `ferrite-metal-kernels` /
+//! `ferrite-model-*` for Metal (`vllm-mlx` was removed — see
+//! `project_vllm_mlx_nuke_plan`).
 
 pub mod awq;
 pub mod bnb;

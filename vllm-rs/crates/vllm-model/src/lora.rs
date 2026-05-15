@@ -2,7 +2,9 @@
 //! LoRA (Low-Rank Adaptation) adapter config parsing.
 //!
 //! Supports parsing PEFT-format adapter_config.json.
-//! Actual weight loading is backend-specific (see vllm-mlx::lora).
+//! Actual weight loading is backend-specific (today: `vllm-cuda` only;
+//! `vllm-mlx` was removed — see `project_vllm_mlx_nuke_plan` —
+//! and the metal path through `FerriteWorker` doesn't yet wire LoRA).
 
 use std::path::Path;
 

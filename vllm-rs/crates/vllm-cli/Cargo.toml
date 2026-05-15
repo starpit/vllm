@@ -20,7 +20,7 @@ profiling = ["cuda"]
 # cuda. `ferrite-cuda-targets` stays cuda-only — the
 # `--cublas-analysis` flag is gated on the `cuda` feature inside
 # `commands/ferrite.rs`.
-metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal", "dep:ferrite-forward", "ferrite-forward/metal"]
+metal = ["vllm-serve/metal", "vllm-bench?/metal", "dep:ferrite-forward", "ferrite-forward/metal"]
 wgpu = ["vllm-serve/wgpu"]
 guided-decoding = ["vllm-serve/guided-decoding"]
 multimodal = ["vllm-serve/multimodal"]
@@ -45,7 +45,6 @@ ferrite-forward = { path = "../ferrite-forward", optional = true }
 ferrite-cuda-targets = { path = "../ferrite-cuda-targets", optional = true }
 vllm-gce = { workspace = true, optional = true }
 vllm-k8s = { workspace = true, optional = true }
-vllm-mlx = { workspace = true, optional = true }
 vllm-bench = { workspace = true, optional = true }
 chrono = "0.4"
 clap = { workspace = true }

@@ -12,7 +12,6 @@ members = [
     "crates/vllm-pyo3",
     "crates/vllm-bench",
     "crates/vllm-cli",
-    "crates/vllm-mlx",
     "crates/vllm-e2e",
     "crates/vllm-wgpu",
     "crates/vllm-cuda",
@@ -197,7 +196,6 @@ ferrite-forward = { path = "crates/ferrite-forward" }
 vllm-protocol = { path = "crates/vllm-protocol" }
 vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }
-vllm-mlx = { path = "crates/vllm-mlx" }
 vllm-e2e = { path = "crates/vllm-e2e" }
 vllm-wgpu = { path = "crates/vllm-wgpu" }
 vllm-cuda = { path = "crates/vllm-cuda" }

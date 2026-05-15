@@ -26,8 +26,13 @@ use crate::chat_template::ChatTemplate;
 use crate::engine::AsyncEngine;
 use crate::tokenizer::Tokenizer;
 
-#[cfg(feature = "metal")]
-use vllm_mlx::worker::{MlxWorker, MlxWorkerConfig};
+// vllm-mlx has been removed. The metal path lives entirely in
+// ferrite-metal (`FerriteWorker`); see `project_vllm_mlx_nuke_plan`.
+// If you hit `ExecutorError::ArchNotSupported` at runtime, the fix is
+// to add the missing arch / quantization overlay to
+// `crates/ferrite-model-<arch>/configs/quantizations.json` (or land
+// the matching backend Impl in `crates/ferrite-forward-macro/src/metal/`)
+// — NOT to bring back MLX.
 
 /// Configuration for initializing the vLLM inference stack.
 ///
@@ -187,7 +192,11 @@ pub struct InitializedSyncStack {
     pub block_size: usize,
 }
 
-/// Check if the metal (MLX) feature is active and the device allows it.
+/// True iff the device string selects the Apple-silicon metal path
+/// (`auto` or `metal`). Name retained as `should_use_mlx` for historical
+/// continuity with the pre-`vllm-mlx`-nuke fallback chain; today there
+/// is no MLX backend — the metal path lives entirely in
+/// `ferrite-metal` (`FerriteWorker`).
 #[cfg(feature = "metal")]
 fn should_use_mlx(device: &str) -> bool {
     matches!(device, "auto" | "metal")
@@ -214,13 +223,13 @@ fn create_worker(
 ) -> Result<WorkerCreationResult> {
     let is_pooling = config.runner == "pooling";
 
-    // Try ferrite-metal first under the metal feature; the
-    // per-arch metal forward is the preferred fast path. If
-    // ferrite-forward has no metal variant for the architecture
-    // (`ExecutorError::ArchNotSupported`), fall back to MlxWorker —
-    // the same fall-through pattern cuda already uses inside
-    // FerriteWorker::load_model, surfaced here at the worker-creation
-    // boundary because metal has no in-FerriteWorker legacy fallback.
+    // ferrite-metal is the only Apple-silicon backend. The historical
+    // MLX fallback (`vllm-mlx`) was deleted because it silently masked
+    // ferrite-metal gaps — a checkpoint whose arch × quantization
+    // wasn't registered with ferrite-metal would silently route to MLX
+    // and produce garbage from MLX-side bugs the user attributed to
+    // ferrite-metal. Now the fallback is a hard error pointing at
+    // exactly what to add.
     #[cfg(feature = "metal")]
     if should_use_mlx(&config.device) {
         use vllm_executor::error::ExecutorError;
@@ -275,46 +284,19 @@ fn create_worker(
                 return Ok((Box::new(ferrite), hf_config, model_dir, dtype_elem_bytes));
             }
             Err(ExecutorError::ArchNotSupported(arch)) => {
-                info!(
-                    "ferrite-metal has no variant for arch `{arch}` — falling back to MLX backend"
-                );
-                drop(ferrite);
+                return Err(anyhow::anyhow!(
+                    "ferrite-metal has no compiled variant for arch `{arch}`. \
+                     The vllm-mlx fallback was removed — fix this by adding the \
+                     missing (arch, quantization) combination to \
+                     `crates/ferrite-model-<arch>/configs/quantizations.json`, \
+                     or by adding a per-arch backend Impl under \
+                     `crates/ferrite-forward-macro/src/metal/` and relaxing the \
+                     matching `BackendCompat<Metal>` assert. Then rebuild with \
+                     `FERRITE_MODELS=<variant-stem>`."
+                ));
             }
             Err(e) => return Err(e).context("failed to load ferrite-metal model"),
         }
-
-        info!("Using MLX backend (Apple Silicon GPU)");
-        let mlx_config = MlxWorkerConfig {
-            model_path: model_path.clone(),
-            dtype: config.dtype.clone(),
-            hf_token: config.hf_token.clone(),
-            cache_dir: None,
-            block_size: config.block_size,
-            lora_adapter: config.lora_adapter.clone(),
-            pooling_strategy: config.pooling_strategy.clone(),
-            is_pooling,
-            enable_prefix_caching: config.enable_prefix_caching,
-        };
-
-        let mut worker = MlxWorker::new(mlx_config);
-        worker
-            .init_device()
-            .context("failed to initialize MLX device")?;
-        worker.load_model().context("failed to load MLX model")?;
-
-        let hf_config = worker
-            .hf_config()
-            .context("model config not available after MLX load")?
-            .clone();
-        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-
-        // KV cache element size in bytes for compute_num_blocks.
-        let dtype_elem_bytes = match config.dtype.as_str() {
-            "f32" | "float32" => 4,
-            _ => 2, // f16, bf16 — default for Metal
-        };
-
-        return Ok((Box::new(worker), hf_config, model_dir, dtype_elem_bytes));
     }
 
     // Try the purpose-built CUDA backend when feature is enabled and device is CUDA.

@@ -5807,13 +5807,44 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
         | I::GgmlFusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k) => {
             I::FusedQkvRopeCache(in_slot, out_slot, layer, false, false)
         }
-        // Quant-flavored bare-Gemm variants (MarlinGemm /
-        // Bnb4Gemm / Fp8Gemm / GgmlGemm) don't carry n/k in
-        // their positional fields; the bf16 `Gemm` does. Until
-        // their substrate dispatch lands, pass through as the
-        // original variant (Phase C dispatch surfaces them as
-        // host-fallback). Falls through to the catch-all `other`
-        // arm below.
+        // Quant-flavored bare-Gemm variants normalize to bf16
+        // `Gemm` with n=1, k=1 sentinels. The variant fields
+        // don't carry matmul shape (the runtime kernel reads it
+        // from weight metadata at load time); bf16 `Gemm`
+        // requires `n > 0`/`k > 0` for the const-generic check,
+        // so we use `1, 1` as the smallest passing sentinel.
+        // Phase C step 2's emit step will plumb real n/k from
+        // the per-arch model bounds at template-instantiation
+        // time. Substrate-wise the proof passes structurally
+        // (3 pages, GemmScope B-tile, 1-iter); only the
+        // matmul-shape helper field is sentinel.
+        I::MarlinGemm(in_slot, out_slot, layer)
+        | I::Bnb4Gemm(in_slot, out_slot, layer)
+        | I::Fp8Gemm(in_slot, out_slot, layer)
+        | I::GgmlGemm(in_slot, out_slot, layer) => I::Gemm(in_slot, out_slot, layer, 1, 1),
+        // Quant FusedGateUp{Silu,Gelu}Mul — same 3-field shape as
+        // their bf16 peers; substrate is identical (3 pages, 2
+        // disjoint MlpScope tiles). Drop weight-format helper.
+        I::MarlinFusedGateUpSiluMul(in_slot, out_slot, layer)
+        | I::Bnb4FusedGateUpSiluMul(in_slot, out_slot, layer)
+        | I::Fp8FusedGateUpSiluMul(in_slot, out_slot, layer)
+        | I::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer) => {
+            I::FusedGateUpSiluMul(in_slot, out_slot, layer)
+        }
+        I::MarlinFusedGateUpGeluMul(in_slot, out_slot, layer)
+        | I::Bnb4FusedGateUpGeluMul(in_slot, out_slot, layer)
+        | I::Fp8FusedGateUpGeluMul(in_slot, out_slot, layer)
+        | I::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer) => {
+            I::FusedGateUpGeluMul(in_slot, out_slot, layer)
+        }
+        // Fp8FusedGemmBias — 3-field shape, no bias data carried;
+        // substrate is `Gemm` with sentinel n=k=1 (no bias is a
+        // helper concern at the emit step, not substrate).
+        I::Fp8FusedGemmBias(in_slot, out_slot, layer) => I::Gemm(in_slot, out_slot, layer, 1, 1),
+        // Same pattern for the quant Gemm fusions that DO carry
+        // n/k (the Marlin/Bnb4/Fp8/Ggml `FusedGemmBias` etc):
+        // they don't appear in the llama tape we're focused on,
+        // so leave them as catch-all-other for now.
         // Tk variants without a 1:1 un-prefixed peer pass through.
         // mega-ir's lower() will treat them as NotYetLifted and the
         // canonical falls back to the host interpreter.

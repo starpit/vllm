@@ -5770,6 +5770,50 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
         I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
             I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k)
         }
+        // Quantization-flavored QKV-rope-cache variants share
+        // substrate shape with the bf16 `FusedQkvRopeCache` —
+        // same 6 pages (in, qkv-weight, cos_sin, q_out, k_out,
+        // v_out), same 2 disjoint RopeScope tiles, same per-iter
+        // phase math. The runtime kernel uses a different weight-
+        // dequant path (Marlin / Bnb4 / Fp8 / Ggml), but the
+        // substrate proofs don't see weight format. Default
+        // biased=false / interleaved=false — neither flag affects
+        // substrate; both are helper config consumed by the
+        // emit step's kernel template selection (Phase C step 2).
+        I::MarlinFusedQkvRopeCache(in_slot, out_slot, layer)
+        | I::Bnb4FusedQkvRopeCache(in_slot, out_slot, layer)
+        | I::Fp8FusedQkvRopeCache(in_slot, out_slot, layer) => {
+            I::FusedQkvRopeCache(in_slot, out_slot, layer, false, false)
+        }
+        I::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, interleaved) => {
+            I::FusedQkvRopeCache(in_slot, out_slot, layer, false, interleaved)
+        }
+        // Prefill peers (bf16 + quant) → bf16 FusedQkvRopeCache.
+        // Substrate-wise the Prefill peers touch the same 6 pages
+        // and same 2 disjoint RopeScope tiles as the Cache peer
+        // — the difference is whether K/V are written to a
+        // contiguous output buffer (Prefill) or the global paged
+        // KV cache (Cache). Both are valid substrate-wise; the
+        // emit-step kernel template selects the right K/V output
+        // path. n/k from Prefill are dropped at the substrate
+        // layer (Phase C step 2 picks them back up if needed for
+        // tile-shape decisions).
+        I::FusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k, biased, interleaved) => {
+            I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved)
+        }
+        I::MarlinFusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k)
+        | I::Bnb4FusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k)
+        | I::Fp8FusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k)
+        | I::GgmlFusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k) => {
+            I::FusedQkvRopeCache(in_slot, out_slot, layer, false, false)
+        }
+        // Quant-flavored bare-Gemm variants (MarlinGemm /
+        // Bnb4Gemm / Fp8Gemm / GgmlGemm) don't carry n/k in
+        // their positional fields; the bf16 `Gemm` does. Until
+        // their substrate dispatch lands, pass through as the
+        // original variant (Phase C dispatch surfaces them as
+        // host-fallback). Falls through to the catch-all `other`
+        // arm below.
         // Tk variants without a 1:1 un-prefixed peer pass through.
         // mega-ir's lower() will treat them as NotYetLifted and the
         // canonical falls back to the host interpreter.

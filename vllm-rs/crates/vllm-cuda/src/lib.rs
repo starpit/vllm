@@ -83,8 +83,6 @@ pub mod graph;
 pub mod graph_piece;
 #[cfg(feature = "cuda")]
 pub mod logits_processor;
-#[cfg(feature = "cuda")]
-pub mod model;
 #[cfg(feature = "nccl")]
 pub use ferrite_cuda_core::nccl;
 pub mod pp;

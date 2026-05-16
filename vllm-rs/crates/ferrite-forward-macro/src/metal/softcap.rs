@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape,
     Resources, SlotMap, TanhSoftCapImpl, WeightAccessor, WorkloadConstraint,
     default_required_weights,
 };
@@ -186,7 +186,7 @@ impl Implementation for MetalTanhSoftCapImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         TanhSoftCapImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }

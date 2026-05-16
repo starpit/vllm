@@ -10,14 +10,14 @@ default = []
 # code's type references resolve. Without this feature, only the
 # numeric pipeline observations (NUM_TILES etc) are available;
 # the emitted runtime types stay gated out.
-cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:ferrite-vision", "ferrite-forward-macro/cuda"]
+cuda = ["dep:ferrite-kernels", "ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:ferrite-vision"]
 # Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
 # `ForwardCtx::tp_group` field). At tp=1 the lowering pass never
 # emits AllReduce, so this feature is a strict superset of `cuda`.
-nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forward-macro/nccl", "ferrite-vision/nccl"]
-# Metal backend on Apple Silicon. Surfaces the `Instruction<W>` enum +
-# `CanonicalParams` trait + `WtFn`/`CosSinFn` aliases so the Metal
-# interpreter (`interpreter::metal`) can lower a per-bucket tape into
+nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-vision/nccl"]
+# Metal backend on Apple Silicon. Surfaces the `Instruction` enum +
+# `CanonicalParams` trait so the Metal interpreter
+# (`interpreter::metal`) can lower a per-bucket tape into
 # `LoweredMetalTape` for ICB recording. Phase 5.A's lowering pass is
 # pure CPU — but Phase 5.B's `pipelines.rs` (specialized pipeline
 # cache) and the upcoming worker/pool pieces (5.C/5.D/5.E) wrap
@@ -25,7 +25,7 @@ nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forwa
 # bring those in. The cfg gate inside `interpreter::metal::pipelines`
 # also requires `target_os = "macos"` so non-Apple builds with the
 # `metal` feature still compile (lowering only).
-metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-forward-macro/metal", "ferrite-cuda-core/metal", "ferrite-kernels/metal"]
+metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -33,8 +33,18 @@ metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2
 probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 
 [dependencies]
-ferrite-forward-macro = { path = "../ferrite-forward-macro", default-features = false }
-ferrite-kernels = { path = "../ferrite-kernels" }
+# Note: NO dependency on ferrite-forward-macro here. The reverse
+# direction (macro → ferrite-forward) is what's needed so that
+# `Implementation::fan_out` can return `Vec<Instruction>` typed
+# at proc-macro time (per `MEGA_IR_PLAN.md` §5+§9 step 4).
+# Consumers of the proc-macro import it directly:
+#   `use ferrite_forward_macro::{forward, vision_forward};`
+# rather than going through ferrite-forward.
+# ferrite-kernels is optional so ferrite-forward can compile without
+# any backend feature (which the proc-macro needs — it depends on
+# ferrite-forward purely for the `Instruction` enum). Both the cuda
+# and metal features pull it in via `dep:ferrite-kernels`.
+ferrite-kernels = { path = "../ferrite-kernels", optional = true }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 # `ferrite-vision` is gated on `cuda` because its lib.rs uses
 # `cudarc::CUstream` unconditionally; the Metal path doesn't touch it.

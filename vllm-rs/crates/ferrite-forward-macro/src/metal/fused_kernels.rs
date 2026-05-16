@@ -14,10 +14,9 @@ use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     CostCtx, FusedAddRmsNormImpl, FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl, Handoff,
-    Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap,
-    WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint, consumes_tile,
-    default_required_weights, first_tile_input, first_weight_ref, gemm_nk_from_fuf,
-    weight_storage_of,
+    Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap,
+    WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights, first_tile_input,
+    first_weight_ref, gemm_nk_from_fuf, weight_storage_of,
 };
 use crate::metal::affine_qmm::{affine_qmm_opcode_shape, affine_qmm_vector_limit};
 use crate::quantization::StorageFormat;
@@ -217,7 +216,7 @@ impl Implementation for MetalFusedAddRmsNormImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         FusedAddRmsNormImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }
@@ -531,7 +530,7 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         if self.is_gelu {
             return FusedGateUpGeluMulImpl.fan_out(m, fuf, program, bounds, slots);
         }
@@ -603,7 +602,7 @@ fn affine_decomposed_fan_out(
     program: &Program,
     bounds: &BTreeMap<String, u64>,
     slots: &SlotMap,
-) -> Vec<OpInstance> {
+) -> Vec<ferrite_forward::Instruction> {
     let silu_id = *m
         .claimed_tiles
         .iter()
@@ -688,51 +687,34 @@ fn affine_decomposed_fan_out(
     let gate_vl = affine_qmm_vector_limit(gate_k, gate_n);
     let up_vl = affine_qmm_vector_limit(up_k, up_n);
 
-    let affine_qmm_ident = || syn::Ident::new("AffineQmm", proc_macro2::Span::call_site());
-    let silu_mul_ident = || syn::Ident::new("SiluMul", proc_macro2::Span::call_site());
-
-    let gate_inst = OpInstance::new(
-        affine_qmm_ident(),
-        vec![
-            quote! { #in_slot_idx },
-            quote! { #gate_out_idx },
-            quote! { #gate_layer_lit },
-            quote! { #gate_n },
-            quote! { #gate_k },
-            quote! { #gate_gs },
-            quote! { #gate_bits },
-            quote! { #gate_vl },
-        ],
-    )
-    .with_weight_slot(WeightSlot {
-        kind: WeightKind::Linear,
-        base: gate_base_ident.clone(),
-    });
-    let up_inst = OpInstance::new(
-        affine_qmm_ident(),
-        vec![
-            quote! { #in_slot_idx },
-            quote! { #up_out_idx },
-            quote! { #up_layer_lit },
-            quote! { #up_n },
-            quote! { #up_k },
-            quote! { #up_gs },
-            quote! { #up_bits },
-            quote! { #up_vl },
-        ],
-    )
-    .with_weight_slot(WeightSlot {
-        kind: WeightKind::Linear,
-        base: up_base_ident.clone(),
-    });
-    let silu_mul_inst = OpInstance::new(
-        silu_mul_ident(),
-        vec![
-            quote! { #gate_out_idx },
-            quote! { #up_out_idx },
-            quote! { #final_out_idx },
-        ],
+    // Weight info (LinearLayer for gate/up) flows through
+    // `required_weights()` — codegen attaches slots in declaration
+    // order, so each `AffineQmm` row gets its own
+    // `(tape_index, op_idx, slot=0)` arm against the right
+    // `Weights::<gate|up>_proj` base.
+    let _ = (gate_base_ident, up_base_ident);
+    let gate_inst = ferrite_forward::Instruction::AffineQmm(
+        in_slot_idx,
+        gate_out_idx,
+        gate_layer_lit,
+        gate_n,
+        gate_k,
+        gate_gs,
+        gate_bits,
+        gate_vl,
     );
+    let up_inst = ferrite_forward::Instruction::AffineQmm(
+        in_slot_idx,
+        up_out_idx,
+        up_layer_lit,
+        up_n,
+        up_k,
+        up_gs,
+        up_bits,
+        up_vl,
+    );
+    let silu_mul_inst =
+        ferrite_forward::Instruction::SiluMul(gate_out_idx, up_out_idx, final_out_idx);
     vec![gate_inst, up_inst, silu_mul_inst]
 }
 

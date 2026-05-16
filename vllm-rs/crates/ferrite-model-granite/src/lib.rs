@@ -22,7 +22,7 @@
 //! `recip_scalar(<name>)`, which `cfg.rs::fold_scalars` resolves to
 //! `ScalarLit` at CFG-build time.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

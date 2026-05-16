@@ -19,7 +19,7 @@
 //! its own `MultimodalForward` registration via `inventory::submit!`.
 //! Qwen2.5-VL is `ferrite-model-qwen2-5-vl` (different vision math).
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

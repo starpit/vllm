@@ -11,7 +11,7 @@
 //!    confirming the conditional emits exactly one attention-family
 //!    tile per unrolled iteration.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 // The full Gemma2 body, mirrored from `ferrite-models/src/gemma2.rs`.
 // Duplicated here (not `mod`-included) because proc-macro attributes

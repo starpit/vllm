@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, EmbedRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance,
+    CostCtx, EmbedRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
     OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
     weight_storage_of,
 };
@@ -188,7 +188,7 @@ impl Implementation for MetalEmbedImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         EmbedRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }

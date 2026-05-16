@@ -14,9 +14,9 @@ use crate::classified::{ExternKind, Program};
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     AttentionPrefillContiguousImpl, AttentionViaCacheImpl, CostCtx, Handoff, Implementation,
-    LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources,
-    SlidingAttentionPrefillContiguousImpl, SlidingAttentionViaCacheImpl, SlotMap, WeightAccessor,
-    WorkloadConstraint, default_required_weights,
+    LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlidingAttentionPrefillContiguousImpl,
+    SlidingAttentionViaCacheImpl, SlotMap, WeightAccessor, WorkloadConstraint,
+    default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -327,7 +327,7 @@ impl Implementation for MetalAttentionImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         match (self.is_sliding, self.is_multihead) {
             (false, false) => AttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
             // Metal prefill: emit `Instruction::AttentionPrefillPaged`
@@ -378,14 +378,8 @@ impl Implementation for MetalAttentionImpl {
                 // a future cuda eval body for this variant should walk
                 // the FUF (`layer_rope_is_interleaved`) instead.
                 let interleaved = false;
-                Some(vec![OpInstance::new(
-                    syn::Ident::new("AttentionPrefillPaged", proc_macro2::Span::call_site()),
-                    vec![
-                        quote! { #q_slot },
-                        quote! { #out_slot },
-                        quote! { #layer },
-                        quote! { #interleaved },
-                    ],
+                Some(vec![ferrite_forward::Instruction::AttentionPrefillPaged(
+                    q_slot, out_slot, layer, interleaved,
                 )])
             }
             (true, false) => SlidingAttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),

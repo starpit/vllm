@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Consumer-facing crate for the `#[forward]` attribute macro.
+//! Runtime support types the `#[forward]`-emitted code depends on:
+//! most importantly [`ForwardCtx`], the ambient-args bundle the
+//! emitted forward fn takes, and the [`Instruction`] enum the
+//! generated tape rows construct.
 //!
-//! Re-exports the proc-macro and exposes runtime support types
-//! the generated code depends on: most importantly [`ForwardCtx`],
-//! the ambient-args bundle the emitted forward fn takes.
-
-pub use ferrite_forward_macro::{forward, vision_forward};
+//! The `#[forward]` / `#[vision_forward]` attribute macros live in
+//! [`ferrite_forward_macro`] — consumer crates import them
+//! directly:
+//!
+//! ```ignore
+//! use ferrite_forward_macro::{forward, vision_forward};
+//! ```
+//!
+//! ferrite-forward intentionally does NOT re-export the proc-macro
+//! crate so it can serve as a build-time dependency of
+//! ferrite-forward-macro itself (per `MEGA_IR_PLAN.md` §9 step 4:
+//! `Implementation::fan_out` returns `Vec<Instruction>` typed at
+//! proc-macro time). Re-exporting the macro would re-introduce the
+//! macro→forward→macro cycle.
 
 #[cfg(feature = "cuda")]
 pub mod attack_surface;
@@ -20,11 +32,12 @@ pub mod paged_kv_layout;
 // arches too.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod info;
-// `instr` is dual-mode: the `Instruction<W>` enum + `CanonicalParams` trait +
-// `WtFn`/`CosSinFn` aliases compile under either `cuda` or `metal`. The
-// CUDA-only eval/run/run_backbone fns inside are individually
-// `#[cfg(feature = "cuda")]`-gated.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+// `instr` is ungated: the `Instruction` enum + `CanonicalParams` /
+// `WeightAccessors` traits compile under any feature combination so
+// the proc-macro (ferrite-forward-macro) can use `Instruction` values
+// at codegen time without pulling in a backend (`cuda` / `metal`).
+// The cuda eval body + `InterpreterCtx` + `run` / `run_backbone`
+// inside `instr.rs` are individually `#[cfg(feature = "cuda")]`-gated.
 pub mod instr;
 // Layered-load helpers are dual-mode like `layers` / `rotary`: stream-free
 // helpers (Embedding, RmsNorm, LinearDense, plus the new `_concat_packed`
@@ -48,19 +61,17 @@ pub use info::{
     normalize_slice,
 };
 
-// Backend-agnostic frontend types. The lift dropped `WtFn`/`CosSinFn`
-// — every variant now resolves weights through the per-arch
-// `WeightAccessors` impl. `Instruction` and `CanonicalParams` stay
-// cross-backend because the metal interpreter still walks the same
-// `&[Instruction]` slices the cuda eval body matches on.
+// `Instruction` is unconditional so the proc-macro can use it at
+// codegen time without any backend feature.
+pub use instr::Instruction;
+// `CanonicalParams` + `WeightAccessors` are cross-backend — the
+// metal interpreter (`interpreter::metal::worker::resolve_weight`)
+// invokes both, mirroring the cuda eval body's pattern.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub use instr::{CanonicalParams, Instruction, WeightAccessors};
+pub use instr::{CanonicalParams, WeightAccessors};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use backend_compat::{BackendCompat, Cuda, Metal, Wgpu};
-// CUDA-only runtime entry points. `WeightAccessors` is the per-arch
-// tape-level weight-resolution trait emitted by the macro (cuda eval
-// body and the metal worker call into it instead of unpacking
-// fn-pointers from variant fields).
+// CUDA-only runtime entry points.
 #[cfg(feature = "cuda")]
 pub use instr::{InterpreterCtx, run, run_backbone};
 // Stream-free / quant-free helpers — reachable under either backend.

@@ -8,12 +8,13 @@ description = "Ferrite Mixtral architecture (one #[forward] body)"
 [features]
 default = []
 cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
-metal = ["ferrite-forward/metal"]
+metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
 nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward-macro = { path = "../ferrite-forward-macro" }
 ferrite-forward = { path = "../ferrite-forward" }
 ferrite-gguf = { path = "../ferrite-gguf" }
 anyhow = { workspace = true }

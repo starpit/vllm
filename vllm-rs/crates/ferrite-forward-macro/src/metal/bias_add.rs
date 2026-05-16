@@ -11,9 +11,9 @@ use crate::classified::{OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint,
-    first_weight_ref, fused_accessor_name, gemm_nk_from_fuf, weight_storage_of,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint, first_weight_ref, fused_accessor_name,
+    gemm_nk_from_fuf, weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -224,7 +224,7 @@ impl Implementation for MetalBiasAddImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let bias_id = m.claimed_tiles[0];
         let bias_node = fuf.get(bias_id);
         let (upstream_id, upstream_slot) = match bias_node.inputs.first() {
@@ -258,20 +258,15 @@ impl Implementation for MetalBiasAddImpl {
             Some(StorageFormat::Affine { .. })
         );
 
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MetalBiasAdd", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #n },
-                quote! { #is_affine },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        // LinearLayer accessor flows through `required_weights()`.
+        let _ = base_ident;
+        Some(vec![ferrite_forward::Instruction::MetalBiasAdd(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            n,
+            is_affine,
+        )])
     }
 }
 

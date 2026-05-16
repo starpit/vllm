@@ -24,8 +24,7 @@ use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     consumes_tile, default_required_weights, CostCtx, Handoff, Implementation, LaunchKind,
-    Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor, WeightKind,
-    WeightSlot, WorkloadConstraint,
+    Layout, MatchInfo, OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -289,7 +288,7 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let mut add_tile: Option<TileId> = None;
         let mut rmsnorm_tile: Option<TileId> = None;
         let mut gemm_tiles: Vec<TileId> = Vec::new();
@@ -395,37 +394,21 @@ impl Implementation for MetalSynthMlpPreDownImpl {
             "synth_mlp_pre_down_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,
         );
-        let symbol_lit = syn::LitStr::new(&symbol, proc_macro2::Span::call_site());
-
         let _ = bits;
-        let bits_lit = self.bits;
-        let gs_lit = gs;
-        let layer_lit = layer;
-
-        Some(vec![OpInstance::new(
-            syn::Ident::new("SynthMlpPreDown", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #residual_slot_idx },
-                quote! { #delta_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer_lit },
-                quote! { #gs_lit },
-                quote! { #bits_lit },
-                quote! { #symbol_lit },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: gate_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: up_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: rms_base,
-        })])
+        // Gate/up LinearLayers and RmsNorm flow through
+        // `required_weights()`; codegen assigns sub-slots
+        // 0/1 (Linear) and 0 (RmsNorm).
+        let _ = (gate_base, up_base, rms_base);
+        let kernel_symbol: &'static str = Box::leak(symbol.into_boxed_str());
+        Some(vec![ferrite_forward::Instruction::SynthMlpPreDown(
+            residual_slot_idx,
+            delta_slot_idx,
+            out_slot_idx,
+            layer,
+            gs,
+            self.bits,
+            kernel_symbol,
+        )])
     }
 
     fn required_weights(

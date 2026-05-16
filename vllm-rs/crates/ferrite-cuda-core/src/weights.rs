@@ -1158,7 +1158,7 @@ impl GpuWeights {
         // stream before returning so the next `take_into` doesn't
         // overwrite the buffer mid-DMA. (No-op when `data` points at
         // the original mmap — that memory isn't reused.)
-        let used_shared_scratch = data == self.cast_scratch.as_ptr();
+        let used_shared_scratch = std::ptr::eq(data, self.cast_scratch.as_ptr());
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
         if used_shared_scratch {
             driver::stream_synchronize(stream)?;

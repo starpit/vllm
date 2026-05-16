@@ -469,6 +469,10 @@ pub fn apply_signature(
         // AvgPool2d divides the leading dim by `vision_pool_factor`
         // (= `vision_pool_kernel`²). Trailing dim preserved.
         OpKind::AvgPool2d => sig_avg_pool_2d(solver, inputs),
+        // StripCls: `[L, e] -> [L - 1, e]`. The shape solver doesn't
+        // model the `L-1` constraint directly — it's a runtime-only
+        // dim. Treat as a pass-through and let the kernel handle.
+        OpKind::StripCls => sig_unary_elementwise(solver, inputs, op),
         // Vision learned positional embedding lookup. Mirror of
         // `Embed` but anchored on `vision_num_positions` /
         // `vision_embed_dim`.
@@ -915,6 +919,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // AvgPool2d takes one activation input ([L, e]); no tensor
         // weight args.
         OpKind::AvgPool2d => &[],
+        // StripCls: one rank-2 activation input ([L, e]); no weights.
+        OpKind::StripCls => &[],
         // PosEmbed: arg 0 is the position_ids extern (rank-1, no
         // assertion via this table — the extern_shape arm handles it),
         // arg 1 is the rank-2 weight table.
@@ -1127,7 +1133,7 @@ pub(crate) fn eval_closed_dim(
             // spatial_merge_size**2` always is. Truncating divide is
             // fine for the bounds-equivalence check (mismatched
             // remainders are caught by the unify path, not here).
-            if d == 0 { None } else { Some(n / d) }
+            n.checked_div(d)
         }
         Dim::Var(_) => None,
     }

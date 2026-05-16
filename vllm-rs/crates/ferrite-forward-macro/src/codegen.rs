@@ -9,14 +9,14 @@
 //! the emitted module contains both:
 //!
 //! - `pub struct Weights { … }` — one field per unique `WeightAccessor`
-//!   across every picked Impl in every workload bucket. Fused
+//!   across every picked Impl in every workload tape_index. Fused
 //!   accessors' fields are packed `LinearLayer`s produced by
 //!   streaming concat at load time.
 //! - `impl Weights { pub fn load(gw, stream) -> Result<Self> }` —
 //!   reads safetensors via `GpuWeights` and produces the packed
 //!   struct.
 //! - `pub unsafe fn forward_m_<N>(wm: &Weights, ctx, device) -> OwnedTensor`
-//!   per workload bucket, plus a `forward(wm, ctx, device, num_tokens)`
+//!   per workload tape_index, plus a `forward(wm, ctx, device, num_tokens)`
 //!   dispatcher.
 //!
 //! The caller's entire integration is two calls: `Weights::load(...)`
@@ -39,7 +39,7 @@ use syn::Ident;
 use crate::classified::{Expr, OpKind, Program, Stmt, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, OpInstance, SlotMap, WeightAccessor};
+use crate::impl_lib::{ImplementationLibrary, SlotMap, WeightAccessor, WeightSlot};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
@@ -1218,7 +1218,7 @@ fn tie_word_embeddings(model: &ModelParams) -> bool {
 }
 
 /// Aggregate every unique WeightAccessor across every workload
-/// bucket's SFUF. Errors on name collisions with conflicting
+/// tape_index's SFUF. Errors on name collisions with conflicting
 /// `rust_type`s.
 fn collect_accessors(
     program: &Program,
@@ -3145,16 +3145,16 @@ pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<Acces
 
     by_base
         .into_iter()
-        .map(|(base, bucket)| {
-            match (bucket.unindexed, bucket.layered_entries.is_empty()) {
+        .map(|(base, tape_index)| {
+            match (tape_index.unindexed, tape_index.layered_entries.is_empty()) {
                 (Some(acc), true) => AccessorGroup {
                     base,
-                    rust_type: bucket.rust_type,
+                    rust_type: tape_index.rust_type,
                     kind: AccessorGroupKind::Unindexed,
                     entries: vec![(None, acc)],
                 },
                 (None, false) => {
-                    let layers: Vec<u64> = bucket.layered_entries.keys().copied().collect();
+                    let layers: Vec<u64> = tape_index.layered_entries.keys().copied().collect();
                     let starts_at_zero = layers.first().copied() == Some(0);
                     let contiguous = layers.iter().enumerate().all(|(i, l)| *l == i as u64);
                     let kind = if starts_at_zero && contiguous {
@@ -3170,11 +3170,11 @@ pub(crate) fn group_accessors_by_base(accessors: &[WeightAccessor]) -> Vec<Acces
                     };
                     let entries: Vec<(Option<u64>, &WeightAccessor)> = layers
                         .iter()
-                        .map(|l| (Some(*l), bucket.layered_entries[l]))
+                        .map(|l| (Some(*l), tape_index.layered_entries[l]))
                         .collect();
                     AccessorGroup {
                         base,
-                        rust_type: bucket.rust_type,
+                        rust_type: tape_index.rust_type,
                         kind,
                         entries,
                     }
@@ -4582,13 +4582,13 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
 }
 
 /// Emit `impl ::ferrite_forward::WeightAccessors for Weights { ... }`
-/// keyed on `(bucket, op_idx)` per the typed-fanout design.
+/// keyed on `(tape_index, op_idx)` per the typed-fanout design.
 ///
-/// The variant of an `Instruction` at position `op_idx` in `bucket`
+/// The variant of an `Instruction` at position `op_idx` in `tape_index`
 /// fixes the *kind* of weight needed; the per-arch impl resolves
-/// `(bucket, op_idx)` → which named field on `Weights`. We walk
-/// every bucket × position, look up the recorded `weight_slots`,
-/// and emit one match arm per (bucket, op_idx, kind) triple.
+/// `(tape_index, op_idx)` → which named field on `Weights`. We walk
+/// every tape_index × position, look up the recorded `weight_slots`,
+/// and emit one match arm per (tape_index, op_idx, kind) triple.
 ///
 /// Sprint 1 scope: `rms_norm_at` only. Sibling methods (`linear_at`,
 /// `embedding_at`, `cos_sin_at`, MoE getters) land per sprint as
@@ -4602,43 +4602,45 @@ fn emit_weight_accessors_impl(
 ) -> TokenStream {
     use crate::impl_lib::WeightKind;
 
-    // Walk every BUCKET × position in declaration order. The bucket
+    // Walk every BUCKET × position in declaration order. The tape_index
     // index in FORWARD_TABLE matches the (m, sk) row order we emit;
-    // we use a synthetic "bucket id" of `2 * row_idx + slice_idx`
+    // we use a synthetic "tape_index id" of `2 * row_idx + slice_idx`
     // where `slice_idx` is 0 for backbone, 1 for lm_head — matching
     // `BUCKET_BACKBONE` / `BUCKET_LM_HEAD` for the simple
-    // single-bucket case.
+    // single-tape_index case.
     //
-    // For now (Sprint 1 + simple model lowering): every bucket row
+    // For now (Sprint 1 + simple model lowering): every tape_index row
     // shares the same canonical's instruction stream, so the match
     // table only needs entries for `(BUCKET_BACKBONE, op_idx)` and
-    // `(BUCKET_LM_HEAD, op_idx)` from any one bucket row. We use
+    // `(BUCKET_LM_HEAD, op_idx)` from any one tape_index row. We use
     // the first canonical entry's lowered slices as the source.
     //
-    // When per-bucket variation lands (different Impls per workload
-    // point), this becomes per-bucket-row and the bucket_id encoding
+    // When per-tape_index variation lands (different Impls per workload
+    // point), this becomes per-tape_index-row and the tape_index encoding
     // expands; the runtime caller of `rms_norm_at` will pass the
     // matching encoded id from the FORWARD_TABLE row it dispatched
     // through.
-    // For each kind, collect `(bucket, op_idx, slot) => self.<base>(layer)`
+    // For each kind, collect `(tape_index, op_idx, slot) => self.<base>(layer)`
     // match arms across every canonical's backbone and lm_head. `slot` is
-    // the per-(bucket, op_idx, kind) ordinal, derived by walking
+    // the per-(tape_index, op_idx, kind) ordinal, derived by walking
     // `weight_slots` in declaration order and counting prior occurrences
     // of the same kind at the same op.
     use std::collections::HashMap;
     let mut by_kind: HashMap<&'static str, Vec<TokenStream>> = HashMap::new();
 
-    // Walk EVERY canonical lowered entry. Each distinct bucket
-    // (workload point) gets a pair of bucket ids: 2*ci (backbone)
+    // Walk EVERY canonical lowered entry. Each distinct tape_index
+    // (workload point) gets a pair of tape_index ids: 2*ci (backbone)
     // and 2*ci+1 (lm_head). FORWARD_TABLE rows pass these ids into
     // run/run_backbone, which forward them to run_slice → eval →
     // the per-arch WeightAccessors match arms.
-    let emit_for = |bucket_id: u32, instances: &[OpInstance], by_kind: &mut HashMap<&'static str, Vec<TokenStream>>| {
-        let bucket_lit = proc_macro2::Literal::u32_unsuffixed(bucket_id);
-        for (op_idx, inst) in instances.iter().enumerate() {
+    let emit_for = |tape_index: u32,
+                    weight_slots: &[Vec<WeightSlot>],
+                    by_kind: &mut HashMap<&'static str, Vec<TokenStream>>| {
+        let tape_index_lit = proc_macro2::Literal::u32_unsuffixed(tape_index);
+        for (op_idx, slots) in weight_slots.iter().enumerate() {
             let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
             let mut counts: HashMap<&'static str, u32> = HashMap::new();
-            for slot in &inst.weight_slots {
+            for slot in slots {
                 let key = match slot.kind {
                     WeightKind::RmsNorm => "rms_norm_at",
                     WeightKind::Embedding => "embedding_at",
@@ -4659,8 +4661,19 @@ fn emit_weight_accessors_impl(
                 let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
                 *n += 1;
                 let base = &slot.base;
+                // CosSin pulls from a `RotaryCache` field on the per-arch
+                // `Weights` struct (`wm.rotary` or `wm.rotary_local`),
+                // not from a `fn <base>(layer) -> &T` getter — rotary is
+                // shared across layers, and the cache itself owns a
+                // single `cos_sin_cache: GpuTensor`. The trait method
+                // returns `GpuTensor` by value, so `.clone()` produces
+                // a cheap handle copy.
+                let arm_body = match slot.kind {
+                    WeightKind::CosSin => quote! { self.#base.cos_sin_cache.clone() },
+                    _ => quote! { self.#base(layer) },
+                };
                 by_kind.entry(key).or_default().push(quote! {
-                    (#bucket_lit, #op_lit, #slot_lit) => self.#base(layer),
+                    (#tape_index_lit, #op_lit, #slot_lit) => #arm_body,
                 });
             }
         }
@@ -4668,8 +4681,8 @@ fn emit_weight_accessors_impl(
     for (ci, (_wp, (cl, _, _, _, _))) in canonical_lowered.iter().enumerate() {
         let bb_id = (ci as u32) * 2;
         let lm_id = bb_id + 1;
-        emit_for(bb_id, &cl.backbone.instances, &mut by_kind);
-        emit_for(lm_id, &cl.lm_head.instances, &mut by_kind);
+        emit_for(bb_id, &cl.backbone.weight_slots, &mut by_kind);
+        emit_for(lm_id, &cl.lm_head.weight_slots, &mut by_kind);
     }
 
     let method_emit = |method: &str, ret_ty: TokenStream| -> TokenStream {
@@ -4683,35 +4696,55 @@ fn emit_weight_accessors_impl(
         quote! {
             fn #method_id(
                 &self,
-                bucket: u32,
+                tape_index: u32,
                 op_idx: u32,
                 slot: u32,
                 layer: u32,
             ) -> #ret_ty {
-                match (bucket, op_idx, slot) {
+                // `layer` is unused for `cos_sin_at` (rotary is layer-
+                // independent); referenced explicitly here so the
+                // generated body type-checks identically across every
+                // method.
+                let _ = layer;
+                match (tape_index, op_idx, slot) {
                     #(#arms)*
                     _ => unreachable!(
-                        "WeightAccessors::{}: no match for (bucket={}, op_idx={}, slot={})",
-                        stringify!(#method_id), bucket, op_idx, slot,
+                        "WeightAccessors::{}: no match for (tape_index={}, op_idx={}, slot={})",
+                        stringify!(#method_id), tape_index, op_idx, slot,
                     ),
                 }
             }
         }
     };
 
-    let rms_norm = method_emit("rms_norm_at", quote! { &::ferrite_kernels::layers::RmsNorm });
+    let rms_norm = method_emit(
+        "rms_norm_at",
+        quote! { &::ferrite_kernels::layers::RmsNorm },
+    );
     let embedding = method_emit(
         "embedding_at",
         quote! { &::ferrite_kernels::layers::Embedding },
     );
-    let linear = method_emit("linear_at", quote! { &::ferrite_kernels::layers::LinearLayer });
+    let linear = method_emit(
+        "linear_at",
+        quote! { &::ferrite_kernels::layers::LinearLayer },
+    );
     let layer_norm = method_emit(
         "layer_norm_at",
         quote! { &::ferrite_kernels::layers::LayerNorm },
     );
-    let marlin = method_emit("marlin_at", quote! { &::ferrite_kernels::layers::MarlinLinear });
-    let bnb4 = method_emit("bnb4_at", quote! { &::ferrite_kernels::layers::Bnb4bitLinear });
-    let fp8 = method_emit("fp8_at", quote! { &::ferrite_kernels::layers::Fp8AnyLinear });
+    let marlin = method_emit(
+        "marlin_at",
+        quote! { &::ferrite_kernels::layers::MarlinLinear },
+    );
+    let bnb4 = method_emit(
+        "bnb4_at",
+        quote! { &::ferrite_kernels::layers::Bnb4bitLinear },
+    );
+    let fp8 = method_emit(
+        "fp8_at",
+        quote! { &::ferrite_kernels::layers::Fp8AnyLinear },
+    );
     let dsmoe = method_emit(
         "deepseek_moe_at",
         quote! { &::ferrite_kernels::layers_moe::DeepSeekV2MoELayer },
@@ -4732,7 +4765,10 @@ fn emit_weight_accessors_impl(
         "shared_fused_moe_at",
         quote! { &::ferrite_kernels::layers_moe::SharedFusedMoELayer },
     );
-    let cos_sin = method_emit("cos_sin_at", quote! { ::ferrite_cuda_core::tensor::GpuTensor });
+    let cos_sin = method_emit(
+        "cos_sin_at",
+        quote! { ::ferrite_cuda_core::tensor::GpuTensor },
+    );
     // `affine_quant_embedding_at` is gated `#[cfg(feature = "metal")]`
     // on the trait so we must emit the cfg attribute together with the
     // method body, or skip both when the arch never resolves an
@@ -4749,25 +4785,32 @@ fn emit_weight_accessors_impl(
             #[cfg(feature = "metal")]
             fn affine_quant_embedding_at(
                 &self,
-                bucket: u32,
+                tape_index: u32,
                 op_idx: u32,
                 slot: u32,
                 layer: u32,
             ) -> &::ferrite_kernels::layers::AffineQuantEmbedding {
-                match (bucket, op_idx, slot) {
+                match (tape_index, op_idx, slot) {
                     #(#aqe_arms)*
                     _ => unreachable!(
                         "WeightAccessors::affine_quant_embedding_at: no match for \
-                         (bucket={}, op_idx={}, slot={})",
-                        bucket, op_idx, slot,
+                         (tape_index={}, op_idx={}, slot={})",
+                        tape_index, op_idx, slot,
                     ),
                 }
             }
         }
     };
 
+    // Emit the impl unconditionally — `CanonicalParams: WeightAccessors`
+    // is an unconditional bound, so leaving this behind a feature gate
+    // would surface as `Weights: WeightAccessors not satisfied` in any
+    // ferrite-model-* crate whose own `metal`/`cuda` feature is empty
+    // or absent (e.g. ferrite-model-phi3 which declares `metal = []`).
+    // The trait methods all return cross-backend types from
+    // `ferrite_kernels::layers{,_moe}` plus `GpuTensor` from
+    // `ferrite-cuda-core` — both available regardless of backend feature.
     quote! {
-        #[cfg(any(feature = "cuda", feature = "metal"))]
         impl ::ferrite_forward::WeightAccessors for Weights {
             #rms_norm
             #embedding
@@ -4830,10 +4873,10 @@ fn marlin_format_literal(model: &ModelParams) -> TokenStream {
 
 // ── Forward fn emission ──────────────────────────────────────────
 //
-// The macro lowers each canonical bucket's solved FUF into a flat
+// The macro lowers each canonical tape_index's solved FUF into a flat
 // instruction list (a `&[Op]` static slice), emits one per-arch
 // `Op` enum + one per-arch `__interpret` helper, then emits one
-// thin per-bucket fn per (forward, backbone) × workload-point that:
+// thin per-tape_index fn per (forward, backbone) × workload-point that:
 // 1. allocates the runtime tile table,
 // 2. runs the alias prelude (zero-copy `View` aliases the lowering
 //    surfaced via `output_alias`),
@@ -4844,7 +4887,7 @@ fn marlin_format_literal(model: &ModelParams) -> TokenStream {
 // the canonical's body via thin `#[inline(always)]` wrappers — same
 // dedup the previous codegen path used.
 
-/// Ident for a per-workload-bucket forward fn. Name is
+/// Ident for a per-workload-tape_index forward fn. Name is
 /// `<prefix>_<m>` when `sk_bucket == 0` (legacy 1-D sweep) and
 /// `<prefix>_<m>_sk_<sk>` otherwise. Preserves the pre-sk naming
 /// for models that don't opt into an sk axis.
@@ -4856,7 +4899,7 @@ fn bucket_fn_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_macro
     }
 }
 
-/// Ident for a per-workload-bucket `static <PREFIX>_<m>: &[Op]`.
+/// Ident for a per-workload-tape_index `static <PREFIX>_<m>: &[Op]`.
 /// Mirrors [`bucket_fn_ident`] in shape but uses upper-case so the
 /// emitted module reads naturally — `FORWARD_M_64` /
 /// `BACKBONE_M_64_SK_2048`.
@@ -4868,7 +4911,7 @@ fn bucket_static_ident(prefix: &str, wp: crate::solver::WorkloadPoint) -> proc_m
     }
 }
 
-/// Per-canonical-bucket lowering products. The `backbone` slice
+/// Per-canonical-tape_index lowering products. The `backbone` slice
 /// carries everything the forward pass needs except the terminal
 /// `lm_head` gemm; the `lm_head` slice carries that single row.
 /// `forward` runs both, `forward_backbone` runs only the backbone
@@ -5014,7 +5057,7 @@ fn emit_alias_prelude(aliases: &[(u32, u32)]) -> Vec<TokenStream> {
     // `TileEntry::View { ref_slot }`; using it instead of inlining
     // the struct literal keeps prettyplease from breaking each
     // alias onto three lines, which matters because there are
-    // hundreds of aliases per bucket on the deeper models.
+    // hundreds of aliases per tape_index on the deeper models.
     aliases
         .iter()
         .map(|(dst, src)| {
@@ -5026,7 +5069,7 @@ fn emit_alias_prelude(aliases: &[(u32, u32)]) -> Vec<TokenStream> {
 }
 
 /// Render the comma-separated impl-name list (`"rmsnorm_ref,
-/// fused_qkv_rope_cache, …"`) the per-bucket fn passes to
+/// fused_qkv_rope_cache, …"`) the per-tape_index fn passes to
 /// `tracing::debug!`. `filter_terminal` drops the terminal subgraph
 /// for the backbone fn's listing.
 fn impl_names_for(
@@ -5045,7 +5088,7 @@ fn impl_names_for(
 }
 
 /// Emit the full per-model module body: Weights struct + loader,
-/// one forward fn per workload bucket, and a dispatching wrapper.
+/// one forward fn per workload tape_index, and a dispatching wrapper.
 ///
 /// When `canonical_override` is `Some(ident)`, this variant is a
 /// shim for that canonical sibling — emit `pub type Weights =
@@ -5053,7 +5096,7 @@ fn impl_names_for(
 /// variant-specific `load` + `fingerprint_matches` bodies
 /// (loaders differ per quant preset, fingerprints differ per
 /// tensor-suffix gate), and `pub use` the canonical's forward +
-/// forward_backbone + per-bucket forward_m_<N> fns. rustc doesn't
+/// forward_backbone + per-tape_index forward_m_<N> fns. rustc doesn't
 /// re-monomorphize `pub use` re-exports, so the canonical fn body
 /// is optimized ONCE regardless of how many variants share it.
 #[allow(clippy::too_many_arguments)]
@@ -5138,7 +5181,7 @@ fn emit_synthesized_kernel_sources_override(
     let consts = crate::fuse_pass::ChunkConstants {
         // Baked as `constant constexpr` literals in the emitted MSL.
         // M is the only remaining function constant (varies per
-        // bucket; can't be baked).
+        // tape_index; can't be baked).
         hidden,
         num_q_heads: num_q,
         num_kv_heads: num_kv,
@@ -5152,7 +5195,7 @@ fn emit_synthesized_kernel_sources_override(
         // Pre-attn synth gains 3 extra `__{q,k,v}_linear_bias` buffer
         // params + a bias epilogue inside each per-band AffineQmvAtom
         // when this is `true`. Threaded down from
-        // `BackendCaps::has_bias_add` so Qwen2/Qwen2.5 (DSL emits
+        // `program_has_bias_add` so Qwen2/Qwen2.5 (DSL emits
         // `bias_add` on QKV) gets the biased variant; Llama (no DSL
         // bias_add) keeps the existing one. MLP / gate-up synths
         // ignore this — Qwen2 MLP has no biases.
@@ -5232,96 +5275,44 @@ fn emit_synthesized_kernel_sources_override(
     }
 }
 
-/// Backend-capability flags derived by walking the classified
-/// `Program` at macro-expand time. Each flag tells
-/// [`ferrite_forward::CanonicalParams`] whether the DSL emits a tile
-/// kind that requires a particular backend `Impl`. The values
-/// surface as `HAS_*` associated consts on the per-canonical
-/// `CanonicalParams` impl, where `ferrite_forward::BackendCompat`
-/// turns "DSL has it, backend doesn't claim it" into a compile-time
-/// `assert!` failure.
-///
-/// The struct's only consumer is [`emit_canonical_params_impl`].
-/// Add a field here when a new "this DSL tile kind needs a backend
-/// Impl that doesn't exist on every backend" axis surfaces.
-#[derive(Copy, Clone, Default, Debug)]
-pub struct BackendCaps {
-    /// At least one `bias_add(...)` tile appears in the DSL.
-    pub has_bias_add: bool,
-    /// At least one `OpKind::Moe` tile (the unified MoE op covering
-    /// router softmax + top-k + experts gather + SwitchGLU) appears
-    /// in the DSL. Set true on every MoE arch (Mixtral, Qwen2-MoE,
-    /// Qwen3-MoE, DeepSeek-V2/V3).
-    pub has_moe: bool,
-}
-
-impl BackendCaps {
-    /// Derive capability flags from a classified DSL `Program`.
-    /// Walks every `Expr::Call`'s `op: OpKind` over the program's
-    /// statements (recursing through nested loops / if-arms) and
-    /// flips the matching field on the first hit.
-    pub fn from_program(program: &Program) -> Self {
-        let mut caps = Self::default();
-        for stmt in &program.statements {
-            Self::scan_stmt(stmt, &mut caps);
-        }
-        caps
-    }
-
-    fn scan_stmt(stmt: &Stmt, caps: &mut BackendCaps) {
+/// Walk the classified DSL `Program` looking for any
+/// `Expr::Call { op: OpKind::BiasAdd, .. }`. Returns `true` on the
+/// first hit. Drives the biased variant of the synth pre-attn
+/// megakernel — Qwen2/Qwen2.5 DSL emits `bias_add` on QKV, Llama
+/// does not.
+pub fn program_has_bias_add(program: &Program) -> bool {
+    fn scan_stmt(stmt: &Stmt) -> bool {
         match stmt {
-            Stmt::Assign { value, .. } => Self::scan_expr(value, caps),
-            Stmt::AssignTuple { value, .. } => Self::scan_expr(value, caps),
-            Stmt::For { body, .. } => {
-                for s in body {
-                    Self::scan_stmt(s, caps);
-                }
-            }
+            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => scan_expr(value),
+            Stmt::For { body, .. } => body.iter().any(scan_stmt),
             Stmt::If {
                 then_body,
                 else_body,
                 ..
-            } => {
-                for s in then_body {
-                    Self::scan_stmt(s, caps);
-                }
-                for s in else_body {
-                    Self::scan_stmt(s, caps);
-                }
-            }
+            } => then_body.iter().any(scan_stmt) || else_body.iter().any(scan_stmt),
         }
     }
-
-    fn scan_expr(expr: &Expr, caps: &mut BackendCaps) {
+    fn scan_expr(expr: &Expr) -> bool {
         match expr {
             Expr::Call { op, args } => {
-                match op {
-                    OpKind::BiasAdd => caps.has_bias_add = true,
-                    OpKind::Moe => caps.has_moe = true,
-                    _ => {}
-                }
-                for a in args {
-                    Self::scan_expr(a, caps);
-                }
+                matches!(op, OpKind::BiasAdd) || args.iter().any(scan_expr)
             }
-            Expr::Add { lhs, rhs } | Expr::Mul { lhs, rhs } => {
-                Self::scan_expr(lhs, caps);
-                Self::scan_expr(rhs, caps);
-            }
+            Expr::Add { lhs, rhs } | Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
             Expr::Local(_)
             | Expr::Extern { .. }
             | Expr::Weight { .. }
             | Expr::ScalarLit(_)
             | Expr::SqrtBound(_)
-            | Expr::ConfigScalar { .. } => {}
+            | Expr::ConfigScalar { .. } => false,
         }
     }
+    program.statements.iter().any(scan_stmt)
 }
 
 fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
-    caps: BackendCaps,
+    has_bias_add: bool,
 ) -> TokenStream {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -5477,11 +5468,15 @@ fn emit_canonical_params_impl(
     // gated). Empty for cuda models and any model that doesn't ship
     // an MLX-affine int4 quantization config; default `&[]` from the
     // CanonicalParams trait kicks in there.
+    //
+    // `has_bias_add` is threaded through so Qwen2/Qwen2.5 (whose DSL
+    // emits `bias_add` on QKV) gets the biased synth kernel variants
+    // — `synth_pre_attn{,_init}_<dtype>_<scale>_gs<N>_bias` — and the
+    // lowering arm's `kernel_symbol` matches the registered library.
+    // Mismatch surfaces at worker init as
+    // `PipelineLookup(no library …_bias in SpecializedPipelineCache)`.
     let synth_sources_override =
-        emit_synthesized_kernel_sources_override(model, tp_world_size, caps.has_bias_add);
-
-    let has_bias_add_lit = caps.has_bias_add;
-    let has_moe_lit = caps.has_moe;
+        emit_synthesized_kernel_sources_override(model, tp_world_size, has_bias_add);
 
     quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
@@ -5514,11 +5509,6 @@ fn emit_canonical_params_impl(
             const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
-            // Backend-capability flags derived by macro DSL inspection
-            // (`BackendCaps::from_program`). Drive
-            // `ferrite_forward::BackendCompat<B>::COMPAT_CHECK`.
-            const HAS_BIAS_ADD: bool = #has_bias_add_lit;
-            const HAS_MOE: bool = #has_moe_lit;
             #mrope_section_tokens
             #synth_sources_override
         }
@@ -5598,12 +5588,12 @@ pub fn emit_model(
         bucket_canonical.push(canonical);
     }
 
-    // Lower every canonical bucket once, backbone-shaped: skip the
+    // Lower every canonical tape_index once, backbone-shaped: skip the
     // terminal subgraph (the `gemm(<final_norm>, lm_head)` row) and
     // emit it separately as a tiny LM_HEAD slice. forward and
     // forward_backbone share the backbone slice; forward additionally
     // runs LM_HEAD; forward_backbone DtoD-copies the backbone-output
-    // slot. No more pair of near-identical full slices per bucket.
+    // slot. No more pair of near-identical full slices per tape_index.
     let mut arch_opcodes = ArchOpcodes::new();
     let mut canonical_lowered: BTreeMap<
         crate::solver::WorkloadPoint,
@@ -5612,10 +5602,10 @@ pub fn emit_model(
             /* num_slots */ u32,
             /* backbone_slot */ u32,
             /* terminal_slot */ u32,
-            /* slots: shared coloring across every bucket in this
-             * canonical's group. Per-bucket arena_bytes (below in
+            /* slots: shared coloring across every tape_index in this
+             * canonical's group. Per-tape_index arena_bytes (below in
              * the metal emission loop) computes its OWN sizes from
-             * this map + that bucket's bounds, so each bucket gets
+             * this map + that tape_index's bounds, so each tape_index gets
              * a tight arena sized for its own num_tokens. */
             crate::impl_lib::SlotMap,
         ),
@@ -5667,7 +5657,7 @@ pub fn emit_model(
             protected_bb.insert((last_node_id, 0));
         }
 
-        // Per-bucket colored slot map. Computed once and shared
+        // Per-tape_index colored slot map. Computed once and shared
         // between backbone lowering and the lm_head fan_out so they
         // agree on slot indices.
         let slots = crate::interpreter_codegen::colored_slot_map(
@@ -5730,6 +5720,10 @@ pub fn emit_model(
                 let term_emits = term_imp
                     .fan_out(&term_match, fuf, program, &bounds, &slots)
                     .expect("terminal subgraph's Impl must implement fan_out");
+                let term_accs = term_imp.required_weights(&term_match.claimed_tiles, fuf, program);
+                let term_slots = crate::interpreter_codegen::weight_accessors_to_slots(&term_accs);
+                let term_weight_slots: Vec<Vec<WeightSlot>> =
+                    term_emits.iter().map(|_| term_slots.clone()).collect();
                 // Eval body lives in `ferrite_forward::Instruction::eval`
                 // — `arch_opcodes` keeps the shape registration for
                 // `emit_bucket_static_slice`'s shape-checking pass.
@@ -5750,6 +5744,7 @@ pub fn emit_model(
                     // same walker against the terminal Impl's
                     // claimed tiles.
                     barriers: vec![true; n],
+                    weight_slots: term_weight_slots,
                     num_slots,
                     final_slot: terminal_slot,
                 }
@@ -5757,6 +5752,7 @@ pub fn emit_model(
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
                 instances: Vec::new(),
                 barriers: Vec::new(),
+                weight_slots: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
             },
@@ -5829,8 +5825,8 @@ pub fn emit_model(
     // expanded source (without it prettyplease wraps
     // `::ferrite_forward::Instruction::<Weights>::Variant(…)` over
     // 3-4 lines per row).
-    let backend_caps = BackendCaps::from_program(program);
-    let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size, backend_caps);
+    let has_bias_add = program_has_bias_add(program);
+    let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size, has_bias_add);
     let weight_accessors_impl = emit_weight_accessors_impl(&canonical_lowered);
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
@@ -5840,7 +5836,7 @@ pub fn emit_model(
     // (which prettyplease wraps over 3-4 lines per row).
     // The `__I` alias and the variant glob-import are backend-agnostic
     // — `Instruction<W>` is defined in `ferrite-forward` without a
-    // backend gate. The per-bucket static slices reference both, so
+    // backend gate. The per-tape_index static slices reference both, so
     // they compile under either `cfg(feature = "cuda")` (linking the
     // cuda `Weights` struct) or `cfg(feature = "metal")` (linking the
     // metal `Weights` ZST emitted in `emit_weights_struct`).
@@ -5852,7 +5848,7 @@ pub fn emit_model(
     let shapes_by_name = arch_opcodes.shapes_by_name();
 
     // Static slices: BACKBONE_M_<wp> + LM_HEAD_M_<wp> per CANONICAL
-    // bucket only. Non-canonical buckets share their canonical
+    // tape_index only. Non-canonical buckets share their canonical
     // sibling's slices via the FORWARD_TABLE entries below.
     let mut static_slices: Vec<TokenStream> = Vec::new();
     for (i, wp) in bucket_points.iter().enumerate() {
@@ -5904,7 +5900,7 @@ pub fn emit_model(
 
     // (m_min, m_max_excl, sk_min, sk_max_excl) for each workload.
     // M=1 is special-cased: the solver may pick M=1-only kernels
-    // (cutlass_gemv) that fail at M>1, so the next bucket starts at
+    // (cutlass_gemv) that fail at M>1, so the next tape_index starts at
     // M=2 even if the configured points list `[1, 8, ...]`.
     let m_max_excl_for = |m_idx: usize| -> u64 {
         if m_idx + 1 == num_tokens_points.len() {
@@ -5927,7 +5923,7 @@ pub fn emit_model(
         .collect();
     // Bucket-id assignment for the per-arch `WeightAccessors` impl:
     // canonical_lowered.iter() ordering pairs each canonical with
-    // bucket ids `(2*ci, 2*ci+1)` for backbone and lm_head. This
+    // tape_index ids `(2*ci, 2*ci+1)` for backbone and lm_head. This
     // mapping must match the iteration order in
     // `emit_weight_accessors_impl` so the match-arm keys line up.
     let canonical_to_bucket_id: HashMap<_, u32> = canonical_lowered
@@ -5946,11 +5942,11 @@ pub fn emit_model(
             .expect("canonical_to_bucket_id missing entry for canonical workload point");
         let bb_bucket_lit = proc_macro2::Literal::u32_unsuffixed(bb_bucket_id);
         let lm_bucket_lit = proc_macro2::Literal::u32_unsuffixed(bb_bucket_id + 1);
-        // Per-bucket slot metadata. The colored slot map is built
+        // Per-tape_index slot metadata. The colored slot map is built
         // per workload point (the solver may pick Impls that need
-        // different intermediate-tile counts per bucket — e.g.
+        // different intermediate-tile counts per tape_index — e.g.
         // CutlassGemmAdd fuses the residual into the GEMM at
-        // prefill, freeing a slot vs the decode-bucket's separate
+        // prefill, freeing a slot vs the decode-tape_index's separate
         // Add). The non-canonical buckets share their canonical's
         // slot metadata since they share its static slices.
         let (_, num_slots_b, backbone_slot_b, terminal_slot_b, _) = &canonical_lowered[&canonical];
@@ -5974,7 +5970,7 @@ pub fn emit_model(
                 .iter()
                 .position(|&sk| sk == wp.sk_bucket)
                 .unwrap();
-            // The first sk bucket per m group must accept sk < its
+            // The first sk tape_index per m group must accept sk < its
             // own configured value — old codegen routed this via a
             // `_ =>` fallback arm onto the smallest sk fn. So emit
             // sk_min=0 for j==0 instead of wp.sk_bucket; without
@@ -6015,7 +6011,7 @@ pub fn emit_model(
         });
     }
 
-    // FORWARD_TABLE — one row per bucket. `__B` aliases the
+    // FORWARD_TABLE — one row per tape_index. `__B` aliases the
     // `BucketEntry` tuple-struct constructor so each row stays on a
     // single line in expanded source. Available under either backend
     // — `vllm ferrite info`'s per-variant `dump()` walks it on both
@@ -6070,11 +6066,21 @@ pub fn emit_model(
         let bucket_m_lit = proc_macro2::Literal::u32_unsuffixed(m as u32);
         let num_slots_lit = proc_macro2::Literal::u32_unsuffixed(*num_slots_b);
         let terminal_slot_lit = proc_macro2::Literal::u32_unsuffixed(*terminal_slot_b);
+        // tape-index ids matching the keys `emit_weight_accessors_impl`
+        // bakes into the per-arch `WeightAccessors` match arms:
+        // `ci*2` for backbone, `ci*2 + 1` for lm_head, where `ci` is
+        // the canonical's position in `canonical_lowered.iter()`.
+        let ci = canonical_lowered
+            .keys()
+            .position(|wp| *wp == canonical)
+            .expect("canonical present in canonical_lowered");
+        let backbone_tape_index_lit = proc_macro2::Literal::u32_unsuffixed((ci as u32) * 2);
+        let lm_head_tape_index_lit = proc_macro2::Literal::u32_unsuffixed((ci as u32) * 2 + 1);
 
-        // Per-bucket arena_bytes: register-coloring tells us which
+        // Per-tape_index arena_bytes: register-coloring tells us which
         // (tile, output_slot) pairs share an arena slot; for THIS
-        // bucket M we evaluate each tile's output shape against this
-        // bucket's bounds and take the per-color max. Each bucket
+        // tape_index M we evaluate each tile's output shape against this
+        // tape_index's bounds and take the per-color max. Each tape_index
         // gets a tight arena sized exactly for its own num_tokens —
         // the worker pool elementwise-maxes across MetalBucketSpec
         // entries once at init time to size the per-worker arena
@@ -6117,6 +6123,8 @@ pub fn emit_model(
         metal_bucket_entries.push(quote! {
             ::ferrite_forward::interpreter::metal::MetalBucketSpec {
                 bucket_m: #bucket_m_lit,
+                backbone_tape_index: #backbone_tape_index_lit,
+                lm_head_tape_index: #lm_head_tape_index_lit,
                 num_arena_slots: #num_slots_lit,
                 terminal_slot: #terminal_slot_lit,
                 arena_bytes: #arena_static_ident,
@@ -6141,7 +6149,7 @@ pub fn emit_model(
 
     // Vocab size — baked from `model.bounds["vocab_size"]` at
     // macro-expansion time. The metal forward body needs it to
-    // shape the `OwnedTensor` it returns from the bucket's terminal
+    // shape the `OwnedTensor` it returns from the tape_index's terminal
     // arena slot ([num_tokens, vocab_size] f16 logits).
     let vocab_size_lit = {
         let vocab = model
@@ -6154,7 +6162,7 @@ pub fn emit_model(
 
     // Per-worker arena peak in bytes — sum across every slot of the
     // worker's arena layout, where each slot is sized to fit the
-    // largest bucket's claim on that color. The pool computes this
+    // largest tape_index's claim on that color. The pool computes this
     // exact layout at runtime via elementwise-max across each
     // `MetalBucketSpec.arena_bytes`; we mirror that calculation here
     // at compile time so the metal worker can pre-declare its
@@ -6199,26 +6207,9 @@ pub fn emit_model(
     };
 
     let metal_emission = quote! {
-        // ── BackendCompat<Metal> gate ────────────────────────────
-        //
-        // Forces `<Weights as BackendCompat<Metal>>::COMPAT_CHECK`
-        // to monomorphize at this crate's compile time. The const's
-        // body asserts `!HAS_BIAS_ADD && !HAS_OUTPUT_GATE &&
-        // !HAS_MOE`; an arch whose DSL contains a tile the metal
-        // backend can't claim fails build with a clear error,
-        // before any runtime garbage-output bug can fire. Pre-
-        // BackendCompat instance: mlx-community/Qwen2.5-1.5B-
-        // Instruct-4bit produced "valid-tokens-in-random-order"
-        // output because Qwen2's QKV `bias_add` tiles were silently
-        // dropped on the metal-affine-int4 path.
-        #[cfg(feature = "metal")]
-        const _: () = <Weights as ::ferrite_forward::BackendCompat<
-            ::ferrite_forward::Metal,
-        >>::COMPAT_CHECK;
-
         #(#metal_arena_bytes_statics)*
 
-        /// Per-canonical bucket plan for the Metal pool. One row per
+        /// Per-canonical tape_index plan for the Metal pool. One row per
         /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`
         /// is a linear smallest-fit scan, so order matters.
         #[cfg(feature = "metal")]
@@ -6228,7 +6219,7 @@ pub fn emit_model(
                 #(#metal_bucket_entries)*
             ];
 
-        /// Largest `num_tokens` bucket across [`METAL_BUCKETS`]. The
+        /// Largest `num_tokens` tape_index across [`METAL_BUCKETS`]. The
         /// metal forward body's `RuntimeFactory` allocates per-worker
         /// runtime buffers (input_ids/positions/slot_mapping/...) at
         /// `METAL_MAX_BUCKET_M * sizeof(u32)`; block_table at
@@ -6244,8 +6235,8 @@ pub fn emit_model(
 
         /// Per-worker arena peak in bytes for this canonical. The
         /// pool's `arena_layout` is the elementwise-max across every
-        /// bucket spec's `arena_bytes`; per-canonical that's the
-        /// shared `METAL_ARENA_BYTES_M_<m>` static (every bucket in
+        /// tape_index spec's `arena_bytes`; per-canonical that's the
+        /// shared `METAL_ARENA_BYTES_M_<m>` static (every tape_index in
         /// one canonical points at the same row), so the sum equals
         /// the worker's resident-arena byte footprint. Read by
         /// `FerriteWorker(metal)::determine_available_memory` to
@@ -6256,10 +6247,10 @@ pub fn emit_model(
         /// Build a [`MetalWorkerPool`] for this canonical. Thin
         /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
         /// the per-canonical [`METAL_BUCKETS`] static so callers don't
-        /// have to construct the bucket plan by hand. The arena layout
-        /// is derived from each bucket's `arena_bytes` field — taking
+        /// have to construct the tape_index plan by hand. The arena layout
+        /// is derived from each tape_index's `arena_bytes` field — taking
         /// the elementwise max so the single per-worker arena fits the
-        /// largest activation across every bucket.
+        /// largest activation across every tape_index.
         ///
         /// `weights` is borrowed; the pool stores no back-reference,
         /// caller passes `&weights` again at every `forward` /
@@ -6300,7 +6291,7 @@ pub fn emit_model(
         /// `ctx.<input>` `TensorView`s — under metal those raw_ptrs
         /// are `metal::Buffer.contents()` so the slice borrow lives
         /// as long as the call — hands them to
-        /// `MetalWorkerPool::forward`, and copies the bucket's
+        /// `MetalWorkerPool::forward`, and copies the tape_index's
         /// terminal arena slot out as a fresh `OwnedTensor` of
         /// `[num_tokens, vocab_size]` f16 logits.
         #[cfg(feature = "metal")]
@@ -6438,11 +6429,11 @@ pub fn emit_model(
 
             // ── Run forward + copy logits out ─────────────────────
             //
-            // The pool picks the bucket from `num_tokens`, runs
+            // The pool picks the tape_index from `num_tokens`, runs
             // `executeCommandsInBuffer` (interleaved with MPS GEMMs
             // on <M4 hardware), waits for completion, then invokes
             // the closure with `&MetalWorker` + `bucket_idx`. The
-            // bucket's terminal arena slot holds the lm_head output;
+            // tape_index's terminal arena slot holds the lm_head output;
             // we wrap that buffer in a fresh `OwnedTensor` (Arc-
             // handle clone — no copy) so the caller can read
             // `[num_tokens, vocab_size]` f16 logits without taking
@@ -6535,7 +6526,7 @@ pub fn emit_model(
 
         #metal_emission
 
-        /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
+        /// Dispatch on (num_tokens, sk_bucket) → tape_index entry, then
         /// run the universal interpreter.
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
@@ -6632,12 +6623,12 @@ fn emit_shim_model(
         emit_fingerprint,
     );
 
-    // Per-bucket fn surfaces are gone — dispatch lives on the
+    // Per-tape_index fn surfaces are gone — dispatch lives on the
     // canonical's `FORWARD_TABLE` + `find_bucket`. Re-export the
     // arch-level dispatchers only. Under `metal` the shim shares the
     // canonical's `METAL_BUCKETS` static + `metal_pool()` constructor
     // — variant-specific differences (quant format, fingerprint) are
-    // load-time only; static bucket plans are byte-identical.
+    // load-time only; static tape_index plans are byte-identical.
     let _ = sfufs;
     quote! {
         #weights
@@ -6711,7 +6702,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 1, super::BackendCaps::default()).to_string();
+        let ts = emit_canonical_params_impl(&m, 1, false).to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 32"),
@@ -6739,7 +6730,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 2, super::BackendCaps::default()).to_string();
+        let ts = emit_canonical_params_impl(&m, 2, false).to_string();
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 16"),
             "tp=2 must shard NUM_Q_HEADS to 16; got {ts}"
@@ -6779,7 +6770,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let ts = emit_canonical_params_impl(&m, 8, super::BackendCaps::default()).to_string();
+        let ts = emit_canonical_params_impl(&m, 8, false).to_string();
         // 32 / 8 = 4
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 4"),

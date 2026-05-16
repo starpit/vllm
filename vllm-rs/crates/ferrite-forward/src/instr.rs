@@ -25,35 +25,38 @@
 //! `&[Instruction]` slices for backbone + lm_head per bucket, and a
 //! 1-line forward shim that delegates to [`run`].
 
-// File compiles under either `cuda` or `metal`:
-// - The `Instruction<W>` enum, `CanonicalParams` trait, and `WtFn`/`CosSinFn`
-//   type aliases are backend-agnostic — only `GpuTensor` (always available)
-//   plus the layer struct *type names* (also always available; methods are
-//   cuda-gated inside `ferrite-kernels/src/layers.rs`).
-// - The `eval`/`run`/`run_backbone` fns and `InterpreterCtx` are cuda-only;
-//   each is individually `#[cfg(feature = "cuda")]`-gated below.
+// File is ungated at the module level so the proc-macro can use
+// `Instruction` without a backend feature. The `Instruction` enum
+// + `CanonicalParams` / `WeightAccessors` traits compile under any
+// feature combination — only `GpuTensor` (always available) plus the
+// layer struct *type names* (also always available; methods are
+// cuda-gated inside `ferrite-kernels/src/layers.rs`) are referenced.
 //
-// Layer type names referenced by the enum variants come from
-// `ferrite_kernels::layers`/`layers_moe`; those modules and their re-exports
-// are now ungated at the lib.rs level (see `ferrite-kernels/src/lib.rs`).
-
-// Cross-backend imports — layer types appear in `WeightAccessors`
-// trait signatures (return types) and `Instruction` variant doc
-// references; both need them under cuda AND metal.
-use ferrite_cuda_core::tensor::{GpuTensor, MAX_DIMS};
+// `MAX_DIMS` is needed by the `Instruction::Reshape` variant which is
+// ungated, so this import stays at the module level.
+use ferrite_cuda_core::tensor::MAX_DIMS;
+// Layer types appear in `WeightAccessors` trait return types and the
+// cuda eval body's local bindings. Gated on `any(cuda, metal)`
+// because ferrite-kernels' own layer types only compile under one of
+// those features — without them, `ferrite_kernels::layers` is empty.
+// `Instruction` enum itself is ungated and references only `u32` /
+// scalar fields after the lift.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use ferrite_cuda_core::tensor::GpuTensor;
 #[cfg(feature = "metal")]
 use ferrite_kernels::layers::AffineQuantEmbedding;
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use ferrite_kernels::layers::{
     Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
 };
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use ferrite_kernels::layers_moe::{
     DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
     SharedFusedMoELayer,
 };
 // Cuda-only imports (eval body, runtime entry points) — gated
-// individually below so the metal-feature build only pulls in the
-// cross-backend pieces above.
-
+// individually below so the metal-feature / no-backend builds only
+// pull in the cross-backend pieces above.
 #[cfg(feature = "cuda")]
 use crate::ForwardCtx;
 #[cfg(feature = "cuda")]
@@ -75,6 +78,7 @@ use ferrite_kernels::kernels;
 /// `Weights` so the universal `Instruction::eval` body can read
 /// model constants without storing them on every variant instance.
 /// Defaults to 0 / 0.0 / -1 for fields the canonical doesn't use.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub trait CanonicalParams: WeightAccessors {
     const HEAD_DIM: u32;
     const NUM_Q_HEADS: u32;
@@ -274,6 +278,10 @@ pub trait CanonicalParams: WeightAccessors {
 /// Cross-backend: both the cuda eval body and the metal worker call
 /// into the same per-arch impl emitted by
 /// `ferrite-forward-macro::codegen::emit_weight_accessors_impl`.
+/// Gated on `any(cuda, metal)` because the return types reference
+/// `ferrite_kernels::layers::*` structs which only compile under
+/// one of those features.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub trait WeightAccessors {
     fn rms_norm_at(
         &self,
@@ -409,6 +417,17 @@ pub trait WeightAccessors {
 
 /// Runtime state passed by `&mut` into every `op.eval(&mut ctx)`.
 /// Constants live on `W: CanonicalParams`, NOT here.
+///
+/// **Reshape / RopeAppend `out_slot != in_slot` invariant.** Both
+/// instructions write `TileEntry::Reshaped { ref_slot, tensor }` at
+/// `out_slot`. The codegen `colored_slot_map` guarantees `out_slot !=
+/// in_slot` for every Impl that declares `output_alias_is_view = true`
+/// (today: `ReshapeRefImpl`, `RopeAppendRefImpl`) — so the overwrite
+/// at `tiles[out_slot]` never drops the upstream's `OwnedTensor` at
+/// `tiles[in_slot]`. The G.7(e.tail.2) bug fix had a runtime safety
+/// net (`pinned_owned: Vec<OwnedTensor>`) that pinned the prior Owned
+/// past the overwrite; once the codegen invariant is in place, the
+/// safety net is unnecessary and was deleted in this commit.
 #[cfg(feature = "cuda")]
 pub struct InterpreterCtx<'a, W> {
     pub wm: &'a W,
@@ -922,6 +941,7 @@ fn assert_weight_shape(
 /// Used by `assert_weight_shape` to skip its check at tp>1 where
 /// runtime per-rank shapes legitimately disagree with the codegen's
 /// unified-bounds shapes.
+#[cfg(feature = "cuda")]
 #[inline]
 #[cfg(feature = "cuda")]
 fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
@@ -1173,12 +1193,7 @@ impl Instruction {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::FusedAddRmsNormWithOffset(
-                delta_slot,
-                residual_slot,
-                layer,
-                offset,
-            ) => unsafe {
+            Instruction::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
@@ -1404,13 +1419,7 @@ impl Instruction {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedQkvRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                biased,
-                interleaved,
-            ) => unsafe {
+            Instruction::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
@@ -1479,13 +1488,7 @@ impl Instruction {
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedQkvQkNormRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                q_offset,
-                k_offset,
-            ) => {
+            Instruction::FusedQkvQkNormRopeCache(in_slot, out_slot, layer, q_offset, k_offset) => {
                 let layer = ctx.layer_offset + layer;
                 let mut q_out = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
@@ -2305,16 +2308,7 @@ impl Instruction {
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::CutlassGemm(
-                in_slot,
-                out_slot,
-                layer,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => unsafe {
+            Instruction::CutlassGemm(in_slot, out_slot, layer, tile_m, tile_n, stages, n, k) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
@@ -2821,12 +2815,7 @@ impl Instruction {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::GgmlFusedQkvRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                interleaved,
-            ) => unsafe {
+            Instruction::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, interleaved) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);

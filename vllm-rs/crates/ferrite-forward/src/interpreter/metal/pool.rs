@@ -66,6 +66,15 @@ use ferrite_cuda_core::MetalAllocator;
 /// an `Arc<[MetalBucketSpec]>` cheaply.
 pub struct MetalBucketSpec {
     pub bucket_m: u32,
+    /// Tape index passed to the per-arch [`crate::WeightAccessors`]
+    /// impl when resolving weight bindings inside this bucket's
+    /// backbone slice. The macro emits a unique id per
+    /// `(canonical, backbone/lm_head)` pair so the trait's match
+    /// arms can disambiguate same-op_idx-different-canonical cases.
+    pub backbone_tape_index: u32,
+    /// Tape index for the lm_head slice. See
+    /// [`Self::backbone_tape_index`].
+    pub lm_head_tape_index: u32,
     pub num_arena_slots: u32,
     /// Index in the colored arena where this bucket's terminal
     /// activation lands (lm_head output for decoder layouts; the
@@ -579,6 +588,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 spec.lm_head_barriers,
                 spec.bucket_m,
                 spec.num_arena_slots,
+                spec.backbone_tape_index,
+                spec.lm_head_tape_index,
                 target_profile.as_ref(),
             )
             .map_err(|e| PoolBuildError::BucketLower {

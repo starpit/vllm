@@ -17,9 +17,9 @@ use crate::classified::{OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint,
-    default_required_weights, gemm_nk_from_fuf, weight_storage_of,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights, gemm_nk_from_fuf,
+    weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -211,7 +211,7 @@ impl Implementation for MetalAffineQmmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -240,23 +240,20 @@ impl Implementation for MetalAffineQmmImpl {
             ),
         };
         let vector_limit = affine_qmm_vector_limit(k, n);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AffineQmm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #n },
-                quote! { #k },
-                quote! { #group_size },
-                quote! { #bits },
-                quote! { #vector_limit },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        // Weight (LinearLayer) flows through `required_weights()`;
+        // the macro injects the `(tape_index, op_idx, slot=0)` arm
+        // into the per-arch `WeightAccessors::linear_at`.
+        let _ = base_ident;
+        Some(vec![ferrite_forward::Instruction::AffineQmm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            n,
+            k,
+            group_size,
+            bits,
+            vector_limit,
+        )])
     }
 }
 

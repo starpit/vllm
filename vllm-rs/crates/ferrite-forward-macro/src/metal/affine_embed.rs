@@ -24,9 +24,8 @@ use crate::fuf::{Fuf, TileId};
 use crate::codegen::split_base_layer;
 use crate::emit::weight_field_name;
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
-    Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot, WorkloadConstraint,
-    weight_storage_of,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint, weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -208,7 +207,7 @@ impl Implementation for MetalAffineEmbedImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let out_slot = slots.of(tile, 0);
         let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
@@ -229,25 +228,16 @@ impl Implementation for MetalAffineEmbedImpl {
                  — matches() should have rejected this"
             ),
         };
-        let gs_lit = proc_macro2::Literal::u32_unsuffixed(group_size);
-        let bits_lit = proc_macro2::Literal::u32_unsuffixed(bits);
-
-        // Weight resolution moves to the tape-level WeightAccessors
-        // impl (see `ferrite-forward::instr::WeightAccessors::
-        // affine_quant_embedding_at`); record the named accessor so
-        // the macro emits the right match arm at this op position.
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AffineEmbed", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #out_slot },
-                quote! { #gs_lit },
-                quote! { #bits_lit },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::AffineQuantEmbedding,
-            base: base_ident,
-        })])
+        // AffineQuantEmbedding accessor flows through
+        // `required_weights()`; the macro injects the
+        // `(tape_index, op_idx, slot=0)` arm into the per-arch
+        // `WeightAccessors::affine_quant_embedding_at`.
+        let _ = base_ident;
+        Some(vec![ferrite_forward::Instruction::AffineEmbed(
+            out_slot,
+            group_size,
+            bits,
+        )])
     }
 }
 

@@ -102,11 +102,10 @@ pub enum PlaceholderPolicy {
     /// `<|image_pad|>` × 1, we expand to N copies, the engine splices
     /// vision embeddings into all N positions.
     RepeatMarker,
-    /// HF Gemma3 expansion: marker (`<start_of_image>`) → `[wrap, boi,
-    /// soft × N, eoi, wrap]`. Splice at the N soft positions. The
-    /// model was trained on this exact bracketed structure (boi + soft
-    /// + eoi sentinels), so a flat `RepeatMarker` of boi gives garbled
-    /// output.
+    /// HF Gemma3 expansion: marker (`<start_of_image>`) → `[wrap, boi, soft × N, eoi, wrap]`.
+    /// Splice at the N soft positions. The model was trained on this exact
+    /// bracketed structure (boi + soft + eoi sentinels), so a flat
+    /// `RepeatMarker` of boi gives garbled output.
     BoiSoftEoiWrap {
         soft_token_id: u32,
         eoi_token_id: u32,

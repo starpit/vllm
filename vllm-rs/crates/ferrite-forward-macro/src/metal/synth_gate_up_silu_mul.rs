@@ -19,8 +19,8 @@ use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     consumes_tile, default_required_weights, weight_storage_of, CostCtx, Handoff, Implementation,
-    LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor,
-    WeightKind, WeightSlot, WorkloadConstraint,
+    LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap, WeightAccessor,
+    WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -204,7 +204,7 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let mut silu_tile_id = None;
         let mut mul_tile     = None;
         for &t in &m.claimed_tiles {
@@ -273,31 +273,24 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         let kernel = synthesize_gate_up_silu_mul_large_chunk(
             SynthesisBackend::Metal, self.act_tag, self.scale_tag, &consts,
         );
-        let symbol_lit = syn::LitStr::new(&kernel.symbol, proc_macro2::Span::call_site());
-
         let _ = bits;
-        let bits_lit = self.bits;
-        let gs_lit   = gs;
-        let layer_lit = layer;
-
-        Some(vec![OpInstance::new(
-            syn::Ident::new("SynthGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #x_norm_slot },
-                quote! { #out_slot },
-                quote! { #layer_lit },
-                quote! { #gs_lit },
-                quote! { #bits_lit },
-                quote! { #symbol_lit },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: gate_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: up_base,
-        })])
+        // Gate/up LinearLayers flow through `required_weights()`;
+        // codegen assigns sub-slots 0/1.
+        let _ = (gate_base, up_base);
+        let kernel_symbol: &'static str = Box::leak(kernel.symbol.into_boxed_str());
+        #[cfg(feature = "metal")]
+        return Some(vec![ferrite_forward::Instruction::SynthGateUpSiluMul(
+            x_norm_slot,
+            out_slot,
+            layer,
+            gs,
+            self.bits,
+            kernel_symbol,
+        )]);
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (x_norm_slot, out_slot, layer, gs, kernel_symbol);
+            return None;
+        }
     }
 }

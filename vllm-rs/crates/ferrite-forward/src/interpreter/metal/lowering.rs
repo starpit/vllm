@@ -63,10 +63,12 @@ pub fn lower_pair<W: CanonicalParams>(
     lm_head_barriers: &[bool],
     bucket_m: u32,
     num_arena_slots: u32,
+    backbone_tape_index: u32,
+    lm_head_tape_index: u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<LoweredMetalTape, LoweringError> {
-    let bb = lower::<W>(backbone, backbone_barriers, bucket_m, num_arena_slots, profile)?;
-    let lh = lower::<W>(lm_head, lm_head_barriers, bucket_m, num_arena_slots, profile)?;
+    let bb = lower::<W>(backbone, backbone_barriers, bucket_m, num_arena_slots, backbone_tape_index, profile)?;
+    let lh = lower::<W>(lm_head, lm_head_barriers, bucket_m, num_arena_slots, lm_head_tape_index, profile)?;
     let mut commands = bb.commands;
     let mut barrier_before = bb.barrier_before;
 
@@ -130,9 +132,9 @@ pub fn lower_pair<W: CanonicalParams>(
                     layer: *layer,
                     // The lm_head AffineQmm is the LAST instruction in
                     // the lm_head slice (lm_head.len() == 1 here), so
-                    // its op_idx is 0 inside the lm_head bucket.
+                    // its op_idx is 0 inside the lm_head tape.
                     locator: WeightLocator {
-                        bucket: 0,
+                        bucket: lm_head_tape_index,
                         op_idx: 0,
                         slot: 0,
                     },
@@ -337,6 +339,7 @@ pub fn lower<W: CanonicalParams>(
     barriers_in: &[bool],
     bucket_m: u32,
     num_arena_slots: u32,
+    tape_index: u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<LoweredMetalTape, LoweringError> {
     let mut commands = Vec::with_capacity(instructions.len());
@@ -386,6 +389,7 @@ pub fn lower<W: CanonicalParams>(
                             body_start + offset,
                             bucket_m,
                             iter as u32,
+                            tape_index,
                             &mut splitk_scratch_bytes,
                             profile,
                         )?;
@@ -402,7 +406,7 @@ pub fn lower<W: CanonicalParams>(
                 i = body_end;
             }
             other => {
-                let cmds = lower_one::<W>(other, i, bucket_m, 0, &mut splitk_scratch_bytes, profile)?;
+                let cmds = lower_one::<W>(other, i, bucket_m, 0, tape_index, &mut splitk_scratch_bytes, profile)?;
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
@@ -454,6 +458,7 @@ fn lower_one<W: CanonicalParams>(
     index: usize,
     bucket_m: u32,
     layer_offset: u32,
+    tape_index: u32,
     splitk_scratch_bytes: &mut u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
@@ -493,7 +498,7 @@ fn lower_one<W: CanonicalParams>(
                     kind: WeightBundleKind::Embedding,
                     which: WeightTensor::Weight,
                     layer: super::ids::LayerId(0),
-                    locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                    locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                     binding_index: 1,
                 },
                 // input_ids
@@ -546,7 +551,7 @@ fn lower_one<W: CanonicalParams>(
                     kind: WeightBundleKind::RmsNorm,
                     which: WeightTensor::Weight,
                     layer: super::ids::LayerId(*layer + layer_offset),
-                    locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                    locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                     binding_index: 2,
                 },
             ],
@@ -589,7 +594,7 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::RmsNorm,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 2,
                     },
                 ],
@@ -634,7 +639,7 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 2,
                     },
                 ],
@@ -724,7 +729,7 @@ fn lower_one<W: CanonicalParams>(
                         *out_slot,
                         super::ids::LayerId(*layer + layer_offset),
                         WeightLocator {
-                            bucket: 0,
+                            bucket: tape_index,
                             op_idx: index as u32,
                             slot: 0,
                         },
@@ -786,7 +791,7 @@ fn lower_one<W: CanonicalParams>(
                                 *in_slot,
                                 *out_slot,
                                 super::ids::LayerId(*layer + layer_offset),
-                                WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                                WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                             ),
                             gemm_dims: None,
                         }
@@ -816,7 +821,7 @@ fn lower_one<W: CanonicalParams>(
                                 *in_slot,
                                 *out_slot,
                                 super::ids::LayerId(*layer + layer_offset),
-                                WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                                WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                             ),
                             gemm_dims: None,
                         }
@@ -868,7 +873,7 @@ fn lower_one<W: CanonicalParams>(
                                 *in_slot,
                                 super::ids::LayerId(*layer + layer_offset),
                                 WeightLocator {
-                                    bucket: 0,
+                                    bucket: tape_index,
                                     op_idx: index as u32,
                                     slot: 0,
                                 },
@@ -1029,21 +1034,21 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::AffineQuantEmbedding,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(0),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 0,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::AffineQuantEmbedding,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(0),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 1,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::AffineQuantEmbedding,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(0),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 2,
                     },
                     Binding::Runtime {
@@ -1161,7 +1166,7 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 2,
                     },
                 ],
@@ -1210,7 +1215,7 @@ fn lower_one<W: CanonicalParams>(
                     k_out: super::ids::ArenaSlotIdx(*k_out_slot),
                     v_out: super::ids::ArenaSlotIdx(*v_out_slot),
                     cos_sin_locator: super::lowered::WeightLocator {
-                        bucket: 0,
+                        bucket: tape_index,
                         op_idx: index as u32,
                         slot: 0,
                     },
@@ -1269,12 +1274,12 @@ fn lower_one<W: CanonicalParams>(
                     q_out: super::ids::ArenaSlotIdx(*out_slot),
                     input: super::ids::ArenaSlotIdx(*in_slot),
                     qkv_locator: super::lowered::WeightLocator {
-                        bucket: 0,
+                        bucket: tape_index,
                         op_idx: index as u32,
                         slot: 0,
                     },
                     cos_sin_locator: super::lowered::WeightLocator {
-                        bucket: 0,
+                        bucket: tape_index,
                         op_idx: index as u32,
                         slot: 1,
                     },
@@ -1345,7 +1350,7 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::RmsNorm,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 3,
                     },
                     // 4..6: Q weight + scales + biases
@@ -1353,65 +1358,65 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 4,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 5,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 6,
                     },
-                    // 7..9: K weight + scales + biases
+                    // 7..9: K weight + scales + biases (LinearLayer sub-slot 1)
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 7,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 8,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 9,
                     },
-                    // 10..12: V weight + scales + biases
+                    // 10..12: V weight + scales + biases (LinearLayer sub-slot 2)
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
                         binding_index: 10,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
                         binding_index: 11,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
                         binding_index: 12,
                     },
                     // 13: cos_sin
@@ -1419,7 +1424,7 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::CosSin,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 13,
                     },
                     // 14: positions
@@ -1455,21 +1460,21 @@ fn lower_one<W: CanonicalParams>(
                             kind: WeightBundleKind::LinearLayer,
                             which: WeightTensor::AffineLinearBias,
                             layer: super::ids::LayerId(*layer + layer_offset),
-                            locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                            locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                             binding_index: 18,
                         });
                         v.push(Binding::Weight {
                             kind: WeightBundleKind::LinearLayer,
                             which: WeightTensor::AffineLinearBias,
                             layer: super::ids::LayerId(*layer + layer_offset),
-                            locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                            locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                             binding_index: 19,
                         });
                         v.push(Binding::Weight {
                             kind: WeightBundleKind::LinearLayer,
                             which: WeightTensor::AffineLinearBias,
                             layer: super::ids::LayerId(*layer + layer_offset),
-                            locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                            locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
                             binding_index: 20,
                         });
                     }
@@ -1540,7 +1545,7 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::RmsNorm,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 3,
                     },
                     // 4..6: gate weight + scales + biases
@@ -1548,43 +1553,43 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 4,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 5,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 6,
                     },
-                    // 7..9: up weight + scales + biases
+                    // 7..9: up weight + scales + biases (LinearLayer sub-slot 1)
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 7,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 8,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 9,
                     },
                 ],
@@ -1621,42 +1626,42 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 2,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 3,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
                         binding_index: 4,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 5,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 6,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: 0, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
                         binding_index: 7,
                     },
                 ],
@@ -1939,7 +1944,7 @@ fn lower_one<W: CanonicalParams>(
                     },
                     layer: super::ids::LayerId(*layer + layer_offset),
                     locator: WeightLocator {
-                        bucket: 0,
+                        bucket: tape_index,
                         op_idx: index as u32,
                         slot: 0,
                     },

@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpInstance, OpcodeShape,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape,
     ReshapeRefImpl, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
     default_required_weights,
 };
@@ -129,7 +129,7 @@ impl Implementation for MetalReshapeImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         ReshapeRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 }

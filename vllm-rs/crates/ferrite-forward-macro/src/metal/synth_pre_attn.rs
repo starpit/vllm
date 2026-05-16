@@ -28,8 +28,7 @@ use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     consumes_tile, default_required_weights, first_tile_input, kv_cache_extern_layer,
     weight_storage_of, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
-    OpInstance, OpcodeShape, Resources, SlotMap, WeightAccessor, WeightKind, WeightSlot,
-    WorkloadConstraint,
+    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -462,7 +461,7 @@ impl Implementation for MetalSynthPreAttnImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         // Find the four key tiles within the claim by op-kind. The
         // claim is sorted by TileId so we walk it and pick.
         let mut add_tile: Option<TileId> = None;
@@ -666,54 +665,29 @@ impl Implementation for MetalSynthPreAttnImpl {
                 self.act_tag, self.scale_tag, self.group_size, bias_suffix,
             )
         };
-        let symbol_lit = syn::LitStr::new(&symbol, proc_macro2::Span::call_site());
-
         let _ = bits;
-        let bits_lit = self.bits;
-        let gs_lit = gs;
-        let layer_lit = layer;
-        let has_linear_bias_lit = has_linear_bias;
-
-        // Weight resolution moves to the tape-level `WeightAccessors`
-        // impl: record three `Linear` slots (Q/K/V at the same op_idx,
-        // disambiguated by sub-slot 0/1/2 inside the codegen), one
-        // `RmsNorm`, one `CosSin`. The macro's
-        // `emit_weight_accessors_impl` walks `weight_slots` in order
-        // and synthesises the `(bucket, op_idx, sub_slot) => self.<base>(layer)`
-        // match arms.
-        Some(vec![OpInstance::new(
-            syn::Ident::new("SynthPreAttn", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #residual_slot_idx },
-                quote! { #delta_slot_idx },
-                quote! { #q_out_slot_idx },
-                quote! { #layer_lit },
-                quote! { #gs_lit },
-                quote! { #bits_lit },
-                quote! { #symbol_lit },
-                quote! { #has_linear_bias_lit },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: q_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: k_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: v_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: rms_base,
-        })
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::CosSin,
-            base: cos_sin_ident,
-        })])
+        // Weight order — Q/K/V LinearLayers, RmsNorm, CosSin — flows
+        // through `required_weights()` as a parallel array; the macro
+        // (`emit_weight_accessors_impl`) walks it to build the
+        // per-arch `WeightAccessors` match arms with sub-slot indices
+        // 0/1/2 for Q/K/V LinearLayer, 0 for RmsNorm, 0 for CosSin.
+        let _ = (q_base, k_base, v_base, rms_base, cos_sin_ident);
+        // SynthPreAttn's `kernel_symbol: &'static str` lives on the
+        // emitted `Instruction`. Leak the formatted symbol so the
+        // `&'static str` reference outlives the macro invocation —
+        // it's serialised back into the per-arch static slice by
+        // `instruction_to_tokens`.
+        let kernel_symbol: &'static str = Box::leak(symbol.into_boxed_str());
+        Some(vec![ferrite_forward::Instruction::SynthPreAttn(
+            residual_slot_idx,
+            delta_slot_idx,
+            q_out_slot_idx,
+            layer,
+            gs,
+            self.bits,
+            kernel_symbol,
+            has_linear_bias,
+        )])
     }
 
     fn required_weights(
@@ -727,13 +701,6 @@ impl Implementation for MetalSynthPreAttnImpl {
         // would produce standalone `GpuTensor`-typed accessors (per
         // `rust_type_for_weight_consumed_by`) that collide with the
         // `LinearLayer` accessor declared from the upstream Gemm.
-        // The LinearLayer's `affine_linear_bias` field already
-        // carries `<prefix>.bias` (the loader auto-detects it in
-        // `load_affine_quant`); the synth kernel binds it via the
-        // worker's `WeightTensor::AffineLinearBias` resolution. So
-        // dropping the BiasAdd tile from the accessor walk is
-        // structurally correct and keeps the per-layer Weights
-        // struct shape stable across biased / non-biased archs.
         let filtered: Vec<TileId> = claimed_tiles
             .iter()
             .copied()

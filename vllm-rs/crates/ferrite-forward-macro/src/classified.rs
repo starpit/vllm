@@ -419,6 +419,10 @@ pub enum OpKind {
     /// `CanonicalParams` so it can convert flat-row index → (row, col)
     /// and walk the k² source cells per output row.
     AvgPool2d,
+    /// CLIP-class CLS-token strip: `strip_cls(x) -> [L-1, e]`. Removes
+    /// the leading CLS row that LLaVA-1.5's CLIP encoder produces.
+    /// Claimed by [`crate::impl_lib::StripClsImpl`].
+    StripCls,
     /// Vision-tower learned positional embedding lookup:
     /// `pos_embed(position_ids, weight) -> [num_tokens, vision_embed_dim]`.
     /// Mirror of [`Self::Embed`] but anchored on
@@ -473,6 +477,7 @@ impl OpKind {
             "moe_block" => Some(Self::Moe),
             "embedding_gather" => Some(Self::EmbeddingGather),
             "avg_pool_2d" => Some(Self::AvgPool2d),
+            "strip_cls" => Some(Self::StripCls),
             "pos_embed" => Some(Self::PosEmbed),
             _ => None,
         }
@@ -519,6 +524,7 @@ impl OpKind {
             Self::LoadPixels => "load_pixels",
             Self::EmbeddingGather => "embedding_gather",
             Self::AvgPool2d => "avg_pool_2d",
+            Self::StripCls => "strip_cls",
             Self::PosEmbed => "pos_embed",
         }
     }

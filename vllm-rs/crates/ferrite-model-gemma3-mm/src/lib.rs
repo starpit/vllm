@@ -29,7 +29,7 @@
 //! `ForwardCtx::vision_position_ids`.
 
 #[cfg(feature = "cuda")]
-use ferrite_forward::vision_forward;
+use ferrite_forward_macro::vision_forward;
 
 /// Gemma3-MM CPU preprocessing: SigLIP encoder + 4×4 avg-pool projector.
 /// HF chat template emits `<start_of_image>` (= `boi_token_index`,

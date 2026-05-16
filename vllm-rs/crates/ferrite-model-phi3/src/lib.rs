@@ -32,7 +32,7 @@
 //! `tie_word_embeddings=false` for Phi-3-mini-4k, so the loader reads
 //! a real `lm_head.weight` — same as Mistral.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

@@ -18,7 +18,15 @@ proc-macro = true
 default = []
 # Backend selection: exactly one must be enabled
 cuda = ["dep:ferrite-cuda-targets"]
-metal = ["dep:ferrite-metal-targets", "dep:ferrite-metal-kernels"]
+# Forwards into `ferrite-forward/metal` so the metal-only
+# `Instruction` variants (`SynthGateUpSiluMul`, `AffineEmbed`) are
+# visible to the macro's match arms — they're gated
+# `#[cfg(feature = "metal")]` in `ferrite-forward::instr`.
+metal = [
+    "dep:ferrite-metal-targets",
+    "dep:ferrite-metal-kernels",
+    "ferrite-forward/metal",
+]
 # Tensor-parallel fanout. When any consumer crate forwards its `nccl`
 # feature into `ferrite-forward-macro/nccl` (every per-arch crate
 # does — see their `nccl = [..., "ferrite-forward-macro/nccl"]`),
@@ -28,7 +36,7 @@ metal = ["dep:ferrite-metal-targets", "dep:ferrite-metal-kernels"]
 # builds. Cargo recompiles the macro per-feature-set, so consumers
 # without nccl still get the fast tp=1-only macro and consumers with
 # it get the full fanout — no cross-talk.
-nccl = []
+nccl = ["ferrite-forward/nccl"]
 
 [dependencies]
 ferrite-fusion-synth = { path = "../ferrite-fusion-synth" }
@@ -38,6 +46,15 @@ proc-macro2 = "1"
 prettyplease = "0.2"
 serde_json = { workspace = true }
 rayon = { workspace = true }
+# Per `MEGA_IR_PLAN.md` §9 step 4: `Implementation::fan_out` returns
+# `Vec<Instruction>` typed at proc-macro time, killing the
+# `OpInstance::field_values: Vec<TokenStream>` round-trip. The
+# proc-macro needs the `Instruction` enum in scope to construct
+# values. ferrite-forward defines `Instruction` (cross-backend
+# already in this branch); we depend on it here so the enum is in
+# scope. ferrite-forward must NOT depend on ferrite-forward-macro
+# back (the re-export of the proc-macro was dropped to break the cycle).
+ferrite-forward = { path = "../ferrite-forward" }
 
 # Backend-specific dependencies (enabled by features)
 ferrite-cuda-targets = { path = "../ferrite-cuda-targets", optional = true }

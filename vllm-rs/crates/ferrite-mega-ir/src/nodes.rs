@@ -290,6 +290,38 @@ impl RmsNorm {
     pub const fn layer(&self) -> u32 {
         self.layer
     }
+
+    /// PROC-MACRO USE ONLY. Runtime-arg ctor that bypasses substrate
+    /// proofs. The proc-macro emits a parallel literal-const-arg
+    /// `b.push_rms_norm::<...>` call per node which DOES fire the
+    /// const-asserts at user-build time (Phase C step 1's contract).
+    /// This unchecked ctor lets the proc-macro assemble a `MegaTape`
+    /// value at proc-macro time so `cuda_emit::lower_to_cuda` can
+    /// walk it for syntactic `.cu` emission. Plain-u32 fields are
+    /// the same regardless of construction path (see §3 of plan).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        weight_page_id: u32,
+        partial_offset: u32,
+        partial_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        layer: u32,
+        weight: WeightRef,
+    ) -> Self {
+        Self {
+            in_page_id,
+            weight_page_id,
+            partial_offset,
+            partial_bytes,
+            consumer_phase,
+            storer_phase,
+            layer,
+            weight,
+        }
+    }
 }
 
 /// The typed lowered FusedQkvRopeCache variant.
@@ -476,6 +508,51 @@ impl FusedQkvRopeCache {
     pub const fn layer(&self) -> u32 {
         self.layer
     }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        qkv_weight_page_id: u32,
+        cos_sin_page_id: u32,
+        q_out_page_id: u32,
+        k_out_page_id: u32,
+        v_out_page_id: u32,
+        q_rope_offset: u32,
+        q_rope_bytes: u32,
+        k_rope_offset: u32,
+        k_rope_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        iters: u32,
+        layer: u32,
+        qkv_weight: WeightRef,
+        rotary: RotaryRef,
+        biased: bool,
+        interleaved: bool,
+    ) -> Self {
+        Self {
+            in_page_id,
+            qkv_weight_page_id,
+            cos_sin_page_id,
+            q_out_page_id,
+            k_out_page_id,
+            v_out_page_id,
+            q_rope_offset,
+            q_rope_bytes,
+            k_rope_offset,
+            k_rope_bytes,
+            consumer_phase,
+            storer_phase,
+            iters,
+            layer,
+            qkv_weight,
+            rotary,
+            biased,
+            interleaved,
+        }
+    }
 }
 
 /// The typed lowered `Add` (residual fold) variant.
@@ -530,6 +607,22 @@ impl Add {
     }
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(
+        delta_page_id: u32,
+        residual_page_id: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+    ) -> Self {
+        Self {
+            delta_page_id,
+            residual_page_id,
+            consumer_phase,
+            storer_phase,
+        }
     }
 }
 
@@ -623,6 +716,33 @@ impl FusedAddRmsNorm {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        delta_page_id: u32,
+        residual_page_id: u32,
+        weight_page_id: u32,
+        partial_offset: u32,
+        partial_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        layer: u32,
+        weight: WeightRef,
+    ) -> Self {
+        Self {
+            delta_page_id,
+            residual_page_id,
+            weight_page_id,
+            partial_offset,
+            partial_bytes,
+            consumer_phase,
+            storer_phase,
+            layer,
+            weight,
+        }
     }
 }
 
@@ -748,6 +868,41 @@ impl FusedGateUpActivateMul {
     pub const fn layer(&self) -> u32 {
         self.layer
     }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        gate_up_weight_page_id: u32,
+        out_page_id: u32,
+        gate_offset: u32,
+        gate_bytes: u32,
+        up_offset: u32,
+        up_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        iters: u32,
+        layer: u32,
+        weight: WeightRef,
+        activation: GateUpActivation,
+    ) -> Self {
+        Self {
+            in_page_id,
+            gate_up_weight_page_id,
+            out_page_id,
+            gate_offset,
+            gate_bytes,
+            up_offset,
+            up_bytes,
+            consumer_phase,
+            storer_phase,
+            iters,
+            layer,
+            weight,
+            activation,
+        }
+    }
 }
 
 /// `Embed` (vocab table lookup) variant.
@@ -803,6 +958,24 @@ impl Embed {
     }
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(
+        out_page_id: u32,
+        embed_weight_page_id: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        embed_weight: WeightRef,
+    ) -> Self {
+        Self {
+            out_page_id,
+            embed_weight_page_id,
+            consumer_phase,
+            storer_phase,
+            embed_weight,
+        }
     }
 }
 
@@ -861,6 +1034,24 @@ impl ScalarMul {
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
     }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        out_page_id: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        scale: FiniteF32,
+    ) -> Self {
+        Self {
+            in_page_id,
+            out_page_id,
+            consumer_phase,
+            storer_phase,
+            scale,
+        }
+    }
 }
 
 /// `TanhSoftCap` variant. Same shape as `ScalarMul` minus scale.
@@ -913,6 +1104,22 @@ impl TanhSoftCap {
     }
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        out_page_id: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+    ) -> Self {
+        Self {
+            in_page_id,
+            out_page_id,
+            consumer_phase,
+            storer_phase,
+        }
     }
 }
 
@@ -999,6 +1206,33 @@ impl ScalarOffsetRmsNorm {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        weight_page_id: u32,
+        partial_offset: u32,
+        partial_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        layer: u32,
+        weight: WeightRef,
+        offset: FiniteF32,
+    ) -> Self {
+        Self {
+            in_page_id,
+            weight_page_id,
+            partial_offset,
+            partial_bytes,
+            consumer_phase,
+            storer_phase,
+            layer,
+            weight,
+            offset,
+        }
     }
 }
 
@@ -1110,6 +1344,39 @@ impl Gemm {
     }
     pub const fn k(&self) -> u32 {
         self.k
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        weight_page_id: u32,
+        out_page_id: u32,
+        b_tile_offset: u32,
+        b_tile_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        iters: u32,
+        layer: u32,
+        n: u32,
+        k: u32,
+        weight: WeightRef,
+    ) -> Self {
+        Self {
+            in_page_id,
+            weight_page_id,
+            out_page_id,
+            b_tile_offset,
+            b_tile_bytes,
+            consumer_phase,
+            storer_phase,
+            iters,
+            layer,
+            n,
+            k,
+            weight,
+        }
     }
 }
 
@@ -1231,6 +1498,39 @@ impl FusedCublasGemmAdd {
     }
     pub const fn k(&self) -> u32 {
         self.k
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        weight_page_id: u32,
+        residual_page_id: u32,
+        b_tile_offset: u32,
+        b_tile_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        iters: u32,
+        layer: u32,
+        n: u32,
+        k: u32,
+        weight: WeightRef,
+    ) -> Self {
+        Self {
+            in_page_id,
+            weight_page_id,
+            residual_page_id,
+            b_tile_offset,
+            b_tile_bytes,
+            consumer_phase,
+            storer_phase,
+            iters,
+            layer,
+            n,
+            k,
+            weight,
+        }
     }
 }
 
@@ -1521,6 +1821,59 @@ impl CutlassFusedNormGemm {
     pub const fn k(&self) -> u32 {
         self.k
     }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    /// Single emit ctor handles both `new_no_delta` and `new_with_delta`
+    /// flavors via `delta_page_id: Option<u32>` + `offset:
+    /// Option<FiniteF32>`. The cross-field invariant
+    /// `(norm_kind == AddScalarOffsetRmsNorm) <=> offset.is_some()`
+    /// is the proc-macro's responsibility — it constructs both fields
+    /// from the same dispatched variant.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        in_page_id: u32,
+        delta_page_id: Option<u32>,
+        norm_weight_page_id: u32,
+        linear_weight_page_id: u32,
+        out_page_id: u32,
+        partial_offset: u32,
+        partial_bytes: u32,
+        b_tile_offset: u32,
+        b_tile_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        iters: u32,
+        layer: u32,
+        n: u32,
+        k: u32,
+        norm_weight: WeightRef,
+        linear_weight: WeightRef,
+        norm_kind: LmHeadNormKind,
+        offset: Option<FiniteF32>,
+    ) -> Self {
+        Self {
+            in_page_id,
+            delta_page_id,
+            norm_weight_page_id,
+            linear_weight_page_id,
+            out_page_id,
+            partial_offset,
+            partial_bytes,
+            b_tile_offset,
+            b_tile_bytes,
+            consumer_phase,
+            storer_phase,
+            iters,
+            layer,
+            n,
+            k,
+            norm_weight,
+            linear_weight,
+            norm_kind,
+            offset,
+        }
+    }
 }
 
 /// `AttentionViaCacheNode` (covers `AttentionViaCache` and
@@ -1648,6 +2001,39 @@ impl AttentionViaCacheNode {
     pub const fn kv_cache_layer(&self) -> u32 {
         self.kv_cache_layer
     }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn __new_for_emit(
+        q_in_page_id: u32,
+        attn_out_page_id: u32,
+        score_offset: u32,
+        score_bytes: u32,
+        pv_offset: u32,
+        pv_bytes: u32,
+        consumer_phase: u32,
+        storer_phase: u32,
+        iters: u32,
+        kv_cache_layer: u32,
+        kind: AttentionKind,
+        interleaved: bool,
+    ) -> Self {
+        Self {
+            q_in_page_id,
+            attn_out_page_id,
+            score_offset,
+            score_bytes,
+            pv_offset,
+            pv_bytes,
+            consumer_phase,
+            storer_phase,
+            iters,
+            kv_cache_layer,
+            kind,
+            interleaved,
+        }
+    }
 }
 
 /// `BarrierSignal` variant.
@@ -1665,6 +2051,12 @@ impl BarrierSignal {
 
     pub const fn edge(&self) -> u32 {
         self.edge
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(edge: u32) -> Self {
+        Self { edge }
     }
 }
 
@@ -1691,6 +2083,12 @@ impl BarrierWait {
     }
     pub const fn expected(&self) -> u32 {
         self.expected
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(edge: u32, expected: u32) -> Self {
+        Self { edge, expected }
     }
 }
 
@@ -1738,6 +2136,16 @@ impl SpliceMmEmbeds {
     }
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
+    }
+
+    /// PROC-MACRO USE ONLY. See [`RmsNorm::__new_for_emit`].
+    #[doc(hidden)]
+    pub fn __new_for_emit(slot_id: u32, consumer_phase: u32, storer_phase: u32) -> Self {
+        Self {
+            slot_id,
+            consumer_phase,
+            storer_phase,
+        }
     }
 }
 

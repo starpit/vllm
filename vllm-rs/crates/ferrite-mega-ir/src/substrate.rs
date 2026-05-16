@@ -1,53 +1,51 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Substrate-typestate vocabulary — **const-generic** edition.
+//! Substrate-typestate vocabulary.
 //!
-//! Substrate-proof primitives whose load-bearing values (page id,
-//! scratch offset/bytes, mbarrier phase, edge id, iter count) live as
-//! **const generics**. Constructors are `const fn` whose bodies open
-//! a `const { assert!(...) }` block — those `assert!`s are evaluated
-//! at MONOMORPHIZATION TIME, so a primitive whose const args violate
-//! a substrate invariant is rejected by `rustc` with `E0080`. The
-//! plan's "if it compiles, it runs coherently" invariant becomes
-//! structurally true at the API surface.
+//! Defines the proof-carrying types that variants of the typed
+//! lowered form (in [`crate::nodes`]) use as load-bearing fields.
+//! Each type discharges one of the substrate bug classes the
+//! `MegaTape<S>` invariant promises (see `MEGA_IR_PLAN.md` §1):
 //!
-//! Per `MEGA_IR_PLAN.md` §1+§4+§8.1.
+//! - [`Page<State>`] — page-slot lifecycle (#1, #2)
+//! - [`ScratchRegion<Scope>`] + [`Scratch::within_budget`] +
+//!   [`Scratch::disjoint`] — scratch budget and overlap (#4, #5)
+//! - [`MbarrierPhase`] — mbarrier parity (#3)
+//! - [`WarpRoleTag<R>`] — warp-role pairing (#6)
 //!
-//! ## What's compile-time
+//! ## Stable-Rust shape
 //!
-//! - `PageId<ID, NUM_PAGES>::new()` — fails if `ID >= NUM_PAGES`.
-//! - `ScratchRegion<OFFSET, BYTES, SCRATCH_BYTES, Scope>::new()` —
-//!   fails if `OFFSET + BYTES > SCRATCH_BYTES` (overflow-safe).
-//! - `ScratchRegion::disjoint_with()` — fails if two regions in the
-//!   same scope overlap.
-//! - `MbarrierPhase<P>::assert_matches::<N>()` — fails if `P != N&1`.
-//! - `IterCount<ITERS>::new()` — fails if `ITERS == 0`.
-//! - `EdgeId<IDX, NUM_EDGES>::new()` — fails if `IDX >= NUM_EDGES`.
-//! - `ExpectedCount<COUNT>::new()` — fails if `COUNT == 0`.
-//! - `Page<ID, NUM_PAGES, State>::new()` — same as PageId.
+//! The plan's `MEGA_IR_PLAN.md` §1+§4 describes the IDEAL design as
+//! const-generic IDs (`Page<const ID: u32, S, State>`,
+//! `ScratchRegion<const OFFSET, const BYTES, Scope>`,
+//! `MbarrierPhase<const P>`, `WarpRoleTag<const R>`). On stable
+//! Rust, const-generic instantiation requires the constant to be
+//! known at the user's source-compile time — but the proc-macro
+//! computes IDs and offsets at proc-macro RUNTIME, so they can't
+//! become const-generic parameters here.
 //!
-//! ## What's runtime (deliberate stable-Rust simplification)
+//! Per `MEGA_IR_PLAN.md` §1: "If the type system can't catch it on
+//! stable, document the NIGHTLY TODO at the point of use and encode
+//! the closest stable approximation (sealed witness traits +
+//! private constructors)."
 //!
-//! - [`PagePool`] — cross-op alias tracking via `Vec<bool>`. With
-//!   const-generic IDs, two `PageId<5, 16>` values are the SAME type;
-//!   the alias-tracking question is "is this slot in use right now"
-//!   which is genuine runtime state in the proc-macro's walk through
-//!   the tape. A truly session-typed pool (linear types) is a
-//!   nightly/Rust-evolution item; we keep `take(id)` runtime here.
+//! The stable approximation in this file:
+//! - **Type-level**: `State` (`Empty`/`Filled`/`Produced`), `Scope`,
+//!   `R` (warp role) are TYPE PARAMETERS. Lifecycle transitions
+//!   consume the typestate token and return a new state — the
+//!   compiler enforces "no consumer reads on `Page<Empty>`" at
+//!   type-check time.
+//! - **Construction-time**: page IDs, scratch offsets, mbarrier
+//!   phases are private `u32` fields inside typed wrappers. Their
+//!   constructors take the substrate budget by reference and PANIC
+//!   on bounds violations. Panics surface as proc-macro errors on
+//!   the user's `#[forward]`.
+//! - **Sealed**: every constructor is `pub(crate)`. Outside this
+//!   crate, typed wrappers can only flow through the lowering
+//!   function in [`crate::lower`].
 //!
-//! - Helper newtypes (`WeightRef`, `RotaryRef`, `FiniteF32`,
-//!   `LmHeadNormKind`, `GateUpActivation`, `AttentionKind`) — these
-//!   are not numeric primitives ranging over a small typed alphabet,
-//!   they're paths/floats/enums. Per plan §3, helpers ride alongside
-//!   substrate-proof load-bearing fields and stay runtime-validated.
-//!
-//! ## Erasure for storage
-//!
-//! Variants in [`crate::nodes`] store plain `u32` fields, NOT typed
-//! const-generic primitives. The substrate proof is discharged at
-//! `MegaNode::variant::new::<...>()` call time via `const {}` block;
-//! after that, the values flow as plain integers (zero runtime cost,
-//! no `PhantomData` chain bloat). The PROOF is at the call site;
-//! the storage is plain.
+//! NIGHTLY TODO at every wrapper: when `adt_const_params` and
+//! `generic_const_exprs` stabilize, lift IDs / offsets / phases
+//! back into const-generic parameters per the plan's ideal.
 
 #![allow(dead_code)]
 
@@ -58,65 +56,86 @@ mod sealed {
 }
 
 // ============================================================
-// Substrate budget — zero-sized type parameterized on the
-// per-variant constants the lowering emits.
+// Substrate budget — runtime-known per-variant constants.
+// The plan's `Substrate` trait used associated `const`s; on stable
+// Rust those force the substrate to be a concrete type at proc-macro
+// compile time, which it isn't (the proc-macro computes per-variant
+// values at proc-macro RUNTIME). A plain struct holds the same data
+// and is passable by reference into constructors.
 // ============================================================
 
-/// Per-variant substrate budget — pure type-level. Const generics
-/// pin every shape constant; the value is zero-sized and exists
-/// solely so primitives can be parameterized on a single
-/// `Budget<NUM_PAGES, ...>` type, but we still expose the individual
-/// const generics directly on each primitive (plan §1's pattern).
+/// Per-variant substrate budget. The proc-macro instantiates one of
+/// these per emitted `.cu` from `(num_pages, num_consumer_warps,
+/// page_size, scratch_bytes)` it computes from the schedule walker.
+/// Constructors of typed wrappers in this module take a borrow of
+/// this struct and bounds-check against its fields.
 ///
-/// `SubstrateBudget::new()` runs a `const {}` block that asserts
-/// non-zero invariants — same shape as the runtime checks, but the
-/// rejection happens at monomorphization, not runtime.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct SubstrateBudget<
-    const NUM_PAGES: u32,
-    const NUM_CONSUMER_WARPS: u32,
-    const PAGE_SIZE: u32,
-    const SCRATCH_BYTES: u32,
-    const NUM_EDGES: u32,
->;
+/// NIGHTLY TODO: when `adt_const_params` stabilizes, replace this
+/// with a sealed `Substrate` trait whose impls carry per-variant
+/// associated constants (the plan's original §6 vision).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SubstrateBudget {
+    num_pages: u32,
+    num_consumer_warps: u32,
+    page_size: u32,
+    scratch_bytes: u32,
+    /// Number of cross-CTA barrier edges in this kernel. Validates
+    /// `BarrierSignal` / `BarrierWait` ops' `edge_idx` against
+    /// `[0, num_edges)`. May be 0 (kernel with no cross-CTA sync —
+    /// e.g. single-CTA shapes). Sprint D's bug class #1 extension.
+    num_edges: u32,
+}
 
-impl<
-    const NUM_PAGES: u32,
-    const NUM_CONSUMER_WARPS: u32,
-    const PAGE_SIZE: u32,
-    const SCRATCH_BYTES: u32,
-    const NUM_EDGES: u32,
-> SubstrateBudget<NUM_PAGES, NUM_CONSUMER_WARPS, PAGE_SIZE, SCRATCH_BYTES, NUM_EDGES>
-{
-    /// Construct a substrate budget. Compile-time `const {}` block
-    /// asserts non-zero invariants.
-    pub const fn new() -> Self {
-        const {
-            assert!(NUM_PAGES > 0, "SubstrateBudget: NUM_PAGES must be > 0");
-            assert!(
-                NUM_CONSUMER_WARPS > 0,
-                "SubstrateBudget: NUM_CONSUMER_WARPS must be > 0",
-            );
-            assert!(PAGE_SIZE > 0, "SubstrateBudget: PAGE_SIZE must be > 0");
-            // SCRATCH_BYTES may legitimately be 0; NUM_EDGES too.
+impl SubstrateBudget {
+    /// Construct a substrate budget. Panics on zero fields where
+    /// zero is nonsensical; permits zero `scratch_bytes` and
+    /// zero `num_edges` (kernels without scratch / without cross-CTA
+    /// sync).
+    pub fn new(
+        num_pages: u32,
+        num_consumer_warps: u32,
+        page_size: u32,
+        scratch_bytes: u32,
+    ) -> Self {
+        assert!(num_pages > 0, "SubstrateBudget: num_pages must be > 0");
+        assert!(
+            num_consumer_warps > 0,
+            "SubstrateBudget: num_consumer_warps must be > 0",
+        );
+        assert!(page_size > 0, "SubstrateBudget: page_size must be > 0");
+        // scratch_bytes may legitimately be 0 (ops with no scratch).
+        Self {
+            num_pages,
+            num_consumer_warps,
+            page_size,
+            scratch_bytes,
+            num_edges: 0,
         }
-        Self
     }
 
-    pub const fn num_pages(self) -> u32 {
-        NUM_PAGES
+    /// Sprint D extension: declare the cross-CTA barrier edge
+    /// budget. Builder-style so existing 4-arg `new` callers stay
+    /// intact (every existing test still passes a tape with zero
+    /// barriers).
+    pub fn with_num_edges(mut self, num_edges: u32) -> Self {
+        self.num_edges = num_edges;
+        self
     }
-    pub const fn num_consumer_warps(self) -> u32 {
-        NUM_CONSUMER_WARPS
+
+    pub fn num_pages(&self) -> u32 {
+        self.num_pages
     }
-    pub const fn page_size(self) -> u32 {
-        PAGE_SIZE
+    pub fn num_consumer_warps(&self) -> u32 {
+        self.num_consumer_warps
     }
-    pub const fn scratch_bytes(self) -> u32 {
-        SCRATCH_BYTES
+    pub fn page_size(&self) -> u32 {
+        self.page_size
     }
-    pub const fn num_edges(self) -> u32 {
-        NUM_EDGES
+    pub fn scratch_bytes(&self) -> u32 {
+        self.scratch_bytes
+    }
+    pub fn num_edges(&self) -> u32 {
+        self.num_edges
     }
 }
 
@@ -139,63 +158,75 @@ impl IsLifecycleState for Produced {}
 
 /// A page slot in the substrate's `pages[]` array.
 ///
-/// Const-generic `ID` carries the slot id; const-generic `NUM_PAGES`
-/// carries the substrate budget. `Page::<5, 16, Empty>::new()` runs
-/// a `const {}` block that compile-fails when `ID >= NUM_PAGES`
-/// (E0080). Lifecycle transitions consume the typestate token —
-/// `Empty` → `Filled` → `Produced` → `Empty`.
-pub struct Page<const ID: u32, const NUM_PAGES: u32, State: IsLifecycleState> {
+/// Type-level `State` typestate: `Empty` → loader fills →
+/// `Filled` → consumer reads + arrives → `Produced` → storer
+/// reads → back to `Empty`. Transitions consume the token (no
+/// `Clone`, no `Copy`, no `Send`, no `Sync`). A `Page<Filled>`
+/// cannot be read in the storer position; a `Page<Empty>` cannot
+/// be read at all.
+///
+/// Runtime `id` is private and bounds-checked at construction
+/// against `SubstrateBudget::num_pages`. The const-generic ID form
+/// is a NIGHTLY TODO — see module docs.
+pub struct Page<State: IsLifecycleState> {
+    id: u32,
     _state: PhantomData<*const State>,
 }
 
-impl<const ID: u32, const NUM_PAGES: u32> Page<ID, NUM_PAGES, Empty> {
-    /// Construct a fresh `Empty` page. Compile-fails (E0080) if
-    /// `ID >= NUM_PAGES`.
-    pub const fn new() -> Self {
-        const {
-            assert!(ID < NUM_PAGES, "Page: ID out of bounds (ID >= NUM_PAGES)");
-        }
+impl Page<Empty> {
+    /// Construct a fresh `Empty` page. Panics if `id >=
+    /// substrate.num_pages` (bug class #1 enforcement).
+    /// `pub(crate)` so only the lowering can mint pages.
+    pub(crate) fn new(id: u32, substrate: &SubstrateBudget) -> Self {
+        assert!(
+            id < substrate.num_pages,
+            "Page id {id} out of substrate budget num_pages={}",
+            substrate.num_pages,
+        );
         Self {
+            id,
             _state: PhantomData,
         }
     }
 
-    /// Loader-fired transition: `Empty` → `Filled`. Consumes self.
-    pub const fn loader_fired(self) -> Page<ID, NUM_PAGES, Filled> {
+    /// Loader-fired transition: `Empty` → `Filled`. Consumes the
+    /// `Empty` token; the page can no longer be filled twice (bug
+    /// class #2 enforcement: double-fill).
+    pub(crate) fn loader_fired(self) -> Page<Filled> {
         Page {
+            id: self.id,
             _state: PhantomData,
         }
     }
 }
 
-impl<const ID: u32, const NUM_PAGES: u32> Page<ID, NUM_PAGES, Filled> {
-    /// Consumer-arrived: `Filled` → `Produced`.
-    pub const fn consumer_arrived(self) -> Page<ID, NUM_PAGES, Produced> {
+impl Page<Filled> {
+    /// Consumer-arrived transition: `Filled` → `Produced`. Consumes
+    /// the `Filled` token; the page can no longer be read by the
+    /// consumer (bug class #2 enforcement: read-after-arrive).
+    pub(crate) fn consumer_arrived(self) -> Page<Produced> {
         Page {
+            id: self.id,
             _state: PhantomData,
         }
     }
 }
 
-impl<const ID: u32, const NUM_PAGES: u32> Page<ID, NUM_PAGES, Produced> {
-    /// Storer-consumed: `Produced` → `Empty`.
-    pub const fn storer_consumed(self) -> Page<ID, NUM_PAGES, Empty> {
+impl Page<Produced> {
+    /// Storer-consumed transition: `Produced` → `Empty`. The page
+    /// is recyclable for the next iter.
+    pub(crate) fn storer_consumed(self) -> Page<Empty> {
         Page {
+            id: self.id,
             _state: PhantomData,
         }
     }
 }
 
-impl<const ID: u32, const NUM_PAGES: u32, State: IsLifecycleState> Page<ID, NUM_PAGES, State> {
+impl<State: IsLifecycleState> Page<State> {
     /// Raw page id — for emit-side string formatting only.
-    pub const fn id(&self) -> u32 {
-        ID
-    }
-}
-
-impl<const ID: u32, const NUM_PAGES: u32> Default for Page<ID, NUM_PAGES, Empty> {
-    fn default() -> Self {
-        Self::new()
+    pub fn id(&self) -> u32 {
+        self.id
     }
 }
 
@@ -206,74 +237,67 @@ impl<const ID: u32, const NUM_PAGES: u32> Default for Page<ID, NUM_PAGES, Empty>
 pub trait IsScratchScope: sealed::Sealed {}
 
 /// A scratch-byte region inside the substrate's
-/// `scratch[SCRATCH_BYTES]` buffer.
+/// `scratch[scratch_bytes]` buffer.
 ///
-/// Const-generic `OFFSET`, `BYTES`, and `SCRATCH_BYTES` make
-/// within-budget a monomorphization-time check (bug class #5).
-/// `disjoint_with` opens a `const {}` block that compile-fails on
-/// overlap (bug class #4). `Scope` is a type parameter; two regions
-/// in different scopes don't constrain each other.
-pub struct ScratchRegion<
-    const OFFSET: u32,
-    const BYTES: u32,
-    const SCRATCH_BYTES: u32,
-    Scope: IsScratchScope,
-> {
+/// Type-level `Scope` disambiguates regions by lifetime — two
+/// regions in different scopes don't need to be disjoint. Runtime
+/// `offset` and `bytes` are private and validated at construction:
+///
+/// - `WithinBudget`: `offset + bytes ≤ substrate.scratch_bytes`
+///   (bug class #5).
+/// - Inter-region disjointness within a scope: combine via
+///   [`Self::disjoint_with`] which checks byte ranges don't
+///   overlap (bug class #4).
+pub struct ScratchRegion<Scope: IsScratchScope> {
+    offset: u32,
+    bytes: u32,
     _scope: PhantomData<*const Scope>,
 }
 
-impl<const OFFSET: u32, const BYTES: u32, const SCRATCH_BYTES: u32, Scope: IsScratchScope>
-    ScratchRegion<OFFSET, BYTES, SCRATCH_BYTES, Scope>
-{
-    /// Construct a scratch region. Compile-fails (E0080) if
-    /// `OFFSET + BYTES` overflows or exceeds `SCRATCH_BYTES`.
-    pub const fn new() -> Self {
-        const {
-            // overflow-safe: u32::MAX as u64 + u32::MAX as u64 fits in u64.
-            let end = (OFFSET as u64) + (BYTES as u64);
-            assert!(
-                end <= SCRATCH_BYTES as u64,
-                "ScratchRegion: OFFSET+BYTES out of substrate scratch budget",
-            );
-        }
+impl<Scope: IsScratchScope> ScratchRegion<Scope> {
+    /// Construct a scratch region. Panics if `offset + bytes`
+    /// overflows `u32` or exceeds `substrate.scratch_bytes` (bug
+    /// class #5). `pub(crate)` so only the lowering can mint
+    /// regions.
+    pub(crate) fn new(offset: u32, bytes: u32, substrate: &SubstrateBudget) -> Self {
+        let end = offset
+            .checked_add(bytes)
+            .expect("ScratchRegion: offset + bytes overflowed u32");
+        assert!(
+            end <= substrate.scratch_bytes,
+            "ScratchRegion out of substrate scratch budget: \
+             [{offset}, {end}) > SCRATCH_BYTES={}",
+            substrate.scratch_bytes,
+        );
         Self {
+            offset,
+            bytes,
             _scope: PhantomData,
         }
     }
 
-    /// Validate this region is disjoint from `other` within the same
-    /// scope. Compile-fails (E0080) on overlap. Returns both regions
-    /// so the caller can hold them simultaneously.
-    pub const fn disjoint_with<const O2: u32, const B2: u32>(
-        self,
-        other: ScratchRegion<O2, B2, SCRATCH_BYTES, Scope>,
-    ) -> (Self, ScratchRegion<O2, B2, SCRATCH_BYTES, Scope>) {
-        const {
-            // disjoint iff a_end <= O2 OR b_end <= OFFSET (in u64 to
-            // avoid u32 overflow during the compile-time comparison).
-            let a_end = (OFFSET as u64) + (BYTES as u64);
-            let b_end = (O2 as u64) + (B2 as u64);
-            assert!(
-                a_end <= O2 as u64 || b_end <= OFFSET as u64,
-                "ScratchRegion overlap within scope",
-            );
-        }
+    /// Validate this region is disjoint from `other` within the
+    /// same scope. Panics on overlap (bug class #4). Returns both
+    /// regions back so the caller can hold them simultaneously.
+    /// `pub(crate)` so only the lowering can declare disjointness.
+    pub(crate) fn disjoint_with(self, other: Self) -> (Self, Self) {
+        let a_end = self.offset + self.bytes;
+        let b_end = other.offset + other.bytes;
+        let overlap = self.offset < b_end && other.offset < a_end;
+        assert!(
+            !overlap,
+            "ScratchRegion overlap within scope: \
+             A=[{}, {}) B=[{}, {})",
+            self.offset, a_end, other.offset, b_end,
+        );
         (self, other)
     }
 
-    pub const fn offset(&self) -> u32 {
-        OFFSET
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
-    pub const fn bytes(&self) -> u32 {
-        BYTES
-    }
-}
-
-impl<const OFFSET: u32, const BYTES: u32, const SCRATCH_BYTES: u32, Scope: IsScratchScope> Default
-    for ScratchRegion<OFFSET, BYTES, SCRATCH_BYTES, Scope>
-{
-    fn default() -> Self {
-        Self::new()
+    pub fn bytes(&self) -> u32 {
+        self.bytes
     }
 }
 
@@ -281,43 +305,40 @@ impl<const OFFSET: u32, const BYTES: u32, const SCRATCH_BYTES: u32, Scope: IsScr
 // Mbarrier phase (bug class #3).
 // ============================================================
 
-/// Mbarrier phase value (0 or 1). Const-generic `P`. The companion
-/// `assert_matches::<N>()` constructor compile-fails when
-/// `P != N & 1` (bug class #3 enforcement: phase mismatch with
-/// cumulative arrive count).
-pub struct MbarrierPhase<const P: u32>;
-
-impl<const P: u32> MbarrierPhase<P> {
-    /// Construct a phase. Compile-fails if `P > 1` (only 0 or 1 is a
-    /// valid mbarrier phase).
-    pub const fn new() -> Self {
-        const {
-            assert!(P <= 1, "MbarrierPhase: P must be 0 or 1");
-        }
-        Self
-    }
-
-    /// Assert this phase parity matches a cumulative arrive count
-    /// `N`. Compile-fails if `P != N & 1`.
-    pub const fn assert_matches<const N: u32>() -> Self {
-        const {
-            assert!(P <= 1, "MbarrierPhase: P must be 0 or 1");
-            assert!(
-                P == N & 1,
-                "MbarrierPhase: parity mismatch with cumulative arrive count",
-            );
-        }
-        Self
-    }
-
-    pub const fn phase(&self) -> u32 {
-        P
-    }
+/// Mbarrier phase value (0 or 1). The substrate's `wait(sem, P)`
+/// blocks until phase != P; each `arrive(sem)` flips parity.
+///
+/// Constructor [`Self::from_arrive_count`] requires the cumulative
+/// arrive count `n` and panics if the requested phase doesn't
+/// match `n & 1` (bug class #3 enforcement: phase mismatch across
+/// iterations).
+pub struct MbarrierPhase {
+    phase: u32,
 }
 
-impl<const P: u32> Default for MbarrierPhase<P> {
-    fn default() -> Self {
-        Self::new()
+impl MbarrierPhase {
+    /// Construct a phase from a cumulative arrive count. The
+    /// resulting phase is `n & 1` — the only valid pairing for a
+    /// `wait` after `n` arrives. Phase value is always 0 or 1.
+    /// `pub(crate)` so only the lowering can mint phases.
+    pub(crate) fn from_arrive_count(n: u32) -> Self {
+        Self { phase: n & 1 }
+    }
+
+    /// Validate that `requested` is the parity of `n`. Panics on
+    /// mismatch (bug class #3).
+    pub(crate) fn assert_matches(requested: u32, n: u32) -> Self {
+        let expected = n & 1;
+        assert!(
+            requested == expected,
+            "MbarrierPhase: requested {requested} but cumulative arrive count {n} \
+             requires phase {expected}",
+        );
+        Self { phase: expected }
+    }
+
+    pub fn phase(&self) -> u32 {
+        self.phase
     }
 }
 
@@ -331,7 +352,15 @@ pub const ROLE_CONSUMER: u8 = 2;
 pub const ROLE_STORER: u8 = 3;
 
 /// A warp's role within the megakernel — `R` is a const-generic
-/// `u8` pinned at type construction time. Sealed for {0..3}.
+/// `u8` pinned at type construction time. Sealed for {0..3}; a
+/// `WarpRoleTag<99>` doesn't satisfy `IsValidWarpRole` and can't
+/// pass the bound.
+///
+/// This IS const-generic on stable Rust because each variant's
+/// role assignment is fixed at type-construction time (the variant
+/// declares which role does what). Page IDs and scratch offsets
+/// are NOT const-generic on stable because they're computed at
+/// proc-macro runtime.
 pub struct WarpRoleTag<const R: u8>;
 
 pub trait IsValidWarpRole: sealed::Sealed {}
@@ -345,131 +374,151 @@ impl IsValidWarpRole for WarpRoleTag<ROLE_CONSUMER> {}
 impl IsValidWarpRole for WarpRoleTag<ROLE_STORER> {}
 
 // ============================================================
-// PageId — finalized validated page-slot id for storage in a
-// `MegaNode` variant (post-erasure to `u32`).
-// ============================================================
-
-/// Validated page id. Const-generic constructor compile-fails when
-/// `ID >= NUM_PAGES`. `raw()` exposes the integer; the variant
-/// stores the raw u32 (PROOF is at construction).
-pub struct PageId<const ID: u32, const NUM_PAGES: u32>;
-
-impl<const ID: u32, const NUM_PAGES: u32> PageId<ID, NUM_PAGES> {
-    /// Construct a PageId. Compile-fails (E0080) if `ID >= NUM_PAGES`.
-    pub const fn new() -> Self {
-        const {
-            assert!(ID < NUM_PAGES, "PageId: ID out of bounds");
-        }
-        Self
-    }
-
-    pub const fn raw(self) -> u32 {
-        ID
-    }
-}
-
-impl<const ID: u32, const NUM_PAGES: u32> Default for PageId<ID, NUM_PAGES> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ============================================================
-// PagePool — RUNTIME cross-op alias tracking.
+// PageId — a validated, finalized page-slot id for storage in a
+// `MegaNode` variant.
 //
-// With const-generic page IDs, two `PageId<5, 16>` values are the
-// SAME type. The "in-flight across pushes" question is genuinely
-// runtime state at the proc-macro's tape walk; a truly session-typed
-// pool (linear types or `&'static mut` per-id tokens) is a
-// nightly/Rust-evolution item. Kept runtime-validated here as a
-// deliberate stable-Rust simplification — the per-op-construction-time
-// substrate proofs already discharge bug classes #1, #4, #5 at
-// compile-time; cross-op aliasing remains a runtime panic in this
-// module.
+// Page<State> tracks lifecycle DURING the lowering walk via
+// typestate transitions. After the op's iter completes, the
+// caller has burned through the Empty→Filled→Produced→Empty
+// cycle and the variant just needs to remember which slot id was
+// used (for emit-time CUDA-string formatting). PageId carries
+// that — a typed wrapper around u32 with bounds validation, no
+// typestate, no transitions.
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageId(u32);
+
+impl PageId {
+    /// Construct a PageId. Panics if `id >= substrate.num_pages`
+    /// (bug class #1 enforcement). `pub(crate)` so only the
+    /// lowering can mint ids; outside callers receive PageIds
+    /// already-validated as part of MegaNode variant fields.
+    pub(crate) fn new(id: u32, substrate: &SubstrateBudget) -> Self {
+        assert!(
+            id < substrate.num_pages,
+            "PageId {id} out of substrate budget num_pages={}",
+            substrate.num_pages,
+        );
+        Self(id)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+// ============================================================
+// PagePool — substrate-aware page allocator the lowering uses to
+// hand out Page<Empty> tokens for ops to walk through their
+// lifecycle. Tracks which physical slots are currently held by
+// in-flight ops; refuses to hand out a slot that's already in
+// use (bug class #2: cross-op page reuse with wrong parity).
 // ============================================================
 
 pub struct PagePool {
     in_use: Vec<bool>,
-    num_pages: u32,
+    substrate: SubstrateBudget,
 }
 
 impl PagePool {
-    /// Construct an empty pool sized to `num_pages`. The const value
-    /// is recovered from the `MegaTapeBuilder<NUM_PAGES, ...>` const
-    /// generic at the only construction site.
-    pub fn new(num_pages: u32) -> Self {
+    /// Construct an empty pool sized to `substrate.num_pages`.
+    pub fn new(substrate: SubstrateBudget) -> Self {
         Self {
-            in_use: vec![false; num_pages as usize],
-            num_pages,
+            in_use: vec![false; substrate.num_pages as usize],
+            substrate,
         }
     }
 
-    /// Take an `Empty` page slot at runtime id `id`. Panics on
-    /// out-of-bounds (cross-op runtime guard, bug class #1
-    /// reinforcement) and cross-op alias (bug class #2 cross-op).
-    /// The op MUST `release` afterwards.
-    ///
-    /// Stable-Rust note: `id` is a runtime u32 here because the
-    /// PagePool tracks state across multiple typed-const-generic
-    /// pushes; the per-op proof at variant `new::<...>()` time is
-    /// where `ID < NUM_PAGES` becomes a compile error.
-    pub fn take(&mut self, id: u32) -> u32 {
+    /// Take an `Empty` page with the given id. Panics if the id is
+    /// out of bounds (bug class #1) or already in use (cross-op
+    /// reuse, bug class #2). The op MUST `release` it after the
+    /// lifecycle walk finishes.
+    pub fn take(&mut self, id: u32) -> Page<Empty> {
         assert!(
-            id < self.num_pages,
+            id < self.substrate.num_pages,
             "PagePool::take: id {id} out of bounds num_pages={}",
-            self.num_pages,
+            self.substrate.num_pages,
         );
         assert!(
             !self.in_use[id as usize],
             "PagePool::take: page id {id} already in use by another op (cross-op reuse)",
         );
         self.in_use[id as usize] = true;
-        id
+        Page::<Empty>::new(id, &self.substrate)
     }
 
-    /// Return a page (any state). Idempotent.
-    pub fn release(&mut self, id: u32) {
-        if (id as usize) < self.in_use.len() {
-            self.in_use[id as usize] = false;
-        }
+    /// Return a page (any state — caller has already walked the
+    /// lifecycle and we just need the slot id). The page is now
+    /// available for the next op.
+    pub fn release<S: IsLifecycleState>(&mut self, page: Page<S>) {
+        let id = page.id() as usize;
+        // The page slot is dropped (we don't keep typestate; we
+        // just record it's free). Re-marking false is idempotent.
+        self.in_use[id] = false;
     }
 
-    pub fn num_pages(&self) -> u32 {
-        self.num_pages
+    pub fn substrate(&self) -> &SubstrateBudget {
+        &self.substrate
     }
 }
 
 // ============================================================
-// Public scope markers — see plan §1+§4.
+// Public scope markers — variants that use scratch declare which
+// scope their regions live in. Two regions in the same scope must
+// be `disjoint_with`; two in different scopes don't constrain
+// each other (they don't coexist in time).
 // ============================================================
 
 pub trait IsScratchScopePub: sealed::Sealed {}
 
-/// Scratch scope for `RmsNorm`-family ops.
+/// Scratch scope for `RmsNorm`-family ops. Per-iter partial-sums
+/// reduction lives in this scope; no other op shares it.
 pub struct RmsNormScope;
 impl sealed::Sealed for RmsNormScope {}
 impl IsScratchScope for RmsNormScope {}
 impl IsScratchScopePub for RmsNormScope {}
 
-/// Scratch scope for `FusedQkvRopeCache` Q/K rotation tiles.
+/// Scratch scope for `FusedQkvRopeCache`. Per-token-iter rotation
+/// buffers (Q-rope, K-rope tiles holding `cos*x - sin*y` /
+/// `sin*x + cos*y` in shmem before the gemm-bias add) live here.
+/// Multiple regions in this scope MUST be `disjoint_with` —
+/// Sprint B's bug class #4 enforcement.
 pub struct RopeScope;
 impl sealed::Sealed for RopeScope {}
 impl IsScratchScope for RopeScope {}
 impl IsScratchScopePub for RopeScope {}
 
-/// Scratch scope for `FusedGateUp{Silu,Gelu}Mul` gate/up tiles.
+/// Scratch scope for `FusedGateUpSiluMul` / `FusedGateUpGeluMul` —
+/// the gate-up MLP fusion's per-token-iter gate / up activation
+/// tiles in shmem before the elementwise `silu(gate) * up` (or
+/// `gelu(gate) * up`) reduction. Sprint C's bug class #4: gate_buf
+/// and up_buf live concurrently inside one per-tok loop iter and
+/// must be `disjoint_with`-discharged.
 pub struct MlpScope;
 impl sealed::Sealed for MlpScope {}
 impl IsScratchScope for MlpScope {}
 impl IsScratchScopePub for MlpScope {}
 
-/// Scratch scope for `AttentionViaCache` score / PV tiles.
+/// Scratch scope for `AttentionViaCache` /
+/// `SlidingAttentionViaCache` — the QKT score tile, softmax
+/// running-max / running-sum reduction, and the post-softmax
+/// PV tile, all live in shmem inside the per-tok attention loop.
+/// Sprint D's bug class #4: the score_tile and pv_tile must be
+/// `disjoint_with`-discharged within one iter (the softmax reads
+/// scores while the PV multiply writes the per-warp PV
+/// accumulator; both are in this scope).
 pub struct AttentionScope;
 impl sealed::Sealed for AttentionScope {}
 impl IsScratchScope for AttentionScope {}
 impl IsScratchScopePub for AttentionScope {}
 
-/// Scratch scope for `Gemm` / lm_head fusion B-tile.
+/// Scratch scope for general `Gemm` / lm_head fusion variants —
+/// the per-warp B-tile staging buffer + accumulator. The
+/// CutlassFused* lm_head variants put their pre-norm partial sums
+/// in `RmsNormScope` (sibling to standalone RmsNorm) and the gemm
+/// itself in this scope; the two are disjoint by virtue of
+/// different scopes.
 pub struct GemmScope;
 impl sealed::Sealed for GemmScope {}
 impl IsScratchScope for GemmScope {}
@@ -477,170 +526,177 @@ impl IsScratchScopePub for GemmScope {}
 
 // ============================================================
 // IterCount — typed iteration count for per-iter phase math.
+// Construction enforces > 0 (a 0-iter op is meaningless and would
+// short-circuit phase advance, leaving the cumulative arrive count
+// in a state inconsistent with what the next op expects).
+//
+// Used by variants whose kernel body iterates over tokens (or other
+// units) inside a single op. The arrive count advances by
+// `iters * arrives_per_iter` after the op completes; the lowering
+// uses `IterCount::raw()` to compute that bump.
 // ============================================================
 
-/// Typed iteration count. Const-generic constructor compile-fails
-/// when `ITERS == 0` (bug class #3: 0-iter ops desync the phase
-/// counter).
-pub struct IterCount<const ITERS: u32>;
+/// Typed iteration count for the per-iter loop inside a multi-iter
+/// op (today: `FusedQkvRopeCache` iterates once per token).
+/// Construction panics if `iters == 0` (bug class #3 — a 0-iter op
+/// would skip every per-iter arrive and leave the cumulative arrive
+/// count desynchronized from the next op's expected phase parity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IterCount(u32);
 
-impl<const ITERS: u32> IterCount<ITERS> {
-    pub const fn new() -> Self {
-        const {
-            assert!(ITERS > 0, "IterCount: ITERS must be > 0");
-        }
-        Self
+impl IterCount {
+    pub fn new(iters: u32) -> Self {
+        assert!(iters > 0, "IterCount: iters must be > 0 (got {iters})");
+        Self(iters)
     }
 
-    pub const fn raw(self) -> u32 {
-        ITERS
-    }
-}
-
-impl<const ITERS: u32> Default for IterCount<ITERS> {
-    fn default() -> Self {
-        Self::new()
+    pub fn raw(self) -> u32 {
+        self.0
     }
 }
 
 // ============================================================
 // Cross-CTA barrier edges (Sprint D).
+//
+// `BarrierSignal` / `BarrierWait` ops sync producer→consumer CTA
+// pairs across the megakernel grid. Each pair is identified by a
+// dense u32 `edge_idx`. The substrate budget records the total
+// number of edges; `EdgeId::new` validates the index is in range
+// (bug class #1 extension).
 // ============================================================
 
-/// Validated edge index. Const-generic; compile-fails when
-/// `IDX >= NUM_EDGES`.
-pub struct EdgeId<const IDX: u32, const NUM_EDGES: u32>;
+/// Validated edge index for a cross-CTA barrier. Bounds-checked
+/// against `SubstrateBudget::num_edges` (bug class #1).
+/// `pub(crate)` so only the lowering can mint ids; outside callers
+/// receive `EdgeId`s already-validated as part of `MegaNode` variant
+/// fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EdgeId(u32);
 
-impl<const IDX: u32, const NUM_EDGES: u32> EdgeId<IDX, NUM_EDGES> {
-    pub const fn new() -> Self {
-        const {
-            assert!(IDX < NUM_EDGES, "EdgeId: IDX out of bounds (>= NUM_EDGES)");
-        }
-        Self
+impl EdgeId {
+    pub(crate) fn new(idx: u32, substrate: &SubstrateBudget) -> Self {
+        assert!(
+            idx < substrate.num_edges,
+            "EdgeId {idx} out of substrate budget num_edges={}",
+            substrate.num_edges,
+        );
+        Self(idx)
     }
 
-    pub const fn raw(self) -> u32 {
-        IDX
-    }
-}
-
-impl<const IDX: u32, const NUM_EDGES: u32> Default for EdgeId<IDX, NUM_EDGES> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Expected arrive-count for a `BarrierWait`. Const-generic;
-/// compile-fails when `COUNT == 0`.
-pub struct ExpectedCount<const COUNT: u32>;
-
-impl<const COUNT: u32> ExpectedCount<COUNT> {
-    pub const fn new() -> Self {
-        const {
-            assert!(COUNT > 0, "ExpectedCount: COUNT must be > 0");
-        }
-        Self
-    }
-
-    pub const fn raw(self) -> u32 {
-        COUNT
+    pub fn raw(self) -> u32 {
+        self.0
     }
 }
 
-impl<const COUNT: u32> Default for ExpectedCount<COUNT> {
-    fn default() -> Self {
-        Self::new()
+/// Expected arrive-count for a `BarrierWait`. The wait blocks until
+/// the per-edge atomic counter reaches this value. Construction
+/// enforces > 0 (a wait with `expected_count == 0` is an immediate
+/// no-op the kernel could omit, but at the IR level we treat it as
+/// a logic bug — the `BarrierWait` op shouldn't have been emitted
+/// at all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpectedCount(u32);
+
+impl ExpectedCount {
+    pub fn new(count: u32) -> Self {
+        assert!(
+            count > 0,
+            "ExpectedCount: BarrierWait count must be > 0 (got {count})",
+        );
+        Self(count)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
     }
 }
 
 // ============================================================
-// Tests — confirm const-generic primitives WORK at the type level.
-// Compile-fail tests live in `tests/compile-fail/*.rs` (trybuild).
+// Tests — confirm the substrate-proof construction-time panics
+// fire as documented.
 // ============================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    type Budget6 = SubstrateBudget<6, 8, 32_768, 8_192, 0>;
+    fn budget() -> SubstrateBudget {
+        SubstrateBudget::new(6, 8, 32_768, 8_192)
+    }
 
     #[test]
     fn page_within_bounds_constructs() {
-        let _p = Page::<0, 6, Empty>::new();
-        let _q = Page::<5, 6, Empty>::new();
+        let _p = Page::<Empty>::new(0, &budget());
+        let _q = Page::<Empty>::new(5, &budget());
+    }
+
+    #[test]
+    #[should_panic(expected = "Page id 6 out of substrate budget num_pages=6")]
+    fn page_out_of_bounds_panics() {
+        let _ = Page::<Empty>::new(6, &budget());
     }
 
     #[test]
     fn page_lifecycle_round_trips() {
-        let p0 = Page::<0, 6, Empty>::new();
+        let p0 = Page::<Empty>::new(0, &budget());
         let p1 = p0.loader_fired();
         let p2 = p1.consumer_arrived();
         let p3 = p2.storer_consumed();
+        // p3 is Empty again; can transition.
         let _p4 = p3.loader_fired();
     }
 
     #[test]
     fn scratch_within_budget_constructs() {
-        let _r = ScratchRegion::<0, 64, 8_192, RmsNormScope>::new();
-        let _r2 = ScratchRegion::<8_128, 64, 8_192, RmsNormScope>::new();
+        let _r = ScratchRegion::<RmsNormScope>::new(0, 64, &budget());
+        let _r2 = ScratchRegion::<RmsNormScope>::new(8128, 64, &budget());
+    }
+
+    #[test]
+    #[should_panic(expected = "ScratchRegion out of substrate scratch budget")]
+    fn scratch_out_of_budget_panics() {
+        let _ = ScratchRegion::<RmsNormScope>::new(8129, 64, &budget());
+    }
+
+    #[test]
+    #[should_panic(expected = "offset + bytes overflowed u32")]
+    fn scratch_overflow_panics() {
+        let b = SubstrateBudget::new(1, 1, 1, u32::MAX);
+        let _ = ScratchRegion::<RmsNormScope>::new(u32::MAX, 1, &b);
     }
 
     #[test]
     fn scratch_disjoint_passes_for_non_overlap() {
-        let a = ScratchRegion::<0, 64, 8_192, RmsNormScope>::new();
-        let b = ScratchRegion::<64, 64, 8_192, RmsNormScope>::new();
+        let a = ScratchRegion::<RmsNormScope>::new(0, 64, &budget());
+        let b = ScratchRegion::<RmsNormScope>::new(64, 64, &budget());
         let _ = a.disjoint_with(b);
     }
 
     #[test]
-    fn mbarrier_phase_construction_passes() {
-        let _ = MbarrierPhase::<0>::new();
-        let _ = MbarrierPhase::<1>::new();
+    #[should_panic(expected = "ScratchRegion overlap within scope")]
+    fn scratch_overlap_panics() {
+        let a = ScratchRegion::<RmsNormScope>::new(0, 128, &budget());
+        let b = ScratchRegion::<RmsNormScope>::new(64, 64, &budget());
+        let _ = a.disjoint_with(b);
+    }
+
+    #[test]
+    fn mbarrier_phase_from_count() {
+        assert_eq!(MbarrierPhase::from_arrive_count(0).phase(), 0);
+        assert_eq!(MbarrierPhase::from_arrive_count(1).phase(), 1);
+        assert_eq!(MbarrierPhase::from_arrive_count(2).phase(), 0);
+        assert_eq!(MbarrierPhase::from_arrive_count(7).phase(), 1);
     }
 
     #[test]
     fn mbarrier_phase_assert_matches_passes() {
-        let _ = MbarrierPhase::<0>::assert_matches::<4>();
-        let _ = MbarrierPhase::<1>::assert_matches::<5>();
-        let _ = MbarrierPhase::<0>::assert_matches::<0>();
+        let _ = MbarrierPhase::assert_matches(0, 4);
+        let _ = MbarrierPhase::assert_matches(1, 5);
     }
 
     #[test]
-    fn iter_count_nonzero_constructs() {
-        let _ = IterCount::<1>::new();
-        let _ = IterCount::<8>::new();
-    }
-
-    #[test]
-    fn page_id_within_bounds_constructs() {
-        let _ = PageId::<0, 6>::new();
-        let _ = PageId::<5, 6>::new();
-    }
-
-    #[test]
-    fn edge_id_within_bounds_constructs() {
-        let _ = EdgeId::<0, 4>::new();
-        let _ = EdgeId::<3, 4>::new();
-    }
-
-    #[test]
-    fn expected_count_nonzero_constructs() {
-        let _ = ExpectedCount::<1>::new();
-        let _ = ExpectedCount::<128>::new();
-    }
-
-    #[test]
-    fn substrate_budget_constructs() {
-        let _ = Budget6::new();
-    }
-
-    #[test]
-    fn substrate_budget_accessors() {
-        let b = Budget6::new();
-        assert_eq!(b.num_pages(), 6);
-        assert_eq!(b.num_consumer_warps(), 8);
-        assert_eq!(b.page_size(), 32_768);
-        assert_eq!(b.scratch_bytes(), 8_192);
-        assert_eq!(b.num_edges(), 0);
+    #[should_panic(expected = "MbarrierPhase: requested 0 but cumulative arrive count 5")]
+    fn mbarrier_phase_assert_mismatches_panics() {
+        let _ = MbarrierPhase::assert_matches(0, 5);
     }
 }

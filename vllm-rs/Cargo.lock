@@ -2012,6 +2012,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-cuda-targets",
  "ferrite-forward",
+ "ferrite-mega-ir",
  "prettyplease",
  "proc-macro2",
  "quote",

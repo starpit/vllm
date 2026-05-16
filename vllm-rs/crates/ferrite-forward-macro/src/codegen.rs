@@ -4779,95 +4779,25 @@ type MegaArtifacts = (
 );
 
 fn emit_mega_artifacts_inline(
-    model: &ModelParams,
-    canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
+    _model: &ModelParams,
+    _canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
 ) -> MegaArtifacts {
-    // Per `MEGA_IR_PLAN.md` §5: walk every canonical's typed
-    // `Vec<Instruction>` tape, build the parallel `Vec<OpInput>`
-    // (instruction + per-op weight base names from the canonical's
-    // `LoweredBucket::weight_slots`), and call
-    // `ferrite_mega_ir::lower(...)` to discharge the substrate
-    // proofs. The resulting `MegaTape` is the load-bearing artifact
-    // the syntactic emit step (Phase C, future) consumes.
+    // Const-generic dispatch lands when the syntactic emit step does
+    // (Phase C). The mega-ir crate now uses const-generic primitives
+    // so substrate-proof bounds are checked at MONOMORPHIZATION time
+    // (rustc E0080 on the user's `#[forward]` for bad const args).
+    // The runtime-walking `ferrite_mega_ir::lower(...)` is fundamentally
+    // incompatible with that model — it would have to pass `op.in_slot`
+    // (runtime u32) as a const-generic, which stable Rust doesn't
+    // support. Per `MEGA_IR_PLAN.md` §C, the proc-macro will eventually
+    // emit literal `builder.push_*::<0, 1, ...>(weight)` calls at
+    // expansion time, with every const arg known statically.
     //
-    // Sprint A–D coverage hits every variant llama / qwen / gemma
-    // tapes carry; variants outside that set surface as
-    // `LowerError::NotYetLifted` and the canonical falls back to
-    // the host interpreter. Other lowering errors are real bugs —
-    // they panic at proc-macro time, surfacing as a compile error
-    // on the user's `#[forward]`.
-    use ferrite_mega_ir::{LowerError, OpInput, SubstrateBudget};
-
-    // Substrate budget. Sprint D's typed lowering doesn't yet need
-    // arch-specific tile-shape numbers — every push_* picks
-    // back-to-back scratch offsets within `scratch_bytes`, and the
-    // page count is the per-canonical concurrent-slot demand. Until
-    // a real budget calculator lands (Sprint E task), pick a
-    // generous default that comfortably fits llama / qwen / gemma
-    // tape demands. `num_edges` is 0 because no Sprint A–D variant
-    // emits cross-CTA barriers in the current llama/qwen tapes.
-    let substrate = SubstrateBudget::new(
-        /*num_pages=*/ 16, /*num_consumer_warps=*/ 8, /*page_size=*/ 32_768,
-        /*scratch_bytes=*/ 32_768,
-    );
-    let num_layers = model.bounds.get("num_hidden_layers").copied().unwrap_or(0) as u32;
-
-    for (wp, (lowered, _num_slots, _backbone_slot, _terminal_slot)) in canonical_lowered {
-        let canonical_name = format!(
-            "{}_m_{}_sk_{}",
-            model
-                .source_stem
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>(),
-            wp.num_tokens,
-            wp.sk_bucket
-        );
-
-        // Build OpInputs from the typed tape + per-op weight bases.
-        let backbone_inputs =
-            build_op_inputs(&lowered.backbone.instances, &lowered.backbone.weight_slots);
-        let lm_head_inputs =
-            build_op_inputs(&lowered.lm_head.instances, &lowered.lm_head.weight_slots);
-
-        for (slice_name, inputs) in [("backbone", &backbone_inputs), ("lm_head", &lm_head_inputs)] {
-            match ferrite_mega_ir::lower(inputs, num_layers, substrate) {
-                Ok(_tape) => {
-                    eprintln!(
-                        "ferrite-mega-ir: lowered {canonical_name}.{slice_name} to typed MegaTape ({} ops)",
-                        inputs.len()
-                    );
-                }
-                Err(LowerError::NotYetLifted { op }) => {
-                    eprintln!(
-                        "ferrite-mega-ir: skipped {canonical_name}.{slice_name}: variant `{op}` not lifted (host fallback)"
-                    );
-                }
-                Err(LowerError::WrongWeightArity { op, expected, got }) => {
-                    eprintln!(
-                        "ferrite-mega-ir: skipped {canonical_name}.{slice_name}: variant `{op}` weight arity mismatch (expected {expected}, got {got}) — host fallback"
-                    );
-                }
-                Err(LowerError::MissingSlidingWindow) => {
-                    eprintln!(
-                        "ferrite-mega-ir: skipped {canonical_name}.{slice_name}: SlidingAttentionViaCache without window context — host fallback"
-                    );
-                }
-                Err(LowerError::SubstrateBudgetTooSmall { need, have }) => {
-                    panic!(
-                        "ferrite-mega-ir: lower({canonical_name}.{slice_name}) — substrate budget too small (need {need}, have {have}). Bump `num_pages` in `emit_mega_artifacts_inline`."
-                    );
-                }
-            }
-        }
-    }
-
-    // Phase C (syntactic emit) lands later; for now the proc-macro
-    // observes `lower(...)` succeeds (or returns `NotYetLifted`)
-    // and emits no mega artifacts — every canonical resolves to
-    // the host interpreter via the per-bucket forward fn already
-    // produced by `emit_model`.
-    let _ = OpInput::new; // silence unused-import for OpInput when no pat needs naming.
+    // For now this emit_mega_artifacts_inline is a stub. The
+    // compile-time guarantees of MegaIR are now structurally there at
+    // the API level — anyone calling `MegaTapeBuilder::push_*::<...>`
+    // gets monomorphization-time substrate-proof verification. The
+    // proc-macro's actual emission of those calls is Phase C work.
     (
         TokenStream::new(),
         BTreeMap::new(),
@@ -4891,6 +4821,15 @@ fn emit_mega_artifacts_inline(
 /// they're substrate-equivalent. Sprint E deletes the prefix
 /// entirely; until then, we strip it at the macro→mega-ir
 /// boundary.
+///
+/// Currently unused — `emit_mega_artifacts_inline` was stubbed when
+/// mega-ir moved to const-generic substrate proofs (the runtime
+/// `lower(...)` entry point is incompatible with const-generic
+/// monomorphization-time proof discharge). Kept for Phase C, where
+/// the proc-macro emits literal `builder.push_*::<...>(weight)`
+/// calls directly and may want this helper to walk Tk-prefix
+/// normalization.
+#[allow(dead_code)]
 fn build_op_inputs(
     instances: &[ferrite_forward::Instruction],
     weight_slots: &[Vec<crate::impl_lib::WeightSlot>],
@@ -4918,6 +4857,9 @@ fn build_op_inputs(
 /// after fan_out); substrate-wise the variants are identical and
 /// each Tk* `eval` delegates to its non-Tk counterpart at runtime.
 /// Variants without a Tk prefix pass through unchanged.
+///
+/// Currently unused — see [`build_op_inputs`] for the rationale.
+#[allow(dead_code)]
 fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::Instruction {
     use ferrite_forward::Instruction as I;
     match instr {

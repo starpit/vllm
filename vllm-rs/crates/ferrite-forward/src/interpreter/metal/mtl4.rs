@@ -79,7 +79,18 @@ unsafe impl Sync for Mtl4Step {}
 /// step is a `Gemm` (MPS) or any kernel exceeds the argument-table
 /// binding cap — the caller falls back to the MTL3 path for that
 /// bucket.
-pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4Step>> {
+pub fn bake_mtl4_steps(
+    steps: &[BucketStep],
+    device: &Device,
+    bucket_m: u32,
+) -> Option<Vec<Mtl4Step>> {
+    // ICBs only at prefill-shaped buckets where num_tokens reliably
+    // matches bucket_m so the bucket_m-baseline grid baked into the
+    // ICB doesn't over-dispatch into uninitialized arena rows. Decode
+    // buckets (bucket_m ≤ 8) get baked but use the direct-dispatch
+    // path; their per-dispatch overhead is small relative to the
+    // attention-over-history work.
+    let icb_eligible_bucket = bucket_m >= 64;
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
         match step {
@@ -123,9 +134,30 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                     }
                     tables.push(table);
                 }
-                let m_scaling_safe = direct_m_scaling.iter().all(|s| s.is_none());
+                // ICBs use the bucket_m baseline grid for every
+                // sub-dispatch (m_scaling is a runtime grid shrink
+                // that we can't apply to a pre-baked ICB — Apple's
+                // MTLIndirectComputeCommand has no indirect-grid
+                // dispatch variant). When `num_tokens < bucket_m`
+                // the ICB over-dispatches; that's safe ONLY for
+                // kernels whose output goes to per-request arena
+                // slots. Kernels that write to shared persistent
+                // storage (KV cache) MUST NOT over-dispatch; they
+                // stay on the direct-dispatch path with m_scaling.
+                let kv_cache_writer = matches!(
+                    *kernel,
+                    super::lowered::KernelId::RopeAppend
+                        | super::lowered::KernelId::FusedQkvRopeCache
+                        | super::lowered::KernelId::FusedAffineQkvRopeCache
+                        | super::lowered::KernelId::AttentionPrefillSdpaPaged
+                        | super::lowered::KernelId::AttentionViaCache
+                        | super::lowered::KernelId::SynthPreAttn
+                        | super::lowered::KernelId::SynthMlpPreDown
+                        | super::lowered::KernelId::SynthGateUpSiluMul
+                );
                 let icb = if std::env::var_os("FERRITE_METAL_ICB").is_some()
-                    && m_scaling_safe
+                    && icb_eligible_bucket
+                    && !kv_cache_writer
                 {
                     build_icb_for_step(device, pipeline, direct_bindings, direct_dispatch)
                 } else {

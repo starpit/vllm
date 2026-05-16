@@ -12,7 +12,7 @@
 use ferrite_forward_macro::forward;
 
 #[forward(
-    workloads = [1, 8, 64, 512, 4096],
+    workloads = [1, 8, 64, 512, 1024, 2048, 4096],
     sk_buckets = [128, 512, 2048, 8192],
 )]
 fn llama() {

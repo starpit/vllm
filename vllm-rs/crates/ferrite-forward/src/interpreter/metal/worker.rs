@@ -917,7 +917,7 @@ fn bake_bucket<W: CanonicalParams>(
         }
     }
 
-    let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device);
+    let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device, tape.bucket_m);
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         steps,

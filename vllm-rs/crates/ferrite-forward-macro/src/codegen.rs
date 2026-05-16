@@ -2337,6 +2337,37 @@ fn emit_weights_struct(
         })
     });
 
+    // Compute dtype the rotary cache must match the model's compute dtype:
+    // the rope kernel dispatches on Q/K activation dtype but reinterprets
+    // cos/sin bytes through that same plan, so a BF16 cos/sin against F16
+    // activations reads the table through the wrong exponent width
+    // (5 vs 8 bits).
+    //
+    // Read at RUNTIME from `embed_tokens.weight`'s on-disk dtype — that
+    // tensor is always present and always in the model's compute dtype
+    // (never quantized). Baking from the manifest's `torch_dtype` is
+    // unsafe: AWQ checkpoints frequently override the base model's dtype
+    // (Qwen2.5 base ships as bf16; the `*-Instruct-AWQ` variants ship as
+    // f16), and the per-AWQ-variant `quant_config.json` does not change
+    // the manifest's compile-time `torch_dtype` literal. Mismatch produces
+    // grammatical-but-incoherent output (rope rotations applied through
+    // the wrong exponent layout). The manifest's `torch_dtype` survives
+    // only as the fallback when the embed tensor isn't visible in the
+    // weights table — same pattern used by the BNB4 / FP8 preludes above.
+    let rope_dtype_fallback: TokenStream = match model.torch_dtype.as_deref() {
+        Some("float16" | "fp16" | "f16" | "half") => {
+            quote! { ::ferrite_cuda_core::dtype::DType::F16 }
+        }
+        _ => quote! { ::ferrite_cuda_core::dtype::DType::BF16 },
+    };
+    let rotary_prelude: TokenStream = quote! {
+        let __rope_dtype = gw
+            .tensor_info(#embed_tokens_weight_path)
+            .map(|(_, dt)| dt)
+            .unwrap_or(#rope_dtype_fallback);
+    };
+    let rope_dtype: TokenStream = quote! { __rope_dtype };
+
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::ferrite_kernels::rotary::RotaryCache, }
     } else {
@@ -2931,6 +2962,7 @@ fn emit_weights_struct(
                 #marlin_prelude
                 #bnb4_prelude
                 #fp8_prelude
+                #rotary_prelude
                 #(#lets)*
                 #rotary_load
                 #rotary_local_load

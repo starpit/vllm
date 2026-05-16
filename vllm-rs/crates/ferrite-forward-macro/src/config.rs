@@ -130,6 +130,17 @@ pub struct ModelParams {
     /// `Program::decoder_safetensors_prefix` and consumed by
     /// [`crate::codegen::safetensors_prefix`] under `Prelude::Decoder`.
     pub decoder_safetensors_prefix: Option<String>,
+    /// HF `torch_dtype` string, lowercased. Read by codegen as the
+    /// FALLBACK for the rotary cache compute dtype when the embed
+    /// tensor isn't visible in the weights table at load time. Today's
+    /// primary path reads `embed_tokens.weight`'s on-disk dtype at
+    /// runtime — see `emit_weights_struct`'s `rotary_prelude`. AWQ
+    /// variants frequently override the base dtype (Qwen2.5 base
+    /// ships bf16; `*-Instruct-AWQ` ships f16) while keeping the
+    /// manifest `torch_dtype` literal unchanged, so the runtime read
+    /// is load-bearing for AWQ correctness. `None` when the JSON
+    /// omits the field.
+    pub torch_dtype: Option<String>,
 }
 
 /// On-disk safetensors layout for a vision tower. Drives
@@ -837,6 +848,10 @@ fn model_params_from_json(
         .get("decoder_safetensors_prefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let torch_dtype = json
+        .get("torch_dtype")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase());
 
     Ok(ModelParams {
         name,
@@ -855,6 +870,7 @@ fn model_params_from_json(
         vision_d_model_fingerprint,
         vision_patch_embed_flatten,
         decoder_safetensors_prefix,
+        torch_dtype,
     })
 }
 

@@ -1427,6 +1427,11 @@ impl ScalarOffsetRmsNorm {
 }
 
 /// `Gemm` variant. Storage erases `(n, k)` to plain u32 fields.
+/// `Gemm` variant.
+///
+/// Kernel ABI: `ferrite::ops::gemm_bf16::{loader, consumer, launcher,
+/// storer}<Config, K, N, M>` in `gemm_bf16.cuh`. M = NUM_TOKENS at
+/// the canonical's workload point.
 pub struct Gemm {
     in_page_id: u32,
     weight_page_id: u32,
@@ -1439,6 +1444,10 @@ pub struct Gemm {
     layer: u32,
     n: u32,
     k: u32,
+    m: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor_idx: u32,
     pub weight: WeightRef,
 }
 
@@ -1460,6 +1469,10 @@ impl Gemm {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const M: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         weight: WeightRef,
     ) -> Self {
@@ -1480,6 +1493,7 @@ impl Gemm {
             assert!(LAYER < NUM_LAYERS, "Gemm: LAYER OOB");
             assert!(N > 0, "Gemm: N must be > 0");
             assert!(K > 0, "Gemm: K must be > 0");
+            assert!(M > 0, "Gemm: M (NUM_TOKENS) must be > 0");
             assert!(CONSUMER_PHASE == ARRIVES & 1, "Gemm: CONSUMER_PHASE parity");
             assert!(
                 STORER_PHASE == (ARRIVES + 1) & 1,
@@ -1498,6 +1512,10 @@ impl Gemm {
             layer: LAYER,
             n: N,
             k: K,
+            m: M,
+            in_act_slot: IN_ACT_SLOT,
+            out_act_slot: OUT_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
             weight,
         }
     }
@@ -1535,6 +1553,18 @@ impl Gemm {
     pub const fn k(&self) -> u32 {
         self.k
     }
+    pub const fn m(&self) -> u32 {
+        self.m
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
+    }
 }
 
 /// `Instruction::FusedCublasGemmAdd(in, residual, layer, n, k)` —
@@ -1542,6 +1572,12 @@ impl Gemm {
 /// is `Gemm` plus a `residual_page` that's read AND written
 /// (the output writes back to the residual buffer; no separate
 /// out_page).
+///
+/// Kernel ABI: `ferrite::ops::down_proj_residual::{loader, consumer,
+/// launcher, storer}<Config, K, N, NUM_TOKENS, K_OFFSET, K_FULL>`
+/// in `down_proj_residual.cuh`. K_OFFSET / K_FULL support the
+/// 4-chunk down_proj split (TkGemmAdd path); the un-split case has
+/// K_OFFSET = 0, K_FULL = K.
 pub struct FusedCublasGemmAdd {
     in_page_id: u32,
     weight_page_id: u32,
@@ -1554,6 +1590,12 @@ pub struct FusedCublasGemmAdd {
     layer: u32,
     n: u32,
     k: u32,
+    num_tokens: u32,
+    k_offset: u32,
+    k_full: u32,
+    in_act_slot: u32,
+    residual_act_slot: u32,
+    weight_accessor_idx: u32,
     pub weight: WeightRef,
 }
 
@@ -1575,6 +1617,12 @@ impl FusedCublasGemmAdd {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const NUM_TOKENS: u32,
+        const K_OFFSET: u32,
+        const K_FULL: u32,
+        const IN_ACT_SLOT: u32,
+        const RESIDUAL_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         weight: WeightRef,
     ) -> Self {
@@ -1606,6 +1654,15 @@ impl FusedCublasGemmAdd {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "FusedCublasGemmAdd: STORER_PHASE parity"
             );
+            assert!(
+                NUM_TOKENS > 0,
+                "FusedCublasGemmAdd: NUM_TOKENS must be > 0"
+            );
+            assert!(K_FULL > 0, "FusedCublasGemmAdd: K_FULL must be > 0");
+            assert!(
+                (K_OFFSET as u64) + (K as u64) <= K_FULL as u64,
+                "FusedCublasGemmAdd: K_OFFSET + K must be <= K_FULL"
+            );
         }
         Self {
             in_page_id: IN_ID,
@@ -1619,6 +1676,12 @@ impl FusedCublasGemmAdd {
             layer: LAYER,
             n: N,
             k: K,
+            num_tokens: NUM_TOKENS,
+            k_offset: K_OFFSET,
+            k_full: K_FULL,
+            in_act_slot: IN_ACT_SLOT,
+            residual_act_slot: RESIDUAL_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
             weight,
         }
     }
@@ -1655,6 +1718,24 @@ impl FusedCublasGemmAdd {
     }
     pub const fn k(&self) -> u32 {
         self.k
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn k_offset(&self) -> u32 {
+        self.k_offset
+    }
+    pub const fn k_full(&self) -> u32 {
+        self.k_full
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn residual_act_slot(&self) -> u32 {
+        self.residual_act_slot
+    }
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
     }
 }
 

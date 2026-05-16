@@ -667,7 +667,10 @@ impl<
         self
     }
 
-    /// Push a typed `Gemm`.
+    /// Push a typed `Gemm`. Adds `M` (NUM_TOKENS), `IN_ACT_SLOT`,
+    /// `OUT_ACT_SLOT`, `WEIGHT_ACCESSOR_IDX` for §0/§4a kernel-AST
+    /// emit (`<Config, K, N, M>` template + `act_ptrs[]` /
+    /// `weight_ptrs[]` indices).
     #[allow(clippy::too_many_arguments)]
     pub fn push_gemm<
         const IN_ID: u32,
@@ -683,6 +686,10 @@ impl<
         const K: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const M: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         weight_path: String,
@@ -708,6 +715,10 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
+            M,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
         >(weight);
         self.nodes.push(MegaNode::Gemm(node));
         self.pool.release(IN_ID);
@@ -719,10 +730,15 @@ impl<
         self
     }
 
-    /// Push a typed `FusedCublasGemmAdd` onto the tape.
-    /// Substrate shape: 3 pages (in / weight / residual=output),
-    /// `GemmScope` B-tile, multi-iter. The residual page is read
-    /// AND written (in-place residual fold after the gemm).
+    /// Push a typed `FusedCublasGemmAdd` onto the tape. Substrate
+    /// shape: 3 pages (in / weight / residual=output), `GemmScope`
+    /// B-tile, multi-iter. The residual page is read AND written
+    /// (in-place residual fold after the gemm).
+    ///
+    /// AST const generics (§0/§4a): NUM_TOKENS, K_OFFSET, K_FULL +
+    /// IN_ACT_SLOT, RESIDUAL_ACT_SLOT, WEIGHT_ACCESSOR_IDX. K_OFFSET
+    /// / K_FULL drive the down_proj 4-chunk split (TkGemmAdd path);
+    /// the un-split case has K_OFFSET = 0, K_FULL = K.
     #[allow(clippy::too_many_arguments)]
     pub fn push_fused_cublas_gemm_add<
         const IN_ID: u32,
@@ -738,6 +754,12 @@ impl<
         const K: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const NUM_TOKENS: u32,
+        const K_OFFSET: u32,
+        const K_FULL: u32,
+        const IN_ACT_SLOT: u32,
+        const RESIDUAL_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         weight_path: String,
@@ -763,6 +785,12 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
+            NUM_TOKENS,
+            K_OFFSET,
+            K_FULL,
+            IN_ACT_SLOT,
+            RESIDUAL_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
         >(weight);
         self.nodes.push(MegaNode::FusedCublasGemmAdd(node));
         self.pool.release(IN_ID);
@@ -1276,7 +1304,9 @@ mod tests {
     #[test]
     fn lowers_gemm() {
         let mut b = BuilderD::new();
-        b.push_gemm::<0, 1, 2, 0, 4096, 0, 1, 4, 3, 4096, 2048, 16, 0>("W::gemm".to_string());
+        b.push_gemm::<0, 1, 2, 0, 4096, 0, 1, 4, 3, 4096, 2048, 16, 0, 8, 0, 2, 0>(
+            "W::gemm".to_string(),
+        );
         let tape = b.finish();
         let MegaNode::Gemm(n) = &tape.nodes()[0] else {
             panic!();

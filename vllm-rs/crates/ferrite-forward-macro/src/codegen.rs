@@ -5504,8 +5504,13 @@ fn dispatch_instruction_to_push(
             let layer_lit = lit(resolved_layer(*layer));
             let n_lit = lit(*n);
             let k_lit = lit(*k);
+            let m_lit = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_gemm::<
                     #in_id, #weight_id, #out_id,
@@ -5513,6 +5518,7 @@ fn dispatch_instruction_to_push(
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #n_lit, #k_lit,
                     #num_layers, #arrives,
+                    #m_lit, #in_act_slot, #out_act_slot, #weight_accessor_idx,
                 >(#weight_str.to_string());
             })
         }
@@ -5828,8 +5834,19 @@ fn dispatch_instruction_to_push(
             let layer_lit = lit(resolved_layer(*layer));
             let n_lit = lit(*n);
             let k_lit = lit(*k);
+            // Un-split path: K_OFFSET=0, K_FULL=K. The TkGemmAdd path
+            // currently normalizes to FusedCublasGemmAdd dropping
+            // (k_offset, k_full); the chunked split lands in a
+            // future iteration with TkGemmAdd's own dispatch arm.
+            let num_tokens_lit = lit(state.num_tokens);
+            let k_offset_lit = lit(0u32);
+            let k_full_lit = lit(*k);
+            let in_act_slot = lit(*in_slot);
+            let residual_act_slot = lit(*residual_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_fused_cublas_gemm_add::<
                     #in_id, #weight_id, #residual_id,
@@ -5837,6 +5854,8 @@ fn dispatch_instruction_to_push(
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #n_lit, #k_lit,
                     #num_layers, #arrives,
+                    #num_tokens_lit, #k_offset_lit, #k_full_lit,
+                    #in_act_slot, #residual_act_slot, #weight_accessor_idx,
                 >(#weight_str.to_string());
             })
         }

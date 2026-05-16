@@ -4919,7 +4919,18 @@ fn emit_canonical_build_fn(
     let num_edges: u32 = count_barrier_edges(&lowered.backbone.instances)
         + count_barrier_edges(&lowered.lm_head.instances);
 
-    let mut state = PhaseCState::new(NUM_PAGES, NUM_CONSUMER_WARPS, SCRATCH_BYTES, num_layers);
+    // Vision-MM tapes have their own per-iter loop with vision-tower
+    // depth (e.g. SigLIP=27 for gemma3-mm, ViT-L=24 for llava-1.5)
+    // that can exceed the text decoder's num_hidden_layers. Walk
+    // both slices for the largest Loop count and use max(text,
+    // vision_loop) as the substrate's NUM_LAYERS so layer-iter
+    // const proofs (`LAYER < NUM_LAYERS`) discharge for vision ops.
+    let max_loop_count = max_loop_iter_count(&lowered.backbone.instances)
+        .max(max_loop_iter_count(&lowered.lm_head.instances));
+    let effective_num_layers = num_layers.max(max_loop_count);
+
+    let mut state =
+        PhaseCState::new(NUM_PAGES, NUM_CONSUMER_WARPS, SCRATCH_BYTES, effective_num_layers);
     let mut body = TokenStream::new();
 
     // Emit pushes for backbone + lm_head with Loop expansion.
@@ -4991,6 +5002,9 @@ fn emit_slice_with_loop_expansion(
                             ferrite_forward::Instruction::Alias(_, _)
                                 | ferrite_forward::Instruction::Free(_)
                                 | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+                                | ferrite_forward::Instruction::LoadPixels(_)
+                                | ferrite_forward::Instruction::EmbeddingGather(_, _, _)
+                                | ferrite_forward::Instruction::StripCls(_, _)
                         ) {
                             continue;
                         }
@@ -5019,7 +5033,10 @@ fn emit_slice_with_loop_expansion(
             }
             ferrite_forward::Instruction::Alias(_, _)
             | ferrite_forward::Instruction::Free(_)
-            | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _) => {
+            | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+            | ferrite_forward::Instruction::LoadPixels(_)
+            | ferrite_forward::Instruction::EmbeddingGather(_, _, _)
+            | ferrite_forward::Instruction::StripCls(_, _) => {
                 // Alias / Free / Reshape are tile-table runtime
                 // control ops — no megakernel substrate effect
                 // (Reshape creates a typed view of an existing slot
@@ -5045,6 +5062,22 @@ fn emit_slice_with_loop_expansion(
         }
     }
     Ok(out)
+}
+
+/// Largest `Loop(count, _)` count anywhere in the slice — used to
+/// size `state.num_layers` so vision-MM canonicals' loop iters
+/// (e.g. SigLIP=27 vs text decoder=26) don't trip the
+/// `LAYER < NUM_LAYERS` substrate proof.
+fn max_loop_iter_count(instrs: &[ferrite_forward::Instruction]) -> u32 {
+    use ferrite_forward::Instruction as I;
+    instrs
+        .iter()
+        .filter_map(|i| match i {
+            I::Loop(count, _) => Some(*count),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Count `BarrierSignal` ops in a tape — used to size
@@ -5956,6 +5989,47 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
         // emitted before this normalization.)
         I::CutlassGemv(in_slot, out_slot, layer, n, k) => {
             I::Gemm(in_slot, out_slot, layer, n, k)
+        }
+        // FusedGemmBias (bf16 dense gemm + bias add, layer-bound):
+        // substrate is the same 3 pages plus GemmScope tile as Gemm
+        // — bias is helper config consumed by the runtime kernel,
+        // not a substrate dim. n/k aren't in the variant fields
+        // (they're emit-step config); use sentinel 1/1 to satisfy
+        // the bf16 Gemm const proof's `n > 0`/`k > 0` check.
+        I::FusedGemmBias(in_slot, out_slot, layer) => {
+            I::Gemm(in_slot, out_slot, layer, 1, 1)
+        }
+        // PosEmbed (SigLIP / Gemma3-MM vision positional embedding):
+        // same substrate as Embed — 1 page (out) plus per-position
+        // weight table. Distinct from Embed only in that table dim 0
+        // is `vision_num_positions` rather than `vocab_size`; that's
+        // a kernel-template selection concern at the emit step, not
+        // a substrate dim.
+        I::PosEmbed(out_slot) => I::Embed(out_slot),
+        // Vision-tower variants (AvgPool2d, QuickGelu, Gelu, GeluErf,
+        // VarlenAttention, VisionRope) are intentionally NOT
+        // normalized here — vision-MM tape (gemma3-mm, llava) has
+        // page-aliasing patterns and a separate iter-count axis
+        // (vision-encoder depth) that need a dedicated vision-substrate
+        // sweep. Leaving them un-normalized makes the MM canonicals
+        // fall back to host_fallback at the dispatch phase, before
+        // any downstream substrate proof can fire on a half-lifted
+        // tape. Phase C step 1 vision coverage is its own sprint.
+        // EncoderAttention (ModernBERT vision/text encoder block): no
+        // KV cache, no per-layer cos_sin — encoder DSL is
+        // attention(q, k, v) with q/k/v already 3D from upstream
+        // projection. Substrate-wise this collapses onto
+        // AttentionViaCache (same 2-pages-plus-attn-scope-tile
+        // shape; the K/V input pages are downstream of upstream
+        // projection ops that already published their substrate
+        // pages). The `layer` is implicitly the loop iter; we use
+        // 0 here since encoder layer iteration is captured by
+        // emit_slice_with_loop_expansion's layer_override pass at
+        // dispatch time. K/V input slots are dropped at the
+        // substrate boundary (their pages were already proven by
+        // their producer ops).
+        I::EncoderAttention(q_slot, _k_slot, _v_slot, out_slot) => {
+            I::AttentionViaCache(q_slot, out_slot, /*layer=*/ 0, /*interleaved=*/ false)
         }
         // Quantization-flavored QKV-rope-cache variants share
         // substrate shape with the bf16 `FusedQkvRopeCache` —

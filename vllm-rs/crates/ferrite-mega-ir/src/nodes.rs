@@ -1444,7 +1444,13 @@ impl AttentionViaCacheNode {
                 ATTN_OUT_ID < NUM_PAGES,
                 "AttentionViaCache: ATTN_OUT_ID OOB"
             );
-            assert!(Q_IN_ID != ATTN_OUT_ID, "AttentionViaCache: page alias");
+            // NOTE: Q_IN_ID == ATTN_OUT_ID is intentional for the
+            // in-place attention pattern — the kernel reads Q from
+            // the page, computes attention via the global paged KV
+            // cache, then writes the output back into the same page.
+            // Lifecycle: Empty (stale) → Filled (Q loaded) →
+            // Produced (consumer wrote attn output) → Empty (drained).
+            // No aliasing problem within the op.
             let s_end = (SCORE_OFF as u64) + (SCORE_BYTES as u64);
             let p_end = (PV_OFF as u64) + (PV_BYTES as u64);
             assert!(

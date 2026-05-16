@@ -7,19 +7,14 @@ description = "Typed correct-by-construction IR for ferrite megakernel emission.
 
 [features]
 default = []
-# Forward `ferrite-forward/nccl` so this crate's `Instruction` match
-# in `lower::variant_name` reaches the `AllReduce` / `AllGather`
-# variants when the consumer enabled tensor parallel.
-nccl = ["ferrite-forward/nccl"]
 
 [dependencies]
-# Per `MEGA_IR_PLAN.md` §5, the lowering input is the existing
-# `Vec<Instruction>` semantic tape from `ferrite-forward::instr`.
-# `Instruction` is ungated (the cuda-only items are
-# `WeightAccessors` / `InterpreterCtx` / `run` / `debug_dump`), so
-# this dep does NOT enable `cuda` — keeps mega-ir free of
-# ferrite-kernels' extern CUDA symbols.
-ferrite-forward = { path = "../ferrite-forward" }
+# `ferrite-mega-ir` has zero external deps. The const-generic
+# `MegaTapeBuilder` API doesn't consume `Instruction` at runtime
+# — the proc-macro emits literal `push_*::<...>(weight_path)`
+# calls at expansion time, monomorphizing them at user build.
+# This lets `ferrite-forward` re-export `ferrite-mega-ir` without
+# closing a `mega-ir → ferrite-forward → mega-ir` cycle.
 
 # Compile-fail tests for const-generic substrate-proof rejection
 # live in `tests/compile_fail.rs` and shell out to `rustc` directly.

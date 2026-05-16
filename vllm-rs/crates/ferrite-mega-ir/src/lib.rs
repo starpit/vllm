@@ -38,7 +38,7 @@ pub mod nodes;
 pub mod substrate;
 pub mod tape;
 
-pub use lower::{ArriveCount, LowerError, MegaTapeBuilder, OpInput, lower};
+pub use lower::{ArriveCount, LowerError, MegaTapeBuilder};
 pub use nodes::{
     Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
     Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,

@@ -51,8 +51,6 @@
 
 #![allow(dead_code)]
 
-use ferrite_forward::Instruction;
-
 use crate::nodes::{
     Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
     Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,
@@ -803,58 +801,14 @@ pub enum LowerError {
     MissingSlidingWindow,
 }
 
-/// Per-op lowering input: one [`Instruction`] paired with the
-/// per-arch weight base names of the slots it consumes.
-///
-/// Kept as a public type for backward compatibility — the
-/// proc-macro currently calls into [`lower`] which is now stubbed
-/// (returns `NotYetLifted` for every input). Phase C of the plan
-/// is the proc-macro emitting literal `builder.push_*::<...>` calls
-/// at expansion time; this `OpInput` type is the interim shape the
-/// proc-macro builds, stored only so callers compile.
-#[derive(Clone)]
-pub struct OpInput {
-    pub instr: Instruction,
-    pub weight_paths: Vec<String>,
-    pub iters: u32,
-    pub sliding_window: Option<u32>,
-}
-
-impl OpInput {
-    pub fn new(instr: Instruction, weight_paths: Vec<String>) -> Self {
-        Self {
-            instr,
-            weight_paths,
-            iters: 1,
-            sliding_window: None,
-        }
-    }
-}
-
-/// Top-level lowering entry point — STUBBED in the const-generic
-/// edition.
-///
-/// Const-generic constructors require literal const args at the call
-/// site; a function dispatching on a runtime [`Instruction`] cannot
-/// pass `op.in_slot: u32` (runtime) as a const-generic. Per the plan
-/// §C, the proc-macro will eventually emit literal
-/// `builder.push_*::<0, 1, ...>(weight)` calls at expansion time,
-/// where every const arg is known.
-///
-/// Until then, `lower` returns `NotYetLifted` for every input. The
-/// proc-macro side stub correspondingly drops the `lower(...)` call.
-/// The compile-time substrate-proof guarantees of MegaIR still hold
-/// at the API surface — anyone calling `MegaTapeBuilder::push_*::<...>`
-/// gets monomorphization-time E0080 errors for bad const args.
-pub fn lower(_ops: &[OpInput], _num_layers: u32) -> Result<MegaTape, LowerError> {
-    // Stable-Rust note: the runtime-walking `lower(...)` is fundamentally
-    // incompatible with const-generic monomorphization-time substrate
-    // proofs. Phase C of the plan replaces this with literal const-arg
-    // emission at proc-macro expansion time.
-    Err(LowerError::NotYetLifted {
-        op: "lower (const-generic API requires literal const args at the call site)",
-    })
-}
+// `OpInput` and the runtime-walking `lower(&[OpInput])` entry point
+// were retired with the const-generic refactor — passing runtime
+// u32 values as const-generic args isn't legal Rust. Per
+// `MEGA_IR_PLAN.md` §C, the proc-macro builds the typed `MegaTape`
+// by EMITTING literal `MegaTapeBuilder::push_*::<...>(weight_path)`
+// calls at expansion time; user-build monomorphization fires the
+// `const {}` blocks. No runtime-dispatch entry point exists, and
+// `ferrite-mega-ir` no longer depends on `ferrite-forward`.
 
 // ============================================================
 // Tests — exercise the const-generic builder at every variant.
@@ -1178,17 +1132,5 @@ mod tests {
         assert_eq!(b.arrives(), 1);
         b.push_rms_norm::<0, 1, 0, 32, 1, 0, 0, 16, 1>("W::n".to_string());
         assert_eq!(b.arrives(), 2);
-    }
-
-    #[test]
-    fn lower_stub_returns_not_yet_lifted() {
-        let ops = vec![OpInput::new(
-            Instruction::RmsNorm(0, 0, 0),
-            vec!["W::norm".to_string()],
-        )];
-        match lower(&ops, 16) {
-            Err(LowerError::NotYetLifted { op: _ }) => {}
-            other => panic!("expected NotYetLifted, got {other:?}"),
-        }
     }
 }

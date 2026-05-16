@@ -4897,7 +4897,7 @@ impl PhaseCState {
     }
 }
 
-/// Emit `fn build_mega_tape_<canonical>() -> ::ferrite_mega_ir::MegaTape`
+/// Emit `fn build_mega_tape_<canonical>() -> ::ferrite_forward::mega_ir::MegaTape`
 /// whose body is a literal-const-arg sequence of `MegaTapeBuilder`
 /// pushes — one per `Instruction` in the canonical's typed tape.
 ///
@@ -4943,10 +4943,10 @@ fn emit_canonical_build_fn(
         /// `const { assert!(...) }` blocks in `ferrite_mega_ir`'s
         /// const-generic primitives. Bad const args → rustc E0080.
         #[allow(dead_code, clippy::let_and_return)]
-        pub fn #fn_name() -> ::ferrite_mega_ir::MegaTape {
-            let mut b: ::ferrite_mega_ir::MegaTapeBuilder<
+        pub fn #fn_name() -> ::ferrite_forward::mega_ir::MegaTape {
+            let mut b: ::ferrite_forward::mega_ir::MegaTapeBuilder<
                 #num_pages_lit, #num_warps_lit, #page_size_lit, #scratch_lit, #num_edges_lit,
-            > = ::ferrite_mega_ir::MegaTapeBuilder::new();
+            > = ::ferrite_forward::mega_ir::MegaTapeBuilder::new();
             #body
             b.finish()
         }
@@ -5356,8 +5356,12 @@ fn dispatch_instruction_to_push(
                 .first()
                 .ok_or_else(|| "FusedGateUp*Mul weight_paths empty".to_string())?;
             let activation_path = match instr {
-                I::FusedGateUpSiluMul(..) => quote! { ::ferrite_mega_ir::GateUpActivation::Silu },
-                I::FusedGateUpGeluMul(..) => quote! { ::ferrite_mega_ir::GateUpActivation::Gelu },
+                I::FusedGateUpSiluMul(..) => {
+                    quote! { ::ferrite_forward::mega_ir::GateUpActivation::Silu }
+                }
+                I::FusedGateUpGeluMul(..) => {
+                    quote! { ::ferrite_forward::mega_ir::GateUpActivation::Gelu }
+                }
                 _ => unreachable!(),
             };
             let in_id = lit(*in_slot);
@@ -5445,7 +5449,7 @@ fn dispatch_instruction_to_push(
                     #score_off, #score_bytes, #pv_off, #pv_bytes,
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #num_layers, #arrives,
-                >(::ferrite_mega_ir::AttentionKind::Full, #interleaved_lit);
+                >(::ferrite_forward::mega_ir::AttentionKind::Full, #interleaved_lit);
             })
         }
         I::SpliceMmEmbeds(slot) => {
@@ -5482,7 +5486,7 @@ fn dispatch_instruction_to_push(
                 *layer,
                 *n,
                 *k,
-                quote! { ::ferrite_mega_ir::LmHeadNormKind::RmsNorm },
+                quote! { ::ferrite_forward::mega_ir::LmHeadNormKind::RmsNorm },
                 weight_paths,
                 state,
             )
@@ -5502,7 +5506,7 @@ fn dispatch_instruction_to_push(
             *layer,
             *n,
             *k,
-            quote! { ::ferrite_mega_ir::LmHeadNormKind::MeanSubRmsNorm },
+            quote! { ::ferrite_forward::mega_ir::LmHeadNormKind::MeanSubRmsNorm },
             weight_paths,
             state,
         ),
@@ -5523,7 +5527,7 @@ fn dispatch_instruction_to_push(
             *layer,
             *n,
             *k,
-            quote! { ::ferrite_mega_ir::LmHeadNormKind::AddRmsNorm },
+            quote! { ::ferrite_forward::mega_ir::LmHeadNormKind::AddRmsNorm },
             None,
             weight_paths,
             state,
@@ -5546,7 +5550,7 @@ fn dispatch_instruction_to_push(
             *layer,
             *n,
             *k,
-            quote! { ::ferrite_mega_ir::LmHeadNormKind::AddScalarOffsetRmsNorm },
+            quote! { ::ferrite_forward::mega_ir::LmHeadNormKind::AddScalarOffsetRmsNorm },
             Some(*offset),
             weight_paths,
             state,
@@ -5663,50 +5667,10 @@ fn emit_lm_head_with_delta(
     })
 }
 
-/// Build `Vec<OpInput>` for one canonical slice. Each instruction
-/// pairs with the per-op weight bases from
-/// `LoweredBucket::weight_slots` (the parallel array the
-/// `WeightAccessors` walker populates). The base ident's string is
-/// the path the typed-fanout walker emits; mega-ir's `WeightRef` /
-/// `RotaryRef` wrap it for syntactic emission.
-///
-/// `Tk*`-prefixed instructions (a marker the typed-fanout
-/// migration kept to signal "claimed by TK megakernel impl, not
-/// host impl") are normalized to their un-prefixed peers — the
-/// substrate model is the megakernel substrate either way, and
-/// the eval-delegating duality on the runtime side already proves
-/// they're substrate-equivalent. Sprint E deletes the prefix
-/// entirely; until then, we strip it at the macro→mega-ir
-/// boundary.
-///
-/// Currently unused — `emit_mega_artifacts_inline` was stubbed when
-/// mega-ir moved to const-generic substrate proofs (the runtime
-/// `lower(...)` entry point is incompatible with const-generic
-/// monomorphization-time proof discharge). Kept for Phase C, where
-/// the proc-macro emits literal `builder.push_*::<...>(weight)`
-/// calls directly and may want this helper to walk Tk-prefix
-/// normalization.
-#[allow(dead_code)]
-fn build_op_inputs(
-    instances: &[ferrite_forward::Instruction],
-    weight_slots: &[Vec<crate::impl_lib::WeightSlot>],
-) -> Vec<ferrite_mega_ir::OpInput> {
-    use ferrite_mega_ir::OpInput;
-    debug_assert_eq!(
-        instances.len(),
-        weight_slots.len(),
-        "instances and weight_slots must be parallel arrays"
-    );
-    instances
-        .iter()
-        .zip(weight_slots.iter())
-        .map(|(instr, slots)| {
-            let normalized = normalize_tk_prefix(*instr);
-            let weight_paths: Vec<String> = slots.iter().map(|s| s.base.to_string()).collect();
-            OpInput::new(normalized, weight_paths)
-        })
-        .collect()
-}
+// `build_op_inputs` was removed when mega-ir dropped its runtime
+// `OpInput` / `lower(...)` API. Phase C dispatch now works
+// directly on `Instruction` + parallel `weight_slots` via
+// `dispatch_instruction_to_push`.
 
 /// Map a Tk-prefixed `Instruction` variant to its un-prefixed peer
 /// for substrate-typed lowering. The Tk prefix is a megakernel-
@@ -6275,8 +6239,17 @@ pub fn emit_model(
                     .fan_out(&term_match, fuf, program, &bounds, &slots)
                     .expect("terminal subgraph Impl must implement fan_out");
                 arch_opcodes.register(term_imp.opcode_shape());
+                // Match the prefill block at codegen.rs:6100 — call
+                // `required_weights` and broadcast across emits, so
+                // the typed-fanout walker's `weight_slots` parallel
+                // array is populated for the lm_head terminal Impl
+                // (was a regression: the decode-canonical_lowered
+                // block dropped the required_weights call and
+                // populated empty inner Vecs).
+                let term_accs = term_imp.required_weights(&term_match.claimed_tiles, fuf, program);
+                let term_slots = crate::interpreter_codegen::weight_accessors_to_slots(&term_accs);
                 let term_weight_slots: Vec<Vec<crate::impl_lib::WeightSlot>> =
-                    (0..term_emits.len()).map(|_| Vec::new()).collect();
+                    term_emits.iter().map(|_| term_slots.clone()).collect();
                 crate::interpreter_codegen::LoweredBucket {
                     instances: term_emits,
                     weight_slots: term_weight_slots,

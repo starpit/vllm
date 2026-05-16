@@ -32,6 +32,12 @@ probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-vision = { path = "../ferrite-vision" }
+# Re-exported as `ferrite_forward::mega_ir` so the proc-macro's
+# Phase C emission (literal-const-arg `MegaTapeBuilder::push_*`
+# calls) resolves through ferrite-forward without every consumer
+# crate needing to add `ferrite-mega-ir` as a dep. The macro's
+# emitted code uses `::ferrite_forward::mega_ir::...` paths.
+ferrite-mega-ir = { path = "../ferrite-mega-ir" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }

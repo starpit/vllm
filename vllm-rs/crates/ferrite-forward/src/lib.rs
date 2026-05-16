@@ -22,6 +22,13 @@
 #[cfg(feature = "cuda")]
 pub mod attack_surface;
 pub mod cpu_golden;
+
+/// Re-export of `ferrite-mega-ir` so the proc-macro's Phase C
+/// emission resolves through `ferrite_forward::mega_ir::...` —
+/// every consumer crate already imports `ferrite-forward`, so no
+/// per-crate Cargo.toml edits are needed for the const-generic
+/// `MegaTapeBuilder::push_*::<...>` paths the macro emits.
+pub use ferrite_mega_ir as mega_ir;
 #[cfg(feature = "cuda")]
 pub mod info;
 pub mod instr;

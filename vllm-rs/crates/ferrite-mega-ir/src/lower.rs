@@ -803,7 +803,10 @@ impl<
     }
 
     /// Push a typed `CutlassFusedNormGemm` for the no-delta flavors
-    /// (RmsNorm, MeanSubRmsNorm).
+    /// (RmsNorm, MeanSubRmsNorm). AST-shape const generics:
+    /// NUM_TOKENS, IN_ACT_SLOT, OUT_ACT_SLOT,
+    /// NORM_WEIGHT_ACCESSOR_IDX, LINEAR_WEIGHT_ACCESSOR_IDX. Runtime
+    /// `eps` for the kernel's consumer eps arg.
     #[allow(clippy::too_many_arguments)]
     pub fn push_cutlass_fused_norm_gemm_no_delta<
         const IN_ID: u32,
@@ -822,11 +825,17 @@ impl<
         const K: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const NORM_WEIGHT_ACCESSOR_IDX: u32,
+        const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         norm_weight_path: String,
         linear_weight_path: String,
         norm_kind: LmHeadNormKind,
+        eps: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_cutlass_fused_norm_gemm_no_delta");
         let _ = self.pool.take(IN_ID);
@@ -835,6 +844,7 @@ impl<
         let _ = self.pool.take(OUT_ID);
         let norm_weight = WeightRef::new(norm_weight_path);
         let linear_weight = WeightRef::new(linear_weight_path);
+        let eps = FiniteF32::new(eps);
         let node = CutlassFusedNormGemm::new_no_delta::<
             IN_ID,
             NORM_W_ID,
@@ -854,7 +864,12 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
-        >(norm_weight, linear_weight, norm_kind);
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+            NORM_WEIGHT_ACCESSOR_IDX,
+            LINEAR_WEIGHT_ACCESSOR_IDX,
+        >(norm_weight, linear_weight, norm_kind, eps);
         self.nodes.push(MegaNode::CutlassFusedNormGemm(node));
         self.pool.release(IN_ID);
         self.pool.release(NORM_W_ID);
@@ -867,7 +882,10 @@ impl<
     }
 
     /// Push a typed `CutlassFusedNormGemm` for the residual-fold
-    /// flavors (AddRmsNorm, AddScalarOffsetRmsNorm).
+    /// flavors (AddRmsNorm, AddScalarOffsetRmsNorm). AST-shape:
+    /// NUM_TOKENS, IN_ACT_SLOT, DELTA_ACT_SLOT, OUT_ACT_SLOT,
+    /// NORM_WEIGHT_ACCESSOR_IDX, LINEAR_WEIGHT_ACCESSOR_IDX. Runtime
+    /// `eps`; offset present only for AddScalarOffsetRmsNorm.
     #[allow(clippy::too_many_arguments)]
     pub fn push_cutlass_fused_norm_gemm_with_delta<
         const IN_ID: u32,
@@ -887,12 +905,19 @@ impl<
         const K: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const DELTA_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const NORM_WEIGHT_ACCESSOR_IDX: u32,
+        const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         norm_weight_path: String,
         linear_weight_path: String,
         norm_kind: LmHeadNormKind,
         offset: Option<f32>,
+        eps: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_cutlass_fused_norm_gemm_with_delta");
         let _ = self.pool.take(IN_ID);
@@ -903,6 +928,7 @@ impl<
         let norm_weight = WeightRef::new(norm_weight_path);
         let linear_weight = WeightRef::new(linear_weight_path);
         let offset = offset.map(FiniteF32::new);
+        let eps = FiniteF32::new(eps);
         let node = CutlassFusedNormGemm::new_with_delta::<
             IN_ID,
             DELTA_ID,
@@ -923,7 +949,13 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
-        >(norm_weight, linear_weight, norm_kind, offset);
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            DELTA_ACT_SLOT,
+            OUT_ACT_SLOT,
+            NORM_WEIGHT_ACCESSOR_IDX,
+            LINEAR_WEIGHT_ACCESSOR_IDX,
+        >(norm_weight, linear_weight, norm_kind, offset, eps);
         self.nodes.push(MegaNode::CutlassFusedNormGemm(node));
         self.pool.release(IN_ID);
         self.pool.release(DELTA_ID);
@@ -936,7 +968,10 @@ impl<
         self
     }
 
-    /// Push a typed `AttentionViaCacheNode`.
+    /// Push a typed `AttentionViaCacheNode`. AST-shape const
+    /// generics: HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE,
+    /// NUM_TOKENS, MAX_SK + Q_IN_ACT_SLOT, ATTN_OUT_ACT_SLOT.
+    /// Runtime: attn_scale, attn_softcap (zero softcap = identity).
     #[allow(clippy::too_many_arguments)]
     pub fn push_attention_via_cache<
         const Q_IN_ID: u32,
@@ -951,14 +986,26 @@ impl<
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const HEAD_DIM: u32,
+        const NUM_Q_HEADS: u32,
+        const NUM_KV_HEADS: u32,
+        const BLOCK_SIZE: u32,
+        const NUM_TOKENS: u32,
+        const MAX_SK: u32,
+        const Q_IN_ACT_SLOT: u32,
+        const ATTN_OUT_ACT_SLOT: u32,
     >(
         &mut self,
         kind: AttentionKind,
         interleaved: bool,
+        attn_scale: f32,
+        attn_softcap: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_attention_via_cache");
         let _ = self.pool.take(Q_IN_ID);
         let _ = self.pool.take(ATTN_OUT_ID);
+        let attn_scale = FiniteF32::new(attn_scale);
+        let attn_softcap = FiniteF32::new(attn_softcap);
         let node = AttentionViaCacheNode::new::<
             Q_IN_ID,
             ATTN_OUT_ID,
@@ -974,7 +1021,15 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
-        >(kind, interleaved);
+            HEAD_DIM,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            BLOCK_SIZE,
+            NUM_TOKENS,
+            MAX_SK,
+            Q_IN_ACT_SLOT,
+            ATTN_OUT_ACT_SLOT,
+        >(kind, interleaved, attn_scale, attn_softcap);
         self.nodes.push(MegaNode::AttentionViaCache(node));
         self.pool.release(Q_IN_ID);
         self.pool.release(ATTN_OUT_ID);
@@ -984,19 +1039,32 @@ impl<
         self
     }
 
-    /// Push a typed `SpliceMmEmbeds`.
+    /// Push a typed `SpliceMmEmbeds`. Adds HIDDEN_DIM, NUM_TOKENS,
+    /// TARGET_ACT_SLOT for §0/§4a kernel-AST D2D-copy emit.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_splice_mm_embeds<
         const SLOT_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const TARGET_ACT_SLOT: u32,
     >(
         &mut self,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_splice_mm_embeds");
         let _ = self.pool.take(SLOT_ID);
-        let node =
-            SpliceMmEmbeds::new::<SLOT_ID, CONSUMER_PHASE, STORER_PHASE, NUM_PAGES, ARRIVES>();
+        let node = SpliceMmEmbeds::new::<
+            SLOT_ID,
+            CONSUMER_PHASE,
+            STORER_PHASE,
+            NUM_PAGES,
+            ARRIVES,
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            TARGET_ACT_SLOT,
+        >();
         self.nodes.push(MegaNode::SpliceMmEmbeds(node));
         self.pool.release(SLOT_ID);
         self.arrives.bump();
@@ -1325,10 +1393,12 @@ mod tests {
             0, 1, 1, 0,
             128_000, 4_096,
             16, 0,
+            8, 0, 1, 0, 1,
         >(
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::RmsNorm,
+            1.0e-5_f32,
         );
         let tape = b.finish();
         let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
@@ -1347,11 +1417,13 @@ mod tests {
             0, 1, 1, 0,
             128_000, 4_096,
             16, 0,
+            8, 0, 1, 2, 0, 1,
         >(
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::AddScalarOffsetRmsNorm,
             Some(1.0),
+            1.0e-5_f32,
         );
         let tape = b.finish();
         let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
@@ -1372,20 +1444,27 @@ mod tests {
             0, 1, 1, 0,
             128_000, 4_096,
             16, 0,
+            8, 0, 1, 2, 0, 1,
         >(
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::AddScalarOffsetRmsNorm,
             None,
+            1.0e-5_f32,
         );
     }
 
     #[test]
     fn lowers_attention_via_cache_full() {
         let mut b = BuilderD::new();
-        b.push_attention_via_cache::<0, 1, 0, 4096, 4096, 4096, 0, 1, 8, 5, 16, 0>(
+        b.push_attention_via_cache::<
+            0, 1, 0, 4096, 4096, 4096, 0, 1, 8, 5, 16, 0,
+            64, 32, 8, 16, 8, 8192, 0, 1,
+        >(
             AttentionKind::Full,
             false,
+            0.125_f32,
+            0.0_f32,
         );
         let tape = b.finish();
         let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {

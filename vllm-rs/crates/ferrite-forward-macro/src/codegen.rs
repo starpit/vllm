@@ -4821,6 +4821,7 @@ fn emit_mega_artifacts_inline(
             num_layers,
             model,
             wp.num_tokens as u32,
+            wp.sk_bucket as u32,
         ) {
             Ok(tokens) => {
                 rust_decls.extend(tokens);
@@ -4892,6 +4893,21 @@ struct PhaseCState {
     /// `final_logit_softcapping` — `TanhSoftCap` kernel cap value.
     /// Gemma2 lm_head softcap; 0.0 for arches without final logit cap.
     tanh_soft_cap: f32,
+    /// `attention_multiplier` / `query_pre_attn_scalar` /
+    /// `1 / sqrt(head_dim)` — `AttentionViaCache` consumer eps-like
+    /// runtime arg (the score-pre-scale).
+    attn_scale: f32,
+    /// `attn_logit_softcapping` — `AttentionViaCache` runtime arg.
+    /// 0.0 for arches without an attention softcap.
+    attn_softcap: f32,
+    /// `sliding_window` — `Instruction::SlidingAttentionViaCache`
+    /// kernel template arg (Gemma2 = 4096); 0 for arches without a
+    /// sliding window. Used at dispatch time when constructing
+    /// `AttentionKind::Sliding(w)`.
+    sliding_window: u32,
+    /// `wp.sk_bucket` — the canonical's max past-K bucket. Becomes
+    /// the `MAX_SK` template arg of `attention_partial`.
+    sk_bucket: u32,
     /// Cumulative weight-accessor index. Each dispatch arm that
     /// consumes a weight slot bumps this by the count it consumes;
     /// the per-op `weight_accessor_idx` field on the emitted MegaNode
@@ -4917,6 +4933,10 @@ impl PhaseCState {
         num_tokens: u32,
         rms_norm_eps: f32,
         tanh_soft_cap: f32,
+        attn_scale: f32,
+        attn_softcap: f32,
+        sliding_window: u32,
+        sk_bucket: u32,
     ) -> Self {
         Self {
             arrives: 0,
@@ -4934,6 +4954,10 @@ impl PhaseCState {
             num_tokens,
             rms_norm_eps,
             tanh_soft_cap,
+            attn_scale,
+            attn_softcap,
+            sliding_window,
+            sk_bucket,
             next_weight_accessor: 0,
         }
     }
@@ -4968,6 +4992,7 @@ fn emit_canonical_build_fn(
     num_layers: u32,
     model: &ModelParams,
     wp_num_tokens: u32,
+    wp_sk_bucket: u32,
 ) -> Result<TokenStream, String> {
     // Substrate budget. Sprint E task: derive these from the
     // canonical's actual schedule walker outputs. For now use
@@ -5012,6 +5037,29 @@ fn emit_canonical_build_fn(
         .get("final_logit_softcapping")
         .copied()
         .unwrap_or(0.0) as f32;
+    // Attention scale: model.scalars["attention_multiplier"] (Granite) →
+    // model.scalars["query_pre_attn_scalar"]^-0.5 (Gemma2) →
+    // 1/sqrt(head_dim) (default). Mirrors the same precedence order
+    // as `emit_canonical_params_impl`.
+    let attn_scale: f32 = if let Some(s) = model.scalars.get("attention_multiplier") {
+        *s as f32
+    } else if let Some(q) = model.scalars.get("query_pre_attn_scalar") {
+        (*q as f32).powf(-0.5)
+    } else if head_dim > 0 {
+        1.0_f32 / (head_dim as f32).sqrt()
+    } else {
+        0.0
+    };
+    let attn_softcap: f32 = model
+        .scalars
+        .get("attn_logit_softcapping")
+        .copied()
+        .unwrap_or(0.0) as f32;
+    let sliding_window: u32 = model
+        .bounds
+        .get("sliding_window")
+        .copied()
+        .unwrap_or(0) as u32;
 
     let mut state = PhaseCState::new(
         NUM_PAGES,
@@ -5027,6 +5075,10 @@ fn emit_canonical_build_fn(
         wp_num_tokens,
         rms_eps,
         tanh_soft_cap,
+        attn_scale,
+        attn_softcap,
+        sliding_window,
+        wp_sk_bucket,
     );
     let mut body = TokenStream::new();
 
@@ -5758,13 +5810,6 @@ fn dispatch_instruction_to_push(
             })
         }
         I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
-            // Sliding window value is per-arch model config (e.g.,
-            // Gemma2 = 4096). Not in the Instruction's positional
-            // fields. For Phase C step 1 we use a sentinel positive
-            // value to satisfy `SlidingWindow::new`'s `> 0` const
-            // proof; Phase C step 2's emit step plumbs the real
-            // window from `model.bounds["sliding_window"]` at
-            // template-instantiation time.
             let q_id = lit(*q_slot);
             let out_id = lit(*attn_out_slot);
             let half = state.scratch_bytes / 2;
@@ -5778,7 +5823,26 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            let head_dim = lit(state.head_dim);
+            let num_q_heads = lit(state.num_q_heads);
+            let num_kv_heads = lit(state.num_kv_heads);
+            let block_size = lit(16u32); // attention_partial.cuh fixed at 16
+            let num_tokens = lit(state.num_tokens);
+            let max_sk = lit(state.sk_bucket.max(1));
+            let q_in_act_slot = lit(*q_slot);
+            let attn_out_act_slot = lit(*attn_out_slot);
             let interleaved_lit = *interleaved;
+            // Real sliding-window value plumbed from model bounds.
+            // Sentinel 4096 if the bound is missing (kept positive
+            // for the `Sliding(w > 0)` runtime invariant).
+            let sliding_window_val = if state.sliding_window > 0 {
+                state.sliding_window
+            } else {
+                4096
+            };
+            let sliding_window_lit = lit(sliding_window_val);
+            let attn_scale_lit = state.attn_scale;
+            let attn_softcap_lit = state.attn_softcap;
             state.arrives += 1;
             Ok(quote! {
                 b.push_attention_via_cache::<
@@ -5786,9 +5850,14 @@ fn dispatch_instruction_to_push(
                     #score_off, #score_bytes, #pv_off, #pv_bytes,
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #num_layers, #arrives,
+                    #head_dim, #num_q_heads, #num_kv_heads, #block_size,
+                    #num_tokens, #max_sk,
+                    #q_in_act_slot, #attn_out_act_slot,
                 >(
-                    ::ferrite_forward::mega_ir::AttentionKind::Sliding(4096u32),
+                    ::ferrite_forward::mega_ir::AttentionKind::Sliding(#sliding_window_lit),
                     #interleaved_lit,
+                    #attn_scale_lit,
+                    #attn_softcap_lit,
                 );
             })
         }
@@ -5806,7 +5875,17 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            let head_dim = lit(state.head_dim);
+            let num_q_heads = lit(state.num_q_heads);
+            let num_kv_heads = lit(state.num_kv_heads);
+            let block_size = lit(16u32); // attention_partial.cuh fixed at 16
+            let num_tokens = lit(state.num_tokens);
+            let max_sk = lit(state.sk_bucket.max(1));
+            let q_in_act_slot = lit(*q_slot);
+            let attn_out_act_slot = lit(*attn_out_slot);
             let interleaved_lit = *interleaved;
+            let attn_scale_lit = state.attn_scale;
+            let attn_softcap_lit = state.attn_softcap;
             state.arrives += 1;
             Ok(quote! {
                 b.push_attention_via_cache::<
@@ -5814,7 +5893,15 @@ fn dispatch_instruction_to_push(
                     #score_off, #score_bytes, #pv_off, #pv_bytes,
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #num_layers, #arrives,
-                >(::ferrite_forward::mega_ir::AttentionKind::Full, #interleaved_lit);
+                    #head_dim, #num_q_heads, #num_kv_heads, #block_size,
+                    #num_tokens, #max_sk,
+                    #q_in_act_slot, #attn_out_act_slot,
+                >(
+                    ::ferrite_forward::mega_ir::AttentionKind::Full,
+                    #interleaved_lit,
+                    #attn_scale_lit,
+                    #attn_softcap_lit,
+                );
             })
         }
         I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k) => {
@@ -5864,12 +5951,16 @@ fn dispatch_instruction_to_push(
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let target_act_slot = lit(*slot);
             state.arrives += 1;
             Ok(quote! {
                 b.push_splice_mm_embeds::<
                     #slot_lit,
                     #consumer_phase, #storer_phase,
                     #arrives,
+                    #hidden_dim, #num_tokens, #target_act_slot,
                 >();
             })
         }
@@ -6005,7 +6096,14 @@ fn emit_lm_head_no_delta(
     let layer_lit = lit(layer);
     let n_lit = lit(n);
     let k_lit = lit(k);
+    let num_tokens = lit(state.num_tokens);
+    let in_act_slot = lit(in_slot);
+    let out_act_slot = lit(out_slot);
+    let norm_weight_accessor_idx = lit(state.next_weight_accessor);
+    let linear_weight_accessor_idx = lit(state.next_weight_accessor + 1);
+    let eps_lit = state.rms_norm_eps;
     state.arrives += 1;
+    state.next_weight_accessor += 2;
     Ok(quote! {
         b.push_cutlass_fused_norm_gemm_no_delta::<
             #in_id, #norm_w_id, #lin_w_id, #out_id,
@@ -6014,7 +6112,9 @@ fn emit_lm_head_no_delta(
             #consumer_phase, #storer_phase,
             #iters, #layer_lit, #n_lit, #k_lit,
             #num_layers, #arrives,
-        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path);
+            #num_tokens, #in_act_slot, #out_act_slot,
+            #norm_weight_accessor_idx, #linear_weight_accessor_idx,
+        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #eps_lit);
     })
 }
 
@@ -6057,11 +6157,19 @@ fn emit_lm_head_with_delta(
     let layer_lit = lit(layer);
     let n_lit = lit(n);
     let k_lit = lit(k);
+    let num_tokens = lit(state.num_tokens);
+    let in_act_slot = lit(residual_slot);
+    let delta_act_slot = lit(delta_slot);
+    let out_act_slot = lit(out_slot);
+    let norm_weight_accessor_idx = lit(state.next_weight_accessor);
+    let linear_weight_accessor_idx = lit(state.next_weight_accessor + 1);
+    let eps_lit = state.rms_norm_eps;
     let offset_expr = match offset {
         Some(v) => quote! { ::core::option::Option::Some(#v) },
         None => quote! { ::core::option::Option::None },
     };
     state.arrives += 1;
+    state.next_weight_accessor += 2;
     Ok(quote! {
         b.push_cutlass_fused_norm_gemm_with_delta::<
             #in_id, #delta_id, #norm_w_id, #lin_w_id, #out_id,
@@ -6070,7 +6178,9 @@ fn emit_lm_head_with_delta(
             #consumer_phase, #storer_phase,
             #iters, #layer_lit, #n_lit, #k_lit,
             #num_layers, #arrives,
-        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #offset_expr);
+            #num_tokens, #in_act_slot, #delta_act_slot, #out_act_slot,
+            #norm_weight_accessor_idx, #linear_weight_accessor_idx,
+        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #offset_expr, #eps_lit);
     })
 }
 

@@ -1750,6 +1750,11 @@ impl FusedCublasGemmAdd {
 /// requires runtime branching at the builder. The substrate-proof
 /// fields (page bounds, scratch budget, phase parity, n/k > 0) are
 /// const-generic.
+///
+/// Kernel ABI: `ferrite::ops::lm_head::{loader, consumer, launcher,
+/// storer}<Config, K, N, NUM_TOKENS>` in `lm_head.cuh`. The norm
+/// kind selects between the four lm_head dispatch entry points
+/// (RmsNorm, AddRmsNorm, MeanSubRmsNorm, AddScalarOffsetRmsNorm).
 pub struct CutlassFusedNormGemm {
     in_page_id: u32,
     delta_page_id: Option<u32>,
@@ -1766,6 +1771,13 @@ pub struct CutlassFusedNormGemm {
     layer: u32,
     n: u32,
     k: u32,
+    num_tokens: u32,
+    in_act_slot: u32,
+    delta_act_slot: Option<u32>,
+    out_act_slot: u32,
+    norm_weight_accessor_idx: u32,
+    linear_weight_accessor_idx: u32,
+    eps: FiniteF32,
     pub norm_weight: WeightRef,
     pub linear_weight: WeightRef,
     pub norm_kind: LmHeadNormKind,
@@ -1777,7 +1789,7 @@ impl CutlassFusedNormGemm {
     /// (RmsNorm / MeanSubRmsNorm — `delta_page_id` = None,
     /// `offset` = None).
     #[allow(clippy::too_many_arguments)]
-    pub const fn new_no_delta<
+    pub fn new_no_delta<
         const IN_ID: u32,
         const NORM_W_ID: u32,
         const LIN_W_ID: u32,
@@ -1796,10 +1808,16 @@ impl CutlassFusedNormGemm {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const NORM_WEIGHT_ACCESSOR_IDX: u32,
+        const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
     >(
         norm_weight: WeightRef,
         linear_weight: WeightRef,
         norm_kind: LmHeadNormKind,
+        eps: FiniteF32,
     ) -> Self {
         const {
             assert!(IN_ID < NUM_PAGES, "CutlassFusedNormGemm: IN_ID OOB");
@@ -1837,6 +1855,10 @@ impl CutlassFusedNormGemm {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "CutlassFusedNormGemm: STORER_PHASE parity"
             );
+            assert!(
+                NUM_TOKENS > 0,
+                "CutlassFusedNormGemm: NUM_TOKENS must be > 0"
+            );
         }
         // Runtime cross-field invariant: norm_kind must NOT carry
         // residual fold or scalar offset for this constructor.
@@ -1864,6 +1886,13 @@ impl CutlassFusedNormGemm {
             layer: LAYER,
             n: N,
             k: K,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            delta_act_slot: None,
+            out_act_slot: OUT_ACT_SLOT,
+            norm_weight_accessor_idx: NORM_WEIGHT_ACCESSOR_IDX,
+            linear_weight_accessor_idx: LINEAR_WEIGHT_ACCESSOR_IDX,
+            eps,
             norm_weight,
             linear_weight,
             norm_kind,
@@ -1874,7 +1903,7 @@ impl CutlassFusedNormGemm {
     /// Const-generic constructor for residual-fold flavors
     /// (AddRmsNorm / AddScalarOffsetRmsNorm).
     #[allow(clippy::too_many_arguments)]
-    pub const fn new_with_delta<
+    pub fn new_with_delta<
         const IN_ID: u32,
         const DELTA_ID: u32,
         const NORM_W_ID: u32,
@@ -1894,11 +1923,18 @@ impl CutlassFusedNormGemm {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const DELTA_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const NORM_WEIGHT_ACCESSOR_IDX: u32,
+        const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
     >(
         norm_weight: WeightRef,
         linear_weight: WeightRef,
         norm_kind: LmHeadNormKind,
         offset: Option<FiniteF32>,
+        eps: FiniteF32,
     ) -> Self {
         const {
             assert!(IN_ID < NUM_PAGES, "CutlassFusedNormGemm: IN_ID OOB");
@@ -1941,6 +1977,10 @@ impl CutlassFusedNormGemm {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "CutlassFusedNormGemm: STORER_PHASE parity"
             );
+            assert!(
+                NUM_TOKENS > 0,
+                "CutlassFusedNormGemm: NUM_TOKENS must be > 0"
+            );
         }
         match (norm_kind, offset.is_some()) {
             (LmHeadNormKind::AddScalarOffsetRmsNorm, true)
@@ -1974,6 +2014,13 @@ impl CutlassFusedNormGemm {
             layer: LAYER,
             n: N,
             k: K,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            delta_act_slot: Some(DELTA_ACT_SLOT),
+            out_act_slot: OUT_ACT_SLOT,
+            norm_weight_accessor_idx: NORM_WEIGHT_ACCESSOR_IDX,
+            linear_weight_accessor_idx: LINEAR_WEIGHT_ACCESSOR_IDX,
+            eps,
             norm_weight,
             linear_weight,
             norm_kind,
@@ -2026,10 +2073,38 @@ impl CutlassFusedNormGemm {
     pub const fn k(&self) -> u32 {
         self.k
     }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn delta_act_slot(&self) -> Option<u32> {
+        self.delta_act_slot
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
+    pub const fn norm_weight_accessor_idx(&self) -> u32 {
+        self.norm_weight_accessor_idx
+    }
+    pub const fn linear_weight_accessor_idx(&self) -> u32 {
+        self.linear_weight_accessor_idx
+    }
+    pub fn eps(&self) -> FiniteF32 {
+        self.eps
+    }
 }
 
 /// `AttentionViaCacheNode` (covers `AttentionViaCache` and
 /// `SlidingAttentionViaCache`).
+///
+/// Kernel ABI: `ferrite::ops::attention_partial::{loader, consumer,
+/// launcher, storer}<Config, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
+/// BLOCK_SIZE, NUM_TOKENS, SPLITS, SLIDING_WINDOW, HAS_SOFTCAP,
+/// MAX_SK>` in `attention_partial.cuh`. `attention_reduction.cuh`
+/// fans the splits back together (SPLITS=1 today; SPLITS>1 is a
+/// future iteration).
 pub struct AttentionViaCacheNode {
     q_in_page_id: u32,
     attn_out_page_id: u32,
@@ -2041,13 +2116,23 @@ pub struct AttentionViaCacheNode {
     storer_phase: u32,
     iters: u32,
     kv_cache_layer: u32,
+    head_dim: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    block_size: u32,
+    num_tokens: u32,
+    max_sk: u32,
+    q_in_act_slot: u32,
+    attn_out_act_slot: u32,
+    attn_scale: FiniteF32,
+    attn_softcap: FiniteF32,
     pub interleaved: bool,
     pub kind: AttentionKind,
 }
 
 impl AttentionViaCacheNode {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const Q_IN_ID: u32,
         const ATTN_OUT_ID: u32,
         const SCORE_OFF: u32,
@@ -2062,9 +2147,19 @@ impl AttentionViaCacheNode {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const HEAD_DIM: u32,
+        const NUM_Q_HEADS: u32,
+        const NUM_KV_HEADS: u32,
+        const BLOCK_SIZE: u32,
+        const NUM_TOKENS: u32,
+        const MAX_SK: u32,
+        const Q_IN_ACT_SLOT: u32,
+        const ATTN_OUT_ACT_SLOT: u32,
     >(
         kind: AttentionKind,
         interleaved: bool,
+        attn_scale: FiniteF32,
+        attn_softcap: FiniteF32,
     ) -> Self {
         const {
             assert!(Q_IN_ID < NUM_PAGES, "AttentionViaCache: Q_IN_ID OOB");
@@ -2103,6 +2198,24 @@ impl AttentionViaCacheNode {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "AttentionViaCache: STORER_PHASE parity"
             );
+            assert!(HEAD_DIM > 0, "AttentionViaCache: HEAD_DIM must be > 0");
+            assert!(
+                NUM_Q_HEADS > 0,
+                "AttentionViaCache: NUM_Q_HEADS must be > 0"
+            );
+            assert!(
+                NUM_KV_HEADS > 0,
+                "AttentionViaCache: NUM_KV_HEADS must be > 0"
+            );
+            assert!(
+                BLOCK_SIZE > 0,
+                "AttentionViaCache: BLOCK_SIZE must be > 0"
+            );
+            assert!(
+                NUM_TOKENS > 0,
+                "AttentionViaCache: NUM_TOKENS must be > 0"
+            );
+            assert!(MAX_SK > 0, "AttentionViaCache: MAX_SK must be > 0");
         }
         // Runtime: SlidingWindow value > 0 was discharged by the
         // const-generic SlidingWindow<W> primitive; here we just
@@ -2118,6 +2231,16 @@ impl AttentionViaCacheNode {
             storer_phase: STORER_PHASE,
             iters: ITERS,
             kv_cache_layer: LAYER,
+            head_dim: HEAD_DIM,
+            num_q_heads: NUM_Q_HEADS,
+            num_kv_heads: NUM_KV_HEADS,
+            block_size: BLOCK_SIZE,
+            num_tokens: NUM_TOKENS,
+            max_sk: MAX_SK,
+            q_in_act_slot: Q_IN_ACT_SLOT,
+            attn_out_act_slot: ATTN_OUT_ACT_SLOT,
+            attn_scale,
+            attn_softcap,
             interleaved,
             kind,
         }
@@ -2152,6 +2275,36 @@ impl AttentionViaCacheNode {
     }
     pub const fn kv_cache_layer(&self) -> u32 {
         self.kv_cache_layer
+    }
+    pub const fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+    pub const fn num_q_heads(&self) -> u32 {
+        self.num_q_heads
+    }
+    pub const fn num_kv_heads(&self) -> u32 {
+        self.num_kv_heads
+    }
+    pub const fn block_size(&self) -> u32 {
+        self.block_size
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn max_sk(&self) -> u32 {
+        self.max_sk
+    }
+    pub const fn q_in_act_slot(&self) -> u32 {
+        self.q_in_act_slot
+    }
+    pub const fn attn_out_act_slot(&self) -> u32 {
+        self.attn_out_act_slot
+    }
+    pub fn attn_scale(&self) -> FiniteF32 {
+        self.attn_scale
+    }
+    pub fn attn_softcap(&self) -> FiniteF32 {
+        self.attn_softcap
     }
 }
 
@@ -2203,19 +2356,29 @@ impl BarrierWait {
 /// placeholder splice. The kernel D2D-copies projected vision
 /// embeddings into the placeholder positions of an in-flight
 /// activation page; substrate shape is one in-place page touch.
+///
+/// AST shape: per-row D2D copy with `<HIDDEN_DIM, NUM_TOKENS>` shape
+/// and the target activation slot.
 pub struct SpliceMmEmbeds {
     slot_id: u32,
     consumer_phase: u32,
     storer_phase: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    target_act_slot: u32,
 }
 
 impl SpliceMmEmbeds {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new<
         const SLOT_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const TARGET_ACT_SLOT: u32,
     >() -> Self {
         const {
             assert!(SLOT_ID < NUM_PAGES, "SpliceMmEmbeds: SLOT_ID out of bounds");
@@ -2227,11 +2390,16 @@ impl SpliceMmEmbeds {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "SpliceMmEmbeds: STORER_PHASE parity mismatch"
             );
+            assert!(HIDDEN_DIM > 0, "SpliceMmEmbeds: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "SpliceMmEmbeds: NUM_TOKENS must be > 0");
         }
         Self {
             slot_id: SLOT_ID,
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            target_act_slot: TARGET_ACT_SLOT,
         }
     }
 
@@ -2243,6 +2411,15 @@ impl SpliceMmEmbeds {
     }
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
+    }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn target_act_slot(&self) -> u32 {
+        self.target_act_slot
     }
 }
 

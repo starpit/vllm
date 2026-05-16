@@ -7,6 +7,40 @@ substrate bug classes unrepresentable." This revision is hard.
 
 ---
 
+## 0. THE HEADLINE — MegaIR IS THE AST FOR THE EMITTED `.cu`
+
+**Both halves of the contract are inviolable.**
+
+1. **The IR carries every substrate proof** that discharges the six
+   bug classes in §1. (This was the previous revision's emphasis.)
+
+2. **The IR carries every field the emitted `.cu` needs.** Every
+   kernel template parameter (`HIDDEN_DIM`, `HEAD_DIM`, `NUM_TOKENS`,
+   `NUM_Q_HEADS`, `NUM_KV_HEADS`, `INTERMEDIATE_DIM`, `M`, `K`, `N`,
+   `BIASED`, `INTERLEAVED`, …), every kernel runtime arg (`eps`,
+   `base_stage`, `tok`, `act_ptrs[in_slot]`, `weight_ptrs[acc *
+   NUM_LAYERS + layer]`, `output_ptrs[out_slot]`, …), every constant
+   the emit step splices into the `.cu` source, **must be a typed
+   field on the corresponding `MegaNode` variant**. The emit step
+   reads typed getters and `format!()`s them. Nothing else.
+
+If a `.cu` value is not derivable from a typed field on the
+`MegaNode`, **the IR is incomplete and emit code does not exist for
+that variant yet**. No "scaffold," no "placeholder body," no "TODO
+sprint X." Extend the IR first; emit second. Always.
+
+> **MegaIR IS THE AST.** Pure literal transcription. If
+> `emit_<variant>` does anything beyond `format!()`-ing IR getters
+> into a template that calls a pre-existing `.cuh`, the emit code is
+> wrong. Revert it. Extend the IR. Try again.
+
+This is enforced at code-review time by the principle: **show me the
+IR field that produces this `.cu` value.** If the answer is "I
+inferred it from the canonical name / substrate budget / context
+wrapper," the field belongs on the node.
+
+---
+
 ## 1. What the MegaIR IS
 
 A typed proof-carrying value `MegaTape<S: Substrate>` such that:
@@ -130,6 +164,61 @@ distinction:
   a variant a real MegaIR variant; substrate proofs are required
   too.
 
+## 4a. Required AST fields per variant (the §0 contract, made concrete)
+
+This section enumerates what every `MegaNode` variant MUST carry,
+as typed fields, for the emit step to be a pure literal
+transcription against the kernel ABI in
+`crates/ferrite-kernels/csrc/tk/ferrite_kernels/`. Reference:
+`crates/ferrite-kernels/csrc/smoke/ferrite_pool_abi_smoke.cu` is the
+canonical "well-formed `.cu` emit" — every variant's emit must
+produce text of that form.
+
+Common to every variant (alongside the substrate proofs of §4):
+
+- **Per-op host-slot indices**: `in_act_slot`, `out_act_slot`
+  (indices into `act_ptrs[]`); `weight_accessor_idx` (index into
+  `weight_ptrs[acc * NUM_LAYERS + layer]`). These are NOT the same
+  as substrate page ids — the substrate page is a per-op scratch
+  page id; the host slot is the gmem ptr table index.
+- **Per-op `base_stage`**: the substrate page slot the kernel uses
+  as offset zero. The kernel hardcodes `base_stage + kInputPageOff
+  (0)`, `base_stage + kWeightPageOff (1)`, etc. — so substrate
+  proofs MUST enforce that the per-op pages are contiguous starting
+  at `base_stage`. (Today the proofs only enforce
+  `IN_ID != WEIGHT_ID`; that is too weak — promote to
+  `WEIGHT_ID == IN_ID + 1`, or replace dual page-ids with a single
+  `base_stage` field whose proof spans the variant's full page
+  count.)
+
+Per-variant kernel-shape fields (every one a typed field on the
+`MegaNode` variant; populated by `dispatch_instruction_to_push` from
+the canonical context):
+
+| Variant | `.cuh` template params | `.cuh` runtime args | Required IR fields |
+|---|---|---|---|
+| `RmsNorm` | `<Config, HIDDEN_DIM, NUM_TOKENS>` | `eps` | `hidden_dim`, `num_tokens`, `eps` |
+| `FusedAddRmsNorm` | `<Config, HIDDEN_DIM, NUM_TOKENS>` | `eps` | same |
+| `ScalarOffsetRmsNorm` (`rms_norm_offset`) | `<Config, HIDDEN_DIM, NUM_TOKENS>` | `eps`, `offset` | `hidden_dim`, `num_tokens`, `eps`, `offset` |
+| `Embed` | `<Config, HIDDEN_DIM, NUM_TOKENS>` | (input_ids ptr) | `hidden_dim`, `num_tokens` |
+| `FusedQkvRopeCache` | `<Config, HIDDEN_DIM, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BIASED, INTERLEAVED>` | `tok` | `hidden_dim`, `head_dim`, `num_q_heads`, `num_kv_heads`, `biased`, `interleaved` (last two ✓ already on IR) |
+| `FusedGateUpActivateMul` (silu/gelu_upgate) | `<Config, HIDDEN_DIM, INTERMEDIATE_DIM, NUM_TOKENS>` | — | `hidden_dim`, `intermediate_dim`, `num_tokens`, `activation` (✓) |
+| `Gemm` (gemm_bf16) | `<Config, K, N, M>` | — | `m` (IR has `n`, `k` ✓; `m` missing) |
+| `FusedCublasGemmAdd` (down_proj_residual) | `<Config, K, N, NUM_TOKENS, K_OFFSET, K_FULL>` | — | `num_tokens`, `k_offset`, `k_full` |
+| `CutlassFusedNormGemm` (lm_head) | `<Config, K, N, NUM_TOKENS>` | `eps` (and `offset` for the offset-rms variant) | `num_tokens`, `eps` (`offset` already on IR via `Option<FiniteF32>` ✓) |
+| `AttentionViaCache` (attention_partial + attention_reduction) | many: `HEAD_DIM`, `NUM_Q_HEADS`, `NUM_KV_HEADS`, `BLOCK_SIZE`, `NUM_PAGES`, `MAX_SPLITS`, sliding-window flags | `block_table`, `seq_lens`, `block_table_stride` | head_dim, num_q_heads, num_kv_heads, block_size, max_splits, sliding_window flag (`AttentionKind::Sliding(w)` ✓), interleaved (✓) |
+| `BarrierSignal` / `BarrierWait` | n/a — emit produces explicit `__syncthreads()` / `arrive` / `wait` lines | edge id, expected count | `edge` (✓), `expected` (✓) |
+| `Add` | (no per-op kernel — emit is a per-page residual fold) | — | `hidden_dim`, `num_tokens` (for the load/add/store loop) |
+| `ScalarMul` | n/a | `scale` | `hidden_dim`, `num_tokens`, `scale` (`scale` ✓) |
+| `TanhSoftCap` | n/a | `cap` | `hidden_dim`, `num_tokens`, `cap` |
+| `SpliceMmEmbeds` | (host-side splice op) | `slot_id` | `slot_id` (✓), shape fields |
+
+**This table is the §0 contract made auditable.** When a sprint
+opens, the first commit extends the IR and `dispatch_instruction_to_push`
+to populate every field for that variant. The second commit (and
+only the second) writes the per-variant emit body. Per §0 there is
+no scaffold — extend, then transcribe.
+
 ## 5. Pipeline
 
 ```
@@ -237,6 +326,23 @@ this plan is structured to prevent.
 
 ## 8. INVIOLABLE INVARIANTS
 
+### 8.0. MEGAIR IS THE AST FOR THE EMITTED `.cu`.
+
+Every kernel template parameter and every kernel runtime arg the
+emitted `.cu` needs is a typed field on the corresponding `MegaNode`
+variant (see §0). Emit is pure literal transcription:
+`format!("ferrite::ops::<op>::consumer<FerriteConfig, {hidden_dim},
+{num_tokens}>(ss, /*base_stage=*/{base_stage}, warp_in_role,
+/*eps=*/{eps:e}f);", ...)` — read getters, splice, done. No
+inference, no helper computation that shapes the emitted source, no
+"wiring up" anything not on the node. **If the IR lacks a field the
+`.cu` needs, STOP — extend the IR. Do NOT invent on the emit side.**
+
+A scaffold that ships an emit pipeline whose data model can't reach
+the kernel ABI is not progress; it is structural debt that must be
+reverted. The shape of every variant's typed-field surface is
+determined by the kernel ABI it lowers to, full stop.
+
 ### 8.1. IF IT COMPILES, IT RUNS COHERENTLY.
 
 Substrate bug classes (the six listed in §1) are unrepresentable.
@@ -279,6 +385,22 @@ build / E2E, present results, wait for go-ahead. No autonomous
 commits.
 
 ## 9. Concrete next steps
+
+> **STATUS (2026-05-16): items 1-6 below are DONE.** Phase B of the
+> un-fuck-it-up shipped in `84df2b3f4` (substrate vocabulary +
+> nodes.rs + lower.rs + dispatch). The IR-as-AST extension on top
+> (every emitted variant carries every kernel template/runtime
+> field per §0/§4a/§8.0) shipped across 5 iteration commits
+> (`4dc3b7210`→`18ee08f95`) on top of the revert of the wrong
+> scaffold (`288324633`).
+>
+> Pod audit: 607 emitted, 54 skipped (MoE/MLA/vision — substrate
+> work, not AST work), 0 errors.
+>
+> The history of items 1-6 is preserved here as the un-fuck-it-up
+> reference. Item 7 (E2E coherence) remains the per-sprint bar in
+> §10 — the per-variant CUDA emit step is the next sprint, and
+> "done" still means E2E coherent on `unsloth/Llama-3.2-1B-Instruct`.
 
 (Phase B of the un-fuck-it-up.)
 
@@ -327,15 +449,49 @@ commits.
 
 ## 10. Sprint sequencing (after un-fuck-it-up)
 
-| Sprint | Variant | Bug class targeted | Done = |
-|---|---|---|---|
-| A | `RmsNorm` | #1 (slot bounds), #2 (lifecycle), #5 (scratch budget), #6 (warp roles) | E2E coherent |
-| B | `FusedQkvRopeCache` | #2, #3 (mbarrier phase math), #4 (scratch overlap inside per-tok loop) | E2E coherent |
-| C | `FusedAddRmsNorm`, `SiluUpgate`, `GeluUpgate`, `DownProjResidual` | all six bug classes | E2E coherent |
-| D | `Embed`, `AttentionViaCache`, `Gemm`, lm_head fusions, barrier ops, sliding attention, scalar/offset/softcap ops | all six | E2E coherent |
-| E | Delete every per-op `.cuh` in `ferrite-kernels/csrc/tk/ferrite_kernels/`. Substrate `.cuh`s stay. | Substrate is the only `__device__` C++; everything else generated | E2E coherent on every model arch the project supports |
+| Sprint | Variant | Bug class targeted | IR substrate | IR AST | Emit | Done = |
+|---|---|---|---|---|---|---|
+| A | `RmsNorm` | #1 (slot bounds), #2 (lifecycle), #5 (scratch budget), #6 (warp roles) | ✅ | ✅ | ⏳ | E2E coherent |
+| B | `FusedQkvRopeCache` | #2, #3 (mbarrier phase math), #4 (scratch overlap inside per-tok loop) | ✅ | ✅ | ⏳ | E2E coherent |
+| C | `FusedAddRmsNorm`, `SiluUpgate`, `GeluUpgate`, `DownProjResidual` | all six bug classes | ✅ | ✅ | ⏳ | E2E coherent |
+| D | `Embed`, `AttentionViaCache`, `Gemm`, lm_head fusions, barrier ops, sliding attention, scalar/offset/softcap ops | all six | ✅ | ✅ | ⏳ | E2E coherent |
+| E | Delete every per-op `.cuh` in `ferrite-kernels/csrc/tk/ferrite_kernels/`. Substrate `.cuh`s stay. | Substrate is the only `__device__` C++; everything else generated | ⏳ | ⏳ | ⏳ | E2E coherent on every model arch the project supports |
+
+Column legend:
+- **IR substrate** — substrate-proof primitives (page ids, scratch,
+  phases, layer) on the typed `MegaNode` variant.
+- **IR AST** — every kernel template parameter and runtime arg the
+  emit step needs is a typed field on the `MegaNode` (per §0/§4a).
+- **Emit** — pure literal `format!()` `.cu` source emit per §8.0;
+  the next-sprint deliverable.
+
+✅ = shipped (commits in worktree). ⏳ = next.
 
 Each sprint produces a substrate-proof-bearing lowered form for its
 ops, the lowering function, and the syntactic emit. No sprint
 "completes" with byte-identical CUDA. Every sprint completes with
 coherent E2E output on `unsloth/Llama-3.2-1B-Instruct`.
+
+## 11. Current state — pod audit
+
+> Last verified 2026-05-16 on H100 nick (full workspace,
+> `cargo clean -p ferrite-forward-macro` then `FERRITE_MEGA=1
+> cargo build -p ferrite-models --features cuda --release`):
+>
+> - **607 canonicals emitted** (every used `MegaNode` variant carries
+>   every kernel-ABI field per §0/§4a/§8.0).
+> - **54 skipped** — MlaSplit/MlaAttention (28) + MoE (16) + vision
+>   tower (10). Each needs a new `MegaNode` variant AND a new
+>   `.cuh` kernel — substrate work, not AST work.
+> - **0 errors.**
+>
+> Branch: `worktree-ff-mega-codegen`. Head:
+> `18ee08f95 ferrite-mega-ir: AST extension — CutlassFusedNormGemm,
+> AttentionViaCache, SpliceMmEmbeds`. Linear chain from the wrong-
+> scaffold revert: `288324633` →
+> `4dc3b7210` → `68059b38e` → `36b84a266` → `0978359bd` → `18ee08f95`.
+>
+> Next: write `cuda_emit::lower_to_cuda` as pure literal
+> `format!()` transcription. Reference: `crates/ferrite-kernels/
+> csrc/smoke/ferrite_pool_abi_smoke.cu` lines 117-174 — every
+> variant's emit must produce text of that form.

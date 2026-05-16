@@ -18,8 +18,9 @@
 #![allow(dead_code)]
 
 use crate::substrate::{
-    IterCount, MbarrierPhase, MlpScope, PageId, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER,
-    ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion, WarpRoleTag,
+    AttentionScope, EdgeId, ExpectedCount, GemmScope, IterCount, MbarrierPhase, MlpScope, PageId,
+    ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion,
+    WarpRoleTag,
 };
 
 /// Helper newtype: layer index for runtime weight-pointer
@@ -351,20 +352,330 @@ pub struct FusedGateUpActivateMul {
     pub activation: GateUpActivation,
 }
 
+/// Helper newtype: finite f32 (rejects NaN / ±∞). Used alongside
+/// substrate proofs by variants that carry scalar coefficients
+/// (`ScalarMul`'s `scale`, `ScalarOffsetRmsNorm`'s `offset`,
+/// `CutlassFusedAddScalarOffsetRmsNormGemm`'s `offset`). Not
+/// load-bearing on its own (per `MEGA_IR_PLAN.md` §3, §4); the
+/// load-bearing fields are still substrate proofs.
+#[derive(Clone, Copy, Debug)]
+pub struct FiniteF32(f32);
+
+impl FiniteF32 {
+    pub fn new(v: f32) -> Self {
+        assert!(v.is_finite(), "FiniteF32 rejects non-finite value: {v}");
+        Self(v)
+    }
+
+    pub fn raw(self) -> f32 {
+        self.0
+    }
+}
+
+impl PartialEq for FiniteF32 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FiniteF32 {}
+
+impl std::hash::Hash for FiniteF32 {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+/// Helper newtype: validated `(n, k)` matmul shape. Construction
+/// enforces both dims > 0. Used alongside substrate proofs on
+/// `Gemm` and the lm_head Cutlass fusion variants. Not
+/// load-bearing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulShape {
+    pub n: u32,
+    pub k: u32,
+}
+
+impl MatmulShape {
+    pub fn new(n: u32, k: u32) -> Self {
+        assert!(n > 0, "MatmulShape: n must be > 0 (got {n})");
+        assert!(k > 0, "MatmulShape: k must be > 0 (got {k})");
+        Self { n, k }
+    }
+}
+
+/// Helper newtype: typed sliding-window size. Validates `> 0` —
+/// a 0-window degenerates to "attend to nothing" which the
+/// attention kernel can't represent. Used alongside substrate
+/// proofs on `SlidingAttentionViaCache`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SlidingWindow(u32);
+
+impl SlidingWindow {
+    pub fn new(window: u32) -> Self {
+        assert!(window > 0, "SlidingWindow must be > 0 (got {window})",);
+        Self(window)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+// ── Sprint D variants ────────────────────────────────────────
+
+/// `Instruction::Embed(out_slot)`: vocab-table lookup using the
+/// `input_ids` extern (per-token id) → `embed_tokens` weight tile.
+/// Single-arrive, single-output-page. The embed table is large
+/// (vocab × hidden) so loader streams the per-token rows from gmem
+/// rather than staging the full table; the substrate proof is just
+/// the output page lifecycle plus the weight-table accessor path.
+pub struct Embed {
+    pub out_page: PageId,
+    pub embed_weight_page: PageId,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub embed_weight: WeightRef,
+}
+
+/// `Instruction::ScalarMul(in_slot, out_slot, scale)`: elementwise
+/// `out = in * scale`. Single-arrive. No weight, no scratch — the
+/// scalar lives in a register. `scale` validated finite via
+/// `FiniteF32`.
+pub struct ScalarMul {
+    pub in_page: PageId,
+    pub out_page: PageId,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub scale: FiniteF32,
+}
+
+/// `Instruction::TanhSoftCap(in_slot, out_slot)`: elementwise
+/// `out = tanh(in / cap) * cap` with the soft-cap value baked into
+/// the kernel template (no runtime scalar — Gemma2/3's softcap
+/// constants are config-known). Same substrate shape as ScalarMul
+/// minus the scalar.
+pub struct TanhSoftCap {
+    pub in_page: PageId,
+    pub out_page: PageId,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+}
+
+/// `Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer,
+/// offset)`: Gemma2 / Gemma3 variant of RmsNorm: weight is `weight
+/// + offset * 1.0` instead of `weight`. Substrate shape is
+/// identical to RmsNorm — partial-sums reduction tile in
+/// `RmsNormScope`, two pages (in, weight), boundary phase parity.
+/// `offset` rides as a `FiniteF32` helper.
+pub struct ScalarOffsetRmsNorm {
+    pub in_page: PageId,
+    pub weight_page: PageId,
+    pub partial_sums: ScratchRegion<RmsNormScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub layer: LayerIndex,
+    pub weight: WeightRef,
+    pub offset: FiniteF32,
+}
+
+/// `Instruction::Gemm(in_slot, out_slot, layer, n, k)`: standalone
+/// matmul against a per-layer `LinearLayer` weight. Multi-iter
+/// (per-token TMA-loaded B-tiles) — `iters` arrives bumped per call.
+/// `b_tile` lives in `GemmScope`.
+pub struct Gemm {
+    pub in_page: PageId,
+    pub weight_page: PageId,
+    pub out_page: PageId,
+    pub b_tile: ScratchRegion<GemmScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub iters: IterCount,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub layer: LayerIndex,
+    pub weight: WeightRef,
+    pub shape: MatmulShape,
+}
+
+/// Norm-flavor for the lm_head Cutlass fusion variants — selects
+/// the pre-gemm transformation kernel template. Helper field; no
+/// substrate consequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LmHeadNormKind {
+    /// `Instruction::CutlassFusedRmsNormGemm`: rms_norm(in) then
+    /// gemm.
+    RmsNorm,
+    /// `Instruction::CutlassFusedAddRmsNormGemm`: residual fold
+    /// then rms_norm then gemm.
+    AddRmsNorm,
+    /// `Instruction::CutlassFusedAddScalarOffsetRmsNormGemm`:
+    /// add then rms_norm with scalar offset then gemm. Carries
+    /// the offset alongside in the variant struct.
+    AddScalarOffsetRmsNorm,
+    /// `Instruction::CutlassFusedMeanSubRmsNormGemm`: mean
+    /// subtraction (CommandR-flavored) then rms_norm then gemm.
+    MeanSubRmsNorm,
+}
+
+/// Unified lm_head Cutlass fusion variant. The four
+/// `Instruction::CutlassFused*` variants share substrate shape:
+/// 2 weight pages (norm weight + linear weight), 1 input page (or
+/// 2 for the residual-folding flavors — delta + residual), 1 output
+/// page, partial sums in `RmsNormScope` for the reduction, B-tile
+/// in `GemmScope` for the gemm. The norm flavor flag picks the
+/// kernel template at emit time.
+///
+/// `delta_page` is `Some` for `AddRmsNorm` / `AddScalarOffsetRmsNorm`
+/// (the residual-fold flavors); `None` for `RmsNorm` / `MeanSubRmsNorm`
+/// (the input row IS the residual, no fold).
+///
+/// `offset` is `Some(FiniteF32)` only for `AddScalarOffsetRmsNorm`.
+pub struct CutlassFusedNormGemm {
+    pub in_page: PageId,
+    pub delta_page: Option<PageId>,
+    pub norm_weight_page: PageId,
+    pub linear_weight_page: PageId,
+    pub out_page: PageId,
+    pub partial_sums: ScratchRegion<RmsNormScope>,
+    pub b_tile: ScratchRegion<GemmScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub iters: IterCount,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub layer: LayerIndex,
+    pub norm_weight: WeightRef,
+    pub linear_weight: WeightRef,
+    pub shape: MatmulShape,
+    pub norm_kind: LmHeadNormKind,
+    pub offset: Option<FiniteF32>,
+}
+
+/// Sliding-window kind for the attention variants. Helper field
+/// distinguishing `AttentionViaCache` (no window — full causal)
+/// from `SlidingAttentionViaCache` (windowed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttentionKind {
+    /// Full causal attention — no window restriction.
+    Full,
+    /// Windowed causal attention — local-context only. Carries the
+    /// `SlidingWindow` size alongside.
+    Sliding(SlidingWindow),
+}
+
+/// Unified attention-via-paged-cache variant. Both
+/// `Instruction::AttentionViaCache` and `SlidingAttentionViaCache`
+/// lower here, distinguished by `kind`.
+///
+/// Substrate proofs:
+/// - 2 PageIds: `q_in_page` (input Q rows) and `attn_out_page`
+///   (post-softmax output). K/V live in the global paged KV cache
+///   which isn't a substrate-managed shmem page — `kv_cache_layer`
+///   is the LayerIndex helper recording which layer's cache to
+///   read.
+/// - 2 disjoint `AttentionScope` scratch tiles: `score_tile` (QKT
+///   softmax-input tile) and `pv_tile` (post-softmax PV
+///   accumulator).
+/// - Boundary phase parity (`consumer_phase`, `storer_phase`) +
+///   `iters` (per-token attention iter count, one consumer arrive
+///   per iter).
+/// - 4 warp role tags.
+pub struct AttentionViaCacheNode {
+    pub q_in_page: PageId,
+    pub attn_out_page: PageId,
+    pub score_tile: ScratchRegion<AttentionScope>,
+    pub pv_tile: ScratchRegion<AttentionScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub iters: IterCount,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub kv_cache_layer: LayerIndex,
+    pub interleaved: bool,
+    pub kind: AttentionKind,
+}
+
+/// `Instruction::BarrierSignal(edge_idx)`: producer-side cross-CTA
+/// barrier signal. Fires `atomicAdd(&barriers[edge_idx], 1)` from
+/// every CTA's storer role.
+///
+/// Substrate proofs:
+/// - `edge`: validated `EdgeId` (bug class #1 against
+///   `SubstrateBudget::num_edges`).
+/// - `_storer_role`: the role doing the atomic add — pinned at
+///   the type level (bug class #6 — only the storer can signal).
+///
+/// No pages, no scratch, no phases at the per-CTA-shmem level
+/// (cross-CTA sync is gmem-bound; the per-CTA mbarrier phases
+/// don't apply to the global atomic counter).
+pub struct BarrierSignal {
+    pub edge: EdgeId,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+}
+
+/// `Instruction::BarrierWait(edge_idx, expected_count)`:
+/// consumer-side cross-CTA barrier wait. Spins on
+/// `barriers[edge_idx] >= expected_count` from the loader role
+/// before consuming the produced data.
+///
+/// Substrate proofs:
+/// - `edge`: validated `EdgeId` (#1).
+/// - `expected`: validated `ExpectedCount` (must be > 0).
+/// - `_loader_role`: the role doing the spin (#6).
+pub struct BarrierWait {
+    pub edge: EdgeId,
+    pub expected: ExpectedCount,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+}
+
 /// The typed lowered MegaNode enum. One variant per migrated op.
 ///
 /// - Sprint A: `RmsNorm`.
 /// - Sprint B: `FusedQkvRopeCache`.
-/// - Sprint C: `Add`, `FusedAddRmsNorm`, `FusedGateUpSiluMul` and
-///   `FusedGateUpGeluMul` (both lower to
-///   `FusedGateUpActivateMul`, distinguished by the
-///   `activation: GateUpActivation` field).
-///
-/// Subsequent sprints add the rest per the plan §10 table.
+/// - Sprint C: `Add`, `FusedAddRmsNorm`, `FusedGateUp{Silu,Gelu}Mul`
+///   (collapsed into `FusedGateUpActivateMul`).
+/// - Sprint D: `Embed`, `ScalarMul`, `TanhSoftCap`,
+///   `ScalarOffsetRmsNorm`, `Gemm`, `CutlassFused*Gemm`
+///   (collapsed into `CutlassFusedNormGemm`),
+///   `AttentionViaCache` and `SlidingAttentionViaCache`
+///   (collapsed into `AttentionViaCacheNode`),
+///   `BarrierSignal`, `BarrierWait`.
 pub enum MegaNode {
     RmsNorm(RmsNorm),
     FusedQkvRopeCache(FusedQkvRopeCache),
     Add(Add),
     FusedAddRmsNorm(FusedAddRmsNorm),
     FusedGateUpActivateMul(FusedGateUpActivateMul),
+    Embed(Embed),
+    ScalarMul(ScalarMul),
+    TanhSoftCap(TanhSoftCap),
+    ScalarOffsetRmsNorm(ScalarOffsetRmsNorm),
+    Gemm(Gemm),
+    CutlassFusedNormGemm(CutlassFusedNormGemm),
+    AttentionViaCache(AttentionViaCacheNode),
+    BarrierSignal(BarrierSignal),
+    BarrierWait(BarrierWait),
 }

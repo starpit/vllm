@@ -45,12 +45,15 @@ pub mod tape;
 
 pub use lower::{ArriveCount, LowerError, MegaTapeBuilder, OpInput, lower};
 pub use nodes::{
-    Add, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation, LayerIndex,
-    MegaNode, RmsNorm, RotaryRef, WeightRef,
+    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
+    Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,
+    Gemm, LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, RmsNorm, RotaryRef, ScalarMul,
+    ScalarOffsetRmsNorm, SlidingWindow, TanhSoftCap, WeightRef,
 };
 pub use substrate::{
-    Empty, Filled, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidWarpRole, IterCount,
-    MbarrierPhase, MlpScope, Page, PageId, PagePool, Produced, ROLE_CONSUMER, ROLE_LAUNCHER,
-    ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
+    AttentionScope, EdgeId, Empty, ExpectedCount, Filled, GemmScope, IsLifecycleState,
+    IsScratchScope, IsScratchScopePub, IsValidWarpRole, IterCount, MbarrierPhase, MlpScope, Page,
+    PageId, PagePool, Produced, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER,
+    RmsNormScope, RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
 };
 pub use tape::MegaTape;

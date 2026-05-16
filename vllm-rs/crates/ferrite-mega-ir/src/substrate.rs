@@ -79,11 +79,18 @@ pub struct SubstrateBudget {
     num_consumer_warps: u32,
     page_size: u32,
     scratch_bytes: u32,
+    /// Number of cross-CTA barrier edges in this kernel. Validates
+    /// `BarrierSignal` / `BarrierWait` ops' `edge_idx` against
+    /// `[0, num_edges)`. May be 0 (kernel with no cross-CTA sync —
+    /// e.g. single-CTA shapes). Sprint D's bug class #1 extension.
+    num_edges: u32,
 }
 
 impl SubstrateBudget {
-    /// Construct a substrate budget. Panics on zero fields (a
-    /// kernel with zero pages or zero scratch is nonsensical).
+    /// Construct a substrate budget. Panics on zero fields where
+    /// zero is nonsensical; permits zero `scratch_bytes` and
+    /// zero `num_edges` (kernels without scratch / without cross-CTA
+    /// sync).
     pub fn new(
         num_pages: u32,
         num_consumer_warps: u32,
@@ -102,7 +109,17 @@ impl SubstrateBudget {
             num_consumer_warps,
             page_size,
             scratch_bytes,
+            num_edges: 0,
         }
+    }
+
+    /// Sprint D extension: declare the cross-CTA barrier edge
+    /// budget. Builder-style so existing 4-arg `new` callers stay
+    /// intact (every existing test still passes a tape with zero
+    /// barriers).
+    pub fn with_num_edges(mut self, num_edges: u32) -> Self {
+        self.num_edges = num_edges;
+        self
     }
 
     pub fn num_pages(&self) -> u32 {
@@ -116,6 +133,9 @@ impl SubstrateBudget {
     }
     pub fn scratch_bytes(&self) -> u32 {
         self.scratch_bytes
+    }
+    pub fn num_edges(&self) -> u32 {
+        self.num_edges
     }
 }
 
@@ -480,6 +500,30 @@ impl sealed::Sealed for MlpScope {}
 impl IsScratchScope for MlpScope {}
 impl IsScratchScopePub for MlpScope {}
 
+/// Scratch scope for `AttentionViaCache` /
+/// `SlidingAttentionViaCache` — the QKT score tile, softmax
+/// running-max / running-sum reduction, and the post-softmax
+/// PV tile, all live in shmem inside the per-tok attention loop.
+/// Sprint D's bug class #4: the score_tile and pv_tile must be
+/// `disjoint_with`-discharged within one iter (the softmax reads
+/// scores while the PV multiply writes the per-warp PV
+/// accumulator; both are in this scope).
+pub struct AttentionScope;
+impl sealed::Sealed for AttentionScope {}
+impl IsScratchScope for AttentionScope {}
+impl IsScratchScopePub for AttentionScope {}
+
+/// Scratch scope for general `Gemm` / lm_head fusion variants —
+/// the per-warp B-tile staging buffer + accumulator. The
+/// CutlassFused* lm_head variants put their pre-norm partial sums
+/// in `RmsNormScope` (sibling to standalone RmsNorm) and the gemm
+/// itself in this scope; the two are disjoint by virtue of
+/// different scopes.
+pub struct GemmScope;
+impl sealed::Sealed for GemmScope {}
+impl IsScratchScope for GemmScope {}
+impl IsScratchScopePub for GemmScope {}
+
 // ============================================================
 // IterCount — typed iteration count for per-iter phase math.
 // Construction enforces > 0 (a 0-iter op is meaningless and would
@@ -504,6 +548,62 @@ impl IterCount {
     pub fn new(iters: u32) -> Self {
         assert!(iters > 0, "IterCount: iters must be > 0 (got {iters})");
         Self(iters)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+// ============================================================
+// Cross-CTA barrier edges (Sprint D).
+//
+// `BarrierSignal` / `BarrierWait` ops sync producer→consumer CTA
+// pairs across the megakernel grid. Each pair is identified by a
+// dense u32 `edge_idx`. The substrate budget records the total
+// number of edges; `EdgeId::new` validates the index is in range
+// (bug class #1 extension).
+// ============================================================
+
+/// Validated edge index for a cross-CTA barrier. Bounds-checked
+/// against `SubstrateBudget::num_edges` (bug class #1).
+/// `pub(crate)` so only the lowering can mint ids; outside callers
+/// receive `EdgeId`s already-validated as part of `MegaNode` variant
+/// fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EdgeId(u32);
+
+impl EdgeId {
+    pub(crate) fn new(idx: u32, substrate: &SubstrateBudget) -> Self {
+        assert!(
+            idx < substrate.num_edges,
+            "EdgeId {idx} out of substrate budget num_edges={}",
+            substrate.num_edges,
+        );
+        Self(idx)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Expected arrive-count for a `BarrierWait`. The wait blocks until
+/// the per-edge atomic counter reaches this value. Construction
+/// enforces > 0 (a wait with `expected_count == 0` is an immediate
+/// no-op the kernel could omit, but at the IR level we treat it as
+/// a logic bug — the `BarrierWait` op shouldn't have been emitted
+/// at all).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpectedCount(u32);
+
+impl ExpectedCount {
+    pub fn new(count: u32) -> Self {
+        assert!(
+            count > 0,
+            "ExpectedCount: BarrierWait count must be > 0 (got {count})",
+        );
+        Self(count)
     }
 
     pub fn raw(self) -> u32 {

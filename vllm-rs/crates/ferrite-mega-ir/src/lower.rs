@@ -28,13 +28,15 @@
 use ferrite_forward::Instruction;
 
 use crate::nodes::{
-    Add, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation, LayerIndex,
-    MegaNode, RmsNorm, RotaryRef, WeightRef,
+    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
+    Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,
+    Gemm, LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, RmsNorm, RotaryRef, ScalarMul,
+    ScalarOffsetRmsNorm, SlidingWindow, TanhSoftCap, WeightRef,
 };
 use crate::substrate::{
-    Empty, IterCount, MbarrierPhase, MlpScope, Page, PageId, PagePool, ROLE_CONSUMER,
-    ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion,
-    SubstrateBudget, WarpRoleTag,
+    AttentionScope, EdgeId, Empty, ExpectedCount, GemmScope, IterCount, MbarrierPhase, MlpScope,
+    Page, PageId, PagePool, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope,
+    RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
 };
 use crate::tape::MegaTape;
 
@@ -603,6 +605,466 @@ impl MegaTapeBuilder {
         self
     }
 
+    // ── Sprint D push methods ──────────────────────────────
+
+    /// Push a typed `Embed` (vocab lookup) onto the tape.
+    /// Two pages (out + embed table), boundary phase parity, four
+    /// role tags. The embed table doesn't sit fully in shmem (vocab
+    /// is huge); the loader streams per-token rows. The substrate
+    /// proof covers the lifecycle of both pages and the weight
+    /// reference path.
+    pub fn push_embed(
+        &mut self,
+        out_slot_id: u32,
+        embed_weight_slot_id: u32,
+        embed_weight_path: String,
+    ) -> &mut Self {
+        let out_page: Page<Empty> = self.pool.take(out_slot_id);
+        let weight_page: Page<Empty> = self.pool.take(embed_weight_slot_id);
+
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+        let weight_empty = weight_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes.push(MegaNode::Embed(Embed {
+            out_page: PageId::new(out_slot_id, self.pool.substrate()),
+            embed_weight_page: PageId::new(embed_weight_slot_id, self.pool.substrate()),
+            consumer_phase,
+            storer_phase,
+            _loader_role: WarpRoleTag::<ROLE_LOADER>,
+            _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+            _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+            _storer_role: WarpRoleTag::<ROLE_STORER>,
+            embed_weight: WeightRef::new(embed_weight_path),
+        }));
+
+        self.pool.release(out_empty);
+        self.pool.release(weight_empty);
+        self.arrives.bump();
+
+        self
+    }
+
+    /// Push a typed `ScalarMul` onto the tape. Two pages, no
+    /// scratch, no weight, boundary phase parity, four role tags.
+    /// `scale` validated finite at construction.
+    pub fn push_scalar_mul(&mut self, in_slot_id: u32, out_slot_id: u32, scale: f32) -> &mut Self {
+        let in_page: Page<Empty> = self.pool.take(in_slot_id);
+        let out_page: Page<Empty> = self.pool.take(out_slot_id);
+        let in_empty = in_page.loader_fired().consumer_arrived().storer_consumed();
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes.push(MegaNode::ScalarMul(ScalarMul {
+            in_page: PageId::new(in_slot_id, self.pool.substrate()),
+            out_page: PageId::new(out_slot_id, self.pool.substrate()),
+            consumer_phase,
+            storer_phase,
+            _loader_role: WarpRoleTag::<ROLE_LOADER>,
+            _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+            _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+            _storer_role: WarpRoleTag::<ROLE_STORER>,
+            scale: FiniteF32::new(scale),
+        }));
+
+        self.pool.release(in_empty);
+        self.pool.release(out_empty);
+        self.arrives.bump();
+
+        self
+    }
+
+    /// Push a typed `TanhSoftCap` onto the tape. Two pages, no
+    /// scratch, no weight, boundary phase parity, four role tags.
+    pub fn push_tanh_soft_cap(&mut self, in_slot_id: u32, out_slot_id: u32) -> &mut Self {
+        let in_page: Page<Empty> = self.pool.take(in_slot_id);
+        let out_page: Page<Empty> = self.pool.take(out_slot_id);
+        let in_empty = in_page.loader_fired().consumer_arrived().storer_consumed();
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes.push(MegaNode::TanhSoftCap(TanhSoftCap {
+            in_page: PageId::new(in_slot_id, self.pool.substrate()),
+            out_page: PageId::new(out_slot_id, self.pool.substrate()),
+            consumer_phase,
+            storer_phase,
+            _loader_role: WarpRoleTag::<ROLE_LOADER>,
+            _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+            _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+            _storer_role: WarpRoleTag::<ROLE_STORER>,
+        }));
+
+        self.pool.release(in_empty);
+        self.pool.release(out_empty);
+        self.arrives.bump();
+
+        self
+    }
+
+    /// Push a typed `ScalarOffsetRmsNorm` onto the tape. Same shape
+    /// as RmsNorm with a `FiniteF32` offset helper riding alongside.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_scalar_offset_rms_norm(
+        &mut self,
+        in_slot_id: u32,
+        weight_slot_id: u32,
+        layer: u32,
+        num_layers: u32,
+        weight_path: String,
+        scratch_offset: u32,
+        offset: f32,
+    ) -> &mut Self {
+        let in_page: Page<Empty> = self.pool.take(in_slot_id);
+        let weight_page: Page<Empty> = self.pool.take(weight_slot_id);
+
+        let in_empty = in_page.loader_fired().consumer_arrived().storer_consumed();
+        let weight_empty = weight_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+
+        let scratch_bytes = self.pool.substrate().num_consumer_warps() * 4;
+        let partial_sums = ScratchRegion::<RmsNormScope>::new(
+            scratch_offset,
+            scratch_bytes,
+            self.pool.substrate(),
+        );
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes
+            .push(MegaNode::ScalarOffsetRmsNorm(ScalarOffsetRmsNorm {
+                in_page: PageId::new(in_slot_id, self.pool.substrate()),
+                weight_page: PageId::new(weight_slot_id, self.pool.substrate()),
+                partial_sums,
+                consumer_phase,
+                storer_phase,
+                _loader_role: WarpRoleTag::<ROLE_LOADER>,
+                _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+                _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+                _storer_role: WarpRoleTag::<ROLE_STORER>,
+                layer: LayerIndex::new(layer, num_layers),
+                weight: WeightRef::new(weight_path),
+                offset: FiniteF32::new(offset),
+            }));
+
+        self.pool.release(in_empty);
+        self.pool.release(weight_empty);
+        self.arrives.bump();
+
+        self
+    }
+
+    /// Push a typed `Gemm` onto the tape. Three pages, one B-tile
+    /// in `GemmScope`, multi-iter (one consumer arrive per token).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_gemm(
+        &mut self,
+        in_slot_id: u32,
+        weight_slot_id: u32,
+        out_slot_id: u32,
+        layer: u32,
+        num_layers: u32,
+        weight_path: String,
+        n: u32,
+        k: u32,
+        iters: u32,
+        b_tile_offset: u32,
+        b_tile_bytes: u32,
+    ) -> &mut Self {
+        let in_page: Page<Empty> = self.pool.take(in_slot_id);
+        let weight_page: Page<Empty> = self.pool.take(weight_slot_id);
+        let out_page: Page<Empty> = self.pool.take(out_slot_id);
+
+        let in_empty = in_page.loader_fired().consumer_arrived().storer_consumed();
+        let weight_empty = weight_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+
+        let b_tile =
+            ScratchRegion::<GemmScope>::new(b_tile_offset, b_tile_bytes, self.pool.substrate());
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes.push(MegaNode::Gemm(Gemm {
+            in_page: PageId::new(in_slot_id, self.pool.substrate()),
+            weight_page: PageId::new(weight_slot_id, self.pool.substrate()),
+            out_page: PageId::new(out_slot_id, self.pool.substrate()),
+            b_tile,
+            consumer_phase,
+            storer_phase,
+            iters: IterCount::new(iters),
+            _loader_role: WarpRoleTag::<ROLE_LOADER>,
+            _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+            _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+            _storer_role: WarpRoleTag::<ROLE_STORER>,
+            layer: LayerIndex::new(layer, num_layers),
+            weight: WeightRef::new(weight_path),
+            shape: MatmulShape::new(n, k),
+        }));
+
+        self.pool.release(in_empty);
+        self.pool.release(weight_empty);
+        self.pool.release(out_empty);
+        for _ in 0..iters {
+            self.arrives.bump();
+        }
+
+        self
+    }
+
+    /// Push a typed `CutlassFusedNormGemm` (lm_head fusion) onto
+    /// the tape. Substrate shape: 3-or-4 pages (in + optional
+    /// delta + norm_weight + linear_weight + out), partial_sums in
+    /// `RmsNormScope`, B-tile in `GemmScope`. Multi-iter.
+    ///
+    /// `delta_slot_id` is `Some` for `AddRmsNorm` /
+    /// `AddScalarOffsetRmsNorm` (residual-fold flavors); `None` for
+    /// `RmsNorm` / `MeanSubRmsNorm`. `offset` is `Some(f32)` only
+    /// for `AddScalarOffsetRmsNorm`; the constructor enforces
+    /// `(norm_kind == AddScalarOffsetRmsNorm) <=> offset.is_some()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_cutlass_fused_norm_gemm(
+        &mut self,
+        in_slot_id: u32,
+        delta_slot_id: Option<u32>,
+        norm_weight_slot_id: u32,
+        linear_weight_slot_id: u32,
+        out_slot_id: u32,
+        layer: u32,
+        num_layers: u32,
+        norm_weight_path: String,
+        linear_weight_path: String,
+        n: u32,
+        k: u32,
+        iters: u32,
+        partial_sums_offset: u32,
+        b_tile_offset: u32,
+        b_tile_bytes: u32,
+        norm_kind: LmHeadNormKind,
+        offset: Option<f32>,
+    ) -> &mut Self {
+        // Cross-field invariant: AddScalarOffsetRmsNorm requires
+        // an offset; the others reject it. The lowering catches a
+        // proc-macro bug at construction (not at runtime).
+        match (norm_kind, offset) {
+            (LmHeadNormKind::AddScalarOffsetRmsNorm, Some(_))
+            | (LmHeadNormKind::RmsNorm, None)
+            | (LmHeadNormKind::AddRmsNorm, None)
+            | (LmHeadNormKind::MeanSubRmsNorm, None) => {}
+            (LmHeadNormKind::AddScalarOffsetRmsNorm, None) => {
+                panic!("CutlassFusedNormGemm: AddScalarOffsetRmsNorm requires Some(offset)",);
+            }
+            (kind, Some(_)) => {
+                panic!("CutlassFusedNormGemm: {kind:?} must not carry an offset",);
+            }
+        }
+
+        let in_page: Page<Empty> = self.pool.take(in_slot_id);
+        let delta_page = delta_slot_id.map(|id| self.pool.take(id));
+        let norm_w_page: Page<Empty> = self.pool.take(norm_weight_slot_id);
+        let lin_w_page: Page<Empty> = self.pool.take(linear_weight_slot_id);
+        let out_page: Page<Empty> = self.pool.take(out_slot_id);
+
+        let in_empty = in_page.loader_fired().consumer_arrived().storer_consumed();
+        let delta_empty = delta_page.map(|p| p.loader_fired().consumer_arrived().storer_consumed());
+        let norm_w_empty = norm_w_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let lin_w_empty = lin_w_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+
+        let partial_bytes = self.pool.substrate().num_consumer_warps() * 4;
+        let partial_sums = ScratchRegion::<RmsNormScope>::new(
+            partial_sums_offset,
+            partial_bytes,
+            self.pool.substrate(),
+        );
+        let b_tile =
+            ScratchRegion::<GemmScope>::new(b_tile_offset, b_tile_bytes, self.pool.substrate());
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes
+            .push(MegaNode::CutlassFusedNormGemm(CutlassFusedNormGemm {
+                in_page: PageId::new(in_slot_id, self.pool.substrate()),
+                delta_page: delta_slot_id.map(|id| PageId::new(id, self.pool.substrate())),
+                norm_weight_page: PageId::new(norm_weight_slot_id, self.pool.substrate()),
+                linear_weight_page: PageId::new(linear_weight_slot_id, self.pool.substrate()),
+                out_page: PageId::new(out_slot_id, self.pool.substrate()),
+                partial_sums,
+                b_tile,
+                consumer_phase,
+                storer_phase,
+                iters: IterCount::new(iters),
+                _loader_role: WarpRoleTag::<ROLE_LOADER>,
+                _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+                _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+                _storer_role: WarpRoleTag::<ROLE_STORER>,
+                layer: LayerIndex::new(layer, num_layers),
+                norm_weight: WeightRef::new(norm_weight_path),
+                linear_weight: WeightRef::new(linear_weight_path),
+                shape: MatmulShape::new(n, k),
+                norm_kind,
+                offset: offset.map(FiniteF32::new),
+            }));
+
+        self.pool.release(in_empty);
+        if let Some(p) = delta_empty {
+            self.pool.release(p);
+        }
+        self.pool.release(norm_w_empty);
+        self.pool.release(lin_w_empty);
+        self.pool.release(out_empty);
+        for _ in 0..iters {
+            self.arrives.bump();
+        }
+
+        self
+    }
+
+    /// Push a typed `AttentionViaCacheNode` (covers
+    /// `AttentionViaCache` and `SlidingAttentionViaCache`). Two
+    /// substrate pages (Q in, attn out — K/V live in the global
+    /// paged KV cache extern), two disjoint `AttentionScope`
+    /// scratch tiles (score, PV), multi-iter, four role tags.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_attention_via_cache(
+        &mut self,
+        q_in_slot_id: u32,
+        attn_out_slot_id: u32,
+        kv_cache_layer: u32,
+        num_layers: u32,
+        iters: u32,
+        score_tile_offset: u32,
+        score_tile_bytes: u32,
+        pv_tile_offset: u32,
+        pv_tile_bytes: u32,
+        kind: AttentionKind,
+        interleaved: bool,
+    ) -> &mut Self {
+        let q_page: Page<Empty> = self.pool.take(q_in_slot_id);
+        let out_page: Page<Empty> = self.pool.take(attn_out_slot_id);
+
+        let q_empty = q_page.loader_fired().consumer_arrived().storer_consumed();
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+
+        let score_raw = ScratchRegion::<AttentionScope>::new(
+            score_tile_offset,
+            score_tile_bytes,
+            self.pool.substrate(),
+        );
+        let pv_raw = ScratchRegion::<AttentionScope>::new(
+            pv_tile_offset,
+            pv_tile_bytes,
+            self.pool.substrate(),
+        );
+        let (score_tile, pv_tile) = score_raw.disjoint_with(pv_raw);
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        self.nodes
+            .push(MegaNode::AttentionViaCache(AttentionViaCacheNode {
+                q_in_page: PageId::new(q_in_slot_id, self.pool.substrate()),
+                attn_out_page: PageId::new(attn_out_slot_id, self.pool.substrate()),
+                score_tile,
+                pv_tile,
+                consumer_phase,
+                storer_phase,
+                iters: IterCount::new(iters),
+                _loader_role: WarpRoleTag::<ROLE_LOADER>,
+                _launcher_role: WarpRoleTag::<ROLE_LAUNCHER>,
+                _consumer_role: WarpRoleTag::<ROLE_CONSUMER>,
+                _storer_role: WarpRoleTag::<ROLE_STORER>,
+                kv_cache_layer: LayerIndex::new(kv_cache_layer, num_layers),
+                interleaved,
+                kind,
+            }));
+
+        self.pool.release(q_empty);
+        self.pool.release(out_empty);
+        for _ in 0..iters {
+            self.arrives.bump();
+        }
+
+        self
+    }
+
+    /// Push a typed `BarrierSignal` onto the tape. No pages, no
+    /// scratch, no phases at the per-CTA mbarrier level — just a
+    /// validated cross-CTA edge id (#1) and the storer role
+    /// constraint (#6). Cumulative arrive count unchanged (the
+    /// global atomic add isn't a per-CTA mbarrier arrive).
+    pub fn push_barrier_signal(&mut self, edge_idx: u32) -> &mut Self {
+        let edge = EdgeId::new(edge_idx, self.pool.substrate());
+        self.nodes.push(MegaNode::BarrierSignal(BarrierSignal {
+            edge,
+            _storer_role: WarpRoleTag::<ROLE_STORER>,
+        }));
+        self
+    }
+
+    /// Push a typed `BarrierWait` onto the tape. Validated edge id
+    /// (#1), validated `expected_count > 0`, loader role (#6).
+    /// Cumulative arrive count unchanged.
+    pub fn push_barrier_wait(&mut self, edge_idx: u32, expected_count: u32) -> &mut Self {
+        let edge = EdgeId::new(edge_idx, self.pool.substrate());
+        let expected = ExpectedCount::new(expected_count);
+        self.nodes.push(MegaNode::BarrierWait(BarrierWait {
+            edge,
+            expected,
+            _loader_role: WarpRoleTag::<ROLE_LOADER>,
+        }));
+        self
+    }
+
     /// Consume the builder and return the typed tape.
     pub fn finish(self) -> MegaTape {
         let substrate = *self.pool.substrate();
@@ -631,6 +1093,11 @@ pub enum LowerError {
     /// every concurrent slot). Caller picks a larger
     /// `num_pages`.
     SubstrateBudgetTooSmall { need: u32, have: u32 },
+    /// `Instruction::SlidingAttentionViaCache` requires
+    /// `OpInput::sliding_window: Some(n)` (the window value is
+    /// arch config, not part of the Instruction's positional
+    /// fields).
+    MissingSlidingWindow,
 }
 
 /// Per-op lowering input: one [`Instruction`] paired with the
@@ -650,13 +1117,21 @@ pub enum LowerError {
 /// `Reshape`) use an empty `Vec`.
 ///
 /// `iters` is the per-op iteration count for variants whose kernel
-/// body loops over tokens internally (today: `FusedQkvRopeCache`).
-/// Most ops are 1-iter and ignore the field.
+/// body loops over tokens internally. Most ops are 1-iter and
+/// ignore the field; `FusedQkvRopeCache`, `Gemm`, the lm_head
+/// Cutlass fusions, and `(Sliding)AttentionViaCache` all use it.
+///
+/// `sliding_window` is `Some(n)` only for
+/// `Instruction::SlidingAttentionViaCache` (the window value is
+/// arch config, not in the Instruction's positional fields). The
+/// proc-macro caller threads it from the per-arch config at
+/// fan_out time.
 #[derive(Clone)]
 pub struct OpInput {
     pub instr: Instruction,
     pub weight_paths: Vec<String>,
     pub iters: u32,
+    pub sliding_window: Option<u32>,
 }
 
 impl OpInput {
@@ -665,6 +1140,7 @@ impl OpInput {
             instr,
             weight_paths,
             iters: 1,
+            sliding_window: None,
         }
     }
 }
@@ -780,6 +1256,197 @@ pub fn lower(
                     half,
                     GateUpActivation::Gelu,
                 );
+            }
+            Instruction::Embed(out_slot) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(Embed): expected one weight_paths entry")
+                    .clone();
+                let weight_slot_id = pick_distinct_slot(&[*out_slot], &mut slot_alloc)?;
+                builder.push_embed(*out_slot, weight_slot_id, weight_path);
+            }
+            Instruction::ScalarMul(in_slot, out_slot, scale) => {
+                builder.push_scalar_mul(*in_slot, *out_slot, *scale);
+            }
+            Instruction::TanhSoftCap(in_slot, out_slot) => {
+                builder.push_tanh_soft_cap(*in_slot, *out_slot);
+            }
+            Instruction::ScalarOffsetRmsNorm(in_slot, _out_slot, layer, offset) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(ScalarOffsetRmsNorm): expected one weight_paths entry")
+                    .clone();
+                let weight_slot_id = pick_distinct_slot(&[*in_slot], &mut slot_alloc)?;
+                builder.push_scalar_offset_rms_norm(
+                    *in_slot,
+                    weight_slot_id,
+                    *layer,
+                    num_layers,
+                    weight_path,
+                    /*scratch_offset=*/ 0,
+                    *offset,
+                );
+            }
+            Instruction::Gemm(in_slot, out_slot, layer, n, k) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(Gemm): expected one weight_paths entry")
+                    .clone();
+                let weight_slot_id = pick_distinct_slot(&[*in_slot, *out_slot], &mut slot_alloc)?;
+                builder.push_gemm(
+                    *in_slot,
+                    weight_slot_id,
+                    *out_slot,
+                    *layer,
+                    num_layers,
+                    weight_path,
+                    *n,
+                    *k,
+                    op.iters,
+                    /*b_tile_offset=*/ 0,
+                    /*b_tile_bytes=*/ substrate.scratch_bytes(),
+                );
+            }
+            Instruction::CutlassFusedRmsNormGemm(
+                in_slot,
+                out_slot,
+                layer,
+                _tile_m,
+                _tile_n,
+                _stages,
+                n,
+                k,
+            ) => lower_lm_head_fusion(
+                &mut builder,
+                &mut slot_alloc,
+                op,
+                LmHeadNormKind::RmsNorm,
+                /*delta=*/ None,
+                /*offset=*/ None,
+                *in_slot,
+                *out_slot,
+                *layer,
+                num_layers,
+                *n,
+                *k,
+                substrate,
+            )?,
+            Instruction::CutlassFusedAddRmsNormGemm(
+                delta_slot,
+                residual_slot,
+                out_slot,
+                layer,
+                _tile_m,
+                _tile_n,
+                _stages,
+                n,
+                k,
+            ) => lower_lm_head_fusion(
+                &mut builder,
+                &mut slot_alloc,
+                op,
+                LmHeadNormKind::AddRmsNorm,
+                Some(*delta_slot),
+                None,
+                *residual_slot,
+                *out_slot,
+                *layer,
+                num_layers,
+                *n,
+                *k,
+                substrate,
+            )?,
+            Instruction::CutlassFusedMeanSubRmsNormGemm(
+                in_slot,
+                out_slot,
+                layer,
+                _tile_m,
+                _tile_n,
+                _stages,
+                n,
+                k,
+            ) => lower_lm_head_fusion(
+                &mut builder,
+                &mut slot_alloc,
+                op,
+                LmHeadNormKind::MeanSubRmsNorm,
+                None,
+                None,
+                *in_slot,
+                *out_slot,
+                *layer,
+                num_layers,
+                *n,
+                *k,
+                substrate,
+            )?,
+            Instruction::CutlassFusedAddScalarOffsetRmsNormGemm(
+                delta_slot,
+                residual_slot,
+                out_slot,
+                layer,
+                offset,
+                _tile_m,
+                _tile_n,
+                _stages,
+                n,
+                k,
+            ) => lower_lm_head_fusion(
+                &mut builder,
+                &mut slot_alloc,
+                op,
+                LmHeadNormKind::AddScalarOffsetRmsNorm,
+                Some(*delta_slot),
+                Some(*offset),
+                *residual_slot,
+                *out_slot,
+                *layer,
+                num_layers,
+                *n,
+                *k,
+                substrate,
+            )?,
+            Instruction::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
+                let half = substrate.scratch_bytes() / 2;
+                builder.push_attention_via_cache(
+                    *q_slot,
+                    *attn_out_slot,
+                    *layer,
+                    num_layers,
+                    op.iters,
+                    /*score_off=*/ 0,
+                    /*score_bytes=*/ half,
+                    /*pv_off=*/ half,
+                    /*pv_bytes=*/ half,
+                    AttentionKind::Full,
+                    *interleaved,
+                );
+            }
+            Instruction::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
+                let window = op.sliding_window.ok_or(LowerError::MissingSlidingWindow)?;
+                let half = substrate.scratch_bytes() / 2;
+                builder.push_attention_via_cache(
+                    *q_slot,
+                    *attn_out_slot,
+                    *layer,
+                    num_layers,
+                    op.iters,
+                    0,
+                    half,
+                    half,
+                    half,
+                    AttentionKind::Sliding(SlidingWindow::new(window)),
+                    *interleaved,
+                );
+            }
+            Instruction::BarrierSignal(edge) => {
+                builder.push_barrier_signal(*edge);
+            }
+            Instruction::BarrierWait(edge, expected_count) => {
+                builder.push_barrier_wait(*edge, *expected_count);
             }
             Instruction::FusedQkvRopeCache(in_slot, _out_slot, layer, biased, interleaved) => {
                 // Two weight paths: [qkv_packed, rotary].
@@ -905,6 +1572,86 @@ fn pick_distinct_slot(exclude: &[u32], alloc: &mut SlotAllocator) -> Result<u32,
         need: alloc.num_pages + 1,
         have: alloc.num_pages,
     })
+}
+
+/// Shared lowering body for the four `CutlassFused*Gemm` lm_head
+/// variants. They share the same substrate shape (in + optional
+/// delta + norm-weight + linear-weight + out pages, partial sums
+/// in `RmsNormScope`, B-tile in `GemmScope`), differing only in
+/// the `LmHeadNormKind` flag and the optional `offset`.
+///
+/// `op.weight_paths` must carry exactly two entries:
+/// `[norm_weight, linear_weight]` in that order — the per-arch
+/// `WeightAccessors` impl emits the norm slot before the linear
+/// slot at this op_idx.
+#[allow(clippy::too_many_arguments)]
+fn lower_lm_head_fusion(
+    builder: &mut MegaTapeBuilder,
+    slot_alloc: &mut SlotAllocator,
+    op: &OpInput,
+    norm_kind: LmHeadNormKind,
+    delta_slot_id: Option<u32>,
+    offset: Option<f32>,
+    in_slot_id: u32,
+    out_slot_id: u32,
+    layer: u32,
+    num_layers: u32,
+    n: u32,
+    k: u32,
+    substrate: SubstrateBudget,
+) -> Result<(), LowerError> {
+    if op.weight_paths.len() != 2 {
+        let label = match norm_kind {
+            LmHeadNormKind::RmsNorm => "CutlassFusedRmsNormGemm",
+            LmHeadNormKind::AddRmsNorm => "CutlassFusedAddRmsNormGemm",
+            LmHeadNormKind::MeanSubRmsNorm => "CutlassFusedMeanSubRmsNormGemm",
+            LmHeadNormKind::AddScalarOffsetRmsNorm => "CutlassFusedAddScalarOffsetRmsNormGemm",
+        };
+        return Err(LowerError::WrongWeightArity {
+            op: label,
+            expected: 2,
+            got: op.weight_paths.len() as u32,
+        });
+    }
+    let norm_weight_path = op.weight_paths[0].clone();
+    let linear_weight_path = op.weight_paths[1].clone();
+
+    // Synthesize non-aliasing weight + (if needed) delta page slots.
+    let mut exclude: Vec<u32> = vec![in_slot_id, out_slot_id];
+    if let Some(d) = delta_slot_id {
+        exclude.push(d);
+    }
+    let norm_weight_slot_id = pick_distinct_slot(&exclude, slot_alloc)?;
+    exclude.push(norm_weight_slot_id);
+    let linear_weight_slot_id = pick_distinct_slot(&exclude, slot_alloc)?;
+
+    // Pack partial-sums + B-tile back-to-back at the front of
+    // scratch. Different scopes — no overlap proof needed across
+    // them; each is independently within-budget.
+    let partial_sums_bytes = substrate.num_consumer_warps() * 4;
+    let b_tile_offset = partial_sums_bytes;
+    let b_tile_bytes = substrate.scratch_bytes().saturating_sub(partial_sums_bytes);
+
+    builder.push_cutlass_fused_norm_gemm(
+        in_slot_id,
+        delta_slot_id,
+        norm_weight_slot_id,
+        linear_weight_slot_id,
+        out_slot_id,
+        layer,
+        num_layers,
+        norm_weight_path,
+        linear_weight_path,
+        n,
+        k,
+        op.iters,
+        /*partial_sums_offset=*/ 0,
+        b_tile_offset,
+        b_tile_bytes,
+        norm_kind,
+        offset,
+    );
+    Ok(())
 }
 
 /// Stable static-string name for an [`Instruction`] variant. Used
@@ -1132,14 +1879,15 @@ mod tests {
 
     #[test]
     fn lower_unmigrated_variant_returns_not_yet_lifted() {
-        // `Gemm` is Sprint D scope — not yet lifted in Sprint A/B/C.
+        // `MlaAttention` (DeepSeek MLA) is not in Sprint A/B/C/D
+        // scope — it lands when the DeepSeek arches enter mega.
         let ops = vec![OpInput::new(
-            Instruction::Gemm(0, 1, 0, 16, 16),
-            vec!["W::gemm".to_string()],
+            Instruction::MlaAttention(0, 1, 2, 0, 16),
+            Vec::new(),
         )];
         match lower(&ops, 16, budget()) {
-            Err(LowerError::NotYetLifted { op }) => assert_eq!(op, "Gemm"),
-            other => panic!("expected NotYetLifted for Gemm, got {other:?}"),
+            Err(LowerError::NotYetLifted { op }) => assert_eq!(op, "MlaAttention"),
+            other => panic!("expected NotYetLifted for MlaAttention, got {other:?}"),
         }
     }
 
@@ -1158,6 +1906,7 @@ mod tests {
                 /*in_slot=*/ 0, /*out_slot=*/ 0, /*layer=*/ 0,
                 /*biased=*/ false, /*interleaved=*/ false,
             ),
+            sliding_window: None,
             weight_paths: vec![
                 "Weights::qkv_proj".to_string(),
                 "Weights::rotary".to_string(),
@@ -1407,6 +2156,7 @@ mod tests {
             instr: Instruction::FusedQkvRopeCache(0, 0, 0, false, false),
             weight_paths: vec!["W::qkv".to_string()], // missing rotary
             iters: 1,
+            sliding_window: None,
         }];
         match lower(&ops, 16, rope_budget()) {
             Err(LowerError::WrongWeightArity { op, expected, got }) => {
@@ -1415,6 +2165,25 @@ mod tests {
                 assert_eq!(got, 1);
             }
             other => panic!("expected WrongWeightArity, got {other:?}"),
+        }
+    }
+
+    fn node_kind(n: &MegaNode) -> &'static str {
+        match n {
+            MegaNode::RmsNorm(_) => "RmsNorm",
+            MegaNode::FusedQkvRopeCache(_) => "FusedQkvRopeCache",
+            MegaNode::Add(_) => "Add",
+            MegaNode::FusedAddRmsNorm(_) => "FusedAddRmsNorm",
+            MegaNode::FusedGateUpActivateMul(_) => "FusedGateUpActivateMul",
+            MegaNode::Embed(_) => "Embed",
+            MegaNode::ScalarMul(_) => "ScalarMul",
+            MegaNode::TanhSoftCap(_) => "TanhSoftCap",
+            MegaNode::ScalarOffsetRmsNorm(_) => "ScalarOffsetRmsNorm",
+            MegaNode::Gemm(_) => "Gemm",
+            MegaNode::CutlassFusedNormGemm(_) => "CutlassFusedNormGemm",
+            MegaNode::AttentionViaCache(_) => "AttentionViaCache",
+            MegaNode::BarrierSignal(_) => "BarrierSignal",
+            MegaNode::BarrierWait(_) => "BarrierWait",
         }
     }
 
@@ -1614,6 +2383,462 @@ mod tests {
         assert_eq!(n.iters.raw(), 4);
     }
 
+    // ── Sprint D: Embed / Scalar / Gemm / lm_head / Attn / Barrier
+
+    fn d_budget() -> SubstrateBudget {
+        // Sprint D's lm_head fusion + attention need a richer
+        // budget: 8 pages (delta + residual + norm_w + lin_w + out
+        // + room for the slot-allocator's distinct picks), 8 KiB
+        // scratch (split for partial_sums + B-tile / score + PV),
+        // 4 cross-CTA edges for barrier tests.
+        SubstrateBudget::new(8, 8, 32_768, 8_192).with_num_edges(4)
+    }
+
+    #[test]
+    fn lowers_embed() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_embed(0, 1, "Weights::embed_tokens".to_string());
+        let tape = b.finish();
+        let MegaNode::Embed(n) = &tape.nodes()[0] else {
+            panic!("expected Embed");
+        };
+        assert_eq!(n.out_page.raw(), 0);
+        assert_eq!(n.embed_weight_page.raw(), 1);
+        assert_eq!(n.embed_weight.path(), "Weights::embed_tokens");
+    }
+
+    #[test]
+    fn lowers_scalar_mul_finite_scale() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_scalar_mul(0, 1, 0.5);
+        let tape = b.finish();
+        let MegaNode::ScalarMul(n) = &tape.nodes()[0] else {
+            panic!("expected ScalarMul");
+        };
+        assert_eq!(n.scale.raw(), 0.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "FiniteF32 rejects non-finite value: NaN")]
+    fn scalar_mul_rejects_nan_scale() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_scalar_mul(0, 1, f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "FiniteF32 rejects non-finite value: inf")]
+    fn scalar_mul_rejects_inf_scale() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_scalar_mul(0, 1, f32::INFINITY);
+    }
+
+    #[test]
+    fn lowers_tanh_soft_cap() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_tanh_soft_cap(0, 1);
+        let tape = b.finish();
+        let MegaNode::TanhSoftCap(_) = &tape.nodes()[0] else {
+            panic!("expected TanhSoftCap");
+        };
+    }
+
+    #[test]
+    fn lowers_scalar_offset_rms_norm() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_scalar_offset_rms_norm(0, 1, 5, 16, "W::norm".to_string(), 0, 1.0);
+        let tape = b.finish();
+        let MegaNode::ScalarOffsetRmsNorm(n) = &tape.nodes()[0] else {
+            panic!("expected ScalarOffsetRmsNorm");
+        };
+        assert_eq!(n.layer.raw(), 5);
+        assert_eq!(n.weight.path(), "W::norm");
+        assert_eq!(n.offset.raw(), 1.0);
+    }
+
+    #[test]
+    fn lowers_gemm() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_gemm(
+            0,
+            1,
+            2,
+            3,
+            16,
+            "W::gemm".to_string(),
+            /*n=*/ 4096,
+            /*k=*/ 2048,
+            /*iters=*/ 4,
+            /*b_tile_off=*/ 0,
+            /*b_tile_bytes=*/ 4_096,
+        );
+        let tape = b.finish();
+        let MegaNode::Gemm(n) = &tape.nodes()[0] else {
+            panic!("expected Gemm");
+        };
+        assert_eq!(n.shape.n, 4096);
+        assert_eq!(n.shape.k, 2048);
+        assert_eq!(n.iters.raw(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "MatmulShape: n must be > 0")]
+    fn gemm_rejects_zero_n() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_gemm(0, 1, 2, 0, 16, "W".to_string(), 0, 16, 1, 0, 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "MatmulShape: k must be > 0")]
+    fn gemm_rejects_zero_k() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_gemm(0, 1, 2, 0, 16, "W".to_string(), 16, 0, 1, 0, 64);
+    }
+
+    #[test]
+    fn lowers_lm_head_rms_norm_gemm() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_cutlass_fused_norm_gemm(
+            0,
+            None,
+            1,
+            2,
+            3,
+            0,
+            16,
+            "W::norm".to_string(),
+            "W::lm_head".to_string(),
+            128_000,
+            4_096,
+            1,
+            0,
+            32,
+            4_096,
+            LmHeadNormKind::RmsNorm,
+            None,
+        );
+        let tape = b.finish();
+        let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
+            panic!("expected CutlassFusedNormGemm");
+        };
+        assert_eq!(n.norm_kind, LmHeadNormKind::RmsNorm);
+        assert!(n.delta_page.is_none());
+        assert!(n.offset.is_none());
+    }
+
+    #[test]
+    fn lowers_lm_head_add_scalar_offset_rms_norm_gemm() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_cutlass_fused_norm_gemm(
+            0,
+            Some(1),
+            2,
+            3,
+            4,
+            0,
+            16,
+            "W::norm".to_string(),
+            "W::lm_head".to_string(),
+            128_000,
+            4_096,
+            1,
+            0,
+            32,
+            4_096,
+            LmHeadNormKind::AddScalarOffsetRmsNorm,
+            Some(1.0),
+        );
+        let tape = b.finish();
+        let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
+            panic!("expected CutlassFusedNormGemm");
+        };
+        assert_eq!(n.norm_kind, LmHeadNormKind::AddScalarOffsetRmsNorm);
+        assert!(n.delta_page.is_some());
+        assert_eq!(n.offset.unwrap().raw(), 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "AddScalarOffsetRmsNorm requires Some(offset)")]
+    fn lm_head_rejects_missing_offset_for_scalar_offset_kind() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_cutlass_fused_norm_gemm(
+            0,
+            Some(1),
+            2,
+            3,
+            4,
+            0,
+            16,
+            "W::n".to_string(),
+            "W::l".to_string(),
+            16,
+            16,
+            1,
+            0,
+            32,
+            4_096,
+            LmHeadNormKind::AddScalarOffsetRmsNorm,
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "RmsNorm must not carry an offset")]
+    fn lm_head_rejects_offset_for_rms_norm_kind() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_cutlass_fused_norm_gemm(
+            0,
+            None,
+            1,
+            2,
+            3,
+            0,
+            16,
+            "W::n".to_string(),
+            "W::l".to_string(),
+            16,
+            16,
+            1,
+            0,
+            32,
+            4_096,
+            LmHeadNormKind::RmsNorm,
+            Some(1.0),
+        );
+    }
+
+    #[test]
+    fn lowers_attention_via_cache_full() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_attention_via_cache(
+            0,
+            1,
+            5,
+            16,
+            /*iters=*/ 8,
+            0,
+            4_096,
+            4_096,
+            4_096,
+            AttentionKind::Full,
+            false,
+        );
+        let tape = b.finish();
+        let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {
+            panic!("expected AttentionViaCache");
+        };
+        assert_eq!(n.kv_cache_layer.raw(), 5);
+        assert_eq!(n.iters.raw(), 8);
+        assert!(matches!(n.kind, AttentionKind::Full));
+    }
+
+    #[test]
+    fn lowers_attention_via_cache_sliding() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_attention_via_cache(
+            0,
+            1,
+            5,
+            16,
+            8,
+            0,
+            4_096,
+            4_096,
+            4_096,
+            AttentionKind::Sliding(SlidingWindow::new(1024)),
+            true,
+        );
+        let tape = b.finish();
+        let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {
+            panic!("expected AttentionViaCache");
+        };
+        match n.kind {
+            AttentionKind::Sliding(w) => assert_eq!(w.raw(), 1024),
+            AttentionKind::Full => panic!("expected sliding"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ScratchRegion overlap within scope")]
+    fn attention_rejects_score_pv_scratch_overlap() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_attention_via_cache(
+            0,
+            1,
+            0,
+            16,
+            1,
+            /*score_off=*/ 0,
+            /*score_bytes=*/ 1_024,
+            /*pv_off=*/ 512,
+            /*pv_bytes=*/ 1_024,
+            AttentionKind::Full,
+            false,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SlidingWindow must be > 0")]
+    fn sliding_attention_rejects_zero_window() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_attention_via_cache(
+            0,
+            1,
+            0,
+            16,
+            1,
+            0,
+            1_024,
+            1_024,
+            1_024,
+            AttentionKind::Sliding(SlidingWindow::new(0)),
+            false,
+        );
+    }
+
+    #[test]
+    fn lowers_barrier_signal_and_wait() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_barrier_signal(0);
+        b.push_barrier_wait(0, 4);
+        let tape = b.finish();
+        let MegaNode::BarrierSignal(s) = &tape.nodes()[0] else {
+            panic!("expected BarrierSignal");
+        };
+        assert_eq!(s.edge.raw(), 0);
+        let MegaNode::BarrierWait(w) = &tape.nodes()[1] else {
+            panic!("expected BarrierWait");
+        };
+        assert_eq!(w.edge.raw(), 0);
+        assert_eq!(w.expected.raw(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "EdgeId 4 out of substrate budget num_edges=4")]
+    fn barrier_signal_rejects_out_of_bounds_edge() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_barrier_signal(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "ExpectedCount: BarrierWait count must be > 0")]
+    fn barrier_wait_rejects_zero_count() {
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_barrier_wait(0, 0);
+    }
+
+    #[test]
+    fn barriers_do_not_advance_arrives() {
+        // BarrierSignal/Wait operate on cross-CTA gmem atomics —
+        // they do NOT bump the per-CTA mbarrier arrive count.
+        // After two barriers, the next op's consumer phase should
+        // still match an empty cumulative count.
+        let mut b = MegaTapeBuilder::new(d_budget());
+        b.push_barrier_signal(0);
+        b.push_barrier_wait(0, 4);
+        b.push_rms_norm(0, 1, 0, 16, "W::n".to_string(), 0);
+        let tape = b.finish();
+        let MegaNode::RmsNorm(n) = &tape.nodes()[2] else {
+            panic!("expected RmsNorm at idx 2");
+        };
+        assert_eq!(n.consumer_phase.phase(), 0);
+    }
+
+    #[test]
+    fn lower_embed_round_trip() {
+        let ops = vec![OpInput::new(
+            Instruction::Embed(0),
+            vec!["W::embed".to_string()],
+        )];
+        let tape = lower(&ops, 16, d_budget()).expect("good Embed");
+        let MegaNode::Embed(_) = &tape.nodes()[0] else {
+            panic!("expected Embed");
+        };
+    }
+
+    #[test]
+    fn lower_scalar_mul_round_trip() {
+        let ops = vec![OpInput::new(Instruction::ScalarMul(0, 1, 2.5), Vec::new())];
+        let tape = lower(&ops, 16, d_budget()).expect("good ScalarMul");
+        let MegaNode::ScalarMul(n) = &tape.nodes()[0] else {
+            panic!("expected ScalarMul");
+        };
+        assert_eq!(n.scale.raw(), 2.5);
+    }
+
+    #[test]
+    fn lower_gemm_round_trip() {
+        let mut op = OpInput::new(
+            Instruction::Gemm(0, 1, 5, 4_096, 2_048),
+            vec!["W::gemm".to_string()],
+        );
+        op.iters = 4;
+        let tape = lower(&[op], 16, d_budget()).expect("good Gemm");
+        let MegaNode::Gemm(n) = &tape.nodes()[0] else {
+            panic!("expected Gemm");
+        };
+        assert_eq!(n.iters.raw(), 4);
+        assert_eq!(n.shape.n, 4_096);
+    }
+
+    #[test]
+    fn lower_lm_head_rms_norm_gemm_round_trip() {
+        let mut op = OpInput::new(
+            Instruction::CutlassFusedRmsNormGemm(
+                0, 1, 0, /*tile_m=*/ 0, /*tile_n=*/ 0, /*stages=*/ 0, 128_000, 4_096,
+            ),
+            vec!["W::norm".to_string(), "W::lm_head".to_string()],
+        );
+        op.iters = 1;
+        let tape = lower(&[op], 16, d_budget()).expect("good lm_head fusion");
+        let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
+            panic!("expected CutlassFusedNormGemm");
+        };
+        assert_eq!(n.norm_kind, LmHeadNormKind::RmsNorm);
+    }
+
+    #[test]
+    fn lower_sliding_attention_requires_window() {
+        // Without sliding_window in OpInput, the lowering errors.
+        let op = OpInput::new(
+            Instruction::SlidingAttentionViaCache(0, 1, 0, false),
+            Vec::new(),
+        );
+        match lower(&[op], 16, d_budget()) {
+            Err(LowerError::MissingSlidingWindow) => {}
+            other => panic!("expected MissingSlidingWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_sliding_attention_with_window_round_trip() {
+        let mut op = OpInput::new(
+            Instruction::SlidingAttentionViaCache(0, 1, 5, true),
+            Vec::new(),
+        );
+        op.iters = 4;
+        op.sliding_window = Some(2_048);
+        let tape = lower(&[op], 16, d_budget()).expect("good sliding attn");
+        let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {
+            panic!("expected AttentionViaCache");
+        };
+        match n.kind {
+            AttentionKind::Sliding(w) => assert_eq!(w.raw(), 2_048),
+            AttentionKind::Full => panic!("expected sliding"),
+        }
+    }
+
+    #[test]
+    fn lower_barrier_round_trip() {
+        let ops = vec![
+            OpInput::new(Instruction::BarrierSignal(0), Vec::new()),
+            OpInput::new(Instruction::BarrierWait(0, 8), Vec::new()),
+        ];
+        let tape = lower(&ops, 16, d_budget()).expect("good barriers");
+        assert_eq!(tape.nodes().len(), 2);
+        assert!(matches!(tape.nodes()[0], MegaNode::BarrierSignal(_)));
+        assert!(matches!(tape.nodes()[1], MegaNode::BarrierWait(_)));
+    }
+
     #[test]
     fn lower_chains_add_rms_silu() {
         // Mini transformer-block tail: residual fold → norm → MLP
@@ -1646,7 +2871,7 @@ mod tests {
                 MegaNode::Add(a) => a.consumer_phase.phase(),
                 MegaNode::FusedAddRmsNorm(f) => f.consumer_phase.phase(),
                 MegaNode::FusedGateUpActivateMul(f) => f.consumer_phase.phase(),
-                MegaNode::RmsNorm(_) | MegaNode::FusedQkvRopeCache(_) => unreachable!(),
+                other => panic!("unexpected node {other:?}", other = node_kind(other)),
             })
             .collect();
         assert_eq!(phases, vec![0, 1, 0]);

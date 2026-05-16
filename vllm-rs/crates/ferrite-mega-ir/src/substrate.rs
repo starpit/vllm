@@ -459,6 +459,47 @@ impl sealed::Sealed for RmsNormScope {}
 impl IsScratchScope for RmsNormScope {}
 impl IsScratchScopePub for RmsNormScope {}
 
+/// Scratch scope for `FusedQkvRopeCache`. Per-token-iter rotation
+/// buffers (Q-rope, K-rope tiles holding `cos*x - sin*y` /
+/// `sin*x + cos*y` in shmem before the gemm-bias add) live here.
+/// Multiple regions in this scope MUST be `disjoint_with` —
+/// Sprint B's bug class #4 enforcement.
+pub struct RopeScope;
+impl sealed::Sealed for RopeScope {}
+impl IsScratchScope for RopeScope {}
+impl IsScratchScopePub for RopeScope {}
+
+// ============================================================
+// IterCount — typed iteration count for per-iter phase math.
+// Construction enforces > 0 (a 0-iter op is meaningless and would
+// short-circuit phase advance, leaving the cumulative arrive count
+// in a state inconsistent with what the next op expects).
+//
+// Used by variants whose kernel body iterates over tokens (or other
+// units) inside a single op. The arrive count advances by
+// `iters * arrives_per_iter` after the op completes; the lowering
+// uses `IterCount::raw()` to compute that bump.
+// ============================================================
+
+/// Typed iteration count for the per-iter loop inside a multi-iter
+/// op (today: `FusedQkvRopeCache` iterates once per token).
+/// Construction panics if `iters == 0` (bug class #3 — a 0-iter op
+/// would skip every per-iter arrive and leave the cumulative arrive
+/// count desynchronized from the next op's expected phase parity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IterCount(u32);
+
+impl IterCount {
+    pub fn new(iters: u32) -> Self {
+        assert!(iters > 0, "IterCount: iters must be > 0 (got {iters})");
+        Self(iters)
+    }
+
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 // ============================================================
 // Tests — confirm the substrate-proof construction-time panics
 // fire as documented.

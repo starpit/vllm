@@ -18,8 +18,8 @@
 #![allow(dead_code)]
 
 use crate::substrate::{
-    MbarrierPhase, PageId, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope,
-    ScratchRegion, WarpRoleTag,
+    IterCount, MbarrierPhase, PageId, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER,
+    RmsNormScope, RopeScope, ScratchRegion, WarpRoleTag,
 };
 
 /// Helper newtype: layer index for runtime weight-pointer
@@ -119,11 +119,115 @@ pub struct RmsNorm {
     pub weight: WeightRef,
 }
 
+/// Helper newtype: per-arch rotary cache accessor — distinguishes
+/// the global rotary (`wm.rotary.cos_sin_cache`) from per-layer
+/// local rotary (`wm.rotary_local.cos_sin_cache`) on archs that
+/// carry both (Gemma3). Construction enforces non-empty path.
+/// Not load-bearing on its own (per `MEGA_IR_PLAN.md` §3, §4).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RotaryRef(String);
+
+impl RotaryRef {
+    pub fn new(path: String) -> Self {
+        assert!(
+            !path.trim().is_empty(),
+            "RotaryRef must be a non-empty path string",
+        );
+        Self(path)
+    }
+
+    pub fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The typed lowered FusedQkvRopeCache variant.
+///
+/// Substrate proofs (load-bearing):
+///
+/// **Six page slots, each walked Empty → Filled → Produced → Empty**
+/// at proc-macro construction time, so the recorded `PageId`s are
+/// witness to a valid lifecycle (bug class #2):
+///
+/// - `in_page`: post-norm activation row feeding the QKV gemm.
+/// - `qkv_weight_page`: packed Q/K/V projection weights (single
+///   accessor; the LinearLayer wrapper packs the three projections
+///   into one buffer at load time).
+/// - `cos_sin_page`: rotary cos/sin cache page.
+/// - `q_out_page`, `k_out_page`, `v_out_page`: per-token outputs.
+///   Q goes to the next op (attention); K/V additionally write to
+///   the global paged KV cache (the `kv_cache_layer` extern; not
+///   substrate-managed because it lives in HBM, not shmem-pages).
+///
+/// `PageId::raw()` is bounds-validated against
+/// `SubstrateBudget::num_pages` (bug class #1).
+///
+/// **Two scratch regions, both in `RopeScope`, validated disjoint**
+/// at proc-macro time (bug class #4):
+///
+/// - `q_rope_buf`: per-token Q rotation tile in shmem.
+/// - `k_rope_buf`: per-token K rotation tile in shmem.
+///
+/// Each is independently validated within `SubstrateBudget::scratch_bytes`
+/// (bug class #5); their disjointness is checked via
+/// [`ScratchRegion::disjoint_with`].
+///
+/// **Per-iter mbarrier phases** (bug class #3):
+///
+/// - `consumer_phase`: parity at iter 0 of the consumer wait. The
+///   lowering proves this matches the cumulative arrive count at
+///   op start.
+/// - `storer_phase`: parity at iter 0 of the storer wait. Lowered
+///   to `(arrives + 1) & 1` — the storer waits AFTER the consumer
+///   arrives.
+/// - `iters`: per-token iteration count (one consumer arrive per
+///   token-iter, so the cumulative arrive count advances by
+///   `iters.raw() * 1` after this op completes).
+///
+/// The kernel-internal `phase ^= 1` advances per iter; given the
+/// initial phase parity matches the start-of-op cumulative count
+/// and `arrives_per_iter == 1`, the kernel-internal phase at iter
+/// `t` matches `(C_start + t) & 1` — the parity the hardware
+/// barrier expects (proof: `(a+b) & 1 == (a&1) ^ (b&1)`).
+///
+/// **Warp role tags** (bug class #6): all four roles claimed; mis-
+/// pairing across roles in the variant declaration is rejected by
+/// the sealed-trait bound on `WarpRoleTag<R>` at the field level.
+///
+/// Helper fields (alongside, not load-bearing):
+/// - `layer`: emit-time layer index for weight-pointer resolution.
+/// - `qkv_weight`: weight accessor path (LinearLayer holding packed Q/K/V).
+/// - `rotary`: rotary accessor path (global or local cos/sin cache).
+/// - `biased`: dense bias attached (Qwen2-family) vs no bias (Llama).
+/// - `interleaved`: interleaved-rope half-rotation pattern.
+pub struct FusedQkvRopeCache {
+    pub in_page: PageId,
+    pub qkv_weight_page: PageId,
+    pub cos_sin_page: PageId,
+    pub q_out_page: PageId,
+    pub k_out_page: PageId,
+    pub v_out_page: PageId,
+    pub q_rope_buf: ScratchRegion<RopeScope>,
+    pub k_rope_buf: ScratchRegion<RopeScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub iters: IterCount,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub layer: LayerIndex,
+    pub qkv_weight: WeightRef,
+    pub rotary: RotaryRef,
+    pub biased: bool,
+    pub interleaved: bool,
+}
+
 /// The typed lowered MegaNode enum. One variant per migrated op.
 ///
-/// Sprint A populates `RmsNorm`. Subsequent sprints add variants
-/// per the plan §10 table. The `_Reserved` variant is gone — the
-/// enum is non-empty without it.
+/// Sprint A populates `RmsNorm`. Sprint B adds `FusedQkvRopeCache`.
+/// Subsequent sprints add the rest per the plan §10 table.
 pub enum MegaNode {
     RmsNorm(RmsNorm),
+    FusedQkvRopeCache(FusedQkvRopeCache),
 }

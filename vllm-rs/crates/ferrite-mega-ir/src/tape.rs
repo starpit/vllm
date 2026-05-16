@@ -16,12 +16,23 @@
 
 #![allow(dead_code)]
 
+use std::fmt;
+
 use crate::nodes::MegaNode;
 use crate::substrate::SubstrateBudget;
 
 pub struct MegaTape {
     nodes: Vec<MegaNode>,
     substrate: SubstrateBudget,
+}
+
+impl fmt::Debug for MegaTape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MegaTape")
+            .field("nodes", &self.nodes.len())
+            .field("substrate", &self.substrate)
+            .finish()
+    }
 }
 
 impl MegaTape {

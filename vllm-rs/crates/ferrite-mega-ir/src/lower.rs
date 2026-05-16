@@ -57,7 +57,7 @@ use crate::nodes::{
     Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
     Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,
     Gemm, LmHeadNormKind, MegaNode, RmsNorm, RotaryRef, ScalarMul, ScalarOffsetRmsNorm,
-    TanhSoftCap, WeightRef,
+    SpliceMmEmbeds, TanhSoftCap, WeightRef,
 };
 use crate::substrate::{PagePool, SubstrateBudget};
 use crate::tape::MegaTape;
@@ -742,6 +742,25 @@ impl<
         for _ in 0..ITERS {
             self.arrives.bump();
         }
+        self
+    }
+
+    /// Push a typed `SpliceMmEmbeds`.
+    pub fn push_splice_mm_embeds<
+        const SLOT_ID: u32,
+        const CONSUMER_PHASE: u32,
+        const STORER_PHASE: u32,
+        const ARRIVES: u32,
+    >(
+        &mut self,
+    ) -> &mut Self {
+        self.verify_arrives(ARRIVES, "push_splice_mm_embeds");
+        let _ = self.pool.take(SLOT_ID);
+        let node =
+            SpliceMmEmbeds::new::<SLOT_ID, CONSUMER_PHASE, STORER_PHASE, NUM_PAGES, ARRIVES>();
+        self.nodes.push(MegaNode::SpliceMmEmbeds(node));
+        self.pool.release(SLOT_ID);
+        self.arrives.bump();
         self
     }
 

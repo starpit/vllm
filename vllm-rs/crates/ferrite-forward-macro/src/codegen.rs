@@ -4779,31 +4779,888 @@ type MegaArtifacts = (
 );
 
 fn emit_mega_artifacts_inline(
-    _model: &ModelParams,
-    _canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
+    model: &ModelParams,
+    canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
 ) -> MegaArtifacts {
-    // Const-generic dispatch lands when the syntactic emit step does
-    // (Phase C). The mega-ir crate now uses const-generic primitives
-    // so substrate-proof bounds are checked at MONOMORPHIZATION time
-    // (rustc E0080 on the user's `#[forward]` for bad const args).
-    // The runtime-walking `ferrite_mega_ir::lower(...)` is fundamentally
-    // incompatible with that model — it would have to pass `op.in_slot`
-    // (runtime u32) as a const-generic, which stable Rust doesn't
-    // support. Per `MEGA_IR_PLAN.md` §C, the proc-macro will eventually
-    // emit literal `builder.push_*::<0, 1, ...>(weight)` calls at
-    // expansion time, with every const arg known statically.
+    // Phase C step 1 (per `MEGA_IR_PLAN.md` §5+§C): for each
+    // canonical, emit a `build_mega_tape_<canonical>() -> MegaTape`
+    // fn whose body is a sequence of literal-const-arg builder
+    // calls. Compiling that fn at the user's `#[forward]` site
+    // monomorphizes every `push_*::<...>` call with concrete const
+    // generics, firing the `const { assert!(...) }` blocks in mega-ir's
+    // primitives. Bad const args → rustc E0080 on the user's build.
     //
-    // For now this emit_mega_artifacts_inline is a stub. The
-    // compile-time guarantees of MegaIR are now structurally there at
-    // the API level — anyone calling `MegaTapeBuilder::push_*::<...>`
-    // gets monomorphization-time substrate-proof verification. The
-    // proc-macro's actual emission of those calls is Phase C work.
+    // Each canonical either lifts cleanly (every Instruction in its
+    // typed `Vec<Instruction>` has a const-generic builder method
+    // that the dispatcher knows how to emit) — in which case we emit
+    // `build_mega_tape_<canonical>` — or one of its ops is
+    // un-handled and we skip the canonical with an `eprintln!` (host
+    // fallback). Lifting every variant llama / qwen / gemma uses is
+    // ongoing work; today most canonicals will skip.
+    let num_layers = model.bounds.get("num_hidden_layers").copied().unwrap_or(0) as u32;
+
+    let mut rust_decls = TokenStream::new();
+    let mut emitted_count: u32 = 0;
+    let mut skipped_count: u32 = 0;
+
+    for (wp, (lowered, _num_slots, _backbone_slot, _terminal_slot)) in canonical_lowered {
+        let canonical_name = format!(
+            "{}_m_{}_sk_{}",
+            model
+                .source_stem
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>(),
+            wp.num_tokens,
+            wp.sk_bucket
+        );
+
+        match emit_canonical_build_fn(&canonical_name, lowered, num_layers) {
+            Ok(tokens) => {
+                rust_decls.extend(tokens);
+                emitted_count += 1;
+                eprintln!(
+                    "ferrite-mega-ir: emitted build_mega_tape_{canonical_name} (compile-time substrate proofs at user build)"
+                );
+            }
+            Err(reason) => {
+                skipped_count += 1;
+                eprintln!("ferrite-mega-ir: skipped {canonical_name}: {reason} (host fallback)");
+            }
+        }
+    }
+
+    eprintln!(
+        "ferrite-mega-ir: phase-c step 1 — {emitted_count} canonical(s) emitted, {skipped_count} skipped"
+    );
+
+    // Phase C step 2 (emit `.cu` per build_mega_tape fn) and step 3
+    // (populate MEGA_FORWARD_TABLE) follow. For now emit zero
+    // dispatch entries so every canonical falls back to the host
+    // interpreter at runtime.
     (
-        TokenStream::new(),
+        rust_decls,
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
     )
+}
+
+/// Per-canonical state threaded through the dispatch walk. Tracks
+/// the cumulative arrive count (for phase parity / `ARRIVES` const
+/// generics) and a slot allocator for synthesizing non-aliasing
+/// weight / intermediate page ids when the `Instruction` only
+/// supplies in/out slots.
+struct PhaseCState {
+    arrives: u32,
+    /// Next page id to hand out (mod num_pages_budget, skipping
+    /// excluded ids). Synthesized at expansion time, baked into
+    /// the emitted const-generic call as a literal.
+    next_slot: u32,
+    num_pages_budget: u32,
+    num_consumer_warps: u32,
+    scratch_bytes: u32,
+    num_layers: u32,
+}
+
+impl PhaseCState {
+    fn new(
+        num_pages_budget: u32,
+        num_consumer_warps: u32,
+        scratch_bytes: u32,
+        num_layers: u32,
+    ) -> Self {
+        Self {
+            arrives: 0,
+            next_slot: 0,
+            num_pages_budget,
+            num_consumer_warps,
+            scratch_bytes,
+            num_layers,
+        }
+    }
+
+    /// Allocate the next free page id that doesn't appear in
+    /// `exclude`. Wraps modulo `num_pages_budget`.
+    fn alloc_distinct(&mut self, exclude: &[u32]) -> Result<u32, String> {
+        for _ in 0..self.num_pages_budget {
+            let id = self.next_slot % self.num_pages_budget;
+            self.next_slot = (self.next_slot + 1) % self.num_pages_budget;
+            if !exclude.contains(&id) {
+                return Ok(id);
+            }
+        }
+        Err(format!(
+            "slot allocator exhausted (num_pages_budget={} all in exclude={:?})",
+            self.num_pages_budget, exclude
+        ))
+    }
+}
+
+/// Emit `fn build_mega_tape_<canonical>() -> ::ferrite_mega_ir::MegaTape`
+/// whose body is a literal-const-arg sequence of `MegaTapeBuilder`
+/// pushes — one per `Instruction` in the canonical's typed tape.
+///
+/// Returns `Err(reason)` if any instruction can't be dispatched
+/// (variant not yet wired through the const-generic builder API).
+/// The caller `eprintln!`s the reason and skips the canonical.
+fn emit_canonical_build_fn(
+    canonical_name: &str,
+    lowered: &CanonicalLowered,
+    num_layers: u32,
+) -> Result<TokenStream, String> {
+    // Substrate budget. Sprint E task: derive these from the
+    // canonical's actual schedule walker outputs. For now use
+    // generous defaults that fit llama / qwen / gemma tape demands.
+    const NUM_PAGES: u32 = 32;
+    const NUM_CONSUMER_WARPS: u32 = 8;
+    const PAGE_SIZE: u32 = 32_768;
+    const SCRATCH_BYTES: u32 = 32_768;
+    let num_edges: u32 = count_barrier_edges(&lowered.backbone.instances)
+        + count_barrier_edges(&lowered.lm_head.instances);
+
+    let mut state = PhaseCState::new(NUM_PAGES, NUM_CONSUMER_WARPS, SCRATCH_BYTES, num_layers);
+    let mut body = TokenStream::new();
+
+    // Emit pushes for backbone + lm_head with Loop expansion.
+    let backbone_tokens =
+        emit_slice_with_loop_expansion("backbone", &lowered.backbone, &mut state)?;
+    body.extend(backbone_tokens);
+    let lm_head_tokens = emit_slice_with_loop_expansion("lm_head", &lowered.lm_head, &mut state)?;
+    body.extend(lm_head_tokens);
+
+    let fn_name = format_ident!("build_mega_tape_{}", canonical_name);
+    let num_pages_lit = proc_macro2::Literal::u32_unsuffixed(NUM_PAGES);
+    let num_warps_lit = proc_macro2::Literal::u32_unsuffixed(NUM_CONSUMER_WARPS);
+    let page_size_lit = proc_macro2::Literal::u32_unsuffixed(PAGE_SIZE);
+    let scratch_lit = proc_macro2::Literal::u32_unsuffixed(SCRATCH_BYTES);
+    let num_edges_lit = proc_macro2::Literal::u32_unsuffixed(num_edges);
+
+    Ok(quote! {
+        /// Compile-time-substrate-proof-bearing MegaTape constructor.
+        /// Phase C step 1: every `push_*::<...>` call below is
+        /// monomorphized at THIS user's compile time, firing the
+        /// `const { assert!(...) }` blocks in `ferrite_mega_ir`'s
+        /// const-generic primitives. Bad const args → rustc E0080.
+        #[allow(dead_code, clippy::let_and_return)]
+        pub fn #fn_name() -> ::ferrite_mega_ir::MegaTape {
+            let mut b: ::ferrite_mega_ir::MegaTapeBuilder<
+                #num_pages_lit, #num_warps_lit, #page_size_lit, #scratch_lit, #num_edges_lit,
+            > = ::ferrite_mega_ir::MegaTapeBuilder::new();
+            #body
+            b.finish()
+        }
+    })
+}
+
+/// Walk one bucket slice (backbone or lm_head), expanding `Loop`
+/// ops at proc-macro time into N copies of the body. Each body op
+/// gets `layer_override = iter` so the const-generic `LAYER` literal
+/// matches the per-iter expectation. Cumulative arrive count is
+/// threaded through `state` and increments naturally per push.
+fn emit_slice_with_loop_expansion(
+    label: &str,
+    bucket: &crate::interpreter_codegen::LoweredBucket,
+    state: &mut PhaseCState,
+) -> Result<TokenStream, String> {
+    let mut out = TokenStream::new();
+    let mut i = 0;
+    while i < bucket.instances.len() {
+        let instr = bucket.instances[i];
+        match instr {
+            ferrite_forward::Instruction::Loop(count, body_len) => {
+                let body_start = i + 1;
+                let body_end = body_start + body_len as usize;
+                if body_end > bucket.instances.len() {
+                    return Err(format!(
+                        "{label}[{i}] Loop({count}, {body_len}): body extends past slice end"
+                    ));
+                }
+                // Unroll: emit count copies of the body, each with
+                // layer_override = iter. ARRIVES cumulative across
+                // iters via `state.arrives` (each dispatch bumps it).
+                for iter in 0..count {
+                    for body_off in 0..body_len as usize {
+                        let body_idx = body_start + body_off;
+                        let body_instr = bucket.instances[body_idx];
+                        let weight_paths: Vec<String> = bucket
+                            .weight_slots
+                            .get(body_idx)
+                            .map(|slots| slots.iter().map(|s| s.base.to_string()).collect())
+                            .unwrap_or_default();
+                        let normalized = normalize_tk_prefix(body_instr);
+                        let push_tokens = dispatch_instruction_to_push(
+                            &normalized,
+                            &weight_paths,
+                            state,
+                            Some(iter),
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "{label}[loop iter {iter} body[{body_off}]] {}: {e}",
+                                instruction_kind(&normalized)
+                            )
+                        })?;
+                        out.extend(push_tokens);
+                    }
+                }
+                i = body_end;
+            }
+            ferrite_forward::Instruction::Alias(_, _) | ferrite_forward::Instruction::Free(_) => {
+                // Alias / Free are tile-table runtime control ops —
+                // no megakernel substrate effect. Skip in Phase C
+                // emission; the runtime host interpreter still
+                // honors them.
+                i += 1;
+            }
+            _ => {
+                let weight_paths: Vec<String> = bucket
+                    .weight_slots
+                    .get(i)
+                    .map(|slots| slots.iter().map(|s| s.base.to_string()).collect())
+                    .unwrap_or_default();
+                let normalized = normalize_tk_prefix(instr);
+                let push_tokens =
+                    dispatch_instruction_to_push(&normalized, &weight_paths, state, None).map_err(
+                        |e| format!("{label}[{i}] {}: {e}", instruction_kind(&normalized)),
+                    )?;
+                out.extend(push_tokens);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Count `BarrierSignal` ops in a tape — used to size
+/// `SubstrateBudget::NUM_EDGES`. Wait ops reuse the same edge ids
+/// signal ops do, so counting signals only is sufficient.
+fn count_barrier_edges(instrs: &[ferrite_forward::Instruction]) -> u32 {
+    use ferrite_forward::Instruction as I;
+    instrs
+        .iter()
+        .filter(|i| matches!(i, I::BarrierSignal(_)))
+        .count() as u32
+}
+
+/// Stable variant name string for diagnostics.
+fn instruction_kind(instr: &ferrite_forward::Instruction) -> &'static str {
+    use ferrite_forward::Instruction as I;
+    match instr {
+        I::RmsNorm(..) => "RmsNorm",
+        I::FusedQkvRopeCache(..) => "FusedQkvRopeCache",
+        I::Add(..) => "Add",
+        I::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
+        I::FusedGateUpSiluMul(..) => "FusedGateUpSiluMul",
+        I::FusedGateUpGeluMul(..) => "FusedGateUpGeluMul",
+        I::Embed(..) => "Embed",
+        I::ScalarMul(..) => "ScalarMul",
+        I::TanhSoftCap(..) => "TanhSoftCap",
+        I::ScalarOffsetRmsNorm(..) => "ScalarOffsetRmsNorm",
+        I::Gemm(..) => "Gemm",
+        I::CutlassFusedRmsNormGemm(..) => "CutlassFusedRmsNormGemm",
+        I::CutlassFusedAddRmsNormGemm(..) => "CutlassFusedAddRmsNormGemm",
+        I::CutlassFusedAddScalarOffsetRmsNormGemm(..) => "CutlassFusedAddScalarOffsetRmsNormGemm",
+        I::CutlassFusedMeanSubRmsNormGemm(..) => "CutlassFusedMeanSubRmsNormGemm",
+        I::AttentionViaCache(..) => "AttentionViaCache",
+        I::SlidingAttentionViaCache(..) => "SlidingAttentionViaCache",
+        I::BarrierSignal(..) => "BarrierSignal",
+        I::BarrierWait(..) => "BarrierWait",
+        I::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
+        I::Loop(..) => "Loop",
+        I::Alias(..) => "Alias",
+        I::Free(..) => "Free",
+        I::Reshape(..) => "Reshape",
+        I::FusedAddRmsNormWithOffset(..) => "FusedAddRmsNormWithOffset",
+        I::MeanSubRmsNorm(..) => "MeanSubRmsNorm",
+        I::MeanSubRmsNormBiasAdd(..) => "MeanSubRmsNormBiasAdd",
+        I::FusedCublasGemmAdd(..) => "FusedCublasGemmAdd",
+        I::FusedGemmBias(..) => "FusedGemmBias",
+        I::FusedQkvRopePrefill(..) => "FusedQkvRopePrefill",
+        I::FusedQkvQkNormRopeCache(..) => "FusedQkvQkNormRopeCache",
+        I::AttentionPrefillContiguous(..) => "AttentionPrefillContiguous",
+        I::EncoderAttention(..) => "EncoderAttention",
+        I::SlidingAttentionPrefillContiguous(..) => "SlidingAttentionPrefillContiguous",
+        I::VarlenAttention(..) => "VarlenAttention",
+        I::VisionRope(..) => "VisionRope",
+        I::QuickGelu(..) => "QuickGelu",
+        I::Gelu(..) => "Gelu",
+        I::PosEmbed(..) => "PosEmbed",
+        I::LoadPixels(..) => "LoadPixels",
+        I::GeluErf(..) => "GeluErf",
+        I::EmbeddingGather(..) => "EmbeddingGather",
+        I::AvgPool2d(..) => "AvgPool2d",
+        I::StripCls(..) => "StripCls",
+        I::FlashInferAttentionDecode(..) => "FlashInferAttentionDecode",
+        I::FlashInferAttentionPrefill(..) => "FlashInferAttentionPrefill",
+        I::RopeAppend(..) => "RopeAppend",
+        I::MlaSplit(..) => "MlaSplit",
+        I::MlaAttention(..) => "MlaAttention",
+        I::DeepSeekMoe(..) => "DeepSeekMoe",
+        I::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
+        I::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
+        I::FusedMoe(..) => "FusedMoe",
+        I::SharedFusedMoe(..) => "SharedFusedMoe",
+        I::CutlassGemm(..) => "CutlassGemm",
+        I::CutlassGemmSplitK(..) => "CutlassGemmSplitK",
+        I::CutlassGemmAdd(..) => "CutlassGemmAdd",
+        I::CutlassGemv(..) => "CutlassGemv",
+        I::CutlassFusedGemmBias(..) => "CutlassFusedGemmBias",
+        I::CutlassFusedGateUpSiluMul(..) => "CutlassFusedGateUpSiluMul",
+        I::CutlassFusedGateUpGeluMul(..) => "CutlassFusedGateUpGeluMul",
+        I::CutlassFusedQkvRopeCache(..) => "CutlassFusedQkvRopeCache",
+        I::CutlassFusedQkvRopePrefill(..) => "CutlassFusedQkvRopePrefill",
+        I::MarlinGemm(..) => "MarlinGemm",
+        I::MarlinFusedGateUpSiluMul(..) => "MarlinFusedGateUpSiluMul",
+        I::MarlinFusedGateUpGeluMul(..) => "MarlinFusedGateUpGeluMul",
+        I::MarlinFusedQkvRopeCache(..) => "MarlinFusedQkvRopeCache",
+        I::MarlinFusedQkvRopePrefill(..) => "MarlinFusedQkvRopePrefill",
+        I::Bnb4Gemm(..) => "Bnb4Gemm",
+        I::Bnb4FusedGateUpSiluMul(..) => "Bnb4FusedGateUpSiluMul",
+        I::Bnb4FusedGateUpGeluMul(..) => "Bnb4FusedGateUpGeluMul",
+        I::Bnb4FusedQkvRopeCache(..) => "Bnb4FusedQkvRopeCache",
+        I::Bnb4FusedQkvRopePrefill(..) => "Bnb4FusedQkvRopePrefill",
+        I::GgmlGemm(..) => "GgmlGemm",
+        I::GgmlFusedGateUpSiluMul(..) => "GgmlFusedGateUpSiluMul",
+        I::GgmlFusedGateUpGeluMul(..) => "GgmlFusedGateUpGeluMul",
+        I::GgmlFusedQkvRopeCache(..) => "GgmlFusedQkvRopeCache",
+        I::GgmlFusedQkvRopePrefill(..) => "GgmlFusedQkvRopePrefill",
+        I::Fp8Gemm(..) => "Fp8Gemm",
+        I::Fp8FusedGemmBias(..) => "Fp8FusedGemmBias",
+        I::Fp8FusedGateUpSiluMul(..) => "Fp8FusedGateUpSiluMul",
+        I::Fp8FusedGateUpGeluMul(..) => "Fp8FusedGateUpGeluMul",
+        I::Fp8FusedQkvRopeCache(..) => "Fp8FusedQkvRopeCache",
+        I::Fp8FusedQkvRopePrefill(..) => "Fp8FusedQkvRopePrefill",
+        I::TkEmbed(..) => "TkEmbed",
+        I::TkScalarMul(..) => "TkScalarMul",
+        I::TkRmsNorm(..) => "TkRmsNorm",
+        I::TkGemm(..) => "TkGemm",
+        I::TkFusedAddRmsNorm(..) => "TkFusedAddRmsNorm",
+        I::TkFusedQkvRopeCache(..) => "TkFusedQkvRopeCache",
+        I::TkAttentionViaCache(..) => "TkAttentionViaCache",
+        I::TkSlidingAttentionViaCache(..) => "TkSlidingAttentionViaCache",
+        I::TkFusedGateUpSiluMul(..) => "TkFusedGateUpSiluMul",
+        I::TkFusedGateUpGeluMul(..) => "TkFusedGateUpGeluMul",
+        I::TkGemmAdd(..) => "TkGemmAdd",
+        I::TkFusedAddRmsNormGemm(..) => "TkFusedAddRmsNormGemm",
+        I::TkScalarOffsetRmsNorm(..) => "TkScalarOffsetRmsNorm",
+        I::TkFusedAddRmsNormWithOffset(..) => "TkFusedAddRmsNormWithOffset",
+        I::TkTanhSoftCap(..) => "TkTanhSoftCap",
+        I::TkFusedAddScalarOffsetRmsNormGemm(..) => "TkFusedAddScalarOffsetRmsNormGemm",
+        I::TkBarrierSignal(..) => "TkBarrierSignal",
+        I::TkBarrierWait(..) => "TkBarrierWait",
+        I::TkSpliceMmEmbeds(..) => "TkSpliceMmEmbeds",
+        #[cfg(feature = "nccl")]
+        I::AllReduce(..) => "AllReduce",
+        #[cfg(feature = "nccl")]
+        I::AllGather(..) => "AllGather",
+    }
+}
+
+/// Dispatch one `Instruction` to a `b.push_*::<...>(...)` token
+/// stream that, when monomorphized at user-build time, drives the
+/// const-generic builder API.
+///
+/// Returns `Err(...)` for variants whose const-generic builder
+/// dispatch isn't wired yet (the caller skips the entire canonical
+/// to host fallback). Adding a variant here = lifting it for
+/// Phase C step 1 emission.
+// `layer_override`: when `Some(iter)`, the variant's `layer` field
+// is REPLACED by `iter` for the const-generic `LAYER` literal.
+// Used by `emit_slice_with_loop_expansion` to substitute per-iter
+// layer indices into unrolled `Loop` body ops. Variants with no
+// layer field ignore the override.
+fn dispatch_instruction_to_push(
+    instr: &ferrite_forward::Instruction,
+    weight_paths: &[String],
+    state: &mut PhaseCState,
+    layer_override: Option<u32>,
+) -> Result<TokenStream, String> {
+    use ferrite_forward::Instruction as I;
+
+    let lit = proc_macro2::Literal::u32_unsuffixed;
+    let resolved_layer = |default: u32| layer_override.unwrap_or(default);
+
+    match instr {
+        I::RmsNorm(in_slot, _out_slot, layer) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let partial_off = lit(0u32);
+            let partial_bytes = lit(state.num_consumer_warps * 4);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let weight_str = weight.as_str();
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_rms_norm::<
+                    #in_id, #weight_id,
+                    #partial_off, #partial_bytes,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit, #num_layers, #arrives,
+                >(#weight_str.to_string());
+            })
+        }
+        I::Add(delta_slot, residual_slot) => {
+            let delta_id = lit(*delta_slot);
+            let residual_id = lit(*residual_slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_add::<
+                    #delta_id, #residual_id,
+                    #consumer_phase, #storer_phase,
+                    #arrives,
+                >();
+            })
+        }
+        I::Embed(out_slot) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "Embed weight_paths empty".to_string())?;
+            let out_id = lit(*out_slot);
+            let weight_id = lit(state.alloc_distinct(&[*out_slot])?);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            let weight_str = weight.as_str();
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_embed::<
+                    #out_id, #weight_id,
+                    #consumer_phase, #storer_phase,
+                    #arrives,
+                >(#weight_str.to_string());
+            })
+        }
+        I::ScalarMul(in_slot, out_slot, scale) => {
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            let scale_lit = *scale;
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_scalar_mul::<
+                    #in_id, #out_id,
+                    #consumer_phase, #storer_phase,
+                    #arrives,
+                >(#scale_lit);
+            })
+        }
+        I::TanhSoftCap(in_slot, out_slot) => {
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_tanh_soft_cap::<
+                    #in_id, #out_id,
+                    #consumer_phase, #storer_phase,
+                    #arrives,
+                >();
+            })
+        }
+        I::ScalarOffsetRmsNorm(in_slot, _out_slot, layer, offset) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "ScalarOffsetRmsNorm weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let partial_off = lit(0u32);
+            let partial_bytes = lit(state.num_consumer_warps * 4);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let weight_str = weight.as_str();
+            let offset_lit = *offset;
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_scalar_offset_rms_norm::<
+                    #in_id, #weight_id,
+                    #partial_off, #partial_bytes,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit, #num_layers, #arrives,
+                >(#weight_str.to_string(), #offset_lit);
+            })
+        }
+        I::Gemm(in_slot, out_slot, layer, n, k) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "Gemm weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot, *out_slot])?);
+            let b_tile_off = lit(0u32);
+            let b_tile_bytes = lit(state.scratch_bytes);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32); // proc-macro hands op-level iters; revisit when scheduler exposes
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let n_lit = lit(*n);
+            let k_lit = lit(*k);
+            let weight_str = weight.as_str();
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_gemm::<
+                    #in_id, #weight_id, #out_id,
+                    #b_tile_off, #b_tile_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #n_lit, #k_lit,
+                    #num_layers, #arrives,
+                >(#weight_str.to_string());
+            })
+        }
+        I::FusedAddRmsNorm(delta_slot, residual_slot, layer) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "FusedAddRmsNorm weight_paths empty".to_string())?;
+            let delta_id = lit(*delta_slot);
+            let residual_id = lit(*residual_slot);
+            let weight_id = lit(state.alloc_distinct(&[*delta_slot, *residual_slot])?);
+            let partial_off = lit(0u32);
+            let partial_bytes = lit(state.num_consumer_warps * 4);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let weight_str = weight.as_str();
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_fused_add_rms_norm::<
+                    #delta_id, #residual_id, #weight_id,
+                    #partial_off, #partial_bytes,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit, #num_layers, #arrives,
+                >(#weight_str.to_string());
+            })
+        }
+        I::FusedGateUpSiluMul(in_slot, out_slot, layer)
+        | I::FusedGateUpGeluMul(in_slot, out_slot, layer) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "FusedGateUp*Mul weight_paths empty".to_string())?;
+            let activation_path = match instr {
+                I::FusedGateUpSiluMul(..) => quote! { ::ferrite_mega_ir::GateUpActivation::Silu },
+                I::FusedGateUpGeluMul(..) => quote! { ::ferrite_mega_ir::GateUpActivation::Gelu },
+                _ => unreachable!(),
+            };
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot, *out_slot])?);
+            let half = state.scratch_bytes / 2;
+            let gate_off = lit(0u32);
+            let gate_bytes = lit(half);
+            let up_off = lit(half);
+            let up_bytes = lit(half);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let weight_str = weight.as_str();
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_fused_gate_up_activate_mul::<
+                    #in_id, #weight_id, #out_id,
+                    #gate_off, #gate_bytes, #up_off, #up_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #num_layers, #arrives,
+                >(#weight_str.to_string(), #activation_path);
+            })
+        }
+        I::FusedQkvRopeCache(in_slot, _out_slot, layer, biased, interleaved) => {
+            if weight_paths.len() != 2 {
+                return Err(format!(
+                    "FusedQkvRopeCache expected 2 weight_paths (qkv, rotary), got {}",
+                    weight_paths.len()
+                ));
+            }
+            let qkv_path = weight_paths[0].as_str();
+            let rotary_path = weight_paths[1].as_str();
+            let in_id = lit(*in_slot);
+            let qkv_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let cs_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let q_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let k_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let v_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let half = state.scratch_bytes / 2;
+            let q_off = lit(0u32);
+            let q_bytes = lit(half);
+            let k_off = lit(half);
+            let k_bytes = lit(half);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let biased_lit = *biased;
+            let interleaved_lit = *interleaved;
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_fused_qkv_rope_cache::<
+                    #in_id, #qkv_id, #cs_id, #q_id, #k_id, #v_id,
+                    #q_off, #q_bytes, #k_off, #k_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #num_layers, #arrives,
+                >(#qkv_path.to_string(), #rotary_path.to_string(), #biased_lit, #interleaved_lit);
+            })
+        }
+        I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
+            let q_id = lit(*q_slot);
+            let out_id = lit(*attn_out_slot);
+            let half = state.scratch_bytes / 2;
+            let score_off = lit(0u32);
+            let score_bytes = lit(half);
+            let pv_off = lit(half);
+            let pv_bytes = lit(half);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let interleaved_lit = *interleaved;
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_attention_via_cache::<
+                    #q_id, #out_id,
+                    #score_off, #score_bytes, #pv_off, #pv_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #num_layers, #arrives,
+                >(::ferrite_mega_ir::AttentionKind::Full, #interleaved_lit);
+            })
+        }
+        I::SpliceMmEmbeds(slot) => {
+            let slot_lit = lit(*slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let arrives = lit(state.arrives);
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_splice_mm_embeds::<
+                    #slot_lit,
+                    #consumer_phase, #storer_phase,
+                    #arrives,
+                >();
+            })
+        }
+        I::BarrierSignal(edge) => {
+            let edge_lit = lit(*edge);
+            Ok(quote! {
+                b.push_barrier_signal::<#edge_lit>();
+            })
+        }
+        I::BarrierWait(edge, count) => {
+            let edge_lit = lit(*edge);
+            let count_lit = lit(*count);
+            Ok(quote! {
+                b.push_barrier_wait::<#edge_lit, #count_lit>();
+            })
+        }
+        I::CutlassFusedRmsNormGemm(in_slot, out_slot, layer, _tile_m, _tile_n, _stages, n, k) => {
+            emit_lm_head_no_delta(
+                *in_slot,
+                *out_slot,
+                *layer,
+                *n,
+                *k,
+                quote! { ::ferrite_mega_ir::LmHeadNormKind::RmsNorm },
+                weight_paths,
+                state,
+            )
+        }
+        I::CutlassFusedMeanSubRmsNormGemm(
+            in_slot,
+            out_slot,
+            layer,
+            _tile_m,
+            _tile_n,
+            _stages,
+            n,
+            k,
+        ) => emit_lm_head_no_delta(
+            *in_slot,
+            *out_slot,
+            *layer,
+            *n,
+            *k,
+            quote! { ::ferrite_mega_ir::LmHeadNormKind::MeanSubRmsNorm },
+            weight_paths,
+            state,
+        ),
+        I::CutlassFusedAddRmsNormGemm(
+            delta_slot,
+            residual_slot,
+            out_slot,
+            layer,
+            _tile_m,
+            _tile_n,
+            _stages,
+            n,
+            k,
+        ) => emit_lm_head_with_delta(
+            *residual_slot,
+            *delta_slot,
+            *out_slot,
+            *layer,
+            *n,
+            *k,
+            quote! { ::ferrite_mega_ir::LmHeadNormKind::AddRmsNorm },
+            None,
+            weight_paths,
+            state,
+        ),
+        I::CutlassFusedAddScalarOffsetRmsNormGemm(
+            delta_slot,
+            residual_slot,
+            out_slot,
+            layer,
+            offset,
+            _tile_m,
+            _tile_n,
+            _stages,
+            n,
+            k,
+        ) => emit_lm_head_with_delta(
+            *residual_slot,
+            *delta_slot,
+            *out_slot,
+            *layer,
+            *n,
+            *k,
+            quote! { ::ferrite_mega_ir::LmHeadNormKind::AddScalarOffsetRmsNorm },
+            Some(*offset),
+            weight_paths,
+            state,
+        ),
+        other => Err(format!(
+            "no const-generic builder dispatch for variant `{}`",
+            instruction_kind(other)
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lm_head_no_delta(
+    in_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    n: u32,
+    k: u32,
+    norm_kind_path: TokenStream,
+    weight_paths: &[String],
+    state: &mut PhaseCState,
+) -> Result<TokenStream, String> {
+    if weight_paths.len() != 2 {
+        return Err(format!(
+            "Cutlass lm_head fusion expected 2 weight_paths (norm, linear), got {}",
+            weight_paths.len()
+        ));
+    }
+    let norm_path = weight_paths[0].as_str();
+    let linear_path = weight_paths[1].as_str();
+    let lit = proc_macro2::Literal::u32_unsuffixed;
+    let in_id = lit(in_slot);
+    let out_id = lit(out_slot);
+    let norm_w_id = lit(state.alloc_distinct(&[in_slot, out_slot])?);
+    let lin_w_id = lit(state.alloc_distinct(&[in_slot, out_slot])?);
+    let partial_off = lit(0u32);
+    let partial_bytes = lit(state.num_consumer_warps * 4);
+    let b_tile_off = lit(state.num_consumer_warps * 4);
+    let b_tile_bytes = lit(state.scratch_bytes - state.num_consumer_warps * 4);
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit((state.arrives + 1) & 1);
+    let iters = lit(1u32);
+    let arrives = lit(state.arrives);
+    let num_layers = lit(state.num_layers);
+    let layer_lit = lit(layer);
+    let n_lit = lit(n);
+    let k_lit = lit(k);
+    state.arrives += 1;
+    Ok(quote! {
+        b.push_cutlass_fused_norm_gemm_no_delta::<
+            #in_id, #norm_w_id, #lin_w_id, #out_id,
+            #partial_off, #partial_bytes,
+            #b_tile_off, #b_tile_bytes,
+            #consumer_phase, #storer_phase,
+            #iters, #layer_lit, #n_lit, #k_lit,
+            #num_layers, #arrives,
+        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path);
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lm_head_with_delta(
+    residual_slot: u32,
+    delta_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    n: u32,
+    k: u32,
+    norm_kind_path: TokenStream,
+    offset: Option<f32>,
+    weight_paths: &[String],
+    state: &mut PhaseCState,
+) -> Result<TokenStream, String> {
+    if weight_paths.len() != 2 {
+        return Err(format!(
+            "Cutlass lm_head fusion expected 2 weight_paths (norm, linear), got {}",
+            weight_paths.len()
+        ));
+    }
+    let norm_path = weight_paths[0].as_str();
+    let linear_path = weight_paths[1].as_str();
+    let lit = proc_macro2::Literal::u32_unsuffixed;
+    let in_id = lit(residual_slot);
+    let delta_id = lit(delta_slot);
+    let out_id = lit(out_slot);
+    let norm_w_id = lit(state.alloc_distinct(&[residual_slot, delta_slot, out_slot])?);
+    let lin_w_id = lit(state.alloc_distinct(&[residual_slot, delta_slot, out_slot])?);
+    let partial_off = lit(0u32);
+    let partial_bytes = lit(state.num_consumer_warps * 4);
+    let b_tile_off = lit(state.num_consumer_warps * 4);
+    let b_tile_bytes = lit(state.scratch_bytes - state.num_consumer_warps * 4);
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit((state.arrives + 1) & 1);
+    let iters = lit(1u32);
+    let arrives = lit(state.arrives);
+    let num_layers = lit(state.num_layers);
+    let layer_lit = lit(layer);
+    let n_lit = lit(n);
+    let k_lit = lit(k);
+    let offset_expr = match offset {
+        Some(v) => quote! { ::core::option::Option::Some(#v) },
+        None => quote! { ::core::option::Option::None },
+    };
+    state.arrives += 1;
+    Ok(quote! {
+        b.push_cutlass_fused_norm_gemm_with_delta::<
+            #in_id, #delta_id, #norm_w_id, #lin_w_id, #out_id,
+            #partial_off, #partial_bytes,
+            #b_tile_off, #b_tile_bytes,
+            #consumer_phase, #storer_phase,
+            #iters, #layer_lit, #n_lit, #k_lit,
+            #num_layers, #arrives,
+        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #offset_expr);
+    })
 }
 
 /// Build `Vec<OpInput>` for one canonical slice. Each instruction
@@ -4892,6 +5749,34 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
         I::TkBarrierSignal(edge) => I::BarrierSignal(edge),
         I::TkBarrierWait(edge, count) => I::BarrierWait(edge, count),
         I::TkSpliceMmEmbeds(slot) => I::SpliceMmEmbeds(slot),
+        // TkFusedAddRmsNormGemm decomposes to CutlassFusedAddRmsNormGemm
+        // with dummy CUTLASS tile dims (the dispatch goes through
+        // cuBLAS at the host interpreter, ignoring tile_m/tile_n/stages
+        // — see `instr.rs::eval` for the same delegation). Substrate
+        // shape is identical: residual fold + rms_norm + gemm.
+        I::TkFusedAddRmsNormGemm(delta_slot, residual_slot, out_slot, layer, n, k) => {
+            I::CutlassFusedAddRmsNormGemm(
+                delta_slot,
+                residual_slot,
+                out_slot,
+                layer,
+                /*tile_m=*/ 16,
+                /*tile_n=*/ 64,
+                /*stages=*/ 3,
+                n,
+                k,
+            )
+        }
+        // TkGemmAdd is chunked-k gemm + add. The non-chunked peer is
+        // FusedCublasGemmAdd(in, residual, layer, n, k). Until the
+        // chunked variant gets its own MegaNode, normalize to the
+        // non-chunked peer by dropping `k_offset`/`k_full` — the
+        // substrate shape (3 pages, gemm-scope tile, residual fold)
+        // matches; the chunked-k iteration count is internal to the
+        // emit step (Phase C step 2).
+        I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
+            I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k)
+        }
         // Tk variants without a 1:1 un-prefixed peer pass through.
         // mega-ir's lower() will treat them as NotYetLifted and the
         // canonical falls back to the host interpreter.

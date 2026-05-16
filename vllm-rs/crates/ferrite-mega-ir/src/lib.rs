@@ -43,7 +43,7 @@ pub use nodes::{
     Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
     Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,
     Gemm, LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, RmsNorm, RotaryRef, ScalarMul,
-    ScalarOffsetRmsNorm, SlidingWindow, TanhSoftCap, WeightRef,
+    ScalarOffsetRmsNorm, SlidingWindow, SpliceMmEmbeds, TanhSoftCap, WeightRef,
 };
 pub use substrate::{
     AttentionScope, EdgeId, Empty, ExpectedCount, Filled, GemmScope, IsLifecycleState,

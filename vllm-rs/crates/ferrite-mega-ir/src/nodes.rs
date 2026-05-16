@@ -1565,6 +1565,53 @@ impl BarrierWait {
     }
 }
 
+/// The typed lowered `SpliceMmEmbeds` variant — multimodal
+/// placeholder splice. The kernel D2D-copies projected vision
+/// embeddings into the placeholder positions of an in-flight
+/// activation page; substrate shape is one in-place page touch.
+pub struct SpliceMmEmbeds {
+    slot_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+}
+
+impl SpliceMmEmbeds {
+    pub const fn new<
+        const SLOT_ID: u32,
+        const CONSUMER_PHASE: u32,
+        const STORER_PHASE: u32,
+        const NUM_PAGES: u32,
+        const ARRIVES: u32,
+    >() -> Self {
+        const {
+            assert!(SLOT_ID < NUM_PAGES, "SpliceMmEmbeds: SLOT_ID out of bounds");
+            assert!(
+                CONSUMER_PHASE == ARRIVES & 1,
+                "SpliceMmEmbeds: CONSUMER_PHASE parity mismatch"
+            );
+            assert!(
+                STORER_PHASE == (ARRIVES + 1) & 1,
+                "SpliceMmEmbeds: STORER_PHASE parity mismatch"
+            );
+        }
+        Self {
+            slot_id: SLOT_ID,
+            consumer_phase: CONSUMER_PHASE,
+            storer_phase: STORER_PHASE,
+        }
+    }
+
+    pub const fn slot_id(&self) -> u32 {
+        self.slot_id
+    }
+    pub const fn consumer_phase(&self) -> u32 {
+        self.consumer_phase
+    }
+    pub const fn storer_phase(&self) -> u32 {
+        self.storer_phase
+    }
+}
+
 /// The typed lowered MegaNode enum.
 pub enum MegaNode {
     RmsNorm(RmsNorm),
@@ -1581,4 +1628,5 @@ pub enum MegaNode {
     AttentionViaCache(AttentionViaCacheNode),
     BarrierSignal(BarrierSignal),
     BarrierWait(BarrierWait),
+    SpliceMmEmbeds(SpliceMmEmbeds),
 }

@@ -39,7 +39,7 @@ use syn::Ident;
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, OpInstance, WeightAccessor};
+use crate::impl_lib::{ImplementationLibrary, WeightAccessor, WeightSlot};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
@@ -4108,12 +4108,14 @@ fn emit_weight_accessors_impl(
     // and 2*ci+1 (lm_head). FORWARD_TABLE rows pass these ids into
     // run/run_backbone, which forward them to run_slice → eval →
     // the per-arch WeightAccessors match arms.
-    let emit_for = |bucket_id: u32, instances: &[OpInstance], by_kind: &mut HashMap<&'static str, Vec<TokenStream>>| {
+    let emit_for = |bucket_id: u32,
+                    weight_slots: &[Vec<WeightSlot>],
+                    by_kind: &mut HashMap<&'static str, Vec<TokenStream>>| {
         let bucket_lit = proc_macro2::Literal::u32_unsuffixed(bucket_id);
-        for (op_idx, inst) in instances.iter().enumerate() {
+        for (op_idx, slots) in weight_slots.iter().enumerate() {
             let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
             let mut counts: HashMap<&'static str, u32> = HashMap::new();
-            for slot in &inst.weight_slots {
+            for slot in slots {
                 let key = match slot.kind {
                     WeightKind::RmsNorm => "rms_norm_at",
                     WeightKind::Embedding => "embedding_at",
@@ -4133,8 +4135,19 @@ fn emit_weight_accessors_impl(
                 let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
                 *n += 1;
                 let base = &slot.base;
+                // CosSin pulls from a `RotaryCache` field on the per-arch
+                // `Weights` struct (`wm.rotary` or `wm.rotary_local`),
+                // not from a `fn <base>(layer) -> &T` getter — rotary is
+                // shared across layers, and the cache itself owns a
+                // single `cos_sin_cache: GpuTensor`. The trait method
+                // returns `GpuTensor` by value, so `.clone()` produces
+                // a cheap handle copy.
+                let arm_body = match slot.kind {
+                    WeightKind::CosSin => quote! { self.#base.cos_sin_cache.clone() },
+                    _ => quote! { self.#base(layer) },
+                };
                 by_kind.entry(key).or_default().push(quote! {
-                    (#bucket_lit, #op_lit, #slot_lit) => self.#base(layer),
+                    (#bucket_lit, #op_lit, #slot_lit) => #arm_body,
                 });
             }
         }
@@ -4142,8 +4155,8 @@ fn emit_weight_accessors_impl(
     for (ci, (_wp, (cl, _, _, _))) in canonical_lowered.iter().enumerate() {
         let bb_id = (ci as u32) * 2;
         let lm_id = bb_id + 1;
-        emit_for(bb_id, &cl.backbone.instances, &mut by_kind);
-        emit_for(lm_id, &cl.lm_head.instances, &mut by_kind);
+        emit_for(bb_id, &cl.backbone.weight_slots, &mut by_kind);
+        emit_for(lm_id, &cl.lm_head.weight_slots, &mut by_kind);
     }
 
     let method_emit = |method: &str, ret_ty: TokenStream| -> TokenStream {
@@ -4162,6 +4175,11 @@ fn emit_weight_accessors_impl(
                 slot: u32,
                 layer: u32,
             ) -> #ret_ty {
+                // `layer` is unused for `cos_sin_at` (rotary is layer-
+                // independent); referenced explicitly here so the
+                // generated body type-checks identically across every
+                // method.
+                let _ = layer;
                 match (bucket, op_idx, slot) {
                     #(#arms)*
                     _ => unreachable!(
@@ -4173,19 +4191,34 @@ fn emit_weight_accessors_impl(
         }
     };
 
-    let rms_norm = method_emit("rms_norm_at", quote! { &::ferrite_kernels::layers::RmsNorm });
+    let rms_norm = method_emit(
+        "rms_norm_at",
+        quote! { &::ferrite_kernels::layers::RmsNorm },
+    );
     let embedding = method_emit(
         "embedding_at",
         quote! { &::ferrite_kernels::layers::Embedding },
     );
-    let linear = method_emit("linear_at", quote! { &::ferrite_kernels::layers::LinearLayer });
+    let linear = method_emit(
+        "linear_at",
+        quote! { &::ferrite_kernels::layers::LinearLayer },
+    );
     let layer_norm = method_emit(
         "layer_norm_at",
         quote! { &::ferrite_kernels::layers::LayerNorm },
     );
-    let marlin = method_emit("marlin_at", quote! { &::ferrite_kernels::layers::MarlinLinear });
-    let bnb4 = method_emit("bnb4_at", quote! { &::ferrite_kernels::layers::Bnb4bitLinear });
-    let fp8 = method_emit("fp8_at", quote! { &::ferrite_kernels::layers::Fp8AnyLinear });
+    let marlin = method_emit(
+        "marlin_at",
+        quote! { &::ferrite_kernels::layers::MarlinLinear },
+    );
+    let bnb4 = method_emit(
+        "bnb4_at",
+        quote! { &::ferrite_kernels::layers::Bnb4bitLinear },
+    );
+    let fp8 = method_emit(
+        "fp8_at",
+        quote! { &::ferrite_kernels::layers::Fp8AnyLinear },
+    );
     let dsmoe = method_emit(
         "deepseek_moe_at",
         quote! { &::ferrite_kernels::layers_moe::DeepSeekV2MoELayer },
@@ -4206,7 +4239,10 @@ fn emit_weight_accessors_impl(
         "shared_fused_moe_at",
         quote! { &::ferrite_kernels::layers_moe::SharedFusedMoELayer },
     );
-    let cos_sin = method_emit("cos_sin_at", quote! { ::ferrite_cuda_core::tensor::GpuTensor });
+    let cos_sin = method_emit(
+        "cos_sin_at",
+        quote! { ::ferrite_cuda_core::tensor::GpuTensor },
+    );
 
     quote! {
         #[cfg(feature = "cuda")]
@@ -4890,18 +4926,24 @@ pub fn emit_model(
                 let term_emits = term_imp
                     .fan_out(&term_match, fuf, program, &bounds, &slots)
                     .expect("terminal subgraph's Impl must implement fan_out");
+                let term_accs = term_imp.required_weights(&term_match.claimed_tiles, fuf, program);
+                let term_slots = crate::interpreter_codegen::weight_accessors_to_slots(&term_accs);
+                let term_weight_slots: Vec<Vec<WeightSlot>> =
+                    term_emits.iter().map(|_| term_slots.clone()).collect();
                 // Eval body lives in `ferrite_forward::Instruction::eval`
                 // — `arch_opcodes` keeps the shape registration for
                 // `emit_bucket_static_slice`'s shape-checking pass.
                 arch_opcodes.register(term_imp.opcode_shape());
                 crate::interpreter_codegen::LoweredBucket {
                     instances: term_emits,
+                    weight_slots: term_weight_slots,
                     num_slots,
                     final_slot: terminal_slot,
                 }
             }
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
                 instances: Vec::new(),
+                weight_slots: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
             },

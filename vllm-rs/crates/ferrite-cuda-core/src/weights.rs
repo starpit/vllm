@@ -921,7 +921,7 @@ impl GpuWeights {
         // (The fast/precast path already syncs before freeing its
         // per-tensor pinned buffer; the slow path needs the same
         // serialization because it reuses one shared buffer.)
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
+        let used_shared_pinned = std::ptr::eq(data, self.cast_pinned.0 as *const u8);
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
             if used_shared_pinned {
@@ -1034,7 +1034,7 @@ impl GpuWeights {
         // Slow path.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
+        let used_shared_pinned = std::ptr::eq(data, self.cast_pinned.0 as *const u8);
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
         if used_shared_pinned {
             // Same race as `take`'s slow path — the next `take_into`
@@ -1405,7 +1405,7 @@ impl GpuWeights {
         self.gpu_allocs
             .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
 
-        let used_shared_pinned = data == self.cast_pinned.0 as *const u8;
+        let used_shared_pinned = std::ptr::eq(data, self.cast_pinned.0 as *const u8);
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
             if used_shared_pinned {

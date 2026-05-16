@@ -19,7 +19,7 @@
 //!    every 6th layer (index 5, 11, 17, …) is global; the rest are
 //!    sliding. Predicate: `layer % 6 == 5` → global.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

@@ -18,7 +18,7 @@
 //! `ferrite-model-qwen2` for the shared text decoder.
 
 #[cfg(feature = "cuda")]
-use ferrite_forward::vision_forward;
+use ferrite_forward_macro::vision_forward;
 
 /// Per-arch CPU preprocessing declaration baked into every emitted
 /// `FerriteMmRegistration` row by the `#[vision_forward(processor = ...)]`

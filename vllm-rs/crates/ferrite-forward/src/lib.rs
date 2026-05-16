@@ -1,18 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Consumer-facing crate for the `#[forward]` attribute macro.
+//! Runtime support types the `#[forward]`-emitted code depends on:
+//! most importantly [`ForwardCtx`], the ambient-args bundle the
+//! emitted forward fn takes, and the [`Instruction`] enum the
+//! generated tape rows construct.
 //!
-//! Re-exports the proc-macro and exposes runtime support types
-//! the generated code depends on: most importantly [`ForwardCtx`],
-//! the ambient-args bundle the emitted forward fn takes.
-
-pub use ferrite_forward_macro::{forward, vision_forward};
+//! The `#[forward]` / `#[vision_forward]` attribute macros live in
+//! [`ferrite_forward_macro`] — consumer crates import them
+//! directly:
+//!
+//! ```ignore
+//! use ferrite_forward_macro::{forward, vision_forward};
+//! ```
+//!
+//! ferrite-forward intentionally does NOT re-export the proc-macro
+//! crate so it can serve as a build-time dependency of
+//! ferrite-forward-macro itself (per `MEGA_IR_PLAN.md` §9 step 4:
+//! `Implementation::fan_out` returns `Vec<Instruction>` typed at
+//! proc-macro time). Re-exporting the macro would re-introduce the
+//! macro→forward→macro cycle.
 
 #[cfg(feature = "cuda")]
 pub mod attack_surface;
 pub mod cpu_golden;
 #[cfg(feature = "cuda")]
 pub mod info;
-#[cfg(feature = "cuda")]
 pub mod instr;
 #[cfg(feature = "cuda")]
 pub mod loaders;
@@ -27,10 +38,9 @@ pub use info::{
     normalize_slice,
 };
 
+pub use instr::Instruction;
 #[cfg(feature = "cuda")]
-pub use instr::{
-    CanonicalParams, Instruction, InterpreterCtx, WeightAccessors, run, run_backbone,
-};
+pub use instr::{CanonicalParams, InterpreterCtx, WeightAccessors, run, run_backbone};
 #[cfg(feature = "cuda")]
 pub use loaders::{
     load_layered_bnb4, load_layered_bnb4_concat, load_layered_embedding,

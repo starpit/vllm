@@ -47,7 +47,7 @@
 //! lowers to a single D2D copy of rows `1..L`.
 
 #[cfg(feature = "cuda")]
-use ferrite_forward::vision_forward;
+use ferrite_forward_macro::vision_forward;
 
 /// LLaVA-1.5 CPU preprocessing. Combines the CLIP image processor
 /// (shortest-edge resize to 336, center-crop to 336², CLIP mean/std

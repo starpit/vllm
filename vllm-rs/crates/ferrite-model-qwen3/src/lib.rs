@@ -12,7 +12,7 @@
 //! vs. the declared `[head_dim]` weight and synthesizes the view
 //! reshape tiles to bridge them.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

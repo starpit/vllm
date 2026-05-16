@@ -28,7 +28,7 @@
 //! `mlp_only_layers`, so the all-MoE assumption holds for the
 //! current consumers.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

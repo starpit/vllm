@@ -19,7 +19,7 @@
 //! Reference: Python vLLM `vllm/model_executor/models/deepseek_v2.py`
 //!   — `DeepseekV3ForCausalLM` is an empty subclass of `DeepseekV2ForCausalLM`.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

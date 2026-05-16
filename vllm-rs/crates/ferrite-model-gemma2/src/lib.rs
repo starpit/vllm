@@ -27,7 +27,7 @@
 //! `1/sqrt(head_dim)`) are read from config by the Impl at emit
 //! time — nothing Gemma-specific appears here.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

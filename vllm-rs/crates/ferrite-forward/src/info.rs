@@ -322,13 +322,7 @@ impl Instruction {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::FusedQkvRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                biased,
-                interleaved,
-            ) => (
+            Instruction::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => (
                 "FusedQkvRopeCache",
                 vec![
                     F::Slot(in_slot),
@@ -340,13 +334,7 @@ impl Instruction {
                     F::ConstBool(interleaved),
                 ],
             ),
-            Instruction::FusedQkvQkNormRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                q_offset,
-                k_offset,
-            ) => (
+            Instruction::FusedQkvQkNormRopeCache(in_slot, out_slot, layer, q_offset, k_offset) => (
                 "FusedQkvQkNormRopeCache",
                 vec![
                     F::Slot(in_slot),
@@ -616,16 +604,7 @@ impl Instruction {
                     F::LayerKind("SharedFusedMoELayer"),
                 ],
             ),
-            Instruction::CutlassGemm(
-                in_slot,
-                out_slot,
-                layer,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => (
+            Instruction::CutlassGemm(in_slot, out_slot, layer, tile_m, tile_n, stages, n, k) => (
                 "CutlassGemm",
                 vec![
                     F::Slot(in_slot),
@@ -903,20 +882,18 @@ impl Instruction {
                     F::RopeCosSin,
                 ],
             ),
-            Instruction::GgmlFusedQkvRopePrefill(in_slot, q_out, k_out, v_out, layer) => {
-                (
-                    "GgmlFusedQkvRopePrefill",
-                    vec![
-                        F::Slot(in_slot),
-                        F::Slot(q_out),
-                        F::Slot(k_out),
-                        F::Slot(v_out),
-                        F::Layer(layer),
-                        F::LayerKind("LinearLayer"),
-                        F::RopeCosSin,
-                    ],
-                )
-            }
+            Instruction::GgmlFusedQkvRopePrefill(in_slot, q_out, k_out, v_out, layer) => (
+                "GgmlFusedQkvRopePrefill",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(q_out),
+                    F::Slot(k_out),
+                    F::Slot(v_out),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                    F::RopeCosSin,
+                ],
+            ),
             Instruction::Bnb4Gemm(in_slot, out_slot, layer) => (
                 "Bnb4Gemm",
                 vec![
@@ -1101,7 +1078,7 @@ mod tests {
 
     #[test]
     fn embed_normalizes() {
-        let i: Instruction =Instruction::Embed(7);
+        let i: Instruction = Instruction::Embed(7);
         let n = i.normalize();
         assert_eq!(n.kind, "Embed");
         assert_eq!(
@@ -1115,7 +1092,7 @@ mod tests {
 
     #[test]
     fn fused_add_rmsnorm_carries_layer_and_kernel_class() {
-        let i: Instruction =Instruction::FusedAddRmsNorm(3, 4, 12);
+        let i: Instruction = Instruction::FusedAddRmsNorm(3, 4, 12);
         let n = i.normalize();
         assert_eq!(n.kind, "FusedAddRmsNorm");
         assert_eq!(
@@ -1131,8 +1108,7 @@ mod tests {
 
     #[test]
     fn cutlass_gemm_add_keeps_tile_consts() {
-        let i: Instruction =
-            Instruction::CutlassGemmAdd(5, 6, 0, 128, 128, 3, 4096, 11008);
+        let i: Instruction = Instruction::CutlassGemmAdd(5, 6, 0, 128, 128, 3, 4096, 11008);
         let n = i.normalize();
         assert_eq!(n.kind, "CutlassGemmAdd");
         assert_eq!(
@@ -1152,7 +1128,7 @@ mod tests {
 
     #[test]
     fn loop_count_and_body_len_are_distinguishable() {
-        let i: Instruction =Instruction::Loop(32, 9);
+        let i: Instruction = Instruction::Loop(32, 9);
         let n = i.normalize();
         assert_eq!(n.kind, "Loop");
         assert_eq!(
@@ -1166,7 +1142,7 @@ mod tests {
 
     #[test]
     fn flashinfer_decode_keeps_head_dim_and_softcap_flag() {
-        let i: Instruction =Instruction::FlashInferAttentionDecode(0, 1, 0, 128, true);
+        let i: Instruction = Instruction::FlashInferAttentionDecode(0, 1, 0, 128, true);
         let n = i.normalize();
         assert_eq!(n.kind, "FlashInferAttentionDecode");
         assert_eq!(

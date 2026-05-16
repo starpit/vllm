@@ -63,7 +63,7 @@
 //! Reference: hand-written `vllm-cuda/src/model/modernbert.rs`.
 //! Probe target: `answerdotai/ModernBERT-base`.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

@@ -38,7 +38,7 @@
 //!   pre-permuted host-side by the vision wrapper before upload.
 
 #[cfg(feature = "cuda")]
-use ferrite_forward::vision_forward;
+use ferrite_forward_macro::vision_forward;
 
 /// Qwen2.5-VL CPU preprocessing: same family conventions as Qwen2-VL —
 /// `<|image_pad|>` placeholder, smart-resize at factor 28, CLIP

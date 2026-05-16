@@ -20,6 +20,8 @@ use std::fmt;
 use proc_macro2::TokenStream;
 use quote::quote;
 
+use ferrite_forward::Instruction;
+
 use crate::classified::{ExternKind, OpKind, Program, WeightId};
 use crate::codegen::split_base_layer;
 use crate::config::ModelParams;
@@ -76,7 +78,7 @@ pub fn eval_dim_with(dim: &Dim, bounds: &BTreeMap<String, u64>) -> Option<u64> {
         Dim::Div(num, den) => {
             let n = eval_dim_with(num, bounds)?;
             let d = eval_dim_with(den, bounds)?;
-            if d == 0 { None } else { Some(n / d) }
+            n.checked_div(d)
         }
         Dim::Var(_) => None,
     }
@@ -689,7 +691,7 @@ pub trait Implementation: fmt::Debug + Send + Sync {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         _slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         None
     }
 }
@@ -757,22 +759,11 @@ impl OpcodeShape {
     }
 }
 
-/// One concrete kernel-call instance an Impl emits at a given
-/// (variant × workload-point). The codegen lowers this to
-/// `<Arch>Op::<name> { #(field_n: <field_value>),* }` inside the
-/// per-bucket static slice.
-///
-/// `field_values` is positional in the same order as
-/// [`OpcodeShape::fields`]. Each entry is a `TokenStream` the
-/// codegen drops verbatim into the constructor expression — useful
-/// when a value is e.g. `slots.of(tile, slot) as u32` or a
-/// pre-resolved literal.
 /// Kind of weight a tape position consumes. The variant of
-/// [`OpInstance`] determines the *count* and *kind list*; what the
-/// proc-macro records per-instance is the per-arch base name(s) so
-/// the per-arch [`WeightAccessors`] impl can emit the right match
-/// arm.
-///
+/// the carrying [`Instruction`] determines the *count* and *kind
+/// list*; what the proc-macro records per-instance is the per-arch
+/// base name(s) so the per-arch [`WeightAccessors`] impl can emit
+/// the right match arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WeightKind {
     RmsNorm,
@@ -790,59 +781,25 @@ pub enum WeightKind {
     CosSin,
 }
 
-/// One weight slot consumed by an `OpInstance`. The `kind` selects
-/// which `WeightAccessors` method the per-arch match arm goes
-/// under; the `base` is the user-source `Weights` accessor method
-/// name (e.g. `input_layernorm`) the match arm calls with the
-/// runtime `layer` argument.
+/// One weight slot consumed by an [`OpInstance`]. The `kind`
+/// selects which `WeightAccessors` method the per-arch match arm
+/// goes under; the `base` is the user-source `Weights` accessor
+/// method name (e.g. `input_layernorm`) the match arm calls with
+/// the runtime `layer` argument.
 #[derive(Clone, Debug)]
 pub struct WeightSlot {
     pub kind: WeightKind,
     pub base: syn::Ident,
 }
 
-#[derive(Clone, Debug)]
-pub struct OpInstance {
-    pub name: syn::Ident,
-    pub field_values: Vec<TokenStream>,
-    /// Weight slots this op consumes, in the variant's declared
-    /// kind order. The proc-macro walks every bucket × position at
-    /// codegen time and emits per-arch [`WeightAccessors`] match
-    /// arms keyed on `(bucket, op_idx)` — nothing about weights is
-    /// stored on the runtime `Instruction` variant.
-    ///
-    /// One entry per accessor the variant consumes — one for
-    /// single-accessor ops (RmsNorm), N for multi-accessor ops
-    /// (`FusedQkvRopeCache` = 2, `FusedQkvQkNormRopeCache` = 6, …).
-    /// Empty for ops that consume no weight (Add, AllReduce, Reshape).
-    pub weight_slots: Vec<WeightSlot>,
-}
-
-impl OpInstance {
-    /// Build with the variant ident matching `opcode_shape().name`
-    /// and a vector of field-value token streams in declaration
-    /// order. Defaults `weight_slots` to empty; weight-bearing ops
-    /// override via [`OpInstance::with_weight_slot`].
-    pub fn new(name: syn::Ident, field_values: Vec<TokenStream>) -> Self {
-        Self {
-            name,
-            field_values,
-            weight_slots: Vec::new(),
-        }
-    }
-
-    /// Replace the weight-slot list with `slots`, in the variant's
-    /// declared kind order.
-    pub fn with_weight_slots(mut self, slots: Vec<WeightSlot>) -> Self {
-        self.weight_slots = slots;
-        self
-    }
-
-    /// Convenience for single-accessor ops.
-    pub fn with_weight_slot(self, slot: WeightSlot) -> Self {
-        self.with_weight_slots(vec![slot])
-    }
-}
+// `Implementation::fan_out` returns `Option<Vec<Instruction>>` —
+// per `MEGA_IR_PLAN.md` §5+§9 step 4. There is no `OpInstance`
+// wrapper, no `Vec<TokenStream>` round-trip, no `FannedOp` tuple.
+// Weight context (kind + base name per slot) is NOT embedded in
+// the fan_out output; it flows separately from the existing
+// [`Implementation::required_weights`] method, which the codegen
+// walker calls alongside `fan_out` and pairs with each emitted
+// op-position in a `LoweredBucket`-level parallel array.
 
 /// Compile-time mapping from `(TileId, output_slot)` → flat slot
 /// index in the runtime tile table. Built once per (variant ×
@@ -1343,10 +1300,7 @@ impl Implementation for EmbedRefImpl {
     // table index.
 
     fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new(
-            "Embed",
-            vec![("out_slot", syn::parse_quote!(u32))],
-        )
+        OpcodeShape::new("Embed", vec![("out_slot", syn::parse_quote!(u32))])
     }
 
     fn fan_out(
@@ -1356,23 +1310,11 @@ impl Implementation for EmbedRefImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let out_slot = slots.of(tile, 0);
-        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
-        let acc = accessors
-            .first()
-            .expect("Embed: required_weights returned empty");
-        let (base, _layer) = split_base_layer(&acc.name.to_string());
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Embed", proc_macro2::Span::call_site()),
-            vec![quote! { #out_slot }],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Embedding,
-            base: base_ident,
-        })])
+        let _ = (program, fuf);
+        Some(vec![Instruction::Embed(out_slot)])
     }
 }
 /// Reference HostCallback impl for `OpKind::RmsNorm`. Hand-written
@@ -1454,7 +1396,7 @@ impl Implementation for RmsNormRefImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -1470,28 +1412,9 @@ impl Implementation for RmsNormRefImpl {
         let acc = accessors
             .first()
             .expect("RmsNorm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        // Typed-fanout: weight accessor lives at the TAPE level,
-        // not as an Instruction variant field, AND not as a parallel
-        // index array. The variant determines the *kind*; the per-
-        // arch `WeightAccessors` impl matches on (bucket, op_idx)
-        // and resolves to the right `Weights` field. We just record
-        // the base name here — the codegen walks every position at
-        // emission time and aggregates them into match arms.
-        Some(vec![OpInstance::new(
-            syn::Ident::new("RmsNorm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::RmsNorm(in_slot_idx, out_slot_idx, layer)])
     }
 }
 /// Reference HostCallback impl for `OpKind::Gemm`. Hand-written
@@ -1577,7 +1500,7 @@ impl Implementation for GemmRefImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -1593,25 +1516,17 @@ impl Implementation for GemmRefImpl {
         let acc = accessors
             .first()
             .expect("Gemm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
             .expect("Gemm: weight (N, K) must resolve from FUF + bounds at fan_out time");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Gemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Gemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            n,
+            k,
+        )])
     }
 }
 
@@ -1750,7 +1665,7 @@ impl Implementation for ReshapeRefImpl {
         _program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -1789,19 +1704,13 @@ impl Implementation for ReshapeRefImpl {
             dims_div_lit[i] = div_lit;
         }
         let ndim = shape.len() as u8;
-        let dims_lit_toks = dims_lit.iter().map(|v| quote! { #v });
-        let dims_nt_pow_toks = dims_nt_pow.iter().map(|v| quote! { #v });
-        let dims_div_lit_toks = dims_div_lit.iter().map(|v| quote! { #v });
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Reshape", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { [ #( #dims_lit_toks ),* ] },
-                quote! { [ #( #dims_nt_pow_toks ),* ] },
-                quote! { [ #( #dims_div_lit_toks ),* ] },
-                quote! { #ndim },
-            ],
+        Some(vec![Instruction::Reshape(
+            in_slot_idx,
+            out_slot_idx,
+            dims_lit,
+            dims_nt_pow,
+            dims_div_lit,
+            ndim,
         )])
     }
 }
@@ -2515,7 +2424,7 @@ impl Implementation for FusedGemmBiasImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -2537,21 +2446,13 @@ impl Implementation for FusedGemmBiasImpl {
         let acc = accessors
             .first()
             .expect("FusedGemmBias: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedGemmBias", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedGemmBias(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -2705,7 +2606,7 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -2729,31 +2630,23 @@ impl Implementation for CutlassFusedGemmBiasImpl {
         let acc = accessors
             .first()
             .expect("CutlassFusedGemmBias: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassFusedGemmBias: weight (N, K) must resolve from FUF + bounds");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedGemmBias", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassFusedGemmBias(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
+        )])
     }
 }
 
@@ -3044,7 +2937,7 @@ impl Implementation for FusedGateUpSiluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let silu_id = *m
             .claimed_tiles
             .iter()
@@ -3078,21 +2971,13 @@ impl Implementation for FusedGateUpSiluMulImpl {
         let acc = accessors
             .first()
             .expect("FusedGateUpSiluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedGateUpSiluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -3282,7 +3167,7 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let silu_id = *m
             .claimed_tiles
             .iter()
@@ -3312,27 +3197,19 @@ impl Implementation for CutlassFusedGateUpSiluMulImpl {
         let acc = accessors
             .first()
             .expect("CutlassFusedGateUpSiluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassFusedGateUpSiluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+        )])
     }
 }
 
@@ -3497,7 +3374,7 @@ impl Implementation for CutlassFusedGateUpGeluMulImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gelu_id = *m
             .claimed_tiles
             .iter()
@@ -3527,9 +3404,8 @@ impl Implementation for CutlassFusedGateUpGeluMulImpl {
         let acc = accessors
             .first()
             .expect("CutlassFusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
 
         // Bake (packed_n=2I, k=H) into the Instruction for the runtime
         // assert_weight_shape check. Use the gate Gemm's K and 2× the
@@ -3540,23 +3416,16 @@ impl Implementation for CutlassFusedGateUpGeluMulImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #packed_n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassFusedGateUpGeluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            packed_n,
+            k,
+        )])
     }
 }
 
@@ -3781,7 +3650,7 @@ impl Implementation for FusedGateUpGeluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gelu_id = *m
             .claimed_tiles
             .iter()
@@ -3811,21 +3680,13 @@ impl Implementation for FusedGateUpGeluMulImpl {
         let acc = accessors
             .first()
             .expect("FusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedGateUpGeluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -4051,7 +3912,7 @@ impl Implementation for ScalarMulImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         if Self::is_unity_passthrough(&m.claimed_tiles, fuf) {
             return Some(Vec::new());
         }
@@ -4060,13 +3921,10 @@ impl Implementation for ScalarMulImpl {
         let scale = Self::scale_of(&m.claimed_tiles, fuf);
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("ScalarMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #scale },
-            ],
+        Some(vec![Instruction::ScalarMul(
+            in_slot_idx,
+            out_slot_idx,
+            scale,
         )])
     }
 }
@@ -4185,7 +4043,7 @@ impl Implementation for TanhSoftCapImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -4194,10 +4052,7 @@ impl Implementation for TanhSoftCapImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("TanhSoftCap", proc_macro2::Span::call_site()),
-            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
-        )])
+        Some(vec![Instruction::TanhSoftCap(in_slot_idx, out_slot_idx)])
     }
 }
 
@@ -4349,7 +4204,7 @@ impl Implementation for AddRefImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let add_id = m.claimed_tiles[0];
         let node = fuf.get(add_id);
         let (delta_id, delta_in_slot) = match node.inputs.first() {
@@ -4362,10 +4217,7 @@ impl Implementation for AddRefImpl {
         };
         let delta_idx = slots.of(delta_id, delta_in_slot);
         let residual_idx = slots.of(residual_id, residual_in_slot);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Add", proc_macro2::Span::call_site()),
-            vec![quote! { #delta_idx }, quote! { #residual_idx }],
-        )])
+        Some(vec![Instruction::Add(delta_idx, residual_idx)])
     }
 }
 
@@ -4561,7 +4413,7 @@ impl Implementation for FusedAddRmsNormImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let add_id = *m
             .claimed_tiles
             .iter()
@@ -4584,21 +4436,13 @@ impl Implementation for FusedAddRmsNormImpl {
         let acc = accessors
             .first()
             .expect("FusedAddRmsNorm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedAddRmsNorm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #delta_idx },
-                quote! { #residual_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedAddRmsNorm(
+            delta_idx,
+            residual_idx,
+            layer,
+        )])
     }
 }
 
@@ -4755,7 +4599,7 @@ impl Implementation for MeanSubRmsNormImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         // The upstream tile x feeding the Mean is the kernel input.
         let mean_id = *m
             .claimed_tiles
@@ -4781,21 +4625,13 @@ impl Implementation for MeanSubRmsNormImpl {
         let acc = accessors
             .first()
             .expect("MeanSubRmsNorm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MeanSubRmsNorm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::MeanSubRmsNorm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -4979,7 +4815,7 @@ impl Implementation for MeanSubRmsNormBiasAddImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let mean_id = *m
             .claimed_tiles
             .iter()
@@ -5002,21 +4838,13 @@ impl Implementation for MeanSubRmsNormBiasAddImpl {
 
         let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
         let acc = accessors.first().expect("required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MeanSubRmsNormBiasAdd", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::LayerNorm,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::MeanSubRmsNormBiasAdd(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -5302,7 +5130,7 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let norm_id = *m
             .claimed_tiles
             .iter()
@@ -5327,47 +5155,31 @@ impl Implementation for CutlassFusedRmsNormGemmImpl {
         let norm_acc = accessors
             .first()
             .expect("CutlassFusedRmsNormGemm: required_weights[0] (norm)");
-        let gemm_acc = accessors
+        let _gemm_acc = accessors
             .get(1)
             .expect("CutlassFusedRmsNormGemm: required_weights[1] (gemm)");
-        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
-        let (gemm_base, _gemm_layer) = split_base_layer(&gemm_acc.name.to_string());
+        let (_norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         // Both accessors should share the same layer offset (or be
         // un-layered together). We bake the norm's layer; the gemm's
         // layer at codegen time must match — un-layered accessors
         // resolve to layer=0 per emit_weights_accessor_methods's
         // contract.
         let layer = norm_layer.unwrap_or(0) as u32;
-        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
-        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassFusedRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedRmsNormGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::RmsNorm,
-                base: norm_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: gemm_ident,
-            },
-        ])])
+        Some(vec![Instruction::CutlassFusedRmsNormGemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
+        )])
     }
 }
 
@@ -5571,7 +5383,7 @@ impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let mean_id = *m
             .claimed_tiles
             .iter()
@@ -5596,45 +5408,26 @@ impl Implementation for CutlassFusedMeanSubRmsNormGemmImpl {
         let norm_acc = accessors
             .first()
             .expect("CutlassFusedMeanSubRmsNormGemm: required_weights[0]");
-        let gemm_acc = accessors
+        let _gemm_acc = accessors
             .get(1)
             .expect("CutlassFusedMeanSubRmsNormGemm: required_weights[1]");
-        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
-        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let (_norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         let layer = norm_layer.unwrap_or(0) as u32;
-        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
-        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassFusedMeanSubRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new(
-                "CutlassFusedMeanSubRmsNormGemm",
-                proc_macro2::Span::call_site(),
-            ),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::RmsNorm,
-                base: norm_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: gemm_ident,
-            },
-        ])])
+        Some(vec![Instruction::CutlassFusedMeanSubRmsNormGemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
+        )])
     }
 }
 
@@ -5848,7 +5641,7 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let add_id = *m
             .claimed_tiles
             .iter()
@@ -5884,43 +5677,27 @@ impl Implementation for CutlassFusedAddRmsNormGemmImpl {
         let norm_acc = accessors
             .first()
             .expect("CutlassFusedAddRmsNormGemm: required_weights[0]");
-        let gemm_acc = accessors
+        let _gemm_acc = accessors
             .get(1)
             .expect("CutlassFusedAddRmsNormGemm: required_weights[1]");
-        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
-        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let (_norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         let layer = norm_layer.unwrap_or(0) as u32;
-        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
-        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassFusedAddRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedAddRmsNormGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #delta_idx },
-                quote! { #residual_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::RmsNorm,
-                base: norm_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: gemm_ident,
-            },
-        ])])
+        Some(vec![Instruction::CutlassFusedAddRmsNormGemm(
+            delta_idx,
+            residual_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
+        )])
     }
 }
 
@@ -6175,7 +5952,7 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         // Identify the residual-stream Add (two Tile inputs) — the
         // scalar-offset Add has a Weight + Scalar.
         let residual_add_id = *m
@@ -6225,22 +6002,14 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
         let acc = accessors
             .first()
             .expect("FusedAddRmsNormWithOffset: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedAddRmsNormWithOffset", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #delta_idx },
-                quote! { #residual_idx },
-                quote! { #layer },
-                quote! { #offset },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedAddRmsNormWithOffset(
+            delta_idx,
+            residual_idx,
+            layer,
+            offset,
+        )])
     }
 }
 
@@ -6428,7 +6197,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let add_id = *m
             .claimed_tiles
             .iter()
@@ -6461,22 +6230,14 @@ impl Implementation for ScalarOffsetRmsNormImpl {
         let acc = accessors
             .first()
             .expect("ScalarOffsetRmsNorm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("ScalarOffsetRmsNorm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #offset },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::RmsNorm,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::ScalarOffsetRmsNorm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            offset,
+        )])
     }
 }
 
@@ -6925,7 +6686,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -6973,31 +6734,8 @@ impl Implementation for FusedQkvRopeCacheImpl {
         let acc = accessors
             .first()
             .expect("FusedQkvRopeCache: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-
-        // Pick rotary cos_sin source per-claim. Mirrors
-        // `rotary_cos_sin_tokens`: any RotaryLocal extern in any
-        // claimed tile → use the local accessor. Llama claims never
-        // produce `rotary_local_cos_sin` so its absence on Llama's
-        // Weights doesn't matter.
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
 
         // The variant carries `layer` once; both the kv_cache index and
         // the weight accessor read it. Sanity-check at codegen that the
@@ -7008,26 +6746,13 @@ impl Implementation for FusedQkvRopeCacheImpl {
             "FusedQkvRopeCache: weight_layer ({weight_layer}) and \
              kv_cache layer ({layer}) disagree — DSL bug"
         );
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedQkvRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #biased },
-                quote! { #interleaved },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::FusedQkvRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            biased,
+            interleaved,
+        )])
     }
 }
 
@@ -7547,7 +7272,7 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -7625,17 +7350,15 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
             5,
             "FusedQkvQkNormRopeCache: expected 5 accessors (q,k,v + q_norm,k_norm)"
         );
-        let resolve_acc = |acc: &WeightAccessor| -> (syn::Ident, u32) {
-            let (base, l) = split_base_layer(&acc.name.to_string());
-            let l = l.unwrap_or(layer as u64) as u32;
-            let ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-            (ident, l)
+        let resolve_layer = |acc: &WeightAccessor| -> u32 {
+            let (_base, l) = split_base_layer(&acc.name.to_string());
+            l.unwrap_or(layer as u64) as u32
         };
-        let (q_w_ident, q_w_layer) = resolve_acc(&accessors[0]);
-        let (k_w_ident, k_w_layer) = resolve_acc(&accessors[1]);
-        let (v_w_ident, v_w_layer) = resolve_acc(&accessors[2]);
-        let (q_n_ident, q_n_layer) = resolve_acc(&accessors[3]);
-        let (k_n_ident, k_n_layer) = resolve_acc(&accessors[4]);
+        let q_w_layer = resolve_layer(&accessors[0]);
+        let k_w_layer = resolve_layer(&accessors[1]);
+        let v_w_layer = resolve_layer(&accessors[2]);
+        let q_n_layer = resolve_layer(&accessors[3]);
+        let k_n_layer = resolve_layer(&accessors[4]);
         for (l, name) in [
             (q_w_layer, "q_weight"),
             (k_w_layer, "k_weight"),
@@ -7650,60 +7373,13 @@ impl Implementation for FusedQkvQkNormRopeCacheImpl {
         }
         let _ = (v_id, q_gemm, k_gemm); // captured into accessors, no further use here.
 
-        // Pick rotary cos_sin source per claim.
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedQkvQkNormRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #q_offset },
-                quote! { #k_offset },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: q_w_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: k_w_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: v_w_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::RmsNorm,
-                base: q_n_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::RmsNorm,
-                base: k_n_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::FusedQkvQkNormRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            q_offset,
+            k_offset,
+        )])
     }
 }
 
@@ -7820,7 +7496,7 @@ impl Implementation for AttentionViaCacheImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -7843,36 +7519,12 @@ impl Implementation for AttentionViaCacheImpl {
             as u32;
         let interleaved = layer_rope_is_interleaved(fuf, layer as u64);
 
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AttentionViaCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #interleaved },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::CosSin,
-            base: cos_sin_ident,
-        })])
+        Some(vec![Instruction::AttentionViaCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            interleaved,
+        )])
     }
 }
 
@@ -8083,7 +7735,7 @@ impl Implementation for RopeAppendRefImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = m.claimed_tiles[0];
         let node = fuf.get(rope_id);
         let interleaved = node.op == OpKind::RopeAppendInterleaved;
@@ -8114,40 +7766,16 @@ impl Implementation for RopeAppendRefImpl {
                 })
                 .expect("RopeAppend: kv_cache extern with concrete layer index") as u32;
 
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-
-        Some(vec![OpInstance::new(
-            syn::Ident::new("RopeAppend", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #v_slot },
-                quote! { #q_out_slot },
-                quote! { #k_out_slot },
-                quote! { #v_out_slot },
-                quote! { #layer },
-                quote! { #interleaved },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::CosSin,
-            base: cos_sin_ident,
-        })])
+        Some(vec![Instruction::RopeAppend(
+            q_slot,
+            k_slot,
+            v_slot,
+            q_out_slot,
+            k_out_slot,
+            v_out_slot,
+            layer,
+            interleaved,
+        )])
     }
 }
 
@@ -8268,7 +7896,7 @@ impl Implementation for FusedQkvRopePrefillImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -8313,53 +7941,22 @@ impl Implementation for FusedQkvRopePrefillImpl {
         let acc = accessors
             .first()
             .expect("FusedQkvRopePrefill: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "FusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
 
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedQkvRopePrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #q_out },
-                quote! { #k_out },
-                quote! { #v_out },
-                quote! { #layer },
-                quote! { #biased },
-                quote! { #interleaved },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::FusedQkvRopePrefill(
+            in_slot_idx,
+            q_out,
+            k_out,
+            v_out,
+            layer,
+            biased,
+            interleaved,
+        )])
     }
 }
 
@@ -8575,7 +8172,7 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -8624,31 +8221,13 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
         let acc = accessors
             .first()
             .expect("CutlassFusedQkvRopeCache: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "CutlassFusedQkvRopeCache: weight_layer ({weight_layer}) and \
              kv_cache layer ({layer}) disagree — DSL bug"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
 
         // Bake (packed_n=q+2*kv, k=hidden) for runtime weight-shape assert.
         // packed_n derives from arch-level `Weights::*_SIZE` at runtime,
@@ -8664,30 +8243,17 @@ impl Implementation for CutlassFusedQkvRopeCacheImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedQkvRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #interleaved },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #packed_n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::CutlassFusedQkvRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            interleaved,
+            tile_m,
+            tile_n,
+            stages,
+            packed_n,
+            k,
+        )])
     }
 }
 
@@ -8806,7 +8372,7 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -8856,30 +8422,12 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
         let acc = accessors
             .first()
             .expect("CutlassFusedQkvRopePrefill: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "CutlassFusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
 
         let (q_n, k) = gemm_nk_from_fuf(fuf, q_gemm_node, bounds)
             .expect("CutlassFusedQkvRopePrefill: q gemm (N, K) must resolve from FUF + bounds");
@@ -8890,32 +8438,19 @@ impl Implementation for CutlassFusedQkvRopePrefillImpl {
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedQkvRopePrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #q_out },
-                quote! { #k_out },
-                quote! { #v_out },
-                quote! { #layer },
-                quote! { #interleaved },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #packed_n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::CutlassFusedQkvRopePrefill(
+            in_slot_idx,
+            q_out,
+            k_out,
+            v_out,
+            layer,
+            interleaved,
+            tile_m,
+            tile_n,
+            stages,
+            packed_n,
+            k,
+        )])
     }
 }
 
@@ -9022,7 +8557,7 @@ impl Implementation for AttentionPrefillContiguousImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -9054,15 +8589,12 @@ impl Implementation for AttentionPrefillContiguousImpl {
             .map(|l| layer_rope_is_interleaved(fuf, l))
             .unwrap_or(false);
 
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AttentionPrefillContiguous", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #v_slot },
-                quote! { #out_slot },
-                quote! { #interleaved },
-            ],
+        Some(vec![Instruction::AttentionPrefillContiguous(
+            q_slot,
+            k_slot,
+            v_slot,
+            out_slot,
+            interleaved,
         )])
     }
 }
@@ -9173,7 +8705,7 @@ impl Implementation for EncoderAttentionImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -9192,14 +8724,8 @@ impl Implementation for EncoderAttentionImpl {
         let v_slot = slots.of(v_id, v_in);
         let out_slot = slots.of(tile, 0);
 
-        Some(vec![OpInstance::new(
-            syn::Ident::new("EncoderAttention", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #v_slot },
-                quote! { #out_slot },
-            ],
+        Some(vec![Instruction::EncoderAttention(
+            q_slot, k_slot, v_slot, out_slot,
         )])
     }
 }
@@ -9299,7 +8825,7 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -9321,35 +8847,12 @@ impl Implementation for SlidingAttentionViaCacheImpl {
             .expect("SlidingAttentionViaCache: kv_cache extern with layer index")
             as u32;
         let interleaved = layer_rope_is_interleaved(fuf, layer as u64);
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("SlidingAttentionViaCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #interleaved },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::CosSin,
-            base: cos_sin_ident,
-        })])
+        Some(vec![Instruction::SlidingAttentionViaCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            interleaved,
+        )])
     }
 }
 
@@ -9447,7 +8950,7 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -9477,18 +8980,12 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
             })
             .map(|l| layer_rope_is_interleaved(fuf, l))
             .unwrap_or(false);
-        Some(vec![OpInstance::new(
-            syn::Ident::new(
-                "SlidingAttentionPrefillContiguous",
-                proc_macro2::Span::call_site(),
-            ),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #v_slot },
-                quote! { #out_slot },
-                quote! { #interleaved },
-            ],
+        Some(vec![Instruction::SlidingAttentionPrefillContiguous(
+            q_slot,
+            k_slot,
+            v_slot,
+            out_slot,
+            interleaved,
         )])
     }
 }
@@ -9740,7 +9237,7 @@ impl Implementation for CutlassGemmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -9753,31 +9250,23 @@ impl Implementation for CutlassGemmImpl {
         let acc = accessors
             .first()
             .expect("CutlassGemm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
         let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
             .expect("CutlassGemm: weight (N, K) must resolve from FUF + bounds");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassGemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
+        )])
     }
 }
 
@@ -9951,7 +9440,7 @@ impl Implementation for CutlassGemmSplitKImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -9964,33 +9453,25 @@ impl Implementation for CutlassGemmSplitKImpl {
         let acc = accessors
             .first()
             .expect("CutlassGemmSplitK: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
         let split_k = self.split_k;
         let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
             .expect("CutlassGemmSplitK: weight (N, K) must resolve from FUF + bounds");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassGemmSplitK", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #split_k },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassGemmSplitK(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            split_k,
+            n,
+            k,
+        )])
     }
 }
 
@@ -10223,7 +9704,7 @@ impl Implementation for CutlassGemmAddImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -10254,31 +9735,23 @@ impl Implementation for CutlassGemmAddImpl {
         let acc = accessors
             .first()
             .expect("CutlassGemmAdd: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let tile_m = self.tile_m;
         let tile_n = self.tile_n;
         let stages = self.stages;
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassGemmAdd: gemm (N, K) must resolve from FUF + bounds");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassGemmAdd", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #residual_idx },
-                quote! { #layer },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassGemmAdd(
+            in_slot_idx,
+            residual_idx,
+            layer,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
+        )])
     }
 }
 
@@ -10479,7 +9952,7 @@ impl Implementation for FusedCublasGemmAddImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -10510,25 +9983,17 @@ impl Implementation for FusedCublasGemmAddImpl {
         let acc = accessors
             .first()
             .expect("FusedCublasGemmAdd: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("FusedCublasGemmAdd: gemm (N, K) must resolve from FUF + bounds");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedCublasGemmAdd", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #residual_idx },
-                quote! { #layer },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedCublasGemmAdd(
+            in_slot_idx,
+            residual_idx,
+            layer,
+            n,
+            k,
+        )])
     }
 }
 
@@ -10625,7 +10090,7 @@ impl Implementation for CutlassGemvImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -10638,25 +10103,17 @@ impl Implementation for CutlassGemvImpl {
         let acc = accessors
             .first()
             .expect("CutlassGemv: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, node, bounds)
             .expect("CutlassGemv: weight (N, K) must resolve from FUF + bounds");
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassGemv", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::CutlassGemv(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            n,
+            k,
+        )])
     }
 }
 
@@ -10971,7 +10428,7 @@ impl Implementation for MarlinGemmImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -10984,21 +10441,13 @@ impl Implementation for MarlinGemmImpl {
         let acc = accessors
             .first()
             .expect("MarlinGemm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MarlinGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Marlin,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::MarlinGemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -11138,7 +10587,7 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let silu_id = *m
             .claimed_tiles
             .iter()
@@ -11168,21 +10617,13 @@ impl Implementation for MarlinFusedGateUpSiluMulImpl {
         let acc = accessors
             .first()
             .expect("MarlinFusedGateUpSiluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MarlinFusedGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Marlin,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::MarlinFusedGateUpSiluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -11323,7 +10764,7 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gelu_id = *m
             .claimed_tiles
             .iter()
@@ -11353,21 +10794,13 @@ impl Implementation for MarlinFusedGateUpGeluMulImpl {
         let acc = accessors
             .first()
             .expect("MarlinFusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MarlinFusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Marlin,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::MarlinFusedGateUpGeluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -11576,7 +11009,7 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -11616,47 +11049,17 @@ impl Implementation for MarlinFusedQkvRopeCacheImpl {
         let acc = accessors
             .first()
             .expect("MarlinFusedQkvRopeCache: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "MarlinFusedQkvRopeCache: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MarlinFusedQkvRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Marlin,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::MarlinFusedQkvRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -11752,7 +11155,7 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -11794,49 +11197,19 @@ impl Implementation for MarlinFusedQkvRopePrefillImpl {
         let acc = accessors
             .first()
             .expect("MarlinFusedQkvRopePrefill: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "MarlinFusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MarlinFusedQkvRopePrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #q_out },
-                quote! { #k_out },
-                quote! { #v_out },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Marlin,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::MarlinFusedQkvRopePrefill(
+            in_slot_idx,
+            q_out,
+            k_out,
+            v_out,
+            layer,
+        )])
     }
 }
 
@@ -11958,7 +11331,7 @@ impl Implementation for Bnb4GemmImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -11971,21 +11344,13 @@ impl Implementation for Bnb4GemmImpl {
         let acc = accessors
             .first()
             .expect("Bnb4Gemm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Bnb4Gemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Bnb4,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Bnb4Gemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -12102,7 +11467,7 @@ impl Implementation for GgmlGemmImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -12115,21 +11480,13 @@ impl Implementation for GgmlGemmImpl {
         let acc = accessors
             .first()
             .expect("GgmlGemm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("GgmlGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::GgmlGemm(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -12264,7 +11621,7 @@ impl Implementation for GgmlFusedGateUpSiluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let silu_id = *m
             .claimed_tiles
             .iter()
@@ -12292,21 +11649,13 @@ impl Implementation for GgmlFusedGateUpSiluMulImpl {
         let acc = accessors
             .first()
             .expect("GgmlFusedGateUpSiluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("GgmlFusedGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::GgmlFusedGateUpSiluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -12439,7 +11788,7 @@ impl Implementation for GgmlFusedGateUpGeluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gelu_id = *m
             .claimed_tiles
             .iter()
@@ -12467,21 +11816,13 @@ impl Implementation for GgmlFusedGateUpGeluMulImpl {
         let acc = accessors
             .first()
             .expect("GgmlFusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("GgmlFusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Linear,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::GgmlFusedGateUpGeluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -12681,7 +12022,7 @@ impl Implementation for GgmlFusedQkvRopeCacheImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -12719,49 +12060,19 @@ impl Implementation for GgmlFusedQkvRopeCacheImpl {
         let acc = accessors
             .first()
             .expect("GgmlFusedQkvRopeCache: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "GgmlFusedQkvRopeCache: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
         let interleaved = fuf.get(rope_id).op == OpKind::RopeAppendInterleaved;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("GgmlFusedQkvRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #interleaved },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::GgmlFusedQkvRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            interleaved,
+        )])
     }
 }
 
@@ -12863,7 +12174,7 @@ impl Implementation for GgmlFusedQkvRopePrefillImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -12905,49 +12216,19 @@ impl Implementation for GgmlFusedQkvRopePrefillImpl {
         let acc = accessors
             .first()
             .expect("GgmlFusedQkvRopePrefill: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "GgmlFusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("GgmlFusedQkvRopePrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #q_out },
-                quote! { #k_out },
-                quote! { #v_out },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Linear,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::GgmlFusedQkvRopePrefill(
+            in_slot_idx,
+            q_out,
+            k_out,
+            v_out,
+            layer,
+        )])
     }
 }
 
@@ -13053,7 +12334,7 @@ impl Implementation for Fp8GemmImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -13066,21 +12347,9 @@ impl Implementation for Fp8GemmImpl {
         let acc = accessors
             .first()
             .expect("Fp8Gemm: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8Gemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Fp8,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Fp8Gemm(in_slot_idx, out_slot_idx, layer)])
     }
 }
 
@@ -13225,7 +12494,7 @@ impl Implementation for Fp8FusedGemmBiasImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gemm_id = *m
             .claimed_tiles
             .iter()
@@ -13247,21 +12516,13 @@ impl Implementation for Fp8FusedGemmBiasImpl {
         let acc = accessors
             .first()
             .expect("Fp8FusedGemmBias: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8FusedGemmBias", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Fp8,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Fp8FusedGemmBias(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -13401,7 +12662,7 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let silu_id = *m
             .claimed_tiles
             .iter()
@@ -13429,21 +12690,13 @@ impl Implementation for Fp8FusedGateUpSiluMulImpl {
         let acc = accessors
             .first()
             .expect("Fp8FusedGateUpSiluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8FusedGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Fp8,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Fp8FusedGateUpSiluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -13578,7 +12831,7 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let silu_id = *m
             .claimed_tiles
             .iter()
@@ -13606,21 +12859,13 @@ impl Implementation for Bnb4FusedGateUpSiluMulImpl {
         let acc = accessors
             .first()
             .expect("Bnb4FusedGateUpSiluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Bnb4FusedGateUpSiluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Bnb4,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Bnb4FusedGateUpSiluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -13752,7 +12997,7 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gelu_id = *m
             .claimed_tiles
             .iter()
@@ -13780,21 +13025,13 @@ impl Implementation for Bnb4FusedGateUpGeluMulImpl {
         let acc = accessors
             .first()
             .expect("Bnb4FusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Bnb4FusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Bnb4,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Bnb4FusedGateUpGeluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -13932,7 +13169,7 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let gelu_id = *m
             .claimed_tiles
             .iter()
@@ -13960,21 +13197,13 @@ impl Implementation for Fp8FusedGateUpGeluMulImpl {
         let acc = accessors
             .first()
             .expect("Fp8FusedGateUpGeluMul: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8FusedGateUpGeluMul", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Fp8,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::Fp8FusedGateUpGeluMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -14181,7 +13410,7 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -14219,47 +13448,17 @@ impl Implementation for Fp8FusedQkvRopeCacheImpl {
         let acc = accessors
             .first()
             .expect("Fp8FusedQkvRopeCache: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "Fp8FusedQkvRopeCache: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8FusedQkvRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Fp8,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::Fp8FusedQkvRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -14352,7 +13551,7 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -14394,49 +13593,19 @@ impl Implementation for Fp8FusedQkvRopePrefillImpl {
         let acc = accessors
             .first()
             .expect("Fp8FusedQkvRopePrefill: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "Fp8FusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Fp8FusedQkvRopePrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #q_out },
-                quote! { #k_out },
-                quote! { #v_out },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Fp8,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::Fp8FusedQkvRopePrefill(
+            in_slot_idx,
+            q_out,
+            k_out,
+            v_out,
+            layer,
+        )])
     }
 }
 
@@ -14628,7 +13797,7 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -14666,47 +13835,17 @@ impl Implementation for Bnb4FusedQkvRopeCacheImpl {
         let acc = accessors
             .first()
             .expect("Bnb4FusedQkvRopeCache: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "Bnb4FusedQkvRopeCache: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Bnb4FusedQkvRopeCache", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Bnb4,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::Bnb4FusedQkvRopeCache(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -14799,7 +13938,7 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let rope_id = *m
             .claimed_tiles
             .iter()
@@ -14841,49 +13980,19 @@ impl Implementation for Bnb4FusedQkvRopePrefillImpl {
         let acc = accessors
             .first()
             .expect("Bnb4FusedQkvRopePrefill: required_weights returned empty");
-        let (base, weight_layer) = split_base_layer(&acc.name.to_string());
+        let (_base, weight_layer) = split_base_layer(&acc.name.to_string());
         let weight_layer = weight_layer.unwrap_or(layer as u64) as u32;
         assert_eq!(
             weight_layer, layer,
             "Bnb4FusedQkvRopePrefill: weight_layer disagrees with kv_cache layer"
         );
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Bnb4FusedQkvRopePrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #q_out },
-                quote! { #k_out },
-                quote! { #v_out },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slots(vec![
-            WeightSlot {
-                kind: WeightKind::Bnb4,
-                base: base_ident,
-            },
-            WeightSlot {
-                kind: WeightKind::CosSin,
-                base: cos_sin_ident,
-            },
-        ])])
+        Some(vec![Instruction::Bnb4FusedQkvRopePrefill(
+            in_slot_idx,
+            q_out,
+            k_out,
+            v_out,
+            layer,
+        )])
     }
 }
 
@@ -15052,7 +14161,7 @@ impl Implementation for FlashInferAttentionDecodeImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -15075,38 +14184,15 @@ impl Implementation for FlashInferAttentionDecodeImpl {
             })
             .expect("FlashInferAttentionDecode: kv_cache extern with layer index")
             as u32;
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
         let head_dim = self.head_dim;
         let softcap = self.use_logits_soft_cap;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FlashInferAttentionDecode", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #head_dim },
-                quote! { #softcap },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::CosSin,
-            base: cos_sin_ident,
-        })])
+        Some(vec![Instruction::FlashInferAttentionDecode(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            head_dim,
+            softcap,
+        )])
     }
 }
 
@@ -15200,7 +14286,7 @@ impl Implementation for FlashInferAttentionPrefillImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -15232,17 +14318,8 @@ impl Implementation for FlashInferAttentionPrefillImpl {
             as u32;
         let head_dim = self.head_dim;
         let softcap = self.use_logits_soft_cap;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FlashInferAttentionPrefill", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #v_slot },
-                quote! { #out_slot },
-                quote! { #layer },
-                quote! { #head_dim },
-                quote! { #softcap },
-            ],
+        Some(vec![Instruction::FlashInferAttentionPrefill(
+            q_slot, k_slot, v_slot, out_slot, layer, head_dim, softcap,
         )])
     }
 }
@@ -15340,7 +14417,7 @@ impl Implementation for MlaSplitRefImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -15350,13 +14427,10 @@ impl Implementation for MlaSplitRefImpl {
         let in_slot_idx = slots.of(in_id, in_slot);
         let kv_latent_slot = slots.of(tile, 0);
         let k_pe_slot = slots.of(tile, 1);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MlaSplit", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #kv_latent_slot },
-                quote! { #k_pe_slot },
-            ],
+        Some(vec![Instruction::MlaSplit(
+            in_slot_idx,
+            kv_latent_slot,
+            k_pe_slot,
         )])
     }
 }
@@ -15459,7 +14533,7 @@ impl Implementation for MlaAttentionImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -15487,36 +14561,9 @@ impl Implementation for MlaAttentionImpl {
             })
             .expect("MlaAttention: kv_cache extern with concrete layer index")
             as u32;
-        let uses_local = m.claimed_tiles.iter().any(|&tid| {
-            fuf.get(tid).inputs.iter().any(|i| {
-                matches!(
-                    i,
-                    FufInput::Extern {
-                        kind: ExternKind::RotaryLocal,
-                        ..
-                    }
-                )
-            })
-        });
-        let cos_sin_ident = if uses_local {
-            syn::Ident::new("rotary_local_cos_sin", proc_macro2::Span::call_site())
-        } else {
-            syn::Ident::new("rotary_cos_sin", proc_macro2::Span::call_site())
-        };
-        Some(vec![OpInstance::new(
-            syn::Ident::new("MlaAttention", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #kv_b_slot },
-                quote! { #k_pe_slot },
-                quote! { #out_slot },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::CosSin,
-            base: cos_sin_ident,
-        })])
+        Some(vec![Instruction::MlaAttention(
+            q_slot, kv_b_slot, k_pe_slot, out_slot, layer,
+        )])
     }
 }
 
@@ -15649,7 +14696,7 @@ impl Implementation for DeepSeekMoeRefImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -15662,21 +14709,13 @@ impl Implementation for DeepSeekMoeRefImpl {
         let acc = accessors
             .first()
             .expect("DeepSeekMoe: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("DeepSeekMoe", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::DeepSeekMoe,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::DeepSeekMoe(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -15788,7 +14827,7 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -15801,21 +14840,13 @@ impl Implementation for DeepSeekFp8BlockMoeImpl {
         let acc = accessors
             .first()
             .expect("DeepSeekMoeFp8Block: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("DeepSeekMoeFp8Block", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::DeepSeekMoeFp8,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::DeepSeekMoeFp8Block(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -15925,7 +14956,7 @@ impl Implementation for DeepSeekGgmlMoeImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -15938,21 +14969,13 @@ impl Implementation for DeepSeekGgmlMoeImpl {
         let acc = accessors
             .first()
             .expect("DeepSeekMoeGgml: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("DeepSeekMoeGgml", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::DeepSeekMoeGgml,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::DeepSeekMoeGgml(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -16077,7 +15100,7 @@ impl Implementation for FusedMoeRefImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -16090,21 +15113,13 @@ impl Implementation for FusedMoeRefImpl {
         let acc = accessors
             .first()
             .expect("FusedMoe: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("FusedMoe", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::FusedMoe,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::FusedMoe(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -16233,7 +15248,7 @@ impl Implementation for SharedFusedMoeRefImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -16246,21 +15261,13 @@ impl Implementation for SharedFusedMoeRefImpl {
         let acc = accessors
             .first()
             .expect("SharedFusedMoe: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("SharedFusedMoe", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-            ],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::SharedFusedMoe,
-            base: base_ident,
-        })])
+        Some(vec![Instruction::SharedFusedMoe(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -16281,17 +15288,14 @@ mod tests {
         assert!(s.fields.is_empty());
     }
 
-    #[test]
-    fn op_instance_field_values_match_shape_field_count() {
-        // Soft contract: `OpInstance::field_values.len()` should
-        // equal `OpcodeShape::fields.len()` for the same variant.
-        // The codegen will assert this at lower-time; the type
-        // doesn't enforce it, so this test pins the convention
-        // alongside a reference Impl-style call.
-        let shape = OpcodeShape::new("Free", vec![("slot", syn::parse_quote!(u32))]);
-        let inst = OpInstance::new(shape.name.clone(), vec![quote! { 7u32 }]);
-        assert_eq!(inst.field_values.len(), shape.fields.len());
-    }
+    // Removed `op_instance_field_values_match_shape_field_count`:
+    // `Implementation::fan_out` now returns `Vec<Instruction>`
+    // directly per `MEGA_IR_PLAN.md` §5+§9 step 4 — the
+    // `OpInstance::field_values` round-trip is gone, so the
+    // arity-vs-shape soft contract no longer has a runtime carrier
+    // here. The remaining arity check lives consumer-side in
+    // `interpreter_codegen` against the per-variant `Instruction`
+    // arm rendered from the typed value.
 
     #[test]
     fn slot_map_assigns_dense_indices_in_insert_order() {
@@ -18073,7 +17077,7 @@ impl Implementation for AllReduceImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let ar_id = m.claimed_tiles[0];
         let node = fuf.get(ar_id);
         let (input_id, input_slot) = match node.inputs.first() {
@@ -18081,10 +17085,15 @@ impl Implementation for AllReduceImpl {
             other => panic!("AllReduce: input 0 must be a Tile (got {other:?})"),
         };
         let slot_idx = slots.of(input_id, input_slot);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AllReduce", proc_macro2::Span::call_site()),
-            vec![quote! { #slot_idx }],
-        )])
+        #[cfg(feature = "nccl")]
+        {
+            Some(vec![Instruction::AllReduce(slot_idx)])
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            let _ = slot_idx;
+            Some(Vec::new())
+        }
     }
 
     // No `interpreter_arm` — the universal `Instruction::eval` body
@@ -18211,7 +17220,7 @@ impl Implementation for AllGatherImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let ag_id = m.claimed_tiles[0];
         let node = fuf.get(ag_id);
         let (input_id, input_slot) = match node.inputs.first() {
@@ -18220,10 +17229,15 @@ impl Implementation for AllGatherImpl {
         };
         let in_idx = slots.of(input_id, input_slot);
         let out_idx = slots.of(ag_id, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AllGather", proc_macro2::Span::call_site()),
-            vec![quote! { #in_idx }, quote! { #out_idx }],
-        )])
+        #[cfg(feature = "nccl")]
+        {
+            Some(vec![Instruction::AllGather(in_idx, out_idx)])
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            let _ = (in_idx, out_idx);
+            Some(Vec::new())
+        }
     }
 }
 
@@ -18342,7 +17356,7 @@ impl Implementation for MmEmbedSpliceImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let splice_id = m.claimed_tiles[0];
         let node = fuf.get(splice_id);
         let (input_id, input_slot) = match node.inputs.first() {
@@ -18350,10 +17364,7 @@ impl Implementation for MmEmbedSpliceImpl {
             other => panic!("MmEmbedSplice: input 0 must be a Tile (got {other:?})"),
         };
         let slot_idx = slots.of(input_id, input_slot);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("SpliceMmEmbeds", proc_macro2::Span::call_site()),
-            vec![quote! { #slot_idx }],
-        )])
+        Some(vec![Instruction::SpliceMmEmbeds(slot_idx)])
     }
 }
 
@@ -18455,13 +17466,10 @@ impl Implementation for LoadPixelsImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let out_slot = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("LoadPixels", proc_macro2::Span::call_site()),
-            vec![quote! { #out_slot }],
-        )])
+        Some(vec![Instruction::LoadPixels(out_slot)])
     }
 }
 
@@ -18555,7 +17563,7 @@ impl Implementation for VarlenAttentionImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -18623,15 +17631,12 @@ impl Implementation for VarlenAttentionImpl {
         let k_slot = slots.of(k_id, k_in);
         let v_slot = slots.of(v_id, v_in);
         let out_slot = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("VarlenAttention", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #v_slot },
-                quote! { #out_slot },
-                quote! { #cu_seqlens_kind },
-            ],
+        Some(vec![Instruction::VarlenAttention(
+            q_slot,
+            k_slot,
+            v_slot,
+            out_slot,
+            cu_seqlens_kind,
         )])
     }
 }
@@ -18736,7 +17741,7 @@ impl Implementation for VisionRopeImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let resolve = |idx: usize| -> (TileId, u8) {
@@ -18751,14 +17756,8 @@ impl Implementation for VisionRopeImpl {
         let k_slot = slots.of(k_id, k_in);
         let q_out_slot = slots.of(tile, 0);
         let k_out_slot = slots.of(tile, 1);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("VisionRope", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #q_slot },
-                quote! { #k_slot },
-                quote! { #q_out_slot },
-                quote! { #k_out_slot },
-            ],
+        Some(vec![Instruction::VisionRope(
+            q_slot, k_slot, q_out_slot, k_out_slot,
         )])
     }
 }
@@ -18847,7 +17846,7 @@ impl Implementation for QuickGeluImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -18856,10 +17855,7 @@ impl Implementation for QuickGeluImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("QuickGelu", proc_macro2::Span::call_site()),
-            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
-        )])
+        Some(vec![Instruction::QuickGelu(in_slot_idx, out_slot_idx)])
     }
 }
 
@@ -18948,7 +17944,7 @@ impl Implementation for GeluErfImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -18957,10 +17953,7 @@ impl Implementation for GeluErfImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("GeluErf", proc_macro2::Span::call_site()),
-            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
-        )])
+        Some(vec![Instruction::GeluErf(in_slot_idx, out_slot_idx)])
     }
 }
 
@@ -19050,7 +18043,7 @@ impl Implementation for GeluImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -19059,10 +18052,7 @@ impl Implementation for GeluImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("Gelu", proc_macro2::Span::call_site()),
-            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
-        )])
+        Some(vec![Instruction::Gelu(in_slot_idx, out_slot_idx)])
     }
 }
 
@@ -19138,10 +18128,7 @@ impl Implementation for PosEmbedRefImpl {
     }
 
     fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new(
-            "PosEmbed",
-            vec![("out_slot", syn::parse_quote!(u32))],
-        )
+        OpcodeShape::new("PosEmbed", vec![("out_slot", syn::parse_quote!(u32))])
     }
 
     fn fan_out(
@@ -19151,23 +18138,11 @@ impl Implementation for PosEmbedRefImpl {
         program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let out_slot = slots.of(tile, 0);
-        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
-        let acc = accessors
-            .first()
-            .expect("PosEmbed: required_weights returned empty");
-        let (base, _layer) = split_base_layer(&acc.name.to_string());
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
-        Some(vec![OpInstance::new(
-            syn::Ident::new("PosEmbed", proc_macro2::Span::call_site()),
-            vec![quote! { #out_slot }],
-        )
-        .with_weight_slot(WeightSlot {
-            kind: WeightKind::Embedding,
-            base: base_ident,
-        })])
+        let _ = (fuf, program);
+        Some(vec![Instruction::PosEmbed(out_slot)])
     }
 }
 
@@ -19261,7 +18236,7 @@ impl Implementation for EmbeddingGatherImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -19284,13 +18259,10 @@ impl Implementation for EmbeddingGatherImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("EmbeddingGather", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #in_slot_idx },
-                quote! { #out_slot_idx },
-                quote! { #indices_kind },
-            ],
+        Some(vec![Instruction::EmbeddingGather(
+            in_slot_idx,
+            out_slot_idx,
+            indices_kind,
         )])
     }
 }
@@ -19376,7 +18348,7 @@ impl Implementation for AvgPool2dImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -19385,10 +18357,7 @@ impl Implementation for AvgPool2dImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("AvgPool2d", proc_macro2::Span::call_site()),
-            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
-        )])
+        Some(vec![Instruction::AvgPool2d(in_slot_idx, out_slot_idx)])
     }
 }
 
@@ -19472,7 +18441,7 @@ impl Implementation for StripClsImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
         let (in_id, in_slot) = match node.inputs.first() {
@@ -19481,9 +18450,6 @@ impl Implementation for StripClsImpl {
         };
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
-        Some(vec![OpInstance::new(
-            syn::Ident::new("StripCls", proc_macro2::Span::call_site()),
-            vec![quote! { #in_slot_idx }, quote! { #out_slot_idx }],
-        )])
+        Some(vec![Instruction::StripCls(in_slot_idx, out_slot_idx)])
     }
 }

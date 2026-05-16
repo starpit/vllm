@@ -1157,7 +1157,7 @@ pub(crate) fn eval_closed_dim(
             // spatial_merge_size**2` always is. Truncating divide is
             // fine for the bounds-equivalence check (mismatched
             // remainders are caught by the unify path, not here).
-            if d == 0 { None } else { Some(n / d) }
+            n.checked_div(d)
         }
         Dim::Var(_) => None,
     }

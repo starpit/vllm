@@ -32,7 +32,7 @@
 //! arch). `tie_word_embeddings: true` for v01, so the codegen's
 //! `LinearTiedToEmbedding` arm wires `lm_head` to the embed buffer.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

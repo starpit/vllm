@@ -34,13 +34,1906 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::classified::Program;
+use ferrite_forward::Instruction;
+
+use crate::classified::{ExternKind, Program};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, MatchInfo, OpInstance, OpcodeShape, SlotMap};
+use crate::impl_lib::{ImplementationLibrary, MatchInfo, OpcodeShape, SlotMap, WeightSlot};
 use crate::schedule::Loop;
 use crate::shape::Shape;
 use crate::solver::{Assignment, SubgraphId};
+
+// ── Instruction helpers ──────────────────────────────────────────
+//
+// `Instruction` (from ferrite-forward) is the universal typed
+// fan_out output. The codegen walker calls `Implementation::fan_out`
+// to get a `Vec<Instruction>`, and `Implementation::required_weights`
+// alongside to get the parallel `Vec<WeightSlot>` for the per-arch
+// `WeightAccessors` impl.
+//
+// These helpers render an `Instruction` back to TokenStream form for
+// the static-slice emit, and extract scalar fields by position for
+// the loop-detection / loop-compression passes.
+
+/// Render one [`Instruction`] as a tuple-style variant constructor:
+/// `Embed(7)`, `RmsNorm(0, 1, 2)`, etc. Each numeric field renders
+/// as an unsuffixed integer literal; bool fields render as
+/// `true`/`false`; `f32` fields render as `f32::from_bits(<bits>)`
+/// because direct float literals can't represent NaN / Inf reliably.
+/// Array fields render as bracketed literals.
+///
+/// The variant ident matches the Rust enum, and the per-arch
+/// codegen prelude does `use ::ferrite_forward::Instruction::*;` so
+/// each row reads as `Variant(...)` without the path prefix.
+pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
+    use ferrite_forward::Instruction as I;
+    let lit_u32 = |v: u32| -> TokenStream {
+        let lit = proc_macro2::Literal::u32_unsuffixed(v);
+        quote! { #lit }
+    };
+    let lit_u8 = |v: u8| -> TokenStream {
+        let lit = proc_macro2::Literal::u8_unsuffixed(v);
+        quote! { #lit }
+    };
+    let lit_bool = |v: bool| -> TokenStream {
+        if v {
+            quote! { true }
+        } else {
+            quote! { false }
+        }
+    };
+    let lit_f32 = |v: f32| -> TokenStream {
+        let bits = v.to_bits();
+        let blit = proc_macro2::Literal::u32_unsuffixed(bits);
+        quote! { f32::from_bits(#blit) }
+    };
+    let lit_arr_u32 = |arr: &[u32]| -> TokenStream {
+        let elems = arr.iter().map(|&x| lit_u32(x));
+        quote! { [ #(#elems),* ] }
+    };
+    let lit_arr_u8 = |arr: &[u8]| -> TokenStream {
+        let elems = arr.iter().map(|&x| lit_u8(x));
+        quote! { [ #(#elems),* ] }
+    };
+    match *inst {
+        I::Embed(a) => {
+            let a = lit_u32(a);
+            quote! { Embed(#a) }
+        }
+        I::RmsNorm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { RmsNorm(#a, #b, #c) }
+        }
+        I::MeanSubRmsNorm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MeanSubRmsNorm(#a, #b, #c) }
+        }
+        I::MeanSubRmsNormBiasAdd(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MeanSubRmsNormBiasAdd(#a, #b, #c) }
+        }
+        I::Reshape(a, b, c, d, e, f) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_arr_u32(&c);
+            let d = lit_arr_u8(&d);
+            let e = lit_arr_u32(&e);
+            let f = lit_u8(f);
+            quote! { Reshape(#a, #b, #c, #d, #e, #f) }
+        }
+        I::Add(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { Add(#a, #b) }
+        }
+        #[cfg(feature = "nccl")]
+        I::AllReduce(a) => {
+            let a = lit_u32(a);
+            quote! { AllReduce(#a) }
+        }
+        #[cfg(feature = "nccl")]
+        I::AllGather(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { AllGather(#a, #b) }
+        }
+        I::SpliceMmEmbeds(a) => {
+            let a = lit_u32(a);
+            quote! { SpliceMmEmbeds(#a) }
+        }
+        I::ScalarMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_f32(c);
+            quote! { ScalarMul(#a, #b, #c) }
+        }
+        I::TanhSoftCap(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { TanhSoftCap(#a, #b) }
+        }
+        I::FusedAddRmsNorm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { FusedAddRmsNorm(#a, #b, #c) }
+        }
+        I::FusedAddRmsNormWithOffset(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_f32(d);
+            quote! { FusedAddRmsNormWithOffset(#a, #b, #c, #d) }
+        }
+        I::ScalarOffsetRmsNorm(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_f32(d);
+            quote! { ScalarOffsetRmsNorm(#a, #b, #c, #d) }
+        }
+        I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { CutlassFusedRmsNormGemm(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { CutlassFusedMeanSubRmsNormGemm(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, h, i) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            quote! { CutlassFusedAddRmsNormGemm(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+        }
+        I::Gemm(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { Gemm(#a, #b, #c, #d, #e) }
+        }
+        I::FusedCublasGemmAdd(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { FusedCublasGemmAdd(#a, #b, #c, #d, #e) }
+        }
+        I::FusedGemmBias(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { FusedGemmBias(#a, #b, #c) }
+        }
+        I::FusedGateUpSiluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { FusedGateUpSiluMul(#a, #b, #c) }
+        }
+        I::FusedGateUpGeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { FusedGateUpGeluMul(#a, #b, #c) }
+        }
+        I::FusedQkvRopeCache(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            let e = lit_bool(e);
+            quote! { FusedQkvRopeCache(#a, #b, #c, #d, #e) }
+        }
+        I::FusedQkvQkNormRopeCache(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_f32(d);
+            let e = lit_f32(e);
+            quote! { FusedQkvQkNormRopeCache(#a, #b, #c, #d, #e) }
+        }
+        I::FusedQkvRopePrefill(a, b, c, d, e, f, g) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_bool(f);
+            let g = lit_bool(g);
+            quote! { FusedQkvRopePrefill(#a, #b, #c, #d, #e, #f, #g) }
+        }
+        I::AttentionViaCache(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            quote! { AttentionViaCache(#a, #b, #c, #d) }
+        }
+        I::AttentionPrefillContiguous(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_bool(e);
+            quote! { AttentionPrefillContiguous(#a, #b, #c, #d, #e) }
+        }
+        I::EncoderAttention(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            quote! { EncoderAttention(#a, #b, #c, #d) }
+        }
+        I::SlidingAttentionViaCache(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            quote! { SlidingAttentionViaCache(#a, #b, #c, #d) }
+        }
+        I::SlidingAttentionPrefillContiguous(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_bool(e);
+            quote! { SlidingAttentionPrefillContiguous(#a, #b, #c, #d, #e) }
+        }
+        I::VarlenAttention(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u8(e);
+            quote! { VarlenAttention(#a, #b, #c, #d, #e) }
+        }
+        I::VisionRope(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            quote! { VisionRope(#a, #b, #c, #d) }
+        }
+        I::QuickGelu(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { QuickGelu(#a, #b) }
+        }
+        I::Gelu(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { Gelu(#a, #b) }
+        }
+        I::PosEmbed(a) => {
+            let a = lit_u32(a);
+            quote! { PosEmbed(#a) }
+        }
+        I::LoadPixels(a) => {
+            let a = lit_u32(a);
+            quote! { LoadPixels(#a) }
+        }
+        I::GeluErf(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { GeluErf(#a, #b) }
+        }
+        I::EmbeddingGather(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u8(c);
+            quote! { EmbeddingGather(#a, #b, #c) }
+        }
+        I::AvgPool2d(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { AvgPool2d(#a, #b) }
+        }
+        I::StripCls(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { StripCls(#a, #b) }
+        }
+        I::FlashInferAttentionDecode(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_bool(e);
+            quote! { FlashInferAttentionDecode(#a, #b, #c, #d, #e) }
+        }
+        I::FlashInferAttentionPrefill(a, b, c, d, e, f, g) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_bool(g);
+            quote! { FlashInferAttentionPrefill(#a, #b, #c, #d, #e, #f, #g) }
+        }
+        I::RopeAppend(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_bool(h);
+            quote! { RopeAppend(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::MlaSplit(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MlaSplit(#a, #b, #c) }
+        }
+        I::MlaAttention(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { MlaAttention(#a, #b, #c, #d, #e) }
+        }
+        I::DeepSeekMoe(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { DeepSeekMoe(#a, #b, #c) }
+        }
+        I::DeepSeekMoeFp8Block(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { DeepSeekMoeFp8Block(#a, #b, #c) }
+        }
+        I::DeepSeekMoeGgml(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { DeepSeekMoeGgml(#a, #b, #c) }
+        }
+        I::FusedMoe(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { FusedMoe(#a, #b, #c) }
+        }
+        I::SharedFusedMoe(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { SharedFusedMoe(#a, #b, #c) }
+        }
+        I::CutlassGemm(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { CutlassGemm(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::CutlassGemmSplitK(a, b, c, d, e, f, g, h, i) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            quote! { CutlassGemmSplitK(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+        }
+        I::CutlassGemmAdd(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { CutlassGemmAdd(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::CutlassGemv(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { CutlassGemv(#a, #b, #c, #d, #e) }
+        }
+        I::CutlassFusedGemmBias(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { CutlassFusedGemmBias(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::CutlassFusedGateUpSiluMul(a, b, c, d, e, f) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            quote! { CutlassFusedGateUpSiluMul(#a, #b, #c, #d, #e, #f) }
+        }
+        I::CutlassFusedGateUpGeluMul(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { CutlassFusedGateUpGeluMul(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
+        I::CutlassFusedQkvRopeCache(a, b, c, d, e, f, g, h, i) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            quote! { CutlassFusedQkvRopeCache(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+        }
+        I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, g, h, i, j, k) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_bool(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            let j = lit_u32(j);
+            let k = lit_u32(k);
+            quote! { CutlassFusedQkvRopePrefill(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j, #k) }
+        }
+        I::MarlinGemm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MarlinGemm(#a, #b, #c) }
+        }
+        I::MarlinFusedGateUpSiluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MarlinFusedGateUpSiluMul(#a, #b, #c) }
+        }
+        I::MarlinFusedGateUpGeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MarlinFusedGateUpGeluMul(#a, #b, #c) }
+        }
+        I::MarlinFusedQkvRopeCache(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { MarlinFusedQkvRopeCache(#a, #b, #c) }
+        }
+        I::MarlinFusedQkvRopePrefill(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { MarlinFusedQkvRopePrefill(#a, #b, #c, #d, #e) }
+        }
+        I::Bnb4Gemm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Bnb4Gemm(#a, #b, #c) }
+        }
+        I::Bnb4FusedGateUpSiluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Bnb4FusedGateUpSiluMul(#a, #b, #c) }
+        }
+        I::Bnb4FusedGateUpGeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Bnb4FusedGateUpGeluMul(#a, #b, #c) }
+        }
+        I::Bnb4FusedQkvRopeCache(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Bnb4FusedQkvRopeCache(#a, #b, #c) }
+        }
+        I::Bnb4FusedQkvRopePrefill(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { Bnb4FusedQkvRopePrefill(#a, #b, #c, #d, #e) }
+        }
+        I::GgmlGemm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { GgmlGemm(#a, #b, #c) }
+        }
+        I::GgmlFusedGateUpSiluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { GgmlFusedGateUpSiluMul(#a, #b, #c) }
+        }
+        I::GgmlFusedGateUpGeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { GgmlFusedGateUpGeluMul(#a, #b, #c) }
+        }
+        I::GgmlFusedQkvRopeCache(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            quote! { GgmlFusedQkvRopeCache(#a, #b, #c, #d) }
+        }
+        I::GgmlFusedQkvRopePrefill(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { GgmlFusedQkvRopePrefill(#a, #b, #c, #d, #e) }
+        }
+        I::Fp8Gemm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Fp8Gemm(#a, #b, #c) }
+        }
+        I::Fp8FusedGemmBias(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Fp8FusedGemmBias(#a, #b, #c) }
+        }
+        I::Fp8FusedGateUpSiluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Fp8FusedGateUpSiluMul(#a, #b, #c) }
+        }
+        I::Fp8FusedGateUpGeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Fp8FusedGateUpGeluMul(#a, #b, #c) }
+        }
+        I::Fp8FusedQkvRopeCache(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { Fp8FusedQkvRopeCache(#a, #b, #c) }
+        }
+        I::Fp8FusedQkvRopePrefill(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { Fp8FusedQkvRopePrefill(#a, #b, #c, #d, #e) }
+        }
+        I::Loop(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { Loop(#a, #b) }
+        }
+        I::Alias(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { Alias(#a, #b) }
+        }
+        I::Free(a) => {
+            let a = lit_u32(a);
+            quote! { Free(#a) }
+        }
+    }
+}
+
+/// Variant ident as it appears on the Rust enum and in
+/// `OpcodeShape::name`. Used by the loop-detection pass to look up
+/// per-variant iter-index field positions.
+pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
+    use ferrite_forward::Instruction as I;
+    match inst {
+        I::Embed(..) => "Embed",
+        I::RmsNorm(..) => "RmsNorm",
+        I::MeanSubRmsNorm(..) => "MeanSubRmsNorm",
+        I::MeanSubRmsNormBiasAdd(..) => "MeanSubRmsNormBiasAdd",
+        I::Reshape(..) => "Reshape",
+        I::Add(..) => "Add",
+        #[cfg(feature = "nccl")]
+        I::AllReduce(..) => "AllReduce",
+        #[cfg(feature = "nccl")]
+        I::AllGather(..) => "AllGather",
+        I::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
+        I::ScalarMul(..) => "ScalarMul",
+        I::TanhSoftCap(..) => "TanhSoftCap",
+        I::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
+        I::FusedAddRmsNormWithOffset(..) => "FusedAddRmsNormWithOffset",
+        I::ScalarOffsetRmsNorm(..) => "ScalarOffsetRmsNorm",
+        I::CutlassFusedRmsNormGemm(..) => "CutlassFusedRmsNormGemm",
+        I::CutlassFusedMeanSubRmsNormGemm(..) => "CutlassFusedMeanSubRmsNormGemm",
+        I::CutlassFusedAddRmsNormGemm(..) => "CutlassFusedAddRmsNormGemm",
+        I::Gemm(..) => "Gemm",
+        I::FusedCublasGemmAdd(..) => "FusedCublasGemmAdd",
+        I::FusedGemmBias(..) => "FusedGemmBias",
+        I::FusedGateUpSiluMul(..) => "FusedGateUpSiluMul",
+        I::FusedGateUpGeluMul(..) => "FusedGateUpGeluMul",
+        I::FusedQkvRopeCache(..) => "FusedQkvRopeCache",
+        I::FusedQkvQkNormRopeCache(..) => "FusedQkvQkNormRopeCache",
+        I::FusedQkvRopePrefill(..) => "FusedQkvRopePrefill",
+        I::AttentionViaCache(..) => "AttentionViaCache",
+        I::AttentionPrefillContiguous(..) => "AttentionPrefillContiguous",
+        I::EncoderAttention(..) => "EncoderAttention",
+        I::SlidingAttentionViaCache(..) => "SlidingAttentionViaCache",
+        I::SlidingAttentionPrefillContiguous(..) => "SlidingAttentionPrefillContiguous",
+        I::VarlenAttention(..) => "VarlenAttention",
+        I::VisionRope(..) => "VisionRope",
+        I::QuickGelu(..) => "QuickGelu",
+        I::Gelu(..) => "Gelu",
+        I::PosEmbed(..) => "PosEmbed",
+        I::LoadPixels(..) => "LoadPixels",
+        I::GeluErf(..) => "GeluErf",
+        I::EmbeddingGather(..) => "EmbeddingGather",
+        I::AvgPool2d(..) => "AvgPool2d",
+        I::StripCls(..) => "StripCls",
+        I::FlashInferAttentionDecode(..) => "FlashInferAttentionDecode",
+        I::FlashInferAttentionPrefill(..) => "FlashInferAttentionPrefill",
+        I::RopeAppend(..) => "RopeAppend",
+        I::MlaSplit(..) => "MlaSplit",
+        I::MlaAttention(..) => "MlaAttention",
+        I::DeepSeekMoe(..) => "DeepSeekMoe",
+        I::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
+        I::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
+        I::FusedMoe(..) => "FusedMoe",
+        I::SharedFusedMoe(..) => "SharedFusedMoe",
+        I::CutlassGemm(..) => "CutlassGemm",
+        I::CutlassGemmSplitK(..) => "CutlassGemmSplitK",
+        I::CutlassGemmAdd(..) => "CutlassGemmAdd",
+        I::CutlassGemv(..) => "CutlassGemv",
+        I::CutlassFusedGemmBias(..) => "CutlassFusedGemmBias",
+        I::CutlassFusedGateUpSiluMul(..) => "CutlassFusedGateUpSiluMul",
+        I::CutlassFusedGateUpGeluMul(..) => "CutlassFusedGateUpGeluMul",
+        I::CutlassFusedQkvRopeCache(..) => "CutlassFusedQkvRopeCache",
+        I::CutlassFusedQkvRopePrefill(..) => "CutlassFusedQkvRopePrefill",
+        I::MarlinGemm(..) => "MarlinGemm",
+        I::MarlinFusedGateUpSiluMul(..) => "MarlinFusedGateUpSiluMul",
+        I::MarlinFusedGateUpGeluMul(..) => "MarlinFusedGateUpGeluMul",
+        I::MarlinFusedQkvRopeCache(..) => "MarlinFusedQkvRopeCache",
+        I::MarlinFusedQkvRopePrefill(..) => "MarlinFusedQkvRopePrefill",
+        I::Bnb4Gemm(..) => "Bnb4Gemm",
+        I::Bnb4FusedGateUpSiluMul(..) => "Bnb4FusedGateUpSiluMul",
+        I::Bnb4FusedGateUpGeluMul(..) => "Bnb4FusedGateUpGeluMul",
+        I::Bnb4FusedQkvRopeCache(..) => "Bnb4FusedQkvRopeCache",
+        I::Bnb4FusedQkvRopePrefill(..) => "Bnb4FusedQkvRopePrefill",
+        I::GgmlGemm(..) => "GgmlGemm",
+        I::GgmlFusedGateUpSiluMul(..) => "GgmlFusedGateUpSiluMul",
+        I::GgmlFusedGateUpGeluMul(..) => "GgmlFusedGateUpGeluMul",
+        I::GgmlFusedQkvRopeCache(..) => "GgmlFusedQkvRopeCache",
+        I::GgmlFusedQkvRopePrefill(..) => "GgmlFusedQkvRopePrefill",
+        I::Fp8Gemm(..) => "Fp8Gemm",
+        I::Fp8FusedGemmBias(..) => "Fp8FusedGemmBias",
+        I::Fp8FusedGateUpSiluMul(..) => "Fp8FusedGateUpSiluMul",
+        I::Fp8FusedGateUpGeluMul(..) => "Fp8FusedGateUpGeluMul",
+        I::Fp8FusedQkvRopeCache(..) => "Fp8FusedQkvRopeCache",
+        I::Fp8FusedQkvRopePrefill(..) => "Fp8FusedQkvRopePrefill",
+        I::Loop(..) => "Loop",
+        I::Alias(..) => "Alias",
+        I::Free(..) => "Free",
+    }
+}
+
+/// Extract the field at position `idx` as a `u64` for loop-detection
+/// purposes (which only ever needs to compare scalar layer-style
+/// fields). Returns `None` for fields that aren't a single scalar
+/// integer (arrays, bools, floats — none of which a sane iter-index
+/// would ever be), and for out-of-range indices.
+pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
+    use ferrite_forward::Instruction as I;
+    let u = |v: u32| Some(v as u64);
+    let u8v = |v: u8| Some(v as u64);
+    match *inst {
+        I::Embed(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::RmsNorm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MeanSubRmsNorm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MeanSubRmsNormBiasAdd(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Reshape(a, b, _, _, _, f) => match idx {
+            0 => u(a),
+            1 => u(b),
+            5 => u8v(f),
+            _ => None,
+        },
+        I::Add(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        #[cfg(feature = "nccl")]
+        I::AllReduce(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        #[cfg(feature = "nccl")]
+        I::AllGather(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::SpliceMmEmbeds(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::ScalarMul(a, b, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::TanhSoftCap(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::FusedAddRmsNorm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedAddRmsNormWithOffset(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::ScalarOffsetRmsNorm(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, g, h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            _ => None,
+        },
+        I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, e, f, g, h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            _ => None,
+        },
+        I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            _ => None,
+        },
+        I::Gemm(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::FusedCublasGemmAdd(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::FusedGemmBias(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedGateUpSiluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedGateUpGeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedQkvRopeCache(a, b, c, _, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedQkvQkNormRopeCache(a, b, c, _, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedQkvRopePrefill(a, b, c, d, e, _, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::AttentionViaCache(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::AttentionPrefillContiguous(a, b, c, d, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        I::EncoderAttention(a, b, c, d) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        I::SlidingAttentionViaCache(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::SlidingAttentionPrefillContiguous(a, b, c, d, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        I::VarlenAttention(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u8v(e),
+            _ => None,
+        },
+        I::VisionRope(a, b, c, d) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        I::QuickGelu(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::Gelu(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::PosEmbed(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::LoadPixels(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::GeluErf(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::EmbeddingGather(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u8v(c),
+            _ => None,
+        },
+        I::AvgPool2d(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::StripCls(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::FlashInferAttentionDecode(a, b, c, d, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        I::FlashInferAttentionPrefill(a, b, c, d, e, f, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            _ => None,
+        },
+        I::RopeAppend(a, b, c, d, e, f, g, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            _ => None,
+        },
+        I::MlaSplit(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MlaAttention(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::DeepSeekMoe(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::DeepSeekMoeFp8Block(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::DeepSeekMoeGgml(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::FusedMoe(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::SharedFusedMoe(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::CutlassGemm(a, b, c, d, e, f, g, h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            _ => None,
+        },
+        I::CutlassGemmSplitK(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            _ => None,
+        },
+        I::CutlassGemmAdd(a, b, c, d, e, f, g, h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            _ => None,
+        },
+        I::CutlassGemv(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::CutlassFusedGemmBias(a, b, c, d, e, f, g, h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            _ => None,
+        },
+        I::CutlassFusedGateUpSiluMul(a, b, c, d, e, f) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            _ => None,
+        },
+        I::CutlassFusedGateUpGeluMul(a, b, c, d, e, f, g, h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            _ => None,
+        },
+        I::CutlassFusedQkvRopeCache(a, b, c, _, e, f, g, h, i) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            _ => None,
+        },
+        I::CutlassFusedQkvRopePrefill(a, b, c, d, e, _, g, h, i, j, k) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            9 => u(j),
+            10 => u(k),
+            _ => None,
+        },
+        I::MarlinGemm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MarlinFusedGateUpSiluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MarlinFusedGateUpGeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MarlinFusedQkvRopeCache(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::MarlinFusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::Bnb4Gemm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Bnb4FusedGateUpSiluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Bnb4FusedGateUpGeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Bnb4FusedQkvRopeCache(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Bnb4FusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::GgmlGemm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::GgmlFusedGateUpSiluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::GgmlFusedGateUpGeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::GgmlFusedQkvRopeCache(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::GgmlFusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::Fp8Gemm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Fp8FusedGemmBias(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Fp8FusedGateUpSiluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Fp8FusedGateUpGeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Fp8FusedQkvRopeCache(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::Fp8FusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::Loop(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::Alias(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::Free(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+    }
+}
+
+/// Replace the field at position `idx` (interpreted as u32) with
+/// `new_val`. Used by `apply_loop_compression` to set per-row
+/// baselines for the iter-index field. Panics if `idx` is invalid
+/// for this variant or if the field at that position is not u32.
+pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -> Instruction {
+    use ferrite_forward::Instruction as I;
+    let n = new_val;
+    match inst {
+        I::Embed(_a) => match idx {
+            0 => I::Embed(n),
+            _ => panic!("Embed: bad idx {idx}"),
+        },
+        I::RmsNorm(a, b, c) => match idx {
+            0 => I::RmsNorm(n, b, c),
+            1 => I::RmsNorm(a, n, c),
+            2 => I::RmsNorm(a, b, n),
+            _ => panic!("RmsNorm: bad idx {idx}"),
+        },
+        I::MeanSubRmsNorm(a, b, c) => match idx {
+            0 => I::MeanSubRmsNorm(n, b, c),
+            1 => I::MeanSubRmsNorm(a, n, c),
+            2 => I::MeanSubRmsNorm(a, b, n),
+            _ => panic!("MeanSubRmsNorm: bad idx {idx}"),
+        },
+        I::MeanSubRmsNormBiasAdd(a, b, c) => match idx {
+            0 => I::MeanSubRmsNormBiasAdd(n, b, c),
+            1 => I::MeanSubRmsNormBiasAdd(a, n, c),
+            2 => I::MeanSubRmsNormBiasAdd(a, b, n),
+            _ => panic!("MeanSubRmsNormBiasAdd: bad idx {idx}"),
+        },
+        I::Reshape(a, b, c, d, e, f) => match idx {
+            0 => I::Reshape(n, b, c, d, e, f),
+            1 => I::Reshape(a, n, c, d, e, f),
+            _ => panic!("Reshape: bad idx {idx}"),
+        },
+        I::Add(a, b) => match idx {
+            0 => I::Add(n, b),
+            1 => I::Add(a, n),
+            _ => panic!("Add: bad idx {idx}"),
+        },
+        #[cfg(feature = "nccl")]
+        I::AllReduce(a) => match idx {
+            0 => I::AllReduce(n),
+            _ => panic!("AllReduce: bad idx {idx}"),
+        },
+        #[cfg(feature = "nccl")]
+        I::AllGather(a, b) => match idx {
+            0 => I::AllGather(n, b),
+            1 => I::AllGather(a, n),
+            _ => panic!("AllGather: bad idx {idx}"),
+        },
+        I::SpliceMmEmbeds(_a) => match idx {
+            0 => I::SpliceMmEmbeds(n),
+            _ => panic!("SpliceMmEmbeds: bad idx {idx}"),
+        },
+        I::ScalarMul(a, b, c) => match idx {
+            0 => I::ScalarMul(n, b, c),
+            1 => I::ScalarMul(a, n, c),
+            _ => panic!("ScalarMul: bad idx {idx}"),
+        },
+        I::TanhSoftCap(a, b) => match idx {
+            0 => I::TanhSoftCap(n, b),
+            1 => I::TanhSoftCap(a, n),
+            _ => panic!("TanhSoftCap: bad idx {idx}"),
+        },
+        I::FusedAddRmsNorm(a, b, c) => match idx {
+            0 => I::FusedAddRmsNorm(n, b, c),
+            1 => I::FusedAddRmsNorm(a, n, c),
+            2 => I::FusedAddRmsNorm(a, b, n),
+            _ => panic!("FusedAddRmsNorm: bad idx {idx}"),
+        },
+        I::FusedAddRmsNormWithOffset(a, b, c, d) => match idx {
+            0 => I::FusedAddRmsNormWithOffset(n, b, c, d),
+            1 => I::FusedAddRmsNormWithOffset(a, n, c, d),
+            2 => I::FusedAddRmsNormWithOffset(a, b, n, d),
+            _ => panic!("FusedAddRmsNormWithOffset: bad idx {idx}"),
+        },
+        I::ScalarOffsetRmsNorm(a, b, c, d) => match idx {
+            0 => I::ScalarOffsetRmsNorm(n, b, c, d),
+            1 => I::ScalarOffsetRmsNorm(a, n, c, d),
+            2 => I::ScalarOffsetRmsNorm(a, b, n, d),
+            _ => panic!("ScalarOffsetRmsNorm: bad idx {idx}"),
+        },
+        I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::CutlassFusedRmsNormGemm(n, b, c, d, e, f, g, h),
+            1 => I::CutlassFusedRmsNormGemm(a, n, c, d, e, f, g, h),
+            2 => I::CutlassFusedRmsNormGemm(a, b, n, d, e, f, g, h),
+            3 => I::CutlassFusedRmsNormGemm(a, b, c, n, e, f, g, h),
+            4 => I::CutlassFusedRmsNormGemm(a, b, c, d, n, f, g, h),
+            5 => I::CutlassFusedRmsNormGemm(a, b, c, d, e, n, g, h),
+            6 => I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, n, h),
+            7 => I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, g, n),
+            _ => panic!("CutlassFusedRmsNormGemm: bad idx {idx}"),
+        },
+        I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::CutlassFusedMeanSubRmsNormGemm(n, b, c, d, e, f, g, h),
+            1 => I::CutlassFusedMeanSubRmsNormGemm(a, n, c, d, e, f, g, h),
+            2 => I::CutlassFusedMeanSubRmsNormGemm(a, b, n, d, e, f, g, h),
+            3 => I::CutlassFusedMeanSubRmsNormGemm(a, b, c, n, e, f, g, h),
+            4 => I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, n, f, g, h),
+            5 => I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, e, n, g, h),
+            6 => I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, e, f, n, h),
+            7 => I::CutlassFusedMeanSubRmsNormGemm(a, b, c, d, e, f, g, n),
+            _ => panic!("CutlassFusedMeanSubRmsNormGemm: bad idx {idx}"),
+        },
+        I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::CutlassFusedAddRmsNormGemm(n, b, c, d, e, f, g, h, i),
+            1 => I::CutlassFusedAddRmsNormGemm(a, n, c, d, e, f, g, h, i),
+            2 => I::CutlassFusedAddRmsNormGemm(a, b, n, d, e, f, g, h, i),
+            3 => I::CutlassFusedAddRmsNormGemm(a, b, c, n, e, f, g, h, i),
+            4 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, n, f, g, h, i),
+            5 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, n, g, h, i),
+            6 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, n, h, i),
+            7 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, n, i),
+            8 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, h, n),
+            _ => panic!("CutlassFusedAddRmsNormGemm: bad idx {idx}"),
+        },
+        I::Gemm(a, b, c, d, e) => match idx {
+            0 => I::Gemm(n, b, c, d, e),
+            1 => I::Gemm(a, n, c, d, e),
+            2 => I::Gemm(a, b, n, d, e),
+            3 => I::Gemm(a, b, c, n, e),
+            4 => I::Gemm(a, b, c, d, n),
+            _ => panic!("Gemm: bad idx {idx}"),
+        },
+        I::FusedCublasGemmAdd(a, b, c, d, e) => match idx {
+            0 => I::FusedCublasGemmAdd(n, b, c, d, e),
+            1 => I::FusedCublasGemmAdd(a, n, c, d, e),
+            2 => I::FusedCublasGemmAdd(a, b, n, d, e),
+            3 => I::FusedCublasGemmAdd(a, b, c, n, e),
+            4 => I::FusedCublasGemmAdd(a, b, c, d, n),
+            _ => panic!("FusedCublasGemmAdd: bad idx {idx}"),
+        },
+        I::FusedGemmBias(a, b, c) => match idx {
+            0 => I::FusedGemmBias(n, b, c),
+            1 => I::FusedGemmBias(a, n, c),
+            2 => I::FusedGemmBias(a, b, n),
+            _ => panic!("FusedGemmBias: bad idx {idx}"),
+        },
+        I::FusedGateUpSiluMul(a, b, c) => match idx {
+            0 => I::FusedGateUpSiluMul(n, b, c),
+            1 => I::FusedGateUpSiluMul(a, n, c),
+            2 => I::FusedGateUpSiluMul(a, b, n),
+            _ => panic!("FusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::FusedGateUpGeluMul(a, b, c) => match idx {
+            0 => I::FusedGateUpGeluMul(n, b, c),
+            1 => I::FusedGateUpGeluMul(a, n, c),
+            2 => I::FusedGateUpGeluMul(a, b, n),
+            _ => panic!("FusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::FusedQkvRopeCache(a, b, c, d, e) => match idx {
+            0 => I::FusedQkvRopeCache(n, b, c, d, e),
+            1 => I::FusedQkvRopeCache(a, n, c, d, e),
+            2 => I::FusedQkvRopeCache(a, b, n, d, e),
+            _ => panic!("FusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::FusedQkvQkNormRopeCache(a, b, c, d, e) => match idx {
+            0 => I::FusedQkvQkNormRopeCache(n, b, c, d, e),
+            1 => I::FusedQkvQkNormRopeCache(a, n, c, d, e),
+            2 => I::FusedQkvQkNormRopeCache(a, b, n, d, e),
+            _ => panic!("FusedQkvQkNormRopeCache: bad idx {idx}"),
+        },
+        I::FusedQkvRopePrefill(a, b, c, d, e, f, g) => match idx {
+            0 => I::FusedQkvRopePrefill(n, b, c, d, e, f, g),
+            1 => I::FusedQkvRopePrefill(a, n, c, d, e, f, g),
+            2 => I::FusedQkvRopePrefill(a, b, n, d, e, f, g),
+            3 => I::FusedQkvRopePrefill(a, b, c, n, e, f, g),
+            4 => I::FusedQkvRopePrefill(a, b, c, d, n, f, g),
+            _ => panic!("FusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::AttentionViaCache(a, b, c, d) => match idx {
+            0 => I::AttentionViaCache(n, b, c, d),
+            1 => I::AttentionViaCache(a, n, c, d),
+            2 => I::AttentionViaCache(a, b, n, d),
+            _ => panic!("AttentionViaCache: bad idx {idx}"),
+        },
+        I::AttentionPrefillContiguous(a, b, c, d, e) => match idx {
+            0 => I::AttentionPrefillContiguous(n, b, c, d, e),
+            1 => I::AttentionPrefillContiguous(a, n, c, d, e),
+            2 => I::AttentionPrefillContiguous(a, b, n, d, e),
+            3 => I::AttentionPrefillContiguous(a, b, c, n, e),
+            _ => panic!("AttentionPrefillContiguous: bad idx {idx}"),
+        },
+        I::EncoderAttention(a, b, c, d) => match idx {
+            0 => I::EncoderAttention(n, b, c, d),
+            1 => I::EncoderAttention(a, n, c, d),
+            2 => I::EncoderAttention(a, b, n, d),
+            3 => I::EncoderAttention(a, b, c, n),
+            _ => panic!("EncoderAttention: bad idx {idx}"),
+        },
+        I::SlidingAttentionViaCache(a, b, c, d) => match idx {
+            0 => I::SlidingAttentionViaCache(n, b, c, d),
+            1 => I::SlidingAttentionViaCache(a, n, c, d),
+            2 => I::SlidingAttentionViaCache(a, b, n, d),
+            _ => panic!("SlidingAttentionViaCache: bad idx {idx}"),
+        },
+        I::SlidingAttentionPrefillContiguous(a, b, c, d, e) => match idx {
+            0 => I::SlidingAttentionPrefillContiguous(n, b, c, d, e),
+            1 => I::SlidingAttentionPrefillContiguous(a, n, c, d, e),
+            2 => I::SlidingAttentionPrefillContiguous(a, b, n, d, e),
+            3 => I::SlidingAttentionPrefillContiguous(a, b, c, n, e),
+            _ => panic!("SlidingAttentionPrefillContiguous: bad idx {idx}"),
+        },
+        I::VarlenAttention(a, b, c, d, e) => match idx {
+            0 => I::VarlenAttention(n, b, c, d, e),
+            1 => I::VarlenAttention(a, n, c, d, e),
+            2 => I::VarlenAttention(a, b, n, d, e),
+            3 => I::VarlenAttention(a, b, c, n, e),
+            _ => panic!("VarlenAttention: bad idx {idx}"),
+        },
+        I::VisionRope(a, b, c, d) => match idx {
+            0 => I::VisionRope(n, b, c, d),
+            1 => I::VisionRope(a, n, c, d),
+            2 => I::VisionRope(a, b, n, d),
+            3 => I::VisionRope(a, b, c, n),
+            _ => panic!("VisionRope: bad idx {idx}"),
+        },
+        I::QuickGelu(a, b) => match idx {
+            0 => I::QuickGelu(n, b),
+            1 => I::QuickGelu(a, n),
+            _ => panic!("QuickGelu: bad idx {idx}"),
+        },
+        I::Gelu(a, b) => match idx {
+            0 => I::Gelu(n, b),
+            1 => I::Gelu(a, n),
+            _ => panic!("Gelu: bad idx {idx}"),
+        },
+        I::PosEmbed(_a) => match idx {
+            0 => I::PosEmbed(n),
+            _ => panic!("PosEmbed: bad idx {idx}"),
+        },
+        I::LoadPixels(_a) => match idx {
+            0 => I::LoadPixels(n),
+            _ => panic!("LoadPixels: bad idx {idx}"),
+        },
+        I::GeluErf(a, b) => match idx {
+            0 => I::GeluErf(n, b),
+            1 => I::GeluErf(a, n),
+            _ => panic!("GeluErf: bad idx {idx}"),
+        },
+        I::EmbeddingGather(a, b, c) => match idx {
+            0 => I::EmbeddingGather(n, b, c),
+            1 => I::EmbeddingGather(a, n, c),
+            _ => panic!("EmbeddingGather: bad idx {idx}"),
+        },
+        I::AvgPool2d(a, b) => match idx {
+            0 => I::AvgPool2d(n, b),
+            1 => I::AvgPool2d(a, n),
+            _ => panic!("AvgPool2d: bad idx {idx}"),
+        },
+        I::StripCls(a, b) => match idx {
+            0 => I::StripCls(n, b),
+            1 => I::StripCls(a, n),
+            _ => panic!("StripCls: bad idx {idx}"),
+        },
+        I::FlashInferAttentionDecode(a, b, c, d, e) => match idx {
+            0 => I::FlashInferAttentionDecode(n, b, c, d, e),
+            1 => I::FlashInferAttentionDecode(a, n, c, d, e),
+            2 => I::FlashInferAttentionDecode(a, b, n, d, e),
+            3 => I::FlashInferAttentionDecode(a, b, c, n, e),
+            _ => panic!("FlashInferAttentionDecode: bad idx {idx}"),
+        },
+        I::FlashInferAttentionPrefill(a, b, c, d, e, f, g) => match idx {
+            0 => I::FlashInferAttentionPrefill(n, b, c, d, e, f, g),
+            1 => I::FlashInferAttentionPrefill(a, n, c, d, e, f, g),
+            2 => I::FlashInferAttentionPrefill(a, b, n, d, e, f, g),
+            3 => I::FlashInferAttentionPrefill(a, b, c, n, e, f, g),
+            4 => I::FlashInferAttentionPrefill(a, b, c, d, n, f, g),
+            5 => I::FlashInferAttentionPrefill(a, b, c, d, e, n, g),
+            _ => panic!("FlashInferAttentionPrefill: bad idx {idx}"),
+        },
+        I::RopeAppend(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::RopeAppend(n, b, c, d, e, f, g, h),
+            1 => I::RopeAppend(a, n, c, d, e, f, g, h),
+            2 => I::RopeAppend(a, b, n, d, e, f, g, h),
+            3 => I::RopeAppend(a, b, c, n, e, f, g, h),
+            4 => I::RopeAppend(a, b, c, d, n, f, g, h),
+            5 => I::RopeAppend(a, b, c, d, e, n, g, h),
+            6 => I::RopeAppend(a, b, c, d, e, f, n, h),
+            _ => panic!("RopeAppend: bad idx {idx}"),
+        },
+        I::MlaSplit(a, b, c) => match idx {
+            0 => I::MlaSplit(n, b, c),
+            1 => I::MlaSplit(a, n, c),
+            2 => I::MlaSplit(a, b, n),
+            _ => panic!("MlaSplit: bad idx {idx}"),
+        },
+        I::MlaAttention(a, b, c, d, e) => match idx {
+            0 => I::MlaAttention(n, b, c, d, e),
+            1 => I::MlaAttention(a, n, c, d, e),
+            2 => I::MlaAttention(a, b, n, d, e),
+            3 => I::MlaAttention(a, b, c, n, e),
+            4 => I::MlaAttention(a, b, c, d, n),
+            _ => panic!("MlaAttention: bad idx {idx}"),
+        },
+        I::DeepSeekMoe(a, b, c) => match idx {
+            0 => I::DeepSeekMoe(n, b, c),
+            1 => I::DeepSeekMoe(a, n, c),
+            2 => I::DeepSeekMoe(a, b, n),
+            _ => panic!("DeepSeekMoe: bad idx {idx}"),
+        },
+        I::DeepSeekMoeFp8Block(a, b, c) => match idx {
+            0 => I::DeepSeekMoeFp8Block(n, b, c),
+            1 => I::DeepSeekMoeFp8Block(a, n, c),
+            2 => I::DeepSeekMoeFp8Block(a, b, n),
+            _ => panic!("DeepSeekMoeFp8Block: bad idx {idx}"),
+        },
+        I::DeepSeekMoeGgml(a, b, c) => match idx {
+            0 => I::DeepSeekMoeGgml(n, b, c),
+            1 => I::DeepSeekMoeGgml(a, n, c),
+            2 => I::DeepSeekMoeGgml(a, b, n),
+            _ => panic!("DeepSeekMoeGgml: bad idx {idx}"),
+        },
+        I::FusedMoe(a, b, c) => match idx {
+            0 => I::FusedMoe(n, b, c),
+            1 => I::FusedMoe(a, n, c),
+            2 => I::FusedMoe(a, b, n),
+            _ => panic!("FusedMoe: bad idx {idx}"),
+        },
+        I::SharedFusedMoe(a, b, c) => match idx {
+            0 => I::SharedFusedMoe(n, b, c),
+            1 => I::SharedFusedMoe(a, n, c),
+            2 => I::SharedFusedMoe(a, b, n),
+            _ => panic!("SharedFusedMoe: bad idx {idx}"),
+        },
+        I::CutlassGemm(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::CutlassGemm(n, b, c, d, e, f, g, h),
+            1 => I::CutlassGemm(a, n, c, d, e, f, g, h),
+            2 => I::CutlassGemm(a, b, n, d, e, f, g, h),
+            3 => I::CutlassGemm(a, b, c, n, e, f, g, h),
+            4 => I::CutlassGemm(a, b, c, d, n, f, g, h),
+            5 => I::CutlassGemm(a, b, c, d, e, n, g, h),
+            6 => I::CutlassGemm(a, b, c, d, e, f, n, h),
+            7 => I::CutlassGemm(a, b, c, d, e, f, g, n),
+            _ => panic!("CutlassGemm: bad idx {idx}"),
+        },
+        I::CutlassGemmSplitK(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::CutlassGemmSplitK(n, b, c, d, e, f, g, h, i),
+            1 => I::CutlassGemmSplitK(a, n, c, d, e, f, g, h, i),
+            2 => I::CutlassGemmSplitK(a, b, n, d, e, f, g, h, i),
+            3 => I::CutlassGemmSplitK(a, b, c, n, e, f, g, h, i),
+            4 => I::CutlassGemmSplitK(a, b, c, d, n, f, g, h, i),
+            5 => I::CutlassGemmSplitK(a, b, c, d, e, n, g, h, i),
+            6 => I::CutlassGemmSplitK(a, b, c, d, e, f, n, h, i),
+            7 => I::CutlassGemmSplitK(a, b, c, d, e, f, g, n, i),
+            8 => I::CutlassGemmSplitK(a, b, c, d, e, f, g, h, n),
+            _ => panic!("CutlassGemmSplitK: bad idx {idx}"),
+        },
+        I::CutlassGemmAdd(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::CutlassGemmAdd(n, b, c, d, e, f, g, h),
+            1 => I::CutlassGemmAdd(a, n, c, d, e, f, g, h),
+            2 => I::CutlassGemmAdd(a, b, n, d, e, f, g, h),
+            3 => I::CutlassGemmAdd(a, b, c, n, e, f, g, h),
+            4 => I::CutlassGemmAdd(a, b, c, d, n, f, g, h),
+            5 => I::CutlassGemmAdd(a, b, c, d, e, n, g, h),
+            6 => I::CutlassGemmAdd(a, b, c, d, e, f, n, h),
+            7 => I::CutlassGemmAdd(a, b, c, d, e, f, g, n),
+            _ => panic!("CutlassGemmAdd: bad idx {idx}"),
+        },
+        I::CutlassGemv(a, b, c, d, e) => match idx {
+            0 => I::CutlassGemv(n, b, c, d, e),
+            1 => I::CutlassGemv(a, n, c, d, e),
+            2 => I::CutlassGemv(a, b, n, d, e),
+            3 => I::CutlassGemv(a, b, c, n, e),
+            4 => I::CutlassGemv(a, b, c, d, n),
+            _ => panic!("CutlassGemv: bad idx {idx}"),
+        },
+        I::CutlassFusedGemmBias(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::CutlassFusedGemmBias(n, b, c, d, e, f, g, h),
+            1 => I::CutlassFusedGemmBias(a, n, c, d, e, f, g, h),
+            2 => I::CutlassFusedGemmBias(a, b, n, d, e, f, g, h),
+            3 => I::CutlassFusedGemmBias(a, b, c, n, e, f, g, h),
+            4 => I::CutlassFusedGemmBias(a, b, c, d, n, f, g, h),
+            5 => I::CutlassFusedGemmBias(a, b, c, d, e, n, g, h),
+            6 => I::CutlassFusedGemmBias(a, b, c, d, e, f, n, h),
+            7 => I::CutlassFusedGemmBias(a, b, c, d, e, f, g, n),
+            _ => panic!("CutlassFusedGemmBias: bad idx {idx}"),
+        },
+        I::CutlassFusedGateUpSiluMul(a, b, c, d, e, f) => match idx {
+            0 => I::CutlassFusedGateUpSiluMul(n, b, c, d, e, f),
+            1 => I::CutlassFusedGateUpSiluMul(a, n, c, d, e, f),
+            2 => I::CutlassFusedGateUpSiluMul(a, b, n, d, e, f),
+            3 => I::CutlassFusedGateUpSiluMul(a, b, c, n, e, f),
+            4 => I::CutlassFusedGateUpSiluMul(a, b, c, d, n, f),
+            5 => I::CutlassFusedGateUpSiluMul(a, b, c, d, e, n),
+            _ => panic!("CutlassFusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::CutlassFusedGateUpGeluMul(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::CutlassFusedGateUpGeluMul(n, b, c, d, e, f, g, h),
+            1 => I::CutlassFusedGateUpGeluMul(a, n, c, d, e, f, g, h),
+            2 => I::CutlassFusedGateUpGeluMul(a, b, n, d, e, f, g, h),
+            3 => I::CutlassFusedGateUpGeluMul(a, b, c, n, e, f, g, h),
+            4 => I::CutlassFusedGateUpGeluMul(a, b, c, d, n, f, g, h),
+            5 => I::CutlassFusedGateUpGeluMul(a, b, c, d, e, n, g, h),
+            6 => I::CutlassFusedGateUpGeluMul(a, b, c, d, e, f, n, h),
+            7 => I::CutlassFusedGateUpGeluMul(a, b, c, d, e, f, g, n),
+            _ => panic!("CutlassFusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::CutlassFusedQkvRopeCache(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::CutlassFusedQkvRopeCache(n, b, c, d, e, f, g, h, i),
+            1 => I::CutlassFusedQkvRopeCache(a, n, c, d, e, f, g, h, i),
+            2 => I::CutlassFusedQkvRopeCache(a, b, n, d, e, f, g, h, i),
+            4 => I::CutlassFusedQkvRopeCache(a, b, c, d, n, f, g, h, i),
+            5 => I::CutlassFusedQkvRopeCache(a, b, c, d, e, n, g, h, i),
+            6 => I::CutlassFusedQkvRopeCache(a, b, c, d, e, f, n, h, i),
+            7 => I::CutlassFusedQkvRopeCache(a, b, c, d, e, f, g, n, i),
+            8 => I::CutlassFusedQkvRopeCache(a, b, c, d, e, f, g, h, n),
+            _ => panic!("CutlassFusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, g, h, i, j, k) => match idx {
+            0 => I::CutlassFusedQkvRopePrefill(n, b, c, d, e, f, g, h, i, j, k),
+            1 => I::CutlassFusedQkvRopePrefill(a, n, c, d, e, f, g, h, i, j, k),
+            2 => I::CutlassFusedQkvRopePrefill(a, b, n, d, e, f, g, h, i, j, k),
+            3 => I::CutlassFusedQkvRopePrefill(a, b, c, n, e, f, g, h, i, j, k),
+            4 => I::CutlassFusedQkvRopePrefill(a, b, c, d, n, f, g, h, i, j, k),
+            6 => I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, n, h, i, j, k),
+            7 => I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, g, n, i, j, k),
+            8 => I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, g, h, n, j, k),
+            9 => I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, g, h, i, n, k),
+            10 => I::CutlassFusedQkvRopePrefill(a, b, c, d, e, f, g, h, i, j, n),
+            _ => panic!("CutlassFusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::MarlinGemm(a, b, c) => match idx {
+            0 => I::MarlinGemm(n, b, c),
+            1 => I::MarlinGemm(a, n, c),
+            2 => I::MarlinGemm(a, b, n),
+            _ => panic!("MarlinGemm: bad idx {idx}"),
+        },
+        I::MarlinFusedGateUpSiluMul(a, b, c) => match idx {
+            0 => I::MarlinFusedGateUpSiluMul(n, b, c),
+            1 => I::MarlinFusedGateUpSiluMul(a, n, c),
+            2 => I::MarlinFusedGateUpSiluMul(a, b, n),
+            _ => panic!("MarlinFusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::MarlinFusedGateUpGeluMul(a, b, c) => match idx {
+            0 => I::MarlinFusedGateUpGeluMul(n, b, c),
+            1 => I::MarlinFusedGateUpGeluMul(a, n, c),
+            2 => I::MarlinFusedGateUpGeluMul(a, b, n),
+            _ => panic!("MarlinFusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::MarlinFusedQkvRopeCache(a, b, c) => match idx {
+            0 => I::MarlinFusedQkvRopeCache(n, b, c),
+            1 => I::MarlinFusedQkvRopeCache(a, n, c),
+            2 => I::MarlinFusedQkvRopeCache(a, b, n),
+            _ => panic!("MarlinFusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::MarlinFusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => I::MarlinFusedQkvRopePrefill(n, b, c, d, e),
+            1 => I::MarlinFusedQkvRopePrefill(a, n, c, d, e),
+            2 => I::MarlinFusedQkvRopePrefill(a, b, n, d, e),
+            3 => I::MarlinFusedQkvRopePrefill(a, b, c, n, e),
+            4 => I::MarlinFusedQkvRopePrefill(a, b, c, d, n),
+            _ => panic!("MarlinFusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::Bnb4Gemm(a, b, c) => match idx {
+            0 => I::Bnb4Gemm(n, b, c),
+            1 => I::Bnb4Gemm(a, n, c),
+            2 => I::Bnb4Gemm(a, b, n),
+            _ => panic!("Bnb4Gemm: bad idx {idx}"),
+        },
+        I::Bnb4FusedGateUpSiluMul(a, b, c) => match idx {
+            0 => I::Bnb4FusedGateUpSiluMul(n, b, c),
+            1 => I::Bnb4FusedGateUpSiluMul(a, n, c),
+            2 => I::Bnb4FusedGateUpSiluMul(a, b, n),
+            _ => panic!("Bnb4FusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::Bnb4FusedGateUpGeluMul(a, b, c) => match idx {
+            0 => I::Bnb4FusedGateUpGeluMul(n, b, c),
+            1 => I::Bnb4FusedGateUpGeluMul(a, n, c),
+            2 => I::Bnb4FusedGateUpGeluMul(a, b, n),
+            _ => panic!("Bnb4FusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::Bnb4FusedQkvRopeCache(a, b, c) => match idx {
+            0 => I::Bnb4FusedQkvRopeCache(n, b, c),
+            1 => I::Bnb4FusedQkvRopeCache(a, n, c),
+            2 => I::Bnb4FusedQkvRopeCache(a, b, n),
+            _ => panic!("Bnb4FusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::Bnb4FusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => I::Bnb4FusedQkvRopePrefill(n, b, c, d, e),
+            1 => I::Bnb4FusedQkvRopePrefill(a, n, c, d, e),
+            2 => I::Bnb4FusedQkvRopePrefill(a, b, n, d, e),
+            3 => I::Bnb4FusedQkvRopePrefill(a, b, c, n, e),
+            4 => I::Bnb4FusedQkvRopePrefill(a, b, c, d, n),
+            _ => panic!("Bnb4FusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::GgmlGemm(a, b, c) => match idx {
+            0 => I::GgmlGemm(n, b, c),
+            1 => I::GgmlGemm(a, n, c),
+            2 => I::GgmlGemm(a, b, n),
+            _ => panic!("GgmlGemm: bad idx {idx}"),
+        },
+        I::GgmlFusedGateUpSiluMul(a, b, c) => match idx {
+            0 => I::GgmlFusedGateUpSiluMul(n, b, c),
+            1 => I::GgmlFusedGateUpSiluMul(a, n, c),
+            2 => I::GgmlFusedGateUpSiluMul(a, b, n),
+            _ => panic!("GgmlFusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::GgmlFusedGateUpGeluMul(a, b, c) => match idx {
+            0 => I::GgmlFusedGateUpGeluMul(n, b, c),
+            1 => I::GgmlFusedGateUpGeluMul(a, n, c),
+            2 => I::GgmlFusedGateUpGeluMul(a, b, n),
+            _ => panic!("GgmlFusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::GgmlFusedQkvRopeCache(a, b, c, d) => match idx {
+            0 => I::GgmlFusedQkvRopeCache(n, b, c, d),
+            1 => I::GgmlFusedQkvRopeCache(a, n, c, d),
+            2 => I::GgmlFusedQkvRopeCache(a, b, n, d),
+            _ => panic!("GgmlFusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::GgmlFusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => I::GgmlFusedQkvRopePrefill(n, b, c, d, e),
+            1 => I::GgmlFusedQkvRopePrefill(a, n, c, d, e),
+            2 => I::GgmlFusedQkvRopePrefill(a, b, n, d, e),
+            3 => I::GgmlFusedQkvRopePrefill(a, b, c, n, e),
+            4 => I::GgmlFusedQkvRopePrefill(a, b, c, d, n),
+            _ => panic!("GgmlFusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::Fp8Gemm(a, b, c) => match idx {
+            0 => I::Fp8Gemm(n, b, c),
+            1 => I::Fp8Gemm(a, n, c),
+            2 => I::Fp8Gemm(a, b, n),
+            _ => panic!("Fp8Gemm: bad idx {idx}"),
+        },
+        I::Fp8FusedGemmBias(a, b, c) => match idx {
+            0 => I::Fp8FusedGemmBias(n, b, c),
+            1 => I::Fp8FusedGemmBias(a, n, c),
+            2 => I::Fp8FusedGemmBias(a, b, n),
+            _ => panic!("Fp8FusedGemmBias: bad idx {idx}"),
+        },
+        I::Fp8FusedGateUpSiluMul(a, b, c) => match idx {
+            0 => I::Fp8FusedGateUpSiluMul(n, b, c),
+            1 => I::Fp8FusedGateUpSiluMul(a, n, c),
+            2 => I::Fp8FusedGateUpSiluMul(a, b, n),
+            _ => panic!("Fp8FusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::Fp8FusedGateUpGeluMul(a, b, c) => match idx {
+            0 => I::Fp8FusedGateUpGeluMul(n, b, c),
+            1 => I::Fp8FusedGateUpGeluMul(a, n, c),
+            2 => I::Fp8FusedGateUpGeluMul(a, b, n),
+            _ => panic!("Fp8FusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::Fp8FusedQkvRopeCache(a, b, c) => match idx {
+            0 => I::Fp8FusedQkvRopeCache(n, b, c),
+            1 => I::Fp8FusedQkvRopeCache(a, n, c),
+            2 => I::Fp8FusedQkvRopeCache(a, b, n),
+            _ => panic!("Fp8FusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::Fp8FusedQkvRopePrefill(a, b, c, d, e) => match idx {
+            0 => I::Fp8FusedQkvRopePrefill(n, b, c, d, e),
+            1 => I::Fp8FusedQkvRopePrefill(a, n, c, d, e),
+            2 => I::Fp8FusedQkvRopePrefill(a, b, n, d, e),
+            3 => I::Fp8FusedQkvRopePrefill(a, b, c, n, e),
+            4 => I::Fp8FusedQkvRopePrefill(a, b, c, d, n),
+            _ => panic!("Fp8FusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::Loop(a, b) => match idx {
+            0 => I::Loop(n, b),
+            1 => I::Loop(a, n),
+            _ => panic!("Loop: bad idx {idx}"),
+        },
+        I::Alias(a, b) => match idx {
+            0 => I::Alias(n, b),
+            1 => I::Alias(a, n),
+            _ => panic!("Alias: bad idx {idx}"),
+        },
+        I::Free(_a) => match idx {
+            0 => I::Free(n),
+            _ => panic!("Free: bad idx {idx}"),
+        },
+    }
+}
 
 // ── Slot allocation ──────────────────────────────────────────────
 
@@ -372,10 +2265,19 @@ pub fn colored_slot_map(
 /// Output of lowering one (variant × workload-point). The codegen
 /// stitches these into the per-bucket forward fn body.
 pub struct LoweredBucket {
-    /// Op instances in execution order, including `Free` rows
+    /// Op instructions in execution order, including `Free` rows
     /// emitted by the drop pass at the same scheduling points the
     /// old codegen would have emitted `drop()` statements.
-    pub instances: Vec<OpInstance>,
+    pub instances: Vec<Instruction>,
+    /// Per-instruction list of weight slots consumed by that op
+    /// position. Same length as `instances`. Each entry is the
+    /// converted `Implementation::required_weights()` output for the
+    /// fan_out call that produced the corresponding instruction (the
+    /// vector is broadcast across all instructions a single fan_out
+    /// call returned). The per-arch `WeightAccessors` impl walks
+    /// `(bucket, op_idx, slot)` against this parallel array to emit
+    /// match arms — `op_idx` is the index into `instances`.
+    pub weight_slots: Vec<Vec<WeightSlot>>,
     /// Total size of the runtime tile table for this bucket.
     pub num_slots: u32,
     /// Slot index whose `Owned` entry is the bucket fn's return
@@ -453,7 +2355,7 @@ impl ArchOpcodes {
 /// `period_check_cost` is `O(P)` of pre-hashed fingerprint
 /// equality + integer-add equality for iter-index fields.
 fn detect_repeating_run(
-    instances: &[OpInstance],
+    instances: &[Instruction],
     iter_index_field_per_variant: &std::collections::HashMap<String, usize>,
 ) -> Option<(usize, usize, u32)> {
     let n = instances.len();
@@ -461,27 +2363,44 @@ fn detect_repeating_run(
         return None;
     }
 
-    // Precompute per-instance: a fingerprint string covering only
-    // the byte-exact-compared parts (variant ident + every field
-    // that ISN'T the iter-index). Pre-hashed once so the inner
-    // pattern-match loop is integer compare instead of repeated
-    // TokenStream-to-String formatting (the n³ blow-up).
+    // Precompute per-instance: a fingerprint covering only the
+    // byte-exact-compared parts (variant ident + every field that
+    // ISN'T the iter-index). Pre-hashed once so the inner pattern-
+    // match loop is integer compare instead of repeated rendering
+    // (the n³ blow-up). Fields are read out positionally via the
+    // variant_name + field_at helpers; for the iter-index field
+    // position we record the value separately for the +1 step check.
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let fp_and_iter: Vec<(u64, Option<u32>)> = instances
         .iter()
         .map(|inst| {
-            let var_name = inst.name.to_string();
-            let iter_field = iter_index_field_per_variant.get(&var_name).copied();
+            let var_name = instruction_variant_name(inst);
+            let iter_field = iter_index_field_per_variant.get(var_name).copied();
             let mut hasher = DefaultHasher::new();
             var_name.hash(&mut hasher);
-            for (i, fv) in inst.field_values.iter().enumerate() {
+            // Iterate over all fields up to a generous bound; field_at
+            // returns None past the variant's arity, terminating the
+            // walk for that variant. Fields the helper can't represent
+            // as u64 (arrays, floats, bools) hash as a marker sentinel
+            // so two instances with structurally-different non-scalar
+            // fields can still collide on hash but that's fine — a
+            // hash-only filter is followed by no further check today
+            // since the only known non-scalar fields (Reshape arrays,
+            // f32 epsilons, bool causal flags) are stable per impl
+            // and don't iterate.
+            for i in 0..16 {
                 if Some(i) == iter_field {
                     continue;
                 }
-                fv.to_string().hash(&mut hasher);
+                match instruction_field_at(inst, i) {
+                    Some(v) => v.hash(&mut hasher),
+                    None => break,
+                }
             }
-            let iter_val = iter_field.and_then(|i| parse_u32_literal(&inst.field_values[i]));
+            let iter_val = iter_field
+                .and_then(|i| instruction_field_at(inst, i))
+                .map(|v| v as u32);
             (hasher.finish(), iter_val)
         })
         .collect();
@@ -605,64 +2524,48 @@ pub fn apply_loop_compression(
     };
 
     let span_end = start + period * iters as usize;
-    let mut new_instances: Vec<OpInstance> = Vec::new();
+    let mut new_instances: Vec<Instruction> = Vec::new();
+    let mut new_weight_slots: Vec<Vec<WeightSlot>> = Vec::new();
     new_instances.extend_from_slice(&lowered.instances[..start]);
+    new_weight_slots.extend_from_slice(&lowered.weight_slots[..start]);
     new_instances.push(loop_instance(iters, period as u32));
-    for inst in &lowered.instances[start..start + period] {
-        let mut copy = inst.clone();
-        if let Some(&fi) = iter_idx.get(&inst.name.to_string()) {
+    new_weight_slots.push(Vec::new());
+    for off in 0..period {
+        let inst = lowered.instances[start + off];
+        let var_name = instruction_variant_name(&inst);
+        let new_inst = if let Some(&fi) = iter_idx.get(var_name) {
             // Preserve the iter-0 baseline per row — the arm
             // computes `layer = __layer + baseline` at dispatch.
-            let baseline = parse_u32_literal(&inst.field_values[fi]).unwrap_or(0);
-            let lit = proc_macro2::Literal::u32_suffixed(baseline);
-            copy.field_values[fi] = quote! { #lit };
-        }
-        new_instances.push(copy);
+            let baseline = instruction_field_at(&inst, fi).unwrap_or(0) as u32;
+            instruction_with_field_set(inst, fi, baseline)
+        } else {
+            inst
+        };
+        new_instances.push(new_inst);
+        new_weight_slots.push(lowered.weight_slots[start + off].clone());
     }
     new_instances.extend_from_slice(&lowered.instances[span_end..]);
+    new_weight_slots.extend_from_slice(&lowered.weight_slots[span_end..]);
     lowered.instances = new_instances;
+    lowered.weight_slots = new_weight_slots;
 }
 
 /// Emit one per-bucket
 /// `static <ident>: &[__I] = &[…];` where `__I` is the per-canonical
-/// alias for `::ferrite_forward::Instruction<Weights>`. Each row is
-/// `__I::<Variant>(v0, v1, …)` — tuple-style construction matching
-/// the variant declaration order in `Instruction<W>`. The match
-/// between `OpInstance::field_values` order and `Instruction`
-/// variant tuple order is enforced by the per-Impl
-/// `OpcodeShape::fields` declaration (the codegen contract).
+/// alias for `::ferrite_forward::Instruction`. Each row is
+/// `<Variant>(v0, v1, …)` — tuple-style construction matching the
+/// variant declaration order in `Instruction`. The variant + field
+/// arity comes directly from the typed `Instruction` value, so the
+/// `OpcodeShape` arity check is no longer load-bearing here; we keep
+/// `shapes_by_name` in the signature for caller-side
+/// shape-registration plumbing but the per-row body trusts the
+/// constructor.
 pub fn emit_bucket_static_slice(
     static_ident: &syn::Ident,
-    shapes_by_name: &BTreeMap<String, OpcodeShape>,
-    instances: &[OpInstance],
+    _shapes_by_name: &BTreeMap<String, OpcodeShape>,
+    instances: &[Instruction],
 ) -> TokenStream {
-    let elements = instances.iter().map(|inst| {
-        let var = &inst.name;
-        let shape: &OpcodeShape = shapes_by_name
-            .get(&inst.name.to_string())
-            .unwrap_or_else(|| {
-                panic!(
-                    "OpInstance variant `{}` has no registered OpcodeShape — \
-                     codegen invariant violated",
-                    inst.name
-                )
-            });
-        assert_eq!(
-            shape.fields.len(),
-            inst.field_values.len(),
-            "OpInstance `{}`: field_values.len()={} but shape.fields.len()={}",
-            inst.name,
-            inst.field_values.len(),
-            shape.fields.len()
-        );
-        let exprs = inst
-            .field_values
-            .iter()
-            .map(|e| strip_int_suffixes(e.clone()));
-        quote! {
-            #var ( #(#exprs),* )
-        }
-    });
+    let elements = instances.iter().map(instruction_to_tokens);
     quote! {
         static #static_ident: &[__I] = &[ #(#elements),* ];
     }
@@ -753,14 +2656,8 @@ pub fn free_variant_shape() -> OpcodeShape {
 }
 
 /// Construct a `Free(slot)` instance the drop pass can emit.
-pub fn free_instance(slot: u32) -> OpInstance {
-    OpInstance::new(
-        syn::Ident::new("Free", proc_macro2::Span::call_site()),
-        vec![{
-            let lit = proc_macro2::Literal::u32_unsuffixed(slot);
-            quote! { #lit }
-        }],
-    )
+pub fn free_instance(slot: u32) -> Instruction {
+    Instruction::Free(slot)
 }
 
 /// The universal `Alias` variant codegen emits at the start of
@@ -781,20 +2678,8 @@ pub fn alias_variant_shape() -> OpcodeShape {
 }
 
 /// Construct an `Alias(dst, src)` instance for the alias prelude.
-pub fn alias_instance(dst: u32, src: u32) -> OpInstance {
-    OpInstance::new(
-        syn::Ident::new("Alias", proc_macro2::Span::call_site()),
-        vec![
-            {
-                let lit = proc_macro2::Literal::u32_unsuffixed(dst);
-                quote! { #lit }
-            },
-            {
-                let lit = proc_macro2::Literal::u32_unsuffixed(src);
-                quote! { #lit }
-            },
-        ],
-    )
+pub fn alias_instance(dst: u32, src: u32) -> Instruction {
+    Instruction::Alias(dst, src)
 }
 
 /// The universal `Loop` variant the layer-template detection
@@ -816,20 +2701,8 @@ pub fn loop_variant_shape() -> OpcodeShape {
 /// Construct a `Loop(count, body_len)` instance the layer-template
 /// detection prepends in front of a repeating sub-sequence of the
 /// slice.
-pub fn loop_instance(count: u32, body_len: u32) -> OpInstance {
-    OpInstance::new(
-        syn::Ident::new("Loop", proc_macro2::Span::call_site()),
-        vec![
-            {
-                let lit = proc_macro2::Literal::u32_unsuffixed(count);
-                quote! { #lit }
-            },
-            {
-                let lit = proc_macro2::Literal::u32_unsuffixed(body_len);
-                quote! { #lit }
-            },
-        ],
-    )
+pub fn loop_instance(count: u32, body_len: u32) -> Instruction {
+    Instruction::Loop(count, body_len)
 }
 
 // ── Bucket lowering driver ───────────────────────────────────────
@@ -923,8 +2796,10 @@ pub fn lower_bucket(
     // not layer L+1 — because in layer L the color isn't reused
     // before exit, but in layer L+1 it is — would break body byte-
     // equivalence). So we don't emit Free here at all.
-    let mut instances: Vec<OpInstance> =
+    let mut instances: Vec<Instruction> =
         aliases.iter().map(|&(d, s)| alias_instance(d, s)).collect();
+    // Alias rows consume no weights — empty parallel entries.
+    let mut weight_slots: Vec<Vec<WeightSlot>> = (0..instances.len()).map(|_| Vec::new()).collect();
 
     for wave in &loop_ir.waves {
         for (sg, imp_id) in &wave.subgraphs {
@@ -950,12 +2825,38 @@ pub fn lower_bucket(
                         id = imp_id.0,
                     )
                 });
+            // Per-Impl weight kinds + base names. Same value for every
+            // emitted Instruction in this fan_out (multi-chunk Impls
+            // like TkGemmAdd that emit N rows for one logical kernel
+            // share the same weight, by design).
+            let accs = imp.required_weights(&claimed, fuf, program);
+            let slots_for_emit = weight_accessors_to_slots(&accs);
             // Eval bodies live in `ferrite_forward::Instruction::eval`
             // — register only the shape, used for static-slice
             // emission and `apply_loop_compression`'s per-variant
             // iter-index field discovery.
             arch_opcodes.register(imp.opcode_shape());
-            instances.extend(emits);
+            // Rotary cos_sin cache is keyed off the *claim*, not a
+            // weight ref — `RotaryLocal` is an `Extern` input on the
+            // rope-consuming tile, so it never appears in
+            // `required_weights`. Inject a `WeightSlot` of kind
+            // `CosSin` for any emitted Instruction whose `eval` body
+            // calls `wm.cos_sin_at(...)`. Base ident picks
+            // `rotary_local` if any tile in the claim references the
+            // local rotary extern, else `rotary` — matching the field
+            // names emitted on the per-arch `Weights` struct.
+            let rotary_base = rotary_base_for_claim(fuf, &claimed);
+            for inst in emits {
+                let mut slots_this = slots_for_emit.clone();
+                if instruction_consumes_rotary(&inst) {
+                    slots_this.push(WeightSlot {
+                        kind: crate::impl_lib::WeightKind::CosSin,
+                        base: rotary_base.clone(),
+                    });
+                }
+                instances.push(inst);
+                weight_slots.push(slots_this);
+            }
         }
     }
 
@@ -963,9 +2864,130 @@ pub fn lower_bucket(
 
     LoweredBucket {
         instances,
+        weight_slots,
         num_slots,
         final_slot,
     }
+}
+
+/// Convert the per-Impl `required_weights` output into the
+/// `Vec<WeightSlot>` parallel-array entry used by the
+/// `WeightAccessors` walker. Each `WeightAccessor` has a
+/// `<base>_<layer>` name (or just `<base>` for arch-wide accessors)
+/// and a Rust type that selects the `WeightKind` variant. The
+/// `_<layer>` suffix is stripped — the per-arch impl receives `layer`
+/// as a runtime arg.
+pub fn weight_accessors_to_slots(accessors: &[crate::impl_lib::WeightAccessor]) -> Vec<WeightSlot> {
+    use crate::impl_lib::WeightKind;
+    accessors
+        .iter()
+        .map(|acc| {
+            let (base, _layer) = crate::codegen::split_base_layer(&acc.name.to_string());
+            let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
+            // Rust-type → WeightKind. The string is the rendered
+            // TokenStream (whitespace varies but the path tokens are
+            // stable). Match on the trailing PascalCase ident.
+            let ts_str = acc.rust_type.to_string();
+            let kind = if ts_str.ends_with("RmsNorm") {
+                WeightKind::RmsNorm
+            } else if ts_str.ends_with("Embedding") {
+                WeightKind::Embedding
+            } else if ts_str.ends_with("LinearLayer") {
+                WeightKind::Linear
+            } else if ts_str.ends_with("LayerNorm") {
+                WeightKind::LayerNorm
+            } else if ts_str.ends_with("MarlinLinear") {
+                WeightKind::Marlin
+            } else if ts_str.ends_with("Bnb4bitLinear") {
+                WeightKind::Bnb4
+            } else if ts_str.ends_with("Fp8AnyLinear") {
+                WeightKind::Fp8
+            } else if ts_str.ends_with("DeepSeekV2MoELayer") {
+                WeightKind::DeepSeekMoe
+            } else if ts_str.ends_with("DeepSeekV2Fp8BlockMoELayer") {
+                WeightKind::DeepSeekMoeFp8
+            } else if ts_str.ends_with("DeepSeekV2GgmlMoELayer") {
+                WeightKind::DeepSeekMoeGgml
+            } else if ts_str.ends_with("SharedFusedMoELayer") {
+                // Order matters: "SharedFusedMoELayer" also ends with
+                // "FusedMoELayer", so the shared variant must be
+                // checked first to avoid mis-classification into the
+                // `FusedMoe` kind (which routes via `fused_moe_at` and
+                // panics with a `&FusedMoELayer` vs `&SharedFusedMoELayer`
+                // type mismatch on Qwen2-MoE / Qwen3-MoE).
+                WeightKind::SharedFusedMoe
+            } else if ts_str.ends_with("FusedMoELayer") {
+                WeightKind::FusedMoe
+            } else if ts_str.ends_with("GpuTensor") {
+                WeightKind::CosSin
+            } else {
+                panic!(
+                    "weight_accessors_to_slots: unknown WeightAccessor rust_type `{}` \
+                     for accessor `{}`",
+                    ts_str, acc.name,
+                );
+            };
+            WeightSlot {
+                kind,
+                base: base_ident,
+            }
+        })
+        .collect()
+}
+
+/// True for any [`Instruction`] variant whose `eval` body calls
+/// `wm.cos_sin_at(...)`. The walker uses this to inject a `CosSin`
+/// `WeightSlot` parallel-array entry for each such emit, since
+/// rotary cache is sourced from an `Extern` input rather than a
+/// `Weight` ref and so never appears in `required_weights`.
+///
+/// Keep in sync with the runtime arms in
+/// `ferrite_forward::Instruction::eval` — any new variant that calls
+/// `wm.cos_sin_at` needs a matching arm here.
+pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
+    use Instruction as I;
+    matches!(
+        inst,
+        I::FusedQkvRopeCache(..)
+            | I::FusedQkvQkNormRopeCache(..)
+            | I::FusedQkvRopePrefill(..)
+            | I::AttentionViaCache(..)
+            | I::SlidingAttentionViaCache(..)
+            | I::FlashInferAttentionDecode(..)
+            | I::RopeAppend(..)
+            | I::CutlassFusedQkvRopeCache(..)
+            | I::CutlassFusedQkvRopePrefill(..)
+            | I::MarlinFusedQkvRopeCache(..)
+            | I::MarlinFusedQkvRopePrefill(..)
+            | I::GgmlFusedQkvRopeCache(..)
+            | I::GgmlFusedQkvRopePrefill(..)
+            | I::Bnb4FusedQkvRopeCache(..)
+            | I::Bnb4FusedQkvRopePrefill(..)
+            | I::Fp8FusedQkvRopeCache(..)
+            | I::Fp8FusedQkvRopePrefill(..)
+            | I::MlaAttention(..)
+    )
+}
+
+/// Pick the rotary field on the per-arch `Weights` struct that this
+/// claim consumes. Mirrors the legacy `rotary_cos_sin_tokens` helper:
+/// if any claimed tile carries an `ExternKind::RotaryLocal` input,
+/// the claim's rope op pulls from `wm.rotary_local`; else from
+/// `wm.rotary`. Both fields are emitted by `codegen.rs` per arch.
+pub fn rotary_base_for_claim(fuf: &Fuf, claimed: &[TileId]) -> syn::Ident {
+    let uses_local = claimed.iter().any(|&tid| {
+        fuf.get(tid).inputs.iter().any(|i| {
+            matches!(
+                i,
+                FufInput::Extern {
+                    kind: ExternKind::RotaryLocal,
+                    ..
+                }
+            )
+        })
+    });
+    let name = if uses_local { "rotary_local" } else { "rotary" };
+    syn::Ident::new(name, proc_macro2::Span::call_site())
 }
 
 pub fn collect_boundary_inputs(fuf: &Fuf, claimed: &[TileId]) -> Vec<TileId> {
@@ -1733,22 +3755,19 @@ mod tests {
     }
 
     // ── Loop-detection invariants ───────────────────────────────
+    //
+    // The loop-detection logic is variant-agnostic; tests use real
+    // `Instruction` variants but exercise the algorithm against
+    // its data shape (variant tag + per-position field comparison).
 
-    /// Build a tiny OpInstance with one variant ident + a list of
-    /// pre-stringified field values. Lets the loop-detection tests
-    /// construct synthetic IR without going through fan_out.
-    fn op(name: &str, fields: &[&str]) -> OpInstance {
-        let parsed: Vec<TokenStream> = fields
-            .iter()
-            .map(|s| s.parse::<TokenStream>().unwrap())
-            .collect();
-        OpInstance::new(format_ident!("{}", name), parsed)
-    }
-
-    /// Three byte-identical `Foo()` rows → period 1, count 3.
+    /// Three byte-identical `Free(0)` rows → period 1, count 3.
     #[test]
     fn loop_detection_finds_simplest_run() {
-        let v = vec![op("Foo", &[]), op("Foo", &[]), op("Foo", &[])];
+        let v = vec![
+            Instruction::Free(0),
+            Instruction::Free(0),
+            Instruction::Free(0),
+        ];
         let map = std::collections::HashMap::new();
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, Some((0, 1, 3)));
@@ -1760,16 +3779,18 @@ mod tests {
     /// the prefix/suffix residues stay where they are.
     #[test]
     fn loop_detection_picks_largest_span_amid_residue() {
+        // Use Free(7) for prefix (so it differs from the body's Free),
+        // Free(0) + Add(0,0) for the repeating body, Free(9) for suffix.
         let v = vec![
-            op("Pre", &[]),
-            op("Pre", &[]),
-            op("A", &[]),
-            op("B", &[]),
-            op("A", &[]),
-            op("B", &[]),
-            op("A", &[]),
-            op("B", &[]),
-            op("Post", &[]),
+            Instruction::Free(7),
+            Instruction::Free(7),
+            Instruction::Free(0),
+            Instruction::Add(0, 0),
+            Instruction::Free(0),
+            Instruction::Add(0, 0),
+            Instruction::Free(0),
+            Instruction::Add(0, 0),
+            Instruction::Free(9),
         ];
         let map = std::collections::HashMap::new();
         let r = detect_repeating_run(&v, &map);
@@ -1780,15 +3801,16 @@ mod tests {
     /// detected only when the iter-index field steps by exactly 1
     /// between iterations. The other field values must be byte-
     /// equal across iterations. This pins the `iter_offset` check
-    /// in `blocks_match`.
+    /// in `blocks_match`. Use `RmsNorm(in_slot, out_slot, layer)`
+    /// with iter-index field 2 (layer).
     #[test]
     fn loop_detection_handles_iter_index_field() {
         let mut map = std::collections::HashMap::new();
-        map.insert("Norm".to_string(), 1usize); // field index 1 = layer
+        map.insert("RmsNorm".to_string(), 2usize);
         let v = vec![
-            op("Norm", &["wm.norm", "0u32"]),
-            op("Norm", &["wm.norm", "1u32"]),
-            op("Norm", &["wm.norm", "2u32"]),
+            Instruction::RmsNorm(0, 1, 0),
+            Instruction::RmsNorm(0, 1, 1),
+            Instruction::RmsNorm(0, 1, 2),
         ];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, Some((0, 1, 3)));
@@ -1800,11 +3822,11 @@ mod tests {
     #[test]
     fn loop_detection_rejects_non_unit_iter_step() {
         let mut map = std::collections::HashMap::new();
-        map.insert("Norm".to_string(), 1usize);
+        map.insert("RmsNorm".to_string(), 2usize);
         let v = vec![
-            op("Norm", &["wm.norm", "0u32"]),
-            op("Norm", &["wm.norm", "2u32"]),
-            op("Norm", &["wm.norm", "4u32"]),
+            Instruction::RmsNorm(0, 1, 0),
+            Instruction::RmsNorm(0, 1, 2),
+            Instruction::RmsNorm(0, 1, 4),
         ];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, None);
@@ -1812,14 +3834,13 @@ mod tests {
 
     /// A non-iter field varies between rows → not a loop. Locks
     /// the "every non-iter field must be byte-equal" rule.
+    /// `RmsNorm(in_slot, out_slot, layer)`: vary `in_slot` (field 0)
+    /// while iter-index field is layer (field 2).
     #[test]
     fn loop_detection_rejects_non_iter_field_drift() {
         let mut map = std::collections::HashMap::new();
-        map.insert("Norm".to_string(), 1usize);
-        let v = vec![
-            op("Norm", &["wm.input_layernorm", "0u32"]),
-            op("Norm", &["wm.post_attention_layernorm", "1u32"]),
-        ];
+        map.insert("RmsNorm".to_string(), 2usize);
+        let v = vec![Instruction::RmsNorm(0, 1, 0), Instruction::RmsNorm(7, 1, 1)];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, None);
     }
@@ -1832,30 +3853,32 @@ mod tests {
     fn loop_compression_emits_loop_and_keeps_baseline() {
         let mut arch_opcodes = ArchOpcodes::new();
         arch_opcodes.register(OpcodeShape::new(
-            "Norm",
+            "RmsNorm",
             vec![
-                ("w", syn::parse_quote!(u32)),
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
             ],
         ));
         let mut lb = LoweredBucket {
             instances: vec![
-                op("Norm", &["7u32", "0u32"]),
-                op("Norm", &["7u32", "1u32"]),
-                op("Norm", &["7u32", "2u32"]),
+                Instruction::RmsNorm(0, 1, 0),
+                Instruction::RmsNorm(0, 1, 1),
+                Instruction::RmsNorm(0, 1, 2),
             ],
+            weight_slots: vec![Vec::new(); 3],
             num_slots: 1,
             final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 2, "Loop + 1 body row");
-        assert_eq!(lb.instances[0].name.to_string(), "Loop");
+        assert_eq!(instruction_variant_name(&lb.instances[0]), "Loop");
         // Loop fields: count, body_len. body_len = 1.
-        assert_eq!(lb.instances[0].field_values[0].to_string(), "3");
-        assert_eq!(lb.instances[0].field_values[1].to_string(), "1");
-        assert_eq!(lb.instances[1].name.to_string(), "Norm");
+        assert_eq!(instruction_field_at(&lb.instances[0], 0), Some(3));
+        assert_eq!(instruction_field_at(&lb.instances[0], 1), Some(1));
+        assert_eq!(instruction_variant_name(&lb.instances[1]), "RmsNorm");
         // Body's `layer` field carries the iter-0 baseline (0).
-        assert_eq!(lb.instances[1].field_values[1].to_string(), "0u32");
+        assert_eq!(instruction_field_at(&lb.instances[1], 2), Some(0));
     }
 
     /// Per-row baseline preservation: when the body period has rows
@@ -1870,41 +3893,53 @@ mod tests {
     fn loop_compression_preserves_per_row_baseline() {
         let mut arch_opcodes = ArchOpcodes::new();
         arch_opcodes.register(OpcodeShape::new(
-            "A",
-            vec![("layer", syn::parse_quote!(u32))],
+            "RmsNorm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+            ],
         ));
         arch_opcodes.register(OpcodeShape::new(
-            "B",
-            vec![("layer", syn::parse_quote!(u32))],
+            "FusedAddRmsNorm",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+            ],
         ));
         let mut lb = LoweredBucket {
             instances: vec![
-                // iter 0: A@0, B@1
-                op("A", &["0u32"]),
-                op("B", &["1u32"]),
-                // iter 1: A@1, B@2
-                op("A", &["1u32"]),
-                op("B", &["2u32"]),
-                // iter 2: A@2, B@3
-                op("A", &["2u32"]),
-                op("B", &["3u32"]),
+                // iter 0: RmsNorm@0, FusedAddRmsNorm@1
+                Instruction::RmsNorm(0, 1, 0),
+                Instruction::FusedAddRmsNorm(0, 1, 1),
+                // iter 1
+                Instruction::RmsNorm(0, 1, 1),
+                Instruction::FusedAddRmsNorm(0, 1, 2),
+                // iter 2
+                Instruction::RmsNorm(0, 1, 2),
+                Instruction::FusedAddRmsNorm(0, 1, 3),
             ],
+            weight_slots: vec![Vec::new(); 6],
             num_slots: 1,
             final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 3, "Loop + 2 body rows");
-        assert_eq!(lb.instances[0].name.to_string(), "Loop");
-        assert_eq!(lb.instances[1].name.to_string(), "A");
+        assert_eq!(instruction_variant_name(&lb.instances[0]), "Loop");
+        assert_eq!(instruction_variant_name(&lb.instances[1]), "RmsNorm");
         assert_eq!(
-            lb.instances[1].field_values[0].to_string(),
-            "0u32",
+            instruction_field_at(&lb.instances[1], 2),
+            Some(0),
             "row A's baseline is 0",
         );
-        assert_eq!(lb.instances[2].name.to_string(), "B");
         assert_eq!(
-            lb.instances[2].field_values[0].to_string(),
-            "1u32",
+            instruction_variant_name(&lb.instances[2]),
+            "FusedAddRmsNorm"
+        );
+        assert_eq!(
+            instruction_field_at(&lb.instances[2], 2),
+            Some(1),
             "row B's baseline is 1 — must be preserved, not zeroed, so the arm \
              can compute `__layer + 1` for the iter-N execution",
         );
@@ -1916,15 +3951,19 @@ mod tests {
     #[test]
     fn loop_compression_is_noop_without_runs() {
         let mut arch_opcodes = ArchOpcodes::new();
-        arch_opcodes.register(OpcodeShape::new("A", vec![("x", syn::parse_quote!(u32))]));
-        let original = vec![op("A", &["0u32"])];
+        arch_opcodes.register(OpcodeShape::new(
+            "Free",
+            vec![("slot", syn::parse_quote!(u32))],
+        ));
+        let original = vec![Instruction::Free(0)];
         let mut lb = LoweredBucket {
             instances: original.clone(),
+            weight_slots: vec![Vec::new(); 1],
             num_slots: 1,
             final_slot: 0,
         };
         apply_loop_compression(&arch_opcodes, &mut lb, "layer");
         assert_eq!(lb.instances.len(), 1);
-        assert_eq!(lb.instances[0].name.to_string(), "A");
+        assert_eq!(instruction_variant_name(&lb.instances[0]), "Free");
     }
 }

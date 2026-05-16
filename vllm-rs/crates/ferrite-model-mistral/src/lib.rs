@@ -28,7 +28,7 @@
 //! loader reads a real `lm_head.weight` from safetensors; same as
 //! Llama's untied variants.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

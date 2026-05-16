@@ -11,7 +11,7 @@
 //! solver + scheduler. We assert on them to prove the pipeline's
 //! output isn't dummy.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 // The real Llama body — SwiGLU MLP (`silu(gate) * up`), exercising
 // the Expr::Mul path that used to emit OpKind::Add by mistake.

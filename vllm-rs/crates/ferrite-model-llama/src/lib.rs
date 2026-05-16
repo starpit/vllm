@@ -9,7 +9,7 @@
 //! from this crate, and for every config JSON in it emits
 //! specialized `Weights` + `forward` under `ferrite_models::llama`.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

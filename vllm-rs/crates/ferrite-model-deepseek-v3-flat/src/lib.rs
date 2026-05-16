@@ -29,7 +29,7 @@
 //! Same DSL body as `ferrite-model-deepseek-v2`; only the configs
 //! and the registered HF arch differ.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

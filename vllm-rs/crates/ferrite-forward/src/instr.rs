@@ -25,22 +25,29 @@
 //! `&[Instruction]` slices for backbone + lm_head per bucket, and a
 //! 1-line forward shim that delegates to [`run`].
 
-#![cfg(feature = "cuda")]
-
+#[cfg(feature = "cuda")]
 use crate::ForwardCtx;
+#[cfg(feature = "cuda")]
 use crate::tile_table::{TileEntry, take_owned, tile_ref, view};
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::alloc::OwnedTensor;
+#[cfg(feature = "cuda")]
 use ferrite_cuda_core::device::GpuDevice;
 use ferrite_cuda_core::tensor::MAX_DIMS;
+#[cfg(feature = "cuda")]
 use ferrite_kernels::attention_helpers as ah;
+#[cfg(feature = "cuda")]
 use ferrite_kernels::cutlass;
+#[cfg(feature = "cuda")]
 use ferrite_kernels::flashinfer;
+#[cfg(feature = "cuda")]
 use ferrite_kernels::kernels;
 
 /// Per-canonical model parameters. Implemented by each canonical's
 /// `Weights` so the universal `Instruction::eval` body can read
 /// model constants without storing them on every variant instance.
 /// Defaults to 0 / 0.0 / -1 for fields the canonical doesn't use.
+#[cfg(feature = "cuda")]
 pub trait CanonicalParams: WeightAccessors {
     const HEAD_DIM: u32;
     const NUM_Q_HEADS: u32;
@@ -265,6 +272,7 @@ pub trait WeightAccessors {
 /// net (`pinned_owned: Vec<OwnedTensor>`) that pinned the prior Owned
 /// past the overwrite; once the codegen invariant is in place, the
 /// safety net is unnecessary and was deleted in this commit.
+#[cfg(feature = "cuda")]
 pub struct InterpreterCtx<'a, W> {
     pub wm: &'a W,
     pub tiles: &'a mut Vec<Option<TileEntry>>,
@@ -578,6 +586,7 @@ impl Clone for Instruction {
 /// the kernel itself uses the runtime tensor's shapes directly,
 /// so the assertion is purely a sanity check that's only sound at
 /// tp=1.
+#[cfg(feature = "cuda")]
 #[track_caller]
 fn assert_weight_shape(
     op: &'static str,
@@ -605,6 +614,7 @@ fn assert_weight_shape(
 /// Used by `assert_weight_shape` to skip its check at tp>1 where
 /// runtime per-rank shapes legitimately disagree with the codegen's
 /// unified-bounds shapes.
+#[cfg(feature = "cuda")]
 #[inline]
 fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     #[cfg(feature = "nccl")]
@@ -617,6 +627,7 @@ fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Instruction {
     /// Evaluate one instruction. Closed match (no `_` arm).
     /// `Loop` is dispatched by [`run`] — never reaches here.
@@ -862,12 +873,7 @@ impl Instruction {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::FusedAddRmsNormWithOffset(
-                delta_slot,
-                residual_slot,
-                layer,
-                offset,
-            ) => unsafe {
+            Instruction::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
@@ -1093,13 +1099,7 @@ impl Instruction {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedQkvRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                biased,
-                interleaved,
-            ) => unsafe {
+            Instruction::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
@@ -1168,13 +1168,7 @@ impl Instruction {
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::FusedQkvQkNormRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                q_offset,
-                k_offset,
-            ) => {
+            Instruction::FusedQkvQkNormRopeCache(in_slot, out_slot, layer, q_offset, k_offset) => {
                 let layer = ctx.layer_offset + layer;
                 let mut q_out = unsafe {
                     let view_in = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
@@ -2008,16 +2002,7 @@ impl Instruction {
                 let out = w.forward(v, ctx.device);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::CutlassGemm(
-                in_slot,
-                out_slot,
-                layer,
-                tile_m,
-                tile_n,
-                stages,
-                n,
-                k,
-            ) => unsafe {
+            Instruction::CutlassGemm(in_slot, out_slot, layer, tile_m, tile_n, stages, n, k) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
@@ -2524,12 +2509,7 @@ impl Instruction {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::GgmlFusedQkvRopeCache(
-                in_slot,
-                out_slot,
-                layer,
-                interleaved,
-            ) => unsafe {
+            Instruction::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, interleaved) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
@@ -2933,6 +2913,7 @@ impl Instruction {
     }
 }
 
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn mla_attention_eval<W: CanonicalParams>(
     ctx: &mut InterpreterCtx<'_, W>,
@@ -3098,6 +3079,7 @@ unsafe fn mla_attention_eval<W: CanonicalParams>(
 /// position within the body), so the per-arch match table is keyed
 /// uniformly on `(bucket, flat_position)` regardless of whether
 /// the op sits inside a `Loop` body.
+#[cfg(feature = "cuda")]
 unsafe fn run_slice<W: CanonicalParams>(
     instructions: &[Instruction],
     bucket: u32,
@@ -3159,6 +3141,7 @@ unsafe fn run_slice<W: CanonicalParams>(
 /// Cost: one D2H + stream sync per slot per instruction. Useful
 /// only for single-request bisection runs; never enable in
 /// production.
+#[cfg(feature = "cuda")]
 mod debug_dump {
     use super::TileEntry;
     use ferrite_cuda_core::CUstream;
@@ -3249,6 +3232,7 @@ mod debug_dump {
 /// # Safety
 /// Both slices well-formed; tile slot indices in range; weight
 /// accessor fns produce live GPU memory.
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run<W: CanonicalParams>(
     backbone: &[Instruction],
@@ -3281,6 +3265,7 @@ pub unsafe fn run<W: CanonicalParams>(
 ///
 /// # Safety
 /// Same as [`run`].
+#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn run_backbone<W: CanonicalParams>(
     backbone: &[Instruction],

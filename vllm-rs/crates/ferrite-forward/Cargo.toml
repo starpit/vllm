@@ -14,7 +14,7 @@ cuda = ["ferrite-kernels/cuda", "ferrite-cuda-core/cuda"]
 # Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
 # `ForwardCtx::tp_group` field). At tp=1 the lowering pass never
 # emits AllReduce, so this feature is a strict superset of `cuda`.
-nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forward-macro/nccl"]
+nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -22,7 +22,13 @@ nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-forwa
 probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 
 [dependencies]
-ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+# Note: NO dependency on ferrite-forward-macro here. The reverse
+# direction (macro → ferrite-forward) is what's needed so that
+# `Implementation::fan_out` can return `Vec<Instruction>` typed
+# at proc-macro time (per `MEGA_IR_PLAN.md` §5+§9 step 4).
+# Consumers of the proc-macro import it directly:
+#   `use ferrite_forward_macro::{forward, vision_forward};`
+# rather than going through ferrite-forward.
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-vision = { path = "../ferrite-vision" }

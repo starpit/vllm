@@ -19,7 +19,7 @@
 //!
 //! Reference: `vllm-cuda/src/model/deepseek_v2.rs`.
 
-use ferrite_forward::forward;
+use ferrite_forward_macro::forward;
 
 #[forward(
     workloads = [1, 8, 64, 512, 4096],

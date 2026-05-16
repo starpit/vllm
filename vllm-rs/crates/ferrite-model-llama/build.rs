@@ -21,6 +21,8 @@ fn main() {
     forward_env("FERRITE_MODELS");
     forward_env("FERRITE_GPU");
     forward_env("FERRITE_DISABLE_CUBLAS_GEMM");
+    forward_env("FERRITE_MEGA"); // recompile when FERRITE_MEGA changes (enables mega dispatch tables)
+    forward_env("FERRITE_CODEGEN_REVISION"); // recompile when revision changes
 }
 
 fn forward_env(name: &str) {

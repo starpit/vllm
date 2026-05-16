@@ -48,6 +48,7 @@ members = [
     "crates/ferrite-quantizations",
     "crates/ferrite-cuda-targets",
     "crates/ferrite-cuda-builder",
+    "crates/ferrite-mega-ir",
     "crates/ferrite-forward",
     "crates/ferrite-forward-macro",
     "crates/ferrite-cost-sweep",

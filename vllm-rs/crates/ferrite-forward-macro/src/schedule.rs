@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn empty_sfuf_empty_loop() {
-        let fuf = Fuf { nodes: Vec::new() };
+        let fuf = Fuf::default();
         let sfuf = Assignment::default();
         let loop_ir = schedule(&fuf, &sfuf);
         assert_eq!(loop_ir.num_waves(), 0);

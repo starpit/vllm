@@ -459,6 +459,7 @@ mod tests {
                     outputs: vec![shape()],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         }
     }
 
@@ -503,7 +504,7 @@ mod tests {
     /// check.
     #[test]
     fn lowering_no_allreduce_at_tp_eq_1_empty_fuf() {
-        let mut fuf = Fuf { nodes: Vec::new() };
+        let mut fuf = Fuf::default();
         let program = synthetic_program();
         insert_all_reduces(&mut fuf, &program, 1);
         assert!(fuf.nodes.is_empty(), "empty FUF must stay empty at tp=1");
@@ -759,6 +760,7 @@ mod tests {
                     outputs: vec![shape()],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut weights = WeightTable::default();
         let _ = weights.intern_str(vec!["lm_head".into()]); // id 0
@@ -844,6 +846,7 @@ mod tests {
                 ],
                 outputs: vec![shape()],
             }],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut weights = WeightTable::default();
         let _ = weights.intern_str(vec!["lm_head".into()]);
@@ -886,6 +889,7 @@ mod tests {
                 ],
                 outputs: vec![shape()],
             }],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut weights = WeightTable::default();
         let _ = weights.intern_str(vec!["self_attn".into(), "q_proj".into()]); // id 0
@@ -956,6 +960,7 @@ mod tests {
                     outputs: vec![shape()],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut weights = WeightTable::default();
         let _ = weights.intern_str(vec!["model".into(), "embed_tokens".into()]); // id 0
@@ -1022,6 +1027,7 @@ mod tests {
                 ],
                 outputs: vec![shape()],
             }],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut weights = WeightTable::default();
         // A non-standard embed name not in the shard table → Replicate.
@@ -1100,6 +1106,7 @@ mod tests {
                     outputs: vec![shape()],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut weights = WeightTable::default();
         let _ = weights.intern_str(vec!["self_attn".into(), "o_proj".into()]); // id 0

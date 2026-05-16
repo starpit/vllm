@@ -476,6 +476,11 @@ pub fn apply_signature(
         // CLIP-class CLS-strip: drop row 0, [vision_num_positions, e]
         // → [vision_in_seq_len, e]. Trailing dim preserved.
         OpKind::StripCls => sig_strip_cls(solver, inputs),
+        // Barrier ops are identity on input 0 — pure control-flow
+        // with no data motion. Inserted post-FUF by
+        // `insert_mega_barriers`; never appears in DSL.
+        OpKind::BarrierSignal => sig_unary_elementwise(solver, inputs, op),
+        OpKind::BarrierWait => sig_unary_elementwise(solver, inputs, op),
     }
 }
 
@@ -949,6 +954,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // StripCls takes one activation input ([vision_num_positions, e])
         // and produces [vision_in_seq_len, e]; no tensor weight args.
         OpKind::StripCls => &[],
+        // Barrier ops: 1 activation input, no tensor weight.
+        OpKind::BarrierSignal => &[],
+        OpKind::BarrierWait => &[],
     }
 }
 

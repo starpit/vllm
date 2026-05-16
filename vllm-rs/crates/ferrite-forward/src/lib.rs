@@ -26,6 +26,8 @@ pub mod cpu_golden;
 pub mod info;
 pub mod instr;
 #[cfg(feature = "cuda")]
+pub mod interpreter;
+#[cfg(feature = "cuda")]
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
@@ -114,12 +116,53 @@ pub fn find_bucket<Op: 'static>(
     num_tokens: u64,
     sk: u64,
 ) -> &'static BucketEntry<Op> {
-    for e in table {
+    &table[find_bucket_idx(table, num_tokens, sk)]
+}
+
+/// Linear-scan bucket lookup returning the matching row index.
+/// Same convention as [`find_bucket`] (fallback to `0`); split out
+/// so the per-model `forward()` can consult a parallel
+/// `MEGA_FORWARD_TABLE` at the same index without walking the
+/// table twice.
+#[cfg(feature = "cuda")]
+pub fn find_bucket_idx<Op: 'static>(
+    table: &'static [BucketEntry<Op>],
+    num_tokens: u64,
+    sk: u64,
+) -> usize {
+    for (i, e) in table.iter().enumerate() {
         if e.0 <= num_tokens && num_tokens < e.1 && e.2 <= sk && sk < e.3 {
-            return e;
+            return i;
         }
     }
-    &table[0]
+    0
+}
+
+/// Phase 3f-2l-i runtime gate for the megakernel dispatch path.
+/// Reads `FERRITE_MEGA` from the environment on the first call and
+/// caches the result. Set `FERRITE_MEGA=1` (or any non-empty,
+/// non-"0" value) at process start to route `forward()` through the
+/// codegen'd `LAUNCH_FN_<VARIANT>` when the bucket has one; any
+/// other value (unset, empty, "0") keeps the host interpreter.
+///
+/// Orthogonal from the build-time `FERRITE_MEGA=1` gate that drives
+/// `.cu` emission: the build-time flag controls whether
+/// `LAUNCH_FN_<VARIANT>` constants exist at all; this runtime flag
+/// controls whether `forward()` actually calls them when they do.
+/// Both must be truthy for the mega path to take over.
+///
+/// Unconditionally compiled in — the cost when disabled is one
+/// atomic-load + branch per forward call, amortized across the
+/// per-bucket lookup.
+#[inline]
+pub fn mega_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FERRITE_MEGA")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
 }
 
 /// Runtime gate for the per-op trace `Instruction::eval` opens
@@ -244,6 +287,45 @@ mod ctx {
     use ferrite_kernels::kv_cache::KvCachePool;
 
     use super::EmbedPatch;
+    use crate::interpreter::mega::{
+        ActPtrs, I32MutPtr, I32Ptr, I64Ptr, KvPtrs, LaunchArgsAttn, LaunchArgsMultiStep, U32Ptr,
+        WeightPtrs, block_table_ptr, input_ids_ptr, positions_ptr, seq_lens_ptr, slot_mapping_ptr,
+    };
+
+    /// Per-step GPU arrays for the multi-step cooperative kernel.
+    /// Built by the executor for M=1 decode batches when FERRITE_MEGA=1
+    /// at runtime and the bucket has a `_ms` variant. Attached to
+    /// `ForwardCtx::multi_step`; `forward()` dispatch reads this to
+    /// stage `LaunchArgsMultiStep` and call `launch_multi_step`.
+    ///
+    /// All pointers are device pointers. The executor owns the backing
+    /// allocations and must keep them alive until the multi-step kernel
+    /// completes (i.e., until after the stream is synchronized).
+    ///
+    /// Layout contract (all arrays have length `num_steps`, except
+    /// `input_ids_multi` which is `num_steps + 1`):
+    /// - `input_ids_multi[0]` — initial token seeded by the host.
+    /// - `input_ids_multi[1..=num_steps]` — filled by in-kernel argmax.
+    /// - `output_token_ids[0..num_steps]` — argmax results per step;
+    ///   read by the executor after the kernel completes.
+    pub struct MultiStepCtx {
+        /// Mutable per-step input token IDs, length `num_steps + 1`.
+        pub input_ids_multi: *mut u32,
+        /// Per-step rotary positions, length `num_steps`.
+        pub positions_multi: U32Ptr,
+        /// Per-step paged-KV slot mappings, length `num_steps`.
+        pub slot_mapping_multi: I64Ptr,
+        /// Per-step sequence lengths (seqused_k per step), length `num_steps`.
+        pub seq_lens_multi: I32Ptr,
+        /// Output token IDs written by in-kernel argmax, length `num_steps`.
+        pub output_token_ids: *mut u32,
+        pub num_steps: i32,
+    }
+
+    // SAFETY: raw device pointers — the executor ensures the backing
+    // allocations outlive concurrent access.
+    unsafe impl Send for MultiStepCtx {}
+    unsafe impl Sync for MultiStepCtx {}
 
     /// Ambient runtime args the emitted forward fn needs. The
     /// caller builds a `ForwardCtx` per forward call and passes
@@ -269,6 +351,12 @@ mod ctx {
         pub slot_mapping: TensorView<'a>,
         pub cu_seqlens_q: TensorView<'a>,
         pub seqused_k: TensorView<'a>,
+        /// Per-token K lengths sized `[total_tokens]` (mega kernel path).
+        /// Mega kernels read `seq_lens[token]` for each flat-batch token,
+        /// while FA2 reads `seqused_k[seq]` per-batch. Both are populated
+        /// by the executor; consumers pick based on which kernel they call.
+        /// `None` is allowed for callers that only invoke FA2 paths.
+        pub seqused_k_per_token: ::core::option::Option<TensorView<'a>>,
         pub block_table: TensorView<'a>,
         pub max_seqlen_q: usize,
         pub max_seqlen_k: usize,
@@ -360,10 +448,256 @@ mod ctx {
         // NCCL group for this rank — see vllm-executor::cuda_worker.
         #[cfg(feature = "nccl")]
         pub tp_group: Option<&'a std::sync::Arc<ferrite_cuda_core::NcclGroup>>,
+        /// Multi-step cooperative kernel context. `Some(_)` when the
+        /// executor has pre-staged per-step arrays and wants `forward()`
+        /// to dispatch the `_ms` variant (N decode steps fused in one
+        /// cooperative kernel launch). `None` for all other forward calls
+        /// (prefill, single-step decode, non-mega paths).
+        pub multi_step: Option<&'a MultiStepCtx>,
+        /// Persistent-decode session pointer. Non-null activates the
+        /// persistent-decode dispatch in `forward()`: on the first call
+        /// (session.resources is None) the kernel is launched; on subsequent
+        /// calls the step is submitted via the pinned protocol buffer and
+        /// polled. The output token is stored in `session.last_output_token`.
+        /// Null for all non-persistent-decode forward calls.
+        /// Raw pointer so the generated `forward(&ctx, ...)` can mutate the
+        /// session through a `&ForwardCtx` without requiring `&mut ForwardCtx`.
+        pub persistent_decode_session: *mut crate::interpreter::mega::PersistentDecodeSession,
+        /// Per-step CPU-side inputs for persistent-decode. Must be `Some`
+        /// when `persistent_decode_session` is non-null; contains the data that
+        /// `write_step_input` sends to the persistent kernel via the
+        /// pinned protocol buffer.
+        pub persistent_decode_step: Option<&'a PersistentDecodeStep>,
+    }
+
+    /// CPU-side per-step inputs for persistent-decode. Staged by the
+    /// executor before each `forward()` call on the persistent-decode path.
+    #[derive(Clone, Copy, Debug)]
+    pub struct PersistentDecodeStep {
+        pub input_id: u32,
+        pub position: u32,
+        pub seq_len: i32,
+        pub slot_mapping: i64,
+        pub block_table_stride: u32,
+        pub block_ids: [u32; 512], // matches protocol_layout::MAX_BLOCKS
+        pub num_block_ids: usize,
+    }
+
+    impl<'a> ForwardCtx<'a> {
+        /// Mega-dispatch accessor: project `seqused_k` to the
+        /// attention-ABI [`I32Ptr`] a [`LaunchArgsAttn::seq_lens`]
+        /// field expects. Thin wrapper over [`seq_lens_ptr`]; the
+        /// dtype-reinterpret rationale lives on that function.
+        ///
+        /// [`LaunchArgsAttn::seq_lens`]: crate::interpreter::mega::LaunchArgsAttn::seq_lens
+        pub fn mega_seq_lens(&self) -> I32Ptr {
+            // Mega reads seq_lens[token] per flat-batch token. Use the
+            // per-token tensor if the executor populated it; fall back
+            // to per-batch seqused_k for callers that don't (e.g. tests).
+            // Per-token is required for mega prefill correctness — without
+            // it, prefill out-of-bounds reads cause CUDA_ERROR_ILLEGAL_ADDRESS.
+            match self.seqused_k_per_token {
+                ::core::option::Option::Some(view) => seq_lens_ptr(view),
+                ::core::option::Option::None => seq_lens_ptr(self.seqused_k),
+            }
+        }
+
+        /// Mega-dispatch accessor: project `block_table` to the
+        /// attention-ABI [`U32Ptr`] a [`LaunchArgsAttn::block_table`]
+        /// field expects. Thin wrapper over [`block_table_ptr`]; the
+        /// signed→unsigned reinterpret rationale lives on that
+        /// function.
+        ///
+        /// [`LaunchArgsAttn::block_table`]: crate::interpreter::mega::LaunchArgsAttn::block_table
+        pub fn mega_block_table(&self) -> U32Ptr {
+            block_table_ptr(self.block_table)
+        }
+
+        /// Mega-dispatch accessor (Wave F): the row stride of
+        /// `block_table` as a `u32`, for the
+        /// [`LaunchArgsAttn::block_table_stride`] field. Read from
+        /// the view's second dimension
+        /// (`self.block_table.dim(1)`) — the host stages the table
+        /// as `[num_tokens, max_blocks_per_seq_in_batch]` i32 in
+        /// `cuda_worker::build_attention_tensors`. An empty block
+        /// table (`max_blocks == 0`, configured for tests or a
+        /// cold-start with no paged pages) returns a stride of `0`;
+        /// the NUM_TOKENS==1 decode path doesn't dereference past
+        /// index 0 so this is inert there, and the batched-decode
+        /// path only enters with at least one page per sequence.
+        ///
+        /// [`LaunchArgsAttn::block_table_stride`]: crate::interpreter::mega::LaunchArgsAttn::block_table_stride
+        pub fn mega_block_table_stride(&self) -> u32 {
+            match (*self.block_table).shape() {
+                [_, stride] => *stride,
+                _ => 0,
+            }
+        }
+
+        /// Mega-dispatch accessor: project `positions` to the QKV-
+        /// tier ABI [`U32Ptr`] a [`LaunchArgsQkv::positions`] /
+        /// [`LaunchArgsAttn::positions`] field expects. Thin wrapper
+        /// over [`positions_ptr`]; the host-dtype rationale
+        /// (`DType::U32` on the host, `const uint32_t*` on the
+        /// mega kernel side) lives on that function.
+        ///
+        /// [`LaunchArgsQkv::positions`]: crate::interpreter::mega::LaunchArgsQkv::positions
+        /// [`LaunchArgsAttn::positions`]: crate::interpreter::mega::LaunchArgsAttn::positions
+        pub fn mega_positions(&self) -> U32Ptr {
+            positions_ptr(self.positions)
+        }
+
+        /// Mega-dispatch accessor: project `input_ids` to the QKV-tier
+        /// ABI [`U32Ptr`] a [`LaunchArgsQkv::input_ids`] /
+        /// [`LaunchArgsAttn::input_ids`] field expects. Thin wrapper
+        /// over [`input_ids_ptr`]; host dtype is `DType::U32` per
+        /// `vllm-cuda/src/graph.rs`, kernel side reads
+        /// `const uint32_t*` — zero-copy pointer reinterpret. Added
+        /// at Phase 3f-2e-iii alongside the `Embed` op dispatch (the
+        /// only consumer of this field in the schedule walker today).
+        ///
+        /// [`LaunchArgsQkv::input_ids`]: crate::interpreter::mega::LaunchArgsQkv::input_ids
+        /// [`LaunchArgsAttn::input_ids`]: crate::interpreter::mega::LaunchArgsAttn::input_ids
+        pub fn mega_input_ids(&self) -> U32Ptr {
+            input_ids_ptr(self.input_ids)
+        }
+
+        /// Mega-dispatch accessor: project `slot_mapping` to the
+        /// QKV-tier ABI [`I64Ptr`] a [`LaunchArgsQkv::slot_mapping`]
+        /// / [`LaunchArgsAttn::slot_mapping`] field expects. Thin
+        /// wrapper over [`slot_mapping_ptr`]; dtype matches both
+        /// sides (`DType::I64` on the host, `const int64_t*` on
+        /// the mega kernel side).
+        ///
+        /// [`LaunchArgsQkv::slot_mapping`]: crate::interpreter::mega::LaunchArgsQkv::slot_mapping
+        /// [`LaunchArgsAttn::slot_mapping`]: crate::interpreter::mega::LaunchArgsAttn::slot_mapping
+        pub fn mega_slot_mapping(&self) -> I64Ptr {
+            slot_mapping_ptr(self.slot_mapping)
+        }
+
+        /// Mega-dispatch accessor: surface the QKV-tier ABI [`KvPtrs`]
+        /// a [`LaunchArgsQkv::key_cache_ptrs`] /
+        /// [`LaunchArgsAttn::key_cache_ptrs`] field expects — a device
+        /// pointer to a `[num_layers]` bf16** array of per-layer K cache
+        /// base pointers, laid out layer-major. Thin wrapper over the
+        /// persistent array the [`KvCachePool`] owns (see
+        /// [`KvCachePool::key_cache_ptrs_gpu`]); callers must keep the
+        /// pool alive for the duration of the launch.
+        ///
+        /// The per-layer base pointers are populated once at pool
+        /// construction and never change, so no host-side staging work
+        /// is needed here.
+        ///
+        /// [`LaunchArgsQkv::key_cache_ptrs`]: crate::interpreter::mega::LaunchArgsQkv::key_cache_ptrs
+        /// [`LaunchArgsAttn::key_cache_ptrs`]: crate::interpreter::mega::LaunchArgsAttn::key_cache_ptrs
+        /// [`KvCachePool::key_cache_ptrs_gpu`]: ferrite_kernels::kv_cache::KvCachePool::key_cache_ptrs_gpu
+        pub fn mega_key_cache_ptrs(&self) -> KvPtrs {
+            self.kv_cache.key_cache_ptrs_gpu()
+        }
+
+        /// Mega-dispatch accessor: surface the QKV-tier ABI [`KvPtrs`]
+        /// a [`LaunchArgsQkv::value_cache_ptrs`] /
+        /// [`LaunchArgsAttn::value_cache_ptrs`] field expects. Same
+        /// contract as [`Self::mega_key_cache_ptrs`], for the V side.
+        ///
+        /// [`LaunchArgsQkv::value_cache_ptrs`]: crate::interpreter::mega::LaunchArgsQkv::value_cache_ptrs
+        /// [`LaunchArgsAttn::value_cache_ptrs`]: crate::interpreter::mega::LaunchArgsAttn::value_cache_ptrs
+        pub fn mega_value_cache_ptrs(&self) -> KvPtrs {
+            self.kv_cache.value_cache_ptrs_gpu()
+        }
+
+        /// Stage a [`LaunchArgsAttn`] from the seven `ForwardCtx`-owned
+        /// pool/metadata fields plus the two variant-owned pointer
+        /// arrays (`act_ptrs`, `weight_ptrs`) a caller has to supply.
+        /// Closes the 2d-v → 2e-iii chain at a single call site: every
+        /// `AttentionViaCache`-bearing variant's generated launch shim
+        /// composes `act_ptrs` + `weight_ptrs` from its own slot /
+        /// accessor tables, then calls this method to fold in the seven
+        /// ctx-sourced fields and hands the result to
+        /// [`dispatch_launch`].
+        ///
+        /// The seven ctx-sourced fields come through the matching
+        /// `mega_*` accessor — `input_ids` via [`Self::mega_input_ids`],
+        /// `positions` via [`Self::mega_positions`],
+        /// `slot_mapping` via [`Self::mega_slot_mapping`],
+        /// `key_cache_ptrs` / `value_cache_ptrs` via
+        /// [`Self::mega_key_cache_ptrs`] / [`Self::mega_value_cache_ptrs`],
+        /// `seq_lens` via [`Self::mega_seq_lens`], and `block_table`
+        /// via [`Self::mega_block_table`]. Each accessor's doc has the
+        /// dtype / layout rationale for the individual projection;
+        /// this helper just groups them into the positional struct the
+        /// emitted `LaunchFnAttn` expects.
+        ///
+        /// The returned struct borrows nothing with a named lifetime —
+        /// it holds raw device pointers whose validity is bounded by
+        /// the ctx's backing tensors + pool. Callers must keep `self`
+        /// (and its `TensorView` / `KvCachePool` sources) alive for the
+        /// duration of the downstream kernel launch.
+        ///
+        /// [`dispatch_launch`]: crate::interpreter::mega::dispatch_launch
+        /// [`LaunchArgsAttn`]: crate::interpreter::mega::LaunchArgsAttn
+        /// [`LaunchFnAttn`]: crate::interpreter::mega::LaunchFnAttn
+        pub fn stage_launch_args_attn(
+            &self,
+            act_ptrs: ActPtrs,
+            weight_ptrs: WeightPtrs,
+            barriers: I32MutPtr,
+            trace_level: i32,
+        ) -> LaunchArgsAttn {
+            LaunchArgsAttn {
+                act_ptrs,
+                weight_ptrs,
+                input_ids: self.mega_input_ids(),
+                positions: self.mega_positions(),
+                slot_mapping: self.mega_slot_mapping(),
+                key_cache_ptrs: self.mega_key_cache_ptrs(),
+                value_cache_ptrs: self.mega_value_cache_ptrs(),
+                seq_lens: self.mega_seq_lens(),
+                block_table: self.mega_block_table(),
+                block_table_stride: self.mega_block_table_stride(),
+                barriers,
+                trace_level,
+            }
+        }
+
+        /// Stage a [`LaunchArgsMultiStep`] from this context's pool/metadata
+        /// fields plus the supplied per-call pointers. Reads per-step arrays
+        /// from `self.multi_step` (which must be `Some`); panics if called
+        /// without a staged [`MultiStepCtx`].
+        ///
+        /// The returned struct holds raw device pointers. Same lifetime /
+        /// aliasing contract as [`Self::stage_launch_args_attn`].
+        pub fn stage_launch_args_multi_step(
+            &self,
+            act_ptrs: ActPtrs,
+            weight_ptrs: WeightPtrs,
+            barriers: I32MutPtr,
+            trace_level: i32,
+        ) -> LaunchArgsMultiStep {
+            let ms = self
+                .multi_step
+                .expect("stage_launch_args_multi_step: multi_step ctx not set");
+            LaunchArgsMultiStep {
+                act_ptrs,
+                weight_ptrs,
+                input_ids_multi: ms.input_ids_multi,
+                positions_multi: ms.positions_multi,
+                slot_mapping_multi: ms.slot_mapping_multi,
+                key_cache_ptrs: self.mega_key_cache_ptrs(),
+                value_cache_ptrs: self.mega_value_cache_ptrs(),
+                seq_lens_multi: ms.seq_lens_multi,
+                block_table: self.mega_block_table(),
+                block_table_stride: self.mega_block_table_stride(),
+                barriers,
+                trace_level,
+                num_steps: ms.num_steps,
+                output_token_ids: ms.output_token_ids,
+            }
+        }
     }
 }
 #[cfg(feature = "cuda")]
-pub use ctx::ForwardCtx;
+pub use ctx::{ForwardCtx, MultiStepCtx, PersistentDecodeStep};
 
 // ── Cross-arch dispatcher (cuda only) ────────────────────────────
 //
@@ -382,6 +716,7 @@ mod dispatcher {
     use ferrite_cuda_core::weights::GpuWeights;
 
     use super::ForwardCtx;
+    pub use crate::interpreter::mega::PersistentDecodeResources;
 
     /// Arch-agnostic handle for a ferrite-loaded model. Every
     /// `#[forward] fn <arch>()` emits an `impl FerriteWeights` for
@@ -422,6 +757,7 @@ mod dispatcher {
             device: &mut GpuDevice,
             num_tokens: u64,
         ) -> OwnedTensor;
+
     }
 
     /// Minimal HF-config view threaded into `try_load` so per-variant
@@ -767,7 +1103,8 @@ mod dispatcher {
 #[cfg(feature = "cuda")]
 pub use dispatcher::{
     EmbedPatch, FerriteArchRegistration, FerriteMmRegistration, FerriteWeights, HfFingerprint,
-    MmTryLoadFn, MultimodalForward, PixelInput, resolve_mm_metadata, try_load, try_load_mm,
+    MmTryLoadFn, MultimodalForward, PixelInput, PersistentDecodeResources, resolve_mm_metadata,
+    try_load, try_load_mm,
 };
 
 /// Re-export `inventory` so the `#[forward]`-macro-emitted

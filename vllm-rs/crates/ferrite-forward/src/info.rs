@@ -275,6 +275,18 @@ impl Instruction {
                     F::WeightShape { n, k },
                 ],
             ),
+            Instruction::CutlassFusedAddScalarOffsetRmsNormGemm(
+                delta_slot, residual_slot, out_slot, layer, offset, tile_m, tile_n, stages, n, k,
+            ) => (
+                "CutlassFusedAddScalarOffsetRmsNormGemm",
+                vec![
+                    F::Slot(delta_slot), F::Slot(residual_slot), F::Slot(out_slot),
+                    F::Layer(layer), F::ConstF32Bits(offset.to_bits()),
+                    F::LayerKind("RmsNorm"), F::LayerKind("LinearLayer"),
+                    F::ConstU32(tile_m), F::ConstU32(tile_n), F::ConstU32(stages),
+                    F::WeightShape { n, k },
+                ],
+            ),
             Instruction::Gemm(in_slot, out_slot, layer, n, k) => (
                 "Gemm",
                 vec![
@@ -1013,12 +1025,91 @@ impl Instruction {
                     F::RopeCosSin,
                 ],
             ),
+            Instruction::TkEmbed(out_slot) => ("TkEmbed", vec![F::Slot(out_slot)]),
+            Instruction::TkScalarMul(in_slot, out_slot, scale) => (
+                "TkScalarMul",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::ConstF32Bits(scale.to_bits())],
+            ),
+            Instruction::TkRmsNorm(in_slot, out_slot, layer) => {
+                ("TkRmsNorm", vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer)])
+            }
+            Instruction::TkGemm(in_slot, out_slot, layer, n, k) => ("TkGemm", vec![
+                F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer), F::ConstU32(n), F::ConstU32(k),
+            ]),
+            Instruction::TkFusedAddRmsNorm(delta_slot, residual_slot, layer) => (
+                "TkFusedAddRmsNorm",
+                vec![F::Slot(delta_slot), F::Slot(residual_slot), F::Layer(layer)],
+            ),
+            Instruction::TkFusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => (
+                "TkFusedQkvRopeCache",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer), F::ConstBool(biased), F::ConstBool(interleaved)],
+            ),
+            Instruction::TkAttentionViaCache(in_slot, out_slot, layer, interleaved) => (
+                "TkAttentionViaCache",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer), F::ConstBool(interleaved)],
+            ),
+            Instruction::TkSlidingAttentionViaCache(in_slot, out_slot, layer, interleaved, window) => (
+                "TkSlidingAttentionViaCache",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer), F::ConstBool(interleaved), F::ConstU32(window)],
+            ),
+            Instruction::TkFusedGateUpSiluMul(in_slot, out_slot, layer) => (
+                "TkFusedGateUpSiluMul",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer)],
+            ),
+            Instruction::TkFusedGateUpGeluMul(in_slot, out_slot, layer) => (
+                "TkFusedGateUpGeluMul",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer)],
+            ),
+            Instruction::TkGemmAdd(in_slot, residual_slot, layer, n, k, k_offset, k_full) => ("TkGemmAdd", vec![
+                F::Slot(in_slot), F::Slot(residual_slot), F::Layer(layer), F::ConstU32(n), F::ConstU32(k), F::ConstU32(k_offset), F::ConstU32(k_full),
+            ]),
+            Instruction::TkFusedAddRmsNormGemm(
+                delta_slot, residual_slot, out_slot, layer, n, k,
+            ) => (
+                "TkFusedAddRmsNormGemm",
+                vec![
+                    F::Slot(delta_slot), F::Slot(residual_slot), F::Slot(out_slot),
+                    F::Layer(layer), F::ConstU32(n), F::ConstU32(k),
+                ],
+            ),
+            Instruction::TkScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => (
+                "TkScalarOffsetRmsNorm",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::Layer(layer), F::ConstF32Bits(offset.to_bits())],
+            ),
+            Instruction::TkFusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => (
+                "TkFusedAddRmsNormWithOffset",
+                vec![F::Slot(delta_slot), F::Slot(residual_slot), F::Layer(layer), F::ConstF32Bits(offset.to_bits())],
+            ),
+            Instruction::TkTanhSoftCap(in_slot, out_slot, n_vocab) => (
+                "TkTanhSoftCap",
+                vec![F::Slot(in_slot), F::Slot(out_slot), F::ConstU32(n_vocab)],
+            ),
+            Instruction::TkFusedAddScalarOffsetRmsNormGemm(
+                delta_slot, residual_slot, out_slot, layer, offset, n, k,
+            ) => (
+                "TkFusedAddScalarOffsetRmsNormGemm",
+                vec![
+                    F::Slot(delta_slot), F::Slot(residual_slot), F::Slot(out_slot),
+                    F::Layer(layer), F::ConstF32Bits(offset.to_bits()), F::ConstU32(n), F::ConstU32(k),
+                ],
+            ),
+            Instruction::TkBarrierSignal(edge_idx) => ("TkBarrierSignal", vec![F::ConstU32(edge_idx)]),
+            Instruction::TkBarrierWait(edge_idx, expected) => (
+                "TkBarrierWait",
+                vec![F::ConstU32(edge_idx), F::ConstU32(expected)],
+            ),
+            Instruction::TkSpliceMmEmbeds(slot) => ("TkSpliceMmEmbeds", vec![F::Slot(slot)]),
             Instruction::Loop(count, body_len) => {
                 ("Loop", vec![F::LoopCount(count), F::LoopBodyLen(body_len)])
             }
             Instruction::Alias(dst, src) => ("Alias", vec![F::Slot(dst), F::Slot(src)]),
             Instruction::Free(slot) => ("Free", vec![F::Slot(slot)]),
             Instruction::SpliceMmEmbeds(slot) => ("SpliceMmEmbeds", vec![F::Slot(slot)]),
+            Instruction::BarrierSignal(edge_idx) => ("BarrierSignal", vec![F::ConstU32(edge_idx)]),
+            Instruction::BarrierWait(edge_idx, expected) => (
+                "BarrierWait",
+                vec![F::ConstU32(edge_idx), F::ConstU32(expected)],
+            ),
         };
         NormalizedStep { kind, fields }
     }

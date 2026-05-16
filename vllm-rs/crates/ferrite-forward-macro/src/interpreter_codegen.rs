@@ -21,11 +21,11 @@
 //!
 //! # Megakernel concerns are out of scope
 //!
-//! Megakernel codegen is a separate code generator. When it lands,
-//! it gets its own translator from per-arch enums to its own wire
-//! format. This module does not produce `[i32; 32]` packed rows,
-//! does not match KVM tp_throughput opcode numbering, does not
-//! emit `Noop` padding. Those are megakernel concerns.
+//! Megakernel codegen is a separate code generator
+//! (`interpreter::mega`). This module produces the host-interpreter
+//! static slices; megakernel codegen walks the same lowered
+//! schedule to emit per-variant `.cu` files. The two share the
+//! schedule input, nothing else.
 
 #![allow(dead_code)]
 
@@ -3133,6 +3133,7 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1)]],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let sm = build_slot_map(&f);
         assert_eq!(sm.total(), 5);
@@ -3290,6 +3291,7 @@ mod tests {
                 add_tile(1, &[(TileId(0), 0)]),
                 add_tile(2, &[(TileId(1), 0)]),
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {
@@ -3321,6 +3323,7 @@ mod tests {
                 add_tile(2, &[(TileId(0), 0)]),
                 add_tile(3, &[(TileId(1), 0), (TileId(2), 0)]),
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {
@@ -3359,6 +3362,7 @@ mod tests {
                 add_tile(1, &[(TileId(0), 0)]),
                 add_tile(2, &[(TileId(1), 0)]),
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {
@@ -3401,6 +3405,7 @@ mod tests {
                 add_tile(1, &[(TileId(0), 0)]), // alias-dst, shape [1]
                 add_tile(2, &[(TileId(1), 0)]), // reads via the alias
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {
@@ -3481,6 +3486,7 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(4), Dim::Lit(16)]],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {
@@ -3540,6 +3546,7 @@ mod tests {
                 },
                 add_tile(2, &[(TileId(1), 0)]),
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {
@@ -3734,6 +3741,7 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(3072)]],
                 },
             ],
+            barrier_meta: ::std::collections::HashMap::new(),
         };
         let mut lib = ImplementationLibrary::new();
         let id_plain = lib.push(Box::new(StubImpl {

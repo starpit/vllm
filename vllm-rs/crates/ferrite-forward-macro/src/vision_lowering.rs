@@ -107,6 +107,7 @@ mod tests {
                 }],
                 outputs: vec![pixels_shape],
             }],
+            barrier_meta: Default::default(),
         }
     }
 
@@ -169,6 +170,8 @@ mod tests {
                 inputs: vec![FufInput::Scalar(0.0), FufInput::Scalar(0.0)],
                 outputs: vec![vec![]],
             }],
+
+            barrier_meta: Default::default(),
         };
         let before = fuf.nodes.len();
         materialize_pixels(&mut fuf);
@@ -207,6 +210,8 @@ mod tests {
                     outputs: vec![pixels_shape],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         materialize_pixels(&mut fuf);
 
@@ -282,6 +287,8 @@ mod tests {
                 ],
                 outputs: vec![q_shape],
             }],
+
+            barrier_meta: Default::default(),
         };
         materialize_pixels(&mut fuf);
 

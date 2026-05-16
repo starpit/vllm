@@ -284,6 +284,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             slot_mapping: null_view,
             cu_seqlens_q: cu_view,
             seqused_k: null_view,
+            seqused_k_per_token: None,
             block_table: null_view,
             max_seqlen_q: max_seqlen,
             max_seqlen_k: 0,
@@ -306,6 +307,9 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_window_index: window_index_view,
             vision_reverse_indices: reverse_indices_view,
             vision_position_ids: position_ids_view,
+            multi_step: None,
+            persistent_decode_session: ::std::ptr::null_mut(),
+            persistent_decode_step: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

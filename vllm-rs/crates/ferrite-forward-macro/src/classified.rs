@@ -449,6 +449,20 @@ pub enum OpKind {
     /// drops from `vision_num_positions` (= patches+1) to
     /// `vision_in_seq_len` (= patches); trailing dim preserved.
     StripCls,
+    /// Mega-kernel cross-CTA synchronization: producer-side signal.
+    /// Inserted by `insert_mega_barriers` at the producer's CTA grid;
+    /// storer emits `ferrite::barrier_signal(&barriers[edge], 1)`.
+    /// Pure control-flow: `output_alias = Some(input)`, no data
+    /// motion. Erased on host-interpreter codegen (stream boundary
+    /// is the barrier). Not reachable from `OpKind::from_name` —
+    /// produced exclusively by the `insert_mega_barriers` pass.
+    BarrierSignal,
+    /// Mega-kernel cross-CTA synchronization: consumer-side wait.
+    /// Inserted at the consumer's CTA grid; loader emits
+    /// `ferrite::barrier_wait(&barriers[edge], expected)`. Same
+    /// aliasing/erasure as `BarrierSignal`. Not reachable from
+    /// `OpKind::from_name`.
+    BarrierWait,
 }
 
 impl OpKind {
@@ -540,6 +554,9 @@ impl OpKind {
             Self::AvgPool2d => "avg_pool_2d",
             Self::PosEmbed => "pos_embed",
             Self::StripCls => "strip_cls",
+            // No DSL surface — produced only by `insert_mega_barriers`.
+            Self::BarrierSignal => "barrier_signal",
+            Self::BarrierWait => "barrier_wait",
         }
     }
 }

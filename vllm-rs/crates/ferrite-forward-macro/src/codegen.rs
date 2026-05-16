@@ -4752,17 +4752,229 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Walk every canonical in `canonical_lowered` and run the Tape-
+/// level claim for each. The winning [`crate::tape_claim::TapeClaimer`]
+/// emits its own compile-time artifacts (`.cu` files for
+/// [`crate::tape::tk_mega::TkMegaTapeClaimer`]; nothing for
+/// [`crate::tape::host_interp::HostInterpreterTapeClaimer`]). The
+/// returned tokenstream is the concatenation of every claimer's
+/// Rust-side declarations; the map surfaces per-bucket forward-fn
+/// idents so [`emit_model`]'s dispatch table can point at them.
+///
+/// Ineligible canonicals (e.g. all-`Tk*` but model dims fail the
+/// TK constraints) fall back to the host interpreter silently —
+/// host always matches, so `pick()` can't return `None`.
+/// Returns `(rust_decls, forward_fn_by_canonical, ms_forward_fn_by_canonical)`.
+/// `ms_forward_fn_by_canonical` maps decode-only M=1 canonicals that have a
+/// successfully-emitted `_ms` variant to their `forward_mega_ms_<canonical>`
+/// fn ident. Consumed by the caller to build `MEGA_FORWARD_TABLE_MULTI_STEP`.
+fn emit_mega_artifacts_inline(
+    model: &ModelParams,
+    canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
+    arch_opcodes: &ArchOpcodes,
+    accessor_type_by_base: &BTreeMap<String, String>,
+    tp_world_size: u8,
+    target_profile: &crate::target::TargetProfile,
+) -> (
+    TokenStream,
+    BTreeMap<crate::solver::WorkloadPoint, Ident>,
+    BTreeMap<crate::solver::WorkloadPoint, Ident>,
+    BTreeMap<crate::solver::WorkloadPoint, Ident>,
+) {
+    use crate::tape_claim::{TapeEmitCtx, starter_tape_library};
+    let shapes = arch_opcodes.shapes_by_name();
+    let eps = rms_norm_eps(model);
+    let library = starter_tape_library();
+
+    let ctx = TapeEmitCtx {
+        shapes: &shapes,
+        rms_norm_eps: eps,
+        profile: target_profile,
+        tp_world_size,
+        bounds: &model.bounds,
+        scalars: &model.scalars,
+        accessor_type_by_base,
+    };
+
+    type WpIdentMap = BTreeMap<crate::solver::WorkloadPoint, Ident>;
+    let mut rust_decls = TokenStream::new();
+    let mut canonical_forward_fn: WpIdentMap = BTreeMap::new();
+    let mut canonical_ms_forward_fn: WpIdentMap = BTreeMap::new();
+    let mut canonical_pd_start_fn: WpIdentMap = BTreeMap::new();
+
+    for (wp, (lowered, _num_slots, _backbone_slot, terminal_slot)) in canonical_lowered {
+        let canonical_name = format!(
+            "{}_m_{}_sk_{}",
+            model
+                .source_stem
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>(),
+            wp.num_tokens,
+            wp.sk_bucket
+        );
+
+        let backbone = &lowered.backbone.instances;
+        let lm_head = &lowered.lm_head.instances;
+
+        let Some((idx, info)) = library.pick(backbone, lm_head, &ctx) else {
+            panic!(
+                "tape claim: no executor matched canonical `{canonical_name}`; \
+                 check that the library contains HostInterpreterTapeClaimer"
+            );
+        };
+
+        let claimer = library.claimer(idx);
+        let emission = claimer.emit(
+            &canonical_name,
+            *wp,
+            backbone,
+            lm_head,
+            *terminal_slot,
+            &ctx,
+            info.as_ref(),
+        );
+
+        if let Some(path) = &emission.cu_path {
+            eprintln!(
+                "tape claim: `{canonical_name}` claimed by `{}`, wrote {} ({} backbone ops, {} lm_head ops)",
+                claimer.name(),
+                path.display(),
+                backbone.len(),
+                lm_head.len()
+            );
+        }
+
+        rust_decls.extend(emission.rust_decls);
+        if let Some(fn_ident) = emission.forward_fn {
+            canonical_forward_fn.insert(*wp, fn_ident);
+        }
+        if let Some(ms_fn_ident) = emission.ms_launch_fn {
+            canonical_ms_forward_fn.insert(*wp, ms_fn_ident);
+        }
+        if let Some(pd_fn_ident) = emission.persistent_decode_launch_fn {
+            canonical_pd_start_fn.insert(*wp, pd_fn_ident);
+        }
+    }
+
+    (rust_decls, canonical_forward_fn, canonical_ms_forward_fn, canonical_pd_start_fn)
+}
+
+/// Render one `*const u16` expression per catalog-ordered accessor,
+/// mapping each accessor's Rust return type (looked up in
+/// `accessor_type_by_base`) to the appropriate path through the
+/// per-arch `Weights` struct. Used by [`emit_mega_artifacts_inline`]
+/// to populate the `match w_idx { 0 => …, 1 => …, … }` arm in the
+/// emitted `forward_mega_<canonical>` body.
+///
+/// The return type → pointer-path mapping:
+///
+/// | Rust return type (trimmed)              | Pointer path |
+/// | --------------------------------------- | ------------ |
+/// | `LinearLayer` / `…::LinearLayer`        | `wm.<base>(layer).dense_weight().as_ptr::<u16>()` |
+/// | `Embedding` / `…::Embedding`            | `wm.<base>(layer).weight.as_ptr::<u16>()` |
+/// | `RmsNorm` / `…::RmsNorm`                | `wm.<base>(layer).weight.as_ptr::<u16>()` |
+///
+/// Special-cased synthesized accessors (not in the collected-accessor
+/// map; emitted by `rotary_cos_sin_methods` / `rotary_local_cos_sin`):
+///
+/// | Accessor base          | Pointer path |
+/// | ---------------------- | ------------ |
+/// | `rotary_cos_sin`       | `wm.rotary_cos_sin(layer).as_ptr::<u16>()` |
+/// | `rotary_local_cos_sin` | `wm.rotary_local_cos_sin(layer).as_ptr::<u16>()` |
+///
+/// An accessor whose type isn't recognized produces a
+/// `compile_error!` expression in its slot — this surfaces the
+/// accessor name + type so the reader can either add a new arm here
+/// or mark the variant `#error` at `canonical_mega_meta` time.
+pub(crate) fn build_mega_accessor_ptr_exprs(
+    accessors: &[String],
+    accessor_type_by_base: &BTreeMap<String, String>,
+    canonical_name: &str,
+) -> Vec<TokenStream> {
+    accessors
+        .iter()
+        .map(|base| {
+            let base_ident = syn::Ident::new(base, proc_macro2::Span::call_site());
+            // Synthesized rotary accessors live off of
+            // `emit_weights_struct::rotary_cos_sin_methods` and return
+            // `GpuTensor` by value.
+            if base == "rotary_cos_sin" || base == "rotary_local_cos_sin" {
+                return quote! {
+                    wm.#base_ident(layer).as_ptr::<u16>()
+                };
+            }
+            let ty = match accessor_type_by_base.get(base) {
+                Some(t) => t,
+                None => {
+                    let err = format!(
+                        "ferrite-forward mega: canonical `{canonical_name}` accessor \
+                         `{base}` not found in collected Weights accessor map — \
+                         cannot synthesize pointer-extraction path"
+                    );
+                    return quote! { compile_error!(#err) };
+                }
+            };
+            // Trim whitespace the tokenstream stringifier adds around
+            // `::` so the type tail matches cleanly.
+            let normalized = ty.replace(' ', "");
+            if normalized.ends_with("LinearLayer") {
+                quote! { wm.#base_ident(layer).dense_weight().as_ptr::<u16>() }
+            } else if normalized.ends_with("Embedding") {
+                quote! { wm.#base_ident(layer).weight.as_ptr::<u16>() }
+            } else if normalized.ends_with("RmsNorm") {
+                quote! { wm.#base_ident(layer).weight.as_ptr::<u16>() }
+            } else {
+                let err = format!(
+                    "ferrite-forward mega: canonical `{canonical_name}` accessor \
+                     `{base}` has unsupported Rust return type `{ty}` — only \
+                     `LinearLayer`, `Embedding`, `RmsNorm`, and the synthesized \
+                     `rotary*_cos_sin` accessors are wired for bf16 mega \
+                     pointer extraction. Add an arm in \
+                     `build_mega_accessor_ptr_exprs` or mark the variant \
+                     ineligible earlier in `canonical_mega_meta`."
+                );
+                quote! { compile_error!(#err) }
+            }
+        })
+        .collect()
+}
+
+/// Build the per-base accessor type map consumed by
+/// [`emit_mega_artifacts_inline`] — one entry per distinct accessor
+/// stem with its Rust return type stringified (e.g.
+/// `"q_proj" → "LinearLayer"`, `"embed_tokens" → "Embedding"`).
+/// Layered bases collapse their per-layer `WeightAccessor` entries
+/// into one map entry (every layer agrees on the `rust_type`;
+/// `collect_accessors`'s conflict check guarantees it).
+fn mega_accessor_type_map(
+    accessors: &[crate::impl_lib::WeightAccessor],
+) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for a in accessors {
+        let full = a.name.to_string();
+        let (base, _layer) = split_base_layer(&full);
+        let ty_str = a.rust_type.to_string();
+        out.entry(base).or_insert(ty_str);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn emit_model(
     program: &Program,
     model: &ModelParams,
     fuf: &Fuf,
     sfufs: &WorkloadAssignments,
     loops: &WorkloadLoops,
+    sfufs_decode: &WorkloadAssignments,
+    loops_decode: &WorkloadLoops,
     lib: &ImplementationLibrary,
     manifest: &crate::weights_manifest::WeightsManifest,
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
     emit_fingerprint: bool,
+    target_profile: &crate::target::TargetProfile,
 ) -> TokenStream {
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
@@ -4999,6 +5211,212 @@ pub fn emit_model(
         crate::interpreter_codegen::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
     }
 
+    // ── Decode-role canonical_lowered ────────────────────────────
+    //
+    // Mirrors the block above but uses `sfufs_decode`/`loops_decode`
+    // (the role=Decode solve). Drives `MEGA_FORWARD_TABLE_DECODE` so
+    // the mega path dispatches TK paged-decode kernels at M>=2 when
+    // all q_lens==1. Same `arch_opcodes` and layout, different
+    // impl assignments per workload point.
+    let bucket_points_decode: Vec<crate::solver::WorkloadPoint> =
+        sfufs_decode.per_workload.keys().copied().collect();
+    let mut sfuf_to_canonical_decode: HashMap<Vec<(u32, u32)>, crate::solver::WorkloadPoint> =
+        HashMap::new();
+    let mut bucket_canonical_decode: Vec<crate::solver::WorkloadPoint> =
+        Vec::with_capacity(bucket_points_decode.len());
+    for wp in &bucket_points_decode {
+        let sfuf = &sfufs_decode.per_workload[wp];
+        let mut sig: Vec<(u32, u32)> = sfuf.impls.iter().map(|(sg, imp)| (sg.0, imp.0)).collect();
+        sig.sort();
+        let canonical = *sfuf_to_canonical_decode.entry(sig).or_insert(*wp);
+        bucket_canonical_decode.push(canonical);
+    }
+    // Build a decode-canonical vector parallel to `bucket_points` (the
+    // REGULAR solve's ordering) so MEGA_FORWARD_TABLE_DECODE[i] aligns
+    // with FORWARD_TABLE[i]. `bucket_canonical_decode` above uses the
+    // DECODE solve's HashMap iteration order (non-deterministic); using
+    // it directly in the table would look up decode fns by REGULAR
+    // canonicals, which differ at M>1 where decode picks all-TK while
+    // regular picks non-TK attention.
+    //
+    // For each regular bucket point, find its decode-solve canonical by
+    // recomputing the sig from `sfufs_decode`. This maps "what regular
+    // solve bucket i covers" → "what decode canonical serves it".
+    let bucket_decode_canonical_for_table: Vec<crate::solver::WorkloadPoint> =
+        bucket_points.iter().map(|wp| {
+            if let Some(sfuf_dec) = sfufs_decode.per_workload.get(wp) {
+                let mut sig: Vec<(u32, u32)> = sfuf_dec.impls.iter()
+                    .map(|(sg, imp)| (sg.0, imp.0))
+                    .collect();
+                sig.sort();
+                sfuf_to_canonical_decode.get(&sig).copied().unwrap_or(*wp)
+            } else {
+                *wp
+            }
+        }).collect();
+
+    let mut canonical_lowered_decode: BTreeMap<
+        crate::solver::WorkloadPoint,
+        (CanonicalLowered, u32, u32, u32),
+    > = BTreeMap::new();
+    for (i, wp) in bucket_points_decode.iter().enumerate() {
+        if bucket_canonical_decode[i] != *wp {
+            continue;
+        }
+        let sfuf = &sfufs_decode.per_workload[wp];
+        let loop_ir = loops_decode
+            .per_workload
+            .get(wp)
+            .expect("decode schedule populated every key");
+        let bounds = bounds_for_wp(model, *wp, tp_world_size);
+        let skip_subgraph = match layout {
+            BackboneLayout::Decoder { .. } => Some(
+                sfuf.subgraph_of(last_node_id)
+                    .expect("terminal tile must be in a subgraph"),
+            ),
+            BackboneLayout::Encoder => None,
+        };
+        let mut protected_bb: HashSet<(TileId, u8)> = HashSet::new();
+        protected_bb.insert(backbone_out);
+        if matches!(layout, BackboneLayout::Decoder { .. }) {
+            protected_bb.insert((last_node_id, 0));
+        }
+        let slots = crate::interpreter_codegen::colored_slot_map(
+            fuf,
+            sfuf,
+            loop_ir,
+            lib,
+            None,
+            &protected_bb,
+        );
+        let backbone_slot = slots.of(backbone_out.0, backbone_out.1);
+        let terminal_slot = match layout {
+            BackboneLayout::Decoder { .. } => slots.of(last_node_id, 0),
+            BackboneLayout::Encoder => backbone_slot,
+        };
+        let num_slots = slots.total();
+        let lowered_bb = lower_bucket(
+            fuf,
+            sfuf,
+            loop_ir,
+            program,
+            model,
+            lib,
+            &bounds,
+            skip_subgraph,
+            &protected_bb,
+            &mut arch_opcodes,
+            backbone_out,
+            &slots,
+        );
+        let lowered_lm = match layout {
+            BackboneLayout::Decoder { .. } => {
+                let terminal_sg =
+                    skip_subgraph.expect("decoder layout always has a terminal subgraph");
+                let term_imp_id = sfuf
+                    .impl_of(terminal_sg)
+                    .expect("terminal subgraph has an Impl assignment");
+                let term_imp = lib.get(term_imp_id);
+                let term_claimed = sfuf.tiles_in_subgraph(terminal_sg);
+                let term_match = crate::impl_lib::MatchInfo {
+                    claimed_tiles: term_claimed.clone(),
+                    boundary_inputs: crate::interpreter_codegen::collect_boundary_inputs(
+                        fuf,
+                        &term_claimed,
+                    ),
+                    boundary_outputs: term_claimed,
+                };
+                let term_emits = term_imp
+                    .fan_out(&term_match, fuf, program, &bounds, &slots)
+                    .expect("terminal subgraph Impl must implement fan_out");
+                arch_opcodes.register(term_imp.opcode_shape());
+                crate::interpreter_codegen::LoweredBucket {
+                    instances: term_emits,
+                    num_slots,
+                    final_slot: terminal_slot,
+                }
+            }
+            BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
+                instances: Vec::new(),
+                num_slots,
+                final_slot: terminal_slot,
+            },
+        };
+        canonical_lowered_decode.insert(
+            *wp,
+            (
+                CanonicalLowered {
+                    backbone: lowered_bb,
+                    lm_head: lowered_lm,
+                },
+                num_slots,
+                backbone_slot,
+                terminal_slot,
+            ),
+        );
+    }
+    for (cl, _, _, _) in canonical_lowered_decode.values_mut() {
+        crate::interpreter_codegen::apply_loop_compression(
+            &arch_opcodes,
+            &mut cl.backbone,
+            "layer",
+        );
+        crate::interpreter_codegen::apply_loop_compression(
+            &arch_opcodes,
+            &mut cl.lm_head,
+            "layer",
+        );
+    }
+
+    // Device-interpreter megakernel codegen — writes per-variant
+    // `.cu` files into the cudaforge cache (gated on
+    // FERRITE_MEGA=1 so default builds don't emit). Files are
+    // picked up by ferrite-cuda-builder's build.rs and
+    // nvcc-compiled into libmegakernels.a.
+    //
+    // Per FERRITE_TK_PLAN.md: emits straight-line C++ over TK 2.0
+    // primitives with four warp-role walker bodies. Same
+    // instruction set as the host interpreter, just inlined into
+    // one kernel.
+    // Build mega from the decode-role canonical_lowered. The mega
+    // kernels are decode-only by design (TK attention_partial does not
+    // support prefill causal masking); the decode-role solve picks
+    // TkAttentionViaCache / AttentionViaCache at M>=2 while the
+    // role-agnostic (existing) FORWARD_TABLE still uses prefill impls
+    // there. MEGA_FORWARD_TABLE_DECODE is indexed by the same bucket
+    // idx as FORWARD_TABLE so `find_bucket_idx` works for both.
+    let (
+        mega_rust_decls,
+        mega_forward_fn_by_canonical_decode,
+        mega_ms_forward_fn_by_canonical,
+        mega_persistent_decode_start_fn_by_canonical,
+    ) = if std::env::var_os("FERRITE_MEGA").is_some() {
+        let accessor_type_map =
+            match collect_accessors(program, fuf, sfufs_decode, lib, model) {
+                Ok(accs) => mega_accessor_type_map(&accs),
+                Err(_) => BTreeMap::new(),
+            };
+        emit_mega_artifacts_inline(
+            model,
+            &canonical_lowered_decode,
+            &arch_opcodes,
+            &accessor_type_map,
+            tp_world_size,
+            target_profile,
+        )
+    } else {
+        (
+            TokenStream::new(),
+            BTreeMap::<crate::solver::WorkloadPoint, Ident>::new(),
+            BTreeMap::<crate::solver::WorkloadPoint, Ident>::new(),
+            BTreeMap::<crate::solver::WorkloadPoint, Ident>::new(),
+        )
+    };
+    // Keep backward-compat alias so code below that was using the old
+    // name still compiles; it now refers to the decode mega map.
+    let mega_forward_fn_by_canonical: &BTreeMap<crate::solver::WorkloadPoint, Ident> =
+        &mega_forward_fn_by_canonical_decode;
+
     // Per-canonical CanonicalParams impl + Instruction type alias.
     // The alias keeps every static-slice row on a single line of
     // expanded source (without it prettyplease wraps
@@ -5226,6 +5644,196 @@ pub fn emit_model(
         },
     };
 
+    // Phase 3f-2l-ii: MEGA_FORWARD_TABLE — parallel to FORWARD_TABLE,
+    // indexed by the same bucket row position. Each row is
+    // `Option<unsafe fn(&Weights, &ForwardCtx, &mut GpuDevice)
+    //                                   -> OwnedTensor>`:
+    // `Some(forward_mega_<canonical>)` when the bucket's canonical
+    // has a linkable mega launch symbol AND its accessor set mapped
+    // cleanly to pointer-extraction paths, `None` otherwise (the
+    // canonical fell back to `#error` on at least one op OR one of
+    // its accessors has no registered bf16-ptr path). Emitted only
+    // when the build-time `FERRITE_MEGA=1` gate fired — otherwise
+    // the table is empty and `forward()` never consults it.
+    //
+    // Runtime dispatch: `forward()` looks up the bucket index once
+    // and consults both tables at that index. Host-interpreter
+    // fallback lives on every bucket (`FORWARD_TABLE` is always
+    // populated), so a `None` row here silently routes through the
+    // host path.
+    let mega_forward_fn_ty = quote! {
+        unsafe fn(
+            &Weights,
+            &::ferrite_forward::ForwardCtx,
+            &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor
+    };
+    // MEGA_FORWARD_TABLE_DECODE — parallel to FORWARD_TABLE, indexed
+    // by the same bucket row position, built from the decode-role
+    // solve. Mega kernels are decode-only (TK attention_partial has
+    // no prefill causal mask); runtime dispatch gates on
+    // `ctx.max_seqlen_q == 1` before consulting this table.
+    // Each row stores (expected_num_tokens, fn) so the dispatch can
+    // guard on exact num_tokens match. A bucket covers a RANGE of M
+    // values but a MEGA kernel is compiled for exactly one NUM_TOKENS.
+    // Without the guard, num_tokens=2 would call the M=8 kernel and
+    // access memory for 6 phantom sequences → CUDA_ERROR_ILLEGAL_ADDRESS.
+    // DEBUG: print mega_forward_fn_by_canonical keys
+    let mega_table_emission: TokenStream = if mega_forward_fn_by_canonical.is_empty() {
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(dead_code)]
+            static MEGA_FORWARD_TABLE_DECODE: &[
+                ::core::option::Option<(u64, #mega_forward_fn_ty)>
+            ] = &[];
+        }
+    } else {
+        // Build a fallback map: for each num_tokens (M), pick ANY canonical
+        // we successfully emitted for that M. Used when a bucket's primary
+        // canonical points to a workload-point that didn't produce a mega
+        // fn (e.g. its impl signature collided with another canonical's
+        // and lost the canonical race, or its variant was rejected by
+        // `canonical_mega_meta`).
+        // Each table entry stores (compiled_M, fn_ident). Dispatch site
+        // guards on num_tokens == compiled_M, so prefill at num_tokens=8
+        // dispatches to the m=8 kernel and decode at num_tokens=1 dispatches
+        // to m=1. Without this fallback, MEGA_FORWARD_TABLE_DECODE[bucket_idx]
+        // = None for any bucket whose canonical didn't emit, and mega never
+        // dispatches for that bucket.
+        let by_m: BTreeMap<u64, &Ident> = mega_forward_fn_by_canonical
+            .iter()
+            .map(|(wp, ident)| (wp.num_tokens, ident))
+            .collect();
+        let rows: Vec<TokenStream> = bucket_decode_canonical_for_table
+            .iter()
+            .map(|decode_canonical| {
+                // Direct hit on the canonical?
+                if let Some(ident) = mega_forward_fn_by_canonical.get(decode_canonical) {
+                    let expected_m: u64 = decode_canonical.num_tokens as u64;
+                    return quote! { ::core::option::Option::Some((#expected_m, #ident)), };
+                }
+                // Same-M fallback: prefer a kernel emitted for the bucket's
+                // canonical num_tokens. Lets buckets sharing the canonical-
+                // assignment race still resolve to a working fn at the same M.
+                if let Some(ident) = by_m.get(&decode_canonical.num_tokens) {
+                    let expected_m: u64 = decode_canonical.num_tokens as u64;
+                    return quote! { ::core::option::Option::Some((#expected_m, #ident)), };
+                }
+                // No same-M fn emitted. Pick the SMALLEST emitted M ≥ this
+                // bucket's canonical num_tokens (closest-larger). The bucket
+                // covers a range; the dispatch site's `num_tokens ==
+                // expected_m` guard will only fire when actual num_tokens
+                // matches the chosen M, so picking a larger M for the table
+                // entry is safe — it just means the exact-match check happens
+                // later. Without this, prefill buckets with no m=2/m=4 kernel
+                // would go to None and prefill mega never fires.
+                let pick = by_m
+                    .iter()
+                    .find(|(m, _)| **m >= decode_canonical.num_tokens)
+                    .map(|(m, ident)| (*m, *ident));
+                match pick {
+                    Some((m, ident)) => {
+                        quote! { ::core::option::Option::Some((#m, #ident)), }
+                    }
+                    None => quote! { ::core::option::Option::None, },
+                }
+            })
+            .collect();
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(dead_code)]
+            static MEGA_FORWARD_TABLE_DECODE: &[
+                ::core::option::Option<(u64, #mega_forward_fn_ty)>
+            ] = &[
+                #(#rows)*
+            ];
+        }
+    };
+
+    // MEGA_FORWARD_TABLE_MULTI_STEP — parallel to MEGA_FORWARD_TABLE_DECODE
+    // but entries point at `forward_mega_ms_<canonical>` fns that call
+    // `launch_multi_step` and return a zero-element placeholder tensor.
+    // Only M=1 decode canonicals that successfully emitted a `_ms` CU
+    // (logits_slot found + TkFusedAddRmsNormGemm in lm_head) get Some(_).
+    // Runtime dispatch: `ctx.multi_step.is_some()` gates on this table
+    // BEFORE the single-step table so multi-step wins when staged.
+    let mega_ms_table_emission: TokenStream = if mega_ms_forward_fn_by_canonical.is_empty() {
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(dead_code)]
+            static MEGA_FORWARD_TABLE_MULTI_STEP: &[
+                ::core::option::Option<(u64, #mega_forward_fn_ty)>
+            ] = &[];
+        }
+    } else {
+        let rows: Vec<TokenStream> = bucket_decode_canonical_for_table
+            .iter()
+            .map(|decode_canonical| {
+                match mega_ms_forward_fn_by_canonical.get(decode_canonical) {
+                    Some(ident) => {
+                        let expected_m: u64 = decode_canonical.num_tokens as u64;
+                        quote! { ::core::option::Option::Some((#expected_m, #ident)), }
+                    }
+                    None => quote! { ::core::option::Option::None, },
+                }
+            })
+            .collect();
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(dead_code)]
+            static MEGA_FORWARD_TABLE_MULTI_STEP: &[
+                ::core::option::Option<(u64, #mega_forward_fn_ty)>
+            ] = &[
+                #(#rows)*
+            ];
+        }
+    };
+
+    // MEGA_PERSISTENT_DECODE_TABLE — parallel to MEGA_FORWARD_TABLE_MULTI_STEP
+    // but for the persistent-decode path. Entries are
+    // `start_persistent_decode_*` fns that launch the cooperative persistent
+    // kernel and return `PersistentDecodeResources`.
+    // fn type differs from mega_forward_fn_ty: extra `protocol` arg, different return.
+    let mega_persistent_decode_fn_ty = quote! {
+        unsafe fn(
+            &Weights,
+            &::ferrite_forward::ForwardCtx,
+            &mut ::ferrite_cuda_core::device::GpuDevice,
+            *mut ::std::ffi::c_void,
+        ) -> ::core::result::Result<::ferrite_forward::PersistentDecodeResources, i32>
+    };
+    let mega_persistent_decode_table_emission: TokenStream = if mega_persistent_decode_start_fn_by_canonical.is_empty() {
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(dead_code)]
+            static MEGA_PERSISTENT_DECODE_TABLE: &[
+                ::core::option::Option<(u64, #mega_persistent_decode_fn_ty)>
+            ] = &[];
+        }
+    } else {
+        let rows: Vec<TokenStream> = bucket_decode_canonical_for_table
+            .iter()
+            .map(|decode_canonical| {
+                match mega_persistent_decode_start_fn_by_canonical.get(decode_canonical) {
+                    Some(ident) => {
+                        let expected_m: u64 = decode_canonical.num_tokens as u64;
+                        quote! { ::core::option::Option::Some((#expected_m, #ident)), }
+                    }
+                    None => quote! { ::core::option::Option::None, },
+                }
+            })
+            .collect();
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(dead_code)]
+            static MEGA_PERSISTENT_DECODE_TABLE: &[
+                ::core::option::Option<(u64, #mega_persistent_decode_fn_ty)>
+            ] = &[
+                #(#rows)*
+            ];
+        }
+    };
+
     quote! {
         #weights
 
@@ -5237,10 +5845,40 @@ pub fn emit_model(
 
         #(#static_slices)*
 
+        // Mega (ferrite-TK) per-variant extern decls + LAUNCH_FN_<VARIANT>
+        // constants + per-canonical `forward_mega_<canonical>` fns —
+        // one pair per canonical bucket whose `.cu` codegen'd without
+        // bailing to `#error` AND whose accessor set resolves to
+        // known bf16 pointer-extraction paths. Empty token stream when
+        // `FERRITE_MEGA=1` isn't set at macro-expansion time.
+        #mega_rust_decls
+
         #forward_table
 
+        // Parallel to FORWARD_TABLE: per-bucket Option<forward_mega_*>.
+        // Populated only under build-time `FERRITE_MEGA=1`; otherwise
+        // an empty slice. Runtime dispatch inspects this alongside
+        // `::ferrite_forward::mega_enabled()` to choose the mega path.
+        #mega_table_emission
+
+        // Parallel to MEGA_FORWARD_TABLE_DECODE: M=1-only multi-step
+        // cooperative kernels. Entries point at `forward_mega_ms_*` fns
+        // that call `launch_multi_step` and return a zero-element tensor.
+        // Only populated when FERRITE_MEGA=1 at build time AND the canonical
+        // has a logits_slot + TkFusedAddRmsNormGemm lm_head.
+        #mega_ms_table_emission
+
+        // Parallel to MEGA_FORWARD_TABLE_DECODE: M=1-only persistent-decode
+        // start fns. Entries point at `start_persistent_decode_*` fns that
+        // launch the persistent cooperative kernel and return PersistentDecodeResources.
+        // Only populated when FERRITE_MEGA=1 at build time AND the canonical
+        // has a logits_slot + TkFusedAddRmsNormGemm lm_head.
+        #mega_persistent_decode_table_emission
+
         /// Dispatch on (num_tokens, sk_bucket) → bucket entry, then
-        /// run the universal interpreter.
+        /// run the universal interpreter (or the mega kernel when
+        /// `FERRITE_MEGA=1` is set at runtime AND the bucket has a
+        /// compiled mega forward fn).
         #[cfg(feature = "cuda")]
         #[allow(clippy::too_many_arguments)]
         pub unsafe fn forward(
@@ -5249,15 +5887,168 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::device::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
-            let e = ::ferrite_forward::find_bucket(
+            let idx = ::ferrite_forward::find_bucket_idx(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
+            // Persistent-decode dispatch: M=1, persistent_decode_session staged by the executor.
+            // On first call (session.resources is None): launch persistent kernel.
+            // On subsequent calls: submit step via protocol buffer and poll output.
+            // Takes priority over multi-step and single-step mega.
+            // persistent_decode_session is a raw *mut so we can mutate through &ForwardCtx.
+            if ::ferrite_forward::mega_enabled()
+                && !ctx.persistent_decode_session.is_null()
+                && ctx.persistent_decode_step.is_some()
+                && ctx.max_seqlen_q == 1
+            {
+                if let ::core::option::Option::Some((expected_m, pd_fn)) =
+                    MEGA_PERSISTENT_DECODE_TABLE.get(idx).copied().flatten()
+                {
+                    if num_tokens == expected_m {
+                        // SAFETY: caller (CudaWorker) owns the PersistentDecodeSession and ensures it
+                        // lives for the duration of this call. No aliasing — only one
+                        // forward() call runs at a time on the worker thread.
+                        let session = unsafe { &mut *ctx.persistent_decode_session };
+                        let step = ctx.persistent_decode_step.unwrap();
+                        // Start the persistent kernel on the first call.
+                        #[cfg(feature = "cuda")]
+                        if session.resources.is_none() {
+                            if ::ferrite_forward::trace_enabled() {
+                                ::std::eprintln!(
+                                    "ferrite-forward pd: starting kernel bucket_idx={} num_tokens={} sk={}",
+                                    idx, num_tokens, ctx.max_seqlen_k,
+                                );
+                            }
+                            match unsafe { pd_fn(wm, ctx, device, session.protocol_ptr()) } {
+                                ::core::result::Result::Ok(resources) => {
+                                    session.resources = ::core::option::Option::Some(resources);
+                                }
+                                ::core::result::Result::Err(rc) => {
+                                    ::std::eprintln!(
+                                        "ferrite-forward pd: start failed rc={rc}, falling through"
+                                    );
+                                    // Fall through to single-step mega / host interp.
+                                }
+                            }
+                        }
+                        // Execute the step via the pinned protocol buffer.
+                        #[cfg(feature = "cuda")]
+                        if session.resources.is_some() {
+                            if ::ferrite_forward::trace_enabled() {
+                                ::std::eprintln!(
+                                    "ferrite-forward pd: step pos={} sl={}",
+                                    step.position, step.seq_len,
+                                );
+                            }
+                            unsafe {
+                                session.write_step_input(
+                                    step.input_id,
+                                    step.position,
+                                    step.seq_len,
+                                    step.slot_mapping,
+                                    step.block_table_stride,
+                                    &step.block_ids[..step.num_block_ids],
+                                );
+                                session.signal_cpu_step();
+                                session.poll_output_token();
+                            }
+                            // Return zero-element placeholder; executor reads
+                            // session.last_output_token directly.
+                            return device.caching.alloc_tensor(
+                                &[0usize],
+                                ::ferrite_cuda_core::dtype::DType::BF16,
+                            );
+                        }
+                    }
+                }
+            }
+            // Multi-step cooperative dispatch: M=1, multi_step ctx staged by
+            // the executor. Takes priority over single-step mega so N decode
+            // steps fuse into one cooperative kernel launch when possible.
+            if ::ferrite_forward::mega_enabled()
+                && ctx.multi_step.is_some()
+                && ctx.max_seqlen_q == 1
+            {
+                if let ::core::option::Option::Some((expected_m, ms_fn)) =
+                    MEGA_FORWARD_TABLE_MULTI_STEP.get(idx).copied().flatten()
+                {
+                    if num_tokens == expected_m {
+                        if ::ferrite_forward::trace_enabled() {
+                            ::std::eprintln!(
+                                "ferrite-forward mega-ms: dispatch bucket_idx={} num_tokens={} sk={}",
+                                idx,
+                                num_tokens,
+                                ctx.max_seqlen_k,
+                            );
+                        }
+                        return unsafe { ms_fn(wm, ctx, device) };
+                    }
+                }
+            }
+            // Single-step mega dispatch: decode-only (all q_lens == 1). The
+            // MEGA_FORWARD_TABLE_DECODE was built from the decode-role
+            // solve (TK paged-cache attention at M>=2, etc.). Prefill
+            // or mixed batches (max_seqlen_q > 1) fall through to the
+            // host interpreter path — mega kernels have no
+            // new-token causal mask for prefill.
+            // Mega: fires for both prefill AND decode (no max_seqlen_q gate).
+            // Guard on num_tokens == expected_m so we only call kernels
+            // compiled for exactly this token count.
+            if ::ferrite_forward::mega_enabled() {
+                if let ::core::option::Option::Some((expected_m, mega_fn)) =
+                    MEGA_FORWARD_TABLE_DECODE.get(idx).copied().flatten()
+                {
+                    if num_tokens == expected_m {
+                        if ::ferrite_forward::trace_enabled() {
+                            ::std::eprintln!(
+                                "ferrite-forward mega: dispatch bucket_idx={} num_tokens={} sk={} max_seqlen_q={}",
+                                idx,
+                                num_tokens,
+                                ctx.max_seqlen_k,
+                                ctx.max_seqlen_q,
+                            );
+                        }
+                        return unsafe { mega_fn(wm, ctx, device) };
+                    }
+                }
+            }
+            let e = &FORWARD_TABLE[idx];
             unsafe {
                 ::ferrite_forward::run(e.4, e.9, e.5, e.10, wm, ctx, device, e.6, e.8)
             }
         }
 
         #forward_backbone_fn
+
+        /// Start a persistent-decode kernel for M=1 greedy decode.
+        /// Looks up `MEGA_PERSISTENT_DECODE_TABLE[bucket_idx]`; returns
+        /// `None` when no persistent-decode kernel was compiled for this
+        /// (num_tokens, sk_bucket) combination.
+        #[cfg(feature = "cuda")]
+        #[allow(dead_code)]
+        pub unsafe fn start_persistent_decode(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            protocol: *mut ::std::ffi::c_void,
+            num_tokens: u64,
+            max_seqlen_k: u64,
+        ) -> ::core::option::Option<
+            ::core::result::Result<::ferrite_forward::PersistentDecodeResources, i32>,
+        > {
+            let idx = ::ferrite_forward::find_bucket_idx(
+                FORWARD_TABLE, num_tokens, max_seqlen_k,
+            );
+            if let ::core::option::Option::Some((expected_m, pd_fn)) =
+                MEGA_PERSISTENT_DECODE_TABLE.get(idx).copied().flatten()
+            {
+                if num_tokens == expected_m {
+                    return ::core::option::Option::Some(unsafe {
+                        pd_fn(wm, ctx, device, protocol)
+                    });
+                }
+            }
+            ::core::option::Option::None
+        }
 
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
         /// row, with backbone + lm_head normalized for non-generic
@@ -6153,6 +6944,8 @@ mod fingerprint_tests {
                     outputs: vec![shape_2d()],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         match backbone_layout(&fuf, &program) {
             BackboneLayout::Decoder { backbone_out } => {
@@ -6203,6 +6996,8 @@ mod fingerprint_tests {
                     outputs: vec![shape_2d()],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         assert!(
             matches!(backbone_layout(&fuf, &program), BackboneLayout::Encoder),
@@ -6258,6 +7053,8 @@ mod fingerprint_tests {
                     outputs: vec![shape_2d()],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         match backbone_layout(&fuf, &program) {
             BackboneLayout::Decoder { backbone_out } => assert_eq!(backbone_out, (TileId(0), 0)),
@@ -6304,6 +7101,8 @@ mod fingerprint_tests {
                     outputs: vec![shape_2d()],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         assert!(
             matches!(backbone_layout(&fuf, &program), BackboneLayout::Encoder),

@@ -474,8 +474,48 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     fn target_compatible(&self, profile: &TargetProfile) -> bool;
 
     /// Workload eligibility. Default accepts any `num_tokens`.
+    ///
+    /// See also [`workload_constraint_for_role`] for role-aware
+    /// variants — decode-only / prefill-only impls override it to
+    /// widen the valid `num_tokens` range when the solver is running
+    /// in a matching role, without affecting role-agnostic callers.
     fn workload_constraint(&self) -> WorkloadConstraint {
         WorkloadConstraint::Any
+    }
+
+    /// Role-aware workload constraint. Default falls back to the
+    /// role-agnostic [`workload_constraint`]. Override when an impl
+    /// legitimately claims a wider range under a specific
+    /// [`ForwardRole`] than under the role-agnostic constraint.
+    ///
+    /// Concrete example: `AttentionViaCacheImpl` is historically
+    /// constrained to `{num_tokens: 1, 1}` because it's the M=1 decode
+    /// path. Under `ForwardRole::Decode`, it legitimately handles any
+    /// `num_tokens` (batched decode with all q_lens == 1 is still
+    /// single-token-per-seq attention), so the decode-role variant
+    /// returns `{1, u32::MAX}`. Role-agnostic callers see the narrow
+    /// constraint — zero behavior change for pre-F/2 code paths.
+    fn workload_constraint_for_role(
+        &self,
+        _role: crate::solver::ForwardRole,
+    ) -> WorkloadConstraint {
+        self.workload_constraint()
+    }
+
+    /// Whether this impl can run in the given forward role.
+    /// Default: both roles. Attention impls override to gate:
+    /// decode-style impls (paged-cache-reading attention) reject
+    /// `ForwardRole::Prefill`; prefill-style impls (contiguous-K/V
+    /// attention) reject `ForwardRole::Decode`.
+    ///
+    /// Orthogonal from [`workload_constraint`] — that gates by
+    /// workload-point scalar axes (num_tokens, sk_bucket); this gates
+    /// by which of the two compiled-forward variants is being
+    /// assembled. Default-true so non-attention impls (rms_norm,
+    /// gemm, silu_mul, rope, …) participate in both roles without
+    /// per-impl code.
+    fn accepts_role(&self, _role: crate::solver::ForwardRole) -> bool {
+        true
     }
 
     /// Try to match a subgraph rooted at the given seed tile.
@@ -1810,6 +1850,27 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
 pub fn starter_library() -> ImplementationLibrary {
     let cutlass_enabled = true;
     let mut lib = ImplementationLibrary::new();
+    // TK peers — sm≥90 gated in `target_compatible`. Registered
+    // first so tied-cost ties against their backend peers resolve
+    // in favor of the Tk path on Hopper, which is required for the
+    // tape-level `TkMegaTapeClaimer` to see an all-Tk tape. See
+    // `src/tk_impls.rs` for the module-level rationale and the
+    // two-layer solve (Instruction-level DP + Tape-level claim).
+    lib.push(Box::new(crate::tk_impls::TkEmbedImpl));
+    lib.push(Box::new(crate::tk_impls::TkRmsNormImpl));
+    lib.push(Box::new(crate::tk_impls::TkScalarMulImpl));
+    lib.push(Box::new(crate::tk_impls::TkGemmImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedAddRmsNormImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedAddRmsNormGemmImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedQkvRopeCacheImpl));
+    lib.push(Box::new(crate::tk_impls::TkAttentionViaCacheImpl));
+    lib.push(Box::new(crate::tk_impls::TkSlidingAttentionViaCacheImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedGateUpSiluMulImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedGateUpGeluMulImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedAddScalarOffsetRmsNormGemmImpl));
+    lib.push(Box::new(crate::tk_impls::TkFusedAddRmsNormWithOffsetImpl));
+    lib.push(Box::new(crate::tk_impls::TkScalarOffsetRmsNormImpl));
+    lib.push(Box::new(crate::tk_impls::TkTanhSoftCapImpl));
     lib.push(Box::new(EmbedRefImpl));
     lib.push(Box::new(RmsNormRefImpl));
     // CohereLayerNorm-flavored norm: claims `(Mean, Sub, RmsNorm)`
@@ -1982,6 +2043,23 @@ pub fn starter_library() -> ImplementationLibrary {
     // on the Embed output — equivalent to the pre-refactor inline
     // splice that lived inside `Instruction::Embed::eval`.
     lib.push(Box::new(MmEmbedSpliceImpl));
+    // Mega-kernel cross-CTA barrier pair: the only matchers for
+    // `OpKind::BarrierSignal` / `OpKind::BarrierWait` nodes the
+    // `insert_mega_barriers` pass injects at every producer→consumer
+    // edge that crosses a CTA boundary. No-op at `FERRITE_MEGA=0`
+    // builds (the pass is skipped, so no nodes to match).
+    lib.push(Box::new(BarrierSignalImpl));
+    lib.push(Box::new(BarrierWaitImpl));
+    // Gemma2 lm_head: 4-tile (residual-Add + scalar-offset-Add + RmsNorm + Gemm).
+    // Larger than both FusedAddRmsNormWithOffsetImpl (3) and
+    // CutlassFusedAddRmsNormGemmImpl (3), so the DP prefers this for Gemma2.
+    for tile in CUTLASS_TILE_ZOO {
+        lib.push(Box::new(CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+            tile_m: tile.0,
+            tile_n: tile.1,
+            stages: tile.2,
+        }));
+    }
     // Gemma-style 3-tile fusion: residual-Add + scalar-offset-Add
     // + RmsNorm. Claimed by the DP in preference to the 2-tile
     // FusedAddRmsNorm + standalone ScalarOffset because it's a
@@ -2083,6 +2161,11 @@ pub fn starter_library() -> ImplementationLibrary {
                 stages: tile.2,
             }));
         }
+        // TK GEMM + residual-add peer: claims (Gemm, Add) at M=1 decode
+        // via `down_proj_residual.cuh`. Registered before CutlassGemmAdd so
+        // the DP prefers TK on sm≥90 (TK_COST_US beats all calibrated CSV rows).
+        lib.push(Box::new(crate::tk_impls::TkGemmAddImpl));
+
         // CUTLASS GEMM + residual-add peer: beta=1.0 epilogue, in-place
         // on residual. 2-tile claim over `(Gemm, Add)`; DP picks over
         // FusedAddRmsNormImpl per layer-residual chain by cost.
@@ -6013,6 +6096,381 @@ impl Implementation for FusedAddRmsNormWithOffsetImpl {
     }
 }
 
+// ── CutlassFusedAddScalarOffsetRmsNormGemmImpl ───────────────────
+//
+// Claims 4 tiles for Gemma2's lm_head canonical pattern:
+//   residual-Add (two Tile inputs),   scalar-offset-Add (Weight+Scalar),
+//   RmsNorm (reads residual-Add at slot 0, scalar-Add at slot 1),
+//   Gemm (reads RmsNorm output).
+//
+// Emits `CutlassFusedAddRmsNormGemm` (wrong for offset) for the host
+// interpreter non-TK path; the TK path uses `TkFusedAddScalarOffsetRmsNormGemmImpl`
+// which emits the correct offset-aware kernel.
+//
+// By claiming all 4 nodes this impl beats both the 3-node
+// `FusedAddRmsNormWithOffsetImpl` and `CutlassFusedAddRmsNormGemmImpl`,
+// preventing conflicts on the RmsNorm node.
+
+#[derive(Debug, Clone)]
+pub struct CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+    pub tile_m: u32,
+    pub tile_n: u32,
+    pub stages: u32,
+}
+
+impl CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+    fn csv_name(&self) -> &'static str {
+        CutlassFusedAddRmsNormGemmImpl {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            stages: self.stages,
+        }
+        .csv_name()
+    }
+}
+
+impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+    fn name(&self) -> &'static str {
+        self.csv_name()
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        profile.cost_table.has_kernel(self.csv_name())
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Seed at the residual-stream Add (both inputs must be Tiles).
+        let residual_add = fuf.get(seed);
+        if residual_add.op != OpKind::Add {
+            return None;
+        }
+        if !residual_add.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. })) {
+            return None;
+        }
+        // Find RmsNorm that consumes this Add at slot 0 AND has a scalar-offset Add at slot 1.
+        for rms in &fuf.nodes {
+            if rms.op != OpKind::RmsNorm || rms.inputs.len() < 2 {
+                continue;
+            }
+            let reads_residual =
+                matches!(rms.inputs[0], FufInput::Tile { id, .. } if id == seed);
+            if !reads_residual {
+                continue;
+            }
+            let scalar_add_id = match rms.inputs[1] {
+                FufInput::Tile { id, .. } => id,
+                _ => continue,
+            };
+            let scalar_add = fuf.get(scalar_add_id);
+            if scalar_add.op != OpKind::Add {
+                continue;
+            }
+            let mut has_weight = false;
+            let mut has_scalar = false;
+            let mut ok = true;
+            for inp in &scalar_add.inputs {
+                match inp {
+                    FufInput::Weight { .. } => has_weight = true,
+                    FufInput::Scalar(_) => has_scalar = true,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !(ok && has_weight && has_scalar) {
+                continue;
+            }
+            // RmsNorm's only consumer must be a single dense Gemm.
+            let mut consumers = fuf.nodes.iter().filter(|n| consumes_tile(n, rms.id));
+            let only = consumers.next()?;
+            if consumers.next().is_some() {
+                return None;
+            }
+            if only.op != OpKind::Gemm {
+                return None;
+            }
+            if !matches!(weight_storage_of(only), Some(StorageFormat::Dense)) {
+                return None;
+            }
+            match first_tile_input(only) {
+                Some((id, slot)) if id == rms.id && slot == 0 => {}
+                _ => return None,
+            }
+            let gemm_id = only.id;
+            let mut claimed = [seed, scalar_add_id, rms.id, gemm_id];
+            claimed.sort();
+            let boundary_inputs: Vec<TileId> = residual_add
+                .inputs
+                .iter()
+                .filter_map(|i| match i {
+                    FufInput::Tile { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            return Some(MatchInfo {
+                claimed_tiles: claimed.to_vec(),
+                boundary_inputs,
+                boundary_outputs: vec![seed, gemm_id],
+            });
+        }
+        None
+    }
+
+    fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| ctx.fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
+        let gemm_node = ctx.fuf.get(gemm_id);
+        let Some((mm, nn, kk)) = gemm_mnk(ctx, gemm_node) else {
+            return UNCALIBRATED_COST_US;
+        };
+        if !cutlass_tile_supports_shape(mm, nn, kk) {
+            return UNCALIBRATED_COST_US;
+        }
+        ctx.profile
+            .cost_us_for(self.csv_name(), mm, nn, kk)
+            .unwrap_or_else(|| cutlass_gemm_roofline_us(ctx, mm, nn, kk))
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let residual_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains residual Add");
+        let add_node = fuf.get(residual_add_id);
+        let residual_src = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            _ => panic!("CutlassFusedAddScalarOffsetRmsNormGemm: Add input 1 must be a Tile"),
+        };
+        vec![((residual_add_id, 0), Some(residual_src))]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // scalar-offset Add's Weight input = norm weight.
+        let scalar_add_id = *claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let scalar_add = fuf.get(scalar_add_id);
+        let (norm_weight_id, norm_weight_idx) = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("scalar-offset Add has a Weight input");
+        let norm_name = weight_field_name(program, norm_weight_id, norm_weight_idx);
+
+        let gemm_id = *claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
+        let gemm_node = fuf.get(gemm_id);
+        let (gemm_weight_id, gemm_weight_idx) = gemm_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { id, index, .. } => Some((*id, *index)),
+                _ => None,
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: Gemm has a Weight input");
+        let gemm_name = weight_field_name(program, gemm_weight_id, gemm_weight_idx);
+
+        vec![
+            WeightAccessor {
+                name: norm_name,
+                rust_type: quote! { ::ferrite_kernels::layers::RmsNorm },
+                source_weights: vec![(norm_weight_id, norm_weight_idx)],
+            },
+            WeightAccessor {
+                name: gemm_name,
+                rust_type: quote! { ::ferrite_kernels::layers::LinearLayer },
+                source_weights: vec![(gemm_weight_id, gemm_weight_idx)],
+            },
+        ]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "CutlassFusedAddScalarOffsetRmsNormGemm",
+            vec![
+                ("delta_slot", syn::parse_quote!(u32)),
+                ("residual_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("offset", syn::parse_quote!(f32)),
+                (
+                    "norm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::RmsNorm
+                    ),
+                ),
+                (
+                    "gemm_wf",
+                    syn::parse_quote!(
+                        for<'a> fn(&'a Weights, u32) -> &'a ::ferrite_kernels::layers::LinearLayer
+                    ),
+                ),
+                ("tile_m", syn::parse_quote!(u32)),
+                ("tile_n", syn::parse_quote!(u32)),
+                ("stages", syn::parse_quote!(u32)),
+                ("n", syn::parse_quote!(u32)),
+                ("k", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let residual_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains residual Add");
+        let scalar_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
+
+        let add_node = fuf.get(residual_add_id);
+        let gemm_node = fuf.get(gemm_id);
+        let scalar_add = fuf.get(scalar_add_id);
+
+        let (delta_id, delta_in_slot) = match add_node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedAddScalarOffsetRmsNormGemm: Add input 0 (delta) must be a Tile (got {other:?})"
+            ),
+        };
+        let (residual_id, residual_in_slot) = match add_node.inputs.get(1) {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!(
+                "CutlassFusedAddScalarOffsetRmsNormGemm: Add input 1 (residual) must be a Tile (got {other:?})"
+            ),
+        };
+
+        let offset: f32 = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: scalar-offset Add has a Scalar");
+
+        let delta_idx = slots.of(delta_id, delta_in_slot);
+        let residual_idx = slots.of(residual_id, residual_in_slot);
+        let out_slot_idx = slots.of(gemm_id, 0);
+
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let norm_acc = accessors
+            .first()
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: required_weights[0]");
+        let gemm_acc = accessors
+            .get(1)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: required_weights[1]");
+
+        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
+        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let layer = norm_layer.unwrap_or(0) as u32;
+        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
+        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
+
+        let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
+            .expect("CutlassFusedAddScalarOffsetRmsNormGemm: gemm (N, K) must resolve");
+
+        let tile_m = self.tile_m;
+        let tile_n = self.tile_n;
+        let stages = self.stages;
+
+        Some(vec![OpInstance::new(
+            syn::Ident::new("CutlassFusedAddScalarOffsetRmsNormGemm", proc_macro2::Span::call_site()),
+            vec![
+                quote! { #delta_idx },
+                quote! { #residual_idx },
+                quote! { #out_slot_idx },
+                quote! { #layer },
+                quote! { #offset },
+                quote! { Weights::#norm_ident },
+                quote! { Weights::#gemm_ident },
+                quote! { #tile_m },
+                quote! { #tile_n },
+                quote! { #stages },
+                quote! { #n },
+                quote! { #k },
+            ],
+        )])
+    }
+}
+
 // ── ScalarOffsetRmsNormImpl ──────────────────────────────────────
 //
 // Claims `(Add, RmsNorm)` where the Add has one [`FufInput::Weight`]
@@ -7414,7 +7872,30 @@ impl Implementation for AttentionViaCacheImpl {
         // impl; this impl ignores the DSL Attention tile's slot-1
         // and slot-2 inputs (which are cache aliases in the decode
         // flow). Prefill uses `AttentionPrefillContiguousImpl`.
+        //
+        // Role-agnostic constraint stays at `{1, 1}` (M=1 decode).
+        // Under `ForwardRole::Decode`, [`workload_constraint_for_role`]
+        // widens to `{1, MAX}` — the kernel correctly handles batched
+        // decode (all q_lens == 1) because each "token" attends over
+        // its own per-sequence KV cache history. See Wave F/1.5 for
+        // the standalone verification at NUM_TOKENS ∈ {1,2,4,8}.
         WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
+    }
+
+    fn workload_constraint_for_role(
+        &self,
+        role: crate::solver::ForwardRole,
+    ) -> WorkloadConstraint {
+        match role {
+            crate::solver::ForwardRole::Decode
+            | crate::solver::ForwardRole::Prefill => {
+                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
+            }
+        }
+    }
+
+    fn accepts_role(&self, _role: crate::solver::ForwardRole) -> bool {
+        true
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
@@ -8483,6 +8964,15 @@ impl Implementation for AttentionPrefillContiguousImpl {
         }
     }
 
+    fn accepts_role(&self, role: crate::solver::ForwardRole) -> bool {
+        // Prefill-only: the kernel reads contiguous K/V (not paged
+        // cache) and applies causal masking between new tokens.
+        // Batched decode (all q_lens == 1) has no new-token K/V to
+        // attend over beyond the current token's own row, so this
+        // kernel would produce wrong output on decode-shaped batches.
+        matches!(role, crate::solver::ForwardRole::Prefill)
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
         if !attention_has_kv_cache_extern(fuf, seed) {
@@ -8756,6 +9246,23 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 
+    fn workload_constraint_for_role(
+        &self,
+        role: crate::solver::ForwardRole,
+    ) -> WorkloadConstraint {
+        // Decode-only mirror of `AttentionViaCacheImpl`.
+        match role {
+            crate::solver::ForwardRole::Decode => {
+                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
+            }
+            crate::solver::ForwardRole::Prefill => self.workload_constraint(),
+        }
+    }
+
+    fn accepts_role(&self, role: crate::solver::ForwardRole) -> bool {
+        matches!(role, crate::solver::ForwardRole::Decode)
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
         if !attention_has_kv_cache_extern(fuf, seed) {
@@ -8879,6 +9386,11 @@ impl Implementation for SlidingAttentionPrefillContiguousImpl {
             min: 2,
             max: u32::MAX,
         }
+    }
+
+    fn accepts_role(&self, role: crate::solver::ForwardRole) -> bool {
+        // Prefill-only mirror of `AttentionPrefillContiguousImpl`.
+        matches!(role, crate::solver::ForwardRole::Prefill)
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
@@ -9106,7 +9618,7 @@ fn gemm_mnk(ctx: &CostCtx, node: &crate::fuf::FufNode) -> Option<(u32, u32, u32)
 /// input's last dim (in_features). Available to `fan_out` impls so
 /// they can bake weight shape into the emitted `Instruction` for the
 /// runtime shape-assert that guards against loader/codegen drift.
-fn gemm_nk_from_fuf(
+pub(crate) fn gemm_nk_from_fuf(
     fuf: &Fuf,
     node: &crate::fuf::FufNode,
     bounds: &BTreeMap<String, u64>,
@@ -14089,6 +14601,29 @@ impl Implementation for FlashInferAttentionDecodeImpl {
         }
     }
 
+    fn workload_constraint_for_role(
+        &self,
+        role: crate::solver::ForwardRole,
+    ) -> WorkloadConstraint {
+        // Decode-role: FI's decode plan cache is keyed by
+        // max_seqlen_q and handles any num_tokens at max_seqlen_q=1,
+        // which is exactly the batched-decode shape. Widen to
+        // `{1, MAX}` under Decode so FI Decode participates in the
+        // batched-decode solve alongside the FA2 AttentionViaCache
+        // path and the TK peer.
+        match role {
+            crate::solver::ForwardRole::Decode => WorkloadConstraint::NumTokensAndSkRange {
+                num_tokens: (1, u32::MAX),
+                sk_bucket: (FI_SK_BUCKET_MIN, FI_SK_BUCKET_MAX),
+            },
+            crate::solver::ForwardRole::Prefill => self.workload_constraint(),
+        }
+    }
+
+    fn accepts_role(&self, role: crate::solver::ForwardRole) -> bool {
+        matches!(role, crate::solver::ForwardRole::Decode)
+    }
+
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         // Decoder-only — see `AttentionViaCacheImpl::matches` for rationale.
         if !attention_has_kv_cache_extern(fuf, seed) {
@@ -14218,6 +14753,15 @@ impl Implementation for FlashInferAttentionPrefillImpl {
             num_tokens: (2, u32::MAX),
             sk_bucket: (FI_SK_BUCKET_MIN, FI_SK_BUCKET_MAX),
         }
+    }
+
+    fn accepts_role(&self, role: crate::solver::ForwardRole) -> bool {
+        // FI's prefill plan is specialised for max_seqlen_q > 1 — it
+        // still reads paged KV but adds causal masking between new
+        // tokens, which the decode plan omits. Gate strictly to the
+        // prefill role; the decode-role solve uses the Decode peer
+        // above.
+        matches!(role, crate::solver::ForwardRole::Prefill)
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
@@ -15831,6 +16375,8 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(16)]],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         let imp = CutlassGemmImpl {
             tile_m: 128,
@@ -15978,6 +16524,8 @@ mod tests {
                 inputs: vec![],
                 outputs: vec![vec![Dim::Lit(1), Dim::Lit(128)]],
             }],
+
+            barrier_meta: Default::default(),
         };
         let mi = MatchInfo {
             claimed_tiles: vec![t0],
@@ -16218,6 +16766,7 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
                 },
             ],
+            barrier_meta: Default::default(),
         }
     }
 
@@ -16269,6 +16818,7 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
                 },
             ],
+            barrier_meta: Default::default(),
         }
     }
 
@@ -16394,6 +16944,7 @@ mod tests {
                     outputs: vec![vec![Dim::Lit(1), Dim::Lit(256000)]],
                 },
             ],
+            barrier_meta: Default::default(),
         }
     }
 
@@ -16674,6 +17225,8 @@ mod tests {
         // Impls reject.
         let fuf3 = Fuf {
             nodes: vec![attention_node(three_arg_encoder_inputs())],
+
+            barrier_meta: Default::default(),
         };
         let seed = TileId(0);
         let enc = EncoderAttentionImpl;
@@ -16701,6 +17254,8 @@ mod tests {
         // EncoderAttentionImpl rejects.
         let fuf5 = Fuf {
             nodes: vec![attention_node(five_arg_decoder_inputs())],
+
+            barrier_meta: Default::default(),
         };
         let seed = TileId(0);
         let enc = EncoderAttentionImpl;
@@ -16799,6 +17354,7 @@ mod tests {
                     outputs: vec![hidden],
                 },
             ],
+            barrier_meta: Default::default(),
         }
     }
 
@@ -16897,6 +17453,8 @@ mod tests {
                     outputs: vec![hidden],
                 },
             ],
+
+            barrier_meta: Default::default(),
         };
         let profile = crate::target::from_profile_def(&ferrite_cuda_targets::L4_SM89);
         assert!(
@@ -17346,7 +17904,7 @@ impl Implementation for MmEmbedSpliceImpl {
     }
 
     fn opcode_shape(&self) -> OpcodeShape {
-        OpcodeShape::new("SpliceMmEmbeds", vec![("slot", syn::parse_quote!(u32))])
+        OpcodeShape::new("TkSpliceMmEmbeds", vec![("slot", syn::parse_quote!(u32))])
     }
 
     fn fan_out(
@@ -17364,7 +17922,262 @@ impl Implementation for MmEmbedSpliceImpl {
             other => panic!("MmEmbedSplice: input 0 must be a Tile (got {other:?})"),
         };
         let slot_idx = slots.of(input_id, input_slot);
-        Some(vec![Instruction::SpliceMmEmbeds(slot_idx)])
+        // ff-mega-codegen: keep the `TkSpliceMmEmbeds` variant (TK
+        // megakernel-targeted), now constructed typed at proc-macro
+        // time per the typed-fanout migration.
+        Some(vec![Instruction::TkSpliceMmEmbeds(slot_idx)])
+    }
+}
+
+// ── BarrierSignalImpl / BarrierWaitImpl ──────────────────────────
+//
+// Mega-kernel cross-CTA synchronization. Inserted by
+// `mega_lowering::insert_mega_barriers` as paired nodes on every
+// producer→consumer edge whose producer and consumer CTAs don't
+// already sit on a common stream/kernel boundary. Each edge gets a
+// dense `edge_idx` baked into a runtime `barriers[num_edges]` i32
+// gmem counter array allocated in `emit_mega_forward_fn`.
+//
+// `BarrierSignalImpl`: producer-side atomic-add. The emitted mega
+// `.cu` calls `ferrite::barrier_signal(&barriers[edge_idx], 1)` from
+// each producer CTA's storer role.
+//
+// `BarrierWaitImpl`: consumer-side spin. The emitted mega `.cu`
+// calls `ferrite::barrier_wait(&barriers[edge_idx], expected_count)`
+// from each consumer CTA's loader role before any gmem read of the
+// shared activation slot.
+//
+// Both ops are pure control-flow with `output_alias = Some(input)` —
+// shape-aware coloring collapses the output to the input's slot
+// (zero extra storage). The host-interpreter FORWARD_TABLE includes
+// them as no-op `Instruction::BarrierSignal` / `Instruction::BarrierWait`
+// variants because the host path's stream-ordered launches already
+// subsume the barrier; the mega codegen reads the same SFUF and
+// emits the actual cross-CTA primitives.
+//
+// Never inserted at `FERRITE_MEGA=0` builds — `insert_mega_barriers`
+// is a no-op in that mode, so the Impl's `matches()` never fires and
+// the solver is free of these nodes.
+
+#[derive(Debug, Default)]
+pub struct BarrierSignalImpl;
+
+impl Implementation for BarrierSignalImpl {
+    fn name(&self) -> &'static str {
+        "barrier_signal"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::BarrierSignal || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        // Pure sync — negligible cost (single atomicAdd per CTA).
+        // Kept at 0 so the DP doesn't second-guess its inclusion; the
+        // lowering pass is the sole producer, so cost-driven
+        // substitution doesn't apply.
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_outputs.len()]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Output aliases the single input — pure sync, no data motion.
+        let bs_id = claimed_tiles[0];
+        let node = fuf.get(bs_id);
+        let input_src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((bs_id, 0), input_src)]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        // Single field: the dense `edge_idx` into `barriers[num_edges]`.
+        // `count=1` is baked at the kernel-codegen level (each producer
+        // CTA contributes a single atomicAdd of 1).
+        OpcodeShape::new("TkBarrierSignal", vec![("edge", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        _slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let bs_id = m.claimed_tiles[0];
+        let meta = fuf.barrier_meta.get(&bs_id).copied().unwrap_or_else(|| {
+            panic!(
+                "BarrierSignalImpl::fan_out: no barrier_meta for tile {:?}; \
+                 insert_mega_barriers must populate Fuf::barrier_meta for \
+                 every BarrierSignal node it inserts",
+                bs_id
+            )
+        });
+        let edge = meta.edge_idx;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("TkBarrierSignal", proc_macro2::Span::call_site()),
+            vec![quote! { #edge }],
+        )])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BarrierWaitImpl;
+
+impl Implementation for BarrierWaitImpl {
+    fn name(&self) -> &'static str {
+        "barrier_wait"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::BarrierWait || node.inputs.len() != 1 {
+            return None;
+        }
+        let input_id = match &node.inputs[0] {
+            FufInput::Tile { id, .. } => *id,
+            _ => return None,
+        };
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: vec![input_id],
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_outputs.len()]
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        let bw_id = claimed_tiles[0];
+        let node = fuf.get(bw_id);
+        let input_src = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => Some((*id, *slot)),
+            _ => None,
+        };
+        vec![((bw_id, 0), input_src)]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        // `edge` indexes `barriers[num_edges]`; `count` is the
+        // producer's native CTA count — how many signals the wait
+        // must observe before unblocking.
+        OpcodeShape::new(
+            "TkBarrierWait",
+            vec![
+                ("edge", syn::parse_quote!(u32)),
+                ("count", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        _slots: &SlotMap,
+    ) -> Option<Vec<OpInstance>> {
+        let bw_id = m.claimed_tiles[0];
+        let meta = fuf.barrier_meta.get(&bw_id).copied().unwrap_or_else(|| {
+            panic!(
+                "BarrierWaitImpl::fan_out: no barrier_meta for tile {:?}; \
+                 insert_mega_barriers must populate Fuf::barrier_meta for \
+                 every BarrierWait node it inserts",
+                bw_id
+            )
+        });
+        let edge = meta.edge_idx;
+        let count = meta.expected_count;
+        Some(vec![OpInstance::new(
+            syn::Ident::new("TkBarrierWait", proc_macro2::Span::call_site()),
+            vec![quote! { #edge }, quote! { #count }],
+        )])
     }
 }
 

@@ -356,6 +356,19 @@ pub enum Instruction {
     /// `ForwardCtx::embed_patches` is empty (text-only batches) —
     /// one extra slot check per forward pass, cost negligible.
     SpliceMmEmbeds(u32),
+    /// Mega-kernel cross-CTA barrier producer-side signal:
+    /// `(edge_idx,)`. Inserted by `insert_mega_barriers` at the
+    /// producer's CTA grid; in the host interpreter this is a no-op
+    /// (stream ordering already provides the guarantee). The mega
+    /// codegen reads the same SFUF and emits
+    /// `ferrite::barrier_signal(&barriers[edge_idx], 1)` from each
+    /// producer CTA's storer role.
+    BarrierSignal(u32),
+    /// Mega-kernel cross-CTA barrier consumer-side wait:
+    /// `(edge_idx, expected_count)`. Host-side no-op; the mega
+    /// codegen emits `ferrite::barrier_wait(&barriers[edge_idx],
+    /// expected_count)` at the consumer CTA's loader role.
+    BarrierWait(u32, u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
     FusedAddRmsNorm(u32, u32, u32),
@@ -380,6 +393,12 @@ pub enum Instruction {
     /// alias semantics as `FusedAddRmsNorm`); the Gemm output is a
     /// fresh OwnedTensor.
     CutlassFusedAddRmsNormGemm(u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    /// Gemma2 lm_head: (Add, ScalarOffsetRmsNorm, Gemm) 4-tile fusion.
+    /// Fields: (delta_slot, residual_slot, out_slot, layer, offset,
+    ///          tile_m, tile_n, stages, n, k). Weight resolution lives
+    ///          on the per-arch `WeightAccessors` impl (RmsNorm + Linear
+    ///          slots at this `op_idx`).
+    CutlassFusedAddScalarOffsetRmsNormGemm(u32, u32, u32, u32, f32, u32, u32, u32, u32, u32),
     Gemm(u32, u32, u32, u32, u32),
     /// cuBLAS-side peer to `CutlassGemmAdd`. cuBLAS GEMM produces a
     /// delta; `add_inplace` then folds it into the residual buffer.
@@ -551,6 +570,59 @@ pub enum Instruction {
     Fp8FusedGateUpGeluMul(u32, u32, u32),
     Fp8FusedQkvRopeCache(u32, u32, u32),
     Fp8FusedQkvRopePrefill(u32, u32, u32, u32, u32),
+    // ── TK megakernel instructions ───────────────────────────────────
+    // These map 1-to-1 to the TK warp-role ops in the fused CUDA
+    // kernel. The mega executor compiles them into a single kernel;
+    // the host interpreter delegates each to its non-TK peer so the
+    // tape is always executable regardless of which executor claimed it.
+    // Weight resolution lives on the per-arch `WeightAccessors` impl
+    // (post-migration); each variant carries no `WtFn`/`CosSinFn`
+    // field — the typed pipeline records weight slots out-of-band.
+    TkEmbed(u32),
+    TkScalarMul(u32, u32, f32),
+    TkRmsNorm(u32, u32, u32),
+    TkGemm(u32, u32, u32, u32, u32),
+    TkFusedAddRmsNorm(u32, u32, u32),
+    TkFusedQkvRopeCache(u32, u32, u32, bool, bool),
+    TkAttentionViaCache(u32, u32, u32, bool),
+    /// Sliding-window variant of `TkAttentionViaCache`. The extra `u32`
+    /// field carries the compile-time `window_size_left` value (emitted
+    /// as a literal template argument to `attention_partial` by the mega
+    /// codegen). The host interpreter ignores `window_size_left` and
+    /// delegates to `SlidingAttentionViaCache.eval()` which reads the
+    /// window size from the model config at runtime — numerically
+    /// equivalent for the non-mega path.
+    TkSlidingAttentionViaCache(u32, u32, u32, bool, u32),
+    TkFusedGateUpSiluMul(u32, u32, u32),
+    TkFusedGateUpGeluMul(u32, u32, u32),
+    /// (in_slot, residual_slot, layer, n, k, k_offset, k_full)
+    /// k_offset/k_full enable 4-chunk down_proj splitting: loads W[:,k_offset:k_offset+k]
+    /// where W has row stride k_full (the full weight matrix K dimension).
+    TkGemmAdd(u32, u32, u32, u32, u32, u32, u32),
+    /// (Add, RmsNorm, Gemm) 3-tile lm_head fusion. Maps to
+    /// `lm_head_fused_residual` in `lm_head.cuh`: fused residual-add +
+    /// final rms_norm + lm_head GEMV in a single 4-warp-role TK body.
+    /// Writes residual_slot (updated skip connection) + out_slot (logits).
+    /// Fields: (delta_slot, residual_slot, out_slot, layer, n, k).
+    TkFusedAddRmsNormGemm(u32, u32, u32, u32, u32, u32),
+    /// TK peer of `ScalarOffsetRmsNorm`. Maps to `rms_norm_offset.cuh`.
+    /// Fields: (in_slot, out_slot, layer, offset).
+    TkScalarOffsetRmsNorm(u32, u32, u32, f32),
+    /// TK peer of `FusedAddRmsNormWithOffset`. Maps to `fused_add_rms_norm_offset.cuh`.
+    /// Fields: (delta_slot, residual_slot, layer, offset).
+    TkFusedAddRmsNormWithOffset(u32, u32, u32, f32),
+    /// TK peer of `TanhSoftCap`. Storer-only in-place logit softcap.
+    /// Fields: (in_slot, out_slot, n_vocab).
+    TkTanhSoftCap(u32, u32, u32),
+    /// (Add, ScalarOffsetRmsNorm, Gemm) 4-tile lm_head fusion for Gemma2.
+    /// Maps to `lm_head_fused_residual_offset` in `lm_head.cuh`.
+    /// Fields: (delta_slot, residual_slot, out_slot, layer, offset, n, k).
+    TkFusedAddScalarOffsetRmsNormGemm(u32, u32, u32, u32, f32, u32, u32),
+    /// Barrier ops: no-op in the host interpreter (sequential execution
+    /// needs no cross-warp synchronisation).
+    TkBarrierSignal(u32),
+    TkBarrierWait(u32, u32),
+    TkSpliceMmEmbeds(u32),
     /// Re-run the next `body_len` instructions `count` times.
     Loop(u32, u32),
     /// `tiles[dst] = Some(View(src))`.
@@ -842,6 +914,14 @@ impl Instruction {
                 let out = group.all_gather_last_dim(v, &mut ctx.device.caching);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
+            // Mega-kernel cross-CTA barriers. Host-side: no-op — each
+            // `Instruction::eval` is its own `cudaStreamLaunch`, and the
+            // stream boundary already enforces producer-before-consumer
+            // ordering without any gmem flag. The mega codegen consumes
+            // the same SFUF and emits the actual `ferrite::barrier_signal`
+            // / `ferrite::barrier_wait` calls inline in the fused `.cu`.
+            Instruction::BarrierSignal(_edge) => {}
+            Instruction::BarrierWait(_edge, _count) => {}
             Instruction::ScalarMul(in_slot, out_slot, scale) => {
                 let owned = take_owned(ctx.tiles, in_slot);
                 unsafe {
@@ -1015,6 +1095,30 @@ impl Instruction {
                     cutlass::CutlassTile::new(tile_m, tile_n, stages),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::CutlassFusedAddScalarOffsetRmsNormGemm(
+                delta_slot, residual_slot, out_slot, layer, offset,
+                tile_m, tile_n, stages, n, k,
+            ) => unsafe {
+                let layer = ctx.layer_offset + layer;
+                let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
+                let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
+                let nw = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
+                let gw = ctx.wm.linear_at(bucket, op_idx, 0, layer);
+                assert_weight_shape(
+                    "CutlassFusedAddScalarOffsetRmsNormGemm",
+                    gw.dense_weight(), n, k, tp_active(ctx),
+                );
+                let (normed_view, _) = kernels::fused_add_rms_norm_inplace_with_offset(
+                    *delta, *residual, nw.weight, nw.eps, offset,
+                    ctx.device.compute_stream,
+                );
+                let out = cutlass::cutlass_gemm(
+                    normed_view, gw.dense_weight(),
+                    cutlass::CutlassTile::new(tile_m, tile_n, stages),
+                    &mut ctx.device.caching, ctx.device.compute_stream,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
@@ -2900,6 +3004,89 @@ impl Instruction {
                 ctx.tiles[k_out_slot as usize] = Some(TileEntry::Owned(k));
                 ctx.tiles[v_out_slot as usize] = Some(TileEntry::Owned(v_out));
             }
+            Instruction::TkEmbed(out_slot) => unsafe {
+                Instruction::Embed(out_slot).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkScalarMul(in_slot, out_slot, scale) => unsafe {
+                Instruction::ScalarMul(in_slot, out_slot, scale).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkRmsNorm(in_slot, out_slot, layer) => unsafe {
+                Instruction::RmsNorm(in_slot, out_slot, layer).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkGemm(in_slot, out_slot, layer, n, k) => unsafe {
+                Instruction::Gemm(in_slot, out_slot, layer, n, k).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkFusedAddRmsNorm(delta_slot, residual_slot, layer) => unsafe {
+                Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkFusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => unsafe {
+                Instruction::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkAttentionViaCache(in_slot, out_slot, layer, interleaved) => unsafe {
+                Instruction::AttentionViaCache(in_slot, out_slot, layer, interleaved)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkSlidingAttentionViaCache(in_slot, out_slot, layer, interleaved, _window) => unsafe {
+                Instruction::SlidingAttentionViaCache(in_slot, out_slot, layer, interleaved)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkFusedGateUpSiluMul(in_slot, out_slot, layer) => unsafe {
+                Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkFusedGateUpGeluMul(in_slot, out_slot, layer) => unsafe {
+                Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkGemmAdd(in_slot, residual_slot, layer, n, k, k_offset, k_full) => unsafe {
+                // Host interpreter: chunk 0 runs the full down_proj (k=k_full).
+                // Chunks k_offset>0 are no-ops: chunk 0 already accumulated the full K.
+                let _ = k;
+                if k_offset == 0 {
+                    Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k_full)
+                        .eval(ctx, bucket, op_idx);
+                }
+            },
+            Instruction::TkFusedAddRmsNormGemm(
+                delta_slot, residual_slot, out_slot, layer, n, k,
+            ) => unsafe {
+                // Host interpreter: decompose into FusedAddRmsNorm + Gemm.
+                Instruction::CutlassFusedAddRmsNormGemm(
+                    delta_slot, residual_slot, out_slot, layer,
+                    // dummy CUTLASS tile dims — host path uses cuBLAS, ignores them
+                    16, 64, 3,
+                    n, k,
+                ).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => unsafe {
+                Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkFusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => unsafe {
+                Instruction::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset)
+                    .eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkTanhSoftCap(in_slot, out_slot, _n_vocab) => unsafe {
+                Instruction::TanhSoftCap(in_slot, out_slot).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkFusedAddScalarOffsetRmsNormGemm(
+                delta_slot, residual_slot, out_slot, layer, offset, n, k,
+            ) => unsafe {
+                // Host interpreter: FusedAddRmsNormWithOffset + Gemm.
+                // The offset is applied via the pre-norm step.
+                Instruction::FusedAddRmsNormWithOffset(
+                    delta_slot, residual_slot, layer, offset,
+                ).eval(ctx, bucket, op_idx);
+                // After fused add+norm, delta_slot holds the normed output.
+                Instruction::Gemm(delta_slot, out_slot, 0, n, k).eval(ctx, bucket, op_idx);
+            },
+            Instruction::TkBarrierSignal(_) | Instruction::TkBarrierWait(_, _) | Instruction::TkSpliceMmEmbeds(_) => {
+                // No-op in the host interpreter: sequential execution needs no
+                // cross-warp barriers, and mm-embed splices are handled by the
+                // mega executor only.
+            },
             Instruction::Loop(_, _) => {
                 unreachable!("Instruction::Loop should be handled by run(), not eval()");
             }
@@ -2908,6 +3095,12 @@ impl Instruction {
             }
             Instruction::Free(slot) => {
                 ctx.tiles[slot as usize] = None;
+            }
+            Instruction::BarrierSignal(_) | Instruction::BarrierWait(_, _) => {
+                // Mega-only cross-CTA sync. On the host interpreter each
+                // Instruction::eval is its own cudaStreamLaunch, so the
+                // stream boundary already provides the ordering guarantee
+                // — these ops are no-ops here.
             }
         }
     }

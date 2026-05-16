@@ -23,11 +23,11 @@ fn cuda_link() {
 
     println!("cargo:rustc-link-search={}", cache_str);
 
-    // Historical megakernel .a (retired with the pre-Ferrite TK
-    // runtime). Kept as a conditional link so rebuilding against a
-    // cache that still contains `libmegakernels.a` doesn't fail the
-    // linker; present builds skip the library entirely.
+    // Megakernel .a: conditionally linked when ferrite-cuda-builder has
+    // compiled the ferrite TK megakernels. Trigger a rerun whenever the
+    // .a appears or disappears so the link directive tracks reality.
     let mk_lib = std::path::Path::new(&cache_str).join("libmegakernels.a");
+    println!("cargo:rerun-if-changed={}", mk_lib.display());
     if mk_lib.exists() {
         println!("cargo:rustc-link-lib=static=megakernels");
     }

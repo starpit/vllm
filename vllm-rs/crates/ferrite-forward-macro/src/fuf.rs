@@ -80,10 +80,36 @@ pub struct FufNode {
     pub outputs: Vec<Shape>,
 }
 
+/// Per-Barrier-node metadata attached to `Fuf::barrier_meta`.
+///
+/// `edge_idx` is the dense index into the runtime `barriers[]` gmem
+/// counter array allocated in `emit_mega_forward_fn`. Each
+/// producer→consumer DAG edge that needs cross-CTA synchronization
+/// gets a unique `edge_idx`; the `BarrierSignal` node at the producer
+/// side and the `BarrierWait` node at the consumer side share the
+/// same index.
+///
+/// `expected_count` is the producer's native CTA count — how many
+/// atomic-adds the consumer's `barrier_wait` must observe before
+/// unblocking. Baked as a `u32` literal on the emitted
+/// `Instruction::BarrierWait`; unused by `BarrierSignal` (each of
+/// its CTAs contributes a single add of 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarrierMeta {
+    pub edge_idx: u32,
+    pub expected_count: u32,
+}
+
 /// The FUF for one model specialization.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Fuf {
     pub nodes: Vec<FufNode>,
+    /// Per-node barrier metadata, populated by
+    /// [`crate::mega_lowering::insert_mega_barriers`] for every
+    /// `OpKind::BarrierSignal` / `OpKind::BarrierWait` node it
+    /// inserts. Empty for non-mega builds or before the mega-lowering
+    /// pass runs. Keyed by the inserted node's `TileId`.
+    pub barrier_meta: HashMap<TileId, BarrierMeta>,
 }
 
 impl Fuf {
@@ -183,7 +209,10 @@ pub fn unroll(cfg: &Cfg, inferred: &Inferred) -> Result<Fuf, UnrollError> {
         loop_vars: HashMap::new(),
     };
     u.walk(cfg.entry)?;
-    Ok(Fuf { nodes: u.nodes })
+    Ok(Fuf {
+        nodes: u.nodes,
+        barrier_meta: HashMap::new(),
+    })
 }
 
 struct Unroller<'a> {

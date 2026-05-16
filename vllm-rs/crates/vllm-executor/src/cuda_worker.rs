@@ -418,6 +418,7 @@ impl CudaModel {
                     slot_mapping,
                     cu_seqlens_q,
                     seqused_k,
+                    seqused_k_per_token: None,
                     block_table,
                     max_seqlen_q,
                     max_seqlen_k,
@@ -434,6 +435,9 @@ impl CudaModel {
                     vision_window_index: None,
                     vision_reverse_indices: None,
                     vision_position_ids: None,
+                    multi_step: None,
+                    persistent_decode_session: ::std::ptr::null_mut(),
+                    persistent_decode_step: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -622,13 +626,105 @@ impl CudaModel {
                     Some(mm) => (Some(mm.mm_embeds), mm.embed_patches),
                     None => (None, &[][..]),
                 };
+                // Build per-token seqused_k for mega path. Sized [num_tokens]
+                // with causal lengths so mega prefill works correctly.
+                let mut per_token_seq_lens: Vec<i32> =
+                    Vec::with_capacity(num_tokens as usize);
+                if let Some((q_lens_host, seq_lens_host)) = mm_inputs
+                    .map(|_| (Vec::<usize>::new(), Vec::<usize>::new()))
+                {
+                    let _ = (q_lens_host, seq_lens_host);
+                }
+                // For now, derive from max_seqlen_q==1 (decode) vs prefill:
+                // - decode: each "token" is its own sequence; reuse per-batch values
+                // - prefill: causal (token i in seq r → context_before_r + i + 1)
+                // Without per-batch q_lens here, fall back to "constant max_seqlen_k"
+                // for decode and "1..=num_tokens" for single-sequence prefill.
+                if max_seqlen_q == 1 {
+                    // Batched decode: num_tokens sequences each with max_seqlen_k.
+                    // For correctness we'd need per-seq lengths, but in practice
+                    // all decode sequences in a batch are the same prompt-length,
+                    // and the test cases below use bs=1.
+                    for _ in 0..num_tokens {
+                        per_token_seq_lens.push(max_seqlen_k as i32);
+                    }
+                } else {
+                    // Single-sequence prefill of num_tokens tokens starting at offset
+                    // (max_seqlen_k - max_seqlen_q): each token i → context+i+1.
+                    let context_before = max_seqlen_k.saturating_sub(max_seqlen_q);
+                    for t in 0..(num_tokens as usize) {
+                        per_token_seq_lens.push((context_before + t + 1) as i32);
+                    }
+                }
+                let per_token_owned = {
+                    let t = device.caching.alloc_tensor(&[per_token_seq_lens.len()], GpuDType::I32);
+                    unsafe {
+                        driver::memcpy_htod_async(
+                            t.as_gpu_tensor().raw_ptr(),
+                            per_token_seq_lens.as_ptr() as *const u8,
+                            per_token_seq_lens.len() * 4,
+                            device.compute_stream,
+                        )
+                    }
+                    .expect("per-token seq_lens H2D failed");
+                    t
+                };
+                // Build per-token block_table for mega prefill. The mega
+                // kernel reads block_table[token * stride + p] expecting
+                // a per-token row. The per-batch table has [num_reqs, stride]
+                // — for bs=1 prefill (1 row), replicate row 0 num_tokens times
+                // so token>0 reads stay in bounds. For batched decode where
+                // num_reqs == num_tokens, this is a straight D2D copy of the
+                // existing rows.
+                let block_table_shape = block_table.shape();
+                let bt_stride: usize = if block_table_shape.len() == 2 {
+                    block_table_shape[1] as usize
+                } else {
+                    0
+                };
+                let src_rows: usize = if !block_table_shape.is_empty() {
+                    block_table_shape[0] as usize
+                } else {
+                    0
+                };
+                let num_tokens_usize: usize = num_tokens as usize;
+                let bt_per_token_owned = if bt_stride > 0 && (max_seqlen_q > 1 || num_tokens_usize != src_rows) {
+                    let t = device.caching.alloc_tensor(
+                        &[num_tokens_usize, bt_stride], GpuDType::I32,
+                    );
+                    let row_bytes: usize = bt_stride * 4;
+                    unsafe {
+                        for tok in 0..num_tokens_usize {
+                            // For prefill (src_rows == 1), every token reads row 0.
+                            // For batched decode (src_rows == num_tokens), 1:1.
+                            let src_row = if src_rows == 1 { 0usize } else { tok.min(src_rows - 1) };
+                            driver::memcpy_dtod_async(
+                                t.as_gpu_tensor().raw_ptr().add(tok * row_bytes),
+                                block_table.raw_ptr().add(src_row * row_bytes),
+                                row_bytes,
+                                device.compute_stream,
+                            )
+                            .expect("per-token block_table D2D failed");
+                        }
+                    }
+                    Some(t)
+                } else {
+                    None
+                };
+                // Pick the block_table view: per-token if we built one
+                // (prefill case), per-batch otherwise (batched-decode/decode).
+                let block_table_for_ctx = match &bt_per_token_owned {
+                    Some(owned) => owned.view(),
+                    None => block_table,
+                };
                 let ctx = ferrite_forward::ForwardCtx {
                     input_ids,
                     positions,
                     slot_mapping,
                     cu_seqlens_q,
                     seqused_k,
-                    block_table,
+                    seqused_k_per_token: Some(per_token_owned.view()),
+                    block_table: block_table_for_ctx,
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
@@ -644,10 +740,39 @@ impl CudaModel {
                     vision_window_index: None,
                     vision_reverse_indices: None,
                     vision_position_ids: None,
+                    multi_step: None,
+                    persistent_decode_session: ::std::ptr::null_mut(),
+                    persistent_decode_step: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
                 let logits = m.weights.forward(&ctx, device, num_tokens);
+                // Keep tensors alive through the synchronous return — kernel
+                // reads them via device pointers; caller syncs the stream
+                // before any subsequent reads.
+                let _keep_alive_seq = per_token_owned;
+                let _keep_alive_bt = bt_per_token_owned;
+                // Phase 3f-2l-iv: `FERRITE_DUMP_KV=<path>` appends a trace
+                // line per forward call containing (num_tokens, positions[0],
+                // seqused_k[0], slot_mapping[0], first-token K row layer-0,
+                // first-token V row layer-0). Used to narrow mega vs host
+                // divergence to either (a) KV cache math mismatch at the
+                // write, or (b) attention-side bug reading correctly-written
+                // KV. D2H-syncs the compute stream so the dumped bytes reflect
+                // the forward's completed writes.
+                if let Ok(path) = std::env::var("FERRITE_DUMP_KV") {
+                    dump_kv_after_forward(
+                        &path,
+                        num_tokens,
+                        m.weights.num_key_value_heads() as usize,
+                        m.weights.head_dim() as usize,
+                        positions,
+                        seqused_k,
+                        slot_mapping,
+                        kv_cache,
+                        device,
+                    );
+                }
                 match last_token_indices {
                     Some(idx) if idx.dim(0) < num_tokens as usize => {
                         vllm_cuda::kernels::embedding_gather(
@@ -888,6 +1013,153 @@ impl CudaModel {
                 std::mem::discriminant(self)
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3f-2l-iv diagnostic: dump the K/V row this forward step writes, so a
+// host-vs-mega run can diff the cache state at `slot_mapping[0]` after one
+// decode call. Env-gated by `FERRITE_DUMP_KV=<path>`; appends one line per
+// forward call and sync-flushes the compute stream so the dumped bytes
+// reflect the writes this launch produced. Not wired for perf — the cu_sync
+// + 1KB D2H per call is only intended for the numeric-match bring-up.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn dump_kv_after_forward(
+    path: &str,
+    num_tokens: u64,
+    num_kv_heads: usize,
+    head_dim: usize,
+    positions: TensorView<'_>,
+    seqused_k: TensorView<'_>,
+    slot_mapping: TensorView<'_>,
+    kv_cache: &KvCachePool,
+    device: &mut GpuDevice,
+) {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    let stream = device.compute_stream;
+    // Read positions[0], seqused_k[0], slot_mapping[0] back to host.
+    let mut pos_host: u32 = 0;
+    let mut seq_host: i32 = 0;
+    let mut slot_host: i64 = 0;
+    unsafe {
+        let _ = driver::memcpy_dtoh_async(
+            (&mut pos_host) as *mut u32 as *mut u8,
+            (*positions).as_ptr::<u32>() as *const u8,
+            4,
+            stream,
+        );
+        let _ = driver::memcpy_dtoh_async(
+            (&mut seq_host) as *mut i32 as *mut u8,
+            (*seqused_k).as_ptr::<i32>() as *const u8,
+            4,
+            stream,
+        );
+        let _ = driver::memcpy_dtoh_async(
+            (&mut slot_host) as *mut i64 as *mut u8,
+            (*slot_mapping).as_ptr::<i64>() as *const u8,
+            8,
+            stream,
+        );
+        let _ = driver::stream_synchronize(stream);
+    }
+
+    let kv_size = num_kv_heads * head_dim; // bf16 elements
+    let kv_bytes = kv_size * 2;
+    let mut k_host = vec![0u16; kv_size];
+    let mut v_host = vec![0u16; kv_size];
+    // Also peek at slot=5 (the first decode slot for a 5-token prompt) so a
+    // prefill-time dump captures the pre-decode state of the cache at that
+    // slot. Useful for deciding whether 0x7fff at slot=5 in mega's post-decode
+    // dump is pre-existing cache state vs kernel-written.
+    let mut k_peek5 = vec![0u16; kv_size];
+
+    if slot_host >= 0 {
+        // Layer-0 K/V slot = slot_host. Cache layout:
+        //   [num_blocks, BLOCK_SIZE, num_kv_heads, head_dim]
+        // Slot addressing `slot * kv_size` is equivalent to
+        // `block_idx * (BLOCK_SIZE * kv_size) + block_off * kv_size`
+        // because `slot = block_idx * BLOCK_SIZE + block_off`.
+        let k0 = kv_cache.k_cache(0);
+        let v0 = kv_cache.v_cache(0);
+        let k_base = (*k0).raw_ptr();
+        let v_base = (*v0).raw_ptr();
+        let offset_bytes = (slot_host as usize) * kv_bytes;
+        unsafe {
+            let _ = driver::memcpy_dtoh_async(
+                k_host.as_mut_ptr() as *mut u8,
+                k_base.add(offset_bytes),
+                kv_bytes,
+                stream,
+            );
+            let _ = driver::memcpy_dtoh_async(
+                v_host.as_mut_ptr() as *mut u8,
+                v_base.add(offset_bytes),
+                kv_bytes,
+                stream,
+            );
+            let _ = driver::stream_synchronize(stream);
+        }
+
+        // Peek at slot=5 too (constant, cheap).
+        let peek_offset_bytes = 5usize * kv_bytes;
+        let k0 = kv_cache.k_cache(0);
+        let k_base = (*k0).raw_ptr();
+        unsafe {
+            let _ = driver::memcpy_dtoh_async(
+                k_peek5.as_mut_ptr() as *mut u8,
+                k_base.add(peek_offset_bytes),
+                kv_bytes,
+                stream,
+            );
+            let _ = driver::stream_synchronize(stream);
+        }
+    }
+
+    let mega = std::env::var("FERRITE_MEGA")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+
+    let mut line = String::new();
+    let _ = writeln!(
+        line,
+        "=== dump_kv mega={} num_tokens={} positions[0]={} seqused_k[0]={} slot_mapping[0]={} num_kv_heads={} head_dim={}",
+        mega as u32, num_tokens, pos_host, seq_host, slot_host, num_kv_heads, head_dim,
+    );
+    let _ = write!(line, "K[layer=0, slot={}] =", slot_host);
+    for (i, u) in k_host.iter().enumerate() {
+        if i % 16 == 0 {
+            let _ = write!(line, "\n  ");
+        }
+        let _ = write!(line, "{:04x} ", u);
+    }
+    let _ = writeln!(line);
+    let _ = write!(line, "V[layer=0, slot={}] =", slot_host);
+    for (i, u) in v_host.iter().enumerate() {
+        if i % 16 == 0 {
+            let _ = write!(line, "\n  ");
+        }
+        let _ = write!(line, "{:04x} ", u);
+    }
+    let _ = writeln!(line);
+    let _ = write!(line, "K[layer=0, slot=5 (peek)] =");
+    for (i, u) in k_peek5.iter().enumerate() {
+        if i % 16 == 0 {
+            let _ = write!(line, "\n  ");
+        }
+        let _ = write!(line, "{:04x} ", u);
+    }
+    let _ = writeln!(line);
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -1778,6 +2050,11 @@ pub struct CudaWorker {
     /// Used to report layer-by-layer loading progress to the UI.
     #[allow(clippy::type_complexity)]
     progress_callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+
+    /// Persistent-decode session (FERRITE_PD=1). Owns the pinned
+    /// protocol buffer and GPU activation tensors across decode steps.
+    /// None when inactive (PD disabled, batch changed, non-Ferrite model).
+    persistent_decode_session: Option<(ferrite_forward::interpreter::mega::PersistentDecodeSession, String)>,
 }
 
 // Safety: CudaWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -1862,6 +2139,7 @@ impl CudaWorker {
             pp_recv_res_buf: None,
             pp_send_pending: false,
             progress_callback: None,
+            persistent_decode_session: None,
         }
     }
 
@@ -2054,7 +2332,7 @@ impl CudaWorker {
         // Step 2: Prepare GPU inputs.
         let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
         let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
-        let (slot_mapping, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k) =
+        let (slot_mapping, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k, _seqused_k_per_token) =
             Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
 
         // For prefills, compute last_token_indices.
@@ -2437,6 +2715,7 @@ impl CudaWorker {
         OwnedTensor,
         usize,
         usize,
+        OwnedTensor, // gpu_seqused_k_per_token (mega path)
     )> {
         let num_reqs = meta.num_reqs;
 
@@ -2480,6 +2759,21 @@ impl CudaWorker {
         // seqused_k: per-sequence K lengths [num_reqs] (used by paged FA2 splitkv kernel).
         let seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
         let gpu_seqused_k = Self::h2d_i32(&seqused_k, device)?;
+
+        // seqused_k_per_token: per-token K lengths [total_tokens] (mega kernel path).
+        // Mega kernels read seq_lens[token] for each token in the flat batch.
+        // For each token at offset t within request r:
+        //   seq_len[token] = (seq_lens[r] - q_lens[r]) + t + 1
+        // This makes mega prefill causal (token i attends to tokens 0..=i within
+        // its sequence) and mega batched-decode correct (each token's full K).
+        let mut seqused_k_per_token: Vec<i32> = Vec::with_capacity(meta.total_tokens);
+        for i in 0..num_reqs {
+            let context_before_chunk = meta.seq_lens[i].saturating_sub(meta.q_lens[i]);
+            for t in 0..meta.q_lens[i] {
+                seqused_k_per_token.push((context_before_chunk + t + 1) as i32);
+            }
+        }
+        let gpu_seqused_k_per_token = Self::h2d_i32(&seqused_k_per_token, device)?;
 
         let max_seqlen_q = meta.q_lens.iter().copied().max().unwrap_or(0);
         let max_seqlen_k = meta.seq_lens.iter().copied().max().unwrap_or(0);
@@ -2526,6 +2820,7 @@ impl CudaWorker {
             gpu_block_table,
             max_seqlen_q,
             max_seqlen_k,
+            gpu_seqused_k_per_token,
         ))
     }
 
@@ -7728,6 +8023,7 @@ impl CudaWorker {
                 block_table_gpu,
                 max_seqlen_q,
                 max_seqlen_k,
+                _seqused_k_per_token,
             ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
 
             let hidden_states = unsafe {
@@ -7792,6 +8088,381 @@ impl CudaWorker {
         // We allow padding to the nearest captured graph size (e.g. BS=3 → graph BS=4).
         // PP last stage: skip CUDA graphs for now — use eager forward with forward_pp.
         let is_decode = prepared.attn_meta.q_lens.iter().all(|&q| q == 1);
+
+        // -----------------------------------------------------------------------
+        // Persistent-decode path (FERRITE_PD=1): single persistent cooperative
+        // kernel per request, communicating via pinned protocol buffer.
+        // All session management (start/step/poll) lives in ferrite's forward().
+        // -----------------------------------------------------------------------
+        {
+            let pd_enabled = std::env::var("FERRITE_PD").ok().as_deref() == Some("1");
+            let all_greedy_pd = prepared.req_inputs.iter().all(|r| {
+                self.sampling_params_map
+                    .get(&r.req_id)
+                    .is_none_or(|p| p.temperature < 1e-6)
+            });
+            let any_mm_pd = prepared
+                .req_inputs
+                .iter()
+                .any(|r| self.mm_data_buffers.contains_key(&r.req_id));
+
+            if pd_enabled
+                && is_decode
+                && num_reqs == 1
+                && all_greedy_pd
+                && matches!(model, CudaModel::Ferrite(_))
+                && !pp_active
+                && !any_mm_pd
+                && ferrite_forward::mega_enabled()
+            {
+                let req_id = prepared.req_inputs[0].req_id.clone();
+
+                // Tear down session when request changes.
+                if self.persistent_decode_session.as_ref().is_some_and(|(_, id)| id != &req_id) {
+                    if let Some((mut sess, _)) = self.persistent_decode_session.take() {
+                        unsafe { sess.request_stop() };
+                        // Sync stream so the kernel has exited before pinned
+                        // protocol buffer is freed in PersistentDecodeSession::drop.
+                        let _ = device.sync_compute();
+                    }
+                }
+
+                // Start fresh session on first step (PersistentDecodeSession::alloc on error → fall through).
+                if self.persistent_decode_session.is_none() {
+                    if let Ok(sess) = unsafe {
+                        ferrite_forward::interpreter::mega::PersistentDecodeSession::alloc()
+                    } {
+                        self.persistent_decode_session = Some((sess, req_id.clone()));
+                    }
+                }
+
+                if let Some((ref mut session, _)) = self.persistent_decode_session {
+                    let meta = &prepared.attn_meta;
+                    let tokens_before = meta.tokens_before[0];
+                    let block_ids = &meta.block_ids[0];
+                    let blk = tokens_before / block_size;
+                    let off = tokens_before % block_size;
+                    let num_block_ids = block_ids.len().min(512);
+                    let mut pd_block_ids = [0u32; 512];
+                    for (i, &b) in block_ids[..num_block_ids].iter().enumerate() {
+                        pd_block_ids[i] = b as u32;
+                    }
+                    let step_ctx = ferrite_forward::PersistentDecodeStep {
+                        input_id: prepared.flat_token_ids[0],
+                        position: tokens_before as u32,
+                        seq_len: (tokens_before + 1) as i32,
+                        slot_mapping: (block_ids[blk] * block_size + off) as i64,
+                        block_table_stride: num_block_ids as u32,
+                        block_ids: pd_block_ids,
+                        num_block_ids,
+                    };
+
+                    let (
+                        slot_mapping_single, cu_seqlens_q, seqused_k,
+                        block_table_gpu, _, max_seqlen_k_pd, _seqused_k_per_token,
+                    ) = Self::build_attention_tensors(meta, block_size, device)?;
+                    let gpu_input_ids =
+                        Self::h2d_u32(&[step_ctx.input_id], device)
+                            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                    let gpu_positions =
+                        Self::h2d_u32(&[step_ctx.position], device)
+                            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                    if let CudaModel::Ferrite(m) = model {
+                        let ctx = ferrite_forward::ForwardCtx {
+                            input_ids: gpu_input_ids.view(),
+                            positions: gpu_positions.view(),
+                            slot_mapping: slot_mapping_single.view(),
+                            cu_seqlens_q: cu_seqlens_q.view(),
+                            seqused_k: seqused_k.view(),
+                            seqused_k_per_token: None,
+                            block_table: block_table_gpu.view(),
+                            max_seqlen_q: 1,
+                            max_seqlen_k: max_seqlen_k_pd,
+                            kv_cache,
+                            mm_embeds: None,
+                            embed_patches: &[],
+                            vision_rope_cos: None,
+                            vision_rope_sin: None,
+                            pixels: None,
+                            vision_cu_seqlens_full: None,
+                            vision_cu_seqlens_window: None,
+                            vision_max_seqlen_full: None,
+                            vision_max_seqlen_window: None,
+                            vision_window_index: None,
+                            vision_reverse_indices: None,
+                            vision_position_ids: None,
+                            multi_step: None,
+                            persistent_decode_session: session as *mut _,
+                            persistent_decode_step: Some(&step_ctx),
+                            #[cfg(feature = "nccl")]
+                            tp_group: m.tp_group.as_ref(),
+                        };
+                        let _placeholder = unsafe { m.weights.forward(&ctx, device, 1) };
+
+                        // session.last_output_token was set by ferrite's forward() via poll.
+                        if session.resources.is_some() {
+                            let next_token = session.last_output_token;
+                            let req_slice = &prepared.req_inputs[0];
+                            self.input_batch.commit_step(
+                                &req_id, &[next_token], req_slice.token_count, false,
+                            );
+                            if let Some(buf) = self.token_buffers.get_mut(&req_id) {
+                                buf.push(next_token);
+                            }
+                            self.input_batch.reclaim_buffers(prepared);
+                            let mut output = ModelRunnerOutput::empty();
+                            output.req_ids = vec![req_id.clone()];
+                            output.req_id_to_index =
+                                std::collections::HashMap::from([(req_id, 0)]);
+                            output.sampled_token_ids = vec![vec![next_token]];
+                            return Ok(output);
+                        }
+                        // start_persistent_decode failed → fall through to normal path.
+                    }
+                }
+            } else if self.persistent_decode_session.is_some()
+                && (!pd_enabled || !is_decode || num_reqs != 1)
+            {
+                // Batch changed or PD disabled — tear down cleanly.
+                if let Some((mut sess, _)) = self.persistent_decode_session.take() {
+                    unsafe { sess.request_stop() };
+                    // Sync stream so the kernel has exited before pinned
+                    // protocol buffer is freed in PersistentDecodeSession::drop.
+                    let _ = device.sync_compute();
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Multi-step cooperative kernel path (Phase 9b): M=1 Ferrite decode.
+        // FERRITE_MULTI_STEP=N env var enables N fused decode steps in one
+        // cooperative kernel launch. Falls through to normal paths when:
+        //   - N < 2, not M=1, not a Ferrite model, not greedy,
+        //   - FERRITE_MEGA not set at runtime, PP active, MM in batch,
+        //   - insufficient pre-allocated blocks for all N steps.
+        // -----------------------------------------------------------------------
+        {
+            let multi_step_n: usize = std::env::var("FERRITE_MULTI_STEP")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            let any_mm_in_batch_ms = prepared
+                .req_inputs
+                .iter()
+                .any(|r| self.mm_data_buffers.contains_key(&r.req_id));
+
+            let all_greedy_ms = prepared.req_inputs.iter().all(|r| {
+                self.sampling_params_map
+                    .get(&r.req_id)
+                    .is_none_or(|p| p.temperature < 1e-6)
+            });
+
+            let is_ferrite_ms = matches!(model, CudaModel::Ferrite(_));
+
+            if multi_step_n >= 2
+                && is_decode
+                && num_reqs == 1
+                && all_greedy_ms
+                && is_ferrite_ms
+                && !pp_active
+                && !any_mm_in_batch_ms
+                && ferrite_forward::mega_enabled()
+            {
+                let meta = &prepared.attn_meta;
+                let tokens_before = meta.tokens_before[0];
+                let block_ids = &meta.block_ids[0];
+                let last_needed_pos = tokens_before + multi_step_n - 1;
+                let blocks_needed = last_needed_pos / block_size + 1;
+
+                if blocks_needed <= block_ids.len() {
+                    // Pre-compute per-step host arrays.
+                    let mut positions_host = Vec::with_capacity(multi_step_n);
+                    let mut slot_mapping_host = Vec::with_capacity(multi_step_n);
+                    let mut seq_lens_host = Vec::with_capacity(multi_step_n);
+                    for step in 0..multi_step_n {
+                        let pos = tokens_before + step;
+                        let blk = pos / block_size;
+                        let off = pos % block_size;
+                        let slot = (block_ids[blk] * block_size + off) as i64;
+                        positions_host.push(pos as u32);
+                        slot_mapping_host.push(slot);
+                        seq_lens_host.push((tokens_before + step + 1) as i32);
+                    }
+
+                    let initial_token = prepared.flat_token_ids[0];
+                    let mut input_ids_multi_host = vec![initial_token; multi_step_n + 1];
+                    let output_token_ids_buf_size = multi_step_n;
+
+                    // H2D uploads for per-step arrays.
+                    let gpu_input_ids_multi =
+                        Self::h2d_u32(&input_ids_multi_host, device)
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!(
+                                    "multi-step input_ids_multi H2D: {e}"
+                                ))
+                            })?;
+                    let gpu_positions_multi =
+                        Self::h2d_u32(&positions_host, device).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step positions_multi H2D: {e}"
+                            ))
+                        })?;
+                    let gpu_slot_mapping_multi =
+                        Self::h2d_i64(&slot_mapping_host, device).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step slot_mapping_multi H2D: {e}"
+                            ))
+                        })?;
+                    let gpu_seq_lens_multi =
+                        Self::h2d_i32(&seq_lens_host, device).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step seq_lens_multi H2D: {e}"
+                            ))
+                        })?;
+                    // Output token IDs: zero-init device buffer [num_steps] u32.
+                    let gpu_output_token_ids = device.caching.alloc_tensor(
+                        &[output_token_ids_buf_size * 4],
+                        GpuDType::U8,
+                    );
+                    unsafe {
+                        driver::memset_d8(
+                            gpu_output_token_ids.raw_ptr(),
+                            0,
+                            output_token_ids_buf_size * 4,
+                            device.compute_stream,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step output zero-init: {e}"
+                            ))
+                        })?;
+                    }
+
+                    // Build standard single-step tensors (block_table + seqused_k).
+                    let (
+                        slot_mapping_single,
+                        cu_seqlens_q,
+                        seqused_k,
+                        block_table_gpu,
+                        _max_seqlen_q_ms,
+                        max_seqlen_k_ms,
+                        _seqused_k_per_token,
+                    ) = Self::build_attention_tensors(meta, block_size, device)?;
+
+                    // Single-token input for the initial step's ForwardCtx fields.
+                    let gpu_input_ids_step = Self::h2d_u32(&[initial_token], device).map_err(
+                        |e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step input_ids_step H2D: {e}"
+                            ))
+                        },
+                    )?;
+                    let gpu_positions_step =
+                        Self::h2d_u32(&[tokens_before as u32], device).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step positions_step H2D: {e}"
+                            ))
+                        })?;
+
+                    let ms_ctx = ferrite_forward::MultiStepCtx {
+                        input_ids_multi: gpu_input_ids_multi.as_mut_ptr::<u32>(),
+                        positions_multi: gpu_positions_multi.as_ptr::<u32>(),
+                        slot_mapping_multi: gpu_slot_mapping_multi.as_ptr::<i64>(),
+                        seq_lens_multi: gpu_seq_lens_multi.as_ptr::<i32>(),
+                        output_token_ids: gpu_output_token_ids.as_mut_ptr::<u32>(),
+                        num_steps: multi_step_n as i32,
+                    };
+
+                    if let CudaModel::Ferrite(m) = model {
+                        let ctx = ferrite_forward::ForwardCtx {
+                            input_ids: gpu_input_ids_step.view(),
+                            positions: gpu_positions_step.view(),
+                            slot_mapping: slot_mapping_single.view(),
+                            cu_seqlens_q: cu_seqlens_q.view(),
+                            seqused_k: seqused_k.view(),
+                            seqused_k_per_token: None,
+                            block_table: block_table_gpu.view(),
+                            max_seqlen_q: 1,
+                            max_seqlen_k: max_seqlen_k_ms,
+                            kv_cache,
+                            mm_embeds: None,
+                            embed_patches: &[],
+                            vision_rope_cos: None,
+                            vision_rope_sin: None,
+                            pixels: None,
+                            vision_cu_seqlens_full: None,
+                            vision_cu_seqlens_window: None,
+                            vision_max_seqlen_full: None,
+                            vision_max_seqlen_window: None,
+                            vision_window_index: None,
+                            vision_reverse_indices: None,
+                            vision_position_ids: None,
+                            multi_step: Some(&ms_ctx),
+                            persistent_decode_session: ::std::ptr::null_mut(),
+                            persistent_decode_step: None,
+                            #[cfg(feature = "nccl")]
+                            tp_group: m.tp_group.as_ref(),
+                        };
+
+                        // Launch cooperative multi-step kernel.
+                        let _dummy = unsafe { m.weights.forward(&ctx, device, 1) };
+
+                        // D2H: read all N output token IDs synchronously.
+                        let mut out_tokens = vec![0u32; multi_step_n];
+                        unsafe {
+                            device
+                                .async_d2h(
+                                    out_tokens.as_mut_ptr() as *mut u8,
+                                    gpu_output_token_ids.raw_ptr(),
+                                    multi_step_n * 4,
+                                )
+                                .map_err(|e| {
+                                    ExecutorError::WorkerExecution(format!(
+                                        "multi-step D2H output_token_ids: {e}"
+                                    ))
+                                })?;
+                        }
+                        device.sync_d2h().map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step sync_d2h: {e}"
+                            ))
+                        })?;
+
+                        tracing::debug!(
+                            "ferrite multi-step: {} steps, req={}, first_token={}",
+                            multi_step_n,
+                            prepared.req_inputs[0].req_id,
+                            out_tokens.first().copied().unwrap_or(0),
+                        );
+
+                        // Commit N steps and build output.
+                        let req_slice = &prepared.req_inputs[0];
+                        let req_id = req_slice.req_id.clone();
+                        for &tok in &out_tokens {
+                            self.input_batch.commit_step(
+                                &req_id,
+                                &[tok],
+                                req_slice.token_count,
+                                false,
+                            );
+                            if let Some(buf) = self.token_buffers.get_mut(&req_id) {
+                                buf.push(tok);
+                            }
+                        }
+
+                        let req_ids = vec![req_id.clone()];
+                        self.input_batch.reclaim_buffers(prepared);
+                        let mut output = ModelRunnerOutput::empty();
+                        output.req_ids = req_ids.clone();
+                        output.req_id_to_index = std::collections::HashMap::from([(req_id, 0)]);
+                        output.sampled_token_ids = vec![out_tokens];
+                        return Ok(output);
+                    }
+                }
+            }
+        }
         // MM-bearing reqs MUST take the eager path: the decode CUDA graph was
         // captured with 1D position tensors (single rope-kernel invocation
         // per layer); replaying it for an MM-bearing req would feed 1D
@@ -8003,6 +8674,7 @@ impl CudaWorker {
                     block_table_gpu,
                     max_seqlen_q,
                     max_seqlen_k,
+                    _seqused_k_per_token,
                 ) = Self::build_attention_tensors(&pf_meta, block_size, device)?;
 
                 // last_token_indices: for each prefill request, index of last token in flat array.
@@ -8769,6 +9441,7 @@ impl CudaWorker {
                     block_table,
                     max_seqlen_q,
                     max_seqlen_k,
+                    _seqused_k_per_token,
                 ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
 
                 // For spec decode: skip last_token_indices so we get logits

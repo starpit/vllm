@@ -111,6 +111,33 @@ impl Assignment {
     }
 }
 
+/// Which compiled-forward variant the solver is assembling.
+///
+/// ferrite emits two specialised forwards per model — `forward_decode`
+/// for batched-decode shapes (all `q_len == 1`, reads paged KV) and
+/// `forward_prefill` for prefill / mixed shapes (at least one
+/// `q_len > 1`, contiguous K/V for the current batch). Attention
+/// impls gate by role via [`Implementation::accepts_role`] so each
+/// specialised tape only picks impls whose kernels handle that
+/// shape correctly; non-attention impls participate in both.
+///
+/// `ForwardRole::Decode` widens decode-only impls via
+/// [`Implementation::workload_constraint_for_role`] so they can claim
+/// `num_tokens >= 2` shapes (the batched-decode case). In the
+/// role-agnostic solve (codegen caller passes `None`), the narrow
+/// role-agnostic `workload_constraint` applies — zero behavior change
+/// for pre-F/2 callers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ForwardRole {
+    /// All queries in the batch have `q_len == 1`. Attention reads
+    /// from the paged KV cache; no causal mask between new tokens.
+    Decode,
+    /// At least one query has `q_len > 1`. Attention reads from
+    /// contiguous K/V buffers for the current batch, with causal
+    /// mask between new tokens.
+    Prefill,
+}
+
 /// A single point in the solver's workload sweep grid.
 ///
 /// Historically the sweep was 1-D (only `num_tokens`). Attention
@@ -255,6 +282,7 @@ pub fn solve(
         bounds,
         num_tokens_points,
         sk_points,
+        None,
     )
 }
 
@@ -266,6 +294,14 @@ pub fn solve(
 /// claiming. Tests that don't exercise per-arch gating stay on
 /// `solve` (no churn), which forwards `arch_ctx = None`; with no
 /// context the filter is treated as default-true.
+///
+/// `role`: Optional [`ForwardRole`] filter. When `Some`, impls must
+/// pass [`Implementation::accepts_role`] AND the solver uses
+/// [`Implementation::workload_constraint_for_role`] instead of the
+/// role-agnostic [`Implementation::workload_constraint`]. When `None`
+/// (all pre-F/2 callers), the role-agnostic constraint applies and
+/// every impl participates — zero behavior change for existing
+/// callers.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_with_arch_filter(
     fuf: &Fuf,
@@ -276,6 +312,7 @@ pub fn solve_with_arch_filter(
     bounds: &BTreeMap<String, u64>,
     num_tokens_points: &[u64],
     sk_points: &[u64],
+    role: Option<ForwardRole>,
 ) -> Result<WorkloadAssignments, SolveError> {
     use rayon::prelude::*;
 
@@ -325,7 +362,14 @@ pub fn solve_with_arch_filter(
             profile: target,
         };
         lib.iter_enumerated()
-            .map(|(_, imp)| !imp.applies_to(&ctx))
+            .map(|(_, imp)| {
+                !imp.applies_to(&ctx)
+                    || role.is_some_and(|r| !imp.accepts_role(r))
+            })
+            .collect()
+    } else if let Some(r) = role {
+        lib.iter_enumerated()
+            .map(|(_, imp)| !imp.accepts_role(r))
             .collect()
     } else {
         vec![false; lib.len()]
@@ -382,6 +426,7 @@ pub fn solve_with_arch_filter(
                 &scratch,
                 wp,
                 &match_cache,
+                role,
                 &ns_phase1,
                 &ns_phase2,
                 &ns_phase3,
@@ -425,6 +470,7 @@ fn solve_one(
     bounds: &BTreeMap<String, u64>,
     point: WorkloadPoint,
     match_cache: &[Vec<(ImplId, MatchInfo)>],
+    role: Option<ForwardRole>,
     ns_phase1: &std::sync::atomic::AtomicU64,
     ns_phase2: &std::sync::atomic::AtomicU64,
     ns_phase3: &std::sync::atomic::AtomicU64,
@@ -455,10 +501,16 @@ fn solve_one(
     for (i, node) in fuf.nodes.iter().enumerate() {
         for (imp_id, info) in &match_cache[i] {
             let imp = lib.get(*imp_id);
-            if !imp
-                .workload_constraint()
-                .accepts(num_tokens as u32, sk_bucket)
-            {
+            // Role-aware when the caller specified a ForwardRole;
+            // role-agnostic otherwise. Widens decode-only impls (e.g.
+            // `AttentionViaCacheImpl`) to claim num_tokens >= 2 in
+            // the decode-role solve without affecting role-agnostic
+            // callers — see `Implementation::workload_constraint_for_role`.
+            let wc = match role {
+                Some(r) => imp.workload_constraint_for_role(r),
+                None => imp.workload_constraint(),
+            };
+            if !wc.accepts(num_tokens as u32, sk_bucket) {
                 continue;
             }
             let cost = imp.cost_us(info, &ctx);

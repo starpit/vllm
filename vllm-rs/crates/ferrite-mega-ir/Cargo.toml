@@ -1,0 +1,8 @@
+[package]
+name = "ferrite-mega-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed correct-by-construction IR for ferrite megakernel emission. Sealed Substrate trait + sealed witnesses ensure a MegaTape value cannot exist unless the megakernel it lowers to is provably free of page-slot lifecycle, mbarrier phase, scratch overlap, and warp-role bug classes."
+
+[dependencies]

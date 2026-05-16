@@ -32,10 +32,17 @@ ferrite-cuda-targets = { path = "../ferrite-cuda-targets" }
 # `Vec<Instruction>` typed at proc-macro time, killing the
 # `OpInstance::field_values: Vec<TokenStream>` round-trip. The
 # proc-macro needs the `Instruction` enum in scope to construct
-# values. ferrite-forward (with its `cuda` feature) defines
-# `Instruction`; we enable that feature here so the enum is in scope.
-# ferrite-forward must NOT depend on ferrite-forward-macro back
+# values. `ferrite-forward` defines `Instruction`; the enum is
+# ungated from `cfg(feature = "cuda")` so we depend on the crate
+# without the cuda feature (avoids pulling ferrite-kernels' extern
+# CUDA symbols into the proc-macro `.so`).
+#
+# `ferrite-forward` must NOT depend on `ferrite-forward-macro` back
 # (the re-export of the proc-macro was dropped to break the cycle).
+# Likewise, `ferrite-mega-ir` does NOT appear here: mega-ir depends
+# on `ferrite-forward` for `Instruction` (per `MEGA_IR_PLAN.md` §5,
+# lower's input is `Vec<Instruction>`), so re-adding it would
+# create a cycle macro → mega-ir → ferrite-forward → macro.
 ferrite-forward = { path = "../ferrite-forward" }
 
 [dev-dependencies]

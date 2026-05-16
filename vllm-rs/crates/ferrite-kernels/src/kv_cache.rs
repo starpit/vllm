@@ -52,6 +52,27 @@ pub struct KvCachePool {
     block_unrotated_gpu_ptr: Option<RawGpuMem>,
     /// GPU mirror of `block_is_span` — for post-attention inverse rotation.
     block_span_gpu_ptr: Option<RawGpuMem>,
+
+    /// Device-resident `[num_layers]` array of per-layer K cache base
+    /// pointers (one `*mut u16` per layer). Layout matches the mega ABI's
+    /// `key_cache_ptrs` field (see
+    /// `ferrite_forward::interpreter::mega::KvPtrs`): layer-major, one
+    /// bf16 base pointer per layer, indexed by layer id. Populated once
+    /// at construction — the per-layer base pointers never change after
+    /// init (each layer's K slab is a single `mem_alloc`), so no re-sync
+    /// is ever needed. Surfaced via [`Self::key_cache_ptrs_gpu`].
+    ///
+    /// The pointer width is `*mut u16` because the mega kernel's
+    /// bf16 pointer type (`__nv_bfloat16*`) is 2 bytes wide — same
+    /// bit pattern as `u16*` on the Rust side. For non-bf16 cache
+    /// dtypes (f16 fits, fp8 does not) this array still holds the
+    /// correct raw device base addresses; the call site is
+    /// responsible for matching the ABI to the pool's dtype.
+    _k_cache_ptr_array_gpu: RawGpuMem,
+    /// Device-resident `[num_layers]` array of per-layer V cache base
+    /// pointers. Same contract as [`Self::_k_cache_ptr_array_gpu`], for
+    /// the V side. Surfaced via [`Self::value_cache_ptrs_gpu`].
+    _v_cache_ptr_array_gpu: RawGpuMem,
 }
 
 // Safety: KvCachePool holds GPU device pointers (GpuTensor arrays and raw
@@ -122,6 +143,49 @@ impl KvCachePool {
             }
         }
 
+        // Stage the per-layer K/V base pointers into two device-resident
+        // `[num_layers]` arrays. This is what the mega ABI's
+        // `key_cache_ptrs` / `value_cache_ptrs` fields
+        // (`ferrite_forward::interpreter::mega::KvPtrs`) expect: a
+        // device pointer to an array of bf16 base pointers, one per
+        // layer. Populated once here — per-layer bases never change
+        // after `new` returns.
+        let ptr_bytes = std::mem::size_of::<*mut u16>();
+        let ptr_array_bytes = num_layers * ptr_bytes;
+        let k_ptr_array = driver::mem_alloc(ptr_array_bytes)?;
+        let v_ptr_array = driver::mem_alloc(ptr_array_bytes)?;
+        {
+            let host_k: Vec<*mut u16> = k_caches
+                .iter()
+                .map(|t| t.raw_ptr() as *mut u16)
+                .collect();
+            let host_v: Vec<*mut u16> = v_caches
+                .iter()
+                .map(|t| t.raw_ptr() as *mut u16)
+                .collect();
+            let null_stream = std::ptr::null_mut();
+            driver::memcpy_htod_async(
+                k_ptr_array,
+                host_k.as_ptr() as *const u8,
+                ptr_array_bytes,
+                null_stream,
+            )?;
+            driver::memcpy_htod_async(
+                v_ptr_array,
+                host_v.as_ptr() as *const u8,
+                ptr_array_bytes,
+                null_stream,
+            )?;
+            // The two H2D copies above are async on the null stream;
+            // memcpy from pageable host memory is synchronous wrt the
+            // host in practice, but keep an explicit sync so the
+            // `host_k` / `host_v` Vecs can be dropped safely at scope
+            // exit regardless of driver version.
+            driver::stream_synchronize(null_stream)?;
+        }
+        let k_cache_ptr_array_gpu = RawGpuMem::new(k_ptr_array, ptr_array_bytes);
+        let v_cache_ptr_array_gpu = RawGpuMem::new(v_ptr_array, ptr_array_bytes);
+
         let total_mb = (2 * num_layers * bytes_per_layer) as f64 / (1024.0 * 1024.0);
         let dtype_label = if dtype.is_fp8() {
             "FP8 E4M3"
@@ -149,6 +213,8 @@ impl KvCachePool {
             block_is_span: vec![false; num_blocks],
             block_unrotated_gpu_ptr: None,
             block_span_gpu_ptr: None,
+            _k_cache_ptr_array_gpu: k_cache_ptr_array_gpu,
+            _v_cache_ptr_array_gpu: v_cache_ptr_array_gpu,
         })
     }
 
@@ -159,6 +225,15 @@ impl KvCachePool {
     /// `Attention` op). Reading any layer index from this pool would
     /// panic — by contract, vision-mode codegen never emits such reads.
     pub fn empty_for_vision() -> Self {
+        // Null RawGpuMem stubs for the per-layer pointer arrays. The vision
+        // pool never fires paged attention, so nothing ever reads these;
+        // `RawGpuMem::Drop` skips `mem_free` when `ptr.is_null()`, so the
+        // stubs are inert on drop. Mirrors the `new_vision_placeholder`
+        // pattern from the Slice 3f-2l attention_partial commit.
+        // SAFETY: null pointer with zero size is always safe to construct;
+        // the Drop impl guards on is_null() before freeing.
+        let null_k = unsafe { RawGpuMem::new(std::ptr::null_mut(), 0) };
+        let null_v = unsafe { RawGpuMem::new(std::ptr::null_mut(), 0) };
         Self {
             k_caches: Vec::new(),
             v_caches: Vec::new(),
@@ -176,6 +251,8 @@ impl KvCachePool {
             block_is_span: Vec::new(),
             block_unrotated_gpu_ptr: None,
             block_span_gpu_ptr: None,
+            _k_cache_ptr_array_gpu: null_k,
+            _v_cache_ptr_array_gpu: null_v,
         }
     }
 
@@ -362,6 +439,28 @@ impl KvCachePool {
             driver::memcpy_htod_async(mem.ptr(), flags.as_ptr(), flags.len(), stream)
                 .expect("sync block_span H2D");
         }
+    }
+
+    /// Device-resident `[num_layers]` array of per-layer K cache base
+    /// pointers, as the mega ABI's `key_cache_ptrs` expects
+    /// (`*const *mut u16` is `ferrite_forward::interpreter::mega::KvPtrs`
+    /// — a device pointer to a bf16** layer-major base-pointer array).
+    ///
+    /// The returned pointer is valid for the lifetime of `self`; the
+    /// underlying allocation is owned by
+    /// [`Self::_k_cache_ptr_array_gpu`] and freed on drop.
+    ///
+    /// The array contents are stable: per-layer base pointers are set
+    /// once in [`Self::new`] and never change.
+    pub fn key_cache_ptrs_gpu(&self) -> *const *mut u16 {
+        self._k_cache_ptr_array_gpu.ptr() as *const *mut u16
+    }
+
+    /// Device-resident `[num_layers]` array of per-layer V cache base
+    /// pointers. Same contract as [`Self::key_cache_ptrs_gpu`], for
+    /// the V side.
+    pub fn value_cache_ptrs_gpu(&self) -> *const *mut u16 {
+        self._v_cache_ptr_array_gpu.ptr() as *const *mut u16
     }
 
     /// GPU pointer to `block_is_unrotated` flags (for pre-attention rotation).

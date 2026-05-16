@@ -515,17 +515,42 @@ fn build_cutlass_gemm_bias(cache_dir: &str, rerun_files: &mut Vec<String>) {
 
 #[cfg(feature = "cuda")]
 fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
-    // Megakernels build is disabled on this branch — the forward!()
-    // macro emits .cu files that #include "kittens.cuh", but
-    // ThunderKittens isn't on this branch's include path. The
-    // ff-interpreter cuBLAS-freedom workstream doesn't ship
-    // megakernels; re-enable only when this branch needs them.
-    let _ = (cache_dir, rerun_files);
-    return;
-    #[allow(unreachable_code)]
+    // Ferrite-TK megakernels (FERRITE_TK_PLAN.md). Each .cu in
+    // the cudaforge cache includes kittens.cuh + the ferrite-
+    // owned substrate headers under crates/ferrite-kernels/csrc/
+    // tk/. No vendor `megakernels/` include path, no CUTLASS
+    // dep — ferrite-owned TK 2.0 code only.
     let megakernel_cache = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");
+
+    // The ferrite-forward macro emits an `#error "..."` stub in
+    // every `.cu` whose schedule contains an op ferrite-TK can't
+    // yet lower. Those stubs are written deliberately so cudaforge's
+    // content-hash invalidates them when ops land (see
+    // `emit_error_variant` in `ferrite-forward-macro/src/interpreter/
+    // mega.rs`) — but nvcc would choke on them. Filter them out at
+    // discovery time. A stub is detected by the first 30-ish lines
+    // containing the marker; reading the whole file is unnecessary.
+    fn is_error_stub(path: &std::path::Path) -> bool {
+        let Ok(s) = std::fs::read_to_string(path) else { return false; };
+        // Only scan the head — emitted stubs put the `#error` line
+        // early (line ~12). Cap at 4 KiB so a genuine long .cu
+        // doesn't pay the full-scan cost.
+        let head = &s[..s.len().min(4096)];
+        head.contains("#error \"ferrite mega:")
+    }
+    // If FERRITE_MODELS is set, only compile megakernels for those models.
+    // The proc-macro maps "llama-3.2-1b" → file stem "llama_3_2_1b" (dashes→underscores).
+    // Without this filter, all cached kernels (including large models like gemma2-27b
+    // with intermediate_dim=36864) get compiled, which can take 10+ min per kernel
+    // when NCW=16 makes the monolithic kernel too large for the PTX optimizer.
+    let model_filter: Option<Vec<String>> = std::env::var("FERRITE_MODELS").ok().map(|v| {
+        v.split(',')
+            .map(|m| m.trim().replace('-', "_").replace('.', "_"))
+            .collect()
+    });
+    println!("cargo:rerun-if-env-changed=FERRITE_MODELS");
 
     let megakernel_cus: Vec<String> = if megakernel_cache.exists() {
         std::fs::read_dir(&megakernel_cache)
@@ -533,6 +558,16 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
             .flatten()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "cu"))
+            .filter(|e| !is_error_stub(&e.path()))
+            .filter(|e| {
+                let Some(ref models) = model_filter else { return true; };
+                let stem = e.path().file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .trim_start_matches("ferrite_")
+                    .to_string();
+                models.iter().any(|m| stem.starts_with(m.as_str()))
+            })
             .map(|e| e.path().display().to_string())
             .collect()
     } else {
@@ -551,15 +586,39 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         "-std=c++17"
     };
 
-    // The megakernel .cu files include megakernel_ops.cuh from vllm-cuda/csrc.
-    const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
+    // Architecture gate for TK primitives. Ferrite is Hopper-
+    // first per the plan; if we ever want sm_89 variants we'll
+    // thread KITTENS_AMPERE through explicitly.
+    let kittens_arch_flag = if arch_num >= 100 {
+        "-DKITTENS_BLACKWELL"
+    } else if arch_num >= 90 {
+        "-DKITTENS_HOPPER"
+    } else {
+        "-DKITTENS_AMPERE"
+    };
+
+    // Hopper TK primitives (`setmaxnreg`, `wgmma`, `tma::*_async`)
+    // require the `sm_90a` architecture extension, not plain
+    // `sm_90`. ptxas rejects these instructions on `.target
+    // 'sm_90'`. Rewrite the gencode target on Hopper.
+    let gencode_arch = if arch_num == 90 {
+        "90a".to_string()
+    } else {
+        arch.clone()
+    };
+
+    // Include path: ferrite substrate headers first (so
+    // `#include "ferrite_globals.cuh"` resolves to ours), then
+    // the vendored TK 2.0 headers for `kittens.cuh`.
+    let ferrite_tk_include = "../../crates/ferrite-kernels/csrc/tk";
+    let tk_include = "../../third_party/thunderkittens/include";
 
     let mut mk_builder = cudaforge::KernelBuilder::new();
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
-        .include_path("../../crates/vllm-cuda/csrc")
-        .with_cutlass(Some(CUTLASS_COMMIT));
+        .include_path(ferrite_tk_include)
+        .include_path(tk_include);
     mk_builder
         .arg(std_flag)
         .arg("-O3")
@@ -567,10 +626,13 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("--expt-extended-lambda")
         .arg("--expt-relaxed-constexpr")
         .arg("-DNDEBUG")
+        .arg(kittens_arch_flag)
         .arg("-Xcompiler=-fPIC")
         .arg("-Xcompiler=-fno-strict-aliasing")
         .arg("-Xcompiler=-Wno-psabi")
-        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .arg(&format!(
+            "-gencode=arch=compute_{gencode_arch},code=sm_{gencode_arch}"
+        ))
         .arg("-lineinfo")
         .build_lib(format!("{cache_dir}/libmegakernels.a"))
         .expect("failed to build megakernel .cu files");
@@ -578,6 +640,33 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     for cu in &megakernel_cus {
         rerun_files.push(cu.clone());
     }
+
+    // Rerun if any ferrite substrate header changes.
+    for entry in walkdir(ferrite_tk_include) {
+        rerun_files.push(entry);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn walkdir(root: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![std::path::PathBuf::from(root)];
+    while let Some(p) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext == "cuh" || ext == "h")
+                {
+                    out.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(feature = "cuda")]

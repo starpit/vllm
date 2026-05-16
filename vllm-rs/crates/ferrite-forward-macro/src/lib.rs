@@ -43,7 +43,10 @@ mod quantization;
 mod schedule;
 mod shape;
 mod solver;
+mod tape;
+mod tape_claim;
 mod target;
+mod tk_impls;
 mod tp_lowering;
 mod vision_lowering;
 mod viz_dump;
@@ -595,6 +598,12 @@ fn compile_common(
         fuf: fuf::Fuf,
         sfufs: solver::WorkloadAssignments,
         loops: schedule::WorkloadLoops,
+        /// Decode-role solve: same workload points as `sfufs` but only
+        /// decode-compatible impls (AttentionViaCache, TK, FI-decode).
+        /// Used to build MEGA_FORWARD_TABLE_DECODE. Host interpreter
+        /// path uses `sfufs` unchanged.
+        sfufs_decode: solver::WorkloadAssignments,
+        loops_decode: schedule::WorkloadLoops,
         stub_items: proc_macro2::TokenStream,
         /// Tensor-parallel world size this model was solved at. The
         /// (variant × tp) fanout constructs one SolvedModel per
@@ -786,6 +795,19 @@ fn compile_common(
                 vision_lowering::materialize_pixels(&mut model_fuf);
             }
 
+            // Mega-kernel barrier lowering moved to post-`expand_loops`
+            // (see `interpreter::mega::insert_mega_barriers`). Running
+            // pre-solver broke multi-tile fusion Impls like
+            // `FusedGateUpSiluMulImpl`, whose `matches()` walks
+            // `consumes_tile(silu, gemm)` — pre-solver Barrier
+            // insertion rewired Silu to read from BarrierWait, so the
+            // direct-edge check failed and the solver couldn't claim
+            // the fused MLP tile group. Post-expand_loops, each
+            // OpInstance is already one Impl's CTA grid, so a linear
+            // scan over the schedule places RAW/WAR barriers only at
+            // genuine cross-Impl boundaries (intra-fusion edges are
+            // inside a single kernel and handled by `__syncthreads`).
+
             // At tp>1, the runtime weight tensors are per-rank shards
             // (column-parallel q/k/v/gate/up halve dim 0; row-parallel
             // o/down halve dim 1). The codegen-baked weight shapes
@@ -822,11 +844,37 @@ fn compile_common(
                 &solve_bounds,
                 &args.workloads,
                 &args.sk_buckets,
+                None, // role=None: role-agnostic solve, matches pre-F/2 behavior.
             )
             .map_err(|e| {
                 syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem))
             })?;
             let d_solve = t_solve.elapsed();
+
+            // Decode-role solve: same workload points, only decode-
+            // compatible impls. Drives MEGA_FORWARD_TABLE_DECODE so
+            // the mega path dispatches decode-capable kernels (TK,
+            // FA2 paged) at M>=2 when all q_lens==1. Host interpreter
+            // path is unaffected — it keeps using the role-agnostic
+            // `sfufs` table. See FERRITE_TK_PLAN.md Wave F/2.
+            let sfufs_decode = solver::solve_with_arch_filter(
+                &model_fuf,
+                &library,
+                &target_profile,
+                Some((&classified, model)),
+                &inferred,
+                &solve_bounds,
+                &args.workloads,
+                &args.sk_buckets,
+                Some(solver::ForwardRole::Decode),
+            )
+            .map_err(|e| {
+                syn::Error::new(
+                    args.span,
+                    format!("solve-decode [{}]: {e}", model.source_stem),
+                )
+            })?;
+            let loops_decode = schedule::schedule_workloads(&model_fuf, &sfufs_decode);
 
             let loops = schedule::schedule_workloads(&model_fuf, &sfufs);
             cost::refresh_predicted_us(
@@ -860,8 +908,8 @@ fn compile_common(
             //     adds, standalone norms. Surfaced because their
             //     existence is usually a "why didn't we fuse this?"
             //     signal.
-            const CLASS_LABELS: [&str; 8] = [
-                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm",
+            const CLASS_LABELS: [&str; 9] = [
+                "fa2", "fi", "mla", "cublas", "cutlass", "marlin", "non-gemm", "comm", "tk",
             ];
             // Names that are non-gemm despite a `fused_` prefix
             // (norm-side fusions with no matmul).
@@ -883,6 +931,9 @@ fn compile_common(
                 "shared_fused_moe_ref",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
+                "tk_scalar_offset_rms_norm",
+                "tk_fused_add_rms_norm_with_offset",
+                "tk_tanh_softcap",
                 "mean_sub_rms_norm",
                 "mean_sub_rms_norm_bias_add",
                 // Vision-side unary elementwise ops (G.4). Shape-
@@ -917,13 +968,20 @@ fn compile_common(
                 // before the projector runs. Single D2D copy; non-gemm.
                 "strip_cls",
             ];
-            let mut classes_used = [false; 8];
+            let mut classes_used = [false; 9];
             let mut unknown_names: std::collections::BTreeSet<&'static str> =
                 std::collections::BTreeSet::new();
             for assignment in sfufs.per_workload.values() {
                 for impl_id in assignment.impls.values() {
                     let name = library.get(*impl_id).name();
-                    let bucket = if name.starts_with("flashinfer") {
+                    let bucket = if name.starts_with("tk_") {
+                        // TK megakernel peers (sm>=90). Class 8 so they
+                        // don't alias the backend classes they delegate
+                        // to (cublas / fa2 / non-gemm); the kernel-mix
+                        // report reads "tk" so the dispatched path is
+                        // visible in build logs.
+                        Some(8) // tk
+                    } else if name.starts_with("flashinfer") {
                         Some(1) // fi
                     } else if name.starts_with("mla_") {
                         Some(2) // mla
@@ -1034,6 +1092,8 @@ fn compile_common(
                 fuf: model_fuf,
                 sfufs,
                 loops,
+                sfufs_decode,
+                loops_decode,
                 stub_items,
                 tp_world_size,
                 mod_name,
@@ -1100,11 +1160,14 @@ fn compile_common(
             &sm.fuf,
             &sm.sfufs,
             &sm.loops,
+            &sm.sfufs_decode,
+            &sm.loops_decode,
             &library,
             &manifest,
             canonical_override.as_ref(),
             sm.tp_world_size,
             mode.emit_arch_dispatch,
+            &target_profile,
         );
         let stub_items = &sm.stub_items;
         // Vision arch glue: per-variant `VisionArchWeights` impl,
@@ -1686,6 +1749,7 @@ fn emit_arch_dispatcher(
             ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
                 unsafe { forward_backbone(self, ctx, device, num_tokens) }
             }
+
         }
 
         // One `FerriteArchRegistration` per distinct tp value across

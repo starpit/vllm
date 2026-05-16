@@ -369,6 +369,23 @@ impl<W: CanonicalParams> MetalWorker<W> {
             bucket_bakings.push(baking);
         }
 
+        // Each ICB built during bake_bucket needs to be resident
+        // before `executeCommandsInBuffer` reads its commands. The
+        // ICB itself is an MTLAllocation but not an MTLBuffer, so we
+        // go through `insert_raw` (added to MetalResidencySet for
+        // exactly this case).
+        if let Some(r) = residency {
+            for baking in &bucket_bakings {
+                if let Some(steps) = baking.mtl4_steps.as_ref() {
+                    for step in steps {
+                        if let Some(ctx) = step.icb.as_ref() {
+                            unsafe { r.insert_raw(ctx.icb().as_ptr()); }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             arena,
             bucket_bakings,
@@ -509,6 +526,37 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let mut total_barriers: usize = 0;
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
+            // ICB pre-bound fast path: when a step's dispatches were
+            // pre-recorded into an MTLIndirectCommandBuffer at bake
+            // time (FERRITE_METAL_ICB=1, no per-dispatch m_scaling),
+            // play the whole step back as ONE
+            // `executeCommandsInBuffer` driver call instead of N
+            // setArgumentTable+dispatchThreadgroups round-trips.
+            // Pipelines were created via the MTL4 compiler with
+            // `MTL4IndirectCommandBufferSupportState::Enabled`, so
+            // ICB execution under MTL4 produces the same kernel
+            // state direct dispatch does.
+            if let Some(ctx) = step.icb.as_ref() {
+                if timing.is_none() {
+                    use ::objc2::msg_send;
+                    use ::objc2::runtime::AnyObject;
+                    use ::objc2_foundation::NSRange;
+                    let n = ctx.command_count();
+                    let enc_ptr: *mut AnyObject =
+                        enc as *const _ as *const AnyObject as *mut _;
+                    unsafe {
+                        let _: () = msg_send![
+                            enc_ptr,
+                            executeCommandsInBuffer: ctx.icb().as_ptr(),
+                            withRange: NSRange { location: 0, length: n }
+                        ];
+                    }
+                    if count_barriers {
+                        total_dispatches += n;
+                    }
+                    continue;
+                }
+            }
             for (((table, (tg, tpt)), need_barrier), scaling) in step
                 .tables
                 .iter()

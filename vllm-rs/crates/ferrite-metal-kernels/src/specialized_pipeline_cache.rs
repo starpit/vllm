@@ -10,13 +10,15 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDataType, MTLDevice,
-    MTLFunctionConstantValues, MTLLibrary, MTLPipelineOption,
+    MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor,
+    MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor,
+    MTL4SpecializedFunctionDescriptor, MTLComputePipelineState, MTLDataType, MTLDevice,
+    MTLFunctionConstantValues, MTLLibrary,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
@@ -156,6 +158,18 @@ pub struct SpecializedPipelineCache {
     device: Device,
     libraries: HashMap<&'static str, Library>,
     pipelines: Mutex<HashMap<PipelineKey, ComputePipelineState>>,
+    /// Lazy-built MTL4 compiler. Pipelines created through this
+    /// compiler are MTL4 ICB-aware (see
+    /// `MTL4IndirectCommandBufferSupportState::Enabled` below); the
+    /// returned `MTLComputePipelineState` is the same legacy type
+    /// that direct `setComputePipelineState` accepts AND that
+    /// `executeCommandsInBuffer` plays back correctly inside an
+    /// `MTL4ComputeCommandEncoder`. The legacy
+    /// `MTLDevice.newComputePipelineStateWithDescriptor(.., MTL3
+    /// `MTLComputePipelineDescriptor`, ..)` path produces
+    /// MTL3-ICB-only pipelines whose ICB execution silently produces
+    /// random outputs on MTL4 encoders.
+    compiler: OnceLock<Retained<ProtocolObject<dyn MTL4Compiler>>>,
 }
 
 impl SpecializedPipelineCache {
@@ -174,6 +188,7 @@ impl SpecializedPipelineCache {
             device,
             libraries,
             pipelines: Mutex::new(HashMap::new()),
+            compiler: OnceLock::new(),
         })
     }
 
@@ -225,6 +240,7 @@ impl SpecializedPipelineCache {
             device,
             libraries,
             pipelines: Mutex::new(HashMap::new()),
+            compiler: OnceLock::new(),
         })
     }
 
@@ -325,31 +341,57 @@ impl SpecializedPipelineCache {
         }
 
         let ns_name = NSString::from_str(key.kernel_name);
-        let function = library
-            .newFunctionWithName_constantValues_error(&ns_name, &constants)
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "newFunctionWithName(`{}`, {} constants) in library `{}`: {e:?}",
-                    key.kernel_name,
-                    key.constants.len(),
-                    key.library_name,
-                ))
-            })?;
 
-        let descriptor = MTLComputePipelineDescriptor::new();
-        descriptor.setComputeFunction(Some(&function));
-        descriptor.setSupportIndirectCommandBuffers(true);
-        let pipeline = self
-            .device
-            .newComputePipelineStateWithDescriptor_options_reflection_error(
-                &descriptor,
-                MTLPipelineOption::None,
-                None,
-            )
+        // MTL4 function-descriptor chain:
+        //   MTL4LibraryFunctionDescriptor       (where to find the
+        //                                         function: library +
+        //                                         entry-point name)
+        //   MTL4SpecializedFunctionDescriptor   (wraps it + bakes
+        //                                         function-constant
+        //                                         values for this
+        //                                         specialization)
+        //   MTL4ComputePipelineDescriptor       (the descriptor the
+        //                                         compiler consumes;
+        //                                         carries the MTL4
+        //                                         ICB-support flag)
+        let lib_fn_desc = MTL4LibraryFunctionDescriptor::new();
+        lib_fn_desc.setName(Some(&ns_name));
+        lib_fn_desc.setLibrary(Some(library));
+
+        let spec_fn_desc = MTL4SpecializedFunctionDescriptor::new();
+        // Upcast: spec descriptor's `setFunctionDescriptor` accepts
+        // any `MTL4FunctionDescriptor` subclass.
+        let lib_fn_super: &::objc2_metal::MTL4FunctionDescriptor = &lib_fn_desc;
+        spec_fn_desc.setFunctionDescriptor(Some(lib_fn_super));
+        spec_fn_desc.setConstantValues(Some(&constants));
+
+        let pipe_desc = MTL4ComputePipelineDescriptor::new();
+        let spec_fn_super: &::objc2_metal::MTL4FunctionDescriptor = &spec_fn_desc;
+        pipe_desc.setComputeFunctionDescriptor(Some(spec_fn_super));
+        // The whole point of this migration: MTL4 compute pipelines
+        // need this enum-flavored support flag (NOT the bool one on
+        // the legacy MTLComputePipelineDescriptor) for
+        // `executeCommandsInBuffer` on an MTL4ComputeCommandEncoder
+        // to fire the pipeline correctly. The MTL3 bool flag enables
+        // MTL3-ICB compatibility only; pipelines created with it
+        // appear to work in MTL4 direct dispatch but silently emit
+        // wrong kernel state under MTL4 ICB execution.
+        pipe_desc.setSupportIndirectCommandBuffers(MTL4IndirectCommandBufferSupportState::Enabled);
+
+        let compiler = self.compiler.get_or_init(|| {
+            let cdesc = MTL4CompilerDescriptor::new();
+            self.device
+                .newCompilerWithDescriptor_error(&cdesc)
+                .expect("newCompilerWithDescriptor")
+        });
+        let pipeline = compiler
+            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&pipe_desc, None)
             .map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!(
-                    "build pipeline `{}`: {e:?}",
+                    "MTL4 build pipeline `{}` (lib `{}`, {} constants): {e:?}",
                     key.kernel_name,
+                    key.library_name,
+                    key.constants.len(),
                 ))
             })?;
 

@@ -87,6 +87,22 @@ impl MetalResidencySet {
         }
     }
 
+    /// Insert any `id<MTLAllocation>`-conforming object by raw pointer.
+    /// Used for `MTLIndirectCommandBuffer` (which is not `MTLBuffer`)
+    /// — without this the ICB lives in unmapped GPU memory and
+    /// `executeCommandsInBuffer` reads garbage commands.
+    ///
+    /// # Safety
+    /// `ptr` must be a non-null pointer to a live ObjC object that
+    /// conforms to the `MTLAllocation` protocol.
+    pub unsafe fn insert_raw(&self, ptr: *mut AnyObject) {
+        let inner = self.inner.lock().expect("residency set mutex");
+        if inner.set_ptr.is_null() || ptr.is_null() {
+            return;
+        }
+        let _: () = msg_send![inner.set_ptr, addAllocation: ptr];
+    }
+
     pub fn commit(&self) {
         let inner = self.inner.lock().expect("residency set mutex");
         if inner.set_ptr.is_null() {

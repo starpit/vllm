@@ -44,10 +44,13 @@ pub mod substrate;
 pub mod tape;
 
 pub use lower::{ArriveCount, LowerError, MegaTapeBuilder, OpInput, lower};
-pub use nodes::{FusedQkvRopeCache, LayerIndex, MegaNode, RmsNorm, RotaryRef, WeightRef};
+pub use nodes::{
+    Add, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation, LayerIndex,
+    MegaNode, RmsNorm, RotaryRef, WeightRef,
+};
 pub use substrate::{
     Empty, Filled, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidWarpRole, IterCount,
-    MbarrierPhase, Page, PageId, PagePool, Produced, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER,
-    ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
+    MbarrierPhase, MlpScope, Page, PageId, PagePool, Produced, ROLE_CONSUMER, ROLE_LAUNCHER,
+    ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
 };
 pub use tape::MegaTape;

@@ -27,10 +27,14 @@
 
 use ferrite_forward::Instruction;
 
-use crate::nodes::{FusedQkvRopeCache, LayerIndex, MegaNode, RmsNorm, RotaryRef, WeightRef};
+use crate::nodes::{
+    Add, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation, LayerIndex,
+    MegaNode, RmsNorm, RotaryRef, WeightRef,
+};
 use crate::substrate::{
-    Empty, IterCount, MbarrierPhase, Page, PageId, PagePool, ROLE_CONSUMER, ROLE_LAUNCHER,
-    ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
+    Empty, IterCount, MbarrierPhase, MlpScope, Page, PageId, PagePool, ROLE_CONSUMER,
+    ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion,
+    SubstrateBudget, WarpRoleTag,
 };
 use crate::tape::MegaTape;
 
@@ -353,6 +357,252 @@ impl MegaTapeBuilder {
         self
     }
 
+    /// Push a typed `Add` (residual fold) onto the tape.
+    ///
+    /// `Instruction::Add(delta_slot, residual_slot)` semantics:
+    /// `residual_slot += delta_slot`. The plan §10 calls this
+    /// "DownProjResidual" when it sits after MLP / attention output;
+    /// the `Instruction` enum has just one universal variant.
+    ///
+    /// Substrate-proof discharge per call:
+    /// 1. Take two `Page<Empty>` tokens (#1 + #2 cross-op).
+    /// 2. Walk both Empty → Filled → Produced → Empty (#2 within-op:
+    ///    consumer can't read before loader fires; storer can't
+    ///    drain before consumer arrives).
+    /// 3. Validate boundary phase parity against the cumulative
+    ///    arrive count (#3).
+    /// 4. Stamp the four warp-role tags (#6).
+    /// 5. Release both pages, bump arrives by 1 (one consumer
+    ///    arrive per op — element-wise add is single-shot).
+    pub fn push_add(&mut self, delta_slot_id: u32, residual_slot_id: u32) -> &mut Self {
+        let delta_page: Page<Empty> = self.pool.take(delta_slot_id);
+        let residual_page: Page<Empty> = self.pool.take(residual_slot_id);
+
+        let delta_empty = delta_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let residual_empty = residual_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        let _loader_role = WarpRoleTag::<ROLE_LOADER>;
+        let _launcher_role = WarpRoleTag::<ROLE_LAUNCHER>;
+        let _consumer_role = WarpRoleTag::<ROLE_CONSUMER>;
+        let _storer_role = WarpRoleTag::<ROLE_STORER>;
+
+        let delta_id = PageId::new(delta_slot_id, self.pool.substrate());
+        let residual_id = PageId::new(residual_slot_id, self.pool.substrate());
+
+        self.nodes.push(MegaNode::Add(Add {
+            delta_page: delta_id,
+            residual_page: residual_id,
+            consumer_phase,
+            storer_phase,
+            _loader_role,
+            _launcher_role,
+            _consumer_role,
+            _storer_role,
+        }));
+
+        self.pool.release(delta_empty);
+        self.pool.release(residual_empty);
+        self.arrives.bump();
+
+        self
+    }
+
+    /// Push a typed `FusedAddRmsNorm` onto the tape.
+    ///
+    /// `Instruction::FusedAddRmsNorm(delta_slot, residual_slot,
+    /// layer)` semantics: `residual += delta; out = rms_norm(residual,
+    /// weight[layer])`, with `out` overwriting `residual_slot`.
+    /// Substrate-proof discharge mirrors `push_rms_norm` but with
+    /// three pages (delta + residual + weight) instead of two
+    /// (input + weight). Scratch shape is identical
+    /// (`partial_sums: ScratchRegion<RmsNormScope>` sized for
+    /// `num_consumer_warps` f32 partial sums).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_fused_add_rms_norm(
+        &mut self,
+        delta_slot_id: u32,
+        residual_slot_id: u32,
+        weight_slot_id: u32,
+        layer: u32,
+        num_layers: u32,
+        weight_path: String,
+        scratch_offset: u32,
+    ) -> &mut Self {
+        let delta_page: Page<Empty> = self.pool.take(delta_slot_id);
+        let residual_page: Page<Empty> = self.pool.take(residual_slot_id);
+        let weight_page: Page<Empty> = self.pool.take(weight_slot_id);
+
+        let delta_empty = delta_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let residual_empty = residual_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let weight_empty = weight_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+
+        let scratch_bytes = self.pool.substrate().num_consumer_warps() * 4;
+        let partial_sums = ScratchRegion::<RmsNormScope>::new(
+            scratch_offset,
+            scratch_bytes,
+            self.pool.substrate(),
+        );
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        let _loader_role = WarpRoleTag::<ROLE_LOADER>;
+        let _launcher_role = WarpRoleTag::<ROLE_LAUNCHER>;
+        let _consumer_role = WarpRoleTag::<ROLE_CONSUMER>;
+        let _storer_role = WarpRoleTag::<ROLE_STORER>;
+
+        let layer = LayerIndex::new(layer, num_layers);
+        let weight = WeightRef::new(weight_path);
+        let delta_id = PageId::new(delta_slot_id, self.pool.substrate());
+        let residual_id = PageId::new(residual_slot_id, self.pool.substrate());
+        let weight_id = PageId::new(weight_slot_id, self.pool.substrate());
+
+        self.nodes.push(MegaNode::FusedAddRmsNorm(FusedAddRmsNorm {
+            delta_page: delta_id,
+            residual_page: residual_id,
+            weight_page: weight_id,
+            partial_sums,
+            consumer_phase,
+            storer_phase,
+            _loader_role,
+            _launcher_role,
+            _consumer_role,
+            _storer_role,
+            layer,
+            weight,
+        }));
+
+        self.pool.release(delta_empty);
+        self.pool.release(residual_empty);
+        self.pool.release(weight_empty);
+        self.arrives.bump();
+
+        self
+    }
+
+    /// Push a typed `FusedGateUp{Silu,Gelu}Mul` onto the tape.
+    ///
+    /// Substrate-proof discharge mirrors `push_fused_qkv_rope_cache`
+    /// (the multi-iter pattern) with: 3 pages (in / packed-gate-up
+    /// weight / out), 2 disjoint `MlpScope` scratch tiles
+    /// (`gate_buf`, `up_buf`), `iters` token-iter count.
+    /// The kernel runs two cublas gemms back-to-back per iter
+    /// (gate, up) into shmem tiles, then elementwise
+    /// `act(gate) * up` into the out page. One consumer arrive per
+    /// iter; cumulative arrive count advances by `iters.raw()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_fused_gate_up_activate_mul(
+        &mut self,
+        in_slot_id: u32,
+        gate_up_weight_slot_id: u32,
+        out_slot_id: u32,
+        layer: u32,
+        num_layers: u32,
+        weight_path: String,
+        iters: u32,
+        gate_scratch_offset: u32,
+        gate_scratch_bytes: u32,
+        up_scratch_offset: u32,
+        up_scratch_bytes: u32,
+        activation: GateUpActivation,
+    ) -> &mut Self {
+        let in_page: Page<Empty> = self.pool.take(in_slot_id);
+        let weight_page: Page<Empty> = self.pool.take(gate_up_weight_slot_id);
+        let out_page: Page<Empty> = self.pool.take(out_slot_id);
+
+        let in_empty = in_page.loader_fired().consumer_arrived().storer_consumed();
+        let weight_empty = weight_page
+            .loader_fired()
+            .consumer_arrived()
+            .storer_consumed();
+        let out_empty = out_page.loader_fired().consumer_arrived().storer_consumed();
+
+        let gate_raw = ScratchRegion::<MlpScope>::new(
+            gate_scratch_offset,
+            gate_scratch_bytes,
+            self.pool.substrate(),
+        );
+        let up_raw = ScratchRegion::<MlpScope>::new(
+            up_scratch_offset,
+            up_scratch_bytes,
+            self.pool.substrate(),
+        );
+        let (gate_buf, up_buf) = gate_raw.disjoint_with(up_raw);
+
+        let consumer_phase =
+            MbarrierPhase::assert_matches(self.arrives.current() & 1, self.arrives.current());
+        let storer_phase = MbarrierPhase::assert_matches(
+            (self.arrives.current() + 1) & 1,
+            self.arrives.current() + 1,
+        );
+
+        let _loader_role = WarpRoleTag::<ROLE_LOADER>;
+        let _launcher_role = WarpRoleTag::<ROLE_LAUNCHER>;
+        let _consumer_role = WarpRoleTag::<ROLE_CONSUMER>;
+        let _storer_role = WarpRoleTag::<ROLE_STORER>;
+
+        let iters_typed = IterCount::new(iters);
+        let layer = LayerIndex::new(layer, num_layers);
+        let weight = WeightRef::new(weight_path);
+        let in_id = PageId::new(in_slot_id, self.pool.substrate());
+        let weight_id = PageId::new(gate_up_weight_slot_id, self.pool.substrate());
+        let out_id = PageId::new(out_slot_id, self.pool.substrate());
+
+        self.nodes
+            .push(MegaNode::FusedGateUpActivateMul(FusedGateUpActivateMul {
+                in_page: in_id,
+                gate_up_weight_page: weight_id,
+                out_page: out_id,
+                gate_buf,
+                up_buf,
+                consumer_phase,
+                storer_phase,
+                iters: iters_typed,
+                _loader_role,
+                _launcher_role,
+                _consumer_role,
+                _storer_role,
+                layer,
+                weight,
+                activation,
+            }));
+
+        self.pool.release(in_empty);
+        self.pool.release(weight_empty);
+        self.pool.release(out_empty);
+        for _ in 0..iters {
+            self.arrives.bump();
+        }
+
+        self
+    }
+
     /// Consume the builder and return the typed tape.
     pub fn finish(self) -> MegaTape {
         let substrate = *self.pool.substrate();
@@ -458,6 +708,77 @@ pub fn lower(
                     num_layers,
                     weight_path,
                     /*scratch_offset=*/ 0,
+                );
+            }
+            Instruction::Add(delta_slot, residual_slot) => {
+                builder.push_add(*delta_slot, *residual_slot);
+            }
+            Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(FusedAddRmsNorm): expected one weight_paths entry")
+                    .clone();
+                // Avoid aliasing with delta_slot/residual_slot. Pick
+                // the smallest free id mod num_pages that doesn't
+                // collide. Sprint D's pipeline-aware allocator
+                // replaces this once attention/gemm sites land.
+                let weight_slot_id =
+                    pick_distinct_slot(&[*delta_slot, *residual_slot], &mut slot_alloc)?;
+                builder.push_fused_add_rms_norm(
+                    *delta_slot,
+                    *residual_slot,
+                    weight_slot_id,
+                    *layer,
+                    num_layers,
+                    weight_path,
+                    /*scratch_offset=*/ 0,
+                );
+            }
+            Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(FusedGateUpSiluMul): expected one weight_paths entry")
+                    .clone();
+                let weight_slot_id = pick_distinct_slot(&[*in_slot, *out_slot], &mut slot_alloc)?;
+                let half = substrate.scratch_bytes() / 2;
+                builder.push_fused_gate_up_activate_mul(
+                    *in_slot,
+                    weight_slot_id,
+                    *out_slot,
+                    *layer,
+                    num_layers,
+                    weight_path,
+                    op.iters,
+                    /*gate_off=*/ 0,
+                    /*gate_bytes=*/ half,
+                    /*up_off=*/ half,
+                    /*up_bytes=*/ half,
+                    GateUpActivation::Silu,
+                );
+            }
+            Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(FusedGateUpGeluMul): expected one weight_paths entry")
+                    .clone();
+                let weight_slot_id = pick_distinct_slot(&[*in_slot, *out_slot], &mut slot_alloc)?;
+                let half = substrate.scratch_bytes() / 2;
+                builder.push_fused_gate_up_activate_mul(
+                    *in_slot,
+                    weight_slot_id,
+                    *out_slot,
+                    *layer,
+                    num_layers,
+                    weight_path,
+                    op.iters,
+                    0,
+                    half,
+                    half,
+                    half,
+                    GateUpActivation::Gelu,
                 );
             }
             Instruction::FusedQkvRopeCache(in_slot, _out_slot, layer, biased, interleaved) => {
@@ -567,6 +888,23 @@ impl SlotAllocator {
             have: self.num_pages,
         })
     }
+}
+
+/// Pick the next slot id from `alloc` that doesn't appear in
+/// `exclude`. Used by Sprint C arms (FusedAddRmsNorm, gate-up
+/// fusions) to pick a non-aliasing weight/intermediate page when
+/// the Instruction only supplies in/out slot ids.
+fn pick_distinct_slot(exclude: &[u32], alloc: &mut SlotAllocator) -> Result<u32, LowerError> {
+    for _ in 0..alloc.num_pages {
+        let id = alloc.next_excluding(u32::MAX)?;
+        if !exclude.contains(&id) {
+            return Ok(id);
+        }
+    }
+    Err(LowerError::SubstrateBudgetTooSmall {
+        need: alloc.num_pages + 1,
+        have: alloc.num_pages,
+    })
 }
 
 /// Stable static-string name for an [`Instruction`] variant. Used
@@ -794,11 +1132,14 @@ mod tests {
 
     #[test]
     fn lower_unmigrated_variant_returns_not_yet_lifted() {
-        // `Add` is in Sprint D — not lifted in Sprint A.
-        let ops = vec![OpInput::new(Instruction::Add(0, 1), Vec::new())];
+        // `Gemm` is Sprint D scope — not yet lifted in Sprint A/B/C.
+        let ops = vec![OpInput::new(
+            Instruction::Gemm(0, 1, 0, 16, 16),
+            vec!["W::gemm".to_string()],
+        )];
         match lower(&ops, 16, budget()) {
-            Err(LowerError::NotYetLifted { op }) => assert_eq!(op, "Add"),
-            other => panic!("expected NotYetLifted for Add, got {other:?}"),
+            Err(LowerError::NotYetLifted { op }) => assert_eq!(op, "Gemm"),
+            other => panic!("expected NotYetLifted for Gemm, got {other:?}"),
         }
     }
 
@@ -1075,5 +1416,239 @@ mod tests {
             }
             other => panic!("expected WrongWeightArity, got {other:?}"),
         }
+    }
+
+    // ── Sprint C: Add / FusedAddRmsNorm / FusedGateUp{Silu,Gelu}Mul
+
+    #[test]
+    fn lowers_add_minimal_shape() {
+        let mut b = MegaTapeBuilder::new(budget());
+        b.push_add(0, 1);
+        let tape = b.finish();
+        let MegaNode::Add(n) = &tape.nodes()[0] else {
+            panic!("expected Add");
+        };
+        assert_eq!(n.delta_page.raw(), 0);
+        assert_eq!(n.residual_page.raw(), 1);
+        assert_eq!(n.consumer_phase.phase(), 0);
+        assert_eq!(n.storer_phase.phase(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "PagePool::take: page id 1 already in use")]
+    fn add_rejects_self_aliasing() {
+        // delta_slot == residual_slot is bug class #2 (within-op
+        // alias) — the kernel would race-read its own write.
+        let mut b = MegaTapeBuilder::new(budget());
+        b.push_add(1, 1);
+    }
+
+    #[test]
+    fn add_advances_arrives_by_one() {
+        let mut b = MegaTapeBuilder::new(budget());
+        b.push_add(0, 1);
+        b.push_add(0, 1);
+        let tape = b.finish();
+        let MegaNode::Add(n0) = &tape.nodes()[0] else {
+            panic!("expected Add");
+        };
+        let MegaNode::Add(n1) = &tape.nodes()[1] else {
+            panic!("expected Add");
+        };
+        assert_eq!(n0.consumer_phase.phase(), 0);
+        assert_eq!(n0.storer_phase.phase(), 1);
+        assert_eq!(n1.consumer_phase.phase(), 1);
+        assert_eq!(n1.storer_phase.phase(), 0);
+    }
+
+    #[test]
+    fn lowers_fused_add_rms_norm_minimal() {
+        let mut b = MegaTapeBuilder::new(budget());
+        b.push_fused_add_rms_norm(0, 1, 2, 3, 16, "W::norm".to_string(), 0);
+        let tape = b.finish();
+        let MegaNode::FusedAddRmsNorm(n) = &tape.nodes()[0] else {
+            panic!("expected FusedAddRmsNorm");
+        };
+        assert_eq!(n.delta_page.raw(), 0);
+        assert_eq!(n.residual_page.raw(), 1);
+        assert_eq!(n.weight_page.raw(), 2);
+        assert_eq!(n.layer.raw(), 3);
+        assert_eq!(n.weight.path(), "W::norm");
+        assert_eq!(n.partial_sums.bytes(), 8 * 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "PagePool::take: page id 0 already in use")]
+    fn fused_add_rms_norm_rejects_aliasing_residual_with_delta() {
+        let mut b = MegaTapeBuilder::new(budget());
+        b.push_fused_add_rms_norm(0, 0, 2, 0, 16, "W".to_string(), 0);
+    }
+
+    fn mlp_budget() -> SubstrateBudget {
+        // Sprint C gate-up needs 3 pages and 2 disjoint MlpScope tiles
+        // (packed half+half within scratch).
+        SubstrateBudget::new(8, 8, 32_768, 4_096)
+    }
+
+    #[test]
+    fn lowers_fused_gate_up_silu_mul() {
+        let mut b = MegaTapeBuilder::new(mlp_budget());
+        b.push_fused_gate_up_activate_mul(
+            0,
+            1,
+            2,
+            5,
+            16,
+            "W::mlp_gate_up".to_string(),
+            /*iters=*/ 8,
+            0,
+            2_048,
+            2_048,
+            2_048,
+            GateUpActivation::Silu,
+        );
+        let tape = b.finish();
+        let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
+            panic!("expected FusedGateUpActivateMul");
+        };
+        assert_eq!(n.in_page.raw(), 0);
+        assert_eq!(n.gate_up_weight_page.raw(), 1);
+        assert_eq!(n.out_page.raw(), 2);
+        assert_eq!(n.iters.raw(), 8);
+        assert_eq!(n.gate_buf.bytes(), 2_048);
+        assert_eq!(n.up_buf.offset(), 2_048);
+        assert_eq!(n.activation, GateUpActivation::Silu);
+    }
+
+    #[test]
+    fn lowers_fused_gate_up_gelu_mul() {
+        let mut b = MegaTapeBuilder::new(mlp_budget());
+        b.push_fused_gate_up_activate_mul(
+            0,
+            1,
+            2,
+            5,
+            16,
+            "W::mlp_gate_up".to_string(),
+            4,
+            0,
+            2_048,
+            2_048,
+            2_048,
+            GateUpActivation::Gelu,
+        );
+        let tape = b.finish();
+        let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
+            panic!("expected FusedGateUpActivateMul");
+        };
+        assert_eq!(n.activation, GateUpActivation::Gelu);
+    }
+
+    #[test]
+    #[should_panic(expected = "ScratchRegion overlap within scope")]
+    fn gate_up_rejects_gate_up_scratch_overlap() {
+        let mut b = MegaTapeBuilder::new(mlp_budget());
+        b.push_fused_gate_up_activate_mul(
+            0,
+            1,
+            2,
+            0,
+            16,
+            "W".to_string(),
+            1,
+            0,
+            1_024,
+            512,
+            1_024,
+            GateUpActivation::Silu,
+        );
+    }
+
+    #[test]
+    fn lower_add_round_trip() {
+        let ops = vec![OpInput::new(Instruction::Add(0, 1), Vec::new())];
+        let tape = lower(&ops, 16, budget()).expect("good Add");
+        assert_eq!(tape.nodes().len(), 1);
+        let MegaNode::Add(_) = &tape.nodes()[0] else {
+            panic!("expected Add");
+        };
+    }
+
+    #[test]
+    fn lower_fused_add_rms_norm_round_trip() {
+        let ops = vec![OpInput::new(
+            Instruction::FusedAddRmsNorm(0, 1, 2),
+            vec!["W::norm".to_string()],
+        )];
+        let tape = lower(&ops, 16, budget()).expect("good FusedAddRmsNorm");
+        assert_eq!(tape.nodes().len(), 1);
+    }
+
+    #[test]
+    fn lower_fused_gate_up_silu_mul_round_trip() {
+        let mut op = OpInput::new(
+            Instruction::FusedGateUpSiluMul(0, 1, 7),
+            vec!["W::mlp_gate_up".to_string()],
+        );
+        op.iters = 8;
+        let tape = lower(&[op], 16, mlp_budget()).expect("good gate-up-silu-mul");
+        let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
+            panic!("expected FusedGateUpActivateMul");
+        };
+        assert_eq!(n.activation, GateUpActivation::Silu);
+        assert_eq!(n.iters.raw(), 8);
+    }
+
+    #[test]
+    fn lower_fused_gate_up_gelu_mul_round_trip() {
+        let mut op = OpInput::new(
+            Instruction::FusedGateUpGeluMul(0, 1, 7),
+            vec!["W::mlp_gate_up".to_string()],
+        );
+        op.iters = 4;
+        let tape = lower(&[op], 16, mlp_budget()).expect("good gate-up-gelu-mul");
+        let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
+            panic!("expected FusedGateUpActivateMul");
+        };
+        assert_eq!(n.activation, GateUpActivation::Gelu);
+        assert_eq!(n.iters.raw(), 4);
+    }
+
+    #[test]
+    fn lower_chains_add_rms_silu() {
+        // Mini transformer-block tail: residual fold → norm → MLP
+        // gate-up. Phase advance must thread through correctly.
+        let ops = vec![
+            OpInput::new(Instruction::Add(0, 1), Vec::new()),
+            OpInput::new(
+                Instruction::FusedAddRmsNorm(0, 1, 2),
+                vec!["W::norm".to_string()],
+            ),
+            {
+                let mut o = OpInput::new(
+                    Instruction::FusedGateUpSiluMul(0, 1, 5),
+                    vec!["W::mlp".to_string()],
+                );
+                o.iters = 4;
+                o
+            },
+        ];
+        let tape = lower(&ops, 16, mlp_budget()).expect("good chain");
+        assert_eq!(tape.nodes().len(), 3);
+        // Add: arrives 0 → 1 (one bump).
+        // FusedAddRmsNorm: arrives 1 → 2 (one bump).
+        // FusedGateUp*Mul iters=4: arrives 2 → 6 (four bumps).
+        // Phase parities of consumer: 0, 1, 0.
+        let phases: Vec<u32> = tape
+            .nodes()
+            .iter()
+            .map(|n| match n {
+                MegaNode::Add(a) => a.consumer_phase.phase(),
+                MegaNode::FusedAddRmsNorm(f) => f.consumer_phase.phase(),
+                MegaNode::FusedGateUpActivateMul(f) => f.consumer_phase.phase(),
+                MegaNode::RmsNorm(_) | MegaNode::FusedQkvRopeCache(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(phases, vec![0, 1, 0]);
     }
 }

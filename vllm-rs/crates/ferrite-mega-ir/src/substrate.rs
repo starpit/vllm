@@ -469,6 +469,17 @@ impl sealed::Sealed for RopeScope {}
 impl IsScratchScope for RopeScope {}
 impl IsScratchScopePub for RopeScope {}
 
+/// Scratch scope for `FusedGateUpSiluMul` / `FusedGateUpGeluMul` —
+/// the gate-up MLP fusion's per-token-iter gate / up activation
+/// tiles in shmem before the elementwise `silu(gate) * up` (or
+/// `gelu(gate) * up`) reduction. Sprint C's bug class #4: gate_buf
+/// and up_buf live concurrently inside one per-tok loop iter and
+/// must be `disjoint_with`-discharged.
+pub struct MlpScope;
+impl sealed::Sealed for MlpScope {}
+impl IsScratchScope for MlpScope {}
+impl IsScratchScopePub for MlpScope {}
+
 // ============================================================
 // IterCount — typed iteration count for per-iter phase math.
 // Construction enforces > 0 (a 0-iter op is meaningless and would

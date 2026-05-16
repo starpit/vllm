@@ -18,8 +18,8 @@
 #![allow(dead_code)]
 
 use crate::substrate::{
-    IterCount, MbarrierPhase, PageId, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER,
-    RmsNormScope, RopeScope, ScratchRegion, WarpRoleTag,
+    IterCount, MbarrierPhase, MlpScope, PageId, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER,
+    ROLE_STORER, RmsNormScope, RopeScope, ScratchRegion, WarpRoleTag,
 };
 
 /// Helper newtype: layer index for runtime weight-pointer
@@ -223,11 +223,148 @@ pub struct FusedQkvRopeCache {
     pub interleaved: bool,
 }
 
+/// The typed lowered `Add` (residual fold) variant.
+///
+/// `Instruction::Add(delta_slot, residual_slot)` semantics:
+/// `residual_slot += delta_slot` in place. The plan §10 calls this
+/// shape "DownProjResidual" because the down-projection's output is
+/// added back into the layer's residual stream; in the
+/// `Instruction` enum it's the universal element-wise residual fold
+/// (used after every MLP and attention block).
+///
+/// Substrate proofs (load-bearing):
+/// - `delta_page`, `residual_page`: two `PageId`s, each
+///   bounds-validated (#1) and lifecycle-walked Empty → Filled →
+///   Produced → Empty during construction (#2). Cross-op aliasing
+///   (#2 cross-op) is guarded by `PagePool::take`.
+/// - `consumer_phase`, `storer_phase`: parity-validated against
+///   the cumulative arrive count at op boundary (#3).
+/// - 4 `WarpRoleTag<R>`: the four roles claimed (#6). The `Add`
+///   kernel doesn't actually use a launcher (no TMA), but every
+///   variant claims all four for consistency — emit-side dispatch
+///   skips unused roles.
+///
+/// No scratch (element-wise add fits in registers; no shmem
+/// reduction). No weight (purely two-input). No iters (single
+/// op-level arrive).
+pub struct Add {
+    pub delta_page: PageId,
+    pub residual_page: PageId,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+}
+
+/// The typed lowered `FusedAddRmsNorm` variant.
+///
+/// `Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer)`
+/// semantics: `residual_slot += delta_slot; out = rms_norm(residual,
+/// weight[layer])` — the result lives back in `residual_slot`
+/// (in-place norm). Used as the pre-attention norm + folded prior
+/// residual (and the pre-MLP norm + folded attention residual) in
+/// every transformer layer.
+///
+/// Substrate proofs (load-bearing):
+/// - `delta_page`, `residual_page`, `weight_page`: three
+///   lifecycle-walked + bounds-validated `PageId`s (#1, #2).
+/// - `partial_sums`: per-iter cross-warp sum-of-squares reduction
+///   in `RmsNormScope` (sibling regions on a future RmsNorm op land
+///   in the same scope and get `disjoint_with`-discharged) — #4 +
+///   #5.
+/// - `consumer_phase`, `storer_phase`: #3.
+/// - 4 `WarpRoleTag<R>`: #6.
+///
+/// One op-level arrive (the kernel-internal per-token reduction
+/// folds into a single consumer arrive at the variant boundary).
+pub struct FusedAddRmsNorm {
+    pub delta_page: PageId,
+    pub residual_page: PageId,
+    pub weight_page: PageId,
+    pub partial_sums: ScratchRegion<RmsNormScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub layer: LayerIndex,
+    pub weight: WeightRef,
+}
+
+/// Activation choice for the gate-up MLP fusion. Two `Instruction`
+/// variants (`FusedGateUpSiluMul`, `FusedGateUpGeluMul`) lower to
+/// the same substrate shape — three pages, two disjoint
+/// `MlpScope` tiles, one weight (packed gate+up `LinearLayer`).
+/// The activation flag rides alongside as a helper field; emit
+/// picks the kernel template, no substrate consequences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GateUpActivation {
+    Silu,
+    Gelu,
+}
+
+/// The typed lowered `FusedGateUp{Silu,Gelu}Mul` variant.
+///
+/// Instruction semantics:
+/// `out = silu(gemm(in, gate_w)) * gemm(in, up_w)` (or `gelu` for
+/// the GeluMul peer). The `gate_w` and `up_w` are packed into a
+/// single `LinearLayer` accessor at load time; the kernel issues
+/// one cublas matmul and slices the output along the inner dim.
+///
+/// Substrate proofs (load-bearing):
+/// - `in_page`, `gate_up_weight_page`, `out_page`: three pages
+///   lifecycle-walked at construction (#1, #2). Aliasing across
+///   them (in == out, in == weight, …) is rejected by `PagePool`.
+/// - `gate_buf`, `up_buf`: two per-tok-iter activation tiles in
+///   `MlpScope`, validated `disjoint_with` at construction (#4)
+///   and each within budget (#5).
+/// - `consumer_phase`, `storer_phase`: per-iter boundary parity
+///   (#3 boundary; per-iter math falls out the same way as Sprint
+///   B's Rope — `(C+t)&1 == (C&1)^(t&1)`).
+/// - `iters`: per-token iteration count. The kernel issues two
+///   gemms + one elementwise activate-mul per iter, with one
+///   consumer arrive per iter; cumulative arrive count advances
+///   by `iters.raw()`.
+/// - 4 `WarpRoleTag<R>`: #6.
+///
+/// Helper fields:
+/// - `layer`, `weight` (packed `gate_up`).
+/// - `activation`: `Silu` or `Gelu`.
+pub struct FusedGateUpActivateMul {
+    pub in_page: PageId,
+    pub gate_up_weight_page: PageId,
+    pub out_page: PageId,
+    pub gate_buf: ScratchRegion<MlpScope>,
+    pub up_buf: ScratchRegion<MlpScope>,
+    pub consumer_phase: MbarrierPhase,
+    pub storer_phase: MbarrierPhase,
+    pub iters: IterCount,
+    pub _loader_role: WarpRoleTag<ROLE_LOADER>,
+    pub _launcher_role: WarpRoleTag<ROLE_LAUNCHER>,
+    pub _consumer_role: WarpRoleTag<ROLE_CONSUMER>,
+    pub _storer_role: WarpRoleTag<ROLE_STORER>,
+    pub layer: LayerIndex,
+    pub weight: WeightRef,
+    pub activation: GateUpActivation,
+}
+
 /// The typed lowered MegaNode enum. One variant per migrated op.
 ///
-/// Sprint A populates `RmsNorm`. Sprint B adds `FusedQkvRopeCache`.
+/// - Sprint A: `RmsNorm`.
+/// - Sprint B: `FusedQkvRopeCache`.
+/// - Sprint C: `Add`, `FusedAddRmsNorm`, `FusedGateUpSiluMul` and
+///   `FusedGateUpGeluMul` (both lower to
+///   `FusedGateUpActivateMul`, distinguished by the
+///   `activation: GateUpActivation` field).
+///
 /// Subsequent sprints add the rest per the plan §10 table.
 pub enum MegaNode {
     RmsNorm(RmsNorm),
     FusedQkvRopeCache(FusedQkvRopeCache),
+    Add(Add),
+    FusedAddRmsNorm(FusedAddRmsNorm),
+    FusedGateUpActivateMul(FusedGateUpActivateMul),
 }

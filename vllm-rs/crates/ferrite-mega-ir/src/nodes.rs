@@ -829,7 +829,8 @@ impl ScalarMul {
         const {
             assert!(IN_ID < NUM_PAGES, "ScalarMul: IN_ID OOB");
             assert!(OUT_ID < NUM_PAGES, "ScalarMul: OUT_ID OOB");
-            assert!(IN_ID != OUT_ID, "ScalarMul: page alias");
+            // ScalarMul is elementwise; in-place (IN_ID == OUT_ID) is
+            // a valid substrate pattern (gemma2 post-attn `* hidden`).
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
                 "ScalarMul: CONSUMER_PHASE parity"
@@ -882,7 +883,8 @@ impl TanhSoftCap {
         const {
             assert!(IN_ID < NUM_PAGES, "TanhSoftCap: IN_ID OOB");
             assert!(OUT_ID < NUM_PAGES, "TanhSoftCap: OUT_ID OOB");
-            assert!(IN_ID != OUT_ID, "TanhSoftCap: page alias");
+            // TanhSoftCap is elementwise; in-place (IN_ID == OUT_ID) is
+            // a valid substrate pattern (gemma2 final logit cap).
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
                 "TanhSoftCap: CONSUMER_PHASE parity"

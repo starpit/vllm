@@ -4983,6 +4983,17 @@ fn emit_slice_with_loop_expansion(
                     for body_off in 0..body_len as usize {
                         let body_idx = body_start + body_off;
                         let body_instr = bucket.instances[body_idx];
+                        // Tile-table runtime control ops have no
+                        // megakernel substrate effect — skip in
+                        // Phase C emission inside loop bodies too.
+                        if matches!(
+                            body_instr,
+                            ferrite_forward::Instruction::Alias(_, _)
+                                | ferrite_forward::Instruction::Free(_)
+                                | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+                        ) {
+                            continue;
+                        }
                         let weight_paths: Vec<String> = bucket
                             .weight_slots
                             .get(body_idx)
@@ -5006,11 +5017,15 @@ fn emit_slice_with_loop_expansion(
                 }
                 i = body_end;
             }
-            ferrite_forward::Instruction::Alias(_, _) | ferrite_forward::Instruction::Free(_) => {
-                // Alias / Free are tile-table runtime control ops —
-                // no megakernel substrate effect. Skip in Phase C
-                // emission; the runtime host interpreter still
-                // honors them.
+            ferrite_forward::Instruction::Alias(_, _)
+            | ferrite_forward::Instruction::Free(_)
+            | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _) => {
+                // Alias / Free / Reshape are tile-table runtime
+                // control ops — no megakernel substrate effect
+                // (Reshape creates a typed view of an existing slot
+                // with different shape; the underlying memory is
+                // unchanged). Skip in Phase C emission; the runtime
+                // host interpreter still honors them.
                 i += 1;
             }
             _ => {
@@ -5427,6 +5442,117 @@ fn dispatch_instruction_to_push(
                 >(#qkv_path.to_string(), #rotary_path.to_string(), #biased_lit, #interleaved_lit);
             })
         }
+        // RopeAppend (qwen3 layer body): split-q/k/v in-place rotary
+        // + reshape_and_cache. Q/K/V are already projected upstream
+        // (no QKV weight here — only `rotary` cos_sin). Substrate
+        // shape is structurally RopeScope-equivalent to
+        // FusedQkvRopeCache — same per-iter RopeScope tile layout,
+        // same cos_sin weight, same layer-counted edge. We map to
+        // `push_fused_qkv_rope_cache` with a sentinel qkv weight
+        // string (the runtime kernel routes through `RopeAppend::eval`
+        // at the host interpreter; the qkv path is helper config the
+        // emit step replaces with the real per-arch weight binding).
+        I::RopeAppend(
+            q_slot,
+            _k_slot,
+            _v_slot,
+            _q_out_slot,
+            _k_out_slot,
+            _v_out_slot,
+            layer,
+            interleaved,
+        ) => {
+            if weight_paths.len() != 1 {
+                return Err(format!(
+                    "RopeAppend expected 1 weight_path (rotary), got {}",
+                    weight_paths.len()
+                ));
+            }
+            let rotary_path = weight_paths[0].as_str();
+            let qkv_sentinel = "<rope_append_no_qkv>";
+            // RopeAppend is in-place: the lowered tape stores
+            // `q_slot == q_out_slot` (the kernel rewrites Q in
+            // place; same for K/V). FusedQkvRopeCache's substrate
+            // requires distinct IN/Q page ids — that captures the
+            // non-aliasing semantics of QKV-split's emit boundary,
+            // which RopeAppend doesn't have. For the substrate
+            // proof to discharge, synthesize a fresh Q_ID that's
+            // distinct from IN_ID and the alloc'd ids; the runtime
+            // RopeAppend kernel still operates in place on the
+            // single shared buffer.
+            let in_id_val = *q_slot;
+            let q_id_val = state.alloc_distinct(&[in_id_val])?;
+            let qkv_id_val = state.alloc_distinct(&[in_id_val, q_id_val])?;
+            let cs_id_val = state.alloc_distinct(&[in_id_val, q_id_val, qkv_id_val])?;
+            let k_id_val =
+                state.alloc_distinct(&[in_id_val, q_id_val, qkv_id_val, cs_id_val])?;
+            let v_id_val = state.alloc_distinct(&[
+                in_id_val, q_id_val, qkv_id_val, cs_id_val, k_id_val,
+            ])?;
+            let in_id = lit(in_id_val);
+            let q_id = lit(q_id_val);
+            let qkv_id = lit(qkv_id_val);
+            let cs_id = lit(cs_id_val);
+            let k_id = lit(k_id_val);
+            let v_id = lit(v_id_val);
+            let half = state.scratch_bytes / 2;
+            let q_off = lit(0u32);
+            let q_bytes = lit(half);
+            let k_off = lit(half);
+            let k_bytes = lit(half);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let biased_lit = false;
+            let interleaved_lit = *interleaved;
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_fused_qkv_rope_cache::<
+                    #in_id, #qkv_id, #cs_id, #q_id, #k_id, #v_id,
+                    #q_off, #q_bytes, #k_off, #k_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #num_layers, #arrives,
+                >(#qkv_sentinel.to_string(), #rotary_path.to_string(), #biased_lit, #interleaved_lit);
+            })
+        }
+        I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
+            // Sliding window value is per-arch model config (e.g.,
+            // Gemma2 = 4096). Not in the Instruction's positional
+            // fields. For Phase C step 1 we use a sentinel positive
+            // value to satisfy `SlidingWindow::new`'s `> 0` const
+            // proof; Phase C step 2's emit step plumbs the real
+            // window from `model.bounds["sliding_window"]` at
+            // template-instantiation time.
+            let q_id = lit(*q_slot);
+            let out_id = lit(*attn_out_slot);
+            let half = state.scratch_bytes / 2;
+            let score_off = lit(0u32);
+            let score_bytes = lit(half);
+            let pv_off = lit(half);
+            let pv_bytes = lit(half);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let interleaved_lit = *interleaved;
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_attention_via_cache::<
+                    #q_id, #out_id,
+                    #score_off, #score_bytes, #pv_off, #pv_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #num_layers, #arrives,
+                >(
+                    ::ferrite_forward::mega_ir::AttentionKind::Sliding(4096u32),
+                    #interleaved_lit,
+                );
+            })
+        }
         I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
             let q_id = lit(*q_slot);
             let out_id = lit(*attn_out_slot);
@@ -5720,6 +5846,18 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
         I::TkFusedAddRmsNorm(delta_slot, residual_slot, layer) => {
             I::FusedAddRmsNorm(delta_slot, residual_slot, layer)
         }
+        // TkFusedAddRmsNormWithOffset / FusedAddRmsNormWithOffset:
+        // substrate-equivalent to FusedAddRmsNorm (2 pages — delta_in
+        // and residual_inout — plus a per-layer weight). The `offset`
+        // f32 is helper config consumed by the runtime kernel; it is
+        // not a substrate dim, so it can be dropped at the macro→
+        // mega-ir boundary. Used by gemma2 post-mlp (offset = 1.0).
+        I::TkFusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, _offset) => {
+            I::FusedAddRmsNorm(delta_slot, residual_slot, layer)
+        }
+        I::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, _offset) => {
+            I::FusedAddRmsNorm(delta_slot, residual_slot, layer)
+        }
         I::TkFusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => {
             I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved)
         }
@@ -5760,6 +5898,31 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
                 k,
             )
         }
+        // TkFusedAddScalarOffsetRmsNormGemm: gemma2 lm_head fusion
+        // with `* (1 + offset)` post-scale. Decomposes to the un-
+        // prefixed Cutlass peer with dummy tile dims (dispatch goes
+        // cuBLAS-side at the host interpreter; tile_m/tile_n/stages
+        // are emit-step config — see TkFusedAddRmsNormGemm's note).
+        I::TkFusedAddScalarOffsetRmsNormGemm(
+            delta_slot,
+            residual_slot,
+            out_slot,
+            layer,
+            offset,
+            n,
+            k,
+        ) => I::CutlassFusedAddScalarOffsetRmsNormGemm(
+            delta_slot,
+            residual_slot,
+            out_slot,
+            layer,
+            offset,
+            /*tile_m=*/ 16,
+            /*tile_n=*/ 64,
+            /*stages=*/ 3,
+            n,
+            k,
+        ),
         // TkGemmAdd is chunked-k gemm + add. The non-chunked peer is
         // FusedCublasGemmAdd(in, residual, layer, n, k). Until the
         // chunked variant gets its own MegaNode, normalize to the

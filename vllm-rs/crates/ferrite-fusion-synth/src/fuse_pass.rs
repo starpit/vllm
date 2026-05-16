@@ -56,6 +56,19 @@ fn format_msl_float(v: f32) -> String {
     format!("{:?}", v)
 }
 
+/// `metal_kittens.h` carries `#pragma once` so it's safe to `#include`
+/// from kernel sources. When we inline it into a synthesized main-TU
+/// `.metal` file, `xcrun metal` warns `#pragma once in main file
+/// [-Wpragma-once-outside-header]`. Strip the pragma at inline time —
+/// each synthesized source is its own TU and inlines the header once.
+fn inline_header(header: &str) -> String {
+    header
+        .lines()
+        .filter(|l| l.trim() != "#pragma once")
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Clone, Debug)]
 pub struct ChunkConstants {
     pub hidden:        u32,
@@ -455,9 +468,9 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     // synthesized source. The header contains literal `{`/`}` which
     // would crash `format!` — so we concatenate raw (no format!) into
     // the source prefix below.
-    let mk_header = include_str!(
+    let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
-    );
+    ));
     let source = format!(
         "// SPDX-License-Identifier: Apache-2.0\n\
          //\n\
@@ -700,9 +713,9 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         eps_lit = format_msl_float(consts.rms_norm_eps),
     );
 
-    let mk_header = include_str!(
+    let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
-    );
+    ));
     let source = format!(
         "// SPDX-License-Identifier: Apache-2.0\n\
          //\n\
@@ -961,7 +974,7 @@ void {symbol}(
     // metal_kittens.h is included unchanged — do NOT add simdgroup_matrix
     // code to that header or all synth kernels will be recompiled.
     // This kernel includes <metal_simdgroup_matrix> directly in its header.
-    let mk_header = include_str!("../../ferrite-metal-kernels/shaders/metal_kittens.h");
+    let mk_header = inline_header(include_str!("../../ferrite-metal-kernels/shaders/metal_kittens.h"));
     let source = format!(
         "// SPDX-License-Identifier: Apache-2.0\n// SYNTHESIZED KERNEL — do not hand-edit.\n\n\
          #include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\n\

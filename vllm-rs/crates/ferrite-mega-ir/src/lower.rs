@@ -253,6 +253,16 @@ impl<
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const HEAD_DIM: u32,
+        const NUM_Q_HEADS: u32,
+        const NUM_KV_HEADS: u32,
+        const IN_ACT_SLOT: u32,
+        const Q_OUT_ACT_SLOT: u32,
+        const K_OUT_ACT_SLOT: u32,
+        const V_OUT_ACT_SLOT: u32,
+        const QKV_WEIGHT_ACCESSOR_IDX: u32,
+        const ROTARY_ACCESSOR_IDX: u32,
     >(
         &mut self,
         qkv_weight_path: String,
@@ -288,6 +298,16 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
+            HIDDEN_DIM,
+            HEAD_DIM,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            IN_ACT_SLOT,
+            Q_OUT_ACT_SLOT,
+            K_OUT_ACT_SLOT,
+            V_OUT_ACT_SLOT,
+            QKV_WEIGHT_ACCESSOR_IDX,
+            ROTARY_ACCESSOR_IDX,
         >(qkv_weight, rotary, biased, interleaved);
         self.nodes.push(MegaNode::FusedQkvRopeCache(node));
         self.pool.release(IN_ID);
@@ -399,7 +419,10 @@ impl<
         self
     }
 
-    /// Push a typed `FusedGateUp{Silu,Gelu}Mul`.
+    /// Push a typed `FusedGateUp{Silu,Gelu}Mul`. Adds HIDDEN_DIM /
+    /// INTERMEDIATE_DIM / NUM_TOKENS / IN_ACT_SLOT / OUT_ACT_SLOT /
+    /// WEIGHT_ACCESSOR_IDX const generics for the kernel-AST emit
+    /// (per `MEGA_IR_PLAN.md` §0/§4a).
     #[allow(clippy::too_many_arguments)]
     pub fn push_fused_gate_up_activate_mul<
         const IN_ID: u32,
@@ -415,6 +438,12 @@ impl<
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const INTERMEDIATE_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         weight_path: String,
@@ -441,6 +470,12 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
+            HIDDEN_DIM,
+            INTERMEDIATE_DIM,
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
         >(weight, activation);
         self.nodes.push(MegaNode::FusedGateUpActivateMul(node));
         self.pool.release(IN_ID);
@@ -1078,7 +1113,10 @@ mod tests {
         // 6 distinct page ids, q_off+q_bytes=2048, k_off=2048+k_bytes=4096,
         // disjoint, within 8192 SCRATCH_BYTES, ITERS=4, LAYER=0,
         // NUM_LAYERS=16, ARRIVES=0, CONSUMER_PHASE=0, STORER_PHASE=1.
-        b.push_fused_qkv_rope_cache::<0, 1, 2, 3, 4, 5, 0, 2048, 2048, 2048, 0, 1, 4, 0, 16, 0>(
+        b.push_fused_qkv_rope_cache::<
+            0, 1, 2, 3, 4, 5, 0, 2048, 2048, 2048, 0, 1, 4, 0, 16, 0,
+            2048, 64, 32, 8, 0, 1, 2, 3, 0, 1,
+        >(
             "W::qkv".to_string(),
             "W::rot".to_string(),
             true,
@@ -1141,7 +1179,10 @@ mod tests {
         let mut b = Builder8::new();
         // IN=0, WEIGHT=1, OUT=2, gate(0,2048), up(2048,2048),
         // phases (0,1), ITERS=8, LAYER=5, NUM_LAYERS=16, ARRIVES=0.
-        b.push_fused_gate_up_activate_mul::<0, 1, 2, 0, 2048, 2048, 2048, 0, 1, 8, 5, 16, 0>(
+        b.push_fused_gate_up_activate_mul::<
+            0, 1, 2, 0, 2048, 2048, 2048, 0, 1, 8, 5, 16, 0,
+            2048, 8192, 8, 0, 2, 0,
+        >(
             "W::mlp".to_string(),
             GateUpActivation::Silu,
         );
@@ -1151,6 +1192,12 @@ mod tests {
         };
         assert_eq!(n.iters(), 8);
         assert_eq!(n.activation, GateUpActivation::Silu);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.intermediate_dim(), 8192);
+        assert_eq!(n.num_tokens(), 8);
+        assert_eq!(n.in_act_slot(), 0);
+        assert_eq!(n.out_act_slot(), 2);
+        assert_eq!(n.weight_accessor_idx(), 0);
     }
 
     #[test]

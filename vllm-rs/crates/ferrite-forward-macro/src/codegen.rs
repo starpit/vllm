@@ -5578,18 +5578,27 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let intermediate_dim = lit(state.intermediate_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_fused_gate_up_activate_mul::<
                     #in_id, #weight_id, #out_id,
                     #gate_off, #gate_bytes, #up_off, #up_bytes,
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #num_layers, #arrives,
+                    #hidden_dim, #intermediate_dim, #num_tokens,
+                    #in_act_slot, #out_act_slot, #weight_accessor_idx,
                 >(#weight_str.to_string(), #activation_path);
             })
         }
-        I::FusedQkvRopeCache(in_slot, _out_slot, layer, biased, interleaved) => {
+        I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => {
             if weight_paths.len() != 2 {
                 return Err(format!(
                     "FusedQkvRopeCache expected 2 weight_paths (qkv, rotary), got {}",
@@ -5615,15 +5624,34 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            // Kernel-AST const generics. The fused Q/K/V outputs are
+            // staged at successive act_ptrs[] indices starting at
+            // `out_slot` (Q/K/V rows are written into a single
+            // contiguous projection write — out_slot+0=Q, +1=K, +2=V
+            // by convention; the per-arch weight/slot map confirms).
+            let hidden_dim = lit(state.hidden_dim);
+            let head_dim = lit(state.head_dim);
+            let num_q_heads = lit(state.num_q_heads);
+            let num_kv_heads = lit(state.num_kv_heads);
+            let in_act_slot = lit(*in_slot);
+            let q_out_act_slot = lit(*out_slot);
+            let k_out_act_slot = lit(out_slot.wrapping_add(1));
+            let v_out_act_slot = lit(out_slot.wrapping_add(2));
+            let qkv_weight_accessor_idx = lit(state.next_weight_accessor);
+            let rotary_accessor_idx = lit(state.next_weight_accessor + 1);
             let biased_lit = *biased;
             let interleaved_lit = *interleaved;
             state.arrives += 1;
+            state.next_weight_accessor += 2;
             Ok(quote! {
                 b.push_fused_qkv_rope_cache::<
                     #in_id, #qkv_id, #cs_id, #q_id, #k_id, #v_id,
                     #q_off, #q_bytes, #k_off, #k_bytes,
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #num_layers, #arrives,
+                    #hidden_dim, #head_dim, #num_q_heads, #num_kv_heads,
+                    #in_act_slot, #q_out_act_slot, #k_out_act_slot, #v_out_act_slot,
+                    #qkv_weight_accessor_idx, #rotary_accessor_idx,
                 >(#qkv_path.to_string(), #rotary_path.to_string(), #biased_lit, #interleaved_lit);
             })
         }
@@ -5691,15 +5719,35 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let head_dim = lit(state.head_dim);
+            let num_q_heads = lit(state.num_q_heads);
+            let num_kv_heads = lit(state.num_kv_heads);
+            // RopeAppend is in-place; in_slot == q_out, plus k/v
+            // contiguously assigned by canonical's slot map.
+            let in_act_slot = lit(in_id_val);
+            let q_out_act_slot = lit(in_id_val);
+            let k_out_act_slot = lit(in_id_val.wrapping_add(1));
+            let v_out_act_slot = lit(in_id_val.wrapping_add(2));
+            // Sentinel weight accessor for the no-qkv RopeAppend path
+            // (the runtime kernel ignores qkv_weight; only rotary
+            // matters). Accessor still bumps so subsequent ops see
+            // the right index.
+            let qkv_weight_accessor_idx = lit(state.next_weight_accessor);
+            let rotary_accessor_idx = lit(state.next_weight_accessor + 1);
             let biased_lit = false;
             let interleaved_lit = *interleaved;
             state.arrives += 1;
+            state.next_weight_accessor += 2;
             Ok(quote! {
                 b.push_fused_qkv_rope_cache::<
                     #in_id, #qkv_id, #cs_id, #q_id, #k_id, #v_id,
                     #q_off, #q_bytes, #k_off, #k_bytes,
                     #consumer_phase, #storer_phase,
                     #iters, #layer_lit, #num_layers, #arrives,
+                    #hidden_dim, #head_dim, #num_q_heads, #num_kv_heads,
+                    #in_act_slot, #q_out_act_slot, #k_out_act_slot, #v_out_act_slot,
+                    #qkv_weight_accessor_idx, #rotary_accessor_idx,
                 >(#qkv_sentinel.to_string(), #rotary_path.to_string(), #biased_lit, #interleaved_lit);
             })
         }

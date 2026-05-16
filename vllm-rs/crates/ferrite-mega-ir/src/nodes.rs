@@ -363,6 +363,11 @@ impl RmsNorm {
 }
 
 /// The typed lowered FusedQkvRopeCache variant.
+///
+/// Kernel ABI: `ferrite::ops::fused_qkv_rope_cache::{loader,
+/// consumer, launcher, storer}<Config, HIDDEN_DIM, HEAD_DIM,
+/// NUM_Q_HEADS, NUM_KV_HEADS, BIASED, INTERLEAVED>` in
+/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/fused_qkv_rope_cache.cuh`.
 pub struct FusedQkvRopeCache {
     in_page_id: u32,
     qkv_weight_page_id: u32,
@@ -378,6 +383,16 @@ pub struct FusedQkvRopeCache {
     storer_phase: u32,
     iters: u32,
     layer: u32,
+    hidden_dim: u32,
+    head_dim: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    in_act_slot: u32,
+    q_out_act_slot: u32,
+    k_out_act_slot: u32,
+    v_out_act_slot: u32,
+    qkv_weight_accessor_idx: u32,
+    rotary_accessor_idx: u32,
     pub qkv_weight: WeightRef,
     pub rotary: RotaryRef,
     pub biased: bool,
@@ -389,6 +404,13 @@ impl FusedQkvRopeCache {
     /// compile time. Six page bounds, six pairwise non-aliases,
     /// two scratch within-budget, two scratch disjoint, two phase
     /// parities, layer in range, iters > 0.
+    ///
+    /// Kernel-AST const generics (per `MEGA_IR_PLAN.md` §0/§4a):
+    /// HIDDEN_DIM, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS — kernel
+    /// template args. IN_ACT_SLOT, Q_OUT_ACT_SLOT, K_OUT_ACT_SLOT,
+    /// V_OUT_ACT_SLOT, QKV_WEIGHT_ACCESSOR_IDX,
+    /// ROTARY_ACCESSOR_IDX — host-slot indices for `act_ptrs[]` /
+    /// `weight_ptrs[]` / cos-sin gmem ptr.
     #[allow(clippy::too_many_arguments)]
     pub const fn new<
         const IN_ID: u32,
@@ -409,6 +431,16 @@ impl FusedQkvRopeCache {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const HEAD_DIM: u32,
+        const NUM_Q_HEADS: u32,
+        const NUM_KV_HEADS: u32,
+        const IN_ACT_SLOT: u32,
+        const Q_OUT_ACT_SLOT: u32,
+        const K_OUT_ACT_SLOT: u32,
+        const V_OUT_ACT_SLOT: u32,
+        const QKV_WEIGHT_ACCESSOR_IDX: u32,
+        const ROTARY_ACCESSOR_IDX: u32,
     >(
         qkv_weight: WeightRef,
         rotary: RotaryRef,
@@ -481,6 +513,16 @@ impl FusedQkvRopeCache {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "FusedQkvRopeCache: STORER_PHASE parity mismatch"
             );
+            assert!(HIDDEN_DIM > 0, "FusedQkvRopeCache: HIDDEN_DIM must be > 0");
+            assert!(HEAD_DIM > 0, "FusedQkvRopeCache: HEAD_DIM must be > 0");
+            assert!(
+                NUM_Q_HEADS > 0,
+                "FusedQkvRopeCache: NUM_Q_HEADS must be > 0"
+            );
+            assert!(
+                NUM_KV_HEADS > 0,
+                "FusedQkvRopeCache: NUM_KV_HEADS must be > 0"
+            );
         }
         Self {
             in_page_id: IN_ID,
@@ -497,6 +539,16 @@ impl FusedQkvRopeCache {
             storer_phase: STORER_PHASE,
             iters: ITERS,
             layer: LAYER,
+            hidden_dim: HIDDEN_DIM,
+            head_dim: HEAD_DIM,
+            num_q_heads: NUM_Q_HEADS,
+            num_kv_heads: NUM_KV_HEADS,
+            in_act_slot: IN_ACT_SLOT,
+            q_out_act_slot: Q_OUT_ACT_SLOT,
+            k_out_act_slot: K_OUT_ACT_SLOT,
+            v_out_act_slot: V_OUT_ACT_SLOT,
+            qkv_weight_accessor_idx: QKV_WEIGHT_ACCESSOR_IDX,
+            rotary_accessor_idx: ROTARY_ACCESSOR_IDX,
             qkv_weight,
             rotary,
             biased,
@@ -545,6 +597,36 @@ impl FusedQkvRopeCache {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+    pub const fn num_q_heads(&self) -> u32 {
+        self.num_q_heads
+    }
+    pub const fn num_kv_heads(&self) -> u32 {
+        self.num_kv_heads
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn q_out_act_slot(&self) -> u32 {
+        self.q_out_act_slot
+    }
+    pub const fn k_out_act_slot(&self) -> u32 {
+        self.k_out_act_slot
+    }
+    pub const fn v_out_act_slot(&self) -> u32 {
+        self.v_out_act_slot
+    }
+    pub const fn qkv_weight_accessor_idx(&self) -> u32 {
+        self.qkv_weight_accessor_idx
+    }
+    pub const fn rotary_accessor_idx(&self) -> u32 {
+        self.rotary_accessor_idx
     }
 }
 
@@ -769,6 +851,11 @@ impl FusedAddRmsNorm {
 }
 
 /// The typed lowered `FusedGateUp{Silu,Gelu}Mul` variant.
+///
+/// Kernel ABI: `ferrite::ops::silu_upgate::{loader, consumer,
+/// launcher, storer}<Config, HIDDEN_DIM, INTERMEDIATE_DIM,
+/// NUM_TOKENS>` (silu) / `ferrite::ops::gelu_upgate::...` (gelu) in
+/// `silu_upgate.cuh` / `gelu_upgate.cuh`.
 pub struct FusedGateUpActivateMul {
     in_page_id: u32,
     gate_up_weight_page_id: u32,
@@ -781,6 +868,12 @@ pub struct FusedGateUpActivateMul {
     storer_phase: u32,
     iters: u32,
     layer: u32,
+    hidden_dim: u32,
+    intermediate_dim: u32,
+    num_tokens: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor_idx: u32,
     pub weight: WeightRef,
     pub activation: GateUpActivation,
 }
@@ -803,6 +896,12 @@ impl FusedGateUpActivateMul {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const INTERMEDIATE_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         weight: WeightRef,
         activation: GateUpActivation,
@@ -839,6 +938,12 @@ impl FusedGateUpActivateMul {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "FusedGateUp: STORER_PHASE parity mismatch",
             );
+            assert!(HIDDEN_DIM > 0, "FusedGateUp: HIDDEN_DIM must be > 0");
+            assert!(
+                INTERMEDIATE_DIM > 0,
+                "FusedGateUp: INTERMEDIATE_DIM must be > 0"
+            );
+            assert!(NUM_TOKENS > 0, "FusedGateUp: NUM_TOKENS must be > 0");
         }
         Self {
             in_page_id: IN_ID,
@@ -852,6 +957,12 @@ impl FusedGateUpActivateMul {
             storer_phase: STORER_PHASE,
             iters: ITERS,
             layer: LAYER,
+            hidden_dim: HIDDEN_DIM,
+            intermediate_dim: INTERMEDIATE_DIM,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            out_act_slot: OUT_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
             weight,
             activation,
         }
@@ -889,6 +1000,24 @@ impl FusedGateUpActivateMul {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn intermediate_dim(&self) -> u32 {
+        self.intermediate_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
     }
 }
 

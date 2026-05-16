@@ -1749,11 +1749,25 @@ fn lower_one<W: CanonicalParams>(
         // Dispatch matches `AttentionPrefillSdpa` (1 Q per
         // threadgroup, head on grid X, Q on grid Y, 1024 threads).
         I::AttentionPrefillPaged(q_slot, out_slot, layer, _interleaved) => {
-            // Steel-attention paged kernel — opt-in via env var while
-            // we debug the bisected coherence regression
-            // (commit df84c658d). Default path is the sdpa_vector port
-            // ("attention_prefill_sdpa_v2_paged_*") which is known
-            // correct.
+            // Steel-attention paged kernel — MLX FA-2 algorithm with
+            // simdgroup_matrix MMAs (BQ=32, BK=16, BD=128, WM=4). Wins
+            // big over the sdpa_vector port for prefill, but at small
+            // bucket_m a BQ=32 tile wastes most of its work, so we
+            // default-route to SDPA there and steel for bucket_m≥32.
+            //
+            // FERRITE_METAL_STEEL_ATTN overrides:
+            //   unset / "1" / "auto"  → bucket_m ≥ 32
+            //   "0" / "off"           → force SDPA everywhere
+            //   "force" / "always"    → force steel everywhere (small-M
+            //                           is correct, just wasteful)
+            //
+            // Earlier comment claimed a "bisected coherence regression
+            // (df84c658d)" — verified false: steel and SDPA emit
+            // identical output at every M tested (incl. 2..64 + the
+            // BQ=32 / BQ+1 boundary). The "garbage" cited in the bisect
+            // was Llama-3.2-3B-Instruct degenerating on bare /v1/
+            // completions prompts; same behavior on both kernels and
+            // on mlx_lm.server.
             //
             // The four (kernel, dtype) combinations are typed ZSTs in
             // `super::kernel_identity`; routing through `for_kernel<K>`
@@ -1765,8 +1779,12 @@ fn lower_one<W: CanonicalParams>(
                 AttentionSteelPagedBf16, AttentionSteelPagedF16,
             };
             let n_q_heads = W::NUM_Q_HEADS;
-            let use_steel = std::env::var_os("FERRITE_METAL_STEEL_ATTN").is_some();
             const BQ_STEEL: u32 = 32;
+            let use_steel = match std::env::var("FERRITE_METAL_STEEL_ATTN").ok().as_deref() {
+                Some("0") | Some("off") | Some("false") => false,
+                Some("force") | Some("always") => true,
+                _ => bucket_m >= BQ_STEEL,
+            };
             let (tg_shape, threads_per_tg, m_scale_axis) = if use_steel {
                 let nq_blocks = bucket_m.div_ceil(BQ_STEEL);
                 (

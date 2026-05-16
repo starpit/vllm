@@ -628,10 +628,9 @@ impl CudaModel {
                 };
                 // Build per-token seqused_k for mega path. Sized [num_tokens]
                 // with causal lengths so mega prefill works correctly.
-                let mut per_token_seq_lens: Vec<i32> =
-                    Vec::with_capacity(num_tokens as usize);
-                if let Some((q_lens_host, seq_lens_host)) = mm_inputs
-                    .map(|_| (Vec::<usize>::new(), Vec::<usize>::new()))
+                let mut per_token_seq_lens: Vec<i32> = Vec::with_capacity(num_tokens as usize);
+                if let Some((q_lens_host, seq_lens_host)) =
+                    mm_inputs.map(|_| (Vec::<usize>::new(), Vec::<usize>::new()))
                 {
                     let _ = (q_lens_host, seq_lens_host);
                 }
@@ -657,15 +656,15 @@ impl CudaModel {
                     }
                 }
                 let per_token_owned = {
-                    let t = device.caching.alloc_tensor(&[per_token_seq_lens.len()], GpuDType::I32);
-                    unsafe {
-                        driver::memcpy_htod_async(
-                            t.as_gpu_tensor().raw_ptr(),
-                            per_token_seq_lens.as_ptr() as *const u8,
-                            per_token_seq_lens.len() * 4,
-                            device.compute_stream,
-                        )
-                    }
+                    let t = device
+                        .caching
+                        .alloc_tensor(&[per_token_seq_lens.len()], GpuDType::I32);
+                    driver::memcpy_htod_async(
+                        t.as_gpu_tensor().raw_ptr(),
+                        per_token_seq_lens.as_ptr() as *const u8,
+                        per_token_seq_lens.len() * 4,
+                        device.compute_stream,
+                    )
                     .expect("per-token seq_lens H2D failed");
                     t
                 };
@@ -688,16 +687,20 @@ impl CudaModel {
                     0
                 };
                 let num_tokens_usize: usize = num_tokens as usize;
-                let bt_per_token_owned = if bt_stride > 0 && (max_seqlen_q > 1 || num_tokens_usize != src_rows) {
-                    let t = device.caching.alloc_tensor(
-                        &[num_tokens_usize, bt_stride], GpuDType::I32,
-                    );
-                    let row_bytes: usize = bt_stride * 4;
-                    unsafe {
+                let bt_per_token_owned =
+                    if bt_stride > 0 && (max_seqlen_q > 1 || num_tokens_usize != src_rows) {
+                        let t = device
+                            .caching
+                            .alloc_tensor(&[num_tokens_usize, bt_stride], GpuDType::I32);
+                        let row_bytes: usize = bt_stride * 4;
                         for tok in 0..num_tokens_usize {
                             // For prefill (src_rows == 1), every token reads row 0.
                             // For batched decode (src_rows == num_tokens), 1:1.
-                            let src_row = if src_rows == 1 { 0usize } else { tok.min(src_rows - 1) };
+                            let src_row = if src_rows == 1 {
+                                0usize
+                            } else {
+                                tok.min(src_rows - 1)
+                            };
                             driver::memcpy_dtod_async(
                                 t.as_gpu_tensor().raw_ptr().add(tok * row_bytes),
                                 block_table.raw_ptr().add(src_row * row_bytes),
@@ -706,11 +709,10 @@ impl CudaModel {
                             )
                             .expect("per-token block_table D2D failed");
                         }
-                    }
-                    Some(t)
-                } else {
-                    None
-                };
+                        Some(t)
+                    } else {
+                        None
+                    };
                 // Pick the block_table view: per-token if we built one
                 // (prefill case), per-batch otherwise (batched-decode/decode).
                 let block_table_for_ctx = match &bt_per_token_owned {
@@ -2054,7 +2056,10 @@ pub struct CudaWorker {
     /// Persistent-decode session (FERRITE_PD=1). Owns the pinned
     /// protocol buffer and GPU activation tensors across decode steps.
     /// None when inactive (PD disabled, batch changed, non-Ferrite model).
-    persistent_decode_session: Option<(ferrite_forward::interpreter::mega::PersistentDecodeSession, String)>,
+    persistent_decode_session: Option<(
+        ferrite_forward::interpreter::mega::PersistentDecodeSession,
+        String,
+    )>,
 }
 
 // Safety: CudaWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -2332,8 +2337,15 @@ impl CudaWorker {
         // Step 2: Prepare GPU inputs.
         let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
         let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
-        let (slot_mapping, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k, _seqused_k_per_token) =
-            Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+        let (
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            _seqused_k_per_token,
+        ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
 
         // For prefills, compute last_token_indices.
         let last_token_indices = if num_reqs < total_tokens {
@@ -8118,22 +8130,25 @@ impl CudaWorker {
                 let req_id = prepared.req_inputs[0].req_id.clone();
 
                 // Tear down session when request changes.
-                if self.persistent_decode_session.as_ref().is_some_and(|(_, id)| id != &req_id) {
-                    if let Some((mut sess, _)) = self.persistent_decode_session.take() {
-                        unsafe { sess.request_stop() };
-                        // Sync stream so the kernel has exited before pinned
-                        // protocol buffer is freed in PersistentDecodeSession::drop.
-                        let _ = device.sync_compute();
-                    }
+                if self
+                    .persistent_decode_session
+                    .as_ref()
+                    .is_some_and(|(_, id)| id != &req_id)
+                    && let Some((sess, _)) = self.persistent_decode_session.take()
+                {
+                    unsafe { sess.request_stop() };
+                    // Sync stream so the kernel has exited before pinned
+                    // protocol buffer is freed in PersistentDecodeSession::drop.
+                    let _ = device.sync_compute();
                 }
 
                 // Start fresh session on first step (PersistentDecodeSession::alloc on error → fall through).
-                if self.persistent_decode_session.is_none() {
-                    if let Ok(sess) = unsafe {
+                if self.persistent_decode_session.is_none()
+                    && let Ok(sess) = unsafe {
                         ferrite_forward::interpreter::mega::PersistentDecodeSession::alloc()
-                    } {
-                        self.persistent_decode_session = Some((sess, req_id.clone()));
                     }
+                {
+                    self.persistent_decode_session = Some((sess, req_id.clone()));
                 }
 
                 if let Some((ref mut session, _)) = self.persistent_decode_session {
@@ -8158,15 +8173,18 @@ impl CudaWorker {
                     };
 
                     let (
-                        slot_mapping_single, cu_seqlens_q, seqused_k,
-                        block_table_gpu, _, max_seqlen_k_pd, _seqused_k_per_token,
+                        slot_mapping_single,
+                        cu_seqlens_q,
+                        seqused_k,
+                        block_table_gpu,
+                        _,
+                        max_seqlen_k_pd,
+                        _seqused_k_per_token,
                     ) = Self::build_attention_tensors(meta, block_size, device)?;
-                    let gpu_input_ids =
-                        Self::h2d_u32(&[step_ctx.input_id], device)
-                            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
-                    let gpu_positions =
-                        Self::h2d_u32(&[step_ctx.position], device)
-                            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                    let gpu_input_ids = Self::h2d_u32(&[step_ctx.input_id], device)
+                        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                    let gpu_positions = Self::h2d_u32(&[step_ctx.position], device)
+                        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
                     if let CudaModel::Ferrite(m) = model {
                         let ctx = ferrite_forward::ForwardCtx {
@@ -8205,7 +8223,10 @@ impl CudaWorker {
                             let next_token = session.last_output_token;
                             let req_slice = &prepared.req_inputs[0];
                             self.input_batch.commit_step(
-                                &req_id, &[next_token], req_slice.token_count, false,
+                                &req_id,
+                                &[next_token],
+                                req_slice.token_count,
+                                false,
                             );
                             if let Some(buf) = self.token_buffers.get_mut(&req_id) {
                                 buf.push(next_token);
@@ -8213,8 +8234,7 @@ impl CudaWorker {
                             self.input_batch.reclaim_buffers(prepared);
                             let mut output = ModelRunnerOutput::empty();
                             output.req_ids = vec![req_id.clone()];
-                            output.req_id_to_index =
-                                std::collections::HashMap::from([(req_id, 0)]);
+                            output.req_id_to_index = std::collections::HashMap::from([(req_id, 0)]);
                             output.sampled_token_ids = vec![vec![next_token]];
                             return Ok(output);
                         }
@@ -8225,7 +8245,7 @@ impl CudaWorker {
                 && (!pd_enabled || !is_decode || num_reqs != 1)
             {
                 // Batch changed or PD disabled — tear down cleanly.
-                if let Some((mut sess, _)) = self.persistent_decode_session.take() {
+                if let Some((sess, _)) = self.persistent_decode_session.take() {
                     unsafe { sess.request_stop() };
                     // Sync stream so the kernel has exited before pinned
                     // protocol buffer is freed in PersistentDecodeSession::drop.
@@ -8292,25 +8312,24 @@ impl CudaWorker {
                     }
 
                     let initial_token = prepared.flat_token_ids[0];
-                    let mut input_ids_multi_host = vec![initial_token; multi_step_n + 1];
+                    let input_ids_multi_host = vec![initial_token; multi_step_n + 1];
                     let output_token_ids_buf_size = multi_step_n;
 
                     // H2D uploads for per-step arrays.
-                    let gpu_input_ids_multi =
-                        Self::h2d_u32(&input_ids_multi_host, device)
-                            .map_err(|e| {
-                                ExecutorError::WorkerExecution(format!(
-                                    "multi-step input_ids_multi H2D: {e}"
-                                ))
-                            })?;
+                    let gpu_input_ids_multi = Self::h2d_u32(&input_ids_multi_host, device)
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "multi-step input_ids_multi H2D: {e}"
+                            ))
+                        })?;
                     let gpu_positions_multi =
                         Self::h2d_u32(&positions_host, device).map_err(|e| {
                             ExecutorError::WorkerExecution(format!(
                                 "multi-step positions_multi H2D: {e}"
                             ))
                         })?;
-                    let gpu_slot_mapping_multi =
-                        Self::h2d_i64(&slot_mapping_host, device).map_err(|e| {
+                    let gpu_slot_mapping_multi = Self::h2d_i64(&slot_mapping_host, device)
+                        .map_err(|e| {
                             ExecutorError::WorkerExecution(format!(
                                 "multi-step slot_mapping_multi H2D: {e}"
                             ))
@@ -8322,10 +8341,9 @@ impl CudaWorker {
                             ))
                         })?;
                     // Output token IDs: zero-init device buffer [num_steps] u32.
-                    let gpu_output_token_ids = device.caching.alloc_tensor(
-                        &[output_token_ids_buf_size * 4],
-                        GpuDType::U8,
-                    );
+                    let gpu_output_token_ids = device
+                        .caching
+                        .alloc_tensor(&[output_token_ids_buf_size * 4], GpuDType::U8);
                     unsafe {
                         driver::memset_d8(
                             gpu_output_token_ids.raw_ptr(),
@@ -8352,15 +8370,14 @@ impl CudaWorker {
                     ) = Self::build_attention_tensors(meta, block_size, device)?;
 
                     // Single-token input for the initial step's ForwardCtx fields.
-                    let gpu_input_ids_step = Self::h2d_u32(&[initial_token], device).map_err(
-                        |e| {
+                    let gpu_input_ids_step =
+                        Self::h2d_u32(&[initial_token], device).map_err(|e| {
                             ExecutorError::WorkerExecution(format!(
                                 "multi-step input_ids_step H2D: {e}"
                             ))
-                        },
-                    )?;
-                    let gpu_positions_step =
-                        Self::h2d_u32(&[tokens_before as u32], device).map_err(|e| {
+                        })?;
+                    let gpu_positions_step = Self::h2d_u32(&[tokens_before as u32], device)
+                        .map_err(|e| {
                             ExecutorError::WorkerExecution(format!(
                                 "multi-step positions_step H2D: {e}"
                             ))
@@ -8425,9 +8442,7 @@ impl CudaWorker {
                                 })?;
                         }
                         device.sync_d2h().map_err(|e| {
-                            ExecutorError::WorkerExecution(format!(
-                                "multi-step sync_d2h: {e}"
-                            ))
+                            ExecutorError::WorkerExecution(format!("multi-step sync_d2h: {e}"))
                         })?;
 
                         tracing::debug!(

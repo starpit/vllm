@@ -547,5 +547,4 @@ mod tests {
     fn mbarrier_phase_assert_mismatches_panics() {
         let _ = MbarrierPhase::assert_matches(0, 5);
     }
-
 }

@@ -533,7 +533,9 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // discovery time. A stub is detected by the first 30-ish lines
     // containing the marker; reading the whole file is unnecessary.
     fn is_error_stub(path: &std::path::Path) -> bool {
-        let Ok(s) = std::fs::read_to_string(path) else { return false; };
+        let Ok(s) = std::fs::read_to_string(path) else {
+            return false;
+        };
         // Only scan the head — emitted stubs put the `#error` line
         // early (line ~12). Cap at 4 KiB so a genuine long .cu
         // doesn't pay the full-scan cost.
@@ -547,7 +549,7 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // when NCW=16 makes the monolithic kernel too large for the PTX optimizer.
     let model_filter: Option<Vec<String>> = std::env::var("FERRITE_MODELS").ok().map(|v| {
         v.split(',')
-            .map(|m| m.trim().replace('-', "_").replace('.', "_"))
+            .map(|m| m.trim().replace(['-', '.'], "_"))
             .collect()
     });
     println!("cargo:rerun-if-env-changed=FERRITE_MODELS");
@@ -560,8 +562,12 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "cu"))
             .filter(|e| !is_error_stub(&e.path()))
             .filter(|e| {
-                let Some(ref models) = model_filter else { return true; };
-                let stem = e.path().file_stem()
+                let Some(ref models) = model_filter else {
+                    return true;
+                };
+                let stem = e
+                    .path()
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .trim_start_matches("ferrite_")

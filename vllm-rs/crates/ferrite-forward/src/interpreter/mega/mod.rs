@@ -845,11 +845,15 @@ pub unsafe fn dispatch_launch(
         LaunchFnAny::MultiStep(_) => {
             // MultiStep kernels use launch_multi_step(), not dispatch_launch().
             // Callers that hold a MultiStep fn should call launch_multi_step directly.
-            panic!("dispatch_launch: MultiStep variant requires launch_multi_step(), not dispatch_launch()");
+            panic!(
+                "dispatch_launch: MultiStep variant requires launch_multi_step(), not dispatch_launch()"
+            );
         }
         LaunchFnAny::PersistentDecode(_) => {
             // PersistentDecode kernels are managed by PersistentDecodeSession, not dispatch_launch().
-            panic!("dispatch_launch: PersistentDecode variant is managed by PersistentDecodeSession");
+            panic!(
+                "dispatch_launch: PersistentDecode variant is managed by PersistentDecodeSession"
+            );
         }
     }
 }
@@ -922,29 +926,37 @@ pub mod protocol_layout {
 /// Unsafe helper: volatile write u32 at byte offset into pinned buffer.
 #[inline(always)]
 unsafe fn proto_write_u32(buf: *mut u8, offset: usize, val: u32) {
-    let p = buf.add(offset) as *mut u32;
-    p.write_volatile(val);
+    unsafe {
+        let p = buf.add(offset) as *mut u32;
+        p.write_volatile(val);
+    }
 }
 
 /// Unsafe helper: volatile write i32.
 #[inline(always)]
 unsafe fn proto_write_i32(buf: *mut u8, offset: usize, val: i32) {
-    let p = buf.add(offset) as *mut i32;
-    p.write_volatile(val);
+    unsafe {
+        let p = buf.add(offset) as *mut i32;
+        p.write_volatile(val);
+    }
 }
 
 /// Unsafe helper: volatile write i64.
 #[inline(always)]
 unsafe fn proto_write_i64(buf: *mut u8, offset: usize, val: i64) {
-    let p = buf.add(offset) as *mut i64;
-    p.write_volatile(val);
+    unsafe {
+        let p = buf.add(offset) as *mut i64;
+        p.write_volatile(val);
+    }
 }
 
 /// Unsafe helper: volatile read u32.
 #[inline(always)]
 unsafe fn proto_read_u32(buf: *const u8, offset: usize) -> u32 {
-    let p = buf.add(offset) as *const u32;
-    p.read_volatile()
+    unsafe {
+        let p = buf.add(offset) as *const u32;
+        p.read_volatile()
+    }
 }
 
 /// CPU-side manager for a persistent decode kernel session.
@@ -965,7 +977,6 @@ pub struct PersistentDecodeSession {
     /// Pinned (page-locked) protocol buffer.
     /// Layout: `protocol_layout::PROTOCOL_BYTES` bytes.
     protocol: *mut u8,
-    protocol_capacity: usize,
     /// Monotonically increasing step counter (CPU side).
     step: u32,
     /// GPU-side tensors held alive for the persistent kernel.
@@ -990,16 +1001,15 @@ impl PersistentDecodeSession {
     pub unsafe fn alloc() -> Result<Self, i32> {
         use protocol_layout::PROTOCOL_BYTES;
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let rc = cuda_malloc_host(&mut ptr, PROTOCOL_BYTES);
+        let rc = unsafe { cuda_malloc_host(&mut ptr, PROTOCOL_BYTES) };
         if rc != 0 {
             return Err(rc);
         }
         let buf = ptr as *mut u8;
         // Zero-initialize the protocol buffer. cpu_step=0, gpu_step=0, stop_flag=0.
-        std::ptr::write_bytes(buf, 0, PROTOCOL_BYTES);
+        unsafe { std::ptr::write_bytes(buf, 0, PROTOCOL_BYTES) };
         Ok(Self {
             protocol: buf,
-            protocol_capacity: PROTOCOL_BYTES,
             step: 0,
             #[cfg(feature = "cuda")]
             resources: None,
@@ -1035,18 +1045,20 @@ impl PersistentDecodeSession {
     ) {
         use protocol_layout::*;
         let p = self.protocol;
-        proto_write_u32(p, OFFSET_INPUT_IDS, input_id);
-        proto_write_u32(p, OFFSET_POSITIONS, position);
-        proto_write_i32(p, OFFSET_SEQ_LENS, seq_len);
-        proto_write_i64(p, OFFSET_SLOT_MAPPING, slot_mapping);
-        proto_write_u32(p, OFFSET_BLOCK_TABLE_STRIDE, block_table_stride);
-        let n = block_ids.len().min(MAX_BLOCKS);
-        for (i, &bid) in block_ids[..n].iter().enumerate() {
-            proto_write_u32(p, OFFSET_BLOCK_TABLE + i * 4, bid);
-        }
-        // Zero-pad entries beyond actual page count.
-        for i in n..block_table_stride.min(MAX_BLOCKS as u32) as usize {
-            proto_write_u32(p, OFFSET_BLOCK_TABLE + i * 4, 0);
+        unsafe {
+            proto_write_u32(p, OFFSET_INPUT_IDS, input_id);
+            proto_write_u32(p, OFFSET_POSITIONS, position);
+            proto_write_i32(p, OFFSET_SEQ_LENS, seq_len);
+            proto_write_i64(p, OFFSET_SLOT_MAPPING, slot_mapping);
+            proto_write_u32(p, OFFSET_BLOCK_TABLE_STRIDE, block_table_stride);
+            let n = block_ids.len().min(MAX_BLOCKS);
+            for (i, &bid) in block_ids[..n].iter().enumerate() {
+                proto_write_u32(p, OFFSET_BLOCK_TABLE + i * 4, bid);
+            }
+            // Zero-pad entries beyond actual page count.
+            for i in n..block_table_stride.min(MAX_BLOCKS as u32) as usize {
+                proto_write_u32(p, OFFSET_BLOCK_TABLE + i * 4, 0);
+            }
         }
     }
 
@@ -1059,7 +1071,7 @@ impl PersistentDecodeSession {
     pub unsafe fn signal_cpu_step(&mut self) {
         use protocol_layout::OFFSET_CPU_STEP;
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-        proto_write_u32(self.protocol, OFFSET_CPU_STEP, self.step + 1);
+        unsafe { proto_write_u32(self.protocol, OFFSET_CPU_STEP, self.step + 1) };
     }
 
     /// Spin-poll until gpu_step > current step. Returns the greedy
@@ -1072,11 +1084,11 @@ impl PersistentDecodeSession {
     pub unsafe fn poll_output_token(&mut self) -> u32 {
         use protocol_layout::{OFFSET_GPU_STEP, OFFSET_OUTPUT_TOKENS};
         loop {
-            let gpu_step = proto_read_u32(self.protocol, OFFSET_GPU_STEP);
+            let gpu_step = unsafe { proto_read_u32(self.protocol, OFFSET_GPU_STEP) };
             if gpu_step > self.step {
                 // Acquire fence: see kernel's writes to output_tokens.
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-                let token = proto_read_u32(self.protocol, OFFSET_OUTPUT_TOKENS);
+                let token = unsafe { proto_read_u32(self.protocol, OFFSET_OUTPUT_TOKENS) };
                 self.step += 1;
                 self.last_output_token = token;
                 return token;
@@ -1096,11 +1108,11 @@ impl PersistentDecodeSession {
     /// calls are safe.
     pub unsafe fn request_stop(&self) {
         use protocol_layout::{OFFSET_CPU_STEP, OFFSET_STOP_FLAG};
-        proto_write_u32(self.protocol, OFFSET_STOP_FLAG, 1);
+        unsafe { proto_write_u32(self.protocol, OFFSET_STOP_FLAG, 1) };
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         // Bump cpu_step to wake the kernel from wait_for_cpu_step.
         // Without this the kernel spins forever and never sees stop_flag.
-        proto_write_u32(self.protocol, OFFSET_CPU_STEP, self.step + 1);
+        unsafe { proto_write_u32(self.protocol, OFFSET_CPU_STEP, self.step + 1) };
     }
 }
 
@@ -1141,7 +1153,9 @@ unsafe fn cuda_free_host(ptr: *mut std::ffi::c_void) -> i32 {
     unsafe { cudaFreeHost(ptr) }
 }
 #[cfg(not(feature = "cuda"))]
-unsafe fn cuda_free_host(_ptr: *mut std::ffi::c_void) -> i32 { 0 }
+unsafe fn cuda_free_host(_ptr: *mut std::ffi::c_void) -> i32 {
+    0
+}
 
 // ============================================================
 
@@ -1318,11 +1332,28 @@ mod tests {
         assert_eq!(LaunchFnAny::Attn(stub_attn).tier(), LaunchTier::Attn);
         // MultiStep tier
         unsafe extern "C" fn stub_ms(
-            _a: ActPtrs, _b: WeightPtrs, _c: *mut u32, _d: U32Ptr, _e: I64Ptr,
-            _f: KvPtrs, _g: KvPtrs, _h: I32Ptr, _i: U32Ptr, _j: u32,
-            _k: I32MutPtr, _l: i32, _m: i32, _n: *mut u32, _s: *mut std::ffi::c_void,
-        ) -> i32 { 0 }
-        assert_eq!(LaunchFnAny::MultiStep(stub_ms).tier(), LaunchTier::MultiStep);
+            _a: ActPtrs,
+            _b: WeightPtrs,
+            _c: *mut u32,
+            _d: U32Ptr,
+            _e: I64Ptr,
+            _f: KvPtrs,
+            _g: KvPtrs,
+            _h: I32Ptr,
+            _i: U32Ptr,
+            _j: u32,
+            _k: I32MutPtr,
+            _l: i32,
+            _m: i32,
+            _n: *mut u32,
+            _s: *mut std::ffi::c_void,
+        ) -> i32 {
+            0
+        }
+        assert_eq!(
+            LaunchFnAny::MultiStep(stub_ms).tier(),
+            LaunchTier::MultiStep
+        );
     }
 
     // `dispatch_launch` calls the fn pointer matching the tier of

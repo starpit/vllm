@@ -757,7 +757,6 @@ mod dispatcher {
             device: &mut GpuDevice,
             num_tokens: u64,
         ) -> OwnedTensor;
-
     }
 
     /// Minimal HF-config view threaded into `try_load` so per-variant
@@ -1103,7 +1102,7 @@ mod dispatcher {
 #[cfg(feature = "cuda")]
 pub use dispatcher::{
     EmbedPatch, FerriteArchRegistration, FerriteMmRegistration, FerriteWeights, HfFingerprint,
-    MmTryLoadFn, MultimodalForward, PixelInput, PersistentDecodeResources, resolve_mm_metadata,
+    MmTryLoadFn, MultimodalForward, PersistentDecodeResources, PixelInput, resolve_mm_metadata,
     try_load, try_load_mm,
 };
 

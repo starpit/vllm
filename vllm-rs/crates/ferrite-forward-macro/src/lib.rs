@@ -43,8 +43,6 @@ mod quantization;
 mod schedule;
 mod shape;
 mod solver;
-mod tape;
-mod tape_claim;
 mod target;
 mod tk_impls;
 mod tp_lowering;
@@ -1167,7 +1165,6 @@ fn compile_common(
             canonical_override.as_ref(),
             sm.tp_world_size,
             mode.emit_arch_dispatch,
-            &target_profile,
         );
         let stub_items = &sm.stub_items;
         // Vision arch glue: per-variant `VisionArchWeights` impl,

@@ -148,6 +148,15 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let a = lit_u32(a);
             quote! { SpliceMmEmbeds(#a) }
         }
+        I::BarrierSignal(a) => {
+            let a = lit_u32(a);
+            quote! { BarrierSignal(#a) }
+        }
+        I::BarrierWait(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { BarrierWait(#a, #b) }
+        }
         I::ScalarMul(a, b, c) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -212,6 +221,19 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let h = lit_u32(h);
             let i = lit_u32(i);
             quote! { CutlassFusedAddRmsNormGemm(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+        }
+        I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g, h, i, j) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_f32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            let j = lit_u32(j);
+            quote! { CutlassFusedAddScalarOffsetRmsNormGemm(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j) }
         }
         I::Gemm(a, b, c, d, e) => {
             let a = lit_u32(a);
@@ -671,6 +693,133 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let e = lit_u32(e);
             quote! { Fp8FusedQkvRopePrefill(#a, #b, #c, #d, #e) }
         }
+        I::TkEmbed(a) => {
+            let a = lit_u32(a);
+            quote! { TkEmbed(#a) }
+        }
+        I::TkScalarMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_f32(c);
+            quote! { TkScalarMul(#a, #b, #c) }
+        }
+        I::TkRmsNorm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { TkRmsNorm(#a, #b, #c) }
+        }
+        I::TkGemm(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { TkGemm(#a, #b, #c, #d, #e) }
+        }
+        I::TkFusedAddRmsNorm(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { TkFusedAddRmsNorm(#a, #b, #c) }
+        }
+        I::TkFusedQkvRopeCache(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            let e = lit_bool(e);
+            quote! { TkFusedQkvRopeCache(#a, #b, #c, #d, #e) }
+        }
+        I::TkAttentionViaCache(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            quote! { TkAttentionViaCache(#a, #b, #c, #d) }
+        }
+        I::TkSlidingAttentionViaCache(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            let e = lit_u32(e);
+            quote! { TkSlidingAttentionViaCache(#a, #b, #c, #d, #e) }
+        }
+        I::TkFusedGateUpSiluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { TkFusedGateUpSiluMul(#a, #b, #c) }
+        }
+        I::TkFusedGateUpGeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { TkFusedGateUpGeluMul(#a, #b, #c) }
+        }
+        I::TkGemmAdd(a, b, c, d, e, f, g) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            quote! { TkGemmAdd(#a, #b, #c, #d, #e, #f, #g) }
+        }
+        I::TkFusedAddRmsNormGemm(a, b, c, d, e, f) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            quote! { TkFusedAddRmsNormGemm(#a, #b, #c, #d, #e, #f) }
+        }
+        I::TkScalarOffsetRmsNorm(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_f32(d);
+            quote! { TkScalarOffsetRmsNorm(#a, #b, #c, #d) }
+        }
+        I::TkFusedAddRmsNormWithOffset(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_f32(d);
+            quote! { TkFusedAddRmsNormWithOffset(#a, #b, #c, #d) }
+        }
+        I::TkTanhSoftCap(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { TkTanhSoftCap(#a, #b, #c) }
+        }
+        I::TkFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_f32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            quote! { TkFusedAddScalarOffsetRmsNormGemm(#a, #b, #c, #d, #e, #f, #g) }
+        }
+        I::TkBarrierSignal(a) => {
+            let a = lit_u32(a);
+            quote! { TkBarrierSignal(#a) }
+        }
+        I::TkBarrierWait(a, b) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            quote! { TkBarrierWait(#a, #b) }
+        }
+        I::TkSpliceMmEmbeds(a) => {
+            let a = lit_u32(a);
+            quote! { TkSpliceMmEmbeds(#a) }
+        }
         I::Loop(a, b) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -705,6 +854,8 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         #[cfg(feature = "nccl")]
         I::AllGather(..) => "AllGather",
         I::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
+        I::BarrierSignal(..) => "BarrierSignal",
+        I::BarrierWait(..) => "BarrierWait",
         I::ScalarMul(..) => "ScalarMul",
         I::TanhSoftCap(..) => "TanhSoftCap",
         I::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
@@ -713,6 +864,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::CutlassFusedRmsNormGemm(..) => "CutlassFusedRmsNormGemm",
         I::CutlassFusedMeanSubRmsNormGemm(..) => "CutlassFusedMeanSubRmsNormGemm",
         I::CutlassFusedAddRmsNormGemm(..) => "CutlassFusedAddRmsNormGemm",
+        I::CutlassFusedAddScalarOffsetRmsNormGemm(..) => "CutlassFusedAddScalarOffsetRmsNormGemm",
         I::Gemm(..) => "Gemm",
         I::FusedCublasGemmAdd(..) => "FusedCublasGemmAdd",
         I::FusedGemmBias(..) => "FusedGemmBias",
@@ -776,6 +928,25 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::Fp8FusedGateUpGeluMul(..) => "Fp8FusedGateUpGeluMul",
         I::Fp8FusedQkvRopeCache(..) => "Fp8FusedQkvRopeCache",
         I::Fp8FusedQkvRopePrefill(..) => "Fp8FusedQkvRopePrefill",
+        I::TkEmbed(..) => "TkEmbed",
+        I::TkScalarMul(..) => "TkScalarMul",
+        I::TkRmsNorm(..) => "TkRmsNorm",
+        I::TkGemm(..) => "TkGemm",
+        I::TkFusedAddRmsNorm(..) => "TkFusedAddRmsNorm",
+        I::TkFusedQkvRopeCache(..) => "TkFusedQkvRopeCache",
+        I::TkAttentionViaCache(..) => "TkAttentionViaCache",
+        I::TkSlidingAttentionViaCache(..) => "TkSlidingAttentionViaCache",
+        I::TkFusedGateUpSiluMul(..) => "TkFusedGateUpSiluMul",
+        I::TkFusedGateUpGeluMul(..) => "TkFusedGateUpGeluMul",
+        I::TkGemmAdd(..) => "TkGemmAdd",
+        I::TkFusedAddRmsNormGemm(..) => "TkFusedAddRmsNormGemm",
+        I::TkScalarOffsetRmsNorm(..) => "TkScalarOffsetRmsNorm",
+        I::TkFusedAddRmsNormWithOffset(..) => "TkFusedAddRmsNormWithOffset",
+        I::TkTanhSoftCap(..) => "TkTanhSoftCap",
+        I::TkFusedAddScalarOffsetRmsNormGemm(..) => "TkFusedAddScalarOffsetRmsNormGemm",
+        I::TkBarrierSignal(..) => "TkBarrierSignal",
+        I::TkBarrierWait(..) => "TkBarrierWait",
+        I::TkSpliceMmEmbeds(..) => "TkSpliceMmEmbeds",
         I::Loop(..) => "Loop",
         I::Alias(..) => "Alias",
         I::Free(..) => "Free",
@@ -840,6 +1011,15 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             0 => u(a),
             _ => None,
         },
+        I::BarrierSignal(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::BarrierWait(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
         I::ScalarMul(a, b, _) => match idx {
             0 => u(a),
             1 => u(b),
@@ -900,6 +1080,18 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             6 => u(g),
             7 => u(h),
             8 => u(i),
+            _ => None,
+        },
+        I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, _, f, g, h, i, j) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            9 => u(j),
             _ => None,
         },
         I::Gemm(a, b, c, d, e) => match idx {
@@ -1344,6 +1536,125 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             4 => u(e),
             _ => None,
         },
+        I::TkEmbed(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::TkScalarMul(a, b, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::TkRmsNorm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkGemm(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::TkFusedAddRmsNorm(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkFusedQkvRopeCache(a, b, c, _, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkAttentionViaCache(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkSlidingAttentionViaCache(a, b, c, _, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            4 => u(e),
+            _ => None,
+        },
+        I::TkFusedGateUpSiluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkFusedGateUpGeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkGemmAdd(a, b, c, d, e, f, g) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            _ => None,
+        },
+        I::TkFusedAddRmsNormGemm(a, b, c, d, e, f) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            _ => None,
+        },
+        I::TkScalarOffsetRmsNorm(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkFusedAddRmsNormWithOffset(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkTanhSoftCap(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
+        I::TkFusedAddScalarOffsetRmsNormGemm(a, b, c, d, _, f, g) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            5 => u(f),
+            6 => u(g),
+            _ => None,
+        },
+        I::TkBarrierSignal(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::TkBarrierWait(a, b) => match idx {
+            0 => u(a),
+            1 => u(b),
+            _ => None,
+        },
+        I::TkSpliceMmEmbeds(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
         I::Loop(a, b) => match idx {
             0 => u(a),
             1 => u(b),
@@ -1416,6 +1727,15 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             0 => I::SpliceMmEmbeds(n),
             _ => panic!("SpliceMmEmbeds: bad idx {idx}"),
         },
+        I::BarrierSignal(_a) => match idx {
+            0 => I::BarrierSignal(n),
+            _ => panic!("BarrierSignal: bad idx {idx}"),
+        },
+        I::BarrierWait(a, b) => match idx {
+            0 => I::BarrierWait(n, b),
+            1 => I::BarrierWait(a, n),
+            _ => panic!("BarrierWait: bad idx {idx}"),
+        },
         I::ScalarMul(a, b, c) => match idx {
             0 => I::ScalarMul(n, b, c),
             1 => I::ScalarMul(a, n, c),
@@ -1477,6 +1797,18 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             7 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, n, i),
             8 => I::CutlassFusedAddRmsNormGemm(a, b, c, d, e, f, g, h, n),
             _ => panic!("CutlassFusedAddRmsNormGemm: bad idx {idx}"),
+        },
+        I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g, h, i, j) => match idx {
+            0 => I::CutlassFusedAddScalarOffsetRmsNormGemm(n, b, c, d, e, f, g, h, i, j),
+            1 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, n, c, d, e, f, g, h, i, j),
+            2 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, n, d, e, f, g, h, i, j),
+            3 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, n, e, f, g, h, i, j),
+            5 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, n, g, h, i, j),
+            6 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, n, h, i, j),
+            7 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g, n, i, j),
+            8 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g, h, n, j),
+            9 => I::CutlassFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g, h, i, n),
+            _ => panic!("CutlassFusedAddScalarOffsetRmsNormGemm: bad idx {idx}"),
         },
         I::Gemm(a, b, c, d, e) => match idx {
             0 => I::Gemm(n, b, c, d, e),
@@ -1917,6 +2249,125 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             3 => I::Fp8FusedQkvRopePrefill(a, b, c, n, e),
             4 => I::Fp8FusedQkvRopePrefill(a, b, c, d, n),
             _ => panic!("Fp8FusedQkvRopePrefill: bad idx {idx}"),
+        },
+        I::TkEmbed(_a) => match idx {
+            0 => I::TkEmbed(n),
+            _ => panic!("TkEmbed: bad idx {idx}"),
+        },
+        I::TkScalarMul(a, b, c) => match idx {
+            0 => I::TkScalarMul(n, b, c),
+            1 => I::TkScalarMul(a, n, c),
+            _ => panic!("TkScalarMul: bad idx {idx}"),
+        },
+        I::TkRmsNorm(a, b, c) => match idx {
+            0 => I::TkRmsNorm(n, b, c),
+            1 => I::TkRmsNorm(a, n, c),
+            2 => I::TkRmsNorm(a, b, n),
+            _ => panic!("TkRmsNorm: bad idx {idx}"),
+        },
+        I::TkGemm(a, b, c, d, e) => match idx {
+            0 => I::TkGemm(n, b, c, d, e),
+            1 => I::TkGemm(a, n, c, d, e),
+            2 => I::TkGemm(a, b, n, d, e),
+            3 => I::TkGemm(a, b, c, n, e),
+            4 => I::TkGemm(a, b, c, d, n),
+            _ => panic!("TkGemm: bad idx {idx}"),
+        },
+        I::TkFusedAddRmsNorm(a, b, c) => match idx {
+            0 => I::TkFusedAddRmsNorm(n, b, c),
+            1 => I::TkFusedAddRmsNorm(a, n, c),
+            2 => I::TkFusedAddRmsNorm(a, b, n),
+            _ => panic!("TkFusedAddRmsNorm: bad idx {idx}"),
+        },
+        I::TkFusedQkvRopeCache(a, b, c, d, e) => match idx {
+            0 => I::TkFusedQkvRopeCache(n, b, c, d, e),
+            1 => I::TkFusedQkvRopeCache(a, n, c, d, e),
+            2 => I::TkFusedQkvRopeCache(a, b, n, d, e),
+            _ => panic!("TkFusedQkvRopeCache: bad idx {idx}"),
+        },
+        I::TkAttentionViaCache(a, b, c, d) => match idx {
+            0 => I::TkAttentionViaCache(n, b, c, d),
+            1 => I::TkAttentionViaCache(a, n, c, d),
+            2 => I::TkAttentionViaCache(a, b, n, d),
+            _ => panic!("TkAttentionViaCache: bad idx {idx}"),
+        },
+        I::TkSlidingAttentionViaCache(a, b, c, d, e) => match idx {
+            0 => I::TkSlidingAttentionViaCache(n, b, c, d, e),
+            1 => I::TkSlidingAttentionViaCache(a, n, c, d, e),
+            2 => I::TkSlidingAttentionViaCache(a, b, n, d, e),
+            4 => I::TkSlidingAttentionViaCache(a, b, c, d, n),
+            _ => panic!("TkSlidingAttentionViaCache: bad idx {idx}"),
+        },
+        I::TkFusedGateUpSiluMul(a, b, c) => match idx {
+            0 => I::TkFusedGateUpSiluMul(n, b, c),
+            1 => I::TkFusedGateUpSiluMul(a, n, c),
+            2 => I::TkFusedGateUpSiluMul(a, b, n),
+            _ => panic!("TkFusedGateUpSiluMul: bad idx {idx}"),
+        },
+        I::TkFusedGateUpGeluMul(a, b, c) => match idx {
+            0 => I::TkFusedGateUpGeluMul(n, b, c),
+            1 => I::TkFusedGateUpGeluMul(a, n, c),
+            2 => I::TkFusedGateUpGeluMul(a, b, n),
+            _ => panic!("TkFusedGateUpGeluMul: bad idx {idx}"),
+        },
+        I::TkGemmAdd(a, b, c, d, e, f, g) => match idx {
+            0 => I::TkGemmAdd(n, b, c, d, e, f, g),
+            1 => I::TkGemmAdd(a, n, c, d, e, f, g),
+            2 => I::TkGemmAdd(a, b, n, d, e, f, g),
+            3 => I::TkGemmAdd(a, b, c, n, e, f, g),
+            4 => I::TkGemmAdd(a, b, c, d, n, f, g),
+            5 => I::TkGemmAdd(a, b, c, d, e, n, g),
+            6 => I::TkGemmAdd(a, b, c, d, e, f, n),
+            _ => panic!("TkGemmAdd: bad idx {idx}"),
+        },
+        I::TkFusedAddRmsNormGemm(a, b, c, d, e, f) => match idx {
+            0 => I::TkFusedAddRmsNormGemm(n, b, c, d, e, f),
+            1 => I::TkFusedAddRmsNormGemm(a, n, c, d, e, f),
+            2 => I::TkFusedAddRmsNormGemm(a, b, n, d, e, f),
+            3 => I::TkFusedAddRmsNormGemm(a, b, c, n, e, f),
+            4 => I::TkFusedAddRmsNormGemm(a, b, c, d, n, f),
+            5 => I::TkFusedAddRmsNormGemm(a, b, c, d, e, n),
+            _ => panic!("TkFusedAddRmsNormGemm: bad idx {idx}"),
+        },
+        I::TkScalarOffsetRmsNorm(a, b, c, d) => match idx {
+            0 => I::TkScalarOffsetRmsNorm(n, b, c, d),
+            1 => I::TkScalarOffsetRmsNorm(a, n, c, d),
+            2 => I::TkScalarOffsetRmsNorm(a, b, n, d),
+            _ => panic!("TkScalarOffsetRmsNorm: bad idx {idx}"),
+        },
+        I::TkFusedAddRmsNormWithOffset(a, b, c, d) => match idx {
+            0 => I::TkFusedAddRmsNormWithOffset(n, b, c, d),
+            1 => I::TkFusedAddRmsNormWithOffset(a, n, c, d),
+            2 => I::TkFusedAddRmsNormWithOffset(a, b, n, d),
+            _ => panic!("TkFusedAddRmsNormWithOffset: bad idx {idx}"),
+        },
+        I::TkTanhSoftCap(a, b, c) => match idx {
+            0 => I::TkTanhSoftCap(n, b, c),
+            1 => I::TkTanhSoftCap(a, n, c),
+            2 => I::TkTanhSoftCap(a, b, n),
+            _ => panic!("TkTanhSoftCap: bad idx {idx}"),
+        },
+        I::TkFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, g) => match idx {
+            0 => I::TkFusedAddScalarOffsetRmsNormGemm(n, b, c, d, e, f, g),
+            1 => I::TkFusedAddScalarOffsetRmsNormGemm(a, n, c, d, e, f, g),
+            2 => I::TkFusedAddScalarOffsetRmsNormGemm(a, b, n, d, e, f, g),
+            3 => I::TkFusedAddScalarOffsetRmsNormGemm(a, b, c, n, e, f, g),
+            5 => I::TkFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, n, g),
+            6 => I::TkFusedAddScalarOffsetRmsNormGemm(a, b, c, d, e, f, n),
+            _ => panic!("TkFusedAddScalarOffsetRmsNormGemm: bad idx {idx}"),
+        },
+        I::TkBarrierSignal(_a) => match idx {
+            0 => I::TkBarrierSignal(n),
+            _ => panic!("TkBarrierSignal: bad idx {idx}"),
+        },
+        I::TkBarrierWait(a, b) => match idx {
+            0 => I::TkBarrierWait(n, b),
+            1 => I::TkBarrierWait(a, n),
+            _ => panic!("TkBarrierWait: bad idx {idx}"),
+        },
+        I::TkSpliceMmEmbeds(_a) => match idx {
+            0 => I::TkSpliceMmEmbeds(n),
+            _ => panic!("TkSpliceMmEmbeds: bad idx {idx}"),
         },
         I::Loop(a, b) => match idx {
             0 => I::Loop(n, b),
@@ -2966,6 +3417,14 @@ pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
             | I::Fp8FusedQkvRopeCache(..)
             | I::Fp8FusedQkvRopePrefill(..)
             | I::MlaAttention(..)
+            // ff-mega-codegen TK variants delegate `eval` to their
+            // non-TK counterparts (see `Instruction::Tk*::eval` in
+            // `instr.rs`), which call `wm.cos_sin_at(bucket, op_idx,
+            // 0, layer)` — so the per-op CosSin slot must be
+            // emitted at the TK variant's op_idx too.
+            | I::TkFusedQkvRopeCache(..)
+            | I::TkAttentionViaCache(..)
+            | I::TkSlidingAttentionViaCache(..)
     )
 }
 

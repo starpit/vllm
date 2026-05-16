@@ -18,8 +18,8 @@
 #![allow(dead_code)]
 
 use crate::substrate::{
-    MbarrierPhase, PageId, RmsNormScope, ScratchRegion, WarpRoleTag, ROLE_CONSUMER, ROLE_LAUNCHER,
-    ROLE_LOADER, ROLE_STORER,
+    MbarrierPhase, PageId, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope,
+    ScratchRegion, WarpRoleTag,
 };
 
 /// Helper newtype: layer index for runtime weight-pointer

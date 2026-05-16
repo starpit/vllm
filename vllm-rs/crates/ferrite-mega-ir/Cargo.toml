@@ -5,4 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Typed correct-by-construction IR for ferrite megakernel emission. Sealed Substrate trait + sealed witnesses ensure a MegaTape value cannot exist unless the megakernel it lowers to is provably free of page-slot lifecycle, mbarrier phase, scratch overlap, and warp-role bug classes."
 
+[features]
+default = []
+# Forward `ferrite-forward/nccl` so this crate's `Instruction` match
+# in `lower::variant_name` reaches the `AllReduce` / `AllGather`
+# variants when the consumer enabled tensor parallel.
+nccl = ["ferrite-forward/nccl"]
+
 [dependencies]
+# Per `MEGA_IR_PLAN.md` §5, the lowering input is the existing
+# `Vec<Instruction>` semantic tape from `ferrite-forward::instr`.
+# `Instruction` is ungated (the cuda-only items are
+# `WeightAccessors` / `InterpreterCtx` / `run` / `debug_dump`), so
+# this dep does NOT enable `cuda` — keeps mega-ir free of
+# ferrite-kernels' extern CUDA symbols.
+ferrite-forward = { path = "../ferrite-forward" }

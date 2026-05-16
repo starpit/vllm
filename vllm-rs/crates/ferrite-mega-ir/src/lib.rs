@@ -43,7 +43,7 @@ pub mod nodes;
 pub mod substrate;
 pub mod tape;
 
-pub use lower::{ArriveCount, LowerError, MegaTapeBuilder, RmsNormInput, lower_rms_norm_only};
+pub use lower::{ArriveCount, LowerError, MegaTapeBuilder, OpInput, lower};
 pub use nodes::{LayerIndex, MegaNode, RmsNorm, WeightRef};
 pub use substrate::{
     Empty, Filled, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidWarpRole,

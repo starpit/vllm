@@ -4768,96 +4768,36 @@ fn emit_canonical_params_impl(model: &ModelParams, tp_world_size: u8) -> TokenSt
 /// `ms_forward_fn_by_canonical` maps decode-only M=1 canonicals that have a
 /// successfully-emitted `_ms` variant to their `forward_mega_ms_<canonical>`
 /// fn ident. Consumed by the caller to build `MEGA_FORWARD_TABLE_MULTI_STEP`.
-fn emit_mega_artifacts_inline(
-    model: &ModelParams,
-    canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
-    arch_opcodes: &ArchOpcodes,
-    accessor_type_by_base: &BTreeMap<String, String>,
-    tp_world_size: u8,
-    target_profile: &crate::target::TargetProfile,
-) -> (
+/// Output of [`emit_mega_artifacts_inline`]:
+/// `(emitted_tokens, mega_forward_fn_by_canonical,
+/// mega_forward_ms_fn_by_canonical, mega_eligibility_by_canonical)`.
+type MegaArtifacts = (
     TokenStream,
     BTreeMap<crate::solver::WorkloadPoint, Ident>,
     BTreeMap<crate::solver::WorkloadPoint, Ident>,
     BTreeMap<crate::solver::WorkloadPoint, Ident>,
-) {
-    use crate::tape_claim::{TapeEmitCtx, starter_tape_library};
-    let shapes = arch_opcodes.shapes_by_name();
-    let eps = rms_norm_eps(model);
-    let library = starter_tape_library();
+);
 
-    let ctx = TapeEmitCtx {
-        shapes: &shapes,
-        rms_norm_eps: eps,
-        profile: target_profile,
-        tp_world_size,
-        bounds: &model.bounds,
-        scalars: &model.scalars,
-        accessor_type_by_base,
-    };
-
-    type WpIdentMap = BTreeMap<crate::solver::WorkloadPoint, Ident>;
-    let mut rust_decls = TokenStream::new();
-    let mut canonical_forward_fn: WpIdentMap = BTreeMap::new();
-    let mut canonical_ms_forward_fn: WpIdentMap = BTreeMap::new();
-    let mut canonical_pd_start_fn: WpIdentMap = BTreeMap::new();
-
-    for (wp, (lowered, _num_slots, _backbone_slot, terminal_slot)) in canonical_lowered {
-        let canonical_name = format!(
-            "{}_m_{}_sk_{}",
-            model
-                .source_stem
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>(),
-            wp.num_tokens,
-            wp.sk_bucket
-        );
-
-        let backbone = &lowered.backbone.instances;
-        let lm_head = &lowered.lm_head.instances;
-
-        let Some((idx, info)) = library.pick(backbone, lm_head, &ctx) else {
-            panic!(
-                "tape claim: no executor matched canonical `{canonical_name}`; \
-                 check that the library contains HostInterpreterTapeClaimer"
-            );
-        };
-
-        let claimer = library.claimer(idx);
-        let emission = claimer.emit(
-            &canonical_name,
-            *wp,
-            backbone,
-            lm_head,
-            *terminal_slot,
-            &ctx,
-            info.as_ref(),
-        );
-
-        if let Some(path) = &emission.cu_path {
-            eprintln!(
-                "tape claim: `{canonical_name}` claimed by `{}`, wrote {} ({} backbone ops, {} lm_head ops)",
-                claimer.name(),
-                path.display(),
-                backbone.len(),
-                lm_head.len()
-            );
-        }
-
-        rust_decls.extend(emission.rust_decls);
-        if let Some(fn_ident) = emission.forward_fn {
-            canonical_forward_fn.insert(*wp, fn_ident);
-        }
-        if let Some(ms_fn_ident) = emission.ms_launch_fn {
-            canonical_ms_forward_fn.insert(*wp, ms_fn_ident);
-        }
-        if let Some(pd_fn_ident) = emission.persistent_decode_launch_fn {
-            canonical_pd_start_fn.insert(*wp, pd_fn_ident);
-        }
-    }
-
-    (rust_decls, canonical_forward_fn, canonical_ms_forward_fn, canonical_pd_start_fn)
+fn emit_mega_artifacts_inline(
+    _model: &ModelParams,
+    _canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
+) -> MegaArtifacts {
+    // Mega tape emission is parked: the previous `TapeClaimer`
+    // machinery (TK megakernel claimer + host fallback) was removed
+    // when `OpInstance` died. The replacement lands as part of the
+    // MegaIR pipeline (per `MEGA_IR_PLAN.md`) once `Implementation::
+    // fan_out` is wired through `ferrite_mega_ir::lower(&[OpInput])`.
+    // Until then, every canonical falls through to the host
+    // interpreter (the per-bucket forward fn already emitted by
+    // `emit_model`). Returning empty maps signals "no mega
+    // candidates" to `MEGA_FORWARD_TABLE` / `_MULTI_STEP` / `_PD`
+    // construction sites.
+    (
+        TokenStream::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
 }
 
 /// Render one `*const u16` expression per catalog-ordered accessor,
@@ -4920,9 +4860,10 @@ pub(crate) fn build_mega_accessor_ptr_exprs(
             let normalized = ty.replace(' ', "");
             if normalized.ends_with("LinearLayer") {
                 quote! { wm.#base_ident(layer).dense_weight().as_ptr::<u16>() }
-            } else if normalized.ends_with("Embedding") {
-                quote! { wm.#base_ident(layer).weight.as_ptr::<u16>() }
-            } else if normalized.ends_with("RmsNorm") {
+            } else if normalized.ends_with("Embedding") || normalized.ends_with("RmsNorm") {
+                // Both wrappers expose the underlying weight tensor as a
+                // `weight: GpuTensor` field; the bf16 mega path treats
+                // them identically.
                 quote! { wm.#base_ident(layer).weight.as_ptr::<u16>() }
             } else {
                 let err = format!(
@@ -4974,7 +4915,6 @@ pub fn emit_model(
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
     emit_fingerprint: bool,
-    target_profile: &crate::target::TargetProfile,
 ) -> TokenStream {
     // Vision encoders have no terminal `gemm(<tile>, lm_head)`; the
     // entire FUF is the backbone. The `BackboneLayout::Encoder` arm
@@ -5242,10 +5182,13 @@ pub fn emit_model(
     // For each regular bucket point, find its decode-solve canonical by
     // recomputing the sig from `sfufs_decode`. This maps "what regular
     // solve bucket i covers" → "what decode canonical serves it".
-    let bucket_decode_canonical_for_table: Vec<crate::solver::WorkloadPoint> =
-        bucket_points.iter().map(|wp| {
+    let bucket_decode_canonical_for_table: Vec<crate::solver::WorkloadPoint> = bucket_points
+        .iter()
+        .map(|wp| {
             if let Some(sfuf_dec) = sfufs_decode.per_workload.get(wp) {
-                let mut sig: Vec<(u32, u32)> = sfuf_dec.impls.iter()
+                let mut sig: Vec<(u32, u32)> = sfuf_dec
+                    .impls
+                    .iter()
                     .map(|(sg, imp)| (sg.0, imp.0))
                     .collect();
                 sig.sort();
@@ -5253,7 +5196,8 @@ pub fn emit_model(
             } else {
                 *wp
             }
-        }).collect();
+        })
+        .collect();
 
     let mut canonical_lowered_decode: BTreeMap<
         crate::solver::WorkloadPoint,
@@ -5330,14 +5274,18 @@ pub fn emit_model(
                     .fan_out(&term_match, fuf, program, &bounds, &slots)
                     .expect("terminal subgraph Impl must implement fan_out");
                 arch_opcodes.register(term_imp.opcode_shape());
+                let term_weight_slots: Vec<Vec<crate::impl_lib::WeightSlot>> =
+                    (0..term_emits.len()).map(|_| Vec::new()).collect();
                 crate::interpreter_codegen::LoweredBucket {
                     instances: term_emits,
+                    weight_slots: term_weight_slots,
                     num_slots,
                     final_slot: terminal_slot,
                 }
             }
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
                 instances: Vec::new(),
+                weight_slots: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
             },
@@ -5361,11 +5309,7 @@ pub fn emit_model(
             &mut cl.backbone,
             "layer",
         );
-        crate::interpreter_codegen::apply_loop_compression(
-            &arch_opcodes,
-            &mut cl.lm_head,
-            "layer",
-        );
+        crate::interpreter_codegen::apply_loop_compression(&arch_opcodes, &mut cl.lm_head, "layer");
     }
 
     // Device-interpreter megakernel codegen — writes per-variant
@@ -5391,19 +5335,13 @@ pub fn emit_model(
         mega_ms_forward_fn_by_canonical,
         mega_persistent_decode_start_fn_by_canonical,
     ) = if std::env::var_os("FERRITE_MEGA").is_some() {
-        let accessor_type_map =
-            match collect_accessors(program, fuf, sfufs_decode, lib, model) {
-                Ok(accs) => mega_accessor_type_map(&accs),
-                Err(_) => BTreeMap::new(),
-            };
-        emit_mega_artifacts_inline(
-            model,
-            &canonical_lowered_decode,
-            &arch_opcodes,
-            &accessor_type_map,
-            tp_world_size,
-            target_profile,
-        )
+        // FERRITE_MEGA is currently inert: the TapeClaimer machinery
+        // it used was retired with the OpInstance migration. Mega
+        // emission re-lands via `ferrite_mega_ir::lower` per
+        // `MEGA_IR_PLAN.md`. Until then `emit_mega_artifacts_inline`
+        // returns empty maps so MEGA_FORWARD_TABLE construction
+        // sites resolve to the host interpreter for every canonical.
+        emit_mega_artifacts_inline(model, &canonical_lowered_decode)
     } else {
         (
             TokenStream::new(),
@@ -5709,14 +5647,14 @@ pub fn emit_model(
             .map(|decode_canonical| {
                 // Direct hit on the canonical?
                 if let Some(ident) = mega_forward_fn_by_canonical.get(decode_canonical) {
-                    let expected_m: u64 = decode_canonical.num_tokens as u64;
+                    let expected_m: u64 = decode_canonical.num_tokens;
                     return quote! { ::core::option::Option::Some((#expected_m, #ident)), };
                 }
                 // Same-M fallback: prefer a kernel emitted for the bucket's
                 // canonical num_tokens. Lets buckets sharing the canonical-
                 // assignment race still resolve to a working fn at the same M.
                 if let Some(ident) = by_m.get(&decode_canonical.num_tokens) {
-                    let expected_m: u64 = decode_canonical.num_tokens as u64;
+                    let expected_m: u64 = decode_canonical.num_tokens;
                     return quote! { ::core::option::Option::Some((#expected_m, #ident)), };
                 }
                 // No same-M fn emitted. Pick the SMALLEST emitted M ≥ this
@@ -5768,15 +5706,15 @@ pub fn emit_model(
     } else {
         let rows: Vec<TokenStream> = bucket_decode_canonical_for_table
             .iter()
-            .map(|decode_canonical| {
-                match mega_ms_forward_fn_by_canonical.get(decode_canonical) {
+            .map(
+                |decode_canonical| match mega_ms_forward_fn_by_canonical.get(decode_canonical) {
                     Some(ident) => {
-                        let expected_m: u64 = decode_canonical.num_tokens as u64;
+                        let expected_m: u64 = decode_canonical.num_tokens;
                         quote! { ::core::option::Option::Some((#expected_m, #ident)), }
                     }
                     None => quote! { ::core::option::Option::None, },
-                }
-            })
+                },
+            )
             .collect();
         quote! {
             #[cfg(feature = "cuda")]
@@ -5802,37 +5740,38 @@ pub fn emit_model(
             *mut ::std::ffi::c_void,
         ) -> ::core::result::Result<::ferrite_forward::PersistentDecodeResources, i32>
     };
-    let mega_persistent_decode_table_emission: TokenStream = if mega_persistent_decode_start_fn_by_canonical.is_empty() {
-        quote! {
-            #[cfg(feature = "cuda")]
-            #[allow(dead_code)]
-            static MEGA_PERSISTENT_DECODE_TABLE: &[
-                ::core::option::Option<(u64, #mega_persistent_decode_fn_ty)>
-            ] = &[];
-        }
-    } else {
-        let rows: Vec<TokenStream> = bucket_decode_canonical_for_table
-            .iter()
-            .map(|decode_canonical| {
-                match mega_persistent_decode_start_fn_by_canonical.get(decode_canonical) {
-                    Some(ident) => {
-                        let expected_m: u64 = decode_canonical.num_tokens as u64;
-                        quote! { ::core::option::Option::Some((#expected_m, #ident)), }
+    let mega_persistent_decode_table_emission: TokenStream =
+        if mega_persistent_decode_start_fn_by_canonical.is_empty() {
+            quote! {
+                #[cfg(feature = "cuda")]
+                #[allow(dead_code)]
+                static MEGA_PERSISTENT_DECODE_TABLE: &[
+                    ::core::option::Option<(u64, #mega_persistent_decode_fn_ty)>
+                ] = &[];
+            }
+        } else {
+            let rows: Vec<TokenStream> = bucket_decode_canonical_for_table
+                .iter()
+                .map(|decode_canonical| {
+                    match mega_persistent_decode_start_fn_by_canonical.get(decode_canonical) {
+                        Some(ident) => {
+                            let expected_m: u64 = decode_canonical.num_tokens;
+                            quote! { ::core::option::Option::Some((#expected_m, #ident)), }
+                        }
+                        None => quote! { ::core::option::Option::None, },
                     }
-                    None => quote! { ::core::option::Option::None, },
-                }
-            })
-            .collect();
-        quote! {
-            #[cfg(feature = "cuda")]
-            #[allow(dead_code)]
-            static MEGA_PERSISTENT_DECODE_TABLE: &[
-                ::core::option::Option<(u64, #mega_persistent_decode_fn_ty)>
-            ] = &[
-                #(#rows)*
-            ];
-        }
-    };
+                })
+                .collect();
+            quote! {
+                #[cfg(feature = "cuda")]
+                #[allow(dead_code)]
+                static MEGA_PERSISTENT_DECODE_TABLE: &[
+                    ::core::option::Option<(u64, #mega_persistent_decode_fn_ty)>
+                ] = &[
+                    #(#rows)*
+                ];
+            }
+        };
 
     quote! {
         #weights

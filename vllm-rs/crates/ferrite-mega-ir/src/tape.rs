@@ -39,10 +39,7 @@ impl MegaTape {
     /// All correctness invariants must be discharged before nodes
     /// are pushed; this function does NO validation.
     #[doc(hidden)]
-    pub(crate) fn __build_from_nodes(
-        nodes: Vec<MegaNode>,
-        substrate: SubstrateBudget,
-    ) -> Self {
+    pub(crate) fn __build_from_nodes(nodes: Vec<MegaNode>, substrate: SubstrateBudget) -> Self {
         Self { nodes, substrate }
     }
 }

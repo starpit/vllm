@@ -362,10 +362,7 @@ pub fn solve_with_arch_filter(
             profile: target,
         };
         lib.iter_enumerated()
-            .map(|(_, imp)| {
-                !imp.applies_to(&ctx)
-                    || role.is_some_and(|r| !imp.accepts_role(r))
-            })
+            .map(|(_, imp)| !imp.applies_to(&ctx) || role.is_some_and(|r| !imp.accepts_role(r)))
             .collect()
     } else if let Some(r) = role {
         lib.iter_enumerated()

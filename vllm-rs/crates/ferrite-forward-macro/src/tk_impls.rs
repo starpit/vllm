@@ -48,18 +48,17 @@ use std::collections::BTreeMap;
 
 use crate::classified::Program;
 use crate::fuf::{Fuf, TileId};
-use quote::quote;
 use crate::impl_lib::{
     AttentionViaCacheImpl, CostCtx, CutlassFusedAddRmsNormGemmImpl,
-    CutlassFusedAddScalarOffsetRmsNormGemmImpl, CutlassGemmAddImpl,
-    EmbedRefImpl, FusedAddRmsNormImpl, FusedAddRmsNormWithOffsetImpl,
-    FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl,
-    FusedQkvRopeCacheImpl, GemmRefImpl,
-    Handoff, Implementation, LaunchKind, Layout, MatchContext, MatchInfo, OpInstance, OpcodeShape,
-    Resources, RmsNormRefImpl, ScalarMulImpl, ScalarOffsetRmsNormImpl, SlotMap,
-    SlidingAttentionViaCacheImpl, TanhSoftCapImpl, WeightAccessor, WorkloadConstraint,
+    CutlassFusedAddScalarOffsetRmsNormGemmImpl, CutlassGemmAddImpl, EmbedRefImpl,
+    FusedAddRmsNormImpl, FusedAddRmsNormWithOffsetImpl, FusedGateUpGeluMulImpl,
+    FusedGateUpSiluMulImpl, FusedQkvRopeCacheImpl, GemmRefImpl, Handoff, Implementation,
+    LaunchKind, Layout, MatchContext, MatchInfo, OpcodeShape, Resources, RmsNormRefImpl,
+    ScalarMulImpl, ScalarOffsetRmsNormImpl, SlidingAttentionViaCacheImpl, SlotMap, TanhSoftCapImpl,
+    WeightAccessor, WorkloadConstraint,
 };
 use crate::target::TargetProfile;
+use ferrite_forward::Instruction;
 
 /// sm version gate shared by every `Tk*Impl::target_compatible`.
 /// TK 2.0 uses Hopper-class primitives (`wgmma`, `tma::*_async`,
@@ -81,16 +80,46 @@ const TK_SM_MIN: u32 = 90;
 /// compute time and ensures TK always wins on sm≥90 targets.
 const TK_COST_US: f64 = 1.0e-12;
 
-/// Rename every instance in `instances` to `Tk<original_name>`.
-/// Preserves field order and tokens verbatim (the backend peer's
-/// `fan_out` has already put the fields in the exact order
-/// `crate::tape::tk_mega::op_emit::op_refs` expects).
-fn rename_instances_with_tk_prefix(mut instances: Vec<OpInstance>) -> Vec<OpInstance> {
-    for inst in &mut instances {
-        let renamed = format!("Tk{}", inst.name);
-        inst.name = syn::Ident::new(&renamed, proc_macro2::Span::call_site());
-    }
+/// Map every base `Instruction::X` to its TK peer `Instruction::TkX`.
+/// Field order/values preserved verbatim because each Tk peer in
+/// `ferrite_forward::Instruction` has the same field tuple as its base
+/// (and the few that gain extra fields — `TkSlidingAttentionViaCache`,
+/// `TkTanhSoftCap` — append the extra value on the call site, not here).
+fn rename_instances_with_tk_prefix(instances: Vec<Instruction>) -> Vec<Instruction> {
     instances
+        .into_iter()
+        .map(|inst| match inst {
+            Instruction::Embed(a) => Instruction::TkEmbed(a),
+            Instruction::ScalarMul(a, b, c) => Instruction::TkScalarMul(a, b, c),
+            Instruction::RmsNorm(a, b, c) => Instruction::TkRmsNorm(a, b, c),
+            Instruction::Gemm(a, b, c, d, e) => Instruction::TkGemm(a, b, c, d, e),
+            Instruction::FusedAddRmsNorm(a, b, c) => Instruction::TkFusedAddRmsNorm(a, b, c),
+            Instruction::FusedQkvRopeCache(a, b, c, d, e) => {
+                Instruction::TkFusedQkvRopeCache(a, b, c, d, e)
+            }
+            Instruction::AttentionViaCache(a, b, c, d) => {
+                Instruction::TkAttentionViaCache(a, b, c, d)
+            }
+            Instruction::FusedGateUpSiluMul(a, b, c) => Instruction::TkFusedGateUpSiluMul(a, b, c),
+            Instruction::FusedGateUpGeluMul(a, b, c) => Instruction::TkFusedGateUpGeluMul(a, b, c),
+            Instruction::ScalarOffsetRmsNorm(a, b, c, d) => {
+                Instruction::TkScalarOffsetRmsNorm(a, b, c, d)
+            }
+            Instruction::FusedAddRmsNormWithOffset(a, b, c, d) => {
+                Instruction::TkFusedAddRmsNormWithOffset(a, b, c, d)
+            }
+            Instruction::SpliceMmEmbeds(a) => Instruction::TkSpliceMmEmbeds(a),
+            // Variants without a typed Tk peer (e.g. `SlidingAttentionViaCache`
+            // which needs an extra `window_size_left` field, `TanhSoftCap`
+            // which needs an extra `n_vocab`) are renamed in their own
+            // call site by mapping directly to the typed Tk variant. Any
+            // other unhandled variant flows through unchanged. Worst case
+            // a Tk delegator emits a non-Tk Instruction — the host
+            // interpreter still runs it correctly; only the mega tape-
+            // level claim would reject it.
+            other => other,
+        })
+        .collect()
 }
 
 /// Re-shape a backend peer's [`OpcodeShape`] with `Tk`-prefixed
@@ -178,7 +207,7 @@ impl Implementation for TkEmbedImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         EmbedRefImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -258,7 +287,7 @@ impl Implementation for TkRmsNormImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         RmsNormRefImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -345,7 +374,7 @@ impl Implementation for TkScalarMulImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         ScalarMulImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -430,7 +459,7 @@ impl Implementation for TkGemmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         GemmRefImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -452,7 +481,7 @@ impl Implementation for TkGemmImpl {
             return false;
         };
         let ncw = (head_dim / 32).clamp(1, 4);
-        let ok = |k: u64| k % ncw == 0 && (k / ncw) % 16 == 0;
+        let ok = |k: u64| k.is_multiple_of(ncw) && (k / ncw).is_multiple_of(16);
         ok(hidden_dim) && ok(intermediate_dim)
     }
 }
@@ -538,7 +567,7 @@ impl Implementation for TkFusedAddRmsNormImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         FusedAddRmsNormImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -563,16 +592,15 @@ impl Implementation for TkFusedQkvRopeCacheImpl {
         FusedQkvRopeCacheImpl.workload_constraint()
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         match role {
             // Wave G unlocked NUM_TOKENS > 1 for both decode AND prefill.
             // Allow M>1 in either role.
-            crate::solver::ForwardRole::Decode
-            | crate::solver::ForwardRole::Prefill => {
-                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
+            crate::solver::ForwardRole::Decode | crate::solver::ForwardRole::Prefill => {
+                WorkloadConstraint::NumTokensRange {
+                    min: 1,
+                    max: u32::MAX,
+                }
             }
         }
     }
@@ -644,7 +672,7 @@ impl Implementation for TkFusedQkvRopeCacheImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         FusedQkvRopeCacheImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -669,10 +697,7 @@ impl Implementation for TkAttentionViaCacheImpl {
         AttentionViaCacheImpl.workload_constraint()
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         AttentionViaCacheImpl.workload_constraint_for_role(role)
     }
 
@@ -757,7 +782,7 @@ impl Implementation for TkAttentionViaCacheImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         AttentionViaCacheImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -792,10 +817,7 @@ impl Implementation for TkSlidingAttentionViaCacheImpl {
         SlidingAttentionViaCacheImpl.workload_constraint()
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         SlidingAttentionViaCacheImpl.workload_constraint_for_role(role)
     }
 
@@ -897,22 +919,22 @@ impl Implementation for TkSlidingAttentionViaCacheImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         let window_size = bounds.get("sliding_window").copied().unwrap_or(0) as u32;
-        let window_lit = proc_macro2::Literal::u32_suffixed(window_size);
         // Delegate to the base impl to compute in_slot/out_slot/layer/
-        // cos_sin_fn/interleaved, then rename and append window_size_left.
+        // interleaved, then re-pack into the TK variant with the extra
+        // compile-time window_size_left field.
         SlidingAttentionViaCacheImpl
             .fan_out(m, fuf, program, bounds, slots)
-            .map(|mut ops| {
-                for op in &mut ops {
-                    op.name = proc_macro2::Ident::new(
-                        "TkSlidingAttentionViaCache",
-                        proc_macro2::Span::call_site(),
-                    );
-                    op.field_values.push(quote! { #window_lit });
-                }
-                ops
+            .map(|ops| {
+                ops.into_iter()
+                    .map(|inst| match inst {
+                        Instruction::SlidingAttentionViaCache(a, b, c, d) => {
+                            Instruction::TkSlidingAttentionViaCache(a, b, c, d, window_size)
+                        }
+                        other => other,
+                    })
+                    .collect()
             })
     }
 }
@@ -931,15 +953,13 @@ impl Implementation for TkFusedGateUpSiluMulImpl {
         profile.compute_capability >= TK_SM_MIN
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         match role {
             // silu_upgate.cuh now supports NUM_TOKENS > 1 via per-token loop.
-            crate::solver::ForwardRole::Decode => {
-                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
-            }
+            crate::solver::ForwardRole::Decode => WorkloadConstraint::NumTokensRange {
+                min: 1,
+                max: u32::MAX,
+            },
             crate::solver::ForwardRole::Prefill => self.workload_constraint(),
         }
     }
@@ -1003,7 +1023,7 @@ impl Implementation for TkFusedGateUpSiluMulImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         FusedGateUpSiluMulImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -1029,14 +1049,12 @@ impl Implementation for TkFusedGateUpGeluMulImpl {
         profile.compute_capability >= TK_SM_MIN
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         match role {
-            crate::solver::ForwardRole::Decode => {
-                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
-            }
+            crate::solver::ForwardRole::Decode => WorkloadConstraint::NumTokensRange {
+                min: 1,
+                max: u32::MAX,
+            },
             crate::solver::ForwardRole::Prefill => self.workload_constraint(),
         }
     }
@@ -1100,7 +1118,7 @@ impl Implementation for TkFusedGateUpGeluMulImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         FusedGateUpGeluMulImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -1153,15 +1171,13 @@ impl Implementation for TkGemmAddImpl {
         profile.compute_capability >= TK_SM_MIN
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         match role {
             // down_proj_residual.cuh now supports NUM_TOKENS > 1 via per-token loop.
-            crate::solver::ForwardRole::Decode => {
-                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
-            }
+            crate::solver::ForwardRole::Decode => WorkloadConstraint::NumTokensRange {
+                min: 1,
+                max: u32::MAX,
+            },
             crate::solver::ForwardRole::Prefill => self.workload_constraint(),
         }
     }
@@ -1247,7 +1263,7 @@ impl Implementation for TkGemmAddImpl {
         program: &crate::classified::Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         use crate::classified::OpKind;
         use crate::codegen::split_base_layer;
         use crate::fuf::FufInput;
@@ -1283,9 +1299,8 @@ impl Implementation for TkGemmAddImpl {
         let acc = accessors
             .first()
             .expect("TkGemmAdd: required_weights returned empty");
-        let (base, layer) = split_base_layer(&acc.name.to_string());
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        let base_ident = syn::Ident::new(&base, proc_macro2::Span::call_site());
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("TkGemmAdd: gemm (N, K) must resolve from FUF + bounds");
         // TK "four-chunk" optimization: split large-K down_proj into multiple ops.
@@ -1298,7 +1313,7 @@ impl Implementation for TkGemmAddImpl {
             .map(|hd| hd as u32)
             .unwrap_or(2048)
             .min(k);
-        let num_chunks = if chunk_k > 0 && k > chunk_k && k % chunk_k == 0 {
+        let num_chunks = if chunk_k > 0 && k > chunk_k && k.is_multiple_of(chunk_k) {
             k / chunk_k
         } else {
             1
@@ -1307,27 +1322,19 @@ impl Implementation for TkGemmAddImpl {
         // k_full = full K dimension of the weight matrix (row stride).
         // For single-chunk ops k_full == k_per_chunk; for 4-chunk split k_full == k.
         let k_full = k;
-        let name = syn::Ident::new("TkGemmAdd", proc_macro2::Span::call_site());
         Some(
             (0..num_chunks)
                 .map(|i| {
                     let k_offset = i * k_per_chunk;
-                    OpInstance::new(
-                        name.clone(),
-                        vec![
-                            quote! { #in_slot_idx },
-                            quote! { #residual_idx },
-                            quote! { #layer },
-                            quote! { #n },
-                            quote! { #k_per_chunk },
-                            quote! { #k_offset },
-                            quote! { #k_full },
-                        ],
+                    Instruction::TkGemmAdd(
+                        in_slot_idx,
+                        residual_idx,
+                        layer,
+                        n,
+                        k_per_chunk,
+                        k_offset,
+                        k_full,
                     )
-                    .with_weight_slot(crate::impl_lib::WeightSlot {
-                        kind: crate::impl_lib::WeightKind::Linear,
-                        base: base_ident.clone(),
-                    })
                 })
                 .collect(),
         )
@@ -1402,11 +1409,18 @@ impl Implementation for TkFusedAddRmsNormGemmImpl {
         use crate::fuf::FufInput;
         let residual_add = fuf.get(seed);
         if residual_add.op == OpKind::Add
-            && residual_add.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            && residual_add
+                .inputs
+                .iter()
+                .all(|i| matches!(i, FufInput::Tile { .. }))
         {
             for rms in &fuf.nodes {
-                if rms.op != OpKind::RmsNorm || rms.inputs.len() < 2 { continue; }
-                if !matches!(rms.inputs[0], FufInput::Tile { id, .. } if id == seed) { continue; }
+                if rms.op != OpKind::RmsNorm || rms.inputs.len() < 2 {
+                    continue;
+                }
+                if !matches!(rms.inputs[0], FufInput::Tile { id, .. } if id == seed) {
+                    continue;
+                }
                 if let FufInput::Tile { id, .. } = rms.inputs[1] {
                     let wt = fuf.get(id);
                     if wt.op == OpKind::Add
@@ -1495,7 +1509,7 @@ impl Implementation for TkFusedAddRmsNormGemmImpl {
         program: &crate::classified::Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         use crate::classified::OpKind;
         use crate::codegen::split_base_layer;
         use crate::fuf::FufInput;
@@ -1517,9 +1531,9 @@ impl Implementation for TkFusedAddRmsNormGemmImpl {
 
         let (delta_id, delta_in_slot) = match add_node.inputs.first() {
             Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => panic!(
-                "TkFusedAddRmsNormGemm: Add input 0 (delta) must be a Tile (got {other:?})"
-            ),
+            other => {
+                panic!("TkFusedAddRmsNormGemm: Add input 0 (delta) must be a Tile (got {other:?})")
+            }
         };
         let (residual_id, residual_in_slot) = match add_node.inputs.get(1) {
             Some(FufInput::Tile { id, slot }) => (*id, *slot),
@@ -1536,40 +1550,24 @@ impl Implementation for TkFusedAddRmsNormGemmImpl {
         let norm_acc = accessors
             .first()
             .expect("TkFusedAddRmsNormGemm: required_weights[0] (norm)");
-        let gemm_acc = accessors
+        let _gemm_acc = accessors
             .get(1)
             .expect("TkFusedAddRmsNormGemm: required_weights[1] (gemm)");
 
-        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
-        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let (_norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         let layer = norm_layer.unwrap_or(0) as u32;
-        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
-        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
 
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("TkFusedAddRmsNormGemm: gemm (N, K) must resolve from FUF + bounds");
 
-        Some(vec![OpInstance::new(
-            syn::Ident::new("TkFusedAddRmsNormGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #delta_idx },
-                quote! { #residual_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            crate::impl_lib::WeightSlot {
-                kind: crate::impl_lib::WeightKind::RmsNorm,
-                base: norm_ident,
-            },
-            crate::impl_lib::WeightSlot {
-                kind: crate::impl_lib::WeightKind::Linear,
-                base: gemm_ident,
-            },
-        ])])
+        Some(vec![Instruction::TkFusedAddRmsNormGemm(
+            delta_idx,
+            residual_idx,
+            out_slot_idx,
+            layer,
+            n,
+            k,
+        )])
     }
 
     /// Same K-divisibility gate as `TkGemmImpl` — the lm_head_fused_residual
@@ -1656,7 +1654,7 @@ impl Implementation for TkScalarOffsetRmsNormImpl {
         program: &crate::classified::Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         ScalarOffsetRmsNormImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -1744,7 +1742,7 @@ impl Implementation for TkFusedAddRmsNormWithOffsetImpl {
         program: &crate::classified::Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         FusedAddRmsNormWithOffsetImpl
             .fan_out(m, fuf, program, bounds, slots)
             .map(rename_instances_with_tk_prefix)
@@ -1809,11 +1807,7 @@ impl Implementation for TkTanhSoftCapImpl {
         TanhSoftCapImpl.is_compute_bound()
     }
 
-    fn consumes_input_tiles(
-        &self,
-        claimed_tiles: &[TileId],
-        fuf: &Fuf,
-    ) -> Vec<(TileId, u8)> {
+    fn consumes_input_tiles(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> Vec<(TileId, u8)> {
         TanhSoftCapImpl.consumes_input_tiles(claimed_tiles, fuf)
     }
 
@@ -1844,20 +1838,17 @@ impl Implementation for TkTanhSoftCapImpl {
         program: &crate::classified::Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         let n_vocab = *bounds.get("vocab_size").unwrap_or(&0) as u32;
-        let n_vocab_lit = proc_macro2::Literal::u32_suffixed(n_vocab);
         TanhSoftCapImpl
             .fan_out(m, fuf, program, bounds, slots)
-            .map(|mut ops| {
-                for op in &mut ops {
-                    op.name = proc_macro2::Ident::new(
-                        "TkTanhSoftCap",
-                        proc_macro2::Span::call_site(),
-                    );
-                    op.field_values.push(quote! { #n_vocab_lit });
-                }
-                ops
+            .map(|ops| {
+                ops.into_iter()
+                    .map(|inst| match inst {
+                        Instruction::TanhSoftCap(a, b) => Instruction::TkTanhSoftCap(a, b, n_vocab),
+                        other => other,
+                    })
+                    .collect()
             })
     }
 }
@@ -1869,8 +1860,8 @@ impl Implementation for TkTanhSoftCapImpl {
 // Delegates match/weight/alias to CutlassFusedAddScalarOffsetRmsNormGemmImpl;
 // custom opcode_shape drops CUTLASS tile dims and adds `offset`.
 
-fn cutlass_fused_add_scalar_offset_rms_norm_gemm_proxy(
-) -> CutlassFusedAddScalarOffsetRmsNormGemmImpl {
+fn cutlass_fused_add_scalar_offset_rms_norm_gemm_proxy()
+-> CutlassFusedAddScalarOffsetRmsNormGemmImpl {
     CutlassFusedAddScalarOffsetRmsNormGemmImpl {
         tile_m: 16,
         tile_n: 64,
@@ -1948,7 +1939,8 @@ impl Implementation for TkFusedAddScalarOffsetRmsNormGemmImpl {
         fuf: &Fuf,
         program: &crate::classified::Program,
     ) -> Vec<WeightAccessor> {
-        cutlass_fused_add_scalar_offset_rms_norm_gemm_proxy().required_weights(claimed, fuf, program)
+        cutlass_fused_add_scalar_offset_rms_norm_gemm_proxy()
+            .required_weights(claimed, fuf, program)
     }
 
     fn output_alias(
@@ -1963,11 +1955,11 @@ impl Implementation for TkFusedAddScalarOffsetRmsNormGemmImpl {
         OpcodeShape::new(
             "TkFusedAddScalarOffsetRmsNormGemm",
             vec![
-                ("delta_slot",    syn::parse_quote!(u32)),
+                ("delta_slot", syn::parse_quote!(u32)),
                 ("residual_slot", syn::parse_quote!(u32)),
-                ("out_slot",      syn::parse_quote!(u32)),
-                ("layer",         syn::parse_quote!(u32)),
-                ("offset",        syn::parse_quote!(f32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("offset", syn::parse_quote!(f32)),
                 ("n", syn::parse_quote!(u32)),
                 ("k", syn::parse_quote!(u32)),
             ],
@@ -1981,22 +1973,33 @@ impl Implementation for TkFusedAddScalarOffsetRmsNormGemmImpl {
         program: &crate::classified::Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<Instruction>> {
         use crate::classified::OpKind;
         use crate::codegen::split_base_layer;
         use crate::fuf::FufInput;
         use crate::impl_lib::gemm_nk_from_fuf;
 
         // Extract residual-Add, scalar-offset-Add, and Gemm from the 4-node claim.
-        let residual_add_id = *m.claimed_tiles.iter().find(|t| {
-            let n = fuf.get(**t);
-            n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
-        }).expect("TkFusedAddScalarOffsetRmsNormGemm: claim contains residual Add");
-        let scalar_add_id = *m.claimed_tiles.iter().find(|t| {
-            let n = fuf.get(**t);
-            n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
-        }).expect("TkFusedAddScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
-        let gemm_id = *m.claimed_tiles.iter().find(|t| fuf.get(**t).op == OpKind::Gemm)
+        let residual_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. }))
+            })
+            .expect("TkFusedAddScalarOffsetRmsNormGemm: claim contains residual Add");
+        let scalar_add_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| {
+                let n = fuf.get(**t);
+                n.op == OpKind::Add && n.inputs.iter().any(|i| matches!(i, FufInput::Scalar(_)))
+            })
+            .expect("TkFusedAddScalarOffsetRmsNormGemm: claim contains scalar-offset Add");
+        let gemm_id = *m
+            .claimed_tiles
+            .iter()
+            .find(|t| fuf.get(**t).op == OpKind::Gemm)
             .expect("TkFusedAddScalarOffsetRmsNormGemm: claim contains Gemm");
 
         let add_node = fuf.get(residual_add_id);
@@ -2005,56 +2008,52 @@ impl Implementation for TkFusedAddScalarOffsetRmsNormGemmImpl {
 
         let (delta_id, delta_in_slot) = match add_node.inputs.first() {
             Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => panic!("TkFusedAddScalarOffsetRmsNormGemm: Add input 0 must be Tile (got {other:?})"),
+            other => panic!(
+                "TkFusedAddScalarOffsetRmsNormGemm: Add input 0 must be Tile (got {other:?})"
+            ),
         };
         let (residual_id, residual_in_slot) = match add_node.inputs.get(1) {
             Some(FufInput::Tile { id, slot }) => (*id, *slot),
-            other => panic!("TkFusedAddScalarOffsetRmsNormGemm: Add input 1 must be Tile (got {other:?})"),
+            other => panic!(
+                "TkFusedAddScalarOffsetRmsNormGemm: Add input 1 must be Tile (got {other:?})"
+            ),
         };
-        let offset: f32 = scalar_add.inputs.iter().find_map(|i| match i {
-            FufInput::Scalar(v) => Some(*v as f32),
-            _ => None,
-        }).expect("TkFusedAddScalarOffsetRmsNormGemm: scalar-offset Add has a Scalar");
+        let offset: f32 = scalar_add
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Scalar(v) => Some(*v as f32),
+                _ => None,
+            })
+            .expect("TkFusedAddScalarOffsetRmsNormGemm: scalar-offset Add has a Scalar");
 
         let delta_idx = slots.of(delta_id, delta_in_slot);
         let residual_idx = slots.of(residual_id, residual_in_slot);
         let out_slot_idx = slots.of(gemm_id, 0);
 
         let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
-        let norm_acc = accessors.first().expect("TkFusedAddScalarOffsetRmsNormGemm: norm weight");
-        let gemm_acc = accessors.get(1).expect("TkFusedAddScalarOffsetRmsNormGemm: gemm weight");
+        let norm_acc = accessors
+            .first()
+            .expect("TkFusedAddScalarOffsetRmsNormGemm: norm weight");
+        let _gemm_acc = accessors
+            .get(1)
+            .expect("TkFusedAddScalarOffsetRmsNormGemm: gemm weight");
 
-        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
-        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let (_norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         let layer = norm_layer.unwrap_or(0) as u32;
-        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
-        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
 
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("TkFusedAddScalarOffsetRmsNormGemm: gemm (N, K)");
 
-        Some(vec![OpInstance::new(
-            syn::Ident::new("TkFusedAddScalarOffsetRmsNormGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #delta_idx },
-                quote! { #residual_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #offset },
-                quote! { #n },
-                quote! { #k },
-            ],
-        )
-        .with_weight_slots(vec![
-            crate::impl_lib::WeightSlot {
-                kind: crate::impl_lib::WeightKind::RmsNorm,
-                base: norm_ident,
-            },
-            crate::impl_lib::WeightSlot {
-                kind: crate::impl_lib::WeightKind::Linear,
-                base: gemm_ident,
-            },
-        ])])
+        Some(vec![Instruction::TkFusedAddScalarOffsetRmsNormGemm(
+            delta_idx,
+            residual_idx,
+            out_slot_idx,
+            layer,
+            offset,
+            n,
+            k,
+        )])
     }
 
     fn applies_to(&self, ctx: &MatchContext) -> bool {

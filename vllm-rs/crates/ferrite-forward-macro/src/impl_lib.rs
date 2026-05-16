@@ -1867,7 +1867,9 @@ pub fn starter_library() -> ImplementationLibrary {
     lib.push(Box::new(crate::tk_impls::TkSlidingAttentionViaCacheImpl));
     lib.push(Box::new(crate::tk_impls::TkFusedGateUpSiluMulImpl));
     lib.push(Box::new(crate::tk_impls::TkFusedGateUpGeluMulImpl));
-    lib.push(Box::new(crate::tk_impls::TkFusedAddScalarOffsetRmsNormGemmImpl));
+    lib.push(Box::new(
+        crate::tk_impls::TkFusedAddScalarOffsetRmsNormGemmImpl,
+    ));
     lib.push(Box::new(crate::tk_impls::TkFusedAddRmsNormWithOffsetImpl));
     lib.push(Box::new(crate::tk_impls::TkScalarOffsetRmsNormImpl));
     lib.push(Box::new(crate::tk_impls::TkTanhSoftCapImpl));
@@ -6144,7 +6146,11 @@ impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
         if residual_add.op != OpKind::Add {
             return None;
         }
-        if !residual_add.inputs.iter().all(|i| matches!(i, FufInput::Tile { .. })) {
+        if !residual_add
+            .inputs
+            .iter()
+            .all(|i| matches!(i, FufInput::Tile { .. }))
+        {
             return None;
         }
         // Find RmsNorm that consumes this Add at slot 0 AND has a scalar-offset Add at slot 1.
@@ -6152,8 +6158,7 @@ impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
             if rms.op != OpKind::RmsNorm || rms.inputs.len() < 2 {
                 continue;
             }
-            let reads_residual =
-                matches!(rms.inputs[0], FufInput::Tile { id, .. } if id == seed);
+            let reads_residual = matches!(rms.inputs[0], FufInput::Tile { id, .. } if id == seed);
             if !reads_residual {
                 continue;
             }
@@ -6377,7 +6382,7 @@ impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
         program: &Program,
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let residual_add_id = *m
             .claimed_tiles
             .iter()
@@ -6434,15 +6439,12 @@ impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
         let norm_acc = accessors
             .first()
             .expect("CutlassFusedAddScalarOffsetRmsNormGemm: required_weights[0]");
-        let gemm_acc = accessors
+        let _gemm_acc = accessors
             .get(1)
             .expect("CutlassFusedAddScalarOffsetRmsNormGemm: required_weights[1]");
 
-        let (norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
-        let (gemm_base, _) = split_base_layer(&gemm_acc.name.to_string());
+        let (_norm_base, norm_layer) = split_base_layer(&norm_acc.name.to_string());
         let layer = norm_layer.unwrap_or(0) as u32;
-        let norm_ident = syn::Ident::new(&norm_base, proc_macro2::Span::call_site());
-        let gemm_ident = syn::Ident::new(&gemm_base, proc_macro2::Span::call_site());
 
         let (n, k) = gemm_nk_from_fuf(fuf, gemm_node, bounds)
             .expect("CutlassFusedAddScalarOffsetRmsNormGemm: gemm (N, K) must resolve");
@@ -6451,22 +6453,17 @@ impl Implementation for CutlassFusedAddScalarOffsetRmsNormGemmImpl {
         let tile_n = self.tile_n;
         let stages = self.stages;
 
-        Some(vec![OpInstance::new(
-            syn::Ident::new("CutlassFusedAddScalarOffsetRmsNormGemm", proc_macro2::Span::call_site()),
-            vec![
-                quote! { #delta_idx },
-                quote! { #residual_idx },
-                quote! { #out_slot_idx },
-                quote! { #layer },
-                quote! { #offset },
-                quote! { Weights::#norm_ident },
-                quote! { Weights::#gemm_ident },
-                quote! { #tile_m },
-                quote! { #tile_n },
-                quote! { #stages },
-                quote! { #n },
-                quote! { #k },
-            ],
+        Some(vec![Instruction::CutlassFusedAddScalarOffsetRmsNormGemm(
+            delta_idx,
+            residual_idx,
+            out_slot_idx,
+            layer,
+            offset,
+            tile_m,
+            tile_n,
+            stages,
+            n,
+            k,
         )])
     }
 }
@@ -7882,14 +7879,13 @@ impl Implementation for AttentionViaCacheImpl {
         WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         match role {
-            crate::solver::ForwardRole::Decode
-            | crate::solver::ForwardRole::Prefill => {
-                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
+            crate::solver::ForwardRole::Decode | crate::solver::ForwardRole::Prefill => {
+                WorkloadConstraint::NumTokensRange {
+                    min: 1,
+                    max: u32::MAX,
+                }
             }
         }
     }
@@ -9246,15 +9242,13 @@ impl Implementation for SlidingAttentionViaCacheImpl {
         WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         // Decode-only mirror of `AttentionViaCacheImpl`.
         match role {
-            crate::solver::ForwardRole::Decode => {
-                WorkloadConstraint::NumTokensRange { min: 1, max: u32::MAX }
-            }
+            crate::solver::ForwardRole::Decode => WorkloadConstraint::NumTokensRange {
+                min: 1,
+                max: u32::MAX,
+            },
             crate::solver::ForwardRole::Prefill => self.workload_constraint(),
         }
     }
@@ -14601,10 +14595,7 @@ impl Implementation for FlashInferAttentionDecodeImpl {
         }
     }
 
-    fn workload_constraint_for_role(
-        &self,
-        role: crate::solver::ForwardRole,
-    ) -> WorkloadConstraint {
+    fn workload_constraint_for_role(&self, role: crate::solver::ForwardRole) -> WorkloadConstraint {
         // Decode-role: FI's decode plan cache is keyed by
         // max_seqlen_q and handles any num_tokens at max_seqlen_q=1,
         // which is exactly the batched-decode shape. Widen to
@@ -18051,7 +18042,7 @@ impl Implementation for BarrierSignalImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         _slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let bs_id = m.claimed_tiles[0];
         let meta = fuf.barrier_meta.get(&bs_id).copied().unwrap_or_else(|| {
             panic!(
@@ -18062,10 +18053,7 @@ impl Implementation for BarrierSignalImpl {
             )
         });
         let edge = meta.edge_idx;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("TkBarrierSignal", proc_macro2::Span::call_site()),
-            vec![quote! { #edge }],
-        )])
+        Some(vec![Instruction::TkBarrierSignal(edge)])
     }
 }
 
@@ -18162,7 +18150,7 @@ impl Implementation for BarrierWaitImpl {
         _program: &Program,
         _bounds: &BTreeMap<String, u64>,
         _slots: &SlotMap,
-    ) -> Option<Vec<OpInstance>> {
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
         let bw_id = m.claimed_tiles[0];
         let meta = fuf.barrier_meta.get(&bw_id).copied().unwrap_or_else(|| {
             panic!(
@@ -18174,10 +18162,7 @@ impl Implementation for BarrierWaitImpl {
         });
         let edge = meta.edge_idx;
         let count = meta.expected_count;
-        Some(vec![OpInstance::new(
-            syn::Ident::new("TkBarrierWait", proc_macro2::Span::call_site()),
-            vec![quote! { #edge }, quote! { #count }],
-        )])
+        Some(vec![Instruction::TkBarrierWait(edge, count)])
     }
 }
 

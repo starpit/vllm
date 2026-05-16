@@ -155,14 +155,8 @@ impl KvCachePool {
         let k_ptr_array = driver::mem_alloc(ptr_array_bytes)?;
         let v_ptr_array = driver::mem_alloc(ptr_array_bytes)?;
         {
-            let host_k: Vec<*mut u16> = k_caches
-                .iter()
-                .map(|t| t.raw_ptr() as *mut u16)
-                .collect();
-            let host_v: Vec<*mut u16> = v_caches
-                .iter()
-                .map(|t| t.raw_ptr() as *mut u16)
-                .collect();
+            let host_k: Vec<*mut u16> = k_caches.iter().map(|t| t.raw_ptr() as *mut u16).collect();
+            let host_v: Vec<*mut u16> = v_caches.iter().map(|t| t.raw_ptr() as *mut u16).collect();
             let null_stream = std::ptr::null_mut();
             driver::memcpy_htod_async(
                 k_ptr_array,

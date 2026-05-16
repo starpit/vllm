@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `Vec<semantic-instr>` → `MegaTape` substrate-aware lowering.
+//! `Vec<Instruction>` → `MegaTape` substrate-aware lowering.
 //!
 //! Sprint A scope (per `MEGA_IR_PLAN.md` §10): RmsNorm only.
 //! Bug classes targeted: #1 (slot bounds), #2 (lifecycle),
 //! #5 (scratch budget), #6 (warp roles). #3 (mbarrier phase
 //! parity) lands at the per-iter level here too.
 //!
-//! ## Sprint A integration shim
+//! ## Pipeline integration
 //!
-//! The proc-macro feeds the lowering ONE op at a time via
-//! [`MegaTapeBuilder::push_rms_norm`]. The proc-macro's existing
-//! `fan_out` returns `Vec<OpInstance>` with TokenStream fields
-//! (the type-erasure point — see `MEGA_IR_PLAN.md` §5+§8.2).
-//! The integration to feed `Instruction<W>` directly is a later
-//! sprint; today's Sprint A pushes from typed numeric/string
-//! values handed in by whatever the proc-macro decides to use.
+//! Per `MEGA_IR_PLAN.md` §5, the input is the existing
+//! `Vec<Instruction>` semantic tape from
+//! `ferrite_forward::Instruction`. There is no `MegaOp` semantic
+//! enum, no `OpInstance::field_values: Vec<TokenStream>` round-trip.
+//! Each `Instruction` is paired with its per-op weight context (the
+//! per-arch base names of the weight slots the variant consumes,
+//! extracted from `OpInstance::weight_slots` at fan_out time).
+//!
+//! [`lower`] is the public entry point: it walks
+//! `&[OpInput]` and dispatches to the substrate-aware push handler
+//! for each variant. Variants whose substrate lifting hasn't landed
+//! yet (Sprint B onwards) return [`LowerError::NotYetLifted`] —
+//! callers are expected to fall back to the host interpreter for
+//! those tapes until the matching sprint lands.
 
 #![allow(dead_code)]
+
+use ferrite_forward::Instruction;
 
 use crate::nodes::{LayerIndex, MegaNode, RmsNorm, WeightRef};
 use crate::substrate::{
@@ -192,42 +201,203 @@ impl MegaTapeBuilder {
 #[derive(Debug)]
 pub enum LowerError {
     /// Reserved for variants that haven't been substrate-lifted
-    /// yet (Sprint B onwards).
+    /// yet (Sprint B onwards). Carries the variant name so the
+    /// proc-macro caller can fall back to the host interpreter.
     NotYetLifted { op: &'static str },
 }
 
-/// Top-level lowering function. Sprint A: takes a slice of typed
-/// RmsNorm op data and produces a `MegaTape`. As more sprints
-/// land, this signature grows or splits.
-pub fn lower_rms_norm_only(
-    rms_norm_ops: &[RmsNormInput],
+/// Per-op lowering input: one [`Instruction`] paired with the
+/// per-arch weight base names of the slots it consumes (in
+/// declaration order — matches `OpInstance::weight_slots` ordering
+/// from fan_out time). Each path is the resolved
+/// `Weights::<base>` source string the emit step splices in.
+///
+/// `RmsNorm` consumes one weight slot, so `weight_paths` has one
+/// entry. Multi-accessor variants (`FusedQkvRopeCache` = 2,
+/// `FusedQkvQkNormRopeCache` = 6, etc.) carry one entry per slot.
+/// Variants that consume no weight (`Add`, `BarrierSignal`,
+/// `Reshape`) use an empty `Vec`.
+#[derive(Clone)]
+pub struct OpInput {
+    pub instr: Instruction,
+    pub weight_paths: Vec<String>,
+}
+
+/// Top-level lowering function: walks a `Vec<Instruction>` semantic
+/// tape (paired with per-op weight context), dispatches each variant
+/// to its substrate-aware push handler, and returns the typed
+/// `MegaTape`.
+///
+/// Per `MEGA_IR_PLAN.md` §5 the input is the existing
+/// `Instruction` enum from `ferrite_forward::instr`. There is no
+/// `MegaOp` semantic enum and no `OpInstance::field_values`
+/// round-trip — the proc-macro hands typed `Instruction` values
+/// directly into this function.
+///
+/// Sprint A handles `RmsNorm`. Other variants return
+/// [`LowerError::NotYetLifted`] until their sprint lands; the
+/// proc-macro is expected to fall back to the host interpreter
+/// path for those tapes.
+pub fn lower(
+    ops: &[OpInput],
+    num_layers: u32,
     substrate: SubstrateBudget,
 ) -> Result<MegaTape, LowerError> {
     let mut builder = MegaTapeBuilder::new(substrate);
-    for op in rms_norm_ops {
-        builder.push_rms_norm(
-            op.in_slot_id,
-            op.weight_slot_id,
-            op.layer,
-            op.num_layers,
-            op.weight_path.clone(),
-            op.scratch_offset,
-        );
+    for op in ops {
+        match &op.instr {
+            Instruction::RmsNorm(in_slot, _out_slot, layer) => {
+                let weight_path = op
+                    .weight_paths
+                    .first()
+                    .expect("lower(RmsNorm): expected one weight_paths entry")
+                    .clone();
+                // Sprint A: substrate page slots are allocated
+                // straight from the activation tile slot ids.
+                // The pool releases pages between ops; with a
+                // single op-in-flight this is sufficient. Sprint B
+                // onwards adds a richer slot allocator when the
+                // pipeline lands.
+                let in_slot_id = *in_slot;
+                // Weight gets its own substrate page; pick the
+                // next free slot deterministically. For Sprint A
+                // we use `in_slot_id ^ 1` so input + weight
+                // never collide (page pool detects collisions
+                // anyway → bug class #2).
+                let weight_slot_id = if in_slot_id == 0 { 1 } else { in_slot_id ^ 1 };
+                builder.push_rms_norm(
+                    in_slot_id,
+                    weight_slot_id,
+                    *layer,
+                    num_layers,
+                    weight_path,
+                    /*scratch_offset=*/ 0,
+                );
+            }
+            other => {
+                return Err(LowerError::NotYetLifted {
+                    op: variant_name(other),
+                });
+            }
+        }
     }
     Ok(builder.finish())
 }
 
-/// Sprint A's per-op input shim. The proc-macro fills these from
-/// fan_out results. Later sprints replace the shim with the
-/// `Instruction<W>` semantic Tape directly.
-#[derive(Clone, Debug)]
-pub struct RmsNormInput {
-    pub in_slot_id: u32,
-    pub weight_slot_id: u32,
-    pub layer: u32,
-    pub num_layers: u32,
-    pub weight_path: String,
-    pub scratch_offset: u32,
+/// Stable static-string name for an [`Instruction`] variant. Used
+/// in [`LowerError::NotYetLifted`] reporting and proc-macro diag.
+fn variant_name(instr: &Instruction) -> &'static str {
+    match instr {
+        Instruction::Embed(..) => "Embed",
+        Instruction::RmsNorm(..) => "RmsNorm",
+        Instruction::MeanSubRmsNorm(..) => "MeanSubRmsNorm",
+        Instruction::MeanSubRmsNormBiasAdd(..) => "MeanSubRmsNormBiasAdd",
+        Instruction::Reshape(..) => "Reshape",
+        Instruction::Add(..) => "Add",
+        Instruction::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
+        Instruction::ScalarMul(..) => "ScalarMul",
+        Instruction::TanhSoftCap(..) => "TanhSoftCap",
+        Instruction::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
+        Instruction::FusedAddRmsNormWithOffset(..) => "FusedAddRmsNormWithOffset",
+        Instruction::ScalarOffsetRmsNorm(..) => "ScalarOffsetRmsNorm",
+        Instruction::CutlassFusedRmsNormGemm(..) => "CutlassFusedRmsNormGemm",
+        Instruction::CutlassFusedMeanSubRmsNormGemm(..) => "CutlassFusedMeanSubRmsNormGemm",
+        Instruction::CutlassFusedAddRmsNormGemm(..) => "CutlassFusedAddRmsNormGemm",
+        Instruction::CutlassFusedAddScalarOffsetRmsNormGemm(..) => {
+            "CutlassFusedAddScalarOffsetRmsNormGemm"
+        }
+        Instruction::Gemm(..) => "Gemm",
+        Instruction::FusedCublasGemmAdd(..) => "FusedCublasGemmAdd",
+        Instruction::FusedGemmBias(..) => "FusedGemmBias",
+        Instruction::FusedGateUpSiluMul(..) => "FusedGateUpSiluMul",
+        Instruction::FusedGateUpGeluMul(..) => "FusedGateUpGeluMul",
+        Instruction::FusedQkvRopeCache(..) => "FusedQkvRopeCache",
+        Instruction::FusedQkvQkNormRopeCache(..) => "FusedQkvQkNormRopeCache",
+        Instruction::FusedQkvRopePrefill(..) => "FusedQkvRopePrefill",
+        Instruction::AttentionViaCache(..) => "AttentionViaCache",
+        Instruction::AttentionPrefillContiguous(..) => "AttentionPrefillContiguous",
+        Instruction::EncoderAttention(..) => "EncoderAttention",
+        Instruction::SlidingAttentionViaCache(..) => "SlidingAttentionViaCache",
+        Instruction::SlidingAttentionPrefillContiguous(..) => "SlidingAttentionPrefillContiguous",
+        Instruction::VarlenAttention(..) => "VarlenAttention",
+        Instruction::VisionRope(..) => "VisionRope",
+        Instruction::QuickGelu(..) => "QuickGelu",
+        Instruction::Gelu(..) => "Gelu",
+        Instruction::PosEmbed(..) => "PosEmbed",
+        Instruction::LoadPixels(..) => "LoadPixels",
+        Instruction::GeluErf(..) => "GeluErf",
+        Instruction::EmbeddingGather(..) => "EmbeddingGather",
+        Instruction::AvgPool2d(..) => "AvgPool2d",
+        Instruction::StripCls(..) => "StripCls",
+        Instruction::FlashInferAttentionDecode(..) => "FlashInferAttentionDecode",
+        Instruction::FlashInferAttentionPrefill(..) => "FlashInferAttentionPrefill",
+        Instruction::RopeAppend(..) => "RopeAppend",
+        Instruction::MlaSplit(..) => "MlaSplit",
+        Instruction::MlaAttention(..) => "MlaAttention",
+        Instruction::DeepSeekMoe(..) => "DeepSeekMoe",
+        Instruction::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
+        Instruction::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
+        Instruction::FusedMoe(..) => "FusedMoe",
+        Instruction::SharedFusedMoe(..) => "SharedFusedMoe",
+        Instruction::CutlassGemm(..) => "CutlassGemm",
+        Instruction::CutlassGemmSplitK(..) => "CutlassGemmSplitK",
+        Instruction::CutlassGemmAdd(..) => "CutlassGemmAdd",
+        Instruction::CutlassGemv(..) => "CutlassGemv",
+        Instruction::CutlassFusedGemmBias(..) => "CutlassFusedGemmBias",
+        Instruction::CutlassFusedGateUpSiluMul(..) => "CutlassFusedGateUpSiluMul",
+        Instruction::CutlassFusedGateUpGeluMul(..) => "CutlassFusedGateUpGeluMul",
+        Instruction::CutlassFusedQkvRopeCache(..) => "CutlassFusedQkvRopeCache",
+        Instruction::CutlassFusedQkvRopePrefill(..) => "CutlassFusedQkvRopePrefill",
+        Instruction::MarlinGemm(..) => "MarlinGemm",
+        Instruction::MarlinFusedGateUpSiluMul(..) => "MarlinFusedGateUpSiluMul",
+        Instruction::MarlinFusedGateUpGeluMul(..) => "MarlinFusedGateUpGeluMul",
+        Instruction::MarlinFusedQkvRopeCache(..) => "MarlinFusedQkvRopeCache",
+        Instruction::MarlinFusedQkvRopePrefill(..) => "MarlinFusedQkvRopePrefill",
+        Instruction::Bnb4Gemm(..) => "Bnb4Gemm",
+        Instruction::Bnb4FusedGateUpSiluMul(..) => "Bnb4FusedGateUpSiluMul",
+        Instruction::Bnb4FusedGateUpGeluMul(..) => "Bnb4FusedGateUpGeluMul",
+        Instruction::Bnb4FusedQkvRopeCache(..) => "Bnb4FusedQkvRopeCache",
+        Instruction::Bnb4FusedQkvRopePrefill(..) => "Bnb4FusedQkvRopePrefill",
+        Instruction::GgmlGemm(..) => "GgmlGemm",
+        Instruction::GgmlFusedGateUpSiluMul(..) => "GgmlFusedGateUpSiluMul",
+        Instruction::GgmlFusedGateUpGeluMul(..) => "GgmlFusedGateUpGeluMul",
+        Instruction::GgmlFusedQkvRopeCache(..) => "GgmlFusedQkvRopeCache",
+        Instruction::GgmlFusedQkvRopePrefill(..) => "GgmlFusedQkvRopePrefill",
+        Instruction::Fp8Gemm(..) => "Fp8Gemm",
+        Instruction::Fp8FusedGemmBias(..) => "Fp8FusedGemmBias",
+        Instruction::Fp8FusedGateUpSiluMul(..) => "Fp8FusedGateUpSiluMul",
+        Instruction::Fp8FusedGateUpGeluMul(..) => "Fp8FusedGateUpGeluMul",
+        Instruction::Fp8FusedQkvRopeCache(..) => "Fp8FusedQkvRopeCache",
+        Instruction::Fp8FusedQkvRopePrefill(..) => "Fp8FusedQkvRopePrefill",
+        Instruction::TkEmbed(..) => "TkEmbed",
+        Instruction::TkScalarMul(..) => "TkScalarMul",
+        Instruction::TkRmsNorm(..) => "TkRmsNorm",
+        Instruction::TkGemm(..) => "TkGemm",
+        Instruction::TkFusedAddRmsNorm(..) => "TkFusedAddRmsNorm",
+        Instruction::TkFusedQkvRopeCache(..) => "TkFusedQkvRopeCache",
+        Instruction::TkAttentionViaCache(..) => "TkAttentionViaCache",
+        Instruction::TkSlidingAttentionViaCache(..) => "TkSlidingAttentionViaCache",
+        Instruction::TkFusedGateUpSiluMul(..) => "TkFusedGateUpSiluMul",
+        Instruction::TkFusedGateUpGeluMul(..) => "TkFusedGateUpGeluMul",
+        Instruction::TkGemmAdd(..) => "TkGemmAdd",
+        Instruction::TkFusedAddRmsNormGemm(..) => "TkFusedAddRmsNormGemm",
+        Instruction::TkScalarOffsetRmsNorm(..) => "TkScalarOffsetRmsNorm",
+        Instruction::TkFusedAddRmsNormWithOffset(..) => "TkFusedAddRmsNormWithOffset",
+        Instruction::TkTanhSoftCap(..) => "TkTanhSoftCap",
+        Instruction::TkFusedAddScalarOffsetRmsNormGemm(..) => "TkFusedAddScalarOffsetRmsNormGemm",
+        Instruction::TkBarrierSignal(..) => "TkBarrierSignal",
+        Instruction::TkBarrierWait(..) => "TkBarrierWait",
+        Instruction::TkSpliceMmEmbeds(..) => "TkSpliceMmEmbeds",
+        Instruction::Loop(..) => "Loop",
+        Instruction::Alias(..) => "Alias",
+        Instruction::Free(..) => "Free",
+        Instruction::BarrierSignal(..) => "BarrierSignal",
+        Instruction::BarrierWait(..) => "BarrierWait",
+        #[cfg(feature = "nccl")]
+        Instruction::AllReduce(..) => "AllReduce",
+        #[cfg(feature = "nccl")]
+        Instruction::AllGather(..) => "AllGather",
+    }
 }
 
 #[cfg(test)]
@@ -238,14 +408,10 @@ mod tests {
         SubstrateBudget::new(6, 8, 32_768, 8_192)
     }
 
-    fn good_input() -> RmsNormInput {
-        RmsNormInput {
-            in_slot_id: 0,
-            weight_slot_id: 1,
-            layer: 0,
-            num_layers: 16,
-            weight_path: "Weights :: input_layernorm".to_string(),
-            scratch_offset: 0,
+    fn good_op() -> OpInput {
+        OpInput {
+            instr: Instruction::RmsNorm(0, 0, 0),
+            weight_paths: vec!["Weights::input_layernorm".to_string()],
         }
     }
 
@@ -323,15 +489,28 @@ mod tests {
     }
 
     #[test]
-    fn lower_rms_norm_only_round_trips() {
-        let inputs = vec![good_input()];
-        let tape = lower_rms_norm_only(&inputs, budget()).expect("good input");
+    fn lower_rms_norm_round_trips() {
+        let ops = vec![good_op()];
+        let tape = lower(&ops, /*num_layers=*/ 16, budget()).expect("good input");
         assert_eq!(tape.nodes().len(), 1);
     }
 
     #[test]
-    fn lower_rms_norm_empty_produces_empty_tape() {
-        let tape = lower_rms_norm_only(&[], budget()).expect("empty input is fine");
+    fn lower_empty_produces_empty_tape() {
+        let tape = lower(&[], 16, budget()).expect("empty input is fine");
         assert!(tape.nodes().is_empty());
+    }
+
+    #[test]
+    fn lower_unmigrated_variant_returns_not_yet_lifted() {
+        // `Add` is in Sprint D — not lifted in Sprint A.
+        let ops = vec![OpInput {
+            instr: Instruction::Add(0, 1),
+            weight_paths: Vec::new(),
+        }];
+        match lower(&ops, 16, budget()) {
+            Err(LowerError::NotYetLifted { op }) => assert_eq!(op, "Add"),
+            Ok(_) => panic!("expected NotYetLifted error for Add"),
+        }
     }
 }

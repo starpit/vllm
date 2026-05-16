@@ -106,7 +106,18 @@ pub fn lower_pair<W: CanonicalParams>(
     //     would need their own row handling). At num_tokens=1024 the
     //     dispatcher always picks Standard, so this is the prefill
     //     path in practice.
-    let slice_info = if std::env::var_os("FERRITE_METAL_LMHEAD_SLICE").is_some()
+    // lm_head only needs the LAST token's row at prefill (the worker's
+    // post-pass `embedding_gather` keys on `last_token_indices=[N-1]`
+    // and discards every other row). Without this slice, lm_head runs
+    // a full M=bucket_m × N=vocab × K=hidden GEMM — at M=1024, vocab=
+    // 128256, hidden=3072 that's ~190 ms of pure waste on M1 Max.
+    //
+    // FERRITE_METAL_LMHEAD_SLICE=0/off/false disables (debug-only).
+    let slice_disabled = matches!(
+        std::env::var("FERRITE_METAL_LMHEAD_SLICE").ok().as_deref(),
+        Some("0") | Some("off") | Some("false"),
+    );
+    let slice_info = if !slice_disabled
         && bucket_m > 1
         && lm_head.len() == 1
         && lh.commands.len() == 1

@@ -4941,14 +4941,11 @@ fn emit_canonical_build_fn(
     body.extend(lm_head_tokens);
 
     let fn_name = format_ident!("build_mega_tape_{}", canonical_name);
-    let cu_fn_name = format_ident!("cu_for_{}", canonical_name);
-    let canonical_lit = proc_macro2::Literal::string(canonical_name);
     let num_pages_lit = proc_macro2::Literal::u32_unsuffixed(NUM_PAGES);
     let num_warps_lit = proc_macro2::Literal::u32_unsuffixed(NUM_CONSUMER_WARPS);
     let page_size_lit = proc_macro2::Literal::u32_unsuffixed(PAGE_SIZE);
     let scratch_lit = proc_macro2::Literal::u32_unsuffixed(SCRATCH_BYTES);
     let num_edges_lit = proc_macro2::Literal::u32_unsuffixed(num_edges);
-    let effective_layers_lit = proc_macro2::Literal::u32_unsuffixed(effective_num_layers);
 
     Ok(quote! {
         /// Compile-time-substrate-proof-bearing MegaTape constructor.
@@ -4963,44 +4960,6 @@ fn emit_canonical_build_fn(
             > = ::ferrite_forward::mega_ir::MegaTapeBuilder::new();
             #body
             b.finish()
-        }
-
-        /// Phase C step 2: lower this canonical's `MegaTape` to a
-        /// per-canonical `.cu` source via `lower_to_cuda`. The
-        /// returned `CuVariant` carries the `extern "C"
-        /// ferrite_<canonical>_launch` ABI tier (`Base` / `Qkv` /
-        /// `Attn`) inferred from the tape's variant set, plus the
-        /// substrate budget and dispatch counts the cudaforge build
-        /// step needs to stamp into the kernel banner.
-        ///
-        /// SCAFFOLD: today every per-node body in `source` is a
-        /// placeholder comment listing the typed-getter values; the
-        /// `MEGA_IR_PLAN.md` §10 sprint table (RmsNorm → … →
-        /// remainder) drives subsequent commits that replace
-        /// placeholders with real per-variant CUDA. Wiring is in
-        /// place so adding a sprint's CUDA does not require
-        /// touching the proc-macro emit path.
-        ///
-        /// `num_act_slots` / `num_weight_accessors` are stamped at
-        /// 0 in this scaffold; the codegen plumbs them in the
-        /// MEGA_FORWARD_TABLE wiring commit (Phase C step 3).
-        #[allow(dead_code, clippy::let_and_return)]
-        pub fn #cu_fn_name() -> ::ferrite_forward::mega_ir::CuVariant {
-            let tape = #fn_name();
-            ::ferrite_forward::mega_ir::lower_to_cuda(
-                &tape,
-                #canonical_lit,
-                &::ferrite_forward::mega_ir::CuLowerCtx {
-                    num_pages: #num_pages_lit,
-                    num_consumer_warps: #num_warps_lit,
-                    page_size: #page_size_lit,
-                    scratch_bytes: #scratch_lit,
-                    num_layers: #effective_layers_lit,
-                    num_edges: #num_edges_lit,
-                    num_act_slots: 0,
-                    num_weight_accessors: 0,
-                },
-            )
         }
     })
 }

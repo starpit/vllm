@@ -33,13 +33,11 @@
 //!   Phase C of the plan replaces this with literal const-arg
 //!   emission at proc-macro expansion time.
 
-pub mod cuda_emit;
 pub mod lower;
 pub mod nodes;
 pub mod substrate;
 pub mod tape;
 
-pub use cuda_emit::{CuAbiTier, CuLowerCtx, CuVariant, lower_to_cuda};
 pub use lower::{ArriveCount, LowerError, MegaTapeBuilder};
 pub use nodes::{
     Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,

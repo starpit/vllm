@@ -5452,6 +5452,35 @@ fn dispatch_instruction_to_push(
                 >(::ferrite_forward::mega_ir::AttentionKind::Full, #interleaved_lit);
             })
         }
+        I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k) => {
+            let weight = weight_paths
+                .first()
+                .ok_or_else(|| "FusedCublasGemmAdd weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let residual_id = lit(*residual_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot, *residual_slot])?);
+            let b_tile_off = lit(0u32);
+            let b_tile_bytes = lit(state.scratch_bytes);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let arrives = lit(state.arrives);
+            let num_layers = lit(state.num_layers);
+            let layer_lit = lit(resolved_layer(*layer));
+            let n_lit = lit(*n);
+            let k_lit = lit(*k);
+            let weight_str = weight.as_str();
+            state.arrives += 1;
+            Ok(quote! {
+                b.push_fused_cublas_gemm_add::<
+                    #in_id, #weight_id, #residual_id,
+                    #b_tile_off, #b_tile_bytes,
+                    #consumer_phase, #storer_phase,
+                    #iters, #layer_lit, #n_lit, #k_lit,
+                    #num_layers, #arrives,
+                >(#weight_str.to_string());
+            })
+        }
         I::SpliceMmEmbeds(slot) => {
             let slot_lit = lit(*slot);
             let consumer_phase = lit(state.arrives & 1);

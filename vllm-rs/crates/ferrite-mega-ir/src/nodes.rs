@@ -1111,6 +1111,127 @@ impl Gemm {
     }
 }
 
+/// `Instruction::FusedCublasGemmAdd(in, residual, layer, n, k)` —
+/// `residual += gemm(in, weight[layer])` in place. Substrate shape
+/// is `Gemm` plus a `residual_page` that's read AND written
+/// (the output writes back to the residual buffer; no separate
+/// out_page).
+pub struct FusedCublasGemmAdd {
+    in_page_id: u32,
+    weight_page_id: u32,
+    residual_page_id: u32,
+    b_tile_offset: u32,
+    b_tile_bytes: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    iters: u32,
+    layer: u32,
+    n: u32,
+    k: u32,
+    pub weight: WeightRef,
+}
+
+impl FusedCublasGemmAdd {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new<
+        const IN_ID: u32,
+        const WEIGHT_ID: u32,
+        const RESIDUAL_ID: u32,
+        const B_TILE_OFF: u32,
+        const B_TILE_BYTES: u32,
+        const CONSUMER_PHASE: u32,
+        const STORER_PHASE: u32,
+        const ITERS: u32,
+        const LAYER: u32,
+        const N: u32,
+        const K: u32,
+        const NUM_PAGES: u32,
+        const NUM_LAYERS: u32,
+        const SCRATCH_BYTES: u32,
+        const ARRIVES: u32,
+    >(
+        weight: WeightRef,
+    ) -> Self {
+        const {
+            assert!(IN_ID < NUM_PAGES, "FusedCublasGemmAdd: IN_ID OOB");
+            assert!(WEIGHT_ID < NUM_PAGES, "FusedCublasGemmAdd: WEIGHT_ID OOB");
+            assert!(
+                RESIDUAL_ID < NUM_PAGES,
+                "FusedCublasGemmAdd: RESIDUAL_ID OOB"
+            );
+            assert!(
+                IN_ID != WEIGHT_ID && IN_ID != RESIDUAL_ID && WEIGHT_ID != RESIDUAL_ID,
+                "FusedCublasGemmAdd: page alias"
+            );
+            let end = (B_TILE_OFF as u64) + (B_TILE_BYTES as u64);
+            assert!(
+                end <= SCRATCH_BYTES as u64,
+                "FusedCublasGemmAdd: b_tile OOB scratch budget"
+            );
+            assert!(ITERS > 0, "FusedCublasGemmAdd: ITERS must be > 0");
+            assert!(LAYER < NUM_LAYERS, "FusedCublasGemmAdd: LAYER OOB");
+            assert!(N > 0, "FusedCublasGemmAdd: N must be > 0");
+            assert!(K > 0, "FusedCublasGemmAdd: K must be > 0");
+            assert!(
+                CONSUMER_PHASE == ARRIVES & 1,
+                "FusedCublasGemmAdd: CONSUMER_PHASE parity"
+            );
+            assert!(
+                STORER_PHASE == (ARRIVES + 1) & 1,
+                "FusedCublasGemmAdd: STORER_PHASE parity"
+            );
+        }
+        Self {
+            in_page_id: IN_ID,
+            weight_page_id: WEIGHT_ID,
+            residual_page_id: RESIDUAL_ID,
+            b_tile_offset: B_TILE_OFF,
+            b_tile_bytes: B_TILE_BYTES,
+            consumer_phase: CONSUMER_PHASE,
+            storer_phase: STORER_PHASE,
+            iters: ITERS,
+            layer: LAYER,
+            n: N,
+            k: K,
+            weight,
+        }
+    }
+
+    pub const fn in_page_id(&self) -> u32 {
+        self.in_page_id
+    }
+    pub const fn weight_page_id(&self) -> u32 {
+        self.weight_page_id
+    }
+    pub const fn residual_page_id(&self) -> u32 {
+        self.residual_page_id
+    }
+    pub const fn b_tile_offset(&self) -> u32 {
+        self.b_tile_offset
+    }
+    pub const fn b_tile_bytes(&self) -> u32 {
+        self.b_tile_bytes
+    }
+    pub const fn consumer_phase(&self) -> u32 {
+        self.consumer_phase
+    }
+    pub const fn storer_phase(&self) -> u32 {
+        self.storer_phase
+    }
+    pub const fn iters(&self) -> u32 {
+        self.iters
+    }
+    pub const fn layer(&self) -> u32 {
+        self.layer
+    }
+    pub const fn n(&self) -> u32 {
+        self.n
+    }
+    pub const fn k(&self) -> u32 {
+        self.k
+    }
+}
+
 /// `CutlassFusedNormGemm` (lm_head fusion) variant.
 ///
 /// `delta_page_id`: `Some` for AddRmsNorm / AddScalarOffsetRmsNorm.
@@ -1630,6 +1751,7 @@ pub enum MegaNode {
     TanhSoftCap(TanhSoftCap),
     ScalarOffsetRmsNorm(ScalarOffsetRmsNorm),
     Gemm(Gemm),
+    FusedCublasGemmAdd(FusedCublasGemmAdd),
     CutlassFusedNormGemm(CutlassFusedNormGemm),
     AttentionViaCache(AttentionViaCacheNode),
     BarrierSignal(BarrierSignal),

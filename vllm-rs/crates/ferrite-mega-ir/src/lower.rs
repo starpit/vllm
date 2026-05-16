@@ -53,9 +53,9 @@
 
 use crate::nodes::{
     Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
-    Embed, FiniteF32, FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation,
-    Gemm, LmHeadNormKind, MegaNode, RmsNorm, RotaryRef, ScalarMul, ScalarOffsetRmsNorm,
-    SpliceMmEmbeds, TanhSoftCap, WeightRef,
+    Embed, FiniteF32, FusedAddRmsNorm, FusedCublasGemmAdd, FusedGateUpActivateMul,
+    FusedQkvRopeCache, GateUpActivation, Gemm, LmHeadNormKind, MegaNode, RmsNorm, RotaryRef,
+    ScalarMul, ScalarOffsetRmsNorm, SpliceMmEmbeds, TanhSoftCap, WeightRef,
 };
 use crate::substrate::{PagePool, SubstrateBudget};
 use crate::tape::MegaTape;
@@ -555,6 +555,61 @@ impl<
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
         self.pool.release(OUT_ID);
+        for _ in 0..ITERS {
+            self.arrives.bump();
+        }
+        self
+    }
+
+    /// Push a typed `FusedCublasGemmAdd` onto the tape.
+    /// Substrate shape: 3 pages (in / weight / residual=output),
+    /// `GemmScope` B-tile, multi-iter. The residual page is read
+    /// AND written (in-place residual fold after the gemm).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_fused_cublas_gemm_add<
+        const IN_ID: u32,
+        const WEIGHT_ID: u32,
+        const RESIDUAL_ID: u32,
+        const B_TILE_OFF: u32,
+        const B_TILE_BYTES: u32,
+        const CONSUMER_PHASE: u32,
+        const STORER_PHASE: u32,
+        const ITERS: u32,
+        const LAYER: u32,
+        const N: u32,
+        const K: u32,
+        const NUM_LAYERS: u32,
+        const ARRIVES: u32,
+    >(
+        &mut self,
+        weight_path: String,
+    ) -> &mut Self {
+        self.verify_arrives(ARRIVES, "push_fused_cublas_gemm_add");
+        let _ = self.pool.take(IN_ID);
+        let _ = self.pool.take(WEIGHT_ID);
+        let _ = self.pool.take(RESIDUAL_ID);
+        let weight = WeightRef::new(weight_path);
+        let node = FusedCublasGemmAdd::new::<
+            IN_ID,
+            WEIGHT_ID,
+            RESIDUAL_ID,
+            B_TILE_OFF,
+            B_TILE_BYTES,
+            CONSUMER_PHASE,
+            STORER_PHASE,
+            ITERS,
+            LAYER,
+            N,
+            K,
+            NUM_PAGES,
+            NUM_LAYERS,
+            SCRATCH_BYTES,
+            ARRIVES,
+        >(weight);
+        self.nodes.push(MegaNode::FusedCublasGemmAdd(node));
+        self.pool.release(IN_ID);
+        self.pool.release(WEIGHT_ID);
+        self.pool.release(RESIDUAL_ID);
         for _ in 0..ITERS {
             self.arrives.bump();
         }

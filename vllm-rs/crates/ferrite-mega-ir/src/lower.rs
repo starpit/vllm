@@ -163,6 +163,21 @@ impl<
     /// - `LAYER < NUM_LAYERS`
     /// - `CONSUMER_PHASE == ARRIVES & 1`
     /// - `STORER_PHASE == (ARRIVES + 1) & 1`
+    /// - `HIDDEN_DIM > 0`, `NUM_TOKENS > 0` (kernel-AST shape)
+    ///
+    /// Kernel-AST const generics (per `MEGA_IR_PLAN.md` §0/§4a/§8.0
+    /// — splice into `ferrite::ops::rms_norm::<role><Config,
+    /// HIDDEN_DIM, NUM_TOKENS>(...)`):
+    /// - `HIDDEN_DIM`, `NUM_TOKENS` — kernel template args.
+    /// - `IN_ACT_SLOT` — `act_ptrs[]` index (input row gmem ptr).
+    /// - `OUT_ACT_SLOT` — `act_ptrs[]` index (storer's output ptr).
+    /// - `WEIGHT_ACCESSOR_IDX` — flat index into `weight_ptrs[acc *
+    ///   NUM_LAYERS + layer]` for the rms weight.
+    ///
+    /// Runtime args:
+    /// - `weight_path` — `WeightRef` for emit-time accessor sanity.
+    /// - `eps` — `FiniteF32` for the kernel's `consumer(..., float eps)`
+    ///   runtime arg (rms denominator stabilizer).
     ///
     /// Runtime checks (cross-op):
     /// - PagePool refuses cross-op alias.
@@ -178,15 +193,22 @@ impl<
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         weight_path: String,
+        eps: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_rms_norm");
         // Cross-op alias check via runtime PagePool.
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(weight_path);
+        let eps = FiniteF32::new(eps);
         let node = RmsNorm::new::<
             IN_ID,
             WEIGHT_ID,
@@ -199,7 +221,12 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
-        >(weight);
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
+        >(weight, eps);
         self.nodes.push(MegaNode::RmsNorm(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
@@ -882,10 +909,15 @@ mod tests {
     #[test]
     fn lowers_well_formed_rms_norm() {
         let mut b = Builder6::new();
-        // IN_ID=0, WEIGHT_ID=1, partial sums offset=0, bytes=32
-        // (NUM_CONSUMER_WARPS * 4), CONSUMER_PHASE=0 (ARRIVES=0&1=0),
-        // STORER_PHASE=1, LAYER=0, NUM_LAYERS=16, ARRIVES=0.
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0>("W::norm".to_string());
+        // Substrate proofs: IN_ID=0, WEIGHT_ID=1, PARTIAL_OFF=0,
+        // PARTIAL_BYTES=32 (NUM_CONSUMER_WARPS*4), CONSUMER_PHASE=0
+        // (ARRIVES=0&1=0), STORER_PHASE=1, LAYER=0, NUM_LAYERS=16,
+        // ARRIVES=0. AST shape: HIDDEN_DIM=2048, NUM_TOKENS=8,
+        // IN_ACT_SLOT=0, OUT_ACT_SLOT=1, WEIGHT_ACCESSOR_IDX=0.
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+            "W::norm".to_string(),
+            1.0e-5_f32,
+        );
         let tape = b.finish();
         assert_eq!(tape.nodes().len(), 1);
         let MegaNode::RmsNorm(n) = &tape.nodes()[0] else {
@@ -898,15 +930,27 @@ mod tests {
         assert_eq!(n.consumer_phase(), 0);
         assert_eq!(n.storer_phase(), 1);
         assert_eq!(n.layer(), 0);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.num_tokens(), 8);
+        assert_eq!(n.in_act_slot(), 0);
+        assert_eq!(n.out_act_slot(), 1);
+        assert_eq!(n.weight_accessor_idx(), 0);
+        assert!((n.eps().raw() - 1.0e-5_f32).abs() < 1e-9);
         assert_eq!(n.weight.path(), "W::norm");
     }
 
     #[test]
     fn lowers_two_rms_norms_with_phase_advance() {
         let mut b = Builder6::new();
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0>("W::n0".to_string());
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+            "W::n0".to_string(),
+            1.0e-5_f32,
+        );
         // After first op, ARRIVES = 1; CONSUMER_PHASE = 1, STORER_PHASE = 0.
-        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 1, 16, 1>("W::n1".to_string());
+        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 1, 16, 1, 2048, 8, 0, 2, 1>(
+            "W::n1".to_string(),
+            1.0e-5_f32,
+        );
         let tape = b.finish();
         let MegaNode::RmsNorm(n0) = &tape.nodes()[0] else {
             panic!();
@@ -1174,7 +1218,10 @@ mod tests {
         let mut b = BuilderD::new();
         b.push_barrier_signal::<0>();
         b.push_barrier_wait::<0, 4>();
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0>("W::n".to_string());
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+            "W::n".to_string(),
+            1.0e-5_f32,
+        );
         let tape = b.finish();
         assert_eq!(tape.nodes().len(), 3);
     }
@@ -1183,9 +1230,15 @@ mod tests {
     fn builder_arrives_visible_to_caller() {
         let mut b = Builder6::new();
         assert_eq!(b.arrives(), 0);
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0>("W::n".to_string());
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+            "W::n".to_string(),
+            1.0e-5_f32,
+        );
         assert_eq!(b.arrives(), 1);
-        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 0, 16, 1>("W::n".to_string());
+        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 0, 16, 1, 2048, 8, 0, 1, 0>(
+            "W::n".to_string(),
+            1.0e-5_f32,
+        );
         assert_eq!(b.arrives(), 2);
     }
 }

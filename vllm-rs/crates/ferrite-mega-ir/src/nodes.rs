@@ -200,9 +200,33 @@ pub enum AttentionKind {
 // can read the integers without re-validating.
 // ============================================================
 
-/// The typed lowered RmsNorm variant. Storage: plain u32s.
-/// Construction via [`RmsNorm::new::<...>`] discharges substrate
-/// proofs at compile time.
+/// The typed lowered RmsNorm variant. Storage: plain u32s + helper
+/// newtypes. Construction via [`RmsNorm::new::<...>`] discharges
+/// substrate proofs at compile time.
+///
+/// ## AST contract (`MEGA_IR_PLAN.md` §0 / §4a / §8.0)
+///
+/// Maps to `ferrite::ops::rms_norm::{loader, consumer, launcher,
+/// storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
+/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/rms_norm.cuh`.
+/// The emit step is a pure literal `format!()` of these typed
+/// getters into the per-role kernel-call lines from
+/// `crates/ferrite-kernels/csrc/smoke/ferrite_pool_abi_smoke.cu`.
+///
+/// ## Substrate-proof fields
+///
+/// `in_page_id`, `weight_page_id`, `partial_offset/bytes`,
+/// `consumer_phase`, `storer_phase`, `layer` — discharged in
+/// `new::<...>`'s `const {}` block.
+///
+/// ## Kernel-AST fields
+///
+/// - `hidden_dim` — `<Config, HIDDEN_DIM, NUM_TOKENS>` template.
+/// - `num_tokens` — same.
+/// - `eps` — `consumer(..., float eps)` runtime arg.
+/// - `in_act_slot` — `act_ptrs[in_act_slot]` (kernel input row).
+/// - `out_act_slot` — `act_ptrs[out_act_slot]` (storer output row).
+/// - `weight_accessor_idx` — `weight_ptrs[idx * NUM_LAYERS + layer]`.
 pub struct RmsNorm {
     in_page_id: u32,
     weight_page_id: u32,
@@ -211,6 +235,12 @@ pub struct RmsNorm {
     consumer_phase: u32,
     storer_phase: u32,
     layer: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor_idx: u32,
+    eps: FiniteF32,
     pub weight: WeightRef,
 }
 
@@ -222,8 +252,9 @@ impl RmsNorm {
     /// - `LAYER < NUM_LAYERS`
     /// - `CONSUMER_PHASE == ARRIVES & 1` (#3)
     /// - `STORER_PHASE == (ARRIVES + 1) & 1` (#3)
+    /// - `HIDDEN_DIM > 0`, `NUM_TOKENS > 0` (kernel-AST shape)
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const IN_ID: u32,
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
@@ -235,8 +266,14 @@ impl RmsNorm {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         weight: WeightRef,
+        eps: FiniteF32,
     ) -> Self {
         const {
             assert!(IN_ID < NUM_PAGES, "RmsNorm: IN_ID out of bounds");
@@ -256,6 +293,8 @@ impl RmsNorm {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "RmsNorm: STORER_PHASE parity mismatch with cumulative arrives + 1",
             );
+            assert!(HIDDEN_DIM > 0, "RmsNorm: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "RmsNorm: NUM_TOKENS must be > 0");
         }
         Self {
             in_page_id: IN_ID,
@@ -265,6 +304,12 @@ impl RmsNorm {
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
             layer: LAYER,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            out_act_slot: OUT_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            eps,
             weight,
         }
     }
@@ -289,6 +334,31 @@ impl RmsNorm {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+    /// Kernel `<Config, HIDDEN_DIM, NUM_TOKENS>` template arg.
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    /// Kernel `<Config, HIDDEN_DIM, NUM_TOKENS>` template arg.
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    /// `act_ptrs[in_act_slot]` — kernel input row gmem ptr.
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    /// `act_ptrs[out_act_slot]` — kernel output row gmem ptr (storer).
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
+    /// `weight_ptrs[weight_accessor_idx * NUM_LAYERS + layer]` —
+    /// flat-table index for the per-layer rms weight.
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
+    }
+    /// Kernel `consumer(..., float eps)` runtime arg.
+    pub fn eps(&self) -> FiniteF32 {
+        self.eps
     }
 }
 

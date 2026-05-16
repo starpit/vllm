@@ -4815,7 +4815,13 @@ fn emit_mega_artifacts_inline(
             wp.sk_bucket
         );
 
-        match emit_canonical_build_fn(&canonical_name, lowered, num_layers) {
+        match emit_canonical_build_fn(
+            &canonical_name,
+            lowered,
+            num_layers,
+            model,
+            wp.num_tokens as u32,
+        ) {
             Ok(tokens) => {
                 rust_decls.extend(tokens);
                 emitted_count += 1;
@@ -4861,14 +4867,52 @@ struct PhaseCState {
     num_consumer_warps: u32,
     scratch_bytes: u32,
     num_layers: u32,
+    // ── Canonical context (Phase C step 2 — `MEGA_IR_PLAN.md` §0/§4a).
+    // Every kernel template/runtime arg the emit step splices into the
+    // .cu source must originate from a typed field on the MegaNode
+    // variant, populated here from per-canonical model bounds.
+    /// `hidden_size` — `<Config, HIDDEN_DIM, …>` template arg for
+    /// every per-row op (RmsNorm, FusedAddRmsNorm, Embed, GateUp, …).
+    hidden_dim: u32,
+    /// Per-head dim (`head_dim`) — fused-QKV / attention template arg.
+    head_dim: u32,
+    /// `num_attention_heads / tp` — per-rank Q heads at the runtime tp.
+    num_q_heads: u32,
+    /// `num_key_value_heads / tp` — per-rank KV heads.
+    num_kv_heads: u32,
+    /// `intermediate_size / tp` — gate-up / down-proj inner dim.
+    intermediate_dim: u32,
+    /// `vocab_size` — embed + lm_head N dim.
+    vocab_size: u32,
+    /// `wp.num_tokens` — kernel `<…, NUM_TOKENS>` template arg (M).
+    num_tokens: u32,
+    /// `rms_norm_eps` — kernel `consumer(..., float eps)` runtime arg
+    /// for every RmsNorm-flavored op.
+    rms_norm_eps: f32,
+    /// Cumulative weight-accessor index. Each dispatch arm that
+    /// consumes a weight slot bumps this by the count it consumes;
+    /// the per-op `weight_accessor_idx` field on the emitted MegaNode
+    /// is the value at the dispatch site, not the post-bump value.
+    /// Maps directly to `weight_ptrs[idx * NUM_LAYERS + layer]` in
+    /// the emitted `.cu` (see `ferrite_pool_abi_smoke.cu` reference).
+    next_weight_accessor: u32,
 }
 
 impl PhaseCState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         num_pages_budget: u32,
         num_consumer_warps: u32,
         scratch_bytes: u32,
         num_layers: u32,
+        hidden_dim: u32,
+        head_dim: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        intermediate_dim: u32,
+        vocab_size: u32,
+        num_tokens: u32,
+        rms_norm_eps: f32,
     ) -> Self {
         Self {
             arrives: 0,
@@ -4877,6 +4921,15 @@ impl PhaseCState {
             num_consumer_warps,
             scratch_bytes,
             num_layers,
+            hidden_dim,
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
+            intermediate_dim,
+            vocab_size,
+            num_tokens,
+            rms_norm_eps,
+            next_weight_accessor: 0,
         }
     }
 
@@ -4908,6 +4961,8 @@ fn emit_canonical_build_fn(
     canonical_name: &str,
     lowered: &CanonicalLowered,
     num_layers: u32,
+    model: &ModelParams,
+    wp_num_tokens: u32,
 ) -> Result<TokenStream, String> {
     // Substrate budget. Sprint E task: derive these from the
     // canonical's actual schedule walker outputs. For now use
@@ -4929,8 +4984,39 @@ fn emit_canonical_build_fn(
         .max(max_loop_iter_count(&lowered.lm_head.instances));
     let effective_num_layers = num_layers.max(max_loop_count);
 
-    let mut state =
-        PhaseCState::new(NUM_PAGES, NUM_CONSUMER_WARPS, SCRATCH_BYTES, effective_num_layers);
+    // Canonical AST context (`MEGA_IR_PLAN.md` §0/§4a). Populated from
+    // the per-arch model bounds + per-workload (M, sk_bucket) tuple.
+    // tp-divisible dims are kept un-sharded here (the macro emits at
+    // tp=1; per-rank sharding happens at `emit_canonical_params_impl`
+    // where the runtime canonical bounds get baked into
+    // `<W as CanonicalParams>::…`).
+    let hidden_dim = *model.bounds.get("hidden_size").unwrap_or(&0) as u32;
+    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as u32;
+    let num_q_heads = *model.bounds.get("num_attention_heads").unwrap_or(&0) as u32;
+    let num_kv_heads = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32;
+    let intermediate_dim = model
+        .bounds
+        .get("intermediate_size")
+        .or_else(|| model.bounds.get("vision_intermediate_size_padded"))
+        .copied()
+        .unwrap_or(0) as u32;
+    let vocab_size = *model.bounds.get("vocab_size").unwrap_or(&0) as u32;
+    let rms_eps = rms_norm_eps(model);
+
+    let mut state = PhaseCState::new(
+        NUM_PAGES,
+        NUM_CONSUMER_WARPS,
+        SCRATCH_BYTES,
+        effective_num_layers,
+        hidden_dim,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        intermediate_dim,
+        vocab_size,
+        wp_num_tokens,
+        rms_eps,
+    );
     let mut body = TokenStream::new();
 
     // Emit pushes for backbone + lm_head with Loop expansion.
@@ -5230,7 +5316,7 @@ fn dispatch_instruction_to_push(
     let resolved_layer = |default: u32| layer_override.unwrap_or(default);
 
     match instr {
-        I::RmsNorm(in_slot, _out_slot, layer) => {
+        I::RmsNorm(in_slot, out_slot, layer) => {
             let weight = weight_paths
                 .first()
                 .ok_or_else(|| "weight_paths empty".to_string())?;
@@ -5243,15 +5329,25 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            // AST-shape const generics (per `MEGA_IR_PLAN.md` §0/§4a).
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
+            let eps_lit = state.rms_norm_eps;
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_rms_norm::<
                     #in_id, #weight_id,
                     #partial_off, #partial_bytes,
                     #consumer_phase, #storer_phase,
                     #layer_lit, #num_layers, #arrives,
-                >(#weight_str.to_string());
+                    #hidden_dim, #num_tokens,
+                    #in_act_slot, #out_act_slot, #weight_accessor_idx,
+                >(#weight_str.to_string(), #eps_lit);
             })
         }
         I::Add(delta_slot, residual_slot) => {

@@ -1,5 +1,5 @@
 // RmsNorm::new with IN_ID == WEIGHT_ID — within-op alias must compile-fail.
-use ferrite_mega_ir::{RmsNorm, WeightRef};
+use ferrite_mega_ir::{FiniteF32, RmsNorm, WeightRef};
 
 fn main() {
     let _ = RmsNorm::new::<
@@ -14,5 +14,13 @@ fn main() {
         /*NUM_LAYERS=*/ 16,
         /*SCRATCH_BYTES=*/ 8192,
         /*ARRIVES=*/ 0,
-    >(WeightRef::new("W::norm".to_string()));
+        /*HIDDEN_DIM=*/ 2048,
+        /*NUM_TOKENS=*/ 8,
+        /*IN_ACT_SLOT=*/ 0,
+        /*OUT_ACT_SLOT=*/ 1,
+        /*WEIGHT_ACCESSOR_IDX=*/ 0,
+    >(
+        WeightRef::new("W::norm".to_string()),
+        FiniteF32::new(1.0e-5_f32),
+    );
 }

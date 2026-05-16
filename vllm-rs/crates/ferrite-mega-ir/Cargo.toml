@@ -20,3 +20,10 @@ nccl = ["ferrite-forward/nccl"]
 # this dep does NOT enable `cuda` — keeps mega-ir free of
 # ferrite-kernels' extern CUDA symbols.
 ferrite-forward = { path = "../ferrite-forward" }
+
+# Compile-fail tests for const-generic substrate-proof rejection
+# live in `tests/compile_fail.rs` and shell out to `rustc` directly.
+# trybuild's primary-span filter rejects post-monomorphization E0080
+# const-eval errors (the primary span lands in `core::panic`), so we
+# don't use it; the hand-rolled driver works around it without
+# adding a dev-dep.

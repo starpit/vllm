@@ -5933,6 +5933,30 @@ fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::
         I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
             I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k)
         }
+        // MeanSubRmsNorm (CommandR pre-attn / pre-mlp): the runtime
+        // kernel does mean-subtract → rms-norm → scale. Substrate
+        // shape is identical to RmsNorm — 2 pages (in, out), 1 weight
+        // page, 1 layer-iter. The mean-subtract step is internal
+        // kernel math, not a substrate dim.
+        I::MeanSubRmsNorm(in_slot, out_slot, layer) => {
+            I::RmsNorm(in_slot, out_slot, layer)
+        }
+        // MeanSubRmsNormBiasAdd (CommandR LayerNorm.bias): same as
+        // MeanSubRmsNorm plus a learned bias add. Bias is a per-
+        // layer weight binding the emit step plumbs; substrate is
+        // still the 2-pages + per-layer-weight RmsNorm shape.
+        I::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer) => {
+            I::RmsNorm(in_slot, out_slot, layer)
+        }
+        // CutlassGemv (Phi-3 m=1 specialized GEMV): substrate is the
+        // same 3 pages (in, weight, out) + GemmScope tile as Gemm.
+        // m=1 vs m>1 is a dispatch-time kernel-selection concern,
+        // not a substrate dim. (For m=8+ the same per-arch tape
+        // emits a regular Gemm, which is why phi-3 m=8 already
+        // emitted before this normalization.)
+        I::CutlassGemv(in_slot, out_slot, layer, n, k) => {
+            I::Gemm(in_slot, out_slot, layer, n, k)
+        }
         // Quantization-flavored QKV-rope-cache variants share
         // substrate shape with the bf16 `FusedQkvRopeCache` —
         // same 6 pages (in, qkv-weight, cos_sin, q_out, k_out,

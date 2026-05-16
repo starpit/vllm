@@ -4889,6 +4889,9 @@ struct PhaseCState {
     /// `rms_norm_eps` — kernel `consumer(..., float eps)` runtime arg
     /// for every RmsNorm-flavored op.
     rms_norm_eps: f32,
+    /// `final_logit_softcapping` — `TanhSoftCap` kernel cap value.
+    /// Gemma2 lm_head softcap; 0.0 for arches without final logit cap.
+    tanh_soft_cap: f32,
     /// Cumulative weight-accessor index. Each dispatch arm that
     /// consumes a weight slot bumps this by the count it consumes;
     /// the per-op `weight_accessor_idx` field on the emitted MegaNode
@@ -4913,6 +4916,7 @@ impl PhaseCState {
         vocab_size: u32,
         num_tokens: u32,
         rms_norm_eps: f32,
+        tanh_soft_cap: f32,
     ) -> Self {
         Self {
             arrives: 0,
@@ -4929,6 +4933,7 @@ impl PhaseCState {
             vocab_size,
             num_tokens,
             rms_norm_eps,
+            tanh_soft_cap,
             next_weight_accessor: 0,
         }
     }
@@ -5002,6 +5007,11 @@ fn emit_canonical_build_fn(
         .unwrap_or(0) as u32;
     let vocab_size = *model.bounds.get("vocab_size").unwrap_or(&0) as u32;
     let rms_eps = rms_norm_eps(model);
+    let tanh_soft_cap = model
+        .scalars
+        .get("final_logit_softcapping")
+        .copied()
+        .unwrap_or(0.0) as f32;
 
     let mut state = PhaseCState::new(
         NUM_PAGES,
@@ -5016,6 +5026,7 @@ fn emit_canonical_build_fn(
         vocab_size,
         wp_num_tokens,
         rms_eps,
+        tanh_soft_cap,
     );
     let mut body = TokenStream::new();
 
@@ -5356,12 +5367,18 @@ fn dispatch_instruction_to_push(
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let delta_act_slot = lit(*delta_slot);
+            let residual_act_slot = lit(*residual_slot);
             state.arrives += 1;
             Ok(quote! {
                 b.push_add::<
                     #delta_id, #residual_id,
                     #consumer_phase, #storer_phase,
                     #arrives,
+                    #hidden_dim, #num_tokens,
+                    #delta_act_slot, #residual_act_slot,
                 >();
             })
         }
@@ -5374,13 +5391,21 @@ fn dispatch_instruction_to_push(
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let vocab_size = lit(state.vocab_size);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_embed::<
                     #out_id, #weight_id,
                     #consumer_phase, #storer_phase,
                     #arrives,
+                    #hidden_dim, #num_tokens, #vocab_size,
+                    #out_act_slot, #weight_accessor_idx,
                 >(#weight_str.to_string());
             })
         }
@@ -5390,6 +5415,10 @@ fn dispatch_instruction_to_push(
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
             let scale_lit = *scale;
             state.arrives += 1;
             Ok(quote! {
@@ -5397,6 +5426,8 @@ fn dispatch_instruction_to_push(
                     #in_id, #out_id,
                     #consumer_phase, #storer_phase,
                     #arrives,
+                    #hidden_dim, #num_tokens,
+                    #in_act_slot, #out_act_slot,
                 >(#scale_lit);
             })
         }
@@ -5406,16 +5437,23 @@ fn dispatch_instruction_to_push(
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let cap_lit = state.tanh_soft_cap;
             state.arrives += 1;
             Ok(quote! {
                 b.push_tanh_soft_cap::<
                     #in_id, #out_id,
                     #consumer_phase, #storer_phase,
                     #arrives,
-                >();
+                    #hidden_dim, #num_tokens,
+                    #in_act_slot, #out_act_slot,
+                >(#cap_lit);
             })
         }
-        I::ScalarOffsetRmsNorm(in_slot, _out_slot, layer, offset) => {
+        I::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => {
             let weight = weight_paths
                 .first()
                 .ok_or_else(|| "ScalarOffsetRmsNorm weight_paths empty".to_string())?;
@@ -5428,16 +5466,25 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
             let offset_lit = *offset;
+            let eps_lit = state.rms_norm_eps;
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_scalar_offset_rms_norm::<
                     #in_id, #weight_id,
                     #partial_off, #partial_bytes,
                     #consumer_phase, #storer_phase,
                     #layer_lit, #num_layers, #arrives,
-                >(#weight_str.to_string(), #offset_lit);
+                    #hidden_dim, #num_tokens,
+                    #in_act_slot, #out_act_slot, #weight_accessor_idx,
+                >(#weight_str.to_string(), #offset_lit, #eps_lit);
             })
         }
         I::Gemm(in_slot, out_slot, layer, n, k) => {
@@ -5483,15 +5530,24 @@ fn dispatch_instruction_to_push(
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let delta_act_slot = lit(*delta_slot);
+            let residual_act_slot = lit(*residual_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
+            let eps_lit = state.rms_norm_eps;
             state.arrives += 1;
+            state.next_weight_accessor += 1;
             Ok(quote! {
                 b.push_fused_add_rms_norm::<
                     #delta_id, #residual_id, #weight_id,
                     #partial_off, #partial_bytes,
                     #consumer_phase, #storer_phase,
                     #layer_lit, #num_layers, #arrives,
-                >(#weight_str.to_string());
+                    #hidden_dim, #num_tokens,
+                    #delta_act_slot, #residual_act_slot, #weight_accessor_idx,
+                >(#weight_str.to_string(), #eps_lit);
             })
         }
         I::FusedGateUpSiluMul(in_slot, out_slot, layer)

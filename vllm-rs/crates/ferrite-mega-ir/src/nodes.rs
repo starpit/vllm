@@ -549,14 +549,22 @@ impl FusedQkvRopeCache {
 }
 
 /// The typed lowered `Add` (residual fold) variant.
+///
+/// Kernel ABI: bf16 elementwise per-row residual add — emit splices a
+/// per-row load/add/store loop with `<HIDDEN_DIM, NUM_TOKENS>` shape.
 pub struct Add {
     delta_page_id: u32,
     residual_page_id: u32,
     consumer_phase: u32,
     storer_phase: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    delta_act_slot: u32,
+    residual_act_slot: u32,
 }
 
 impl Add {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new<
         const DELTA_ID: u32,
         const RESIDUAL_ID: u32,
@@ -564,6 +572,10 @@ impl Add {
         const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const DELTA_ACT_SLOT: u32,
+        const RESIDUAL_ACT_SLOT: u32,
     >() -> Self {
         const {
             assert!(DELTA_ID < NUM_PAGES, "Add: DELTA_ID out of bounds");
@@ -580,12 +592,18 @@ impl Add {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "Add: STORER_PHASE parity mismatch"
             );
+            assert!(HIDDEN_DIM > 0, "Add: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "Add: NUM_TOKENS must be > 0");
         }
         Self {
             delta_page_id: DELTA_ID,
             residual_page_id: RESIDUAL_ID,
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            delta_act_slot: DELTA_ACT_SLOT,
+            residual_act_slot: RESIDUAL_ACT_SLOT,
         }
     }
 
@@ -601,9 +619,25 @@ impl Add {
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
     }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn delta_act_slot(&self) -> u32 {
+        self.delta_act_slot
+    }
+    pub const fn residual_act_slot(&self) -> u32 {
+        self.residual_act_slot
+    }
 }
 
 /// The typed lowered `FusedAddRmsNorm` variant.
+///
+/// Kernel ABI: `ferrite::ops::fused_add_rms_norm::{loader, consumer,
+/// launcher, storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
+/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/fused_add_rms_norm.cuh`.
 pub struct FusedAddRmsNorm {
     delta_page_id: u32,
     residual_page_id: u32,
@@ -613,12 +647,18 @@ pub struct FusedAddRmsNorm {
     consumer_phase: u32,
     storer_phase: u32,
     layer: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    delta_act_slot: u32,
+    residual_act_slot: u32,
+    weight_accessor_idx: u32,
+    eps: FiniteF32,
     pub weight: WeightRef,
 }
 
 impl FusedAddRmsNorm {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const DELTA_ID: u32,
         const RESIDUAL_ID: u32,
         const WEIGHT_ID: u32,
@@ -631,8 +671,14 @@ impl FusedAddRmsNorm {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const DELTA_ACT_SLOT: u32,
+        const RESIDUAL_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         weight: WeightRef,
+        eps: FiniteF32,
     ) -> Self {
         const {
             assert!(DELTA_ID < NUM_PAGES, "FusedAddRmsNorm: DELTA_ID OOB");
@@ -656,6 +702,8 @@ impl FusedAddRmsNorm {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "FusedAddRmsNorm: STORER_PHASE parity mismatch",
             );
+            assert!(HIDDEN_DIM > 0, "FusedAddRmsNorm: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "FusedAddRmsNorm: NUM_TOKENS must be > 0");
         }
         Self {
             delta_page_id: DELTA_ID,
@@ -666,6 +714,12 @@ impl FusedAddRmsNorm {
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
             layer: LAYER,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            delta_act_slot: DELTA_ACT_SLOT,
+            residual_act_slot: RESIDUAL_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            eps,
             weight,
         }
     }
@@ -693,6 +747,24 @@ impl FusedAddRmsNorm {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn delta_act_slot(&self) -> u32 {
+        self.delta_act_slot
+    }
+    pub const fn residual_act_slot(&self) -> u32 {
+        self.residual_act_slot
+    }
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
+    }
+    pub fn eps(&self) -> FiniteF32 {
+        self.eps
     }
 }
 
@@ -821,15 +893,28 @@ impl FusedGateUpActivateMul {
 }
 
 /// `Embed` (vocab table lookup) variant.
+///
+/// Kernel ABI: `ferrite::ops::embed::{loader, consumer, launcher,
+/// storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
+/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/embed.cuh`. The
+/// vocab table (size `VOCAB_SIZE × HIDDEN_DIM`) is loaded from
+/// `weight_ptrs[weight_accessor_idx * NUM_LAYERS + 0]` (embed has
+/// no per-layer indexing — `LAYER` is always 0).
 pub struct Embed {
     out_page_id: u32,
     embed_weight_page_id: u32,
     consumer_phase: u32,
     storer_phase: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    vocab_size: u32,
+    out_act_slot: u32,
+    weight_accessor_idx: u32,
     pub embed_weight: WeightRef,
 }
 
 impl Embed {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new<
         const OUT_ID: u32,
         const WEIGHT_ID: u32,
@@ -837,6 +922,11 @@ impl Embed {
         const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const VOCAB_SIZE: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         embed_weight: WeightRef,
     ) -> Self {
@@ -852,12 +942,20 @@ impl Embed {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "Embed: STORER_PHASE parity"
             );
+            assert!(HIDDEN_DIM > 0, "Embed: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "Embed: NUM_TOKENS must be > 0");
+            assert!(VOCAB_SIZE > 0, "Embed: VOCAB_SIZE must be > 0");
         }
         Self {
             out_page_id: OUT_ID,
             embed_weight_page_id: WEIGHT_ID,
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            vocab_size: VOCAB_SIZE,
+            out_act_slot: OUT_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
             embed_weight,
         }
     }
@@ -874,18 +972,41 @@ impl Embed {
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
     }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn vocab_size(&self) -> u32 {
+        self.vocab_size
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
+    }
 }
 
 /// `ScalarMul` variant.
+///
+/// Kernel ABI: bf16 elementwise per-row scale — emit splices a per-row
+/// load/mul/store loop with `<HIDDEN_DIM, NUM_TOKENS>` shape.
 pub struct ScalarMul {
     in_page_id: u32,
     out_page_id: u32,
     consumer_phase: u32,
     storer_phase: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
     pub scale: FiniteF32,
 }
 
 impl ScalarMul {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new<
         const IN_ID: u32,
         const OUT_ID: u32,
@@ -893,6 +1014,10 @@ impl ScalarMul {
         const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
     >(
         scale: FiniteF32,
     ) -> Self {
@@ -909,12 +1034,18 @@ impl ScalarMul {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "ScalarMul: STORER_PHASE parity"
             );
+            assert!(HIDDEN_DIM > 0, "ScalarMul: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "ScalarMul: NUM_TOKENS must be > 0");
         }
         Self {
             in_page_id: IN_ID,
             out_page_id: OUT_ID,
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            out_act_slot: OUT_ACT_SLOT,
             scale,
         }
     }
@@ -931,17 +1062,38 @@ impl ScalarMul {
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
     }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
 }
 
-/// `TanhSoftCap` variant. Same shape as `ScalarMul` minus scale.
+/// `TanhSoftCap` variant. Same shape as `ScalarMul` plus a runtime
+/// `cap` value. Kernel: emit splices a per-row load/tanh-cap/store
+/// loop with `<HIDDEN_DIM, NUM_TOKENS>` shape and the runtime cap
+/// (Gemma2 final-logit softcap; 0.0 = identity for arches without).
 pub struct TanhSoftCap {
     in_page_id: u32,
     out_page_id: u32,
     consumer_phase: u32,
     storer_phase: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    pub cap: FiniteF32,
 }
 
 impl TanhSoftCap {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new<
         const IN_ID: u32,
         const OUT_ID: u32,
@@ -949,7 +1101,13 @@ impl TanhSoftCap {
         const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
-    >() -> Self {
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+    >(
+        cap: FiniteF32,
+    ) -> Self {
         const {
             assert!(IN_ID < NUM_PAGES, "TanhSoftCap: IN_ID OOB");
             assert!(OUT_ID < NUM_PAGES, "TanhSoftCap: OUT_ID OOB");
@@ -963,12 +1121,19 @@ impl TanhSoftCap {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "TanhSoftCap: STORER_PHASE parity"
             );
+            assert!(HIDDEN_DIM > 0, "TanhSoftCap: HIDDEN_DIM must be > 0");
+            assert!(NUM_TOKENS > 0, "TanhSoftCap: NUM_TOKENS must be > 0");
         }
         Self {
             in_page_id: IN_ID,
             out_page_id: OUT_ID,
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            out_act_slot: OUT_ACT_SLOT,
+            cap,
         }
     }
 
@@ -984,9 +1149,25 @@ impl TanhSoftCap {
     pub const fn storer_phase(&self) -> u32 {
         self.storer_phase
     }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
 }
 
 /// `ScalarOffsetRmsNorm` variant.
+///
+/// Kernel ABI: `ferrite::ops::rms_norm_offset::{loader, consumer,
+/// launcher, storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
+/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/rms_norm_offset.cuh`.
 pub struct ScalarOffsetRmsNorm {
     in_page_id: u32,
     weight_page_id: u32,
@@ -995,13 +1176,19 @@ pub struct ScalarOffsetRmsNorm {
     consumer_phase: u32,
     storer_phase: u32,
     layer: u32,
+    hidden_dim: u32,
+    num_tokens: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor_idx: u32,
+    eps: FiniteF32,
     pub weight: WeightRef,
     pub offset: FiniteF32,
 }
 
 impl ScalarOffsetRmsNorm {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const IN_ID: u32,
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
@@ -1013,9 +1200,15 @@ impl ScalarOffsetRmsNorm {
         const NUM_LAYERS: u32,
         const SCRATCH_BYTES: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         weight: WeightRef,
         offset: FiniteF32,
+        eps: FiniteF32,
     ) -> Self {
         const {
             assert!(IN_ID < NUM_PAGES, "ScalarOffsetRmsNorm: IN_ID OOB");
@@ -1035,6 +1228,14 @@ impl ScalarOffsetRmsNorm {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "ScalarOffsetRmsNorm: STORER_PHASE parity"
             );
+            assert!(
+                HIDDEN_DIM > 0,
+                "ScalarOffsetRmsNorm: HIDDEN_DIM must be > 0"
+            );
+            assert!(
+                NUM_TOKENS > 0,
+                "ScalarOffsetRmsNorm: NUM_TOKENS must be > 0"
+            );
         }
         Self {
             in_page_id: IN_ID,
@@ -1044,6 +1245,12 @@ impl ScalarOffsetRmsNorm {
             consumer_phase: CONSUMER_PHASE,
             storer_phase: STORER_PHASE,
             layer: LAYER,
+            hidden_dim: HIDDEN_DIM,
+            num_tokens: NUM_TOKENS,
+            in_act_slot: IN_ACT_SLOT,
+            out_act_slot: OUT_ACT_SLOT,
+            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            eps,
             weight,
             offset,
         }
@@ -1069,6 +1276,24 @@ impl ScalarOffsetRmsNorm {
     }
     pub const fn layer(&self) -> u32 {
         self.layer
+    }
+    pub const fn hidden_dim(&self) -> u32 {
+        self.hidden_dim
+    }
+    pub const fn num_tokens(&self) -> u32 {
+        self.num_tokens
+    }
+    pub const fn in_act_slot(&self) -> u32 {
+        self.in_act_slot
+    }
+    pub const fn out_act_slot(&self) -> u32 {
+        self.out_act_slot
+    }
+    pub const fn weight_accessor_idx(&self) -> u32 {
+        self.weight_accessor_idx
+    }
+    pub fn eps(&self) -> FiniteF32 {
+        self.eps
     }
 }
 

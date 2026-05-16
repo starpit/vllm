@@ -302,7 +302,9 @@ impl<
         self
     }
 
-    /// Push a typed `Add` (residual fold).
+    /// Push a typed `Add` (residual fold). Now carries `HIDDEN_DIM` /
+    /// `NUM_TOKENS` / `DELTA_ACT_SLOT` / `RESIDUAL_ACT_SLOT` const
+    /// generics for the per-row load/add/store emit (§4a contract).
     #[allow(clippy::too_many_arguments)]
     pub fn push_add<
         const DELTA_ID: u32,
@@ -310,14 +312,28 @@ impl<
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const DELTA_ACT_SLOT: u32,
+        const RESIDUAL_ACT_SLOT: u32,
     >(
         &mut self,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_add");
         let _ = self.pool.take(DELTA_ID);
         let _ = self.pool.take(RESIDUAL_ID);
-        let node =
-            Add::new::<DELTA_ID, RESIDUAL_ID, CONSUMER_PHASE, STORER_PHASE, NUM_PAGES, ARRIVES>();
+        let node = Add::new::<
+            DELTA_ID,
+            RESIDUAL_ID,
+            CONSUMER_PHASE,
+            STORER_PHASE,
+            NUM_PAGES,
+            ARRIVES,
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            DELTA_ACT_SLOT,
+            RESIDUAL_ACT_SLOT,
+        >();
         self.nodes.push(MegaNode::Add(node));
         self.pool.release(DELTA_ID);
         self.pool.release(RESIDUAL_ID);
@@ -325,7 +341,9 @@ impl<
         self
     }
 
-    /// Push a typed `FusedAddRmsNorm`.
+    /// Push a typed `FusedAddRmsNorm`. Carries `HIDDEN_DIM` /
+    /// `NUM_TOKENS` / `DELTA_ACT_SLOT` / `RESIDUAL_ACT_SLOT` /
+    /// `WEIGHT_ACCESSOR_IDX` const generics + runtime `eps` (§4a).
     #[allow(clippy::too_many_arguments)]
     pub fn push_fused_add_rms_norm<
         const DELTA_ID: u32,
@@ -338,15 +356,22 @@ impl<
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const DELTA_ACT_SLOT: u32,
+        const RESIDUAL_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         weight_path: String,
+        eps: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_fused_add_rms_norm");
         let _ = self.pool.take(DELTA_ID);
         let _ = self.pool.take(RESIDUAL_ID);
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(weight_path);
+        let eps = FiniteF32::new(eps);
         let node = FusedAddRmsNorm::new::<
             DELTA_ID,
             RESIDUAL_ID,
@@ -360,7 +385,12 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
-        >(weight);
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            DELTA_ACT_SLOT,
+            RESIDUAL_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
+        >(weight, eps);
         self.nodes.push(MegaNode::FusedAddRmsNorm(node));
         self.pool.release(DELTA_ID);
         self.pool.release(RESIDUAL_ID);
@@ -422,13 +452,21 @@ impl<
         self
     }
 
-    /// Push a typed `Embed`.
+    /// Push a typed `Embed`. Adds `HIDDEN_DIM` / `NUM_TOKENS` /
+    /// `VOCAB_SIZE` / `OUT_ACT_SLOT` / `WEIGHT_ACCESSOR_IDX` const
+    /// generics — every kernel template + slot index field per §4a.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_embed<
         const OUT_ID: u32,
         const WEIGHT_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const VOCAB_SIZE: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         embed_weight_path: String,
@@ -437,9 +475,19 @@ impl<
         let _ = self.pool.take(OUT_ID);
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(embed_weight_path);
-        let node = Embed::new::<OUT_ID, WEIGHT_ID, CONSUMER_PHASE, STORER_PHASE, NUM_PAGES, ARRIVES>(
-            weight,
-        );
+        let node = Embed::new::<
+            OUT_ID,
+            WEIGHT_ID,
+            CONSUMER_PHASE,
+            STORER_PHASE,
+            NUM_PAGES,
+            ARRIVES,
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            VOCAB_SIZE,
+            OUT_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
+        >(weight);
         self.nodes.push(MegaNode::Embed(node));
         self.pool.release(OUT_ID);
         self.pool.release(WEIGHT_ID);
@@ -447,13 +495,19 @@ impl<
         self
     }
 
-    /// Push a typed `ScalarMul`.
+    /// Push a typed `ScalarMul`. Adds `HIDDEN_DIM` / `NUM_TOKENS` /
+    /// `IN_ACT_SLOT` / `OUT_ACT_SLOT` for kernel-AST emit (§4a).
+    #[allow(clippy::too_many_arguments)]
     pub fn push_scalar_mul<
         const IN_ID: u32,
         const OUT_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
     >(
         &mut self,
         scale: f32,
@@ -462,9 +516,18 @@ impl<
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(OUT_ID);
         let scale = FiniteF32::new(scale);
-        let node = ScalarMul::new::<IN_ID, OUT_ID, CONSUMER_PHASE, STORER_PHASE, NUM_PAGES, ARRIVES>(
-            scale,
-        );
+        let node = ScalarMul::new::<
+            IN_ID,
+            OUT_ID,
+            CONSUMER_PHASE,
+            STORER_PHASE,
+            NUM_PAGES,
+            ARRIVES,
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+        >(scale);
         self.nodes.push(MegaNode::ScalarMul(node));
         self.pool.release(IN_ID);
         self.pool.release(OUT_ID);
@@ -472,21 +535,40 @@ impl<
         self
     }
 
-    /// Push a typed `TanhSoftCap`.
+    /// Push a typed `TanhSoftCap`. Adds `HIDDEN_DIM` / `NUM_TOKENS` /
+    /// `IN_ACT_SLOT` / `OUT_ACT_SLOT` const generics + runtime `cap`
+    /// (Gemma2 final-logit softcap; 0.0 = identity for non-Gemma2).
+    #[allow(clippy::too_many_arguments)]
     pub fn push_tanh_soft_cap<
         const IN_ID: u32,
         const OUT_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
     >(
         &mut self,
+        cap: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_tanh_soft_cap");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(OUT_ID);
-        let node =
-            TanhSoftCap::new::<IN_ID, OUT_ID, CONSUMER_PHASE, STORER_PHASE, NUM_PAGES, ARRIVES>();
+        let cap = FiniteF32::new(cap);
+        let node = TanhSoftCap::new::<
+            IN_ID,
+            OUT_ID,
+            CONSUMER_PHASE,
+            STORER_PHASE,
+            NUM_PAGES,
+            ARRIVES,
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+        >(cap);
         self.nodes.push(MegaNode::TanhSoftCap(node));
         self.pool.release(IN_ID);
         self.pool.release(OUT_ID);
@@ -494,7 +576,9 @@ impl<
         self
     }
 
-    /// Push a typed `ScalarOffsetRmsNorm`.
+    /// Push a typed `ScalarOffsetRmsNorm`. Adds `HIDDEN_DIM` /
+    /// `NUM_TOKENS` / `IN_ACT_SLOT` / `OUT_ACT_SLOT` /
+    /// `WEIGHT_ACCESSOR_IDX` + runtime `eps` (§4a).
     #[allow(clippy::too_many_arguments)]
     pub fn push_scalar_offset_rms_norm<
         const IN_ID: u32,
@@ -506,16 +590,23 @@ impl<
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
+        const HIDDEN_DIM: u32,
+        const NUM_TOKENS: u32,
+        const IN_ACT_SLOT: u32,
+        const OUT_ACT_SLOT: u32,
+        const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
         weight_path: String,
         offset: f32,
+        eps: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_scalar_offset_rms_norm");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(weight_path);
         let offset = FiniteF32::new(offset);
+        let eps = FiniteF32::new(eps);
         let node = ScalarOffsetRmsNorm::new::<
             IN_ID,
             WEIGHT_ID,
@@ -528,7 +619,12 @@ impl<
             NUM_LAYERS,
             SCRATCH_BYTES,
             ARRIVES,
-        >(weight, offset);
+            HIDDEN_DIM,
+            NUM_TOKENS,
+            IN_ACT_SLOT,
+            OUT_ACT_SLOT,
+            WEIGHT_ACCESSOR_IDX,
+        >(weight, offset, eps);
         self.nodes.push(MegaNode::ScalarOffsetRmsNorm(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
@@ -1009,13 +1105,17 @@ mod tests {
     #[test]
     fn lowers_add_minimal() {
         let mut b = Builder6::new();
-        b.push_add::<0, 1, 0, 1, 0>();
+        b.push_add::<0, 1, 0, 1, 0, 2048, 8, 0, 1>();
         let tape = b.finish();
         let MegaNode::Add(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.delta_page_id(), 0);
         assert_eq!(n.residual_page_id(), 1);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.num_tokens(), 8);
+        assert_eq!(n.delta_act_slot(), 0);
+        assert_eq!(n.residual_act_slot(), 1);
     }
 
     #[test]
@@ -1023,7 +1123,11 @@ mod tests {
         let mut b = Builder6::new();
         // DELTA=0, RES=1, WEIGHT=2, partial_off=0, partial_bytes=32,
         // phases (0,1), layer 3 (NUM_LAYERS=16), ARRIVES=0.
-        b.push_fused_add_rms_norm::<0, 1, 2, 0, 32, 0, 1, 3, 16, 0>("W::norm".to_string());
+        // AST shape: HIDDEN_DIM=2048, NUM_TOKENS=8, slots 0/1, w_acc=0.
+        b.push_fused_add_rms_norm::<0, 1, 2, 0, 32, 0, 1, 3, 16, 0, 2048, 8, 0, 1, 0>(
+            "W::norm".to_string(),
+            1.0e-5_f32,
+        );
         let tape = b.finish();
         let MegaNode::FusedAddRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
@@ -1052,53 +1156,74 @@ mod tests {
     #[test]
     fn lowers_embed() {
         let mut b = BuilderD::new();
-        b.push_embed::<0, 1, 0, 1, 0>("W::embed".to_string());
+        b.push_embed::<0, 1, 0, 1, 0, 2048, 8, 128_000, 0, 0>("W::embed".to_string());
         let tape = b.finish();
         let MegaNode::Embed(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.out_page_id(), 0);
         assert_eq!(n.embed_weight_page_id(), 1);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.num_tokens(), 8);
+        assert_eq!(n.vocab_size(), 128_000);
+        assert_eq!(n.out_act_slot(), 0);
+        assert_eq!(n.weight_accessor_idx(), 0);
     }
 
     #[test]
     fn lowers_scalar_mul_finite_scale() {
         let mut b = BuilderD::new();
-        b.push_scalar_mul::<0, 1, 0, 1, 0>(0.5);
+        b.push_scalar_mul::<0, 1, 0, 1, 0, 2048, 8, 0, 1>(0.5);
         let tape = b.finish();
         let MegaNode::ScalarMul(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.scale.raw(), 0.5);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.in_act_slot(), 0);
+        assert_eq!(n.out_act_slot(), 1);
     }
 
     #[test]
     #[should_panic(expected = "FiniteF32 rejects non-finite value: NaN")]
     fn scalar_mul_rejects_nan_scale() {
         let mut b = BuilderD::new();
-        b.push_scalar_mul::<0, 1, 0, 1, 0>(f32::NAN);
+        b.push_scalar_mul::<0, 1, 0, 1, 0, 2048, 8, 0, 1>(f32::NAN);
     }
 
     #[test]
     fn lowers_tanh_soft_cap() {
         let mut b = BuilderD::new();
-        b.push_tanh_soft_cap::<0, 1, 0, 1, 0>();
+        b.push_tanh_soft_cap::<0, 1, 0, 1, 0, 2048, 8, 0, 1>(30.0);
         let tape = b.finish();
-        let MegaNode::TanhSoftCap(_) = &tape.nodes()[0] else {
+        let MegaNode::TanhSoftCap(n) = &tape.nodes()[0] else {
             panic!();
         };
+        assert_eq!(n.cap.raw(), 30.0);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.num_tokens(), 8);
     }
 
     #[test]
     fn lowers_scalar_offset_rms_norm() {
         let mut b = BuilderD::new();
-        b.push_scalar_offset_rms_norm::<0, 1, 0, 32, 0, 1, 5, 16, 0>("W::norm".to_string(), 1.0);
+        b.push_scalar_offset_rms_norm::<0, 1, 0, 32, 0, 1, 5, 16, 0, 2048, 8, 0, 1, 0>(
+            "W::norm".to_string(),
+            1.0,
+            1.0e-5_f32,
+        );
         let tape = b.finish();
         let MegaNode::ScalarOffsetRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.layer(), 5);
         assert_eq!(n.offset.raw(), 1.0);
+        assert_eq!(n.hidden_dim(), 2048);
+        assert_eq!(n.num_tokens(), 8);
+        assert_eq!(n.in_act_slot(), 0);
+        assert_eq!(n.out_act_slot(), 1);
+        assert_eq!(n.weight_accessor_idx(), 0);
+        assert!((n.eps().raw() - 1.0e-5_f32).abs() < 1e-9);
     }
 
     #[test]

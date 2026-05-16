@@ -1170,11 +1170,7 @@ pub fn lower(
     for op in ops {
         match &op.instr {
             Instruction::RmsNorm(in_slot, _out_slot, layer) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(RmsNorm): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "RmsNorm")?;
                 let in_slot_id = *in_slot;
                 let weight_slot_id = if in_slot_id == 0 { 1 } else { in_slot_id ^ 1 };
                 builder.push_rms_norm(
@@ -1190,11 +1186,7 @@ pub fn lower(
                 builder.push_add(*delta_slot, *residual_slot);
             }
             Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(FusedAddRmsNorm): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "FusedAddRmsNorm")?;
                 // Avoid aliasing with delta_slot/residual_slot. Pick
                 // the smallest free id mod num_pages that doesn't
                 // collide. Sprint D's pipeline-aware allocator
@@ -1212,11 +1204,7 @@ pub fn lower(
                 );
             }
             Instruction::FusedGateUpSiluMul(in_slot, out_slot, layer) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(FusedGateUpSiluMul): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "FusedGateUpSiluMul")?;
                 let weight_slot_id = pick_distinct_slot(&[*in_slot, *out_slot], &mut slot_alloc)?;
                 let half = substrate.scratch_bytes() / 2;
                 builder.push_fused_gate_up_activate_mul(
@@ -1235,11 +1223,7 @@ pub fn lower(
                 );
             }
             Instruction::FusedGateUpGeluMul(in_slot, out_slot, layer) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(FusedGateUpGeluMul): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "FusedGateUpGeluMul")?;
                 let weight_slot_id = pick_distinct_slot(&[*in_slot, *out_slot], &mut slot_alloc)?;
                 let half = substrate.scratch_bytes() / 2;
                 builder.push_fused_gate_up_activate_mul(
@@ -1258,11 +1242,7 @@ pub fn lower(
                 );
             }
             Instruction::Embed(out_slot) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(Embed): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "Embed")?;
                 let weight_slot_id = pick_distinct_slot(&[*out_slot], &mut slot_alloc)?;
                 builder.push_embed(*out_slot, weight_slot_id, weight_path);
             }
@@ -1273,11 +1253,7 @@ pub fn lower(
                 builder.push_tanh_soft_cap(*in_slot, *out_slot);
             }
             Instruction::ScalarOffsetRmsNorm(in_slot, _out_slot, layer, offset) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(ScalarOffsetRmsNorm): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "ScalarOffsetRmsNorm")?;
                 let weight_slot_id = pick_distinct_slot(&[*in_slot], &mut slot_alloc)?;
                 builder.push_scalar_offset_rms_norm(
                     *in_slot,
@@ -1290,11 +1266,7 @@ pub fn lower(
                 );
             }
             Instruction::Gemm(in_slot, out_slot, layer, n, k) => {
-                let weight_path = op
-                    .weight_paths
-                    .first()
-                    .expect("lower(Gemm): expected one weight_paths entry")
-                    .clone();
+                let weight_path = expect_one_weight_path(op, "Gemm")?;
                 let weight_slot_id = pick_distinct_slot(&[*in_slot, *out_slot], &mut slot_alloc)?;
                 builder.push_gemm(
                     *in_slot,
@@ -1555,6 +1527,22 @@ impl SlotAllocator {
             have: self.num_pages,
         })
     }
+}
+
+/// Validate that `op.weight_paths` has exactly one entry and
+/// return a clone. Returns `WrongWeightArity` instead of panicking
+/// so a downstream canonical that hits a weight-resolution
+/// mismatch falls back to the host interpreter rather than
+/// breaking the build.
+fn expect_one_weight_path(op: &OpInput, variant: &'static str) -> Result<String, LowerError> {
+    if op.weight_paths.len() != 1 {
+        return Err(LowerError::WrongWeightArity {
+            op: variant,
+            expected: 1,
+            got: op.weight_paths.len() as u32,
+        });
+    }
+    Ok(op.weight_paths[0].clone())
 }
 
 /// Pick the next slot id from `alloc` that doesn't appear in

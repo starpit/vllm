@@ -38,12 +38,19 @@ ferrite-cuda-targets = { path = "../ferrite-cuda-targets" }
 # CUDA symbols into the proc-macro `.so`).
 #
 # `ferrite-forward` must NOT depend on `ferrite-forward-macro` back
-# (the re-export of the proc-macro was dropped to break the cycle).
-# Likewise, `ferrite-mega-ir` does NOT appear here: mega-ir depends
-# on `ferrite-forward` for `Instruction` (per `MEGA_IR_PLAN.md` §5,
-# lower's input is `Vec<Instruction>`), so re-adding it would
-# create a cycle macro → mega-ir → ferrite-forward → macro.
+# (the re-export of the proc-macro was dropped to break the cycle —
+# that edge previously closed `macro → mega-ir → ferrite-forward →
+# macro` into a cycle; with the proc-macro re-export gone, no cycle
+# exists and `ferrite-mega-ir` can be a direct dep here).
 ferrite-forward = { path = "../ferrite-forward" }
+# Per `MEGA_IR_PLAN.md` §5: the proc-macro builds typed
+# `Vec<OpInput>` from each canonical's `LoweredBucket` and calls
+# `ferrite_mega_ir::lower(...)` to produce a substrate-proof-bearing
+# `MegaTape`. Sprint A–D coverage means every variant the tape can
+# carry has a substrate-typed lowering; variants outside that set
+# return `LowerError::NotYetLifted`, which the proc-macro treats as
+# "fall back to the host interpreter for this canonical".
+ferrite-mega-ir = { path = "../ferrite-mega-ir" }
 
 [dev-dependencies]
 trybuild = "1"

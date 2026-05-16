@@ -4779,25 +4779,199 @@ type MegaArtifacts = (
 );
 
 fn emit_mega_artifacts_inline(
-    _model: &ModelParams,
-    _canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
+    model: &ModelParams,
+    canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
 ) -> MegaArtifacts {
-    // Mega tape emission is parked: the previous `TapeClaimer`
-    // machinery (TK megakernel claimer + host fallback) was removed
-    // when `OpInstance` died. The replacement lands as part of the
-    // MegaIR pipeline (per `MEGA_IR_PLAN.md`) once `Implementation::
-    // fan_out` is wired through `ferrite_mega_ir::lower(&[OpInput])`.
-    // Until then, every canonical falls through to the host
-    // interpreter (the per-bucket forward fn already emitted by
-    // `emit_model`). Returning empty maps signals "no mega
-    // candidates" to `MEGA_FORWARD_TABLE` / `_MULTI_STEP` / `_PD`
-    // construction sites.
+    // Per `MEGA_IR_PLAN.md` §5: walk every canonical's typed
+    // `Vec<Instruction>` tape, build the parallel `Vec<OpInput>`
+    // (instruction + per-op weight base names from the canonical's
+    // `LoweredBucket::weight_slots`), and call
+    // `ferrite_mega_ir::lower(...)` to discharge the substrate
+    // proofs. The resulting `MegaTape` is the load-bearing artifact
+    // the syntactic emit step (Phase C, future) consumes.
+    //
+    // Sprint A–D coverage hits every variant llama / qwen / gemma
+    // tapes carry; variants outside that set surface as
+    // `LowerError::NotYetLifted` and the canonical falls back to
+    // the host interpreter. Other lowering errors are real bugs —
+    // they panic at proc-macro time, surfacing as a compile error
+    // on the user's `#[forward]`.
+    use ferrite_mega_ir::{LowerError, OpInput, SubstrateBudget};
+
+    // Substrate budget. Sprint D's typed lowering doesn't yet need
+    // arch-specific tile-shape numbers — every push_* picks
+    // back-to-back scratch offsets within `scratch_bytes`, and the
+    // page count is the per-canonical concurrent-slot demand. Until
+    // a real budget calculator lands (Sprint E task), pick a
+    // generous default that comfortably fits llama / qwen / gemma
+    // tape demands. `num_edges` is 0 because no Sprint A–D variant
+    // emits cross-CTA barriers in the current llama/qwen tapes.
+    let substrate = SubstrateBudget::new(
+        /*num_pages=*/ 16, /*num_consumer_warps=*/ 8, /*page_size=*/ 32_768,
+        /*scratch_bytes=*/ 32_768,
+    );
+    let num_layers = model.bounds.get("num_hidden_layers").copied().unwrap_or(0) as u32;
+
+    for (wp, (lowered, _num_slots, _backbone_slot, _terminal_slot)) in canonical_lowered {
+        let canonical_name = format!(
+            "{}_m_{}_sk_{}",
+            model
+                .source_stem
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>(),
+            wp.num_tokens,
+            wp.sk_bucket
+        );
+
+        // Build OpInputs from the typed tape + per-op weight bases.
+        let backbone_inputs =
+            build_op_inputs(&lowered.backbone.instances, &lowered.backbone.weight_slots);
+        let lm_head_inputs =
+            build_op_inputs(&lowered.lm_head.instances, &lowered.lm_head.weight_slots);
+
+        for (slice_name, inputs) in [("backbone", &backbone_inputs), ("lm_head", &lm_head_inputs)] {
+            match ferrite_mega_ir::lower(inputs, num_layers, substrate) {
+                Ok(_tape) => {
+                    eprintln!(
+                        "ferrite-mega-ir: lowered {canonical_name}.{slice_name} to typed MegaTape ({} ops)",
+                        inputs.len()
+                    );
+                }
+                Err(LowerError::NotYetLifted { op }) => {
+                    eprintln!(
+                        "ferrite-mega-ir: skipped {canonical_name}.{slice_name}: variant `{op}` not lifted (host fallback)"
+                    );
+                }
+                Err(LowerError::WrongWeightArity { op, expected, got }) => {
+                    eprintln!(
+                        "ferrite-mega-ir: skipped {canonical_name}.{slice_name}: variant `{op}` weight arity mismatch (expected {expected}, got {got}) — host fallback"
+                    );
+                }
+                Err(LowerError::MissingSlidingWindow) => {
+                    eprintln!(
+                        "ferrite-mega-ir: skipped {canonical_name}.{slice_name}: SlidingAttentionViaCache without window context — host fallback"
+                    );
+                }
+                Err(LowerError::SubstrateBudgetTooSmall { need, have }) => {
+                    panic!(
+                        "ferrite-mega-ir: lower({canonical_name}.{slice_name}) — substrate budget too small (need {need}, have {have}). Bump `num_pages` in `emit_mega_artifacts_inline`."
+                    );
+                }
+            }
+        }
+    }
+
+    // Phase C (syntactic emit) lands later; for now the proc-macro
+    // observes `lower(...)` succeeds (or returns `NotYetLifted`)
+    // and emits no mega artifacts — every canonical resolves to
+    // the host interpreter via the per-bucket forward fn already
+    // produced by `emit_model`.
+    let _ = OpInput::new; // silence unused-import for OpInput when no pat needs naming.
     (
         TokenStream::new(),
         BTreeMap::new(),
         BTreeMap::new(),
         BTreeMap::new(),
     )
+}
+
+/// Build `Vec<OpInput>` for one canonical slice. Each instruction
+/// pairs with the per-op weight bases from
+/// `LoweredBucket::weight_slots` (the parallel array the
+/// `WeightAccessors` walker populates). The base ident's string is
+/// the path the typed-fanout walker emits; mega-ir's `WeightRef` /
+/// `RotaryRef` wrap it for syntactic emission.
+///
+/// `Tk*`-prefixed instructions (a marker the typed-fanout
+/// migration kept to signal "claimed by TK megakernel impl, not
+/// host impl") are normalized to their un-prefixed peers — the
+/// substrate model is the megakernel substrate either way, and
+/// the eval-delegating duality on the runtime side already proves
+/// they're substrate-equivalent. Sprint E deletes the prefix
+/// entirely; until then, we strip it at the macro→mega-ir
+/// boundary.
+fn build_op_inputs(
+    instances: &[ferrite_forward::Instruction],
+    weight_slots: &[Vec<crate::impl_lib::WeightSlot>],
+) -> Vec<ferrite_mega_ir::OpInput> {
+    use ferrite_mega_ir::OpInput;
+    debug_assert_eq!(
+        instances.len(),
+        weight_slots.len(),
+        "instances and weight_slots must be parallel arrays"
+    );
+    instances
+        .iter()
+        .zip(weight_slots.iter())
+        .map(|(instr, slots)| {
+            let normalized = normalize_tk_prefix(*instr);
+            let weight_paths: Vec<String> = slots.iter().map(|s| s.base.to_string()).collect();
+            OpInput::new(normalized, weight_paths)
+        })
+        .collect()
+}
+
+/// Map a Tk-prefixed `Instruction` variant to its un-prefixed peer
+/// for substrate-typed lowering. The Tk prefix is a megakernel-
+/// claim marker (set by `tk_impls.rs::rename_instances_with_tk_prefix`
+/// after fan_out); substrate-wise the variants are identical and
+/// each Tk* `eval` delegates to its non-Tk counterpart at runtime.
+/// Variants without a Tk prefix pass through unchanged.
+fn normalize_tk_prefix(instr: ferrite_forward::Instruction) -> ferrite_forward::Instruction {
+    use ferrite_forward::Instruction as I;
+    match instr {
+        I::TkEmbed(out_slot) => I::Embed(out_slot),
+        I::TkScalarMul(in_slot, out_slot, scale) => I::ScalarMul(in_slot, out_slot, scale),
+        I::TkRmsNorm(in_slot, out_slot, layer) => I::RmsNorm(in_slot, out_slot, layer),
+        I::TkGemm(in_slot, out_slot, layer, n, k) => I::Gemm(in_slot, out_slot, layer, n, k),
+        I::TkFusedAddRmsNorm(delta_slot, residual_slot, layer) => {
+            I::FusedAddRmsNorm(delta_slot, residual_slot, layer)
+        }
+        I::TkFusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => {
+            I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved)
+        }
+        I::TkAttentionViaCache(in_slot, out_slot, layer, interleaved) => {
+            I::AttentionViaCache(in_slot, out_slot, layer, interleaved)
+        }
+        I::TkSlidingAttentionViaCache(in_slot, out_slot, layer, interleaved, _window) => {
+            I::SlidingAttentionViaCache(in_slot, out_slot, layer, interleaved)
+        }
+        I::TkFusedGateUpSiluMul(in_slot, out_slot, layer) => {
+            I::FusedGateUpSiluMul(in_slot, out_slot, layer)
+        }
+        I::TkFusedGateUpGeluMul(in_slot, out_slot, layer) => {
+            I::FusedGateUpGeluMul(in_slot, out_slot, layer)
+        }
+        I::TkScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => {
+            I::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset)
+        }
+        I::TkTanhSoftCap(in_slot, out_slot, _n_vocab) => I::TanhSoftCap(in_slot, out_slot),
+        I::TkBarrierSignal(edge) => I::BarrierSignal(edge),
+        I::TkBarrierWait(edge, count) => I::BarrierWait(edge, count),
+        I::TkSpliceMmEmbeds(slot) => I::SpliceMmEmbeds(slot),
+        // Tk variants without a 1:1 un-prefixed peer pass through.
+        // mega-ir's lower() will treat them as NotYetLifted and the
+        // canonical falls back to the host interpreter.
+        // - TkGemmAdd: paired with FusedCublasGemmAdd; the latter
+        //   takes 5 fields, TkGemmAdd takes 7 (extra k_offset /
+        //   k_full for chunked-k tiling). Different substrate
+        //   shape — needs its own MegaNode variant when chunked-k
+        //   gemm-add lands in mega.
+        // - TkFusedAddRmsNormGemm: lm_head fusion with TK rope
+        //   path; un-prefixed peer is CutlassFusedAddRmsNormGemm
+        //   but the field arity differs. Substrate-equivalent
+        //   to AddRmsNorm flavor of CutlassFusedNormGemm; needs
+        //   its own routing arm in lower() to map onto that.
+        // - TkFusedAddRmsNormWithOffset: paired with
+        //   FusedAddRmsNormWithOffset (un-prefixed exists with
+        //   identical fields) — that variant isn't yet in any
+        //   sprint, so passing through is correct.
+        // - TkFusedAddScalarOffsetRmsNormGemm: paired with the
+        //   un-prefixed CutlassFusedAddScalarOffsetRmsNormGemm
+        //   but again with field-count drift.
+        other => other,
+    }
 }
 
 /// Render one `*const u16` expression per catalog-ordered accessor,

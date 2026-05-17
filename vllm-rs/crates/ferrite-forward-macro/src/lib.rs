@@ -954,7 +954,11 @@ fn compile_common(
                 #[cfg(feature = "metal")]
                 "metal_add_f16",
                 #[cfg(feature = "metal")]
+                "metal_add_bf16",
+                #[cfg(feature = "metal")]
                 "metal_embed_f16",
+                #[cfg(feature = "metal")]
+                "metal_embed_bf16",
                 #[cfg(feature = "metal")]
                 "metal_affine_embed_f16",
                 #[cfg(feature = "metal")]
@@ -964,19 +968,33 @@ fn compile_common(
                 #[cfg(feature = "metal")]
                 "metal_bias_add_f16",
                 #[cfg(feature = "metal")]
+                "metal_bias_add_bf16",
+                #[cfg(feature = "metal")]
                 "metal_rmsnorm_f16",
+                #[cfg(feature = "metal")]
+                "metal_rmsnorm_bf16",
                 #[cfg(feature = "metal")]
                 "metal_fused_add_rmsnorm_f16",
                 #[cfg(feature = "metal")]
+                "metal_fused_add_rmsnorm_bf16",
+                #[cfg(feature = "metal")]
                 "metal_fused_gate_up_silu_mul_f16",
+                #[cfg(feature = "metal")]
+                "metal_fused_gate_up_silu_mul_bf16",
                 #[cfg(feature = "metal")]
                 "metal_fused_gate_up_gelu_mul_f16",
                 #[cfg(feature = "metal")]
+                "metal_fused_gate_up_gelu_mul_bf16",
+                #[cfg(feature = "metal")]
                 "metal_rope_append_f16",
+                #[cfg(feature = "metal")]
+                "metal_rope_append_bf16",
                 // CommandR and other models use the interleaved rope
                 // variant; same shape class as the regular rope_append.
                 #[cfg(feature = "metal")]
                 "metal_rope_append_interleaved_f16",
+                #[cfg(feature = "metal")]
+                "metal_rope_append_interleaved_bf16",
                 #[cfg(feature = "metal")]
                 "metal_fatrelu_f16",
                 // Metal counterparts of the CUDA `scalar_mul_inplace`

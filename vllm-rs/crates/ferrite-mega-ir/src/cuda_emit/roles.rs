@@ -16,7 +16,7 @@
 use crate::nodes::{Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
 use crate::tape::TapeBudget;
 
-use super::cu::{CuBlock, CuExpr, CuStmt};
+use super::cu::{CuBlock, CuExpr};
 use super::handles::{
     gmem_act_ptr_raw, gmem_weight_ptr_raw, page_as_sv_bf, page_consumed_sem,
     page_done_sem, page_ready_sem, scratch_as,
@@ -188,32 +188,23 @@ fn emit_rms_norm(n: &RmsNorm, budget: TapeBudget) -> RoleBodies {
     consumer.push(decl_partial);
     consumer.push(tk20::warp_sum_to_scalar_f32(&partial_sum_expr, &sq_rv));
 
-    // Cross-warp accumulation through scratch.
-    consumer.push(CuStmt::new(format!(
-        "if (kittens::laneid() == 0) {{ {p}[kittens::warpid()] = __rms_partial_sum; }}",
-        p = partial.expr()
-    )));
-    consumer.push(tk20::group_sync_named(ncw, bar_reduce));
-
-    // Compute the full sum + scale on every thread (broadcast read
-    // from scratch — every lane reads the same NCW slots).
-    consumer.push(CuStmt::new("float __rms_full_sum = 0.0f;".to_string()));
-    consumer.push(CuStmt::new(format!(
-        "#pragma unroll\nfor (int __i = 0; __i < {ncw}; ++__i) {{ \
-         __rms_full_sum += {p}[__i]; }}",
-        p = partial.expr()
-    )));
-    consumer.push(CuStmt::new(format!(
-        "const float __rms_scale = rsqrtf(__rms_full_sum / {hidden_dim}.0f + {eps:e}f);",
-        eps = eps_value
-    )));
+    // Cross-warp accumulate the per-warp partial sums + compute scale.
+    let (decl_full, full_sum_expr) =
+        tk20::decl_local_f32("__rms_full_sum", "0.0f");
+    consumer.push(decl_full);
+    consumer.push(tk20::cross_warp_reduce_sum_f32(
+        full_sum_expr.as_str(),
+        partial_sum_expr.as_str(),
+        &partial,
+        ncw,
+        bar_reduce,
+    ));
+    let (decl_scale, scale_expr) =
+        tk20::decl_rms_scale_local("__rms_scale", full_sum_expr.as_str(), hidden_dim, eps_value);
+    consumer.push(decl_scale);
 
     // Apply scale + weight in registers.
-    consumer.push(tk20::warp_mul_rv_scalar_f32(
-        &act_rv,
-        &act_rv,
-        &CuExpr::new("__rms_scale".to_string()),
-    ));
+    consumer.push(tk20::warp_mul_rv_scalar_f32(&act_rv, &act_rv, &scale_expr));
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(
         ncw,
         &weight_rv,
@@ -230,10 +221,10 @@ fn emit_rms_norm(n: &RmsNorm, budget: TapeBudget) -> RoleBodies {
 
     // Cross-warp publish before warp 0 signals page_done.
     consumer.push(tk20::group_sync_named(ncw, bar_publish));
-    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
-    consumer.push(tk20::group_arrive(1, &in_done));
-    consumer.push(tk20::group_arrive(1, &weight_consumed));
-    consumer.push(CuStmt::new("}".to_string()));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &in_done),
+        tk20::group_arrive(1, &weight_consumed),
+    ]));
 
     // ---------------- Storer body ----------------
     let mut storer = CuBlock::new();
@@ -363,10 +354,10 @@ fn emit_add(n: &Add, budget: TapeBudget) -> RoleBodies {
         &res_rv,
     ));
     consumer.push(tk20::group_sync_named(ncw, bar_publish));
-    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
-    consumer.push(tk20::group_arrive(1, &residual_done));
-    consumer.push(tk20::group_arrive(1, &delta_consumed));
-    consumer.push(CuStmt::new("}".to_string()));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &residual_done),
+        tk20::group_arrive(1, &delta_consumed),
+    ]));
 
     // Storer: TMA-store residual back to gmem.
     let mut storer = CuBlock::new();
@@ -458,12 +449,11 @@ fn emit_scalar_mul(n: &ScalarMul, budget: TapeBudget) -> RoleBodies {
         &act_rv,
     ));
     consumer.push(tk20::group_sync_named(ncw, bar_publish));
-    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
-    consumer.push(tk20::group_arrive(1, &out_done));
+    let mut publish_stmts = vec![tk20::group_arrive(1, &out_done)];
     if !in_place {
-        consumer.push(tk20::group_arrive(1, &in_consumed));
+        publish_stmts.push(tk20::group_arrive(1, &in_consumed));
     }
-    consumer.push(CuStmt::new("}".to_string()));
+    consumer.push(tk20::block_warp_zero(&publish_stmts));
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait(1, &out_done, storer_phase));
@@ -552,12 +542,11 @@ fn emit_tanh_soft_cap(n: &TanhSoftCap, budget: TapeBudget) -> RoleBodies {
         &act_rv,
     ));
     consumer.push(tk20::group_sync_named(ncw, bar_publish));
-    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
-    consumer.push(tk20::group_arrive(1, &out_done));
+    let mut publish_stmts = vec![tk20::group_arrive(1, &out_done)];
     if !in_place {
-        consumer.push(tk20::group_arrive(1, &in_consumed));
+        publish_stmts.push(tk20::group_arrive(1, &in_consumed));
     }
-    consumer.push(CuStmt::new("}".to_string()));
+    consumer.push(tk20::block_warp_zero(&publish_stmts));
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait(1, &out_done, storer_phase));
@@ -677,25 +666,25 @@ fn emit_fused_add_rms_norm(n: &FusedAddRmsNorm, budget: TapeBudget) -> RoleBodie
         tk20::decl_local_f32("__farn_partial_sum", "0.0f");
     consumer.push(decl_partial);
     consumer.push(tk20::warp_sum_to_scalar_f32(&partial_sum_expr, &sq_rv));
-    consumer.push(CuStmt::new(format!(
-        "if (kittens::laneid() == 0) {{ {p}[kittens::warpid()] = __farn_partial_sum; }}",
-        p = partial.expr()
-    )));
-    consumer.push(tk20::group_sync_named(ncw, bar_reduce));
-    consumer.push(CuStmt::new("float __farn_full_sum = 0.0f;".to_string()));
-    consumer.push(CuStmt::new(format!(
-        "#pragma unroll\nfor (int __i = 0; __i < {ncw}; ++__i) {{ __farn_full_sum += {p}[__i]; }}",
-        p = partial.expr()
-    )));
-    consumer.push(CuStmt::new(format!(
-        "const float __farn_scale = rsqrtf(__farn_full_sum / {hidden_dim}.0f + {eps:e}f);",
-        eps = eps_value
-    )));
-    consumer.push(tk20::warp_mul_rv_scalar_f32(
-        &res_rv,
-        &res_rv,
-        &CuExpr::new("__farn_scale".to_string()),
+
+    let (decl_full, full_sum_expr) =
+        tk20::decl_local_f32("__farn_full_sum", "0.0f");
+    consumer.push(decl_full);
+    consumer.push(tk20::cross_warp_reduce_sum_f32(
+        full_sum_expr.as_str(),
+        partial_sum_expr.as_str(),
+        &partial,
+        ncw,
+        bar_reduce,
     ));
+    let (decl_scale, scale_expr) = tk20::decl_rms_scale_local(
+        "__farn_scale",
+        full_sum_expr.as_str(),
+        hidden_dim,
+        eps_value,
+    );
+    consumer.push(decl_scale);
+    consumer.push(tk20::warp_mul_rv_scalar_f32(&res_rv, &res_rv, &scale_expr));
 
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &weight_rv, &weight_smem));
     consumer.push(tk20::warp_mul_rv_rv(&res_rv, &res_rv, &weight_rv));
@@ -703,11 +692,11 @@ fn emit_fused_add_rms_norm(n: &FusedAddRmsNorm, budget: TapeBudget) -> RoleBodie
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(ncw, &residual_smem, &res_rv));
 
     consumer.push(tk20::group_sync_named(ncw, bar_publish));
-    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
-    consumer.push(tk20::group_arrive(1, &residual_done));
-    consumer.push(tk20::group_arrive(1, &delta_consumed));
-    consumer.push(tk20::group_arrive(1, &weight_consumed));
-    consumer.push(CuStmt::new("}".to_string()));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &residual_done),
+        tk20::group_arrive(1, &delta_consumed),
+        tk20::group_arrive(1, &weight_consumed),
+    ]));
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait(1, &residual_done, storer_phase));

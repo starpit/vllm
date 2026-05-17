@@ -280,6 +280,76 @@ pub fn warp_sum_to_scalar_f32(
     ))
 }
 
+/// Cross-warp fp32 sum reduction via the canonical TK 2.0 idiom:
+/// per-warp partial sum already in `partial_in_name` (lane 0 has the
+/// authoritative value); lane 0 of each warp writes to
+/// `scratch[warpid()]`; group<NCW>::sync(BAR) so all warps' partials
+/// are visible; every lane reads all NCW slots into
+/// `scalar_out_name` (which the caller declares as a `float` local
+/// initialized to 0).
+///
+/// Composes only TK 2.0 primitives: `kittens::laneid()` /
+/// `kittens::warpid()` (group.cuh:29-30) +
+/// `kittens::group<NCW>::sync(int id)` (group.cuh:33). The scratch
+/// indexing and the for-loop are vanilla C++ wrapping those
+/// primitives — same pattern TK uses internally for cross-warp
+/// reductions.
+pub fn cross_warp_reduce_sum_f32(
+    scalar_out_name: &str,
+    partial_in_name: &str,
+    scratch: &super::handles::ScratchPtr<F32>,
+    ncw: u32,
+    bar_id: u32,
+) -> CuStmt {
+    debug_assert!(
+        (1..=15).contains(&bar_id),
+        "cross_warp_reduce_sum_f32: bar_id ({bar_id}) must be in 1..=15"
+    );
+    CuStmt::new(format!(
+        "if (kittens::laneid() == 0) {{ {scratch}[kittens::warpid()] = {partial}; }}\n\
+         kittens::group<{ncw}>::sync({bar_id});\n\
+         #pragma unroll\n\
+         for (int __cw_i = 0; __cw_i < {ncw}; ++__cw_i) {{ {out} += {scratch}[__cw_i]; }}",
+        scratch = scratch.expr(),
+        partial = partial_in_name,
+        out = scalar_out_name
+    ))
+}
+
+/// `const float <name> = rsqrtf(<full_sum_name> / <hidden_dim>.0f
+/// + <eps>f);` — declare and bind the canonical RMS scale local.
+/// Wraps a CUDA math intrinsic + arithmetic; not a TK 2.0 primitive
+/// per se but the standard expression used in every RmsNorm-flavor
+/// op body.
+pub fn decl_rms_scale_local(
+    name: &str,
+    full_sum_name: &str,
+    hidden_dim: u32,
+    eps: f32,
+) -> (CuStmt, CuExpr) {
+    let stmt = CuStmt::new(format!(
+        "const float {name} = rsqrtf({sum} / {hidden_dim}.0f + {eps:e}f);",
+        sum = full_sum_name
+    ));
+    (stmt, CuExpr::new(name.to_string()))
+}
+
+/// Wrap a sequence of statements in `if (kittens::warpid() == 0) {
+/// ... }` — the canonical "warp 0 publishes" gate. Used to gate
+/// `kittens::group<1>::arrive(sem)` calls (which auto-laneid-gate
+/// internally but don't warp-id-gate; without the warp-id gate
+/// every warp would arrive once, multiplying the count by NCW).
+pub fn block_warp_zero(stmts: &[CuStmt]) -> CuStmt {
+    let body = stmts
+        .iter()
+        .map(|s| format!("    {}", s.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    CuStmt::new(format!(
+        "if (kittens::warpid() == 0) {{\n{body}\n}}"
+    ))
+}
+
 /// `kittens::warp::apply(dst, src, lambda);` — per-lane unary map.
 /// `lambda_body` is a CUDA expression in `x` (the per-lane fp32
 /// value) returning a fp32 result. The wrapper takes a 2-arg

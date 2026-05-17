@@ -966,6 +966,54 @@ pub fn qmm_t_kernel_static_name(
     }
 }
 
+/// Compute-aware variant. When `compute_dtype != dtype`, picks the
+/// extended `affine_qmm_t_<act>_c_<compute>_s_<scale>_*` symbol. Only
+/// the (Bf16-act, F16-compute) combo is currently instantiated — used
+/// on Apple7 (M1) where bf16 simdgroup MMAs are slow-path emulation.
+/// Falls back to [`qmm_t_kernel_static_name`] when compute == act.
+pub fn qmm_t_kernel_static_name_with_compute(
+    kernel: QmmTKernel,
+    act_dtype: DequantDtype,
+    compute_dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    bits: u32,
+    group_size: u32,
+    aligned_n: bool,
+) -> &'static str {
+    if compute_dtype == act_dtype {
+        return qmm_t_kernel_static_name(kernel, act_dtype, scale_dtype, bits, group_size, aligned_n);
+    }
+    debug_assert_eq!(bits, 4, "qmm_t_kernel_static_name_with_compute: only bits=4");
+    use DequantDtype::*;
+    use ScaleDtype as S;
+    match (kernel, act_dtype, compute_dtype, scale_dtype, group_size, aligned_n) {
+        // ── qmm_t Standard, bf16-act + f16-compute ───────────────
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 32, true)   => "affine_qmm_t_bf16_c_f16_s_f16_gs_32_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 32, false)  => "affine_qmm_t_bf16_c_f16_s_f16_gs_32_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 64, true)   => "affine_qmm_t_bf16_c_f16_s_f16_gs_64_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 64, false)  => "affine_qmm_t_bf16_c_f16_s_f16_gs_64_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 128, true)  => "affine_qmm_t_bf16_c_f16_s_f16_gs_128_b_4_alN_true_batch_0",
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 128, false) => "affine_qmm_t_bf16_c_f16_s_f16_gs_128_b_4_alN_false_batch_0",
+        // ── qmm_t SplitK, bf16-act + f16-compute ─────────────────
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 32, true)   => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_32_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 32, false)  => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_32_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 64, true)   => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_64_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 64, false)  => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_64_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 128, true)  => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_128_b_4_alN_true",
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 128, false) => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_128_b_4_alN_false",
+        // NAX path: don't override compute dtype — Apple9 has hardware
+        // bf16 acceleration via the matrix unit, no fast-path needed.
+        (QmmTKernel::Nax, _, _, _, _, _) => panic!(
+            "qmm_t_kernel_static_name_with_compute: NAX path doesn't need a compute override"
+        ),
+        _ => panic!(
+            "qmm_t_kernel_static_name_with_compute: unsupported (act={act_dtype:?}, \
+             compute={compute_dtype:?}, scale={scale_dtype:?}, gs={group_size}) — only \
+             (Bf16, F16, F16) is instantiated for the M1 fast-path"
+        ),
+    }
+}
+
 /// MLX-affine int4 prefill-matmul (transpose=true) dispatcher. Wraps
 /// the `quantized_qmm` metallib's `affine_qmm_t` and
 /// `affine_qmm_t_splitk` kernels.

@@ -30,7 +30,8 @@
 use crate::{CanonicalParams, Instruction};
 use ferrite_metal_kernels::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
-    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmv_dispatch_shape, qmv_kernel_static_name,
+    qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
+    qmv_dispatch_shape, qmv_kernel_static_name,
     splitk_reduce_kernel_static_name,
 };
 use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
@@ -776,6 +777,27 @@ fn lower_one<W: CanonicalParams>(
                     QmmTKernel::Nax => n_v.is_multiple_of(64),
                     _ => n_v.is_multiple_of(32),
                 };
+                // M1 fast-path: bf16 simdgroup MMA is software emulation
+                // (~1.7× slower than f16). Pick T_compute=F16 for the
+                // qmm_t kernel — kernel reads bf16 from device memory,
+                // casts to f16 on threadgroup-tile populate, runs MMA
+                // in f16, casts back to bf16 on store. Output is bf16
+                // so the residual stream is unchanged. M2+ has
+                // hardware bf16 so we keep T_compute=T_act there.
+                // FERRITE_METAL_F16_COMPUTE_DISABLE=1 turns this off
+                // (escape hatch for parity / correctness validation).
+                use ferrite_metal_kernels::ferrite_metal_targets::bf16_simdgroup_is_slow_path;
+                let f16_compute_eligible = profile
+                    .map(|p| bf16_simdgroup_is_slow_path(p.generation))
+                    .unwrap_or(false)
+                    && std::env::var_os("FERRITE_METAL_F16_COMPUTE_DISABLE").is_none()
+                    && matches!(dtype, DequantDtype::Bf16)
+                    && !matches!(kernel, QmmTKernel::Nax);
+                let compute_dtype = if f16_compute_eligible {
+                    DequantDtype::F16
+                } else {
+                    dtype
+                };
                 match kernel {
                     QmmTKernel::Nax => {
                         let (tg, tpg) =
@@ -813,8 +835,8 @@ fn lower_one<W: CanonicalParams>(
                         LoweredCommand {
                             kernel: KernelId::AffineQmmT,
                             library: "quantized_qmm",
-                            function: qmm_t_kernel_static_name(
-                                kernel, dtype, scale_dtype, bits_v, gs, aligned_n,
+                            function: qmm_t_kernel_static_name_with_compute(
+                                kernel, dtype, compute_dtype, scale_dtype, bits_v, gs, aligned_n,
                             ),
                             constants: super::kernel_constants::AffineQmmTConstants {
                                 k: super::ids::KDimI32(k_v as i32),
@@ -854,8 +876,8 @@ fn lower_one<W: CanonicalParams>(
                         let qmm_t_cmd = LoweredCommand {
                             kernel: KernelId::AffineQmmTSplitK,
                             library: "quantized_qmm",
-                            function: qmm_t_kernel_static_name(
-                                kernel, dtype, scale_dtype, bits_v, gs, aligned_n,
+                            function: qmm_t_kernel_static_name_with_compute(
+                                kernel, dtype, compute_dtype, scale_dtype, bits_v, gs, aligned_n,
                             ),
                             // SplitK needs FOUR function constants:
                             // (0=K, 1=N, 2=M, 3=k_partition_size) per

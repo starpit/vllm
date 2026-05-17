@@ -138,15 +138,25 @@ inline constexpr short get_bytes_per_pack() {
 //   TGP = WM * WN * SIMD_SIZE = 128 threads / threadgroup
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+// T_compute is the dtype the threadgroup tiles + simdgroup MMA run on.
+// Defaults to T_act (current behavior). On Apple7 (M1 family) bf16
+// simdgroup_multiply_accumulate is a slow-path emulation (~1.7× slower
+// than the f16 path); a `T_act = bfloat, T_compute = half` instantiation
+// reads bf16 from device memory, casts to half when populating Xs/Ws,
+// runs MMA in half, casts back to bf16 on output store. Output dtype on
+// disk stays T_act so the residual stream's bf16 dynamic range is
+// preserved (full-f16 streams break Llama-3.x exponent range — see
+// `instr.rs:199-202`).
+template <typename T_act, typename T_compute, typename T_scale,
+          int group_size, int bits, bool aligned_N>
 METAL_FUNC void qmm_t_impl_inline(
     const device uint32_t*  w,
     const device T_scale*   scales,
     const device T_scale*   biases,
     const device T_act*     x,
     device T_act*           y,
-    threadgroup T_act*      Xs,
-    threadgroup T_act*      Ws,
+    threadgroup T_compute*  Xs,
+    threadgroup T_compute*  Ws,
     threadgroup float*      out_scratch,
     const int              K,
     const int              N,
@@ -168,7 +178,9 @@ METAL_FUNC void qmm_t_impl_inline(
   constexpr int TM = BM / (8 * WM);            // 2
   constexpr int TN = BN / (8 * WN);            // 2
   constexpr int KFR = BK / 8;                  // 4 K-frags per BK iter
-  constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
+  // Threadgroup tiles live in T_compute, so BK_padded keys off
+  // sizeof(T_compute) (= 40 for both fp16 and bf16, since both are 2 B).
+  constexpr int BK_padded = BK + 16 / int(sizeof(T_compute));
   constexpr int TGP = WM * WN * SIMD_SIZE;     // 128
 
   constexpr int pack_factor    = get_pack_factor<bits, 8>();    // 2
@@ -219,10 +231,12 @@ METAL_FUNC void qmm_t_impl_inline(
 
   // ── Per-thread source/dest pointers (BlockLoader constructor :47-58
   //    and QuantizedBlockLoader constructor :605-626) ──────────────
-  threadgroup T_act* Xs_dst = Xs + bi_x * BK_padded + bj_x;
+  // Xs_dst/Ws_dst are T_compute (the threadgroup-tile dtype); X_src is
+  // T_act (device-memory dtype) and gets cast on load.
+  threadgroup T_compute* Xs_dst = Xs + bi_x * BK_padded + bj_x;
   const device T_act* X_src = x_block + bi_x * K + bj_x;
 
-  threadgroup T_act* Ws_dst = Ws + bi_w * BK_padded + bj_w * pack_factor;
+  threadgroup T_compute* Ws_dst = Ws + bi_w * BK_padded + bj_w * pack_factor;
   const device uint8_t* W_src = w_block + bi_w * K_w + bj_w * bytes_per_pack;
   const device T_scale* Sc_row = s_block + bi_w * K_g;
   const device T_scale* Bs_row = b_block + bi_w * K_g;
@@ -277,16 +291,26 @@ METAL_FUNC void qmm_t_impl_inline(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ─── X loader (BlockLoader<T, BM, BK, BK_padded, 1, TGP>) ─────
-    //   load_unsafe: contiguous vec4 of T × 2 per thread → 8 halves.
+    //   load_unsafe: contiguous vec4 of T × 2 per thread → 8 elements.
     //   load_safe (M-tail): zero rows past m_tile.
+    // Loads 8 T_act values from device, casts to T_compute on store
+    // into Xs. When T_compute == T_act the compiler emits the same
+    // vec4 burst copy. When they differ (T_act=bfloat, T_compute=half)
+    // it inserts per-element converting moves; still memory-bound.
     if (m_full || bi_x < m_tile) {
-      ((threadgroup vec<T_act, 4>*)Xs_dst)[0] =
-          ((const device vec<T_act, 4>*)X_src)[0];
-      ((threadgroup vec<T_act, 4>*)Xs_dst)[1] =
-          ((const device vec<T_act, 4>*)X_src)[1];
+      const device vec<T_act, 4>* X_src_v4 =
+          (const device vec<T_act, 4>*)X_src;
+      threadgroup vec<T_compute, 4>* Xs_dst_v4 =
+          (threadgroup vec<T_compute, 4>*)Xs_dst;
+      vec<T_act, 4> a0 = X_src_v4[0];
+      vec<T_act, 4> a1 = X_src_v4[1];
+      Xs_dst_v4[0] = vec<T_compute, 4>(
+          T_compute(a0[0]), T_compute(a0[1]), T_compute(a0[2]), T_compute(a0[3]));
+      Xs_dst_v4[1] = vec<T_compute, 4>(
+          T_compute(a1[0]), T_compute(a1[1]), T_compute(a1[2]), T_compute(a1[3]));
     } else {
-      ((threadgroup vec<T_act, 4>*)Xs_dst)[0] = vec<T_act, 4>(0);
-      ((threadgroup vec<T_act, 4>*)Xs_dst)[1] = vec<T_act, 4>(0);
+      ((threadgroup vec<T_compute, 4>*)Xs_dst)[0] = vec<T_compute, 4>(0);
+      ((threadgroup vec<T_compute, 4>*)Xs_dst)[1] = vec<T_compute, 4>(0);
     }
 
     // ─── W loader (QuantizedBlockLoader<T, BN, BK, ..., 1, TGP, gs, 4>) ──
@@ -298,25 +322,25 @@ METAL_FUNC void qmm_t_impl_inline(
     //   w_local[2i]   = s0 * (b & 0x0f) + bias;
     //   w_local[2i+1] = s1 * (b & 0xf0) + bias;
     if (n_full || bi_w < n_tile) {
-      // In-register T_scale → T_act cast (`INT4_PARITY_PROBES.md` §7):
-      // scales/biases ship F16 on disk; dequant math stays in T_act
-      // (MLX quantized.h:521-527 keeps it in the kernel's scalar type).
-      T_act scale = static_cast<T_act>(*Sc_row);
-      T_act bias  = static_cast<T_act>(*Bs_row);
-      T_act s0 = scale;
-      T_act s1 = scale / static_cast<T_act>(16.0f);
+      // Dequant math runs in T_compute (the threadgroup-tile dtype).
+      // T_scale → T_compute cast keeps the in-register dtype consistent
+      // with what the MMA inner loop will read out of Ws.
+      T_compute scale = static_cast<T_compute>(*Sc_row);
+      T_compute bias  = static_cast<T_compute>(*Bs_row);
+      T_compute s0 = scale;
+      T_compute s1 = scale / static_cast<T_compute>(16.0f);
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < N_READS; ++i) {
         uint8_t b = W_src[i * bytes_per_pack];
         Ws_dst[i * pack_factor + 0] =
-            s0 * static_cast<T_act>(b & 0x0f) + bias;
+            s0 * static_cast<T_compute>(b & 0x0f) + bias;
         Ws_dst[i * pack_factor + 1] =
-            s1 * static_cast<T_act>(b & 0xf0) + bias;
+            s1 * static_cast<T_compute>(b & 0xf0) + bias;
       }
     } else {
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < N_READS * pack_factor; ++i) {
-        Ws_dst[i] = T_act(0);
+        Ws_dst[i] = T_compute(0);
       }
     }
 
@@ -357,33 +381,29 @@ METAL_FUNC void qmm_t_impl_inline(
     //   Bs_offset = sm * B_str_k + (tn + sn) * B_str_n
     //             = sm + (tn + sn) * BK_padded  (B_str_k=1, B_str_n=BK_padded
     //                                            since transpose_b=true)
-    threadgroup const T_act* As_iter = Xs + (tm + sm) * BK_padded + sn;
-    threadgroup const T_act* Bs_iter = Ws + sm + (tn + sn) * BK_padded;
+    threadgroup const T_compute* As_iter = Xs + (tm + sm) * BK_padded + sn;
+    threadgroup const T_compute* Bs_iter = Ws + sm + (tn + sn) * BK_padded;
 
     MLX_MTL_PRAGMA_UNROLL
     for (int kf = 0; kf < KFR; ++kf) {
       simdgroup_barrier(mem_flags::mem_none);
 
-      // A frag (TM, 1): i-axis steps by `i * TM_stride * A_str_m`
-      // = i * 16 * BK_padded. Per-thread reads dst[0]=src[0],
-      // dst[1]=src[A_str_k]=src[1].
-      vec<T_act, 2> a_frag[TM];
+      // A frag (TM, 1): per-thread reads dst[0]=src[0], dst[1]=src[1].
+      vec<T_compute, 2> a_frag[TM];
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < TM; ++i) {
-        threadgroup const T_act* p = As_iter + i * TM_stride * BK_padded;
+        threadgroup const T_compute* p = As_iter + i * TM_stride * BK_padded;
         a_frag[i][0] = p[0];
         a_frag[i][1] = p[1];
       }
 
       simdgroup_barrier(mem_flags::mem_none);
 
-      // B frag (1, TN): j-axis steps by `j * TN_stride * B_str_n`
-      // = j * 16 * BK_padded. Per-thread reads dst[0]=src[0],
-      // dst[1]=src[B_str_n]=src[BK_padded].
-      vec<T_act, 2> b_frag[TN];
+      // B frag (1, TN): per-thread reads dst[0]=src[0], dst[1]=src[BK_padded].
+      vec<T_compute, 2> b_frag[TN];
       MLX_MTL_PRAGMA_UNROLL
       for (int j = 0; j < TN; ++j) {
-        threadgroup const T_act* p = Bs_iter + j * TN_stride * BK_padded;
+        threadgroup const T_compute* p = Bs_iter + j * TN_stride * BK_padded;
         b_frag[j][0] = p[0];
         b_frag[j][1] = p[BK_padded];
       }
@@ -391,19 +411,20 @@ METAL_FUNC void qmm_t_impl_inline(
       simdgroup_barrier(mem_flags::mem_none);
 
       // Serpentine MMA: matches MLX `tile_matmad` (mma.h:411).
-      // Materialize A/B/C/D simdgroup_matrix per call from vec<…,2>
-      // frags (MLX `MMAFrag::mma`, mma.h:181-198).
+      // simdgroup_matrix runs in T_compute — that's the lever: when
+      // T_compute=half on Apple7, we hit the fast f16 simdgroup
+      // multiply-accumulate path instead of the slow bf16 emulation.
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < TM; ++i) {
         MLX_MTL_PRAGMA_UNROLL
         for (int j = 0; j < TN; ++j) {
           int j_serp = (i & 1) ? (TN - 1 - j) : j;
-          simdgroup_matrix<T_act, 8, 8> A_mat;
-          simdgroup_matrix<T_act, 8, 8> B_mat;
+          simdgroup_matrix<T_compute, 8, 8> A_mat;
+          simdgroup_matrix<T_compute, 8, 8> B_mat;
           simdgroup_float8x8 C_mat;
           simdgroup_float8x8 D_mat;
-          reinterpret_cast<thread vec<T_act, 2>&>(A_mat.thread_elements()) = a_frag[i];
-          reinterpret_cast<thread vec<T_act, 2>&>(B_mat.thread_elements()) = b_frag[j_serp];
+          reinterpret_cast<thread vec<T_compute, 2>&>(A_mat.thread_elements()) = a_frag[i];
+          reinterpret_cast<thread vec<T_compute, 2>&>(B_mat.thread_elements()) = b_frag[j_serp];
           reinterpret_cast<thread vec<float, 2>&>(C_mat.thread_elements()) = acc[i][j_serp];
           simdgroup_multiply_accumulate(D_mat, A_mat, B_mat, C_mat);
           acc[i][j_serp] = reinterpret_cast<thread vec<float, 2>&>(D_mat.thread_elements());
@@ -506,7 +527,8 @@ METAL_FUNC void qmm_t_impl_inline(
 // (`quantized.h:1351`), deferred to P13 alongside MoE gather.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+template <typename T_act, typename T_compute, typename T_scale,
+          int group_size, int bits, bool aligned_N>
 [[kernel]] void affine_qmm_t_kernel(
     const device uint32_t*  w        [[buffer(0)]],
     const device T_scale*   scales   [[buffer(1)]],
@@ -521,11 +543,11 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     uint3 tgid          [[threadgroup_position_in_grid]])
 {
   constexpr int BM = 32, BN = 32, BK = 32;
-  constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
-  threadgroup T_act Xs[BM * BK_padded];
-  threadgroup T_act Ws[BN * BK_padded];
+  constexpr int BK_padded = BK + 16 / int(sizeof(T_compute));
+  threadgroup T_compute Xs[BM * BK_padded];
+  threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
-  qmm_t_impl_inline<T_act, T_scale, group_size, bits, aligned_N>(
+  qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       w, scales, biases, x, y,
       Xs, Ws, out_scratch,
       QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
@@ -543,7 +565,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 // final out.
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+template <typename T_act, typename T_compute, typename T_scale,
+          int group_size, int bits, bool aligned_N>
 [[kernel]] void affine_qmm_t_splitk_kernel(
     const device uint32_t*  w                        [[buffer(0)]],
     const device T_scale*   scales                   [[buffer(1)]],
@@ -572,11 +595,11 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
   device T_act*         y_shift      = y + int64_t(tgid.z) * split_k_partition_stride;
 
   constexpr int BM = 32, BN = 32, BK = 32;
-  constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
-  threadgroup T_act Xs[BM * BK_padded];
-  threadgroup T_act Ws[BN * BK_padded];
+  constexpr int BK_padded = BK + 16 / int(sizeof(T_compute));
+  threadgroup T_compute Xs[BM * BK_padded];
+  threadgroup T_compute Ws[BN * BK_padded];
   threadgroup float out_scratch[BM * BN];
-  qmm_t_impl_inline<T_act, T_scale, group_size, bits, aligned_N>(
+  qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N>(
       (const device uint32_t*)wl,
       scales_shift,
       biases_shift,
@@ -969,11 +992,45 @@ template <typename T_act, typename T_scale, int group_size, int bits>
 // at `quantized.cpp:728-737` (qmm_t / qmm_n) and `:830-838` (splitk).
 // ─────────────────────────────────────────────────────────────────
 
+// INST_QMM_T_C: explicit compute-dtype instantiation. Symbol carries
+// `_c_<compute_tag>` after `_<act_tag>` so existing `_s_<scale_tag>_gs_..`
+// suffix parsing keeps working. Existing INST_QMM_T (below) is a thin
+// wrapper that fixes T_compute = T_act, preserving every legacy symbol.
+#define INST_QMM_T_C(act_tag, act_type, ctag, ctype, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  template [[host_name(                                                                            \
+      "affine_qmm_t_" #act_tag "_c_" #ctag "_s_" #scale_tag "_gs_" #gs                             \
+      "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                           \
+  affine_qmm_t_kernel<act_type, ctype, scale_type, gs, 4, aln_val>(                                \
+      const device uint32_t*   w        [[buffer(0)]],                                             \
+      const device scale_type* scales   [[buffer(1)]],                                             \
+      const device scale_type* biases   [[buffer(2)]],                                             \
+      const device act_type*   x        [[buffer(3)]],                                             \
+      device act_type*         y        [[buffer(4)]],                                             \
+      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                                      \
+      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                           \
+      uint3 tgid          [[threadgroup_position_in_grid]]);
+
+#define INST_QMM_T_SPLITK_C(act_tag, act_type, ctag, ctype, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  template [[host_name(                                                                                   \
+      "affine_qmm_t_splitk_" #act_tag "_c_" #ctag "_s_" #scale_tag "_gs_" #gs                            \
+      "_b_4_alN_" #aln_tag)]] [[kernel]] void                                                            \
+  affine_qmm_t_splitk_kernel<act_type, ctype, scale_type, gs, 4, aln_val>(                               \
+      const device uint32_t*   w                        [[buffer(0)]],                                   \
+      const device scale_type* scales                   [[buffer(1)]],                                   \
+      const device scale_type* biases                   [[buffer(2)]],                                   \
+      const device act_type*   x                        [[buffer(3)]],                                   \
+      device act_type*         y                        [[buffer(4)]],                                   \
+      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                                            \
+      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                                 \
+      uint3 tgid          [[threadgroup_position_in_grid]]);
+
+// Legacy INST_QMM_T: T_compute = T_act. Emits the old symbol name
+// (no `_c_` segment) so existing pipeline-cache lookups keep hitting.
 #define INST_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val)   \
   template [[host_name(                                                               \
       "affine_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                            \
       "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                              \
-  affine_qmm_t_kernel<act_type, scale_type, gs, 4, aln_val>(                          \
+  affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(                \
       const device uint32_t*   w        [[buffer(0)]],                                \
       const device scale_type* scales   [[buffer(1)]],                                \
       const device scale_type* biases   [[buffer(2)]],                                \
@@ -987,7 +1044,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
   template [[host_name(                                                                   \
       "affine_qmm_t_splitk_" #act_tag "_s_" #scale_tag "_gs_" #gs                         \
       "_b_4_alN_" #aln_tag)]] [[kernel]] void                                             \
-  affine_qmm_t_splitk_kernel<act_type, scale_type, gs, 4, aln_val>(                       \
+  affine_qmm_t_splitk_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(             \
       const device uint32_t*   w                        [[buffer(0)]],                    \
       const device scale_type* scales                   [[buffer(1)]],                    \
       const device scale_type* biases                   [[buffer(2)]],                    \
@@ -1027,3 +1084,21 @@ INST_QMM_ALL(f16,  half,   f16, half, 128)
 INST_QMM_ALL(bf16, bfloat, f16, half,  32)
 INST_QMM_ALL(bf16, bfloat, f16, half,  64)
 INST_QMM_ALL(bf16, bfloat, f16, half, 128)
+
+// Apple7 (M1) fast-path: bf16 device dtype, f16 compute. Skips the
+// slow bf16 simdgroup_multiply_accumulate emulation and runs the MMA
+// in half — ~1.7× faster on M1 Max for prefill matmuls. Output stays
+// bf16 so the residual stream's bf16 dynamic range is preserved.
+// Only qmm_t (not qmm_n; qmm_n isn't on the prefill hot path).
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 64, true,  true)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 64, false, false)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 32, true,  true)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 32, false, false)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 128, true,  true)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 128, false, false)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 64, true,  true)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 64, false, false)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 32, true,  true)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 32, false, false)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 128, true,  true)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 128, false, false)

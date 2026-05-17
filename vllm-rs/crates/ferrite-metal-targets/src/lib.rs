@@ -198,6 +198,27 @@ pub fn is_nax_capable(_gen: AppleSiliconGen) -> bool {
     false
 }
 
+/// Returns `true` when the GPU's bf16 simdgroup MMA path is slow
+/// enough that loading bf16 from memory and running the MMA in fp16
+/// is a perf win — the M1 generation only.
+///
+/// On M1 (Apple7), `simdgroup_multiply_accumulate` of
+/// `simdgroup_matrix<bfloat>` runs through a software emulation path
+/// and clocks ~1.7× slower than `simdgroup_matrix<half>` on the same
+/// shapes (validated empirically: 4.58 TF/s bf16 vs 7.74 TF/s f16 on
+/// `affine_qmm_t_*_gs_64_b_4_alN_true_batch_0` at M=1024 N=3072 K=3072).
+/// M2 added partial hardware bf16 support; M3+ has fully accelerated
+/// bf16 plus the NAX matrix unit.
+///
+/// The qmm_t lowering reads this to pick a `T_compute=half`
+/// instantiation when the model's activation dtype is bf16, casting
+/// bf16↔half inside the kernel only — the residual stream stays bf16
+/// so dynamic-range correctness is preserved (full-f16 streams break
+/// Llama-3.x exponent range — see `ferrite-forward/src/instr.rs:199-202`).
+pub fn bf16_simdgroup_is_slow_path(gen: AppleSiliconGen) -> bool {
+    matches!(gen, AppleSiliconGen::M1)
+}
+
 /// M4 device profile with measured costs loaded from
 /// `profiles/cost_m4.csv` (regenerate via
 /// `cargo run -p ferrite-metal-cost-sweep --release > profiles/cost_m4.csv`).

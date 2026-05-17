@@ -171,6 +171,15 @@ pub enum WorkerError {
         bucket_index: usize,
         command_index: usize,
     },
+    /// A command referenced `Binding::PersistentBarrierCounter` but
+    /// the worker was constructed without a persistent counter
+    /// buffer. Indicates either the binding shape moved out from
+    /// under the worker (lowering bug) or a sub-path (GEMM resolver)
+    /// reached a persistent-envelope kernel it shouldn't have.
+    PersistentBarrierCounterMissing {
+        bucket_index: usize,
+        command_index: usize,
+    },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -220,6 +229,15 @@ impl std::fmt::Display for WorkerError {
                  Binding::Scratch with no splitk scratch buffer allocated \
                  (lowering / tape accounting bug)"
             ),
+            Self::PersistentBarrierCounterMissing {
+                bucket_index,
+                command_index,
+            } => write!(
+                f,
+                "MetalWorker: bucket {bucket_index} command {command_index}: \
+                 Binding::PersistentBarrierCounter referenced but the worker \
+                 has no counter buffer (probably called via the GEMM sub-path)"
+            ),
         }
     }
 }
@@ -248,6 +266,13 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// gate_out / up_out / down_out byte offsets) are owned by the
     /// lowering pass — see `MoeScratchLayout` in `lowering.rs`.
     pub moe_scratch: Option<Buffer>,
+    /// 4-byte shared atomic-counter buffer for persistent-envelope
+    /// cross-TG barriers. Always allocated (cost is negligible); used
+    /// by `Binding::PersistentBarrierCounter`. The buffer is
+    /// zero-initialized at allocation time and re-zeroed by the worker
+    /// at each binding resolve so the counter starts at 0 for every
+    /// dispatch.
+    pub persistent_barrier_counter: Buffer,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -397,6 +422,31 @@ impl<W: CanonicalParams> MetalWorker<W> {
             None
         };
 
+        // Persistent-envelope barrier counter — single 4-byte u32,
+        // zero-initialized. Storage-mode-shared so the worker can
+        // memset(0) it host-side before each binding. Negligible
+        // memory cost; allocated unconditionally so the
+        // `Binding::PersistentBarrierCounter` arm always has a
+        // resolved buffer (cost gated behind whether any tape
+        // actually emits a binding referencing it).
+        let persistent_barrier_counter: Buffer = {
+            let buf = device
+                .newBufferWithLength_options(
+                    4,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("newBufferWithLength_options returned nil (persistent barrier counter)");
+            // Zero-init.
+            unsafe {
+                let p = buf.contents().as_ptr() as *mut u32;
+                p.write(0);
+            }
+            if let Some(r) = residency {
+                r.insert(&buf);
+            }
+            buf
+        };
+
         // Runtime metadata buffers (`input_ids`, `positions`,
         // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
         // are allocated by the per-canonical `RuntimeFactory` closure
@@ -429,6 +479,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 &arena,
                 splitk_scratch.as_ref(),
                 moe_scratch.as_ref(),
+                Some(&persistent_barrier_counter),
                 pipelines,
                 weights,
                 allocator,
@@ -471,6 +522,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             bucket_bakings,
             splitk_scratch,
             moe_scratch,
+            persistent_barrier_counter,
             _marker: std::marker::PhantomData,
         })
     }
@@ -914,6 +966,7 @@ fn bake_bucket<W: CanonicalParams>(
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
     moe_scratch: Option<&Buffer>,
+    persistent_barrier_counter: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
     weights: &W,
     allocator: &MetalAllocator,
@@ -1134,6 +1187,7 @@ fn bake_bucket<W: CanonicalParams>(
             moe_scratch,
             moe_inline_buf.as_ref(),
             &mut inline_cursor,
+            persistent_barrier_counter,
             weights,
             allocator,
             runtime,
@@ -1284,6 +1338,7 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
         moe_scratch,
         moe_inline_buf,
         inline_cursor,
+        /*persistent_barrier_counter=*/ None,
         weights,
         allocator,
         runtime,
@@ -1613,6 +1668,7 @@ fn resolve_bindings<W: CanonicalParams>(
     moe_scratch: Option<&Buffer>,
     moe_inline_buf: Option<&Buffer>,
     inline_cursor: &mut u32,
+    persistent_barrier_counter: Option<&Buffer>,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
@@ -1690,6 +1746,25 @@ fn resolve_bindings<W: CanonicalParams>(
                              being set (lowering pass bug)",
                 })?;
                 (buf.clone(), *byte_offset as u64, *binding_index as u64)
+            }
+            Binding::PersistentBarrierCounter { binding_index } => {
+                // Zero-init at bind time so the counter starts at 0 for
+                // every dispatch. Cheap (4 bytes, shared memory). When
+                // Phase 2a Impl wires `SynthPreAttnPersistent` into the
+                // tape, dispatches re-enter this arm and the counter is
+                // freshly zeroed before each ICB exec records its
+                // setBuffer of this binding.
+                let counter = persistent_barrier_counter.ok_or(
+                    WorkerError::PersistentBarrierCounterMissing {
+                        bucket_index,
+                        command_index,
+                    },
+                )?;
+                unsafe {
+                    let p = counter.contents().as_ptr() as *mut u32;
+                    p.write(0);
+                }
+                (counter.clone(), 0u64, *binding_index as u64)
             }
         };
         out.push((buf, off, idx));

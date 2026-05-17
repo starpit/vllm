@@ -1999,6 +1999,17 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(
             crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_init(),
         ));
+        // Persistent-envelope variant — gated by FERRITE_PERSISTENT_PREATTN=1
+        // env var. When enabled, the persistent Impl matches the same
+        // chain as the non-persistent one above; when disabled,
+        // `target_compatible` returns false and it never enters the
+        // solver pool (non-persistent path stays the default).
+        lib.push(Box::new(
+            crate::metal::synth_pre_attn_persistent::MetalSynthPreAttnPersistentImpl::bf16_gs64(),
+        ));
+        lib.push(Box::new(
+            crate::metal::synth_pre_attn_persistent::MetalSynthPreAttnPersistentImpl::bf16_gs64_init(),
+        ));
         lib.push(Box::new(
             crate::metal::synth_mlp_pre_down::MetalSynthMlpPreDownImpl::bf16_gs64(),
         ));

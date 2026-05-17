@@ -5559,6 +5559,25 @@ fn emit_synthesized_kernel_sources_override(
         t_scale,
         &consts,
     );
+    // Persistent-envelope variants of pre-attn — same atom-body content
+    // wrapped in the cross-TG-barrier scaffolding. AOT-compiled here so
+    // the runtime can pick them up via the SpecializedPipelineCache
+    // without an extra source-compile path. Dispatch arm wiring lands
+    // in a follow-up commit; for now the metallibs are loaded but
+    // never selected by an Instruction.
+    let pre_attn_persistent = crate::fuse_pass::synthesize_pre_attn_chunk_persistent(
+        crate::fuse_pass::SynthesisBackend::Metal,
+        t_act,
+        t_scale,
+        &consts,
+    );
+    let pre_attn_init_persistent =
+        crate::fuse_pass::synthesize_pre_attn_init_chunk_persistent(
+            crate::fuse_pass::SynthesisBackend::Metal,
+            t_act,
+            t_scale,
+            &consts,
+        );
     let mlp_pre_down = crate::fuse_pass::synthesize_mlp_pre_down_chunk(
         crate::fuse_pass::SynthesisBackend::Metal,
         t_act,
@@ -5586,6 +5605,14 @@ fn emit_synthesized_kernel_sources_override(
         &pre_attn_init.symbol,
         &pre_attn_init.source,
     );
+    let pap_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &pre_attn_persistent.symbol,
+        &pre_attn_persistent.source,
+    );
+    let pip_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &pre_attn_init_persistent.symbol,
+        &pre_attn_init_persistent.source,
+    );
     let md_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
         &mlp_pre_down.symbol,
         &mlp_pre_down.source,
@@ -5598,22 +5625,32 @@ fn emit_synthesized_kernel_sources_override(
         syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
     let pi_symbol_lit =
         syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
+    let pap_symbol_lit =
+        syn::LitStr::new(&pre_attn_persistent.symbol, proc_macro2::Span::call_site());
+    let pip_symbol_lit =
+        syn::LitStr::new(&pre_attn_init_persistent.symbol, proc_macro2::Span::call_site());
     let md_symbol_lit =
         syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
 
     let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
     let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
+    let pap_bytes_lit = syn::LitByteStr::new(&pap_bytes, proc_macro2::Span::call_site());
+    let pip_bytes_lit = syn::LitByteStr::new(&pip_bytes, proc_macro2::Span::call_site());
     let md_bytes_lit = syn::LitByteStr::new(&md_bytes, proc_macro2::Span::call_site());
 
     quote! {
         fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
             const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
             const __SYNTH_PRE_ATTN_INIT_LIB: &[u8] = #pi_bytes_lit;
+            const __SYNTH_PRE_ATTN_PERSISTENT_LIB: &[u8] = #pap_bytes_lit;
+            const __SYNTH_PRE_ATTN_INIT_PERSISTENT_LIB: &[u8] = #pip_bytes_lit;
             const __SYNTH_MLP_PRE_DOWN_LIB: &[u8] = #md_bytes_lit;
             const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
             &[
                 (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
                 (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
+                (#pap_symbol_lit, __SYNTH_PRE_ATTN_PERSISTENT_LIB),
+                (#pip_symbol_lit, __SYNTH_PRE_ATTN_INIT_PERSISTENT_LIB),
                 (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_LIB),
                 (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
             ]

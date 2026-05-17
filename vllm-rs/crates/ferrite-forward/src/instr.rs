@@ -907,6 +907,32 @@ pub enum Instruction {
         /// quantized chains land here; Llama stays `false`.
         bool,
     ),
+    /// Persistent-envelope variant of `SynthPreAttn`. Identical tuple
+    /// shape — the symbol resolves to `synth_pre_attn_persistent_*`
+    /// instead of `synth_pre_attn_*`, and the lowering arm appends
+    /// ONE extra binding for the cross-TG barrier counter buffer
+    /// (index 18 / 21 depending on `has_linear_bias`). `num_tgs` is
+    /// derived inline in the MSL as `M * (NUM_Q + 2*NUM_KV)` so no
+    /// uniform-scalar binding is required.
+    ///
+    /// Emitted only when the env var `FERRITE_PERSISTENT_PREATTN=1`
+    /// makes `MetalSynthPreAttnPersistentImpl` `target_compatible`.
+    /// Otherwise the non-persistent `SynthPreAttn` is selected by the
+    /// solver as today. Single-phase persistent is overhead-only
+    /// (~5 µs trailing barrier per dispatch); Phase 2b will fuse
+    /// across chunks for the real ~10× decode win.
+    ///
+    /// CUDA eval is `unreachable!`.
+    SynthPreAttnPersistent(
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        &'static str,
+        bool,
+    ),
     /// Compiler-synthesized MLP pre-down chunk megakernel. Metal-only.
     /// Combines (FusedAddRmsNorm → AffineQmv gate → AffineQmv up →
     /// SiluMul) into one dispatch, leaving the down-projection as a
@@ -3307,6 +3333,12 @@ impl Instruction {
                 unreachable!(
                     "Instruction::SynthPreAttn is metal-only — emitted by the \
                      compiler-driven megakernel synthesis pass on the metal forward only"
+                );
+            }
+            Instruction::SynthPreAttnPersistent(..) => {
+                unreachable!(
+                    "Instruction::SynthPreAttnPersistent is metal-only — emitted by \
+                     MetalSynthPreAttnPersistentImpl when FERRITE_PERSISTENT_PREATTN=1"
                 );
             }
             Instruction::SynthMlpPreDown(..) => {

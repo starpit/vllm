@@ -1129,6 +1129,25 @@ impl Instruction {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
+            Instruction::SynthPreAttnPersistent(
+                residual_slot,
+                delta_slot,
+                out_slot,
+                layer,
+                _group_size,
+                _bits,
+                _symbol,
+                _has_linear_bias,
+            ) => (
+                "SynthPreAttnPersistent",
+                vec![
+                    F::Slot(residual_slot),
+                    F::Slot(delta_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
             Instruction::SynthMlpPreDown(
                 residual_slot,
                 delta_slot,

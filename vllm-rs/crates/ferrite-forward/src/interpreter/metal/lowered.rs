@@ -161,6 +161,11 @@ pub enum KernelId {
     /// Kernel body is generated at macro-expansion time by
     /// `ferrite-forward-macro::fuse_pass`.
     SynthPreAttn,
+    /// Persistent-envelope variant of `SynthPreAttn`. Same kernel
+    /// shape and bindings, plus one appended buffer for the cross-TG
+    /// barrier counter. Emitted only when
+    /// `FERRITE_PERSISTENT_PREATTN=1`.
+    SynthPreAttnPersistent,
     /// Compiler-synthesized MLP pre-down megakernel. Symbol resolves
     /// against a per-arch source-compiled library registered at worker
     /// init via `SpecializedPipelineCache::register_source_library`.
@@ -469,6 +474,13 @@ pub enum Binding {
     /// lowering time and stamped into the byte_offset field; the
     /// worker only sees opaque offsets.
     MoeScratch { binding_index: u8, byte_offset: u32 },
+    /// Per-worker zero-initialized 4-byte atomic-counter buffer for
+    /// the persistent-envelope cross-TG ticket-lock barrier. The
+    /// worker pre-allocates ONE shared u32 buffer at init and
+    /// `memset(0)`s it before each dispatch that references this
+    /// binding. Used exclusively by `KernelId::SynthPreAttnPersistent`
+    /// (and future persistent-envelope kernels).
+    PersistentBarrierCounter { binding_index: u8 },
 }
 
 /// Per-bundle locator for the macro-emitted `WeightAccessors` impl.

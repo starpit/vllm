@@ -28,9 +28,13 @@
 mod affine_qmm_sweep;
 mod affine_qmv_sweep;
 mod attention_sweep;
+mod barrier_bench;
+mod persistent_vs_dispatched;
 mod rmsnorm_sweep;
 mod synth_gate_up_silu_mul_sweep;
+mod single_tg_gemv_bench;
 mod synth_mlp_pre_down_sweep;
+mod synth_persistent_test;
 mod synth_pre_attn_sweep;
 mod util;
 
@@ -73,6 +77,18 @@ fn main() {
     }
     if want("attention") {
         attention_sweep::run(launch_overhead_us);
+    }
+    if want("barrier") {
+        barrier_bench::run(launch_overhead_us);
+    }
+    if want("single_tg_gemv") {
+        single_tg_gemv_bench::run(launch_overhead_us);
+    }
+    if want("persistent_vs_dispatched") {
+        persistent_vs_dispatched::run(launch_overhead_us);
+    }
+    if want("synth_persistent_test") {
+        synth_persistent_test::run(launch_overhead_us);
     }
 
     eprintln!("metal_cost_sweep: done");

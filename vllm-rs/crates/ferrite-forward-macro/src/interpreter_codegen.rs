@@ -751,6 +751,15 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let f = lit_u32(f);
             quote! { SynthPreAttn(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
+        I::SynthPreAttnPersistent(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            quote! { SynthPreAttnPersistent(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
         I::SynthMlpPreDown(a, b, c, d, e, f, g) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -882,6 +891,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::AttentionPrefillPaged(..) => "AttentionPrefillPaged",
         I::AffineQmm(..) => "AffineQmm",
         I::SynthPreAttn(..) => "SynthPreAttn",
+        I::SynthPreAttnPersistent(..) => "SynthPreAttnPersistent",
         I::SynthMlpPreDown(..) => "SynthMlpPreDown",
         I::SiluMul(..) => "SiluMul",
         #[cfg(feature = "metal")]
@@ -1522,6 +1532,15 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             _ => None,
         },
         I::SynthPreAttn(a, b, c, d, e, f, _g, _h) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            _ => None,
+        },
+        I::SynthPreAttnPersistent(a, b, c, d, e, f, _g, _h) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -2197,6 +2216,15 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             4 => I::SynthPreAttn(a, b, c, d, n, f, g, h),
             5 => I::SynthPreAttn(a, b, c, d, e, n, g, h),
             _ => panic!("SynthPreAttn: bad idx {idx}"),
+        },
+        I::SynthPreAttnPersistent(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::SynthPreAttnPersistent(n, b, c, d, e, f, g, h),
+            1 => I::SynthPreAttnPersistent(a, n, c, d, e, f, g, h),
+            2 => I::SynthPreAttnPersistent(a, b, n, d, e, f, g, h),
+            3 => I::SynthPreAttnPersistent(a, b, c, n, e, f, g, h),
+            4 => I::SynthPreAttnPersistent(a, b, c, d, n, f, g, h),
+            5 => I::SynthPreAttnPersistent(a, b, c, d, e, n, g, h),
+            _ => panic!("SynthPreAttnPersistent: bad idx {idx}"),
         },
         I::SynthMlpPreDown(a, b, c, d, e, f, g) => match idx {
             0 => I::SynthMlpPreDown(n, b, c, d, e, f, g),

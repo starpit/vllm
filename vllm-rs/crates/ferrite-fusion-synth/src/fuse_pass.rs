@@ -1006,6 +1006,676 @@ pub fn dump_llama_3_2_3b_4bit_pre_attn() -> SynthesizedKernel {
     synthesize_pre_attn_chunk(SynthesisBackend::Metal, "bfloat", "half", &consts)
 }
 
+/// Persistent-envelope variant of `synthesize_pre_attn_chunk`.
+///
+/// Emits a kernel whose body is the same AddRmsNorm + 3×AffineQmv + RopeAppend
+/// atom chain, but wrapped in the persistent envelope (counter @ buffer 0,
+/// num_tgs @ buffer 1, all other buffer indices shifted by +2). The body is
+/// emitted as a single `PersistentPhase` since this kernel has only one phase
+/// (Phase 2b will introduce multi-phase variants that fuse across chunks).
+///
+/// The trailing `cross_tg_barrier_msl` after the single phase is a no-op for
+/// downstream correctness when this kernel is dispatched standalone, but
+/// costs ~5 µs per call. It exists because the envelope template emits one
+/// barrier per phase including the last (uniform post-condition).
+///
+/// Symbol name: `synth_pre_attn_persistent_<t_act>_<t_scale>_gs<gs>[_bias]`
+/// — distinguishes from the non-persistent variant so both can coexist in
+/// the AOT-compiled metallib registry.
+pub fn synthesize_pre_attn_chunk_persistent(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    synthesize_pre_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, false)
+}
+
+/// Layer-0 (init) variant of `synthesize_pre_attn_chunk_persistent`.
+pub fn synthesize_pre_attn_init_chunk_persistent(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    synthesize_pre_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, true)
+}
+
+/// Append-style persistent variant: signature is a strict superset of
+/// the non-persistent `synth_pre_attn_*` kernel (same buffers at the
+/// same indices), plus one extra `device atomic_uint* __barrier_counter`
+/// appended at the next free index. `num_tgs` is derived inline as
+/// `M * (NUM_Q + 2u * NUM_KV)` so the worker doesn't need to bind a
+/// scalar uniform. This keeps the interpreter arm a one-line patch
+/// over the existing SynthPreAttn arm.
+fn synthesize_pre_attn_chunk_persistent_impl(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+    init: bool,
+) -> SynthesizedKernel {
+    assert_eq!(
+        backend,
+        SynthesisBackend::Metal,
+        "MVP only emits Metal",
+    );
+
+    // Channel-name allocation — same as `synthesize_pre_attn_chunk_impl`
+    // (kept verbatim so atom-body emissions textually match).
+    let x_norm_name   = "__x_norm".to_string();
+    let qmv_smem_name = "__qmv_smem".to_string();
+    let residual_io   = "__residual_io".to_string();
+    let delta_buf     = "__delta".to_string();
+    let rms_wt_buf    = "__rms_weight".to_string();
+    let q_wt_buf = "__q_weight".to_string();
+    let q_sc_buf = "__q_scales".to_string();
+    let q_bi_buf = "__q_biases".to_string();
+    let k_wt_buf = "__k_weight".to_string();
+    let k_sc_buf = "__k_scales".to_string();
+    let k_bi_buf = "__k_biases".to_string();
+    let v_wt_buf = "__v_weight".to_string();
+    let v_sc_buf = "__v_scales".to_string();
+    let v_bi_buf = "__v_biases".to_string();
+    let q_lb_buf = "__q_linear_bias".to_string();
+    let k_lb_buf = "__k_linear_bias".to_string();
+    let v_lb_buf = "__v_linear_bias".to_string();
+    let cos_sin_buf   = "__cos_sin".to_string();
+    let positions_buf = "__positions".to_string();
+    let slot_map_buf  = "__slot_mapping".to_string();
+    let q_out_buf     = "__q_out".to_string();
+    let kv_cache_k    = "__kv_cache_k".to_string();
+    let kv_cache_v    = "__kv_cache_v".to_string();
+
+    let constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
+        ("HIDDEN",      AtomConstantValue::Uint(consts.hidden)),
+        ("NUM_Q",       AtomConstantValue::Uint(consts.num_q_heads)),
+        ("NUM_KV",      AtomConstantValue::Uint(consts.num_kv_heads)),
+        ("HEAD_DIM",    AtomConstantValue::Uint(consts.head_dim)),
+        ("ROT_DIM",     AtomConstantValue::Uint(consts.rot_dim)),
+        ("BLOCK_SIZE",  AtomConstantValue::Uint(consts.block_size)),
+        ("M",           AtomConstantValue::Uint(consts.m)),
+        ("EPS",         AtomConstantValue::Float(consts.rms_norm_eps)),
+    ];
+
+    let addrms = AddRmsNormAtom { init };
+    let rope   = RopeAppendAtom;
+    let qmv_q = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "__head",
+        has_linear_bias: consts.has_linear_bias,
+    };
+    let qmv_k = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "(__head - __num_q)",
+        has_linear_bias: consts.has_linear_bias,
+    };
+    let qmv_v = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "(__head - __num_q - __num_kv)",
+        has_linear_bias: consts.has_linear_bias,
+    };
+
+    let addrms_in  = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
+    let addrms_out = vec![x_norm_name.clone()];
+    let addrms_ctx = AtomCtx {
+        bound_inputs: &addrms_in,
+        bound_outputs: &addrms_out,
+        constants: &constants_slice,
+        t_act,
+        t_scale,
+    };
+
+    let rope_in  = vec![
+        qmv_smem_name.clone(),
+        cos_sin_buf.clone(),
+        positions_buf.clone(),
+        slot_map_buf.clone(),
+    ];
+    let rope_out = vec![q_out_buf.clone(), kv_cache_k.clone(), kv_cache_v.clone()];
+    let rope_ctx = AtomCtx {
+        bound_inputs: &rope_in,
+        bound_outputs: &rope_out,
+        constants: &constants_slice,
+        t_act,
+        t_scale,
+    };
+
+    let addrms_body = addrms.emit_metal_body(&addrms_ctx)
+        .expect("AddRmsNormAtom Metal emit");
+    let rope_body   = rope.emit_metal_body(&rope_ctx)
+        .expect("RopeAppendAtom Metal emit");
+
+    let emit_band_body =
+        |atom: &AffineQmvAtom, w: &str, s: &str, b: &str, lb: Option<&str>| -> String {
+            let mut band_in = vec![
+                x_norm_name.clone(), w.to_string(), s.to_string(), b.to_string(),
+            ];
+            if let Some(lb_name) = lb {
+                band_in.push(lb_name.to_string());
+            }
+            let band_out = vec![qmv_smem_name.clone()];
+            let band_ctx = AtomCtx {
+                bound_inputs: &band_in,
+                bound_outputs: &band_out,
+                constants: &constants_slice,
+                t_act,
+                t_scale,
+            };
+            atom.emit_metal_body(&band_ctx)
+                .expect("AffineQmvAtom Metal emit")
+        };
+    let q_lb_opt: Option<&str> = consts.has_linear_bias.then_some(q_lb_buf.as_str());
+    let k_lb_opt: Option<&str> = consts.has_linear_bias.then_some(k_lb_buf.as_str());
+    let v_lb_opt: Option<&str> = consts.has_linear_bias.then_some(v_lb_buf.as_str());
+    let qmv_q_body = emit_band_body(&qmv_q, &q_wt_buf, &q_sc_buf, &q_bi_buf, q_lb_opt);
+    let qmv_k_body = emit_band_body(&qmv_k, &k_wt_buf, &k_sc_buf, &k_bi_buf, k_lb_opt);
+    let qmv_v_body = emit_band_body(&qmv_v, &v_wt_buf, &v_sc_buf, &v_bi_buf, v_lb_opt);
+    let qmv_body = format!(
+        r#"
+    // --- per-band QKV qmv (3× AffineQmvAtom, band-selected by __head) ---
+    if (__head < __num_q) {{
+        {qmv_q_body}
+    }} else if (__head < __num_q + __num_kv) {{
+        {qmv_k_body}
+    }} else {{
+        {qmv_v_body}
+    }}
+"#,
+    );
+
+    let bias_suffix = if consts.has_linear_bias { "_bias" } else { "" };
+    let symbol = if init {
+        format!(
+            "synth_pre_attn_init_persistent_{}_{}_gs{}{}",
+            t_act, t_scale, consts.group_size, bias_suffix,
+        )
+    } else {
+        format!(
+            "synth_pre_attn_persistent_{}_{}_gs{}{}",
+            t_act, t_scale, consts.group_size, bias_suffix,
+        )
+    };
+
+    // Buffer indices: same as the non-persistent kernel through
+    // buffer(17) (kv_cache_v); the persistent variant only ADDS the
+    // counter at the next free index.
+    //   counter index = 18 (no bias) or 21 (with bias)
+    // num_tgs = M * (NUM_Q + 2 * NUM_KV) is derived inline so the
+    // worker doesn't need to bind a uniform scalar.
+    let counter_buf = "__barrier_counter";
+    let counter_idx: u32 = if consts.has_linear_bias { 21 } else { 18 };
+
+    let maybe_bias_params = if consts.has_linear_bias {
+        format!(
+            "    device const {t_act}*   {q_lb_buf}      [[buffer(18)]],\n\
+             \x20   device const {t_act}*   {k_lb_buf}      [[buffer(19)]],\n\
+             \x20   device const {t_act}*   {v_lb_buf}      [[buffer(20)]],\n",
+            t_act = t_act,
+            q_lb_buf = q_lb_buf, k_lb_buf = k_lb_buf, v_lb_buf = v_lb_buf,
+        )
+    } else {
+        String::new()
+    };
+
+    let mk_header = inline_header(include_str!(
+        "../../ferrite-metal-kernels/shaders/metal_kittens.h"
+    ));
+
+    let source_tail = format!(
+        r#"
+
+// Model-invariant dims baked at synth time, identical to the
+// non-persistent variant. M stays a function constant.
+constant constexpr uint  HIDDEN     = {hidden_lit}u;
+constant constexpr uint  NUM_Q      = {num_q_lit}u;
+constant constexpr uint  NUM_KV     = {num_kv_lit}u;
+constant constexpr uint  HEAD_DIM   = {head_dim_lit}u;
+constant constexpr uint  ROT_DIM    = {rot_dim_lit}u;
+constant constexpr uint  BLOCK_SIZE = {block_size_lit}u;
+constant constexpr float EPS        = {eps_lit}f;
+constant uint  M [[function_constant(0)]];
+
+constant constexpr uint __HIDDEN_MAX   = HIDDEN;
+constant constexpr uint __HEAD_DIM_MAX = HEAD_DIM;
+constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
+
+[[kernel, max_total_threads_per_threadgroup({threads_per_tg}u)]]
+void {symbol}(
+    device       {t_act}*   {q_out_buf}      [[buffer(0)]],
+    device       {t_act}*   {residual_io}    [[buffer(1)]],
+    device const {t_act}*   {delta_buf}      [[buffer(2)]],
+    device const {t_scale}* {rms_wt_buf}     [[buffer(3)]],
+    device const uint32_t*  {q_wt_buf}       [[buffer(4)]],
+    device const {t_scale}* {q_sc_buf}       [[buffer(5)]],
+    device const {t_scale}* {q_bi_buf}       [[buffer(6)]],
+    device const uint32_t*  {k_wt_buf}       [[buffer(7)]],
+    device const {t_scale}* {k_sc_buf}       [[buffer(8)]],
+    device const {t_scale}* {k_bi_buf}       [[buffer(9)]],
+    device const uint32_t*  {v_wt_buf}       [[buffer(10)]],
+    device const {t_scale}* {v_sc_buf}       [[buffer(11)]],
+    device const {t_scale}* {v_bi_buf}       [[buffer(12)]],
+    device const {t_act}*   {cos_sin_buf}    [[buffer(13)]],
+    device const uint*      {positions_buf}  [[buffer(14)]],
+    device const uint*      {slot_map_buf}   [[buffer(15)]],
+    device       {t_act}*   {kv_cache_k}     [[buffer(16)]],
+    device       {t_act}*   {kv_cache_v}     [[buffer(17)]],
+{maybe_bias_params}    device atomic_uint* {counter_buf} [[buffer({counter_idx})]],
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tid_pos   [[thread_position_in_threadgroup]],
+    uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid  [[thread_index_in_simdgroup]])
+{{
+    const uint __t                = __tg_pos.x;
+    const uint __head             = __tg_pos.y;
+    const uint __tid              = __tid_pos.x;
+    const uint __head_dim         = HEAD_DIM;
+    const uint __hidden           = HIDDEN;
+    const uint __num_q            = NUM_Q;
+    const uint __num_kv           = NUM_KV;
+    const uint __rot_dim          = ROT_DIM;
+    const uint __half_dim         = __rot_dim / 2;
+    const uint __block_sz         = BLOCK_SIZE;
+    const uint __num_heads_total  = __num_q + 2u * __num_kv;
+    const uint __threads_per_tg   = MK_SIMD_SIZE * __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const uint __num_simdgroups   = __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const float __eps             = EPS;
+
+    // Persistent-envelope barrier-state. Derived from M and the
+    // model's NUM_HEADS_TOTAL so the worker doesn't need to bind a
+    // num_tgs uniform.
+    const uint __persistent_num_tgs = M * __num_heads_total;
+
+    if (__t >= M || __head >= __num_heads_total) return;
+
+    threadgroup {t_act} {x_norm_name}[__HIDDEN_MAX];
+    threadgroup float   __scratch  [__SCRATCH_MAX];
+    threadgroup float   {qmv_smem_name}[__HEAD_DIM_MAX];
+
+    {addrms_body}
+
+    {qmv_body}
+
+    {rope_body}
+
+    // ── trailing cross-TG barrier (single-phase envelope) ──
+    // Flush this TG's device writes; bump the counter; spin until all
+    // other TGs have arrived; per-TG acquire. ~5 µs at production
+    // grid sizes (measured in `barrier_bench`).
+    threadgroup_barrier(mem_flags::mem_device);
+    if (__tid == 0u) {{
+        atomic_fetch_add_explicit({counter_buf}, 1u, memory_order_relaxed);
+        while (atomic_load_explicit({counter_buf}, memory_order_relaxed)
+                < __persistent_num_tgs) {{
+            // spin
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_device);
+}}
+"#,
+        symbol = symbol, t_act = t_act, t_scale = t_scale,
+        q_out_buf = q_out_buf, residual_io = residual_io,
+        delta_buf = delta_buf, rms_wt_buf = rms_wt_buf,
+        q_wt_buf = q_wt_buf, q_sc_buf = q_sc_buf, q_bi_buf = q_bi_buf,
+        k_wt_buf = k_wt_buf, k_sc_buf = k_sc_buf, k_bi_buf = k_bi_buf,
+        v_wt_buf = v_wt_buf, v_sc_buf = v_sc_buf, v_bi_buf = v_bi_buf,
+        cos_sin_buf = cos_sin_buf, positions_buf = positions_buf,
+        slot_map_buf = slot_map_buf,
+        kv_cache_k = kv_cache_k, kv_cache_v = kv_cache_v,
+        maybe_bias_params = maybe_bias_params,
+        counter_buf = counter_buf, counter_idx = counter_idx,
+        x_norm_name = x_norm_name, qmv_smem_name = qmv_smem_name,
+        addrms_body = addrms_body,
+        qmv_body = qmv_body,
+        rope_body = rope_body,
+        threads_per_tg = 8 * consts.head_dim,
+        hidden_lit = consts.hidden,
+        num_q_lit = consts.num_q_heads,
+        num_kv_lit = consts.num_kv_heads,
+        head_dim_lit = consts.head_dim,
+        rot_dim_lit = consts.rot_dim,
+        block_size_lit = consts.block_size,
+        eps_lit = format_msl_float(consts.rms_norm_eps),
+    );
+
+    let source = format!(
+        "// SPDX-License-Identifier: Apache-2.0\n\
+         //\n\
+         // SYNTHESIZED PERSISTENT PRE-ATTN KERNEL — generated by ferrite-fusion-synth::fuse_pass.\n\
+         // Do not hand-edit.\n\n\
+         #include <metal_stdlib>\n\
+         #include <metal_atomic>\n\
+         using namespace metal;\n\n\
+         // === inlined metal_kittens.h ===\n\
+         {mk_header}\n\
+         // === end inlined metal_kittens.h ===\n\n\
+         {source_tail}",
+        mk_header = mk_header,
+        source_tail = source_tail,
+    );
+
+    SynthesizedKernel {
+        symbol,
+        source,
+        backend: SynthesisBackend::Metal,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Persistent megakernel synthesis (multi-phase, cross-TG barrier).
+//
+// Background: the synth chunks above (synthesize_pre_attn_chunk etc.)
+// each emit ONE kernel containing ONE fused phase region. Today's
+// worker dispatches each of these chunks as a separate Metal kernel
+// boundary — N dispatches per token, with each dispatch boundary
+// costing ~1 ms of per-dispatch GPU command-processor overhead on M4
+// (measured in `ferrite-metal-cost-sweep::persistent_vs_dispatched`).
+//
+// The persistent megakernel collapses all phase chunks into ONE
+// kernel dispatch per token, with cross-TG ticket-lock barriers
+// between phases instead of kernel boundaries. Measured win: 11×
+// faster on M4 at production resource pressure (1024 threads/TG,
+// 16 TGs, heterogeneous phase bodies — see
+// `project_metal_persistent_megakernel_feasibility.md`).
+//
+// This MVP scaffolding emits a persistent kernel from a sequence of
+// `PersistentPhase` descriptors. Each phase is currently just an MSL
+// body fragment; future work threads atom DAG → phase body emission
+// + automatic phase-boundary detection where TG decomposition has
+// to change. The runtime atomic-counter target uses a strictly-
+// increasing schedule so a single device counter serves all phases.
+// ───────────────────────────────────────────────────────────────────
+
+/// One phase of a persistent megakernel. Body is an MSL fragment
+/// emitted into the kernel scope between cross-TG barriers. Callers
+/// must use only kernel-scope variable names (no shared local
+/// state across phase fragment boundaries beyond what's declared at
+/// kernel scope above the per-phase bodies).
+#[derive(Clone, Debug)]
+pub struct PersistentPhase {
+    /// Diagnostic name — appears in a comment in the emitted MSL,
+    /// and the symbol name when phase count is small.
+    pub name: String,
+    /// MSL body fragment. Has access to:
+    /// - `uint tg_id`            — `[[threadgroup_position_in_grid]]`
+    /// - `uint tid`              — `[[thread_position_in_threadgroup]]`
+    /// - `constant uint num_tgs` — TG count (passed via function_constant)
+    /// - any buffer parameters declared in the kernel signature
+    pub body: String,
+}
+
+impl PersistentPhase {
+    /// Build a phase from a raw MSL body string. Use when the body
+    /// is hand-written or pre-computed.
+    pub fn from_body(name: impl Into<String>, body: impl Into<String>) -> Self {
+        Self { name: name.into(), body: body.into() }
+    }
+
+    /// Build a phase by calling an `Atom`'s `emit_metal_body` on the
+    /// supplied `AtomCtx`. The caller is responsible for providing
+    /// kernel-scope variable declarations (via the `prologue` of
+    /// `synthesize_persistent_chunk`) that the atom body references —
+    /// e.g. `__t`, `__hidden`, `__head`, `__head_dim`, and any TG-
+    /// memory arrays the atom's output channels expect.
+    ///
+    /// Returns `None` if the atom doesn't implement Metal emission.
+    pub fn from_atom_metal(
+        name: impl Into<String>,
+        atom: &dyn crate::atom::Atom,
+        ctx: &crate::atom::AtomCtx,
+    ) -> Option<Self> {
+        atom.emit_metal_body(ctx).map(|body| Self { name: name.into(), body })
+    }
+}
+
+/// Standard pre-attention kernel-scope prologue. Emits the local
+/// variable declarations atom bodies in `atom_lib` expect to find at
+/// kernel scope: thread/TG position derivatives (`__t`, `__head`,
+/// `__tid`), per-shape constants (`__hidden`, `__head_dim`, etc.),
+/// the early-exit guard, and the standard TG-memory allocations
+/// (`x_norm`, `__scratch`, `qmv_smem`).
+///
+/// Inputs are MSL constant names (typically baked as `constexpr` in
+/// the kernel source above the prologue). Constants must be visible
+/// at the point the prologue is spliced in.
+///
+/// Used by the persistent-megakernel codegen path so atoms that work
+/// in the existing `synthesize_pre_attn_chunk` body can also run in
+/// a persistent kernel — same prologue, different envelope.
+pub fn pre_attn_kernel_scope_prologue(
+    t_act: &str,
+    hidden_const: &str,
+    head_dim_const: &str,
+    num_q_const: &str,
+    num_kv_const: &str,
+    rot_dim_const: &str,
+    block_size_const: &str,
+    eps_const: &str,
+    m_const: &str,
+    x_norm_name: &str,
+    qmv_smem_name: &str,
+    hidden_max: u32,
+    head_dim_max: u32,
+) -> String {
+    format!(
+        r#"
+    const uint __t                = __tg_pos.x;
+    const uint __head             = __tg_pos.y;
+    const uint __tid              = __tid_pos.x;
+    const uint __head_dim         = {head_dim};
+    const uint __hidden           = {hidden};
+    const uint __num_q            = {num_q};
+    const uint __num_kv           = {num_kv};
+    const uint __rot_dim          = {rot_dim};
+    const uint __half_dim         = __rot_dim / 2;
+    const uint __block_sz         = {block_size};
+    const uint __num_heads_total  = __num_q + 2u * __num_kv;
+    const uint __threads_per_tg   = MK_SIMD_SIZE * __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const uint __num_simdgroups   = __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const float __eps             = {eps};
+
+    if (__t >= {m} || __head >= __num_heads_total) return;
+
+    // `constant` address-space qualifier is illegal on function-scope
+    // automatic variables — drop it and use plain `constexpr`. The
+    // values are still compile-time constants (the array sizes below
+    // resolve at MSL-compile time).
+    constexpr uint __HIDDEN_MAX   = {hidden_max}u;
+    constexpr uint __HEAD_DIM_MAX = {head_dim_max}u;
+    constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
+
+    threadgroup {t_act} {x_norm}[__HIDDEN_MAX];
+    threadgroup float   __scratch  [__SCRATCH_MAX];
+    threadgroup float   {qmv_smem}[__HEAD_DIM_MAX];
+"#,
+        t_act = t_act,
+        hidden = hidden_const,
+        head_dim = head_dim_const,
+        num_q = num_q_const,
+        num_kv = num_kv_const,
+        rot_dim = rot_dim_const,
+        block_size = block_size_const,
+        eps = eps_const,
+        m = m_const,
+        hidden_max = hidden_max,
+        head_dim_max = head_dim_max,
+        x_norm = x_norm_name,
+        qmv_smem = qmv_smem_name,
+    )
+}
+
+/// MSL helper fragment that performs a cross-TG ticket-lock barrier
+/// at `phase_idx`. TG-leader threads (`tid == 0`) atomically bump
+/// the device counter and spin until it reaches the target value
+/// `num_tgs * (phase_idx + 1)`, after which a TG-level barrier
+/// propagates the device-memory acquire to non-leader threads.
+///
+/// Apple Metal supports only `memory_order_relaxed` on atomics;
+/// the trailing `threadgroup_barrier(mem_flags::mem_device)` is
+/// what provides the actual cross-phase visibility ordering.
+fn cross_tg_barrier_msl(phase_idx: usize, counter_name: &str) -> String {
+    // Apple Metal only supports memory_order_relaxed atomics, so we
+    // rely on `threadgroup_barrier(mem_flags::mem_device)` for cross-
+    // phase visibility instead of atomic ordering. The PRE-barrier
+    // flushes this TG's phase-N writes to L2 before signalling
+    // arrival; the POST-barrier ensures phase-(N+1) reads happen
+    // after all TGs have signalled.
+    //
+    // Without the pre-barrier the atomic increment can be observed
+    // by another TG before that TG's phase-N device writes are
+    // visible, and downstream reads of those writes return stale
+    // (often zero) data — verified by the
+    // `synth_persistent_e2e_test` end-to-end check.
+    format!(
+        r#"
+    // ── cross-TG barrier (phase {phase_idx}) ──
+    // Flush this TG's phase-{phase_idx} device writes to L2 before
+    // signalling arrival.
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {{
+        atomic_fetch_add_explicit({counter_name}, 1u, memory_order_relaxed);
+        uint __target = num_tgs * {target}u;
+        while (atomic_load_explicit({counter_name}, memory_order_relaxed) < __target) {{
+            // spin
+        }}
+    }}
+    // Acquire-side: ensure phase-{next_phase} reads see all other
+    // TGs' phase-{phase_idx} device writes.
+    threadgroup_barrier(mem_flags::mem_device);
+"#,
+        phase_idx = phase_idx,
+        next_phase = phase_idx + 1,
+        counter_name = counter_name,
+        target = phase_idx + 1,
+    )
+}
+
+/// Synthesize a persistent megakernel containing multiple phase
+/// bodies separated by cross-TG ticket-lock barriers.
+///
+/// The emitted kernel signature is (MSL):
+/// ```text
+/// [[kernel, max_total_threads_per_threadgroup(N)]]
+/// void <symbol>(
+///     device atomic_uint* __barrier_counter [[buffer(0)]],
+///     constant uint& num_tgs                [[buffer(1)]],
+///     /* per-phase buffer params at indices 2..N (caller provides
+///        the kernel-scope variable declarations via the prologue) */
+///     uint tg_id [[threadgroup_position_in_grid]],
+///     uint tid   [[thread_position_in_threadgroup]])
+/// { ... }
+/// ```
+///
+/// `extra_signature` lets callers append per-phase buffer parameters
+/// to the signature (one comma-prefixed `,\n    <type> <name> [[buffer(K)]]`
+/// per parameter). `prologue` is emitted at the top of the kernel
+/// body (before phase 0) — typically `threadgroup` allocations and
+/// derived constants.
+///
+/// This is the MVP scaffolding; future work will derive the signature,
+/// prologue, and phase bodies from an atom DAG walk rather than
+/// requiring the caller to pre-format them.
+pub fn synthesize_persistent_chunk(
+    backend: SynthesisBackend,
+    symbol: &str,
+    threads_per_tg: u32,
+    extra_signature: &str,
+    prologue: &str,
+    phases: &[PersistentPhase],
+) -> SynthesizedKernel {
+    synthesize_persistent_chunk_with_preamble(
+        backend, symbol, threads_per_tg, extra_signature, "", prologue, phases,
+    )
+}
+
+/// As `synthesize_persistent_chunk`, but accepts a `preamble` that's
+/// emitted between the `#include`s and the kernel function. Use to
+/// bake model-shape constants as `constexpr` at file scope so they
+/// resolve to literal values inside the kernel prologue + atom bodies.
+pub fn synthesize_persistent_chunk_with_preamble(
+    backend: SynthesisBackend,
+    symbol: &str,
+    threads_per_tg: u32,
+    extra_signature: &str,
+    preamble: &str,
+    prologue: &str,
+    phases: &[PersistentPhase],
+) -> SynthesizedKernel {
+    assert_eq!(
+        backend,
+        SynthesisBackend::Metal,
+        "MVP only emits Metal",
+    );
+    assert!(!phases.is_empty(), "synthesize_persistent_chunk: empty phase list");
+
+    let counter_name = "__barrier_counter";
+    let mut body = String::new();
+    body.push_str(prologue);
+    body.push('\n');
+
+    for (i, phase) in phases.iter().enumerate() {
+        body.push_str(&format!("\n    // ── phase {}: {} ──\n", i, phase.name));
+        body.push_str(&phase.body);
+        // Cross-TG barrier between phases. The barrier after the
+        // last phase is also emitted so a downstream phase / kernel
+        // observes the final phase's writes; it costs ~5 µs and
+        // makes the post-condition uniform.
+        body.push_str(&cross_tg_barrier_msl(i, counter_name));
+    }
+
+    let source = format!(
+        r#"// SPDX-License-Identifier: Apache-2.0
+// SYNTHESIZED PERSISTENT MEGAKERNEL — do not hand-edit.
+// Generated by ferrite-fusion-synth::synthesize_persistent_chunk.
+//
+// Phases ({n_phases}):
+{phase_comments}
+
+#include <metal_stdlib>
+#include <metal_atomic>
+using namespace metal;
+
+{preamble}
+
+[[kernel, max_total_threads_per_threadgroup({threads_per_tg})]]
+void {symbol}(
+    device atomic_uint* {counter}   [[buffer(0)]],
+    constant uint&      num_tgs     [[buffer(1)]]{extra_signature},
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tid_pos   [[thread_position_in_threadgroup]],
+    uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid  [[thread_index_in_simdgroup]])
+{{
+    // Convenience scalars for phase bodies that don't need the full
+    // 3D thread/TG position. Atoms in `atom_lib` reference the 3D
+    // versions directly; simple bodies can use these.
+    const uint tg_id = __tg_pos.x;
+    const uint tid   = __tid_pos.x;
+{body}
+}}
+"#,
+        n_phases = phases.len(),
+        phase_comments = phases
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("//   [{}] {}", i, p.name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        threads_per_tg = threads_per_tg,
+        symbol = symbol,
+        counter = counter_name,
+        extra_signature = extra_signature,
+        preamble = preamble,
+        body = body,
+    );
+
+    SynthesizedKernel {
+        symbol: symbol.to_string(),
+        source,
+        backend: SynthesisBackend::Metal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1699,112 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_persistent_chunk_emits_well_formed_msl() {
+        // Three trivial phases: each writes a marker to a per-phase
+        // output buffer. Cross-TG barriers separate them. The test
+        // validates the structural shape of the emitted MSL — that
+        // the kernel signature, phase comments, barriers, and bodies
+        // all appear at the expected places.
+        let phases = vec![
+            PersistentPhase {
+                name: "phase_a".to_string(),
+                body: "    if (tid == 0u) out_a[tg_id] = 1.0f;\n".to_string(),
+            },
+            PersistentPhase {
+                name: "phase_b".to_string(),
+                body: "    if (tid == 0u) out_b[tg_id] = 2.0f;\n".to_string(),
+            },
+            PersistentPhase {
+                name: "phase_c".to_string(),
+                body: "    if (tid == 0u) out_c[tg_id] = 3.0f;\n".to_string(),
+            },
+        ];
+        let extra_sig = ",\n    device float* out_a [[buffer(2)]],\n    device float* out_b [[buffer(3)]],\n    device float* out_c [[buffer(4)]]";
+        let kernel = synthesize_persistent_chunk(
+            SynthesisBackend::Metal,
+            "test_persistent_three_phases",
+            256,
+            extra_sig,
+            "",
+            &phases,
+        );
+        assert_eq!(kernel.symbol, "test_persistent_three_phases");
+        assert!(kernel.source.contains("[[kernel, max_total_threads_per_threadgroup(256)]]"));
+        assert!(kernel.source.contains("test_persistent_three_phases"));
+        // All three phase names appear (in both header comment block
+        // and per-phase markers).
+        assert!(kernel.source.matches("phase_a").count() >= 2);
+        assert!(kernel.source.matches("phase_b").count() >= 2);
+        assert!(kernel.source.matches("phase_c").count() >= 2);
+        // Three cross-TG barriers (one after each phase).
+        assert_eq!(kernel.source.matches("cross-TG barrier (phase ").count(), 3);
+        // Counter targets are strictly increasing (1, 2, 3).
+        assert!(kernel.source.contains("num_tgs * 1u"));
+        assert!(kernel.source.contains("num_tgs * 2u"));
+        assert!(kernel.source.contains("num_tgs * 3u"));
+        // Atomic spin pattern is intact.
+        assert!(kernel.source.contains("atomic_fetch_add_explicit"));
+        assert!(kernel.source.contains("memory_order_relaxed"));
+        assert!(kernel.source.contains("threadgroup_barrier(mem_flags::mem_device)"));
+        // Phase bodies preserved verbatim.
+        assert!(kernel.source.contains("out_a[tg_id] = 1.0f"));
+        assert!(kernel.source.contains("out_b[tg_id] = 2.0f"));
+        assert!(kernel.source.contains("out_c[tg_id] = 3.0f"));
+    }
+
+    #[test]
+    fn persistent_phase_from_atom_metal_threads_through() {
+        // Wire AddRmsNormAtom through PersistentPhase::from_atom_metal
+        // and synthesize_persistent_chunk. Validates that the atom
+        // composition path emits MSL containing the atom's body
+        // verbatim with channel-name substitutions applied.
+        let atom = AddRmsNormAtom::default();
+        let in_names = vec![
+            "__residual_io".to_string(),
+            "__delta".to_string(),
+            "__rms_weight".to_string(),
+        ];
+        let out_names = vec!["__x_norm".to_string()];
+        let consts: Vec<(&'static str, AtomConstantValue)> = vec![
+            ("HIDDEN", AtomConstantValue::Uint(2048)),
+            ("NUM_Q", AtomConstantValue::Uint(32)),
+            ("NUM_KV", AtomConstantValue::Uint(8)),
+            ("HEAD_DIM", AtomConstantValue::Uint(64)),
+            ("EPS", AtomConstantValue::Float(1e-5)),
+        ];
+        let ctx = AtomCtx {
+            bound_inputs: &in_names,
+            bound_outputs: &out_names,
+            constants: &consts,
+            t_act: "bfloat",
+            t_scale: "half",
+        };
+        let phase = PersistentPhase::from_atom_metal("add_rms_norm", &atom, &ctx)
+            .expect("AddRmsNormAtom should emit Metal body");
+        assert!(phase.body.contains("AddRmsNorm"),
+            "atom body should contain its own comment marker");
+        assert!(phase.body.contains("__residual_io"),
+            "channel substitution should write the bound name into the body");
+
+        // Wire through the persistent-chunk synthesizer. Symbol naming +
+        // structural shape should match what the standalone tests check.
+        let kernel = synthesize_persistent_chunk(
+            SynthesisBackend::Metal,
+            "test_atom_persistent_chunk",
+            256,
+            ",\n    device bfloat* __residual_io [[buffer(2)]]",
+            "",
+            std::slice::from_ref(&phase),
+        );
+        assert!(kernel.source.contains("add_rms_norm"));
+        assert!(kernel.source.contains("test_atom_persistent_chunk"));
+        // One cross-TG barrier emitted after the single atom phase.
+        assert_eq!(kernel.source.matches("cross-TG barrier (phase ").count(), 1);
+        // Atom body's marker still present after composition.
+        assert!(kernel.source.contains("AddRmsNorm"));
+    }
+
+    #[test]
     fn synthesize_pre_attn_chunk_emits_non_empty_metal_source() {
         let kernel = synthesize_pre_attn_chunk(
             SynthesisBackend::Metal,
@@ -1043,5 +1819,58 @@ mod tests {
         assert!(kernel.source.contains("mk_rope_pair"));
         assert!(kernel.source.contains(&kernel.symbol));
         assert_eq!(kernel.backend, SynthesisBackend::Metal);
+    }
+
+    #[test]
+    fn synthesize_pre_attn_chunk_persistent_structural() {
+        // Persistent-envelope variant emits the same atom-body content
+        // plus the persistent-kernel scaffolding (counter binding,
+        // num_tgs, atomic spin barrier). Validate symbol naming,
+        // envelope markers, and that the atom bodies survive.
+        let consts = llama_3_2_3b_constants();
+        let kernel = synthesize_pre_attn_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+        );
+        assert_eq!(kernel.backend, SynthesisBackend::Metal);
+        assert!(kernel.symbol.starts_with("synth_pre_attn_persistent_"));
+        assert!(kernel.symbol.contains("bfloat"));
+        assert!(kernel.symbol.contains("gs64"));
+        // Persistent envelope markers.
+        assert!(kernel.source.contains("__barrier_counter"));
+        assert!(kernel.source.contains("atomic_fetch_add_explicit"));
+        assert!(kernel.source.contains("max_total_threads_per_threadgroup"));
+        // Atom bodies survive.
+        assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));
+        assert!(kernel.source.contains("mk_qdot"));
+        assert!(kernel.source.contains("mk_rope_pair"));
+        // One trailing barrier (single-phase envelope).
+        assert!(kernel.source.contains("trailing cross-TG barrier"));
+        // Buffer indices match the non-persistent kernel (strict
+        // signature superset). q_out at 0, kv_cache_v at 17, counter
+        // appended at 18.
+        assert!(kernel.source.contains("__q_out      [[buffer(0)]]"));
+        assert!(kernel.source.contains("__kv_cache_v     [[buffer(17)]]"));
+        assert!(kernel.source.contains("__barrier_counter [[buffer(18)]]"));
+        // M function constant still wired.
+        assert!(kernel.source.contains("constant uint  M [[function_constant(0)]]"));
+        // num_tgs derived inline (no runtime binding).
+        assert!(kernel.source.contains("__persistent_num_tgs = M * __num_heads_total"));
+    }
+
+    #[test]
+    fn synthesize_pre_attn_init_chunk_persistent_uses_init_symbol() {
+        let consts = llama_3_2_3b_constants();
+        let kernel = synthesize_pre_attn_init_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+        );
+        assert!(kernel.symbol.starts_with("synth_pre_attn_init_persistent_"));
+        // Init body has the "no residual add" comment marker.
+        assert!(kernel.source.contains("layer-0 / no residual add"));
     }
 }

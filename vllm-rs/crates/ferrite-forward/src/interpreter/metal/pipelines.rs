@@ -334,6 +334,7 @@ mod tests {
                 | KernelId::SplitKReduceSum
                 | KernelId::FusedAffineQkvRopeCache
                 | KernelId::SynthPreAttn
+            | KernelId::SynthPreAttnPersistent
             | KernelId::SynthMlpPreDown
             | KernelId::SynthGateUpSiluMul
             // BiasAdd specialized pipeline reads `num_cols` from
@@ -416,6 +417,7 @@ mod tests {
             | KernelId::SplitKReduceSum
             | KernelId::FusedAffineQkvRopeCache
             | KernelId::SynthPreAttn
+            | KernelId::SynthPreAttnPersistent
             | KernelId::SynthMlpPreDown
             | KernelId::SynthGateUpSiluMul
             | KernelId::BiasAdd => {

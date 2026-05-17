@@ -2016,6 +2016,19 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(
             crate::metal::synth_mlp_pre_down_persistent::MetalSynthMlpPreDownPersistentImpl::bf16_gs64(),
         ));
+        // Whole-forward persistent decode megakernel — env-gated via
+        // FERRITE_PERSISTENT_FORWARD=1. When enabled, the matcher
+        // claims the ENTIRE decode forward (every layer + final
+        // RmsNorm + lm_head); fan_out emits one
+        // `Instruction::ForwardDecodePersistent` so the runtime
+        // dispatches a single Metal kernel for the whole token (vs
+        // ~80 dispatches/token today). When the gate is off the Impl
+        // is target_compatible: false and the solver pool stays
+        // unchanged — production path is the per-phase synth siblings
+        // above + per-op kernels.
+        lib.push(Box::new(
+            crate::metal::forward_decode_persistent::MetalForwardDecodePersistentImpl::bf16_gs64(),
+        ));
         lib.push(Box::new(
             crate::metal::synth_gate_up_silu_mul::MetalSynthGateUpSiluMulImpl::bf16_gs64(),
         ));

@@ -719,6 +719,66 @@ impl KFullRef {
     }
 }
 
+/// Verified positive paged-KV block size (BLOCK_SIZE in attention
+/// kernels; the rows-per-page tile shape).
+pub struct BlockSize<const N: u32>;
+impl<const N: u32> BlockSize<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "BlockSize: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> BlockSizeRef {
+        BlockSizeRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for BlockSize<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BlockSizeRef(u32);
+impl BlockSizeRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive max-sequence-K bucket (MAX_SK ceiling for the
+/// attention KV pages-per-seq dimension).
+pub struct MaxSk<const N: u32>;
+impl<const N: u32> MaxSk<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "MaxSk: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> MaxSkRef {
+        MaxSkRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for MaxSk<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MaxSkRef(u32);
+impl MaxSkRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified positive matmul-N (output cols / N dim).
 pub struct MatmulN<const N: u32>;
 impl<const N: u32> MatmulN<N> {

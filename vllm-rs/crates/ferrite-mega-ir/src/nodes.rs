@@ -2286,24 +2286,24 @@ impl CutlassFusedNormGemm {
 /// reduction step that the codegen will splice as a second per-tile
 /// pass.
 pub struct AttentionViaCacheNode {
-    q_in_page_id: u32,
-    attn_out_page_id: u32,
-    score_offset: u32,
-    score_bytes: u32,
-    pv_offset: u32,
-    pv_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    iters: u32,
-    kv_cache_layer: u32,
-    head_dim: u32,
-    num_q_heads: u32,
-    num_kv_heads: u32,
-    block_size: u32,
-    num_tokens: u32,
-    max_sk: u32,
-    q_in_act_slot: u32,
-    attn_out_act_slot: u32,
+    q_in_page: crate::substrate::PageRef,
+    attn_out_page: crate::substrate::PageRef,
+    score_offset: crate::substrate::ScratchOffsetRef,
+    score_bytes: crate::substrate::ScratchBytesRef,
+    pv_offset: crate::substrate::ScratchOffsetRef,
+    pv_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    iters: crate::substrate::IterCountRef,
+    kv_cache_layer: crate::substrate::LayerRef,
+    head_dim: crate::substrate::HeadDimRef,
+    num_q_heads: crate::substrate::NumQHeadsRef,
+    num_kv_heads: crate::substrate::NumKvHeadsRef,
+    block_size: crate::substrate::BlockSizeRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    max_sk: crate::substrate::MaxSkRef,
+    q_in_act_slot: crate::substrate::ActSlotRef,
+    attn_out_act_slot: crate::substrate::ActSlotRef,
     attn_scale: FiniteF32,
     attn_softcap: FiniteF32,
     pub interleaved: bool,
@@ -2400,25 +2400,29 @@ impl AttentionViaCacheNode {
         // Runtime: SlidingWindow value > 0 was discharged by the
         // const-generic SlidingWindow<W> primitive; here we just
         // store the runtime u32 carried in AttentionKind::Sliding.
+        use crate::substrate::{
+            ActSlotConst, BlockSize, HeadDim, IterCount, MaxSk, MbarrierPhase, NumKvHeads,
+            NumQHeads, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef,
+        };
         Self {
-            q_in_page_id: Q_IN_ID,
-            attn_out_page_id: ATTN_OUT_ID,
-            score_offset: SCORE_OFF,
-            score_bytes: SCORE_BYTES,
-            pv_offset: PV_OFF,
-            pv_bytes: PV_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            iters: ITERS,
-            kv_cache_layer: LAYER,
-            head_dim: HEAD_DIM,
-            num_q_heads: NUM_Q_HEADS,
-            num_kv_heads: NUM_KV_HEADS,
-            block_size: BLOCK_SIZE,
-            num_tokens: NUM_TOKENS,
-            max_sk: MAX_SK,
-            q_in_act_slot: Q_IN_ACT_SLOT,
-            attn_out_act_slot: ATTN_OUT_ACT_SLOT,
+            q_in_page: PageId::<Q_IN_ID, NUM_PAGES>::new().erase(),
+            attn_out_page: PageId::<ATTN_OUT_ID, NUM_PAGES>::new().erase(),
+            score_offset: ScratchOffsetRef::__new_for_erase(SCORE_OFF),
+            score_bytes: ScratchBytesRef::__new_for_erase(SCORE_BYTES),
+            pv_offset: ScratchOffsetRef::__new_for_erase(PV_OFF),
+            pv_bytes: ScratchBytesRef::__new_for_erase(PV_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            iters: IterCount::<ITERS>::new().erase(),
+            kv_cache_layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            head_dim: HeadDim::<HEAD_DIM>::new().erase(),
+            num_q_heads: NumQHeads::<NUM_Q_HEADS>::new().erase(),
+            num_kv_heads: NumKvHeads::<NUM_KV_HEADS>::new().erase(),
+            block_size: BlockSize::<BLOCK_SIZE>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            max_sk: MaxSk::<MAX_SK>::new().erase(),
+            q_in_act_slot: ActSlotConst::<Q_IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            attn_out_act_slot: ActSlotConst::<ATTN_OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             attn_scale,
             attn_softcap,
             interleaved,
@@ -2426,58 +2430,58 @@ impl AttentionViaCacheNode {
         }
     }
 
-    pub const fn q_in_page_id(&self) -> u32 {
-        self.q_in_page_id
+    pub const fn q_in_page(&self) -> crate::substrate::PageRef {
+        self.q_in_page
     }
-    pub const fn attn_out_page_id(&self) -> u32 {
-        self.attn_out_page_id
+    pub const fn attn_out_page(&self) -> crate::substrate::PageRef {
+        self.attn_out_page
     }
-    pub const fn score_offset(&self) -> u32 {
+    pub const fn score_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.score_offset
     }
-    pub const fn score_bytes(&self) -> u32 {
+    pub const fn score_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.score_bytes
     }
-    pub const fn pv_offset(&self) -> u32 {
+    pub const fn pv_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.pv_offset
     }
-    pub const fn pv_bytes(&self) -> u32 {
+    pub const fn pv_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.pv_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn iters(&self) -> u32 {
+    pub const fn iters(&self) -> crate::substrate::IterCountRef {
         self.iters
     }
-    pub const fn kv_cache_layer(&self) -> u32 {
+    pub const fn kv_cache_layer(&self) -> crate::substrate::LayerRef {
         self.kv_cache_layer
     }
-    pub const fn head_dim(&self) -> u32 {
+    pub const fn head_dim(&self) -> crate::substrate::HeadDimRef {
         self.head_dim
     }
-    pub const fn num_q_heads(&self) -> u32 {
+    pub const fn num_q_heads(&self) -> crate::substrate::NumQHeadsRef {
         self.num_q_heads
     }
-    pub const fn num_kv_heads(&self) -> u32 {
+    pub const fn num_kv_heads(&self) -> crate::substrate::NumKvHeadsRef {
         self.num_kv_heads
     }
-    pub const fn block_size(&self) -> u32 {
+    pub const fn block_size(&self) -> crate::substrate::BlockSizeRef {
         self.block_size
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn max_sk(&self) -> u32 {
+    pub const fn max_sk(&self) -> crate::substrate::MaxSkRef {
         self.max_sk
     }
-    pub const fn q_in_act_slot(&self) -> u32 {
+    pub const fn q_in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.q_in_act_slot
     }
-    pub const fn attn_out_act_slot(&self) -> u32 {
+    pub const fn attn_out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.attn_out_act_slot
     }
     pub fn attn_scale(&self) -> FiniteF32 {

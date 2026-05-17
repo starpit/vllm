@@ -1282,6 +1282,27 @@ impl<
         const ATTN_OUT_ACT_SLOT: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _q_in_page: crate::substrate::PageId<Q_IN_ID, NUM_PAGES>,
+        _attn_out_page: crate::substrate::PageId<ATTN_OUT_ID, NUM_PAGES>,
+        _score_tile: crate::substrate::ScratchRegion<
+            SCORE_OFF, SCORE_BYTES, SCRATCH_BYTES, crate::substrate::AttentionScope,
+        >,
+        _pv_tile: crate::substrate::ScratchRegion<
+            PV_OFF, PV_BYTES, SCRATCH_BYTES, crate::substrate::AttentionScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _head_dim: crate::substrate::HeadDim<HEAD_DIM>,
+        _num_q_heads: crate::substrate::NumQHeads<NUM_Q_HEADS>,
+        _num_kv_heads: crate::substrate::NumKvHeads<NUM_KV_HEADS>,
+        _block_size: crate::substrate::BlockSize<BLOCK_SIZE>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _max_sk: crate::substrate::MaxSk<MAX_SK>,
+        _q_in_act_slot: crate::substrate::ActSlotConst<Q_IN_ACT_SLOT, { u32::MAX }>,
+        _attn_out_act_slot: crate::substrate::ActSlotConst<ATTN_OUT_ACT_SLOT, { u32::MAX }>,
         kind: AttentionKind,
         interleaved: bool,
         attn_scale: f32,
@@ -2035,11 +2056,32 @@ mod tests {
 
     #[test]
     fn lowers_attention_via_cache_full() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, AttentionScope, BlockSize, HeadDim, IterCount, MaxSk,
+            MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId, ScratchRegion,
+        };
         let mut b = BuilderD::new();
         b.push_attention_via_cache::<
             0, 1, 0, 4096, 4096, 4096, 0, 1, 8, 5, 16, 0,
             64, 32, 8, 16, 8, 8192, 0, 1,
         >(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            ScratchRegion::<0, 4096, 32_768, AttentionScope>::new(),
+            ScratchRegion::<4096, 4096, 32_768, AttentionScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<8>::new(),
+            crate::nodes::LayerIndex::<5, 16>::new(),
+            HeadDim::<64>::new(),
+            NumQHeads::<32>::new(),
+            NumKvHeads::<8>::new(),
+            BlockSize::<16>::new(),
+            NumTokensConst::<8>::new(),
+            MaxSk::<8192>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
             AttentionKind::Full,
             false,
             0.125_f32,
@@ -2049,8 +2091,8 @@ mod tests {
         let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.kv_cache_layer(), 5);
-        assert_eq!(n.iters(), 8);
+        assert_eq!(n.kv_cache_layer().raw(), 5);
+        assert_eq!(n.iters().raw(), 8);
         assert!(matches!(n.kind, AttentionKind::Full));
     }
 

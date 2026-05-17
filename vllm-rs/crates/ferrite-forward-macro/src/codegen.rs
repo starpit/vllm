@@ -6041,17 +6041,34 @@ fn dispatch_instruction_to_push(
             let sliding_window_lit = lit(sliding_window_val);
             let attn_scale_lit = state.attn_scale;
             let attn_softcap_lit = state.attn_softcap;
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             Ok(quote! {
-                b.push_attention_via_cache::<
-                    #q_id, #out_id,
-                    #score_off, #score_bytes, #pv_off, #pv_bytes,
-                    #consumer_phase, #storer_phase,
-                    #iters, #layer_lit, #num_layers, #arrives,
-                    #head_dim, #num_q_heads, #num_kv_heads, #block_size,
-                    #num_tokens, #max_sk,
-                    #q_in_act_slot, #attn_out_act_slot,
-                >(
+                b.push_attention_via_cache(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#q_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #score_off, #score_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::AttentionScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #pv_off, #pv_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::AttentionScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::IterCount::<#iters>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::HeadDim::<#head_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumQHeads::<#num_q_heads>::new(),
+                    ::ferrite_forward::mega_ir::NumKvHeads::<#num_kv_heads>::new(),
+                    ::ferrite_forward::mega_ir::BlockSize::<#block_size>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::MaxSk::<#max_sk>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#q_in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#attn_out_act_slot, { u32::MAX }>::new(),
                     ::ferrite_forward::mega_ir::AttentionKind::Sliding(#sliding_window_lit),
                     #interleaved_lit,
                     #attn_scale_lit,
@@ -6084,17 +6101,34 @@ fn dispatch_instruction_to_push(
             let interleaved_lit = *interleaved;
             let attn_scale_lit = state.attn_scale;
             let attn_softcap_lit = state.attn_softcap;
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             Ok(quote! {
-                b.push_attention_via_cache::<
-                    #q_id, #out_id,
-                    #score_off, #score_bytes, #pv_off, #pv_bytes,
-                    #consumer_phase, #storer_phase,
-                    #iters, #layer_lit, #num_layers, #arrives,
-                    #head_dim, #num_q_heads, #num_kv_heads, #block_size,
-                    #num_tokens, #max_sk,
-                    #q_in_act_slot, #attn_out_act_slot,
-                >(
+                b.push_attention_via_cache(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#q_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #score_off, #score_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::AttentionScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #pv_off, #pv_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::AttentionScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::IterCount::<#iters>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::HeadDim::<#head_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumQHeads::<#num_q_heads>::new(),
+                    ::ferrite_forward::mega_ir::NumKvHeads::<#num_kv_heads>::new(),
+                    ::ferrite_forward::mega_ir::BlockSize::<#block_size>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::MaxSk::<#max_sk>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#q_in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#attn_out_act_slot, { u32::MAX }>::new(),
                     ::ferrite_forward::mega_ir::AttentionKind::Full,
                     #interleaved_lit,
                     #attn_scale_lit,

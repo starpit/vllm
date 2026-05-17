@@ -5584,6 +5584,13 @@ fn emit_synthesized_kernel_sources_override(
         t_scale,
         &consts,
     );
+    let mlp_pre_down_persistent =
+        crate::fuse_pass::synthesize_mlp_pre_down_chunk_persistent(
+            crate::fuse_pass::SynthesisBackend::Metal,
+            t_act,
+            t_scale,
+            &consts,
+        );
     // AOT-compile each synth source to a `.metallib` blob at macro
     // expansion time. Same `xcrun metal -c` + `xcrun metallib`
     // pipeline used by `ferrite-metal-kernels/build.rs` for every
@@ -5617,6 +5624,10 @@ fn emit_synthesized_kernel_sources_override(
         &mlp_pre_down.symbol,
         &mlp_pre_down.source,
     );
+    let mdp_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(
+        &mlp_pre_down_persistent.symbol,
+        &mlp_pre_down_persistent.source,
+    );
 
     let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
     let gu_bytes_lit  = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
@@ -5631,12 +5642,17 @@ fn emit_synthesized_kernel_sources_override(
         syn::LitStr::new(&pre_attn_init_persistent.symbol, proc_macro2::Span::call_site());
     let md_symbol_lit =
         syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
+    let mdp_symbol_lit = syn::LitStr::new(
+        &mlp_pre_down_persistent.symbol,
+        proc_macro2::Span::call_site(),
+    );
 
     let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
     let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
     let pap_bytes_lit = syn::LitByteStr::new(&pap_bytes, proc_macro2::Span::call_site());
     let pip_bytes_lit = syn::LitByteStr::new(&pip_bytes, proc_macro2::Span::call_site());
     let md_bytes_lit = syn::LitByteStr::new(&md_bytes, proc_macro2::Span::call_site());
+    let mdp_bytes_lit = syn::LitByteStr::new(&mdp_bytes, proc_macro2::Span::call_site());
 
     quote! {
         fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
@@ -5645,6 +5661,7 @@ fn emit_synthesized_kernel_sources_override(
             const __SYNTH_PRE_ATTN_PERSISTENT_LIB: &[u8] = #pap_bytes_lit;
             const __SYNTH_PRE_ATTN_INIT_PERSISTENT_LIB: &[u8] = #pip_bytes_lit;
             const __SYNTH_MLP_PRE_DOWN_LIB: &[u8] = #md_bytes_lit;
+            const __SYNTH_MLP_PRE_DOWN_PERSISTENT_LIB: &[u8] = #mdp_bytes_lit;
             const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
             &[
                 (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
@@ -5652,6 +5669,7 @@ fn emit_synthesized_kernel_sources_override(
                 (#pap_symbol_lit, __SYNTH_PRE_ATTN_PERSISTENT_LIB),
                 (#pip_symbol_lit, __SYNTH_PRE_ATTN_INIT_PERSISTENT_LIB),
                 (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_LIB),
+                (#mdp_symbol_lit, __SYNTH_MLP_PRE_DOWN_PERSISTENT_LIB),
                 (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
             ]
         }

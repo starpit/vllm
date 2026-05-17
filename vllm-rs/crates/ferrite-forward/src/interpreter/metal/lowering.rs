@@ -1806,6 +1806,68 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Persistent-envelope variant of SynthMlpPreDown ─────────
+        // Same bindings as SynthMlpPreDown at the same indices, plus one
+        // appended Binding::PersistentBarrierCounter at index 10. Symbol
+        // resolves to `synth_mlp_pre_down_persistent_*`. The persistent
+        // counter buffer is the same per-worker shared u32 that
+        // SynthPreAttnPersistent uses, zero-init'd at each bind.
+        I::SynthMlpPreDownPersistent(
+            residual_slot,
+            delta_slot,
+            silu_mul_out_slot,
+            layer,
+            group_size,
+            bits,
+            symbol,
+        ) => {
+            assert_eq!(
+                *bits, 4,
+                "metal lowering: SynthMlpPreDownPersistent only wired for bits=4"
+            );
+            let _ = group_size;
+            let tile_n = W::HEAD_DIM;
+            let intermediate = W::INTERMEDIATE_SIZE as u32;
+            let num_tiles = intermediate / tile_n;
+            assert!(
+                intermediate % tile_n == 0,
+                "metal lowering: SynthMlpPreDownPersistent requires INTERMEDIATE_SIZE \
+                 ({intermediate}) divisible by HEAD_DIM ({tile_n})"
+            );
+            let threads_per_tg = 32 * tile_n / 4;
+            LoweredCommand {
+                kernel: KernelId::SynthMlpPreDownPersistent,
+                library: *symbol,
+                function: *symbol,
+                constants: super::kernel_constants::SynthMegakernelConstants { bucket_m: super::ids::BucketM(bucket_m) }.into(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, num_tiles, 1),
+                    threads_per_threadgroup: (threads_per_tg, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot { slot: *silu_mul_out_slot, binding_index: 0 },
+                    Binding::ArenaSlot { slot: *residual_slot, binding_index: 1 },
+                    Binding::ArenaSlot { slot: *delta_slot, binding_index: 2 },
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        binding_index: 3,
+                    },
+                    Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::Weight,       layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 }, binding_index: 4 },
+                    Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::AffineScales, layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 }, binding_index: 5 },
+                    Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::AffineBiases, layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 }, binding_index: 6 },
+                    Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::Weight,       layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 }, binding_index: 7 },
+                    Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::AffineScales, layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 }, binding_index: 8 },
+                    Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::AffineBiases, layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 }, binding_index: 9 },
+                    Binding::PersistentBarrierCounter { binding_index: 10 },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── SynthGateUpSiluMul — fused gate+up GEMM + SiluMul (large-M) ─────
         I::SynthGateUpSiluMul(
             x_norm_slot,

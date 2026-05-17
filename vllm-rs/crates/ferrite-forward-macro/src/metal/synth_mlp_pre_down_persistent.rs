@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Persistent-envelope variant of `MetalSynthPreAttnImpl`.
+//! Persistent-envelope variant of `MetalSynthMlpPreDownImpl`.
 //!
-//! Wraps the existing pre-attn synth Impl and rewrites its emitted
-//! `Instruction::SynthPreAttn` into `Instruction::SynthPreAttnPersistent`
+//! Wraps the existing mlp-pre-down synth Impl and rewrites its emitted
+//! `Instruction::SynthMlpPreDown` into `Instruction::SynthMlpPreDownPersistent`
 //! (same tuple shape, persistent kernel symbol). The persistent kernel
 //! is byte-identical body to the non-persistent variant, plus one
-//! appended counter binding + a trailing cross-TG barrier. Single-phase
-//! persistent is overhead-only (~5 µs trailing barrier); Phase 2b will
-//! fuse across chunks for the real ~10× decode win.
+//! appended counter binding + a trailing cross-TG barrier. Pairs with
+//! `MetalSynthPreAttnPersistentImpl` so a full layer (pre_attn ⟶
+//! attention ⟶ mlp_pre_down) becomes one persistent pre-attn dispatch
+//! ⟶ one attention dispatch ⟶ one persistent mlp_pre_down dispatch.
 //!
 //! Gating: `target_compatible` additionally requires the runtime env
-//! var `FERRITE_PERSISTENT_PREATTN=1`. Without it, the solver pool
-//! contains only the non-persistent variant (today's behavior). With
-//! it, the persistent variant claims the chain and the non-persistent
-//! one stays inert (matches the same tiles but the solver picks one).
+//! var `FERRITE_PERSISTENT_PREATTN=1` (same gate as Phase 2a — both
+//! turn on together). Without it, the solver pool contains only the
+//! non-persistent variant.
 
 use std::collections::BTreeMap;
 
@@ -23,23 +23,20 @@ use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
     SlotMap, WeightAccessor, WorkloadConstraint,
 };
-use crate::metal::synth_pre_attn::MetalSynthPreAttnImpl;
+use crate::metal::synth_mlp_pre_down::MetalSynthMlpPreDownImpl;
 use crate::target::TargetProfile;
 
 /// Persistent-envelope variant. Delegates everything except `name`,
 /// `target_compatible` (env gate), `fan_out` (Instruction rewrite),
 /// and `opcode_shape` (new variant name).
 #[derive(Debug)]
-pub struct MetalSynthPreAttnPersistentImpl {
-    inner: MetalSynthPreAttnImpl,
+pub struct MetalSynthMlpPreDownPersistentImpl {
+    inner: MetalSynthMlpPreDownImpl,
 }
 
-impl MetalSynthPreAttnPersistentImpl {
+impl MetalSynthMlpPreDownPersistentImpl {
     pub fn bf16_gs64() -> Self {
-        Self { inner: MetalSynthPreAttnImpl::bf16_gs64() }
-    }
-    pub fn bf16_gs64_init() -> Self {
-        Self { inner: MetalSynthPreAttnImpl::bf16_gs64_init() }
+        Self { inner: MetalSynthMlpPreDownImpl::bf16_gs64() }
     }
 
     fn is_enabled() -> bool {
@@ -49,13 +46,9 @@ impl MetalSynthPreAttnPersistentImpl {
     }
 }
 
-impl Implementation for MetalSynthPreAttnPersistentImpl {
+impl Implementation for MetalSynthMlpPreDownPersistentImpl {
     fn name(&self) -> &'static str {
-        if self.inner.init {
-            "metal_synth_pre_attn_init_persistent"
-        } else {
-            "metal_synth_pre_attn_persistent"
-        }
+        "metal_synth_mlp_pre_down_persistent"
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
@@ -71,15 +64,8 @@ impl Implementation for MetalSynthPreAttnPersistentImpl {
     }
 
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
-        // Tiebreak: when env-enabled, both this and the non-persistent
-        // variant pass target_compatible and claim the same tiles at
-        // the same cost. The DP preserves registration order on ties,
-        // and the non-persistent is registered first — so without a
-        // strict cost preference here the persistent variant never
-        // wins. Subtract an ε well below any measurable kernel cost
-        // (~5 µs is the cross-TG-barrier overhead this approximates;
-        // 0.001 µs is below the cost-model's resolution but flips the
-        // sort).
+        // ε-tiebreak vs the non-persistent variant — see Phase 2a's
+        // MetalSynthPreAttnPersistentImpl::cost_us for the rationale.
         self.inner.cost_us(m, ctx) - 0.001
     }
 
@@ -116,20 +102,10 @@ impl Implementation for MetalSynthPreAttnPersistentImpl {
         self.inner.output_alias(claimed_tiles, fuf)
     }
 
-    fn kv_layer_io(
-        &self,
-        claimed_tiles: &[TileId],
-        fuf: &Fuf,
-    ) -> (Option<u32>, Option<u32>) {
-        self.inner.kv_layer_io(claimed_tiles, fuf)
-    }
-
     fn opcode_shape(&self) -> OpcodeShape {
-        // Same field layout as SynthPreAttn — only the canonical
-        // name changes so the macro registers a distinct opcode.
         let base = self.inner.opcode_shape();
         OpcodeShape {
-            name: syn::Ident::new("SynthPreAttnPersistent", proc_macro2::Span::call_site()),
+            name: syn::Ident::new("SynthMlpPreDownPersistent", proc_macro2::Span::call_site()),
             fields: base.fields,
         }
     }
@@ -143,33 +119,23 @@ impl Implementation for MetalSynthPreAttnPersistentImpl {
         slots: &SlotMap,
     ) -> Option<Vec<ferrite_forward::Instruction>> {
         let inner = self.inner.fan_out(m, fuf, program, bounds, slots)?;
-        // Rewrite every SynthPreAttn instruction into SynthPreAttnPersistent
-        // with the `_persistent` symbol variant. The non-persistent
-        // symbol (e.g. "synth_pre_attn_bfloat_half_gs64") becomes
-        // "synth_pre_attn_persistent_bfloat_half_gs64"; init variant
-        // becomes "synth_pre_attn_init_persistent_*". Leak the new
-        // string so the &'static str on the Instruction outlives the
-        // macro invocation, mirroring how the inner impl leaks its
-        // symbol.
         Some(
             inner
                 .into_iter()
                 .map(|instr| match instr {
-                    ferrite_forward::Instruction::SynthPreAttn(
-                        a, b, c, d, e, f, sym, h,
+                    ferrite_forward::Instruction::SynthMlpPreDown(
+                        a, b, c, d, e, f, sym,
                     ) => {
-                        let new_sym: String = if sym.contains("_init_") {
-                            sym.replacen("_init_", "_init_persistent_", 1)
-                        } else if let Some(stripped) = sym.strip_prefix("synth_pre_attn_") {
-                            format!("synth_pre_attn_persistent_{stripped}")
+                        let new_sym: String = if let Some(stripped) =
+                            sym.strip_prefix("synth_mlp_pre_down_")
+                        {
+                            format!("synth_mlp_pre_down_persistent_{stripped}")
                         } else {
-                            // Defensive: unfamiliar symbol — leave alone (will
-                            // fail to resolve at runtime, surfacing the bug).
                             sym.to_string()
                         };
                         let leaked: &'static str = Box::leak(new_sym.into_boxed_str());
-                        ferrite_forward::Instruction::SynthPreAttnPersistent(
-                            a, b, c, d, e, f, leaked, h,
+                        ferrite_forward::Instruction::SynthMlpPreDownPersistent(
+                            a, b, c, d, e, f, leaked,
                         )
                     }
                     other => other,

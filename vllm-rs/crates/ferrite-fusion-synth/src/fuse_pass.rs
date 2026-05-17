@@ -738,6 +738,249 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     }
 }
 
+/// Persistent-envelope variant of `synthesize_mlp_pre_down_chunk`.
+///
+/// Strict superset of the non-persistent signature: same buffers at
+/// the same indices through `buffer(9)`, plus one appended
+/// `device atomic_uint* __barrier_counter` at buffer(10). The kernel
+/// body is byte-identical through the SiluMul atom, with a trailing
+/// cross-TG ticket-lock barrier (same pattern as
+/// `synthesize_pre_attn_chunk_persistent`). `num_tgs` is derived
+/// inline as `M_FC * (INTERMEDIATE_FC / TILE_N_FC)` so the worker
+/// doesn't need to bind a scalar uniform.
+pub fn synthesize_mlp_pre_down_chunk_persistent(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    assert_eq!(
+        backend,
+        SynthesisBackend::Metal,
+        "MVP only emits Metal",
+    );
+
+    let x_norm_name    = "__x_norm".to_string();
+    let gate_smem_name = "__gate_smem".to_string();
+    let up_smem_name   = "__up_smem".to_string();
+    let residual_io    = "__residual_io".to_string();
+    let delta_buf      = "__delta".to_string();
+    let rms_wt_buf     = "__rms_weight".to_string();
+    let gate_wt_buf    = "__gate_weight".to_string();
+    let gate_sc_buf    = "__gate_scales".to_string();
+    let gate_bi_buf    = "__gate_biases".to_string();
+    let up_wt_buf      = "__up_weight".to_string();
+    let up_sc_buf      = "__up_scales".to_string();
+    let up_bi_buf      = "__up_biases".to_string();
+    let silu_mul_out   = "__silu_mul_out".to_string();
+
+    let constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
+        ("HIDDEN",       AtomConstantValue::Uint(consts.hidden)),
+        ("INTERMEDIATE", AtomConstantValue::Uint(consts.num_q_heads)),
+        ("HEAD_DIM",     AtomConstantValue::Uint(consts.head_dim)),
+        ("M",            AtomConstantValue::Uint(consts.m)),
+        ("EPS",          AtomConstantValue::Float(consts.rms_norm_eps)),
+    ];
+
+    let addrms = AddRmsNormAtom::default();
+    let silu_mul = SiluMulAtom;
+    let qmv = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "__head",
+        has_linear_bias: false,
+    };
+
+    let addrms_in  = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
+    let addrms_out = vec![x_norm_name.clone()];
+    let addrms_ctx = AtomCtx {
+        bound_inputs: &addrms_in,
+        bound_outputs: &addrms_out,
+        constants: &constants_slice,
+        t_act,
+        t_scale,
+    };
+    let addrms_body = addrms.emit_metal_body(&addrms_ctx)
+        .expect("AddRmsNormAtom Metal emit");
+
+    let emit_qmv_body = |w: &str, s: &str, b: &str, out_smem: &str| -> String {
+        let q_in = vec![
+            x_norm_name.clone(),
+            w.to_string(),
+            s.to_string(),
+            b.to_string(),
+        ];
+        let q_out = vec![out_smem.to_string()];
+        let q_ctx = AtomCtx {
+            bound_inputs: &q_in,
+            bound_outputs: &q_out,
+            constants: &constants_slice,
+            t_act,
+            t_scale,
+        };
+        qmv.emit_metal_body(&q_ctx)
+            .expect("AffineQmvAtom Metal emit")
+    };
+    let gate_qmv_body = emit_qmv_body(&gate_wt_buf, &gate_sc_buf, &gate_bi_buf, &gate_smem_name);
+    let up_qmv_body   = emit_qmv_body(&up_wt_buf,   &up_sc_buf,   &up_bi_buf,   &up_smem_name);
+
+    let sm_in  = vec![gate_smem_name.clone(), up_smem_name.clone()];
+    let sm_out = vec![silu_mul_out.clone()];
+    let sm_ctx = AtomCtx {
+        bound_inputs: &sm_in,
+        bound_outputs: &sm_out,
+        constants: &constants_slice,
+        t_act,
+        t_scale,
+    };
+    let silu_mul_body = silu_mul.emit_metal_body(&sm_ctx)
+        .expect("SiluMulAtom Metal emit");
+
+    let symbol = format!(
+        "synth_mlp_pre_down_persistent_{}_{}_gs{}",
+        t_act,
+        t_scale,
+        consts.group_size,
+    );
+
+    let counter_buf = "__barrier_counter";
+    let counter_idx: u32 = 10;
+
+    let mk_header = inline_header(include_str!(
+        "../../ferrite-metal-kernels/shaders/metal_kittens.h"
+    ));
+
+    let source_tail = format!(
+        r#"
+
+
+// Model-invariant dims baked at synth time, identical to the
+// non-persistent variant. M_FC stays a function constant.
+constant constexpr uint  HIDDEN_FC       = {hidden_lit}u;
+constant constexpr uint  INTERMEDIATE_FC = {intermediate_lit}u;
+constant constexpr uint  TILE_N_FC       = {tile_n_lit}u;
+constant constexpr float EPS_FC          = {eps_lit}f;
+constant uint  M_FC [[function_constant(0)]];
+
+constant constexpr uint __HIDDEN_MAX   = 8192;
+constant constexpr uint __HEAD_DIM_MAX = 256;
+constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
+
+[[kernel]] void {symbol}(
+    device       {t_act}*   {silu_mul_out}  [[buffer(0)]],
+    device       {t_act}*   {residual_io}   [[buffer(1)]],
+    device const {t_act}*   {delta_buf}     [[buffer(2)]],
+    device const {t_scale}* {rms_wt_buf}    [[buffer(3)]],
+    device const uint32_t*  {gate_wt_buf}   [[buffer(4)]],
+    device const {t_scale}* {gate_sc_buf}   [[buffer(5)]],
+    device const {t_scale}* {gate_bi_buf}   [[buffer(6)]],
+    device const uint32_t*  {up_wt_buf}     [[buffer(7)]],
+    device const {t_scale}* {up_sc_buf}     [[buffer(8)]],
+    device const {t_scale}* {up_bi_buf}     [[buffer(9)]],
+    device atomic_uint*     {counter_buf}   [[buffer({counter_idx})]],
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tgs_per_grid [[threadgroups_per_grid]],
+    uint3 __tid_pos   [[thread_position_in_threadgroup]],
+    uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid  [[thread_index_in_simdgroup]])
+{{
+    const uint __t                = __tg_pos.x;
+    const uint __head             = __tg_pos.y;
+    const uint __tid              = __tid_pos.x;
+    const uint __head_dim         = TILE_N_FC;
+    const uint __hidden           = HIDDEN_FC;
+    const uint __intermediate     = INTERMEDIATE_FC;
+    const uint __num_q            = __hidden / __head_dim;
+    const uint __num_kv           = 0u;
+    (void)__num_kv;
+    const uint __num_heads_total  = __intermediate / __head_dim;
+    const uint __threads_per_tg   = MK_SIMD_SIZE * __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const uint __num_simdgroups   = __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const float __eps             = EPS_FC;
+
+    // Read the runtime-dispatched grid count via the builtin — see
+    // pre_attn persistent for the rationale (M_FC is the bucket cap;
+    // m_scaling shrinks the grid to num_tokens at runtime).
+    const uint __persistent_num_tgs = __tgs_per_grid.x * __tgs_per_grid.y;
+
+    if (__t >= M_FC || __head >= __num_heads_total) return;
+
+    threadgroup {t_act} {x_norm}[__HIDDEN_MAX];
+    threadgroup float   __scratch[__SCRATCH_MAX];
+    threadgroup float   {gate_smem}[__HEAD_DIM_MAX];
+    threadgroup float   {up_smem}[__HEAD_DIM_MAX];
+
+    {addrms_body}
+
+    {gate_qmv_body}
+
+    {up_qmv_body}
+
+    {silu_mul_body}
+
+    // Single-phase envelope: no trailing cross-TG barrier required.
+    // Metal's implicit kernel-completion barrier already publishes
+    // every TG's device writes by the time the dispatch returns.
+    // The persistent counter binding (`{counter_buf}`) is reserved
+    // for Phase 2c (multi-phase fusion) where the kernel chains
+    // additional work after a cross-TG sync; until then, leaving
+    // a ticket-lock here would force every TG to remain concurrently
+    // resident — which exceeds M4 occupancy at INTERMEDIATE / TILE_N
+    // dispatches (128 TGs on Llama-1B) and deadlocks.
+    (void){counter_buf};
+    (void)__persistent_num_tgs;
+}}
+"#,
+        symbol = symbol,
+        t_act = t_act,
+        t_scale = t_scale,
+        silu_mul_out = silu_mul_out,
+        residual_io = residual_io,
+        delta_buf = delta_buf,
+        rms_wt_buf = rms_wt_buf,
+        gate_wt_buf = gate_wt_buf,
+        gate_sc_buf = gate_sc_buf,
+        gate_bi_buf = gate_bi_buf,
+        up_wt_buf = up_wt_buf,
+        up_sc_buf = up_sc_buf,
+        up_bi_buf = up_bi_buf,
+        counter_buf = counter_buf,
+        counter_idx = counter_idx,
+        x_norm = x_norm_name,
+        gate_smem = gate_smem_name,
+        up_smem = up_smem_name,
+        addrms_body = addrms_body,
+        gate_qmv_body = gate_qmv_body,
+        up_qmv_body = up_qmv_body,
+        silu_mul_body = silu_mul_body,
+        hidden_lit = consts.hidden,
+        intermediate_lit = consts.intermediate,
+        tile_n_lit = consts.head_dim,
+        eps_lit = format_msl_float(consts.rms_norm_eps),
+    );
+
+    let source = format!(
+        "// SPDX-License-Identifier: Apache-2.0\n\
+         //\n\
+         // SYNTHESIZED PERSISTENT MLP-PRE-DOWN KERNEL — generated by ferrite-fusion-synth::fuse_pass.\n\
+         // Do not hand-edit.\n\n\
+         #include <metal_stdlib>\n\
+         #include <metal_atomic>\n\
+         using namespace metal;\n\n\
+         // === inlined metal_kittens.h ===\n\
+         {mk_header}\n\
+         // === end inlined metal_kittens.h ===\n\n\
+         {source_tail}",
+        mk_header = mk_header,
+        source_tail = source_tail,
+    );
+
+    SynthesizedKernel {
+        symbol,
+        source,
+        backend: SynthesisBackend::Metal,
+    }
+}
+
 /// Synthesize the fused gate+up+SiluMul large-M prefill kernel.
 ///
 /// Claims gate_Gemm + up_Gemm + Silu + Mul (4 tiles). Uses simdgroup_matrix
@@ -1262,6 +1505,7 @@ void {symbol}(
     device       {t_act}*   {kv_cache_v}     [[buffer(17)]],
 {maybe_bias_params}    device atomic_uint* {counter_buf} [[buffer({counter_idx})]],
     uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tgs_per_grid [[threadgroups_per_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
     uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  __simd_lid  [[thread_index_in_simdgroup]])
@@ -1281,10 +1525,13 @@ void {symbol}(
     const uint __num_simdgroups   = __head_dim / MK_ROWS_PER_SIMDGROUP;
     const float __eps             = EPS;
 
-    // Persistent-envelope barrier-state. Derived from M and the
-    // model's NUM_HEADS_TOTAL so the worker doesn't need to bind a
-    // num_tgs uniform.
-    const uint __persistent_num_tgs = M * __num_heads_total;
+    // Persistent-envelope barrier-state. The runtime scales the X-axis
+    // grid by m_scaling to `num_tokens` (≤ M=bucket_m cap), so the
+    // actual dispatched grid is `num_tokens × num_heads_total`. Read
+    // it via the `[[threadgroups_per_grid]]` builtin — relying on
+    // `M * num_heads_total` would over-count when num_tokens < M
+    // (bucket cap) and the counter spins forever.
+    const uint __persistent_num_tgs = __tgs_per_grid.x * __tgs_per_grid.y;
 
     if (__t >= M || __head >= __num_heads_total) return;
 
@@ -1298,19 +1545,13 @@ void {symbol}(
 
     {rope_body}
 
-    // ── trailing cross-TG barrier (single-phase envelope) ──
-    // Flush this TG's device writes; bump the counter; spin until all
-    // other TGs have arrived; per-TG acquire. ~5 µs at production
-    // grid sizes (measured in `barrier_bench`).
-    threadgroup_barrier(mem_flags::mem_device);
-    if (__tid == 0u) {{
-        atomic_fetch_add_explicit({counter_buf}, 1u, memory_order_relaxed);
-        while (atomic_load_explicit({counter_buf}, memory_order_relaxed)
-                < __persistent_num_tgs) {{
-            // spin
-        }}
-    }}
-    threadgroup_barrier(mem_flags::mem_device);
+    // Single-phase envelope: no trailing cross-TG barrier required.
+    // See `synthesize_mlp_pre_down_chunk_persistent` for the
+    // rationale — the persistent counter stays bound (Phase 2c
+    // multi-phase fusion will need it) but is otherwise unused so a
+    // grid larger than M4 concurrent-residency doesn't deadlock.
+    (void){counter_buf};
+    (void)__persistent_num_tgs;
 }}
 "#,
         symbol = symbol, t_act = t_act, t_scale = t_scale,

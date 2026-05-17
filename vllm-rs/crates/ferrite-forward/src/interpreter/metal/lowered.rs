@@ -176,6 +176,13 @@ pub enum KernelId {
     /// instruction follows immediately and consumes the device-buffer
     /// `silu_mul` output.
     SynthMlpPreDown,
+    /// Persistent-envelope variant of `SynthMlpPreDown`. Same kernel
+    /// shape and bindings, plus one appended buffer for the cross-TG
+    /// barrier counter. Shares the worker's single 4-byte counter
+    /// buffer with `SynthPreAttnPersistent`; the counter is zero-init'd
+    /// at each bind so back-to-back persistent dispatches don't
+    /// conflict. Emitted only when `FERRITE_PERSISTENT_PREATTN=1`.
+    SynthMlpPreDownPersistent,
     /// Fused gate+up GEMM + SiluMul large-M prefill kernel.
     SynthGateUpSiluMul,
     /// Slice the last-token row of a `[num_tokens, hidden]` activation

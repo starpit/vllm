@@ -336,6 +336,7 @@ mod tests {
                 | KernelId::SynthPreAttn
             | KernelId::SynthPreAttnPersistent
             | KernelId::SynthMlpPreDown
+            | KernelId::SynthMlpPreDownPersistent
             | KernelId::SynthGateUpSiluMul
             // BiasAdd specialized pipeline reads `num_cols` from
             // `function_constant(0)`. The test helper's
@@ -419,6 +420,7 @@ mod tests {
             | KernelId::SynthPreAttn
             | KernelId::SynthPreAttnPersistent
             | KernelId::SynthMlpPreDown
+            | KernelId::SynthMlpPreDownPersistent
             | KernelId::SynthGateUpSiluMul
             | KernelId::BiasAdd => {
                 unreachable!(

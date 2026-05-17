@@ -11,6 +11,7 @@ pub mod add;
 pub mod dataflow;
 pub mod synth_gate_up_silu_mul;
 pub mod synth_mlp_pre_down;
+pub mod synth_mlp_pre_down_persistent;
 pub mod synth_pre_attn;
 pub mod synth_pre_attn_persistent;
 pub mod affine_embed;

@@ -2014,6 +2014,9 @@ pub fn starter_library() -> ImplementationLibrary {
             crate::metal::synth_mlp_pre_down::MetalSynthMlpPreDownImpl::bf16_gs64(),
         ));
         lib.push(Box::new(
+            crate::metal::synth_mlp_pre_down_persistent::MetalSynthMlpPreDownPersistentImpl::bf16_gs64(),
+        ));
+        lib.push(Box::new(
             crate::metal::synth_gate_up_silu_mul::MetalSynthGateUpSiluMulImpl::bf16_gs64(),
         ));
         // BF16-scale variants — claim on Qwen3 family (their

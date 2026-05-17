@@ -952,6 +952,20 @@ pub enum Instruction {
     ///
     /// CUDA eval is `unreachable!`.
     SynthMlpPreDown(u32, u32, u32, u32, u32, u32, &'static str),
+    /// Persistent-envelope variant of `SynthMlpPreDown`. Same tuple
+    /// shape — the symbol resolves to `synth_mlp_pre_down_persistent_*`
+    /// instead of `synth_mlp_pre_down_*`, and the lowering arm appends
+    /// ONE extra binding for the cross-TG barrier counter buffer
+    /// (shared with `SynthPreAttnPersistent`). `num_tgs` is derived
+    /// inline in the MSL so no uniform-scalar binding is required.
+    ///
+    /// Emitted only when the env var `FERRITE_PERSISTENT_PREATTN=1`
+    /// makes `MetalSynthMlpPreDownPersistentImpl` `target_compatible`.
+    /// Pairs with `SynthPreAttnPersistent` to land the full per-layer
+    /// persistent-dispatch pattern.
+    ///
+    /// CUDA eval is `unreachable!`.
+    SynthMlpPreDownPersistent(u32, u32, u32, u32, u32, u32, &'static str),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are
@@ -3345,6 +3359,12 @@ impl Instruction {
                 unreachable!(
                     "Instruction::SynthMlpPreDown is metal-only — emitted by the \
                      compiler-driven megakernel synthesis pass on the metal forward only"
+                );
+            }
+            Instruction::SynthMlpPreDownPersistent(..) => {
+                unreachable!(
+                    "Instruction::SynthMlpPreDownPersistent is metal-only — emitted by \
+                     MetalSynthMlpPreDownPersistentImpl when FERRITE_PERSISTENT_PREATTN=1"
                 );
             }
             Instruction::SiluMul(..) => {

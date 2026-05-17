@@ -769,6 +769,15 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let f = lit_u32(f);
             quote! { SynthMlpPreDown(#a, #b, #c, #d, #e, #f, #g) }
         }
+        I::SynthMlpPreDownPersistent(a, b, c, d, e, f, g) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            quote! { SynthMlpPreDownPersistent(#a, #b, #c, #d, #e, #f, #g) }
+        }
         I::SiluMul(a, b, c) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -893,6 +902,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::SynthPreAttn(..) => "SynthPreAttn",
         I::SynthPreAttnPersistent(..) => "SynthPreAttnPersistent",
         I::SynthMlpPreDown(..) => "SynthMlpPreDown",
+        I::SynthMlpPreDownPersistent(..) => "SynthMlpPreDownPersistent",
         I::SiluMul(..) => "SiluMul",
         #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(..) => "SynthGateUpSiluMul",
@@ -1550,6 +1560,15 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             _ => None,
         },
         I::SynthMlpPreDown(a, b, c, d, e, f, _g) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            _ => None,
+        },
+        I::SynthMlpPreDownPersistent(a, b, c, d, e, f, _g) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -2234,6 +2253,15 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             4 => I::SynthMlpPreDown(a, b, c, d, n, f, g),
             5 => I::SynthMlpPreDown(a, b, c, d, e, n, g),
             _ => panic!("SynthMlpPreDown: bad idx {idx}"),
+        },
+        I::SynthMlpPreDownPersistent(a, b, c, d, e, f, g) => match idx {
+            0 => I::SynthMlpPreDownPersistent(n, b, c, d, e, f, g),
+            1 => I::SynthMlpPreDownPersistent(a, n, c, d, e, f, g),
+            2 => I::SynthMlpPreDownPersistent(a, b, n, d, e, f, g),
+            3 => I::SynthMlpPreDownPersistent(a, b, c, n, e, f, g),
+            4 => I::SynthMlpPreDownPersistent(a, b, c, d, n, f, g),
+            5 => I::SynthMlpPreDownPersistent(a, b, c, d, e, n, g),
+            _ => panic!("SynthMlpPreDownPersistent: bad idx {idx}"),
         },
         I::SiluMul(a, b, c) => match idx {
             0 => I::SiluMul(n, b, c),
@@ -3523,8 +3551,8 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         // chains (RmsNorm + 3 LinearLayer / RmsNorm + 2 LinearLayer /
         // 2 LinearLayer). CosSin is auto-injected on top by the
         // rotary check, not counted here.
-        I::SynthPreAttn(..) => 4,
-        I::SynthMlpPreDown(..) => 3,
+        I::SynthPreAttn(..) | I::SynthPreAttnPersistent(..) => 4,
+        I::SynthMlpPreDown(..) | I::SynthMlpPreDownPersistent(..) => 3,
         I::SynthGateUpSiluMul(..) => 2,
         // Fused QKV+RoPE family (cuda). Same 3-LinearLayer shape as
         // SynthPreAttn minus RmsNorm (RmsNorm is upstream/separate).
@@ -3591,6 +3619,7 @@ pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
             // cache, so the macro must inject a `CosSin` slot for
             // this op.
             | I::SynthPreAttn(..)
+            | I::SynthPreAttnPersistent(..)
     )
 }
 

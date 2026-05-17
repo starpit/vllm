@@ -15,7 +15,7 @@
 
 use crate::ir::nodes::{
     Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, Gemm, MegaNode, RmsNorm,
-    ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
+    ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap, TkFusedGemmAdd,
 };
 use crate::ir::tape::TapeBudget;
 
@@ -59,7 +59,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
         MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
         MegaNode::Gemm(n) => emit_gemm(n, budget),
-        MegaNode::TkFusedGemmAdd(_) => RoleBodies::skipped("TkFusedGemmAdd"),
+        MegaNode::TkFusedGemmAdd(n) => emit_tk_fused_gemm_add(n, budget),
         MegaNode::TkFusedNormGemm(_) => RoleBodies::skipped("TkFusedNormGemm"),
         MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
         MegaNode::SpliceMmEmbeds(_) => RoleBodies::skipped("SpliceMmEmbeds"),
@@ -1163,6 +1163,211 @@ fn emit_gemm(node: &Gemm, budget: TapeBudget) -> RoleBodies {
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// TkFusedGemmAdd — `residual += A * B` (in-place residual fold).
+// Mirror of `emit_gemm` (Sprint 10) with the output writing back
+// to the residual page instead of a separate out page.
+// ============================================================
+//
+// Page lifecycle:
+//   in_page:       Empty → Filled (loader TMA in)
+//                        → Empty (consumer arrive page_consumed)
+//   weight_page:   Empty → Filled (loader TMA b_tile)
+//                        → Empty (consumer arrive page_consumed)
+//   residual_page: Empty → Filled (loader TMA residual_smem)
+//                        → Produced (consumer warp::store of acc)
+//                        → Empty (storer TMA residual back to gmem
+//                                + arrive page_consumed)
+//
+// The residual page is BOTH read AND written: the loader stages
+// the pre-add residual, the consumer loads it into the fp32
+// accumulator (TK 2.0's internal bf16->fp32 convertor handles the
+// dtype conversion), uses it as the `C` operand of `mma_AB` so
+// `acc = A*B + residual` in a single mma, then stores `acc` back
+// to the same shared slice; the storer TMA-flushes the updated
+// residual back to its gmem slot (in-place). No separate out page.
+
+fn emit_tk_fused_gemm_add(node: &TkFusedGemmAdd, budget: TapeBudget) -> RoleBodies {
+    let in_page = node.in_page();
+    let weight_page = node.weight_page();
+    let residual_page = node.residual_page();
+    let consumer_phase = node.consumer_phase().raw();
+    let storer_phase = node.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let iters = node.iters().raw();
+    let layer = node.layer().raw();
+    let n_dim = node.n().raw();
+    let k_dim = node.k().raw();
+    // M = num_tokens for TkFusedGemmAdd (mirrors S10 Gemm's `m`).
+    let m_dim = node.num_tokens().raw();
+    let tile_n = node.tile_n().raw();
+    let chunk_k = node.chunk_k().raw();
+    let in_act_slot = node.in_act_slot().raw();
+    let residual_act_slot = node.residual_act_slot().raw();
+    let weight_accessor_idx = node.weight_accessor_idx().raw();
+    let bar_publish = node.consumer_bar_publish().raw();
+    let b_tile_offset = node.b_tile_offset();
+
+    let ncw = budget.num_consumer_warps;
+    let num_layers = budget.num_layers.max(1);
+
+    // Sprint 11 limit: single-shot b_tile only. Multi-iter
+    // pipelining requires per-iter mbarrier phases that the IR
+    // doesn't yet model. Mirrors S10 emit_gemm.
+    if iters != 1 {
+        return RoleBodies::skipped("TkFusedGemmAdd");
+    }
+
+    debug_assert_eq!(
+        chunk_k, k_dim,
+        "emit_tk_fused_gemm_add: ITERS=1 requires CHUNK_K ({chunk_k}) == K ({k_dim})"
+    );
+    debug_assert_eq!(
+        tile_n * ncw,
+        n_dim,
+        "emit_tk_fused_gemm_add: AlongN split requires TILE_N ({tile_n}) * NCW ({ncw}) == N ({n_dim})"
+    );
+    debug_assert!(
+        m_dim % 16 == 0,
+        "emit_tk_fused_gemm_add: TK 2.0 mma_AB requires M ({m_dim}) divisible by 16"
+    );
+    debug_assert!(
+        k_dim % 16 == 0,
+        "emit_tk_fused_gemm_add: TK 2.0 mma_AB requires K ({k_dim}) divisible by 16"
+    );
+    debug_assert!(
+        tile_n % 16 == 0,
+        "emit_tk_fused_gemm_add: TK 2.0 mma_AB requires TILE_N ({tile_n}) divisible by 16"
+    );
+
+    let in_smem = page_as_st_bf(in_page, m_dim, k_dim); // [M, K]
+    let residual_smem = page_as_st_bf(residual_page, m_dim, n_dim); // [M, N]
+    let b_tile = scratch_as_st_bf(b_tile_offset, k_dim, n_dim); // [K, N]
+
+    let in_ready = page_ready_sem(in_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let residual_ready = page_ready_sem(residual_page);
+    let residual_done = page_done_sem(residual_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let residual_consumed = page_consumed_sem(residual_page);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let residual_gmem = gmem_act_ptr_raw(residual_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+
+    let bf16 = 2_u32;
+    let act_bytes = m_dim * k_dim * bf16; // [M, K]
+    let weight_bytes = k_dim * n_dim * bf16; // [K, N]
+    let residual_bytes = m_dim * n_dim * bf16; // [M, N]
+
+    // ---------------- Loader body ----------------
+    // Three TMA loads: activation, weight tile, residual.
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &weight_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &residual_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1, &in_smem, &in_gmem, act_bytes, &in_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &weight_ready, weight_bytes));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1,
+        &b_tile,
+        &weight_gmem,
+        weight_bytes,
+        &weight_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(
+        1,
+        &residual_ready,
+        residual_bytes,
+    ));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1,
+        &residual_smem,
+        &residual_gmem,
+        residual_bytes,
+        &residual_ready,
+    ));
+
+    // ---------------- Launcher body ----------------
+    // No per-iter pipelining at ITERS=1 — launcher idle.
+    let launcher = CuBlock::new();
+
+    // ---------------- Consumer body ----------------
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &weight_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &residual_ready, consumer_phase));
+
+    let (decl_a, a_rt) = tk20::decl_rt_bf_row("__gemm_a", m_dim, k_dim);
+    let (decl_b, b_rt) = tk20::decl_rt_bf_col("__gemm_b", k_dim, tile_n);
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl("__gemm_acc", m_dim, tile_n);
+    consumer.push(decl_a);
+    consumer.push(decl_b);
+    consumer.push(decl_acc);
+
+    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
+    let (decl_b_sub, b_sub) =
+        tk20::decl_st_bf_subtile("__gemm_b_sub", &b_tile, k_dim, tile_n, "0", warp_idx_expr);
+    let (decl_resid_sub, resid_sub) = tk20::decl_st_bf_subtile(
+        "__gemm_resid_sub",
+        &residual_smem,
+        m_dim,
+        tile_n,
+        "0",
+        warp_idx_expr,
+    );
+    consumer.push(decl_b_sub);
+    consumer.push(decl_resid_sub);
+
+    // Load A and B (bf16). Load residual directly into the fp32
+    // accumulator (TK's bf16->fp32 convertor); residual then
+    // enters mma as the C operand → `acc = A*B + residual` in a
+    // single mma.
+    consumer.push(tk20::warp_load_rt_from_st_bf(&a_rt, &in_smem));
+    consumer.push(tk20::warp_load_rt_from_st_bf(&b_rt, &b_sub));
+    consumer.push(tk20::warp_load_rt_fl_from_st_bf(&acc_rt, &resid_sub));
+
+    consumer.push(tk20::warp_mma_AB(&acc_rt, &a_rt, &b_rt, &acc_rt));
+
+    // Store accumulator IN PLACE to the per-warp residual slice
+    // (overwrites the pre-add residual the loader staged).
+    consumer.push(tk20::warp_store_st_bf_from_rt_fl(&resid_sub, &acc_rt));
+
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &residual_done),
+        tk20::group_arrive(1, &in_consumed),
+        tk20::group_arrive(1, &weight_consumed),
+    ]));
+
+    // ---------------- Storer body ----------------
+    // TMA-store the updated residual_smem back to its gmem slot.
+    // Arrive on residual_consumed (NOT a separate out_consumed —
+    // no out page exists for this variant).
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &residual_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw_st_bf(
+        1,
+        &residual_gmem,
+        &residual_smem,
+        residual_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &residual_consumed));
 
     RoleBodies {
         loader,

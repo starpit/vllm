@@ -319,6 +319,113 @@ mod tests {
         }
     }
 
+    /// Sprint 11: TkFusedGemmAdd — `residual += A * B`. Mirror of
+    /// the S10 Gemm smoke with the output writing back IN PLACE
+    /// to the residual page instead of a separate out page (no
+    /// `out_*` slot/page; residual_page is BOTH read and written).
+    /// Smoke config: M=16, K=32, N=256, NCW=8. TILE_N=32,
+    /// CHUNK_K=K=32. b_tile = 32 * 256 * 2 = 16384 bytes.
+    #[test]
+    fn tk_fused_gemm_add_emits_tk20_calls() {
+        use crate::ir::substrate::{
+            BarSyncId, ChunkK, GemmScope, IterCount, KFull, KOffset, MatmulK, MatmulN,
+            ScratchRegion, TileN,
+        };
+        let mut b = BuilderD::new();
+        b.push_tk_fused_gemm_add(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // weight
+            PageId::<2, 8>::new(), // residual (read+write)
+            ScratchRegion::<0, 16_384, 32_768, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            MatmulN::<256>::new(),
+            MatmulK::<32>::new(),
+            NumTokensConst::<16>::new(),
+            KOffset::<0>::new(),
+            KFull::<32>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),       // in_act_slot
+            ActSlotConst::<2, { u32::MAX }>::new(),       // residual_act_slot
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            TileN::<32>::new(),
+            ChunkK::<32>::new(),
+            BarSyncId::<7>::new(),
+            "W::tk_fused_gemm_add".to_string(),
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_tk_fused_gemm_add", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "skipped: {:?}",
+            cu.skipped_variants
+        );
+        std::fs::write("/tmp/tk_fused_gemm_add_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // Loader: three TMA loads (act + b_tile + residual).
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[0], 1024);",
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[1], 16384);",
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[2], 8192);",
+            "(*reinterpret_cast<kittens::st_bf<16, 32>*>(ss.pages[0]))",
+            "(*reinterpret_cast<kittens::st_bf<32, 256>*>(ss.scratch + 0))",
+            "(*reinterpret_cast<kittens::st_bf<16, 256>*>(ss.pages[2]))",
+            // Consumer: rt decls + per-warp B + RESIDUAL subtiles.
+            "kittens::rt_bf<16, 32> __gemm_a;",
+            "kittens::rt_bf<32, 32, kittens::ducks::rt_layout::col> __gemm_b;",
+            "kittens::rt_fl<16, 32> __gemm_acc;",
+            "auto __gemm_b_sub = ",
+            "auto __gemm_resid_sub = ",
+            // The residual subtile is a [16, 32] slice of residual_smem.
+            ".template subtile<16, 32>(int2{0, static_cast<int>(kittens::warpid())})",
+            // bf16 -> bf16 loads for A and B; bf16 -> fp32 load for residual
+            // (same `kittens::warp::load` call site — TK does the convert).
+            "kittens::warp::load(__gemm_a, ",
+            "kittens::warp::load(__gemm_b, __gemm_b_sub);",
+            "kittens::warp::load(__gemm_acc, __gemm_resid_sub);",
+            // Single fused mma: D = A*B + C, with C = residual (=acc).
+            "kittens::warp::mma_AB(__gemm_acc, __gemm_a, __gemm_b, __gemm_acc);",
+            // Store accumulator back IN PLACE to residual subtile.
+            "kittens::warp::store(__gemm_resid_sub, __gemm_acc);",
+            "kittens::group<8>::sync(7);",
+            // Consumer publishes page_done[residual] + arrives on
+            // both input pages' consumed sems. Residual_consumed is
+            // the storer's job.
+            "kittens::group<1>::arrive(ss.page_done[2]);",
+            "kittens::group<1>::arrive(ss.page_consumed[0]);",
+            "kittens::group<1>::arrive(ss.page_consumed[1]);",
+            // Storer: TMA-store residual back to its own gmem slot
+            // (act_ptrs[2]) and arrive on residual's consumed sem.
+            "kittens::group<1>::tma::store_async(",
+            "g.act_ptrs[2]",
+            "kittens::group<1>::tma::store_async_wait();",
+            "kittens::group<1>::arrive(ss.page_consumed[2]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+
+        // Crucially: NO `__gemm_out_sub` (TkFusedGemmAdd writes
+        // back to residual, not a separate out page) and NO zero
+        // of the accumulator (the residual fills that slot
+        // instead).
+        assert!(
+            !cu.source.contains("__gemm_out_sub"),
+            "TkFusedGemmAdd must not declare an out-subtile; got:\n{}",
+            cu.source
+        );
+        assert!(
+            !cu.source.contains("kittens::warp::zero(__gemm_acc)"),
+            "TkFusedGemmAdd must not zero the accumulator (residual fills it); got:\n{}",
+            cu.source
+        );
+    }
+
     /// Sprint 1: Rust-side smoke. Verifies the emit walks without
     /// panicking AND that key TK 2.0 primitive calls land in the
     /// emitted source. The REAL DOD is `nvcc` compiling this on

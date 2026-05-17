@@ -583,6 +583,39 @@ pub fn warp_load_rt_from_st_bf<L: RtLayoutTag>(
     ))
 }
 
+/// `kittens::warp::load(rt_fl, st_bf);` — collaborative
+/// shared->register load with bf16->fp32 type conversion handled
+/// internally by TK 2.0 (`base_types::convertor<T2, U2>` at
+/// `shared_to_register.cuh:47-50,96-99,120-123`). Used by
+/// `TkFusedGemmAdd` to bring the residual subtile into the fp32
+/// accumulator as the mma C operand (`acc = A*B + residual`).
+///
+/// Source: `include/ops/group/memory/tile/shared_to_register.cuh:14-128`.
+pub fn warp_load_rt_fl_from_st_bf(
+    rt: &Rt<F32, RtRow>,
+    st: &St<Bf16>,
+) -> CuStmt {
+    debug_assert_eq!(
+        rt.rows(),
+        st.rows(),
+        "warp_load_rt_fl_from_st_bf: rt.rows ({}) must equal st.rows ({})",
+        rt.rows(),
+        st.rows()
+    );
+    debug_assert_eq!(
+        rt.cols(),
+        st.cols(),
+        "warp_load_rt_fl_from_st_bf: rt.cols ({}) must equal st.cols ({})",
+        rt.cols(),
+        st.cols()
+    );
+    CuStmt::new(format!(
+        "kittens::warp::load({rt}, {st});",
+        rt = rt.expr(),
+        st = st.expr()
+    ))
+}
+
 /// `kittens::warp::store(st, rt);` — collaborative register->shared
 /// store. Same shape constraints as
 /// [`warp_load_rt_from_st_bf`]. Used to land the gemm fp32

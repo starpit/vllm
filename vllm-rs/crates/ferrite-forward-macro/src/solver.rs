@@ -26,9 +26,9 @@
 //! after `schedule::schedule()` builds waves — the solver doesn't
 //! need to know about waves.
 //!
-//! Complexity: O(n × 2^K × C) where n = tiles, K = max claim spread
-//! in the library, C = candidates per position. For today's library
-//! max spread is ~4 and K=8 is plenty of headroom.
+//! Complexity: O(n × 2^K × C) where n = tiles, K = `ClaimMask::WINDOW`
+//! = max claim spread, C = candidates per position. Bumping K is a
+//! one-line change in `ClaimMask` plus (eventually) a wider repr.
 //!
 //! NOT ported from the old DP (llama-specific hacks — see PLAN.md
 //! NON-reuse):
@@ -59,6 +59,87 @@ use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchContext, MatchInfo};
 use crate::shape::{Inferred, Shape, extern_shape};
 use crate::target::TargetProfile;
+
+/// Per-seed bitmask of which tiles in `[seed, seed + WINDOW)` are
+/// claimed by a multi-tile candidate. Carried in two roles:
+///
+/// 1. As `Candidate.mask`: the candidate's claim pattern, bit 0 = seed
+///    position (always set by construction).
+/// 2. As DP `claim_state`: bit 0 = "tile at the current DP position is
+///    pre-claimed by an earlier in-flight multi-tile candidate", bit
+///    `j` = "tile at position+j is pre-claimed", etc. After moving
+///    past the current position the mask `.advance()`s (shifts right).
+///
+/// Hidden behind methods so the underlying representation can swap
+/// (`u16` → `u32` / `u64` / `bitvec::SmallBitVec`) without touching
+/// the DP hot loop or candidate construction. Bumping the per-seed
+/// span limit is a one-line constant change here plus (eventually) a
+/// wider repr.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
+pub struct ClaimMask(u16);
+
+impl ClaimMask {
+    /// Per-seed window size in tiles == bit width of the repr. The
+    /// candidate-filter at `solve_one` Phase 2 rejects any claim whose
+    /// max offset is `>= WINDOW`. Largest claim in the current library
+    /// is `FusedQkvQkNormRopeCacheImpl` at ~12 tiles (Gemma3 QK-norm
+    /// chain); K=16 leaves headroom.
+    pub const WINDOW: usize = u16::BITS as usize;
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Set the bit at `off`. Debug-asserts the offset is within the
+    /// window so callers catch the inverted-rejection bug at the
+    /// candidate-construction site instead of silently truncating.
+    pub fn with_bit(self, off: usize) -> Self {
+        debug_assert!(off < Self::WINDOW, "ClaimMask offset {off} exceeds WINDOW {}", Self::WINDOW);
+        Self(self.0 | (1 << off))
+    }
+
+    /// True iff bit `off` is set.
+    pub fn test(self, off: usize) -> bool {
+        (self.0 >> off) & 1 != 0
+    }
+
+    /// True iff every bit is clear — the terminal DP state at end of
+    /// FUF, meaning no in-flight multi-tile claims.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Slide the window one tile forward: bit `i` → bit `i-1`. Bit 0
+    /// drops off; bit WINDOW-1 becomes 0. Called by the DP after
+    /// committing a transition at the current seed position.
+    pub fn advance(self) -> Self {
+        Self(self.0 >> 1)
+    }
+
+    /// True iff `self` and `other` share any set bits. Used to reject
+    /// candidates whose claim conflicts with already-in-flight claims.
+    pub fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// Bitwise union — claim pattern post-commit.
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Iterate the offsets where bits are set, ascending order.
+    pub fn iter_offsets(self) -> impl Iterator<Item = usize> {
+        let mut bits = self.0;
+        std::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+            let off = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            Some(off)
+        })
+    }
+}
 
 /// Stable identifier for one claimed subgraph within an SFUF. Each
 /// commit of "these tiles are claimed by this impl" allocates a
@@ -512,34 +593,33 @@ fn solve_one(
     let t_p2 = std::time::Instant::now();
     // ── Phase 2: convert candidate claim_tiles to bitmasks ──
     //
-    // Each candidate's claim_tiles becomes a K-bit mask relative to
+    // Each candidate's claim_tiles becomes a `ClaimMask` relative to
     // its seed position. Bit 0 = seed; bit j = seed + j. Candidates
-    // whose claim exceeds K bits or reaches backward in topo order
-    // are dropped (with the matches_at[i] entry removed) — they'd
-    // be invariant violations for this DP. FusedQkvQkNormRopeCacheImpl
-    // spans up to 12 tiles per layer (Gemma3 QK-norm chain), so K=16.
-    const K: usize = 16;
-    type ClaimMask = u16;
-
+    // whose claim reaches backward in topo order or exceeds the
+    // window are dropped (with the matches_at[i] entry removed) —
+    // they'd be invariant violations for this DP.
+    // `FusedQkvQkNormRopeCacheImpl` spans up to 12 tiles per layer
+    // (Gemma3 QK-norm chain), so `ClaimMask::WINDOW = 16` leaves
+    // headroom.
     let candidates: Vec<Vec<Candidate>> = matches_at
         .iter()
         .enumerate()
         .map(|(i, v)| {
             v.iter()
                 .filter_map(|(imp_id, info, cost)| {
-                    let mut mask: ClaimMask = 0;
+                    let mut mask = ClaimMask::empty();
                     for t in &info.claimed_tiles {
                         let pos = t.0 as usize;
                         if pos < i {
                             return None; // claims backward — reject
                         }
                         let off = pos - i;
-                        if off >= K {
-                            return None; // spread exceeds K bits — reject
+                        if off >= ClaimMask::WINDOW {
+                            return None; // spread exceeds window — reject
                         }
-                        mask |= 1 << off;
+                        mask = mask.with_bit(off);
                     }
-                    if mask & 1 == 0 {
+                    if !mask.test(0) {
                         return None; // seed must be in the claim
                     }
                     Some(Candidate {
@@ -604,10 +684,10 @@ fn solve_one(
 
     let mut dp: Vec<HashMap<ClaimMask, SparseCell>> = vec![HashMap::new(); n + 1];
     dp[0].insert(
-        0,
+        ClaimMask::empty(),
         SparseCell {
             cost: 0.0,
-            prev_cs: 0,
+            prev_cs: ClaimMask::empty(),
             choice: None,
             picks_count: 0,
         },
@@ -636,9 +716,10 @@ fn solve_one(
             .map(|(k, c)| (*k, c.cost, c.picks_count))
             .collect();
         for (cs, cost, picks_count) in at_i {
-            if cs & 1 != 0 {
-                // Tile i is pre-claimed — pass through.
-                let new_cs = cs >> 1;
+            if cs.test(0) {
+                // Tile i is pre-claimed by an in-flight multi-tile
+                // candidate committed earlier — pass through.
+                let new_cs = cs.advance();
                 update(
                     &mut dp[i + 1],
                     new_cs,
@@ -651,10 +732,10 @@ fn solve_one(
                 );
             } else {
                 for cand in &candidates[i] {
-                    if cand.mask & cs != 0 {
+                    if cs.intersects(cand.mask) {
                         continue; // conflict with pending claims
                     }
-                    let new_cs = (cs | cand.mask) >> 1;
+                    let new_cs = cs.union(cand.mask).advance();
                     let new_cost = cost + cand.cost;
                     let new_picks_count = picks_count + 1;
                     update(
@@ -672,7 +753,7 @@ fn solve_one(
         }
     }
 
-    let Some(terminal) = dp[n].get(&0).copied() else {
+    let Some(terminal) = dp[n].get(&ClaimMask::empty()).copied() else {
         // No feasible plan for this workload. Emit the specific
         // tile where we ran out of candidates.
         if let Some((i, _)) = candidates.iter().enumerate().find(|(_, c)| c.is_empty()) {
@@ -728,12 +809,10 @@ fn solve_one(
             .find(|c| c.imp_id == imp_id && c.mask == mask)
             .expect("DP stored a candidate that exists in the candidate list");
 
-        for j in 0..K {
-            if mask & (1 << j) != 0 {
-                let tile_idx = i + j;
-                if tile_idx < n {
-                    assignment.cover.insert(fuf.nodes[tile_idx].id, sg);
-                }
+        for off in mask.iter_offsets() {
+            let tile_idx = i + off;
+            if tile_idx < n {
+                assignment.cover.insert(fuf.nodes[tile_idx].id, sg);
             }
         }
         assignment.impls.insert(sg, imp_id);
@@ -758,7 +837,7 @@ struct Candidate {
     imp_id: ImplId,
     /// Bit `j` set ⇒ position `seed + j` is claimed. Bit 0 (seed)
     /// is always set by construction.
-    mask: u16,
+    mask: ClaimMask,
     cost: f64,
 }
 

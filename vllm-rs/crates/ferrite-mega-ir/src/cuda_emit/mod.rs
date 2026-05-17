@@ -339,6 +339,58 @@ mod tests {
         }
     }
 
+    /// Sprint 5: FusedAddRmsNorm — residual+=delta, then RmsNorm,
+    /// in-place to residual page.
+    #[test]
+    fn fused_add_rms_norm_emits_tk20_calls() {
+        use crate::substrate::RmsNormScope;
+        let mut b = BuilderD::new();
+        b.push_fused_add_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // delta
+            PageId::<1, 8>::new(), // residual
+            PageId::<2, 8>::new(), // weight
+            ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
+            "W::farn".to_string(),
+            1.0e-5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_farn", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/fused_add_rms_norm_emit.cu", &cu.source).ok();
+
+        for needle in [
+            "kittens::group<8>::load(__farn_delta_rv,",
+            "kittens::group<8>::load(__farn_res_rv,",
+            "kittens::warp::add(__farn_res_rv, __farn_res_rv, __farn_delta_rv);",
+            "kittens::warp::sum(__farn_partial_sum, __farn_sq_rv);",
+            "kittens::group<8>::sync(1);",
+            "kittens::group<8>::sync(2);",
+            "rsqrtf(__farn_full_sum / 2048.0f + 1e-5f)",
+            "kittens::warp::mul(__farn_res_rv, __farn_res_rv, __farn_scale);",
+            "kittens::warp::mul(__farn_res_rv, __farn_res_rv, __farn_weight_rv);",
+            "kittens::group<8>::store(",
+            "g.weight_ptrs[5 * 16 + 3]",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// Sprint 4: TanhSoftCap via `kittens::warp::apply` lambda.
     #[test]
     fn tanh_soft_cap_emits_tk20_apply_lambda() {

@@ -13,7 +13,7 @@
 //! sprint, each variant's emitted `.cu` must compile against TK
 //! 2.0 on the pod before it's "done."
 
-use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
+use crate::nodes::{Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -48,7 +48,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::RmsNorm(n) => emit_rms_norm(n, budget),
         MegaNode::FusedQkvRopeCache(_) => RoleBodies::skipped("FusedQkvRopeCache"),
         MegaNode::Add(n) => emit_add(n, budget),
-        MegaNode::FusedAddRmsNorm(_) => RoleBodies::skipped("FusedAddRmsNorm"),
+        MegaNode::FusedAddRmsNorm(n) => emit_fused_add_rms_norm(n, budget),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
@@ -569,6 +569,153 @@ fn emit_tanh_soft_cap(n: &TanhSoftCap, budget: TapeBudget) -> RoleBodies {
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+
+// ============================================================
+// FusedAddRmsNorm — residual += delta, then RmsNorm in-place.
+// ============================================================
+//
+// Page lifecycle:
+//   delta_page:    Empty -> Filled (loader) -> Empty (consumer arrive)
+//   residual_page: Empty -> Filled (loader) -> Produced (consumer store)
+//                                           -> Empty (storer + arrive)
+//   weight_page:   Empty -> Filled (loader) -> Empty (consumer arrive)
+//
+// Same TK 2.0 surface as RmsNorm + extra warp::add for the
+// residual fold. No new TK 2.0 primitive.
+
+fn emit_fused_add_rms_norm(n: &FusedAddRmsNorm, budget: TapeBudget) -> RoleBodies {
+    let delta_page = n.delta_page();
+    let residual_page = n.residual_page();
+    let weight_page = n.weight_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let layer = n.layer().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let delta_act_slot = n.delta_act_slot().raw();
+    let residual_act_slot = n.residual_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+    let bar_reduce = n.consumer_bar_reduce().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+    let eps_value = n.eps().raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(ncw > 0 && hidden_dim % ncw == 0);
+    let k_per_warp = hidden_dim / ncw;
+    let num_layers = budget.num_layers.max(1);
+
+    let delta_smem = page_as_sv_bf(delta_page, hidden_dim);
+    let residual_smem = page_as_sv_bf(residual_page, hidden_dim);
+    let weight_smem = page_as_sv_bf(weight_page, hidden_dim);
+    let delta_ready = page_ready_sem(delta_page);
+    let residual_ready = page_ready_sem(residual_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let residual_done = page_done_sem(residual_page);
+    let delta_consumed = page_consumed_sem(delta_page);
+    let residual_consumed = page_consumed_sem(residual_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let partial = scratch_as::<super::handles::F32>(n.partial_offset());
+    let delta_gmem = gmem_act_ptr_raw(delta_act_slot);
+    let residual_gmem = gmem_act_ptr_raw(residual_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+
+    let bf16_size_bytes = 2_u32;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+    let weight_bytes = hidden_dim * bf16_size_bytes;
+
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &delta_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &residual_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &weight_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &delta_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &delta_smem, &delta_gmem, act_bytes, &delta_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &residual_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &residual_smem, &residual_gmem, act_bytes, &residual_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &weight_ready, weight_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &weight_smem, &weight_gmem, weight_bytes, &weight_ready,
+    ));
+
+    let launcher = CuBlock::new();
+
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &delta_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &residual_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &weight_ready, consumer_phase));
+
+    let (decl_delta, delta_rv) = tk20::decl_rv_fl("__farn_delta_rv", k_per_warp);
+    let (decl_res, res_rv) = tk20::decl_rv_fl("__farn_res_rv", k_per_warp);
+    let (decl_sq, sq_rv) = tk20::decl_rv_fl("__farn_sq_rv", k_per_warp);
+    let (decl_w, weight_rv) = tk20::decl_rv_fl("__farn_weight_rv", k_per_warp);
+    consumer.push(decl_delta);
+    consumer.push(decl_res);
+    consumer.push(decl_sq);
+    consumer.push(decl_w);
+
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &delta_rv, &delta_smem));
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &res_rv, &residual_smem));
+    consumer.push(tk20::warp_add_rv_rv(&res_rv, &res_rv, &delta_rv));
+
+    consumer.push(tk20::warp_copy_rv(&sq_rv, &res_rv));
+    consumer.push(tk20::warp_mul_rv_rv(&sq_rv, &sq_rv, &sq_rv));
+    let (decl_partial, partial_sum_expr) =
+        tk20::decl_local_f32("__farn_partial_sum", "0.0f");
+    consumer.push(decl_partial);
+    consumer.push(tk20::warp_sum_to_scalar_f32(&partial_sum_expr, &sq_rv));
+    consumer.push(CuStmt::new(format!(
+        "if (kittens::laneid() == 0) {{ {p}[kittens::warpid()] = __farn_partial_sum; }}",
+        p = partial.expr()
+    )));
+    consumer.push(tk20::group_sync_named(ncw, bar_reduce));
+    consumer.push(CuStmt::new("float __farn_full_sum = 0.0f;".to_string()));
+    consumer.push(CuStmt::new(format!(
+        "#pragma unroll\nfor (int __i = 0; __i < {ncw}; ++__i) {{ __farn_full_sum += {p}[__i]; }}",
+        p = partial.expr()
+    )));
+    consumer.push(CuStmt::new(format!(
+        "const float __farn_scale = rsqrtf(__farn_full_sum / {hidden_dim}.0f + {eps:e}f);",
+        eps = eps_value
+    )));
+    consumer.push(tk20::warp_mul_rv_scalar_f32(
+        &res_rv,
+        &res_rv,
+        &CuExpr::new("__farn_scale".to_string()),
+    ));
+
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &weight_rv, &weight_smem));
+    consumer.push(tk20::warp_mul_rv_rv(&res_rv, &res_rv, &weight_rv));
+
+    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(ncw, &residual_smem, &res_rv));
+
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(tk20::group_arrive(1, &residual_done));
+    consumer.push(tk20::group_arrive(1, &delta_consumed));
+    consumer.push(tk20::group_arrive(1, &weight_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &residual_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw(
+        1, &residual_gmem, &residual_smem, act_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &residual_consumed));
 
     RoleBodies {
         loader,

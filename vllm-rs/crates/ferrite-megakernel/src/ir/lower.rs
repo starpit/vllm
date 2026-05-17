@@ -567,6 +567,7 @@ impl<
     /// WEIGHT_ACCESSOR_IDX const generics for the kernel-AST emit
     /// (per `MEGA_IR_PLAN.md` §0/§4a).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn push_fused_gate_up_activate_mul<
         const IN_ID: u32,
         const WEIGHT_ID: u32,
@@ -587,6 +588,8 @@ impl<
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
@@ -611,9 +614,15 @@ impl<
         _weight_accessor_idx: crate::ir::substrate::WeightAccessorConst<
             WEIGHT_ACCESSOR_IDX, { u32::MAX },
         >,
+        _tile_n: crate::ir::substrate::TileN<TILE_N>,
+        _consumer_bar_publish: crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
         weight_path: String,
         activation: GateUpActivation,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+    {
         self.verify_arrives(ARRIVES, "push_fused_gate_up_activate_mul");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
@@ -641,6 +650,8 @@ impl<
             IN_ACT_SLOT,
             OUT_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
+            TILE_N,
+            CONSUMER_BAR_PUBLISH,
         >(weight, activation);
         self.nodes.push(MegaNode::FusedGateUpActivateMul(node));
         self.pool.release(IN_ID);
@@ -1795,8 +1806,9 @@ mod tests {
     fn lowers_fused_gate_up_silu_mul() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, IntermediateDim, IterCount, MbarrierPhase,
-            MlpScope, NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, IntermediateDim, IterCount,
+            MbarrierPhase, MlpScope, NumTokensConst, PageId, ScratchRegion, TileN,
+            WeightAccessorConst,
         };
         let mut b = Builder8::new();
         b.push_fused_gate_up_activate_mul(
@@ -1816,6 +1828,9 @@ mod tests {
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<2, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
+            // intermediate_dim (8192) / NCW (8) = 1024.
+            TileN::<1024>::new(),
+            BarSyncId::<1>::new(),
             "W::mlp".to_string(),
             GateUpActivation::Silu,
         );

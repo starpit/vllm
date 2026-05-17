@@ -740,6 +740,17 @@ pub fn dispatch_instruction_to_push(
             let weight_str = weight.as_str();
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            // S12a IR ext: TILE_N = INTERMEDIATE_DIM / NCW
+            // (AlongN warp split). Mirrors Gemm/TkFusedGemmAdd.
+            let ncw = state.num_consumer_warps;
+            let tile_n_const =
+                if ncw > 0 && state.intermediate_dim % ncw == 0 {
+                    state.intermediate_dim / ncw
+                } else {
+                    state.intermediate_dim
+                };
+            let tile_n_lit = lit(tile_n_const);
+            let consumer_bar_publish = lit(1u32);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
@@ -766,6 +777,8 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::WeightAccessorConst::<
                         #weight_accessor_idx, { u32::MAX },
                     >::new(),
+                    ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
+                    ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
                     #weight_str.to_string(),
                     #activation_path,
                 );

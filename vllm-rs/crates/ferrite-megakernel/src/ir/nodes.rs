@@ -1038,6 +1038,12 @@ impl FusedAddRmsNorm {
 /// `<HIDDEN_DIM, INTERMEDIATE_DIM, NUM_TOKENS>` come from typed
 /// getters; activation enum (`GateUpActivation::{Silu,Gelu}`)
 /// selects which TK helper sequence the codegen emits.
+///
+/// Sprint 12a (S12a) IR ext: `tile_n` and `consumer_bar_publish`
+/// added to mirror the S10a (Gemm) / S11a (TkFusedGemmAdd)
+/// pattern. The AlongN warp split needs `tile_n * NCW ==
+/// intermediate_dim`; the consumer's cross-warp publish before
+/// `page_done[out]` needs a `bar.sync` ID in 1..=15.
 pub struct FusedGateUpActivateMul {
     in_page: crate::ir::substrate::PageRef,
     gate_up_weight_page: crate::ir::substrate::PageRef,
@@ -1053,9 +1059,22 @@ pub struct FusedGateUpActivateMul {
     hidden_dim: crate::ir::substrate::HiddenDimRef,
     intermediate_dim: crate::ir::substrate::IntermediateDimRef,
     num_tokens: crate::ir::substrate::NumTokensRef,
+    /// Per-warp output N slice (AlongN warp split). Mirrors the
+    /// `Gemm::tile_n` field added in Sprint 9. Equality with
+    /// `intermediate_dim / NCW` is enforced at emit time (NCW
+    /// isn't a const generic on the builder).
+    tile_n: crate::ir::substrate::TileNRef,
     in_act_slot: crate::ir::substrate::ActSlotRef,
     out_act_slot: crate::ir::substrate::ActSlotRef,
     weight_accessor_idx: crate::ir::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps
+    /// wrote their `[M, TILE_N]` accumulator slice into out_smem"
+    /// publish before warp 0 arrives on `page_done[out]`. Mirrors
+    /// `Gemm::consumer_bar_publish` (Sprint 10a). Validity
+    /// (1..=15) is enforced at construction by `BarSyncId<ID>:
+    /// IsValidBarSyncId`. AlongN split → no cross-warp reduction
+    /// over the tile, so only one bar is needed.
+    consumer_bar_publish: crate::ir::substrate::BarRef,
     pub weight: WeightRef,
     pub activation: GateUpActivation,
 }
@@ -1084,10 +1103,18 @@ impl FusedGateUpActivateMul {
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         weight: WeightRef,
         activation: GateUpActivation,
-    ) -> Self {
+    ) -> Self
+    where
+        // Sealed-witness: BAR_PUBLISH ∈ 1..=15. Mirrors the
+        // S10a/S11a precedent (`BarSyncId` validity check).
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "FusedGateUp: IN_ID OOB");
             assert!(WEIGHT_ID < NUM_PAGES, "FusedGateUp: WEIGHT_ID OOB");
@@ -1126,10 +1153,17 @@ impl FusedGateUpActivateMul {
                 "FusedGateUp: INTERMEDIATE_DIM must be > 0"
             );
             assert!(NUM_TOKENS > 0, "FusedGateUp: NUM_TOKENS must be > 0");
+            // Tile-layout invariant (mirror of Gemm Sprint 9).
+            // AlongN warp split: each consumer warp covers TILE_N
+            // output cols. tile_n * NCW equality with
+            // intermediate_dim is enforced by the proc-macro
+            // (NCW isn't a const generic here); tile_n > 0 is.
+            assert!(TILE_N > 0, "FusedGateUp: TILE_N must be > 0");
         }
         use crate::ir::substrate::{
-            ActSlotConst, HiddenDim, IntermediateDim, IterCount, MbarrierPhase, NumTokensConst,
-            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, HiddenDim, IntermediateDim, IterCount, MbarrierPhase,
+            NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1146,10 +1180,12 @@ impl FusedGateUpActivateMul {
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             intermediate_dim: IntermediateDim::<INTERMEDIATE_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            tile_n: TileN::<TILE_N>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
                 .erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
             weight,
             activation,
         }
@@ -1205,6 +1241,16 @@ impl FusedGateUpActivateMul {
     }
     pub const fn weight_accessor_idx(&self) -> crate::ir::substrate::WeightAccessorRef {
         self.weight_accessor_idx
+    }
+    pub const fn tile_n(&self) -> crate::ir::substrate::TileNRef {
+        self.tile_n
+    }
+    /// `bar.sync` ID for the consumer's "all warps wrote their
+    /// `[M, TILE_N]` accumulator slice" publish before warp 0
+    /// arrives on `page_done[out]`. Validity (1..=15) was
+    /// discharged by sealed-witness type-check at construction.
+    pub const fn consumer_bar_publish(&self) -> crate::ir::substrate::BarRef {
+        self.consumer_bar_publish
     }
 }
 

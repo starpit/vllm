@@ -16,7 +16,7 @@
 use crate::ir::nodes::{
     Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, FusedGateUpActivateMul,
     GateUpActivation, Gemm, LmHeadNormKind, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm,
-    TanhSoftCap, TkFusedGemmAdd, TkFusedNormGemm,
+    SpliceMmEmbeds, TanhSoftCap, TkFusedGemmAdd, TkFusedNormGemm,
 };
 use crate::ir::tape::TapeBudget;
 
@@ -63,7 +63,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::TkFusedGemmAdd(n) => emit_tk_fused_gemm_add(n, budget),
         MegaNode::TkFusedNormGemm(n) => emit_tk_fused_norm_gemm(n, budget),
         MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
-        MegaNode::SpliceMmEmbeds(_) => RoleBodies::skipped("SpliceMmEmbeds"),
+        MegaNode::SpliceMmEmbeds(n) => emit_splice_mm_embeds(n),
         MegaNode::BarrierSignal(n) => emit_barrier_signal(n),
         MegaNode::BarrierWait(n) => emit_barrier_wait(n),
     }
@@ -1992,6 +1992,71 @@ fn emit_tk_fused_norm_gemm(node: &TkFusedNormGemm, budget: TapeBudget) -> RoleBo
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+
+// ============================================================
+// SpliceMmEmbeds — multimodal placeholder splice (passthrough).
+// ============================================================
+//
+// The actual D2D copy of projected vision embeddings into the
+// activation slot's placeholder rows happens OUTSIDE this kernel
+// (host-side `memcpy_dtod_async`, see
+// `ferrite-forward/src/instr.rs:762`). The megakernel does no
+// data movement for this op — but the substrate still bumped
+// `arrives` by one in `push_splice_mm_embeds` (lower.rs), so the
+// page's barrier cycle MUST advance to keep the next op's phase
+// parity correct.
+//
+// Page lifecycle (advance-only, no TMA):
+//   slot:   Empty -> Filled-marker  (loader: `arrive(page_ready)`)
+//                  -> Done-marker    (consumer warp 0: `arrive(page_done)`)
+//                  -> Empty          (storer: `arrive(page_consumed)`)
+//
+// TK 2.0 primitives used (cited):
+//   - kittens::group<1>::wait     (sync.cuh:112)
+//   - kittens::group<1>::arrive   (sync.cuh:69)
+//
+// No `Globals`-style runtime data is read — only the substrate's
+// per-page semaphores `ss.page_ready[N]` / `ss.page_done[N]` /
+// `ss.page_consumed[N]` are touched.
+
+fn emit_splice_mm_embeds(n: &SpliceMmEmbeds) -> RoleBodies {
+    let slot = n.slot();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase;
+
+    let slot_ready = page_ready_sem(slot);
+    let slot_done = page_done_sem(slot);
+    let slot_consumed = page_consumed_sem(slot);
+
+    // Loader: wait page_consumed, arrive page_ready (no data).
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &slot_consumed, loader_phase));
+    loader.push(tk20::group_arrive(1, &slot_ready));
+
+    let launcher = CuBlock::new();
+
+    // Consumer: wait page_ready, warp 0 arrives page_done.
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &slot_ready, consumer_phase));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &slot_done),
+    ]));
+
+    // Storer: wait page_done, arrive page_consumed.
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &slot_done, storer_phase));
+    storer.push(tk20::group_arrive(1, &slot_consumed));
 
     RoleBodies {
         loader,

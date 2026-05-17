@@ -1141,4 +1141,69 @@ mod tests {
             );
         }
     }
+
+    /// Sprint 14: SpliceMmEmbeds — passthrough emit. The actual
+    /// D2D vision-embed copy happens outside the megakernel; the
+    /// kernel only advances the page's barrier cycle (arrives bump
+    /// in `push_splice_mm_embeds`) so the next op's phase parity
+    /// stays correct. No `act_ptrs` / `weight_ptrs` / `input_ids`
+    /// are touched.
+    #[test]
+    fn splice_mm_embeds_emits_passthrough() {
+        let mut b = BuilderD::new();
+        b.push_splice_mm_embeds(
+            ArrivesCount::<0>::new(),
+            PageId::<3, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<7>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_splice", &tape);
+        assert!(cu.skipped_variants.is_empty(), "skipped: {:?}", cu.skipped_variants);
+        std::fs::write("/tmp/splice_mm_embeds_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // Loader: wait page_consumed, arrive page_ready.
+            "kittens::group<1>::wait(ss.page_consumed[3], 1);",
+            "kittens::group<1>::arrive(ss.page_ready[3]);",
+            // Consumer: wait page_ready, warp 0 arrives page_done.
+            "kittens::group<1>::wait(ss.page_ready[3], 0);",
+            "if (kittens::warpid() == 0) {",
+            "kittens::group<1>::arrive(ss.page_done[3]);",
+            // Storer: wait page_done, arrive page_consumed.
+            "kittens::group<1>::wait(ss.page_done[3], 1);",
+            "kittens::group<1>::arrive(ss.page_consumed[3]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+
+        // Negative: no role-body reads of kernel-arg locals
+        // (`act_ptrs[N]`, `weight_ptrs[...]`, `input_ids[t]`,
+        // `barrier_slots[N]`) and no TMA. The kernel signature
+        // still declares those args — these checks look for the
+        // INDEXING form which only role bodies emit. Passthrough
+        // touches only `ss.*` sems.
+        for forbidden in [
+            "act_ptrs[",
+            "weight_ptrs[",
+            "input_ids[",
+            "barrier_slots[",
+            "tma::load_async",
+            "tma::store_async",
+            "tma::expect_bytes",
+        ] {
+            assert!(
+                !cu.source.contains(forbidden),
+                "forbidden {forbidden:?} appeared in passthrough emit:\n{}",
+                cu.source
+            );
+        }
+    }
 }

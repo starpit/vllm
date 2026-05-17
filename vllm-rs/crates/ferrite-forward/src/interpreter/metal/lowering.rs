@@ -728,16 +728,35 @@ fn lower_one<W: CanonicalParams>(
                 // cost_us from the profile's CSV. Falls back to the
                 // MLX-mirrored heuristic when no profile (uncalibrated
                 // chip).
+                // qmv variant pick: default is the MLX-mirrored shape
+                // heuristic (qmv_fast when N%8==0 && K%512==0,
+                // qmv_quad when K∈{64,128}, else generic). The
+                // cost-CSV sweep methodology dispatches each variant
+                // in its own command buffer, so its per-call
+                // measurements include per-CB submit/wait fixed
+                // overhead that doesn't apply when many qmv calls
+                // share one MTL4 encoder in production. Empirically
+                // the CSV picked the wrong variant (slower generic
+                // over faster qmv_fast) for Llama-3.2-3B at decode
+                // — heuristic was 0.28 ms / 3% TPOT faster on
+                // single-stream M1 Max bench. Set
+                // `FERRITE_METAL_QMV_COST=1` to fall back to the
+                // (biased) cost-driven path for diagnosis or for
+                // off-grid shapes where the heuristic might be
+                // wrong.
+                let use_cost_path = std::env::var_os("FERRITE_METAL_QMV_COST").is_some();
                 let kernel = match profile {
-                    Some(p) => ferrite_metal_kernels::quantized::pick_qmv_kernel_by_cost(
-                        |name, mm, nn, kk| p.cost_us_for(name, mm, nn, kk),
-                        n_v,
-                        k_v,
-                        bits_v,
-                        gs,
-                        dtype,
-                    ),
-                    None => pick_qmv_kernel(n_v, k_v, bits_v),
+                    Some(p) if use_cost_path => {
+                        ferrite_metal_kernels::quantized::pick_qmv_kernel_by_cost(
+                            |name, mm, nn, kk| p.cost_us_for(name, mm, nn, kk),
+                            n_v,
+                            k_v,
+                            bits_v,
+                            gs,
+                            dtype,
+                        )
+                    }
+                    _ => pick_qmv_kernel(n_v, k_v, bits_v),
                 };
                 let (tg, tpg) = qmv_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                 let kernel_id = match kernel {

@@ -526,7 +526,52 @@ mod dispatcher {
         fn metal_dtype(&self) -> crate::interpreter::metal::MetalDtype {
             crate::interpreter::metal::MetalDtype::Bf16
         }
+
+        /// Metal forward + caller-supplied follow-on hook chained on
+        /// the forward CB's shared event. Used by the executor to
+        /// fuse argmax onto the forward CB so there's no host-side
+        /// sync between forward and sampling.
+        ///
+        /// Default impl falls back to plain `forward` and ignores the
+        /// hook — non-metal builds and arches that haven't been
+        /// re-emitted with the metal followup glue still build.
+        ///
+        /// # Safety
+        /// Same as [`Self::forward`].
+        #[cfg(feature = "metal")]
+        unsafe fn forward_with_metal_followup(
+            &self,
+            ctx: &ForwardCtx,
+            device: &mut GpuDevice,
+            num_tokens: u64,
+            _followup: Option<MetalForwardFollowup<'_>>,
+        ) -> OwnedTensor {
+            unsafe { self.forward(ctx, device, num_tokens) }
+        }
     }
+
+    /// Box for a Metal forward-encoder tail hook. Invoked on the same
+    /// MTL4 compute encoder used to encode the forward, AFTER the
+    /// forward dispatches and BEFORE `endEncoding`. The callee can
+    /// append additional dispatches (e.g. argmax sampling) so they
+    /// run inside the same command buffer with one commit and one
+    /// host wait. Receives:
+    ///   - the MTL4 compute encoder to append dispatches onto;
+    ///   - the logits MTLBuffer (the bucket's terminal arena slot);
+    ///   - `total_n` (logits row count) and `vocab` (column count).
+    /// MTL4 only.
+    #[cfg(feature = "metal")]
+    pub type MetalForwardFollowup<'a> = Box<
+        dyn FnOnce(
+                &::objc2::runtime::ProtocolObject<
+                    dyn ::objc2_metal::MTL4ComputeCommandEncoder,
+                >,
+                &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+                u32,
+                u32,
+            ) -> Result<(), String>
+            + 'a,
+    >;
 
     /// Minimal HF-config view threaded into `try_load` so per-variant
     /// `fingerprint_matches` can disambiguate checkpoints that share
@@ -888,6 +933,16 @@ mod dispatcher {
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
+#[cfg(feature = "metal")]
+pub use dispatcher::MetalForwardFollowup;
+/// Re-exports of the objc2/objc2_metal types referenced by macro-emitted
+/// `forward_with_metal_followup` / trait `MetalForwardFollowup` so consuming
+/// crates don't need direct `objc2`/`objc2_metal` deps.
+#[cfg(feature = "metal")]
+pub mod metal_followup_reexports {
+    pub use objc2::runtime::ProtocolObject;
+    pub use objc2_metal::{MTL4ComputeCommandEncoder, MTLBuffer};
+}
 // Multimodal sibling surface — text-side only crates (every metal
 // arch today) skip; cuda owns the vision pipeline.
 #[cfg(feature = "cuda")]

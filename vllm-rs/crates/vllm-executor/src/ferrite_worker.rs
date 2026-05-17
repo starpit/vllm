@@ -1853,6 +1853,25 @@ pub struct FerriteWorker {
     /// to avoid recompiling the MSL kernel each step.
     #[cfg(feature = "metal")]
     argmax_kernels: Option<ferrite_metal_kernels::argmax::ArgmaxKernels>,
+    /// Persistent argmax output buffer (sized for the largest
+    /// `total_n` we've seen). Reused across decode steps and bound
+    /// into [`Self::argmax_arg_table`] at index 1. Resized in place
+    /// when `total_n` grows.
+    #[cfg(feature = "metal")]
+    argmax_out_buf: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>>,
+    /// Persistent 8-byte buffer holding `[batch, vocab]` as two u32s.
+    /// Bound into [`Self::argmax_arg_table`] at indices 2 and 3 (with
+    /// offsets 0 and 4) for the kernel's `constant uint &batch` and
+    /// `constant uint &vocab` parameters. Updated per step.
+    #[cfg(feature = "metal")]
+    argmax_consts_buf: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>>,
+    /// Persistent MTL4 argument table for the argmax dispatch. Built
+    /// lazily when first needed and reused across decode steps;
+    /// addresses at indices 0 (logits), 1 (output), 2 (batch), 3
+    /// (vocab) are rebound each step before the dispatch is encoded
+    /// onto the forward command encoder.
+    #[cfg(feature = "metal")]
+    argmax_arg_table: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ArgumentTable>>>,
 }
 
 // Safety: FerriteWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -9368,6 +9387,9 @@ impl FerriteWorker {
             gpu_device: None,
             model: None,
             argmax_kernels: None,
+            argmax_out_buf: None,
+            argmax_consts_buf: None,
+            argmax_arg_table: None,
         }
     }
 
@@ -9987,9 +10009,137 @@ impl Worker for FerriteWorker {
             kv_cache,
         };
 
-        let logits = unsafe { model.forward(&ctx, device_mut, num_tokens as u64) };
+        // Build / refresh the persistent argmax MTL4 argument table
+        // and dimension buffer, then pass an encoder-tail closure to
+        // `forward_with_metal_followup` so argmax encodes onto the
+        // SAME MTL4 forward command encoder. Forward + argmax run as
+        // one CB, one commit, one host wait — closes the
+        // ~0.5 ms / 5% argmax sync hole at single-stream M=1 decode.
+        let needed_argmax_bytes = (num_tokens as usize).max(1) * 4;
+        let argmax_out_ok = self
+            .argmax_out_buf
+            .as_ref()
+            .map(|b| b.length() >= needed_argmax_bytes)
+            .unwrap_or(false);
+        if !argmax_out_ok {
+            self.argmax_out_buf = Some(
+                mtl_device
+                    .newBufferWithLength_options(
+                        needed_argmax_bytes,
+                        ::objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .expect("argmax_out_buf alloc"),
+            );
+        }
+        if self.argmax_consts_buf.is_none() {
+            self.argmax_consts_buf = Some(
+                mtl_device
+                    .newBufferWithLength_options(
+                        8,
+                        ::objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .expect("argmax_consts_buf alloc"),
+            );
+        }
+        if self.argmax_arg_table.is_none() {
+            use ::objc2_metal::MTL4ArgumentTableDescriptor;
+            let desc = MTL4ArgumentTableDescriptor::new();
+            desc.setMaxBufferBindCount(4);
+            self.argmax_arg_table = Some(
+                mtl_device
+                    .newArgumentTableWithDescriptor_error(&desc)
+                    .expect("argmax_arg_table alloc"),
+            );
+        }
+        // Pre-compute vocab from the model to bake into the consts
+        // buffer ahead of the forward call. The persistent dim buffer
+        // is laid out as [batch:u32, vocab:u32] at offsets 0 and 4.
+        let metal_vocab: u32 = {
+            // We need vocab BEFORE forward returns; pull it from the
+            // last known logits column count. First call has no
+            // history — fall back to 0 and let the closure update it
+            // once `forward_with_metal_followup` is in flight (the
+            // closure runs after worker has resolved bucket_idx but
+            // before the dispatch is encoded; we can read it then).
+            // For now: stash a model-side accessor via the trait.
+            model.vocab_size() as u32
+        };
+        // Argmax kernels reference (passed into the closure).
+        let argmax_kernels_ref = argmax_kernels;
+        let dtype = model.metal_dtype();
+        // Closure captures by move; uses raw pointers cast to usize for
+        // Send safety on the small handles.
+        let argmax_out_buf = self.argmax_out_buf.as_ref().expect("just set").clone();
+        let argmax_consts_buf = self.argmax_consts_buf.as_ref().expect("just set").clone();
+        let argmax_arg_table = self.argmax_arg_table.as_ref().expect("just set").clone();
+        let followup: ferrite_forward::MetalForwardFollowup<'_> = Box::new(
+            move |enc, logits_buf, total_n_actual, vocab_actual| -> Result<(), String> {
+                // Update consts buffer in-place (StorageModeShared).
+                let consts_ptr = argmax_consts_buf.contents().as_ptr() as *mut u32;
+                unsafe {
+                    *consts_ptr = total_n_actual;
+                    *consts_ptr.add(1) = vocab_actual;
+                }
+                // Bind logits, output, batch (offset 0), vocab (offset 4)
+                // into the persistent argument table.
+                use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
+                let logits_addr = logits_buf.gpuAddress();
+                let out_addr = argmax_out_buf.gpuAddress();
+                let consts_addr = argmax_consts_buf.gpuAddress();
+                unsafe {
+                    argmax_arg_table.setAddress_atIndex(logits_addr, 0);
+                    argmax_arg_table.setAddress_atIndex(out_addr, 1);
+                    argmax_arg_table.setAddress_atIndex(consts_addr, 2);
+                    argmax_arg_table.setAddress_atIndex(consts_addr + 4, 3);
+                }
+                let _ = vocab_actual; // vocab is in consts buf via address
+                match dtype {
+                    ferrite_forward::interpreter::metal::MetalDtype::F16 => {
+                        ferrite_metal_kernels::argmax::encode_argmax_f16_into_mtl4(
+                            argmax_kernels_ref,
+                            enc,
+                            &argmax_arg_table,
+                            total_n_actual,
+                        )
+                        .map_err(|e| format!("encode_argmax_f16: {e:?}"))?;
+                    }
+                    ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
+                        ferrite_metal_kernels::argmax::encode_argmax_bf16_into_mtl4(
+                            argmax_kernels_ref,
+                            enc,
+                            &argmax_arg_table,
+                            total_n_actual,
+                        )
+                        .map_err(|e| format!("encode_argmax_bf16: {e:?}"))?;
+                    }
+                    ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                        return Err("argmax: int4 dtype has no direct kernel".into());
+                    }
+                }
+                Ok(())
+            },
+        );
+        // FERRITE_METAL_DISABLE_FUSED_ARGMAX=1 routes argmax back to the
+        // legacy separate-CB synchronous dispatch path for A/B benching
+        // and bisection. Default fuses argmax onto the forward CB.
+        let disable_fused_argmax =
+            std::env::var_os("FERRITE_METAL_DISABLE_FUSED_ARGMAX").is_some();
+        let logits = if disable_fused_argmax {
+            drop(followup);
+            unsafe { model.forward(&ctx, device_mut, num_tokens as u64) }
+        } else {
+            unsafe {
+                model.forward_with_metal_followup(
+                    &ctx,
+                    device_mut,
+                    num_tokens as u64,
+                    Some(followup),
+                )
+            }
+        };
         let vocab = logits.dim(1) as u32;
         let total_n = logits.dim(0) as u32;
+        let _ = metal_vocab;
 
         // DIAGNOSTIC: peek at EACH row of logits. Tells us which
         // rows have real values vs zeros.
@@ -10012,38 +10162,48 @@ impl Worker for FerriteWorker {
             }
         }
 
-        // Argmax over `[total_n, vocab]` → `[total_n]` u32. We
-        // post-gather per-request last-token rows host-side rather
-        // than emit a per-row gather kernel; greedy bring-up.
-        let argmax_out = mtl_device
-            .newBufferWithLength_options(
-                (total_n as usize).max(1) * 4,
-                ::objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
-            .expect("newBufferWithLength_options returned nil");
+        // Argmax was either encoded onto the forward CB via the
+        // followup (default), or — when `disable_fused_argmax` is
+        // set — needs a separate synchronous dispatch now.
+        let argmax_out = self
+            .argmax_out_buf
+            .as_ref()
+            .expect("argmax_out_buf was set above")
+            .clone();
+        if disable_fused_argmax {
+            match model.metal_dtype() {
+                ferrite_forward::interpreter::metal::MetalDtype::F16 => {
+                    ferrite_metal_kernels::argmax::dispatch_argmax_f16(
+                        argmax_kernels,
+                        &device_mut.queue,
+                        logits.metal_buffer(),
+                        &argmax_out,
+                        total_n,
+                        vocab,
+                    )
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_f16: {e:?}")))?;
+                }
+                ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
+                    ferrite_metal_kernels::argmax::dispatch_argmax_bf16(
+                        argmax_kernels,
+                        &device_mut.queue,
+                        logits.metal_buffer(),
+                        &argmax_out,
+                        total_n,
+                        vocab,
+                    )
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_bf16: {e:?}")))?;
+                }
+                ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                    return Err(ExecutorError::WorkerExecution(
+                        "argmax: int4 dtype has no direct argmax kernel".into(),
+                    ));
+                }
+            }
+        }
         match model.metal_dtype() {
-            ferrite_forward::interpreter::metal::MetalDtype::F16 => {
-                ferrite_metal_kernels::argmax::dispatch_argmax_f16(
-                    argmax_kernels,
-                    &device_mut.queue,
-                    logits.metal_buffer(),
-                    &argmax_out,
-                    total_n,
-                    vocab,
-                )
-                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_f16: {e:?}")))?;
-            }
-            ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
-                ferrite_metal_kernels::argmax::dispatch_argmax_bf16(
-                    argmax_kernels,
-                    &device_mut.queue,
-                    logits.metal_buffer(),
-                    &argmax_out,
-                    total_n,
-                    vocab,
-                )
-                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_bf16: {e:?}")))?;
-            }
+            ferrite_forward::interpreter::metal::MetalDtype::F16 => {}
+            ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {}
             ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
                 return Err(ExecutorError::WorkerExecution(
                     "argmax: int4 dtype has no direct argmax kernel — \

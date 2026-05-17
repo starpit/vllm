@@ -6498,6 +6498,24 @@ pub fn emit_model(
             device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
         ) -> ::ferrite_cuda_core::OwnedTensor {
+            unsafe { forward_with_metal_followup(wm, ctx, device, num_tokens, None) }
+        }
+
+        /// Same as [`forward`] but takes an optional encoder-tail hook
+        /// that's invoked on the same MTL4 compute encoder used to
+        /// encode the forward, AFTER the bucket dispatches and BEFORE
+        /// `endEncoding`. Lets the caller (the executor's argmax
+        /// dispatch, today) append its own dispatches onto the same
+        /// CB so forward + tail share one commit and one host wait.
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_with_metal_followup(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
+            num_tokens: u64,
+            followup: ::core::option::Option<::ferrite_forward::MetalForwardFollowup<'_>>,
+        ) -> ::ferrite_cuda_core::OwnedTensor {
             use ::ferrite_forward::CanonicalParams as _;
             use ::ferrite_forward::interpreter::metal::__re::{Buffer, MTLResourceOptions};
 
@@ -6634,7 +6652,34 @@ pub fn emit_model(
             // handle clone — no copy) so the caller can read
             // `[num_tokens, vocab_size]` f16 logits without taking
             // ownership of the worker's arena.
-            pool.forward(
+            // Adapter: pool's tail receives `(encoder, worker, bucket_idx)`
+            // and returns `Result<(), ForwardError>`. The public hook
+            // is `(encoder, logits_buf, total_n, vocab) -> Result<(), String>`.
+            // Resolve logits + dims from the worker's arena and the
+            // canonical's compile-time vocab; map error variants.
+            let tail_adapter = followup.map(|f| {
+                move |enc: &::ferrite_forward::metal_followup_reexports::ProtocolObject<
+                          dyn ::ferrite_forward::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                      >,
+                      worker: &::ferrite_forward::interpreter::metal::MetalWorker<Weights>,
+                      bucket_idx: usize|
+                      -> ::core::result::Result<
+                    (),
+                    ::ferrite_forward::interpreter::metal::ForwardError,
+                > {
+                    let spec = &METAL_BUCKETS[bucket_idx];
+                    let logits_buf: &::ferrite_forward::metal_followup_reexports::ProtocolObject<
+                        dyn ::ferrite_forward::metal_followup_reexports::MTLBuffer,
+                    > = &worker.arena[spec.terminal_slot as usize];
+                    let total_n = n as u32;
+                    let vocab = METAL_VOCAB_SIZE as u32;
+                    f(enc, logits_buf, total_n, vocab).map_err(
+                        ::ferrite_forward::interpreter::metal::ForwardError::Followup,
+                    )
+                }
+            });
+
+            pool.forward_with_tail(
                 wm,
                 &device.queue,
                 &inputs,
@@ -6660,6 +6705,7 @@ pub fn emit_model(
                     );
                     ::ferrite_cuda_core::OwnedTensor::from_metal_buffer(inner, buf, bytes)
                 },
+                tail_adapter,
             )
             .expect("MetalWorkerPool::forward")
         }

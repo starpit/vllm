@@ -90,6 +90,9 @@ pub enum ForwardError {
     /// status. This is the GPU-side failure mode — Metal exposes only
     /// the enum, not the underlying NSError.
     ExecutionFailed(MTLCommandBufferStatus),
+    /// A caller-supplied followup hook (e.g. argmax encode + wait
+    /// chained on the forward CB's shared event) failed.
+    Followup(String),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -118,6 +121,7 @@ impl std::fmt::Display for ForwardError {
                 f,
                 "MetalWorkerPool::forward: command buffer status = {status:?} (expected Completed)"
             ),
+            Self::Followup(msg) => write!(f, "MetalWorkerPool::forward: followup hook failed: {msg}"),
         }
     }
 }

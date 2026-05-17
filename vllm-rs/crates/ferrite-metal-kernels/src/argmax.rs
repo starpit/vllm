@@ -7,9 +7,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
-    MTLSize,
+    MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLBuffer, MTLCommandBuffer,
+    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -244,6 +244,58 @@ pub fn dispatch_argmax_bf16(
             err_desc,
         )));
     }
+    Ok(())
+}
+
+/// MTL4 encoder-tail argmax dispatcher.
+///
+/// Encodes `setComputePipelineState` + `setArgumentTable` +
+/// `dispatchThreadgroups` onto a caller-supplied
+/// [`MTL4ComputeCommandEncoder`]. The caller is responsible for
+/// encoder/CB/queue lifecycle (typically the same encoder being used
+/// to encode the model forward — append argmax as the tail of the
+/// forward CB so they share one commit and one host wait).
+///
+/// The argument table must be pre-built with:
+/// - index 0: logits GPU address
+/// - index 1: output GPU address
+/// - index 2: 4-byte address holding `batch` (u32)
+/// - index 3: 4-byte address holding `vocab` (u32)
+pub fn encode_argmax_f16_into_mtl4(
+    kernels: &ArgmaxKernels,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+    batch: u32,
+) -> Result<(), MetalStreamError> {
+    encode_argmax_into_mtl4_inner(&kernels.f16, encoder, arg_table, batch, "argmax_f16")
+}
+
+pub fn encode_argmax_bf16_into_mtl4(
+    kernels: &ArgmaxKernels,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+    batch: u32,
+) -> Result<(), MetalStreamError> {
+    encode_argmax_into_mtl4_inner(&kernels.bf16, encoder, arg_table, batch, "argmax_bf16")
+}
+
+fn encode_argmax_into_mtl4_inner(
+    pipeline: &ComputePipelineState,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+    batch: u32,
+    name: &'static str,
+) -> Result<(), MetalStreamError> {
+    if batch == 0 {
+        return Err(MetalStreamError::ShaderCompilationFailed(format!(
+            "{name} encode: batch=0"
+        )));
+    }
+    encoder.setComputePipelineState(pipeline);
+    encoder.setArgumentTable(Some(arg_table));
+    let threadgroups = MTLSize { width: batch as usize, height: 1, depth: 1 };
+    let threads_per_tg = MTLSize { width: ARGMAX_DEFAULT_TG_SIZE, height: 1, depth: 1 };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
     Ok(())
 }
 

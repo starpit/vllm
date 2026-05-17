@@ -880,6 +880,35 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
     ) -> Result<(), ForwardError> {
+        self.run_bucket_mtl4_with_tail::<fn(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+            &MetalWorker<W>,
+            usize,
+        ) -> Result<(), ForwardError>>(worker, bucket_idx, num_tokens, None)
+    }
+
+    /// MTL4 forward dispatch + optional encoder-tail hook.
+    ///
+    /// When `tail = Some(f)`, after the worker has encoded the bucket's
+    /// dispatches and BEFORE the encoder is ended, the pool calls
+    /// `f(&encoder)` so the caller can append additional dispatches
+    /// (e.g. argmax) onto the same compute encoder. Forward + tail
+    /// share one CB, one commit, and one host wait — no separate
+    /// queue or shared event needed.
+    fn run_bucket_mtl4_with_tail<F>(
+        &self,
+        worker: &MetalWorker<W>,
+        bucket_idx: usize,
+        num_tokens: usize,
+        tail: Option<F>,
+    ) -> Result<(), ForwardError>
+    where
+        F: FnOnce(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+            &MetalWorker<W>,
+            usize,
+        ) -> Result<(), ForwardError>,
+    {
         use objc2::runtime::AnyObject;
         use std::ptr::NonNull;
         self.ensure_mtl4();
@@ -921,6 +950,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 worker
                     .run_bucket_mtl4(bucket_idx, num_tokens as u32, &enc)
                     .map_err(ForwardError::Worker)?;
+            }
+            // Caller-supplied encoder-tail hook (e.g. argmax dispatch)
+            // runs on the SAME MTL4 compute encoder as the forward —
+            // forward + tail share one CB, one commit, one host wait.
+            if let Some(t) = tail {
+                t(&enc, worker, bucket_idx)?;
             }
             enc.endEncoding();
             cb.endCommandBuffer();
@@ -1000,6 +1035,34 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         inputs: &ForwardInputs<'_>,
         with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
     ) -> Result<R, ForwardError> {
+        self.forward_with_tail::<R, fn(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+            &MetalWorker<W>,
+            usize,
+        ) -> Result<(), ForwardError>>(weights, queue, inputs, with_output, None)
+    }
+
+    /// Same as [`forward`], but takes an optional encoder-tail hook
+    /// invoked on the same MTL4 compute encoder as the forward,
+    /// AFTER the bucket's dispatches and BEFORE `endEncoding`. Lets
+    /// callers append additional dispatches (e.g. argmax sampling)
+    /// onto the same CB so the whole step lives in one command
+    /// buffer with one commit and one host wait.
+    pub fn forward_with_tail<R, F>(
+        &self,
+        weights: &W,
+        queue: &CommandQueue,
+        inputs: &ForwardInputs<'_>,
+        with_output: impl FnOnce(&MetalWorker<W>, usize) -> R,
+        tail: Option<F>,
+    ) -> Result<R, ForwardError>
+    where
+        F: FnOnce(
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+            &MetalWorker<W>,
+            usize,
+        ) -> Result<(), ForwardError>,
+    {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
 
         // Lazily commit + attach the allocator's residency set on the
@@ -1046,6 +1109,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 bucket_idx,
                 inputs.num_tokens as usize,
             )?;
+            // MTL3 path doesn't take an encoder tail (legacy path);
+            // caller's separate sync dispatch still applies.
+            let _ = &tail;
         } else {
             assert!(
                 guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
@@ -1053,7 +1119,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                  exceeds the 31-binding argument-table cap)",
                 bucket_idx,
             );
-            self.run_bucket_mtl4(&guard.worker, bucket_idx, inputs.num_tokens as usize)?;
+            self.run_bucket_mtl4_with_tail(
+                &guard.worker,
+                bucket_idx,
+                inputs.num_tokens as usize,
+                tail,
+            )?;
         }
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells

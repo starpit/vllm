@@ -1528,6 +1528,20 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant dispatch arms for `forward_with_metal_followup`.
+    let forward_with_followup_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::forward_with_metal_followup(w, ctx, device, num_tokens, followup)
+                },
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
     // emits this const from the macro's per-canonical metal_emission;
     // shim variants re-export the canonical's. The trait impl below
@@ -1818,6 +1832,25 @@ fn emit_arch_dispatcher(
             }
         }
 
+        /// Same as [`forward`] but with an MTL4 encoder-tail hook.
+        /// See `MetalForwardFollowup` for semantics.
+        ///
+        /// # Safety
+        /// Same as [`forward`].
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_with_metal_followup(
+            w: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
+            num_tokens: u64,
+            followup: ::core::option::Option<::ferrite_forward::MetalForwardFollowup<'_>>,
+        ) -> ::ferrite_cuda_core::OwnedTensor {
+            match w {
+                #(#forward_with_followup_arms)*
+            }
+        }
+
         /// Dispatching backbone-only forward (no lm_head). Returns
         /// `[num_tokens, hidden_size]` as an independently-owned
         /// `OwnedTensor`. For pipeline-parallel intermediate ranks
@@ -1892,6 +1925,17 @@ fn emit_arch_dispatcher(
                 match self {
                     #(#metal_arena_peak_arms)*
                 }
+            }
+
+            #[cfg(feature = "metal")]
+            unsafe fn forward_with_metal_followup(
+                &self,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
+                num_tokens: u64,
+                followup: ::core::option::Option<::ferrite_forward::MetalForwardFollowup<'_>>,
+            ) -> ::ferrite_cuda_core::OwnedTensor {
+                unsafe { forward_with_metal_followup(self, ctx, device, num_tokens, followup) }
             }
         }
 

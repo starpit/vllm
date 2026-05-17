@@ -753,6 +753,15 @@ impl<
         const OUT_ACT_SLOT: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
         cap: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_tanh_soft_cap");
@@ -1675,15 +1684,29 @@ mod tests {
 
     #[test]
     fn lowers_tanh_soft_cap() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         let mut b = BuilderD::new();
-        b.push_tanh_soft_cap::<0, 1, 0, 1, 0, 2048, 8, 0, 1>(30.0);
+        b.push_tanh_soft_cap(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            30.0,
+        );
         let tape = b.finish();
         let MegaNode::TanhSoftCap(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.cap.raw(), 30.0);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.num_tokens(), 8);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.num_tokens().raw(), 8);
     }
 
     #[test]

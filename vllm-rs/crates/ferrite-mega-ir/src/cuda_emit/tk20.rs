@@ -248,6 +248,24 @@ pub fn warp_add_rv_rv(
     ))
 }
 
+/// `kittens::warp::add(dst, src, scalar);` — rv-scalar broadcast add.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh:54-55` (the
+/// `bin_op(T &dst, const T &src, const typename T::dtype &param)`
+/// scalar overload — `add` reaches it via the same dispatch).
+pub fn warp_add_rv_scalar_f32(
+    dst: &Rv<F32>,
+    src: &Rv<F32>,
+    scalar: &CuExpr,
+) -> CuStmt {
+    debug_assert_eq!(dst.len(), src.len());
+    CuStmt::new(format!(
+        "kittens::warp::add({dst}, {src}, {scalar});",
+        dst = dst.expr(),
+        src = src.expr()
+    ))
+}
+
 /// `kittens::warp::mul(dst, src, scalar);` — rv-scalar broadcast.
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:54-55` (the

@@ -13,7 +13,9 @@
 //! sprint, each variant's emitted `.cu` must compile against TK
 //! 2.0 on the pod before it's "done."
 
-use crate::nodes::{Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
+use crate::nodes::{
+    Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
+};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr};
@@ -53,7 +55,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
-        MegaNode::ScalarOffsetRmsNorm(_) => RoleBodies::skipped("ScalarOffsetRmsNorm"),
+        MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
         MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
         MegaNode::FusedCublasGemmAdd(_) => RoleBodies::skipped("FusedCublasGemmAdd"),
         MegaNode::CutlassFusedNormGemm(_) => RoleBodies::skipped("CutlassFusedNormGemm"),
@@ -705,6 +707,134 @@ fn emit_fused_add_rms_norm(n: &FusedAddRmsNorm, budget: TapeBudget) -> RoleBodie
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &residual_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+
+// ============================================================
+// ScalarOffsetRmsNorm — out = (act * scale) * (weight + offset)
+// ============================================================
+
+fn emit_scalar_offset_rms_norm(
+    n: &ScalarOffsetRmsNorm,
+    budget: TapeBudget,
+) -> RoleBodies {
+    let in_page = n.in_page();
+    let weight_page = n.weight_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let layer = n.layer().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let in_act_slot = n.in_act_slot().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+    let bar_reduce = n.consumer_bar_reduce().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+    let eps_value = n.eps().raw();
+    let offset_value = n.offset.raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(ncw > 0 && hidden_dim % ncw == 0);
+    let k_per_warp = hidden_dim / ncw;
+    let num_layers = budget.num_layers.max(1);
+
+    let in_smem = page_as_sv_bf(in_page, hidden_dim);
+    let weight_smem = page_as_sv_bf(weight_page, hidden_dim);
+    let in_ready = page_ready_sem(in_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let in_done = page_done_sem(in_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let partial = scratch_as::<super::handles::F32>(n.partial_offset());
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+
+    let bf16_size_bytes = 2_u32;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+    let weight_bytes = hidden_dim * bf16_size_bytes;
+
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &weight_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &in_smem, &in_gmem, act_bytes, &in_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &weight_ready, weight_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &weight_smem, &weight_gmem, weight_bytes, &weight_ready,
+    ));
+
+    let launcher = CuBlock::new();
+
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &weight_ready, consumer_phase));
+
+    let (decl_act, act_rv) = tk20::decl_rv_fl("__sors_act_rv", k_per_warp);
+    let (decl_sq, sq_rv) = tk20::decl_rv_fl("__sors_sq_rv", k_per_warp);
+    let (decl_w, weight_rv) = tk20::decl_rv_fl("__sors_weight_rv", k_per_warp);
+    consumer.push(decl_act);
+    consumer.push(decl_sq);
+    consumer.push(decl_w);
+
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &act_rv, &in_smem));
+
+    consumer.push(tk20::warp_copy_rv(&sq_rv, &act_rv));
+    consumer.push(tk20::warp_mul_rv_rv(&sq_rv, &sq_rv, &sq_rv));
+    let (decl_partial, partial_sum_expr) =
+        tk20::decl_local_f32("__sors_partial_sum", "0.0f");
+    consumer.push(decl_partial);
+    consumer.push(tk20::warp_sum_to_scalar_f32(&partial_sum_expr, &sq_rv));
+    let (decl_full, full_sum_expr) =
+        tk20::decl_local_f32("__sors_full_sum", "0.0f");
+    consumer.push(decl_full);
+    consumer.push(tk20::cross_warp_reduce_sum_f32(
+        full_sum_expr.as_str(),
+        partial_sum_expr.as_str(),
+        &partial,
+        ncw,
+        bar_reduce,
+    ));
+    let (decl_scale, scale_expr) = tk20::decl_rms_scale_local(
+        "__sors_scale",
+        full_sum_expr.as_str(),
+        hidden_dim,
+        eps_value,
+    );
+    consumer.push(decl_scale);
+    consumer.push(tk20::warp_mul_rv_scalar_f32(&act_rv, &act_rv, &scale_expr));
+
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &weight_rv, &weight_smem));
+    let offset_lit = CuExpr::new(format!("{:e}f", offset_value));
+    consumer.push(tk20::warp_add_rv_scalar_f32(&weight_rv, &weight_rv, &offset_lit));
+    consumer.push(tk20::warp_mul_rv_rv(&act_rv, &act_rv, &weight_rv));
+
+    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(ncw, &in_smem, &act_rv));
+
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &in_done),
+        tk20::group_arrive(1, &weight_consumed),
+    ]));
+
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &in_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw(
+        1, &out_gmem, &in_smem, act_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &in_consumed));
 
     RoleBodies {
         loader,

@@ -339,6 +339,54 @@ mod tests {
         }
     }
 
+    /// Sprint 6: ScalarOffsetRmsNorm — out = (act * scale) *
+    /// (weight + offset). gemma2's rms_norm_offset reformulation.
+    #[test]
+    fn scalar_offset_rms_norm_emits_tk20_calls() {
+        use crate::substrate::RmsNormScope;
+        let mut b = BuilderD::new();
+        b.push_scalar_offset_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // weight
+            ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<5, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<3, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
+            "W::sors".to_string(),
+            1.0_f32,
+            1.0e-5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_sors", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/scalar_offset_rms_norm_emit.cu", &cu.source).ok();
+
+        for needle in [
+            "kittens::group<8>::load(__sors_act_rv,",
+            "kittens::warp::sum(__sors_partial_sum, __sors_sq_rv);",
+            "kittens::group<8>::sync(1);",
+            "kittens::warp::mul(__sors_act_rv, __sors_act_rv, __sors_scale);",
+            "kittens::warp::add(__sors_weight_rv, __sors_weight_rv, 1e0f);",
+            "kittens::warp::mul(__sors_act_rv, __sors_act_rv, __sors_weight_rv);",
+            "kittens::group<8>::sync(2);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// Sprint 5: FusedAddRmsNorm — residual+=delta, then RmsNorm,
     /// in-place to residual page.
     #[test]

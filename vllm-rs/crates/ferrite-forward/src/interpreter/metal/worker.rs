@@ -26,7 +26,8 @@ use ::objc2::runtime::ProtocolObject;
 use ::objc2_metal::MTL4ComputeCommandEncoder;
 
 use super::lowered::{
-    Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightBundleKind, WeightTensor,
+    Binding, KernelId, KvCacheWhich, LoweredCommand, LoweredMetalTape, MetalDtype,
+    PerLayerArgField, RuntimeBindingKind, WeightBundleKind, WeightTensor,
 };
 use super::pipelines::{PipelineLookupError, SpecializedPipelines};
 use super::runtime::RuntimeBindings;
@@ -123,6 +124,33 @@ pub struct BucketBaking {
     /// top_k stamps. ICB-bound commands access this via
     /// `setBuffer_offset_atIndex` like any other device buffer.
     pub moe_inline_buf: Option<Buffer>,
+    /// Persistent whole-forward decode argument buffer + residency
+    /// list. `Some` iff one of this bucket's commands references
+    /// `Binding::PerLayerArgumentBuffer` (i.e. the solver picked
+    /// `MetalForwardDecodePersistentImpl` for some workload point).
+    /// The dispatch path must `useResources(&residency, ...,
+    /// MTLResourceUsage::Read)` before dispatching the matching
+    /// persistent command so indirect-pointer loads through the
+    /// argument buffer don't fault on non-resident weights.
+    pub forward_persistent_baking: Option<PerLayerArgBufferBaking>,
+}
+
+/// Baked Tier-2 MTLArgumentBuffer + residency list for a
+/// `Binding::PerLayerArgumentBuffer`. Built once at bake time
+/// (weight buffer pointers are stable across forwards) and reused
+/// every dispatch. Lives on the `BucketBaking`.
+pub struct PerLayerArgBufferBaking {
+    /// Shared-storage MTLBuffer of `num_layers * fields.len() * 8`
+    /// bytes. Each 8-byte slot is a u64 GPU virtual address (= the
+    /// underlying buffer's `gpuAddress()` plus its byte offset).
+    /// MSL reads through `device const PerLayerWeights*` at
+    /// `[[buffer(N)]]` where N matches `binding_index`.
+    pub buffer: Buffer,
+    /// All distinct underlying MTLBuffers referenced via the
+    /// argument buffer. Passed to `useResources:count:usage:` on
+    /// the compute encoder before every dispatch. Deduplicated by
+    /// raw pointer at bake time so the residency list is minimal.
+    pub residency: Vec<Buffer>,
 }
 
 #[derive(Debug)]
@@ -488,7 +516,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             r.insert(&runtime.cu_seqlens_q);
             r.insert(&runtime.seq_used_k);
             r.insert(&runtime.block_table);
-            r.commit();
+            // Hold off on `commit()` until after we've baked per-bucket
+            // artifacts — the persistent-forward bucket bake adds a
+            // Tier-2 MTLArgumentBuffer + its referenced weight/KV-cache
+            // buffers to the residency set; one combined commit avoids
+            // a second residency round-trip.
         }
 
         let mut bucket_bakings = Vec::with_capacity(bucket_tapes.len());
@@ -513,11 +545,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
             if let (Some(r), Some(b)) = (residency, baking.moe_inline_buf.as_ref()) {
                 r.insert(b);
             }
+            // Insert the persistent-forward argument buffer + every
+            // underlying weight/KV-cache buffer it references into the
+            // residency set so MTL3 + MTL4 dispatches don't fault on
+            // indirect-pointer loads through the argument buffer.
+            if let Some(persistent) = baking.forward_persistent_baking.as_ref() {
+                if let Some(r) = residency {
+                    r.insert(&persistent.buffer);
+                    for b in &persistent.residency {
+                        r.insert(b);
+                    }
+                }
+            }
             bucket_bakings.push(baking);
         }
         if let (Some(r), Some(b)) = (residency, moe_scratch.as_ref()) {
             r.insert(b);
-            r.commit();
         }
 
         // Each ICB built during bake_bucket needs to be resident
@@ -535,6 +578,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     }
                 }
             }
+        }
+        // Single commit after every residency insert from this worker
+        // is done (runtime + persistent-forward arg buffers + MoE
+        // scratch + MoE inline + ICBs).
+        if let Some(r) = residency {
+            r.commit();
         }
 
         Ok(Self {
@@ -1042,6 +1091,32 @@ fn bake_bucket<W: CanonicalParams>(
     let mut inline_cursor: u32 = 0;
 
     let mut steps: Vec<BucketStep> = Vec::new();
+    // Scan ahead for the at-most-one command with a
+    // `Binding::PerLayerArgumentBuffer`. The persistent whole-forward
+    // decode kernel is the only consumer today; if/when other
+    // persistent-shape kernels land that also take a per-layer arg
+    // buffer, this scan generalizes to a `HashMap<cmd_idx,
+    // PerLayerArgBufferBaking>`. For now, one is enough.
+    let mut forward_persistent_baking: Option<PerLayerArgBufferBaking> = None;
+    let mut forward_persistent_cmd_idx: Option<usize> = None;
+    for (cmd_idx, cmd) in tape.commands.iter().enumerate() {
+        for b in &cmd.bindings {
+            if let Binding::PerLayerArgumentBuffer { .. } = b {
+                if forward_persistent_baking.is_some() {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "bake_bucket: more than one PerLayerArgumentBuffer \
+                                 binding in the same bucket — only one persistent \
+                                 whole-forward command is supported per bucket today",
+                    });
+                }
+                let baking = build_per_layer_arg_buffer(
+                    &device, b, weights, allocator, runtime,
+                )?;
+                forward_persistent_baking = Some(baking);
+                forward_persistent_cmd_idx = Some(cmd_idx);
+            }
+        }
+    }
 
     for (cmd_idx, cmd) in tape.commands.iter().enumerate() {
         if matches!(cmd.kernel, KernelId::Gemm) {
@@ -1198,6 +1273,13 @@ fn bake_bucket<W: CanonicalParams>(
             .pipeline_for_command::<W>(cmd)
             .map_err(WorkerError::PipelineLookup)?;
 
+        // Plug in the pre-built per-layer argument buffer for the
+        // matching command, if this is the persistent-forward one.
+        let per_layer_arg_buf: Option<&Buffer> = if forward_persistent_cmd_idx == Some(cmd_idx) {
+            forward_persistent_baking.as_ref().map(|b| &b.buffer)
+        } else {
+            None
+        };
         let bound = resolve_bindings(
             bucket_index,
             cmd_idx,
@@ -1208,6 +1290,7 @@ fn bake_bucket<W: CanonicalParams>(
             moe_inline_buf.as_ref(),
             &mut inline_cursor,
             persistent_barrier_counter,
+            per_layer_arg_buf,
             weights,
             allocator,
             runtime,
@@ -1322,6 +1405,7 @@ fn bake_bucket<W: CanonicalParams>(
         steps,
         mtl4_steps,
         moe_inline_buf,
+        forward_persistent_baking,
     })
 }
 
@@ -1359,6 +1443,7 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
         moe_inline_buf,
         inline_cursor,
         /*persistent_barrier_counter=*/ None,
+        /*per_layer_arg_buffer=*/ None,
         weights,
         allocator,
         runtime,
@@ -1673,6 +1758,118 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
         })
 }
 
+/// One field stride in `struct PerLayerWeights` — a single `device
+/// const T*` pointer, 8 bytes on Apple Silicon.
+const PER_LAYER_FIELD_STRIDE: u64 = 8;
+
+/// Build the Tier-2 MTLArgumentBuffer that backs a
+/// `Binding::PerLayerArgumentBuffer`. Encodes each per-layer field's
+/// GPU virtual address (`underlying.gpuAddress() + offset`) into the
+/// buffer at byte offset `layer * stride_per_layer + arg_id * 8`,
+/// matching the layout the MSL `struct PerLayerWeights` expects when
+/// read through `device const PerLayerWeights* table` and indexed by
+/// `table[__layer]`.
+///
+/// Tier-2 argument buffers on Apple Silicon allow direct pointer
+/// encoding (no `MTLArgumentEncoder` round-trip needed): the GPU
+/// virtual address space is unified, so a u64 written into the
+/// buffer is a valid `device T*` after the kernel loads it. The
+/// `MTL4ArgumentTable::setAddress_atIndex` path already uses this
+/// idiom for top-level kernel-arg bindings.
+///
+/// Residency: the dispatch must `useResources(...)` every underlying
+/// buffer because the indirect-pointer load itself doesn't trigger
+/// Metal's automatic residency tracking. The returned `residency`
+/// vec is deduplicated by raw `MTLBuffer` pointer so the
+/// `useResources` call stays minimal even on a 16-layer transformer
+/// where every layer's weights live in a shared arena.
+fn build_per_layer_arg_buffer<W: CanonicalParams + crate::WeightAccessors>(
+    device: &Device,
+    binding: &Binding,
+    weights: &W,
+    allocator: &MetalAllocator,
+    runtime: &RuntimeBindings,
+) -> Result<PerLayerArgBufferBaking, WorkerError> {
+    let (num_layers, fields, _binding_index) = match binding {
+        Binding::PerLayerArgumentBuffer {
+            num_layers,
+            fields,
+            binding_index,
+        } => (*num_layers, fields.as_slice(), *binding_index),
+        _ => unreachable!(
+            "build_per_layer_arg_buffer called on non-PerLayerArgumentBuffer binding"
+        ),
+    };
+    assert!(num_layers > 0, "PerLayerArgumentBuffer: num_layers must be > 0");
+    assert!(
+        !fields.is_empty(),
+        "PerLayerArgumentBuffer: fields must be non-empty"
+    );
+
+    let stride_bytes = (fields.len() as u64) * PER_LAYER_FIELD_STRIDE;
+    let total_bytes = stride_bytes * num_layers as u64;
+    let buffer = device
+        .newBufferWithLength_options(
+            total_bytes as usize,
+            MTLResourceOptions::StorageModeShared,
+        )
+        .ok_or(WorkerError::WeightLookupFailed {
+            reason: "PerLayerArgumentBuffer: newBufferWithLength_options returned nil",
+        })?;
+
+    let mut residency: Vec<Buffer> = Vec::new();
+    let mut seen_ptrs: std::collections::HashSet<*const std::ffi::c_void> =
+        std::collections::HashSet::new();
+
+    for layer in 0..num_layers {
+        for field in fields {
+            let (underlying, off, arg_id): (Buffer, u64, u8) = match field {
+                PerLayerArgField::Weight {
+                    arg_id,
+                    kind,
+                    which,
+                    locator,
+                } => {
+                    let (b, o) = resolve_weight(weights, allocator, kind, layer, *which, *locator)?;
+                    (b, o, *arg_id)
+                }
+                PerLayerArgField::KvCache { arg_id, which } => {
+                    let kind = match which {
+                        KvCacheWhich::K => RuntimeBindingKind::KvCacheK {
+                            layer: super::ids::LayerId(layer),
+                        },
+                        KvCacheWhich::V => RuntimeBindingKind::KvCacheV {
+                            layer: super::ids::LayerId(layer),
+                        },
+                    };
+                    (runtime.buffer_for(kind).clone(), 0u64, *arg_id)
+                }
+            };
+
+            let addr: u64 = underlying.gpuAddress() + off;
+            let byte_offset =
+                (layer as u64) * stride_bytes + (arg_id as u64) * PER_LAYER_FIELD_STRIDE;
+            // The argument buffer is shared-storage so `contents()` is
+            // a CPU-writable pointer. The kernel never writes through
+            // its `device const T*` views, so no host-side flush is
+            // required (StorageModeShared is coherent on Apple
+            // Silicon's unified-memory architecture).
+            unsafe {
+                let p =
+                    (buffer.contents().as_ptr() as *mut u8).add(byte_offset as usize) as *mut u64;
+                p.write_unaligned(addr);
+            }
+
+            let raw = Retained::as_ptr(&underlying) as *const std::ffi::c_void;
+            if seen_ptrs.insert(raw) {
+                residency.push(underlying);
+            }
+        }
+    }
+
+    Ok(PerLayerArgBufferBaking { buffer, residency })
+}
+
 /// Resolve every binding on `cmd` to (buffer, offset, binding-index).
 ///
 /// Returns owned `Buffer` clones (cheap ObjC refcount) so callers
@@ -1689,6 +1886,7 @@ fn resolve_bindings<W: CanonicalParams>(
     moe_inline_buf: Option<&Buffer>,
     inline_cursor: &mut u32,
     persistent_barrier_counter: Option<&Buffer>,
+    per_layer_arg_buffer: Option<&Buffer>,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
@@ -1786,21 +1984,21 @@ fn resolve_bindings<W: CanonicalParams>(
                 }
                 (counter.clone(), 0u64, *binding_index as u64)
             }
-            Binding::PerLayerArgumentBuffer { .. } => {
-                // The argument-buffer construction path lives in
-                // `bake_bucket` (step 4 of the persistent-decode chain).
-                // The bake step is responsible for allocating the
-                // MTLBuffer + encoding all `num_layers × fields.len()`
-                // pointer entries BEFORE calling `resolve_bindings`, so
-                // by the time the binding reaches this resolver it
-                // must already be paired with a concrete buffer through
-                // a side-channel. Until step 4 is wired, surface a
-                // distinct error rather than silently producing a
-                // half-baked binding.
-                return Err(WorkerError::PerLayerArgumentBufferUnwired {
-                    bucket_index,
-                    command_index,
-                });
+            Binding::PerLayerArgumentBuffer { binding_index, .. } => {
+                // The argument buffer itself was built and stored on
+                // `BucketBaking::forward_persistent_baking` by
+                // `bake_bucket` BEFORE calling `resolve_bindings`. The
+                // side-channel `per_layer_arg_buffer: Option<&Buffer>`
+                // carries the pre-built handle into this resolver so
+                // we can plug it in as a normal `(buffer, offset, idx)`
+                // entry like the other shared resources.
+                let arg = per_layer_arg_buffer.ok_or(
+                    WorkerError::PerLayerArgumentBufferUnwired {
+                        bucket_index,
+                        command_index,
+                    },
+                )?;
+                (arg.clone(), 0u64, *binding_index as u64)
             }
         };
         out.push((buf, off, idx));

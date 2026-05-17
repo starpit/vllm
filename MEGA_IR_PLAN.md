@@ -326,17 +326,102 @@ this plan is structured to prevent.
 
 ## 8. INVIOLABLE INVARIANTS
 
+### 8.0a. TK 2.0 PRIMITIVES ONLY. NO TK 1.0 BULLSHIT.
+
+The emit step calls **TK 2.0 primitives only**. The TK 2.0 primitive
+surface lives in:
+
+```
+third_party/thunderkittens/include/         ← TK 2.0 (canonical)
+  types/global/gl.cuh                       ← gl<T, b, d, r, c, TMA_Types...>
+  types/global/tma.cuh                      ← tensor-map descriptor dict
+  ops/group/memory/tile/tma.cuh             ← tma::load_async / store_async
+  ops/group/util/sync.cuh                   ← arrive / wait
+  ops/group/group.cuh                       ← group<N>::sync(int id)
+  ops/group/mma/warp.cuh                    ← mma_AB / mma_ABt / ...
+  ops/group/register/{tile,vec}/maps.cuh    ← warp::add / mul / sum / ...
+  types/register/{rt,rv}.cuh                ← register tile / vector types
+```
+
+The TK 1.0 / VM-style reference lives in:
+
+```
+third_party/thunderkittens/tests/vm/llama_official/  ← TK 1.0-style
+  matvec_pipeline.cuh                                ← raw-ptr scheduling
+  rms_matvec_rope_append.cu                          ← old globals + PTM
+  utils.cuh                                          ← helpers (some valid)
+```
+
+**Reading the TK 1.0 / VM reference for emit pattern recognition is a
+documented failure mode.** It looks like working CUDA, the function
+names overlap, but the calling conventions diverge in ways that don't
+fail any narrow per-variant unit test — they only fail at link/compile
+time against actual TK 2.0. The previous cuda_emit revision shipped 9
+sprints of code that pattern-matched on `tests/vm/llama_official/`
+references (raw `bf16**` Globals tables, `g.act_ptrs[3]` index math,
+init-list `{0}` coordinates) and was nuked without ever compiling once
+against TK 2.0.
+
+Concrete TK 2.0 contracts every emit must respect:
+
+- **Globals are `gl<...>` descriptors**, not raw `T**` tables.
+  `gl<T, b, d, r, c, TMA_Types...>` carries a `T* raw_ptr` plus
+  compile-time-or-runtime dims plus a `tma_descs` dict over the
+  shared-tile types it'll be TMA'd against. Constructed host-side
+  via `gl(T*, batch, depth, rows, cols)`.
+- **TMA calls take a `gl` by reference and a `coord<>` index**:
+  `kittens::tma::load_async(ST &dst, const GL &src, const COORD &idx,
+  semaphore& bar)`. NOT raw pointers. NOT init-lists.
+- **Cross-warp sync is `kittens::group<N>::sync(int id)`** for named
+  PTX `bar.sync` 1..=15 (bar 0 = `__syncthreads`). The IR's `BarRef`
+  fields feed this.
+- **Mbarrier handoff is `kittens::wait(sem, phase)` /
+  `kittens::arrive(sem)`**. The IR's `MbarrierPhase` typestate +
+  page-handoff semaphores in `ferrite_substrate.cuh::SharedState`
+  feed this.
+- **Matmul is `kittens::warp::mma_AB(D, A, B, C)` and friends**
+  on register tiles, NOT a hand-rolled "matvec_pipeline" port.
+  Layout shapes (rt_fl/rt_bf, NxK/NxM/MxK) come from the IR's
+  matmul-shape primitives.
+
+**Workflow before emitting any new variant:**
+
+1. **Read the actual TK 2.0 primitive header for every call you'd
+   emit.** If a header doesn't exist or you can't find the signature,
+   the primitive doesn't exist — find another way or add an IR field.
+2. **Check the host-side ABI** in `crates/ferrite-forward/src/
+   interpreter/mega/mod.rs` (`LaunchArgs*`, `launch*` fns). The
+   kernel signature you emit must match what the host already
+   constructs and passes.
+3. **If the emit needs a value not on the IR, STOP — extend the IR.**
+   This rule is §8.0; the TK 2.0 constraint is §8.0a; both apply.
+
 ### 8.0. MEGAIR IS THE AST FOR THE EMITTED `.cu`.
 
 Every kernel template parameter and every kernel runtime arg the
 emitted `.cu` needs is a typed field on the corresponding `MegaNode`
-variant (see §0). Emit is pure literal transcription:
-`format!("ferrite::ops::<op>::consumer<FerriteConfig, {hidden_dim},
-{num_tokens}>(ss, /*base_stage=*/{base_stage}, warp_in_role,
-/*eps=*/{eps:e}f);", ...)` — read getters, splice, done. No
-inference, no helper computation that shapes the emitted source, no
-"wiring up" anything not on the node. **If the IR lacks a field the
-`.cu` needs, STOP — extend the IR. Do NOT invent on the emit side.**
+variant (see §0). Emit is pure literal transcription: read typed
+getters off the IR, splice them into TK 2.0 primitive calls (see
+§8.0a). No inference, no helper computation that shapes the emitted
+source, no "wiring up" anything not on the node. **If the IR lacks
+a field the `.cu` needs, STOP — extend the IR. Do NOT invent on the
+emit side.**
+
+The shape of every variant's emit body is determined by:
+
+- The IR's typed-field surface (HIDDEN_DIM, NUM_TOKENS, page IDs,
+  scratch offsets, mbarrier phases, BAR IDs, weight-accessor
+  indices, ...) — these are the *values* spliced in.
+- The TK 2.0 primitive surface (§8.0a) — these are the *function
+  calls* spliced in.
+- Ferrite's substrate (`ferrite_substrate.cuh::SharedState<Config>`,
+  `ferrite_warp_roles.cuh`, `ferrite_barrier.cuh`) — these define
+  the per-CTA scaffolding the emit wraps the primitives in.
+
+There is no fourth source. There are no per-op `.cuh` wrappers
+(those were nuked); there is no hand-rolled scheduling logic; there
+is no "matvec_pipeline port." If you find yourself reaching for any
+of those, stop and re-read §8.0a.
 
 A scaffold that ships an emit pipeline whose data model can't reach
 the kernel ABI is not progress; it is structural debt that must be
@@ -485,13 +570,35 @@ coherent E2E output on `unsloth/Llama-3.2-1B-Instruct`.
 >   `.cuh` kernel — substrate work, not AST work.
 > - **0 errors.**
 >
-> Branch: `worktree-ff-mega-codegen`. Head:
-> `18ee08f95 ferrite-mega-ir: AST extension — CutlassFusedNormGemm,
-> AttentionViaCache, SpliceMmEmbeds`. Linear chain from the wrong-
-> scaffold revert: `288324633` →
-> `4dc3b7210` → `68059b38e` → `36b84a266` → `0978359bd` → `18ee08f95`.
+> ## TK 1.0 pollution incident — 2026-05-17
 >
-> Next: write `cuda_emit::lower_to_cuda` as pure literal
-> `format!()` transcription. Reference: `crates/ferrite-kernels/
-> csrc/smoke/ferrite_pool_abi_smoke.cu` lines 117-174 — every
-> variant's emit must produce text of that form.
+> A first attempt at `cuda_emit` shipped 9 sprints (foundation +
+> RmsNorm + Add + ScalarMul + TanhSoftCap + FusedAddRmsNorm +
+> ScalarOffsetRmsNorm + Embed + BarrierSignal/Wait) that
+> pattern-matched on `tests/vm/llama_official/` (TK 1.0-style)
+> reference code and would NOT compile against TK 2.0's actual
+> primitive surface (raw `bf16**` Globals tables instead of
+> `kittens::gl<...>`; init-list `{0}` coordinates instead of
+> `coord<>`; no `gl::tma_descs` for the TMA descriptor dict). The
+> per-variant unit tests passed because they only checked emitted
+> text patterns, never compiled the output against TK 2.0.
+>
+> **Recovery:** the `crates/ferrite-mega-ir/src/cuda_emit/`
+> directory has been nuked. The IR-side additions made during
+> those sprints are kept because they're substrate / model-metadata,
+> ABI-neutral:
+>
+> - `TapeBudget.num_layers` (model param, used for weight indexing)
+> - `MegaTapeBuilder::finish(num_layers)` (companion API change)
+> - FusedAddRmsNorm `consumer_bar_reduce` / `consumer_bar_publish`
+>   / `bar_pair_proof` (sealed-witness BAR IDs in 1..=15 — feed
+>   into TK 2.0's `kittens::group<N>::sync(int id)` legitimately)
+> - ScalarOffsetRmsNorm: same three fields
+> - Proc-macro side emits the BAR literals + `b.finish(NUM_LAYERS)`
+>
+> Re-emit happens against TK 2.0 from a clean audit. See §8.0a for
+> the inviolable TK 2.0-only constraint and the workflow.
+>
+> Next: TK 2.0 surface audit (gl, coord, tma::*, warp::*, mma_*,
+> group<N>::sync), THEN cuda_emit rebuild starting from RmsNorm,
+> THEN E2E coherence on `unsloth/Llama-3.2-1B-Instruct` per §7.

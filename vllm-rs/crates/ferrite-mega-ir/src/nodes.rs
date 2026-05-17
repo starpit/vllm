@@ -1439,18 +1439,18 @@ impl TanhSoftCap {
 /// as RmsNorm plus a `float offset` runtime arg in the consumer's
 /// scale-multiply step.
 pub struct ScalarOffsetRmsNorm {
-    in_page_id: u32,
-    weight_page_id: u32,
-    partial_offset: u32,
-    partial_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    layer: u32,
-    hidden_dim: u32,
-    num_tokens: u32,
-    in_act_slot: u32,
-    out_act_slot: u32,
-    weight_accessor_idx: u32,
+    in_page: crate::substrate::PageRef,
+    weight_page: crate::substrate::PageRef,
+    partial_offset: crate::substrate::ScratchOffsetRef,
+    partial_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    layer: crate::substrate::LayerRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    out_act_slot: crate::substrate::ActSlotRef,
+    weight_accessor_idx: crate::substrate::WeightAccessorRef,
     eps: FiniteF32,
     pub weight: WeightRef,
     pub offset: FiniteF32,
@@ -1507,59 +1507,64 @@ impl ScalarOffsetRmsNorm {
                 "ScalarOffsetRmsNorm: NUM_TOKENS must be > 0"
             );
         }
+        use crate::substrate::{
+            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef,
+            ScratchOffsetRef, WeightAccessorConst,
+        };
         Self {
-            in_page_id: IN_ID,
-            weight_page_id: WEIGHT_ID,
-            partial_offset: PARTIAL_OFF,
-            partial_bytes: PARTIAL_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            layer: LAYER,
-            hidden_dim: HIDDEN_DIM,
-            num_tokens: NUM_TOKENS,
-            in_act_slot: IN_ACT_SLOT,
-            out_act_slot: OUT_ACT_SLOT,
-            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
+            partial_offset: ScratchOffsetRef::__new_for_erase(PARTIAL_OFF),
+            partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
             eps,
             weight,
             offset,
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn weight_page_id(&self) -> u32 {
-        self.weight_page_id
+    pub const fn weight_page(&self) -> crate::substrate::PageRef {
+        self.weight_page
     }
-    pub const fn partial_offset(&self) -> u32 {
+    pub const fn partial_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.partial_offset
     }
-    pub const fn partial_bytes(&self) -> u32 {
+    pub const fn partial_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.partial_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn layer(&self) -> u32 {
+    pub const fn layer(&self) -> crate::substrate::LayerRef {
         self.layer
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
-    pub const fn out_act_slot(&self) -> u32 {
+    pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
     }
-    pub const fn weight_accessor_idx(&self) -> u32 {
+    pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
     }
     pub fn eps(&self) -> FiniteF32 {

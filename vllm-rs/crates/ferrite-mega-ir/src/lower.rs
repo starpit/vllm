@@ -808,6 +808,22 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _partial: crate::substrate::ScratchRegion<
+            PARTIAL_OFF, PARTIAL_BYTES, SCRATCH_BYTES, crate::substrate::RmsNormScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         weight_path: String,
         offset: f32,
         eps: f32,
@@ -1711,8 +1727,25 @@ mod tests {
 
     #[test]
     fn lowers_scalar_offset_rms_norm() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            RmsNormScope, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = BuilderD::new();
-        b.push_scalar_offset_rms_norm::<0, 1, 0, 32, 0, 1, 5, 16, 0, 2048, 8, 0, 1, 0>(
+        b.push_scalar_offset_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<5, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
             "W::norm".to_string(),
             1.0,
             1.0e-5_f32,
@@ -1721,13 +1754,13 @@ mod tests {
         let MegaNode::ScalarOffsetRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.layer(), 5);
+        assert_eq!(n.layer().raw(), 5);
         assert_eq!(n.offset.raw(), 1.0);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.num_tokens(), 8);
-        assert_eq!(n.in_act_slot(), 0);
-        assert_eq!(n.out_act_slot(), 1);
-        assert_eq!(n.weight_accessor_idx(), 0);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.in_act_slot().raw(), 0);
+        assert_eq!(n.out_act_slot().raw(), 1);
+        assert_eq!(n.weight_accessor_idx().raw(), 0);
         assert!((n.eps().raw() - 1.0e-5_f32).abs() < 1e-9);
     }
 

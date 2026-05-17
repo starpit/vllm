@@ -5595,17 +5595,33 @@ fn dispatch_instruction_to_push(
             let weight_str = weight.as_str();
             let offset_lit = *offset;
             let eps_lit = state.rms_norm_eps;
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
-                b.push_scalar_offset_rms_norm::<
-                    #in_id, #weight_id,
-                    #partial_off, #partial_bytes,
-                    #consumer_phase, #storer_phase,
-                    #layer_lit, #num_layers, #arrives,
-                    #hidden_dim, #num_tokens,
-                    #in_act_slot, #out_act_slot, #weight_accessor_idx,
-                >(#weight_str.to_string(), #offset_lit, #eps_lit);
+                b.push_scalar_offset_rms_norm(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #partial_off, #partial_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::RmsNormScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                        #weight_accessor_idx, { u32::MAX },
+                    >::new(),
+                    #weight_str.to_string(),
+                    #offset_lit,
+                    #eps_lit,
+                );
             })
         }
         I::Gemm(in_slot, out_slot, layer, n, k) => {

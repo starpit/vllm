@@ -166,6 +166,13 @@ pub enum KernelId {
     /// barrier counter. Emitted only when
     /// `FERRITE_PERSISTENT_PREATTN=1`.
     SynthPreAttnPersistent,
+    /// Whole-forward persistent megakernel. ONE Metal dispatch for
+    /// the entire decode forward pass per token. Per-layer weights
+    /// via `MTLArgumentBuffer`; cross-layer weights at direct buffer
+    /// slots; scratch + runtime + barrier counter at fixed slots.
+    /// See `synthesize_forward_decode` for the full kernel signature.
+    /// Emitted only when `FERRITE_PERSISTENT_FORWARD=1`.
+    ForwardDecodePersistent,
     /// Compiler-synthesized MLP pre-down megakernel. Symbol resolves
     /// against a per-arch source-compiled library registered at worker
     /// init via `SpecializedPipelineCache::register_source_library`.

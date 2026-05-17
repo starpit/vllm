@@ -1148,6 +1148,27 @@ impl Instruction {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
+            Instruction::ForwardDecodePersistent(
+                residual_slot,
+                q_scratch_slot,
+                attn_scratch_slot,
+                mlp_scratch_slot,
+                logits_slot,
+                _num_layers,
+                _group_size,
+                _bits,
+                _symbol,
+            ) => (
+                "ForwardDecodePersistent",
+                vec![
+                    F::Slot(residual_slot),
+                    F::Slot(q_scratch_slot),
+                    F::Slot(attn_scratch_slot),
+                    F::Slot(mlp_scratch_slot),
+                    F::Slot(logits_slot),
+                    F::LayerKind("LinearLayer"),
+                ],
+            ),
             Instruction::SynthMlpPreDown(
                 residual_slot,
                 delta_slot,

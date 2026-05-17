@@ -933,6 +933,48 @@ pub enum Instruction {
         &'static str,
         bool,
     ),
+    /// Whole-forward persistent megakernel. ONE Metal dispatch for the
+    /// entire decode forward pass for ONE token. Layer loop expressed
+    /// in MSL; per-layer weights via `MTLArgumentBuffer`; cross-TG
+    /// ticket-lock barriers between phases. Eliminates the per-layer
+    /// dispatch boundary entirely — the ~80 host dispatches per token
+    /// today (16 layers × 5 phases) collapse to 1, recovering the
+    /// dispatch-overhead win that per-chunk fusion couldn't deliver.
+    ///
+    /// The kernel itself is generated at macro-expansion time by
+    /// `ferrite-fusion-synth::synthesize_forward_decode`; the symbol
+    /// name carried here resolves at runtime against a per-arch
+    /// metallib registered into the `SpecializedPipelineCache`.
+    ///
+    /// Tuple fields:
+    ///   `(residual_slot, q_scratch_slot, attn_scratch_slot,
+    ///     mlp_scratch_slot, logits_out_slot, num_layers, group_size,
+    ///     bits, kernel_symbol)`
+    ///
+    /// Per-layer weights (rms / Q/K/V proj / cos_sin / KV cache /
+    /// o_proj / post-attn rms / gate / up / down) are resolved
+    /// through `WeightAccessors` for each `layer ∈ [0, num_layers)`
+    /// and packed into a single `MTLArgumentBuffer` at worker init.
+    /// The cross-layer `final_rmsnorm` and `lm_head` weights bind at
+    /// direct buffer slots (see the kernel signature in
+    /// `synthesize_forward_decode`).
+    ///
+    /// Emitted only when env var `FERRITE_PERSISTENT_FORWARD=1` gates
+    /// `MetalForwardDecodePersistentImpl` on; otherwise today's per-op
+    /// instruction stream is what the solver picks.
+    ///
+    /// CUDA eval is `unreachable!`.
+    ForwardDecodePersistent(
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        &'static str,
+    ),
     /// Compiler-synthesized MLP pre-down chunk megakernel. Metal-only.
     /// Combines (FusedAddRmsNorm → AffineQmv gate → AffineQmv up →
     /// SiluMul) into one dispatch, leaving the down-projection as a
@@ -3353,6 +3395,12 @@ impl Instruction {
                 unreachable!(
                     "Instruction::SynthPreAttnPersistent is metal-only — emitted by \
                      MetalSynthPreAttnPersistentImpl when FERRITE_PERSISTENT_PREATTN=1"
+                );
+            }
+            Instruction::ForwardDecodePersistent(..) => {
+                unreachable!(
+                    "Instruction::ForwardDecodePersistent is metal-only — emitted by \
+                     MetalForwardDecodePersistentImpl when FERRITE_PERSISTENT_FORWARD=1"
                 );
             }
             Instruction::SynthMlpPreDown(..) => {

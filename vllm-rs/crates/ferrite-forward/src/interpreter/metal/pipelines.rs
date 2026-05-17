@@ -338,6 +338,7 @@ mod tests {
             | KernelId::SynthMlpPreDown
             | KernelId::SynthMlpPreDownPersistent
             | KernelId::SynthGateUpSiluMul
+            | KernelId::ForwardDecodePersistent
             // BiasAdd specialized pipeline reads `num_cols` from
             // `function_constant(0)`. The test helper's
             // `(kernel, bucket_m)` API can't supply a per-call N;
@@ -422,6 +423,7 @@ mod tests {
             | KernelId::SynthMlpPreDown
             | KernelId::SynthMlpPreDownPersistent
             | KernelId::SynthGateUpSiluMul
+            | KernelId::ForwardDecodePersistent
             | KernelId::BiasAdd => {
                 unreachable!(
                     "constants_for: Affine*/SiluMul/SplitKReduceSum/BiasAdd not wired into the \

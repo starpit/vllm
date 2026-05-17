@@ -760,6 +760,17 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let f = lit_u32(f);
             quote! { SynthPreAttnPersistent(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
+        I::ForwardDecodePersistent(a, b, c, d, e, f, g, h, sym) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { ForwardDecodePersistent(#a, #b, #c, #d, #e, #f, #g, #h, #sym) }
+        }
         I::SynthMlpPreDown(a, b, c, d, e, f, g) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -901,6 +912,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::AffineQmm(..) => "AffineQmm",
         I::SynthPreAttn(..) => "SynthPreAttn",
         I::SynthPreAttnPersistent(..) => "SynthPreAttnPersistent",
+        I::ForwardDecodePersistent(..) => "ForwardDecodePersistent",
         I::SynthMlpPreDown(..) => "SynthMlpPreDown",
         I::SynthMlpPreDownPersistent(..) => "SynthMlpPreDownPersistent",
         I::SiluMul(..) => "SiluMul",
@@ -1557,6 +1569,17 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             3 => u(d),
             4 => u(e),
             5 => u(f),
+            _ => None,
+        },
+        I::ForwardDecodePersistent(a, b, c, d, e, f, g, h, _sym) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
             _ => None,
         },
         I::SynthMlpPreDown(a, b, c, d, e, f, _g) => match idx {
@@ -2244,6 +2267,17 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             4 => I::SynthPreAttnPersistent(a, b, c, d, n, f, g, h),
             5 => I::SynthPreAttnPersistent(a, b, c, d, e, n, g, h),
             _ => panic!("SynthPreAttnPersistent: bad idx {idx}"),
+        },
+        I::ForwardDecodePersistent(a, b, c, d, e, f, g, h, sym) => match idx {
+            0 => I::ForwardDecodePersistent(n, b, c, d, e, f, g, h, sym),
+            1 => I::ForwardDecodePersistent(a, n, c, d, e, f, g, h, sym),
+            2 => I::ForwardDecodePersistent(a, b, n, d, e, f, g, h, sym),
+            3 => I::ForwardDecodePersistent(a, b, c, n, e, f, g, h, sym),
+            4 => I::ForwardDecodePersistent(a, b, c, d, n, f, g, h, sym),
+            5 => I::ForwardDecodePersistent(a, b, c, d, e, n, g, h, sym),
+            6 => I::ForwardDecodePersistent(a, b, c, d, e, f, n, h, sym),
+            7 => I::ForwardDecodePersistent(a, b, c, d, e, f, g, n, sym),
+            _ => panic!("ForwardDecodePersistent: bad idx {idx}"),
         },
         I::SynthMlpPreDown(a, b, c, d, e, f, g) => match idx {
             0 => I::SynthMlpPreDown(n, b, c, d, e, f, g),

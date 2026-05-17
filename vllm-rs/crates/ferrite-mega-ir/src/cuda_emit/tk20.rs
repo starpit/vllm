@@ -21,7 +21,10 @@
 //! confirming the signature.
 
 use super::cu::{CuExpr, CuStmt};
-use super::handles::{Bf16, F32, GmemPtrRaw, Rv, RvCudaName, Semaphore, Sv};
+use super::handles::{
+    Bf16, F32, GmemPtrRaw, Rt, RtCol, RtCudaName, RtLayoutTag, RtRow, Rv, RvCudaName,
+    Semaphore, St, Sv,
+};
 
 // ============================================================
 // kittens::group<N>::wait / arrive / sync
@@ -500,4 +503,255 @@ pub fn decl_rv_fl(name: &str, len: u32) -> (CuStmt, Rv<F32>) {
 pub fn decl_local_f32(name: &str, init: &str) -> (CuStmt, CuExpr) {
     let stmt = CuStmt::new(format!("float {name} = {init};"));
     (stmt, CuExpr::new(name.to_string()))
+}
+
+// ============================================================
+// Register-tile declarations + ops (Sprint 10 — Gemm).
+// ============================================================
+
+/// `kittens::rt_fl<rows, cols> <name>;` — declare local fp32
+/// register tile (default row layout). Returned handle is
+/// row-layout-typed.
+///
+/// Source: `include/types/register/rt.cuh:142` (rt_fl alias).
+pub fn decl_rt_fl(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<F32, RtRow>) {
+    let stmt = CuStmt::new(format!("kittens::rt_fl<{rows}, {cols}> {name};"));
+    (stmt, Rt::from_expr(CuExpr::new(name.to_string()), rows, cols))
+}
+
+/// `kittens::rt_bf<rows, cols> <name>;` — declare local bf16
+/// register tile in row layout (mma_AB A operand).
+///
+/// Source: `include/types/register/rt.cuh:143` (rt_bf alias).
+pub fn decl_rt_bf_row(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<Bf16, RtRow>) {
+    let stmt = CuStmt::new(format!("kittens::rt_bf<{rows}, {cols}> {name};"));
+    (stmt, Rt::from_expr(CuExpr::new(name.to_string()), rows, cols))
+}
+
+/// `kittens::rt_bf<rows, cols, kittens::ducks::rt_layout::col>
+/// <name>;` — declare local bf16 register tile in col layout
+/// (mma_AB B operand).
+///
+/// Source: `include/types/register/rt.cuh:143` + `rt_layout.cuh`.
+pub fn decl_rt_bf_col(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<Bf16, RtCol>) {
+    let stmt = CuStmt::new(format!(
+        "kittens::rt_bf<{rows}, {cols}, kittens::ducks::rt_layout::col> {name};"
+    ));
+    (stmt, Rt::from_expr(CuExpr::new(name.to_string()), rows, cols))
+}
+
+/// `kittens::warp::zero(rt);` — set every element of a register
+/// tile to zero (canonical accumulator init).
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:421-424`.
+pub fn warp_zero_rt<T: super::handles::DtypeName + RtCudaName, L: RtLayoutTag>(
+    rt: &Rt<T, L>,
+) -> CuStmt {
+    CuStmt::new(format!("kittens::warp::zero({});", rt.expr()))
+}
+
+/// `kittens::warp::load(rt, st);` — collaborative shared->register
+/// load. With `kittens::warp == kittens::group<1>`, GROUP_WARPS is
+/// 1, so the static_asserts in TK 2.0 collapse to
+/// `ST::rows == RT::rows && ST::cols == RT::cols`. The RT layout
+/// (row vs col) determines whether `ldsm4` or `ldsm4t` is emitted
+/// internally — TK handles both.
+///
+/// Source: `include/ops/group/memory/tile/shared_to_register.cuh:14-128`.
+pub fn warp_load_rt_from_st_bf<L: RtLayoutTag>(
+    rt: &Rt<Bf16, L>,
+    st: &St<Bf16>,
+) -> CuStmt {
+    debug_assert_eq!(
+        rt.rows(),
+        st.rows(),
+        "warp_load_rt_from_st_bf: rt.rows ({}) must equal st.rows ({})",
+        rt.rows(),
+        st.rows()
+    );
+    debug_assert_eq!(
+        rt.cols(),
+        st.cols(),
+        "warp_load_rt_from_st_bf: rt.cols ({}) must equal st.cols ({})",
+        rt.cols(),
+        st.cols()
+    );
+    CuStmt::new(format!(
+        "kittens::warp::load({rt}, {st});",
+        rt = rt.expr(),
+        st = st.expr()
+    ))
+}
+
+/// `kittens::warp::store(st, rt);` — collaborative register->shared
+/// store. Same shape constraints as
+/// [`warp_load_rt_from_st_bf`]. Used to land the gemm fp32
+/// accumulator (downcast to bf16 by TK's internal type-converter)
+/// back into a shared `st_bf<M, TILE_N>` slice of out_smem.
+///
+/// Source: `include/ops/group/memory/tile/shared_to_register.cuh:138-244`.
+pub fn warp_store_st_bf_from_rt_fl(
+    st: &St<Bf16>,
+    rt: &Rt<F32, RtRow>,
+) -> CuStmt {
+    debug_assert_eq!(
+        rt.rows(),
+        st.rows(),
+        "warp_store_st_bf_from_rt_fl: rt.rows ({}) must equal st.rows ({})",
+        rt.rows(),
+        st.rows()
+    );
+    debug_assert_eq!(
+        rt.cols(),
+        st.cols(),
+        "warp_store_st_bf_from_rt_fl: rt.cols ({}) must equal st.cols ({})",
+        rt.cols(),
+        st.cols()
+    );
+    CuStmt::new(format!(
+        "kittens::warp::store({st}, {rt});",
+        st = st.expr(),
+        rt = rt.expr()
+    ))
+}
+
+/// `kittens::warp::mma_AB(d, a, b, c);` — `D = A * B + C` with
+/// D=fp32 row, A=bf16 row, B=bf16 col, C=fp32 row. Layouts and
+/// shape compat are enforced by TK 2.0 `static_assert`s
+/// (D::rows==A::rows, D::cols==B::cols, A::cols==B::rows,
+/// D::rows==C::rows, D::cols==C::cols).
+///
+/// Source: `include/ops/group/mma/warp.cuh:583-632`.
+#[allow(non_snake_case)]
+pub fn warp_mma_AB(
+    d: &Rt<F32, RtRow>,
+    a: &Rt<Bf16, RtRow>,
+    b: &Rt<Bf16, RtCol>,
+    c: &Rt<F32, RtRow>,
+) -> CuStmt {
+    debug_assert_eq!(
+        d.rows(),
+        a.rows(),
+        "warp_mma_AB: D.rows ({}) must equal A.rows ({})",
+        d.rows(),
+        a.rows()
+    );
+    debug_assert_eq!(
+        d.cols(),
+        b.cols(),
+        "warp_mma_AB: D.cols ({}) must equal B.cols ({})",
+        d.cols(),
+        b.cols()
+    );
+    debug_assert_eq!(
+        a.cols(),
+        b.rows(),
+        "warp_mma_AB: A.cols ({}) must equal B.rows ({})",
+        a.cols(),
+        b.rows()
+    );
+    debug_assert_eq!(
+        d.rows(),
+        c.rows(),
+        "warp_mma_AB: D.rows ({}) must equal C.rows ({})",
+        d.rows(),
+        c.rows()
+    );
+    debug_assert_eq!(
+        d.cols(),
+        c.cols(),
+        "warp_mma_AB: D.cols ({}) must equal C.cols ({})",
+        d.cols(),
+        c.cols()
+    );
+    CuStmt::new(format!(
+        "kittens::warp::mma_AB({d}, {a}, {b}, {c});",
+        d = d.expr(),
+        a = a.expr(),
+        b = b.expr(),
+        c = c.expr()
+    ))
+}
+
+/// `auto <name> = <parent>.template subtile<rows, cols>(int2{row, col});`
+/// — declare a named local binding to a shared-tile soft-subtile
+/// view (`st_subtile`). Returns the bound `St<Bf16>` handle.
+///
+/// `kittens::st<>::subtile<rows, cols>(int2)` is a non-const
+/// member returning the subtile by VALUE. Binding via `auto`
+/// materializes the temporary as a non-const lvalue — required
+/// by `kittens::warp::store(ST &dst, const RT &src)` whose
+/// `dst` is a non-const lvalue reference.
+///
+/// `row_idx_expr` / `col_idx_expr` are CUDA expressions in scope
+/// (e.g. `"0"`, `"k_iter"`, `"static_cast<int>(kittens::warpid())"`).
+///
+/// Source: `include/types/shared/st.cuh:152-153,191-272`.
+pub fn decl_st_bf_subtile(
+    name: &str,
+    parent: &St<Bf16>,
+    rows: u32,
+    cols: u32,
+    row_idx_expr: &str,
+    col_idx_expr: &str,
+) -> (CuStmt, St<Bf16>) {
+    let stmt = CuStmt::new(format!(
+        "auto {name} = ({parent}).template subtile<{rows}, {cols}>(int2{{{row_idx_expr}, {col_idx_expr}}});",
+        parent = parent.expr()
+    ));
+    let handle = St::from_expr(CuExpr::new(name.to_string()), rows, cols);
+    (stmt, handle)
+}
+
+// ============================================================
+// Tile-flavored non-tensor TMA (used by Gemm loader/storer to
+// stage [M, K] activation, [CHUNK_K, N] b_tile, and [M, N]
+// output between gmem and shared). Same C++ entry points as
+// [`group_tma_load_async_raw`] / [`group_tma_store_async_raw`];
+// only the typed dst/src handle differs.
+// ============================================================
+
+/// Tile-flavored `kittens::group<N>::tma::load_async(void* dst,
+/// void* src, uint32_t bytes, sem& bar);` — stages a contiguous
+/// `[rows, cols]` bf16 block from gmem into a shared tile.
+///
+/// Source: `include/ops/group/util/tma.cuh:72`.
+pub fn group_tma_load_async_raw_st_bf(
+    n: u32,
+    dst: &St<Bf16>,
+    src: &GmemPtrRaw<Bf16>,
+    size_bytes: u32,
+    sem: &Semaphore,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::group<{n}>::tma::load_async(\
+         reinterpret_cast<void*>(&{dst}), \
+         reinterpret_cast<void*>({src}), \
+         {size_bytes}, \
+         {sem});",
+        dst = dst.expr(),
+        src = src.expr(),
+        sem = sem.expr()
+    ))
+}
+
+/// Tile-flavored `kittens::group<N>::tma::store_async(void* dst,
+/// void* src, uint32_t bytes);` — stores a contiguous
+/// `[rows, cols]` bf16 block from a shared tile to gmem.
+///
+/// Source: `include/ops/group/util/tma.cuh:82`.
+pub fn group_tma_store_async_raw_st_bf(
+    n: u32,
+    dst: &GmemPtrRaw<Bf16>,
+    src: &St<Bf16>,
+    size_bytes: u32,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::group<{n}>::tma::store_async(\
+         reinterpret_cast<void*>({dst}), \
+         reinterpret_cast<void*>(&{src}), \
+         {size_bytes});",
+        dst = dst.expr(),
+        src = src.expr()
+    ))
 }

@@ -14,16 +14,16 @@
 //! 2.0 on the pod before it's "done."
 
 use crate::nodes::{
-    Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul,
-    ScalarOffsetRmsNorm, TanhSoftCap,
+    Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, Gemm, MegaNode, RmsNorm,
+    ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
 };
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr};
 use super::handles::{
     gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_weight_ptr_raw,
-    page_as_byte_ptr, page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem,
-    scratch_as,
+    page_as_byte_ptr, page_as_st_bf, page_as_sv_bf, page_consumed_sem, page_done_sem,
+    page_ready_sem, scratch_as, scratch_as_st_bf,
 };
 use super::tk20;
 
@@ -58,7 +58,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
         MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
-        MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
+        MegaNode::Gemm(n) => emit_gemm(n, budget),
         MegaNode::FusedCublasGemmAdd(_) => RoleBodies::skipped("FusedCublasGemmAdd"),
         MegaNode::CutlassFusedNormGemm(_) => RoleBodies::skipped("CutlassFusedNormGemm"),
         MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
@@ -954,6 +954,212 @@ fn emit_embed(n: &Embed, budget: TapeBudget) -> RoleBodies {
         &out_byte,
         hidden_dim,
         num_tokens,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+
+// ============================================================
+// Gemm — `D = A * B + C` with C zero-init (pure matmul). AlongN
+// warp split: each consumer warp owns `[M, TILE_N]` output cols
+// of out_smem. ITERS=1 path only (multi-iter b_tile pipelining
+// is a future sprint and the handoff acknowledges the IR-side
+// design is open). For ITERS != 1 the variant skips emit.
+// ============================================================
+//
+// Page lifecycle:
+//   in_page:     Empty -> Filled (loader TMA `[M, K]` bf16)
+//                       -> Empty (consumer warp 0 arrive `page_consumed`)
+//   weight_page: Empty -> Filled-marker only (loader TMA writes
+//                       to scratch b_tile but uses weight_page's
+//                       page_ready as the b_tile-ready signal).
+//                       -> Empty (consumer warp 0 arrive `page_consumed`)
+//   out_page:    Empty -> Produced (consumer per-warp store of
+//                       `[M, TILE_N]` accumulator slice)
+//                       -> Empty (storer TMA + arrive page_consumed)
+//
+// TK 2.0 primitives used (every call cited):
+//   - kittens::group<1>::wait                       (sync.cuh:112)
+//   - kittens::group<1>::arrive                     (sync.cuh:69)
+//   - kittens::group<1>::tma::expect_bytes          (util/tma.cuh:18)
+//   - kittens::group<1>::tma::load_async (raw)      (util/tma.cuh:72)
+//   - kittens::group<1>::tma::store_async (raw)     (util/tma.cuh:82)
+//   - kittens::group<1>::tma::store_async_wait      (util/tma.cuh:46)
+//   - kittens::group<NCW>::sync(int id)             (group.cuh:33)
+//   - kittens::warp::load(rt, st)                   (memory/tile/shared_to_register.cuh:14)
+//   - kittens::warp::store(st, rt)                  (memory/tile/shared_to_register.cuh:138)
+//   - kittens::warp::zero(rt)                       (register/tile/maps.cuh:421)
+//   - kittens::warp::mma_AB(D, A, B, C)             (mma/warp.cuh:583)
+//   - st_bf<...>::subtile<R, C>(int2{...})          (shared/st.cuh:152)
+
+fn emit_gemm(node: &Gemm, budget: TapeBudget) -> RoleBodies {
+    let in_page = node.in_page();
+    let weight_page = node.weight_page();
+    let out_page = node.out_page();
+    let consumer_phase = node.consumer_phase().raw();
+    let storer_phase = node.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let iters = node.iters().raw();
+    let layer = node.layer().raw();
+    let n_dim = node.n().raw();
+    let k_dim = node.k().raw();
+    let m_dim = node.m().raw();
+    let tile_n = node.tile_n().raw();
+    let chunk_k = node.chunk_k().raw();
+    let in_act_slot = node.in_act_slot().raw();
+    let out_act_slot = node.out_act_slot().raw();
+    let weight_accessor_idx = node.weight_accessor_idx().raw();
+    let bar_publish = node.consumer_bar_publish().raw();
+    let b_tile_offset = node.b_tile_offset();
+
+    let ncw = budget.num_consumer_warps;
+    let num_layers = budget.num_layers.max(1);
+
+    // Sprint 10 limit: single-shot b_tile only. Multi-iter
+    // pipelining requires per-iter mbarrier phases that the IR
+    // doesn't yet model.
+    if iters != 1 {
+        return RoleBodies::skipped("Gemm");
+    }
+
+    debug_assert_eq!(
+        chunk_k, k_dim,
+        "emit_gemm: ITERS=1 requires CHUNK_K ({chunk_k}) == K ({k_dim})"
+    );
+    debug_assert_eq!(
+        tile_n * ncw,
+        n_dim,
+        "emit_gemm: AlongN split requires TILE_N ({tile_n}) * NCW ({ncw}) == N ({n_dim})"
+    );
+    debug_assert!(
+        m_dim % 16 == 0,
+        "emit_gemm: TK 2.0 mma_AB requires M ({m_dim}) divisible by 16"
+    );
+    debug_assert!(
+        k_dim % 16 == 0,
+        "emit_gemm: TK 2.0 mma_AB requires K ({k_dim}) divisible by 16"
+    );
+    debug_assert!(
+        tile_n % 16 == 0,
+        "emit_gemm: TK 2.0 mma_AB requires TILE_N ({tile_n}) divisible by 16"
+    );
+
+    // Substrate handles.
+    let in_smem = page_as_st_bf(in_page, m_dim, k_dim); // [M, K]
+    let out_smem = page_as_st_bf(out_page, m_dim, n_dim); // [M, N]
+    let b_tile = scratch_as_st_bf(b_tile_offset, k_dim, n_dim); // [K, N]
+
+    let in_ready = page_ready_sem(in_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let out_done = page_done_sem(out_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let out_consumed = page_consumed_sem(out_page);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+
+    let bf16 = 2_u32;
+    let act_bytes = m_dim * k_dim * bf16; // [M, K]
+    let weight_bytes = k_dim * n_dim * bf16; // [K, N]
+    let out_bytes = m_dim * n_dim * bf16; // [M, N]
+
+    // ---------------- Loader body ----------------
+    // TMA-load activation into in_smem and the full weight tile
+    // into b_tile (lives in scratch). The weight_page semaphore
+    // gates the b_tile-ready handshake.
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &weight_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &out_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1, &in_smem, &in_gmem, act_bytes, &in_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &weight_ready, weight_bytes));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1,
+        &b_tile,
+        &weight_gmem,
+        weight_bytes,
+        &weight_ready,
+    ));
+
+    // ---------------- Launcher body ----------------
+    // No per-iter pipelining at ITERS=1 — launcher idle.
+    let launcher = CuBlock::new();
+
+    // ---------------- Consumer body ----------------
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &weight_ready, consumer_phase));
+
+    // Per-warp register tiles. AlongN: each warp owns
+    // `[M, TILE_N]` output cols. A is loaded full `[M, K]` per
+    // warp (every warp reads the same activation); B is the
+    // per-warp `[K, TILE_N]` slice from b_tile.
+    let (decl_a, a_rt) = tk20::decl_rt_bf_row("__gemm_a", m_dim, k_dim);
+    let (decl_b, b_rt) = tk20::decl_rt_bf_col("__gemm_b", k_dim, tile_n);
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl("__gemm_acc", m_dim, tile_n);
+    consumer.push(decl_a);
+    consumer.push(decl_b);
+    consumer.push(decl_acc);
+
+    // Per-warp B subtile + OUT subtile (col-direction slice at
+    // index = warpid()). Declared as named `auto` locals so the
+    // st_subtile materializes as a non-const lvalue —
+    // `kittens::warp::store(ST&, ...)` requires it.
+    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
+    let (decl_b_sub, b_sub) =
+        tk20::decl_st_bf_subtile("__gemm_b_sub", &b_tile, k_dim, tile_n, "0", warp_idx_expr);
+    let (decl_out_sub, out_sub) = tk20::decl_st_bf_subtile(
+        "__gemm_out_sub",
+        &out_smem,
+        m_dim,
+        tile_n,
+        "0",
+        warp_idx_expr,
+    );
+    consumer.push(decl_b_sub);
+    consumer.push(decl_out_sub);
+
+    // Load operands.
+    consumer.push(tk20::warp_load_rt_from_st_bf(&a_rt, &in_smem));
+    consumer.push(tk20::warp_load_rt_from_st_bf(&b_rt, &b_sub));
+
+    // Zero accumulator and execute mma.
+    consumer.push(tk20::warp_zero_rt(&acc_rt));
+    consumer.push(tk20::warp_mma_AB(&acc_rt, &a_rt, &b_rt, &acc_rt));
+
+    // Store accumulator to per-warp slice of out_smem.
+    consumer.push(tk20::warp_store_st_bf_from_rt_fl(&out_sub, &acc_rt));
+
+    // Cross-warp publish before warp 0 signals page_done.
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &out_done),
+        tk20::group_arrive(1, &in_consumed),
+        tk20::group_arrive(1, &weight_consumed),
+    ]));
+
+    // ---------------- Storer body ----------------
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &out_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw_st_bf(
+        1,
+        &out_gmem,
+        &out_smem,
+        out_bytes,
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &out_consumed));

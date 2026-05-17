@@ -88,6 +88,59 @@ impl RvCudaName for F32 {
     }
 }
 
+/// CUDA type name for a `kittens::rt_<dtype><R, C, layout>` of this dtype.
+pub trait RtCudaName {
+    fn rt_token() -> &'static str;
+}
+impl RtCudaName for Bf16 {
+    fn rt_token() -> &'static str {
+        "kittens::rt_bf"
+    }
+}
+impl RtCudaName for F32 {
+    fn rt_token() -> &'static str {
+        "kittens::rt_fl"
+    }
+}
+
+/// CUDA type name for a `kittens::st_<dtype><R, C>` of this dtype.
+pub trait StCudaName {
+    fn st_token() -> &'static str;
+}
+impl StCudaName for Bf16 {
+    fn st_token() -> &'static str {
+        "kittens::st_bf"
+    }
+}
+impl StCudaName for F32 {
+    fn st_token() -> &'static str {
+        "kittens::st_fl"
+    }
+}
+
+// Register tile layout tag — `kittens::ducks::rt_layout::row` or
+// `::col`. Phantom-typed so wrong-layout pass-through into mma_AB
+// fails to typecheck (mma_AB requires A=row, B=col, C=row, D=row).
+#[derive(Clone, Copy, Debug)]
+pub struct RtRow;
+#[derive(Clone, Copy, Debug)]
+pub struct RtCol;
+pub trait RtLayoutTag {
+    /// CUDA token for explicit layout arg (empty string = default
+    /// row layout, omitted from the rt_<dtype><R,C> template args).
+    fn cuda_layout_arg() -> &'static str;
+}
+impl RtLayoutTag for RtRow {
+    fn cuda_layout_arg() -> &'static str {
+        ""
+    }
+}
+impl RtLayoutTag for RtCol {
+    fn cuda_layout_arg() -> &'static str {
+        ", kittens::ducks::rt_layout::col"
+    }
+}
+
 // ============================================================
 // Shared / register / pointer / semaphore handles
 // ============================================================
@@ -141,6 +194,80 @@ impl<T: DtypeName + RvCudaName> Rv<T> {
     }
     pub fn cuda_type(&self) -> String {
         format!("{}<{}>", T::rv_token(), self.len)
+    }
+}
+
+/// Shared tile — `kittens::st_<dtype><rows, cols>`. Used for the
+/// gemm activation tile (`[M, K]`), per-iter b_tile chunk
+/// (`[CHUNK_K, N]`), and accumulator landing.
+#[derive(Clone, Debug)]
+pub struct St<T> {
+    expr: CuExpr,
+    rows: u32,
+    cols: u32,
+    _t: PhantomData<T>,
+}
+impl<T: DtypeName + StCudaName> St<T> {
+    pub(super) fn from_expr(expr: CuExpr, rows: u32, cols: u32) -> Self {
+        Self {
+            expr,
+            rows,
+            cols,
+            _t: PhantomData,
+        }
+    }
+    pub(super) fn expr(&self) -> &CuExpr {
+        &self.expr
+    }
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+    pub fn cuda_type(&self) -> String {
+        format!("{}<{}, {}>", T::st_token(), self.rows, self.cols)
+    }
+}
+
+/// Register tile — `kittens::rt_<dtype><rows, cols, layout>`.
+/// Layout phantom catches mma_AB row/col mismatches at codegen
+/// build time.
+#[derive(Clone, Debug)]
+pub struct Rt<T, L> {
+    expr: CuExpr,
+    rows: u32,
+    cols: u32,
+    _t: PhantomData<T>,
+    _l: PhantomData<L>,
+}
+impl<T: DtypeName + RtCudaName, L: RtLayoutTag> Rt<T, L> {
+    pub(super) fn from_expr(expr: CuExpr, rows: u32, cols: u32) -> Self {
+        Self {
+            expr,
+            rows,
+            cols,
+            _t: PhantomData,
+            _l: PhantomData,
+        }
+    }
+    pub(super) fn expr(&self) -> &CuExpr {
+        &self.expr
+    }
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+    pub fn cuda_type(&self) -> String {
+        format!(
+            "{}<{}, {}{}>",
+            T::rt_token(),
+            self.rows,
+            self.cols,
+            L::cuda_layout_arg()
+        )
     }
 }
 
@@ -287,4 +414,32 @@ pub fn gmem_input_ids() -> CuExpr {
 /// `kittens::sv_bf<LEN>` view.
 pub fn page_as_byte_ptr(page: PageRef) -> CuExpr {
     CuExpr::new(format!("ss.pages[{}]", page.raw()))
+}
+
+/// Reinterpret-cast a substrate page as a `kittens::st_bf<rows, cols>`.
+/// Used for the gemm activation tile view of in_page (shape `[M, K]`)
+/// and the gemm output tile view of out_page (shape `[M, N]`).
+pub fn page_as_st_bf(page: PageRef, rows: u32, cols: u32) -> St<Bf16> {
+    St::from_expr(
+        CuExpr::new(format!(
+            "(*reinterpret_cast<kittens::st_bf<{rows}, {cols}>*>(ss.pages[{}]))",
+            page.raw()
+        )),
+        rows,
+        cols,
+    )
+}
+
+/// Reinterpret-cast a slice of substrate scratch starting at `offset`
+/// as a `kittens::st_bf<rows, cols>`. Used for gemm b_tile staging
+/// (`[CHUNK_K, N]` per iter).
+pub fn scratch_as_st_bf(offset: ScratchOffsetRef, rows: u32, cols: u32) -> St<Bf16> {
+    St::from_expr(
+        CuExpr::new(format!(
+            "(*reinterpret_cast<kittens::st_bf<{rows}, {cols}>*>(ss.scratch + {}))",
+            offset.raw()
+        )),
+        rows,
+        cols,
+    )
 }

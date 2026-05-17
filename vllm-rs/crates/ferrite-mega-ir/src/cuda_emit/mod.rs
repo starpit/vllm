@@ -241,6 +241,84 @@ mod tests {
 
     type BuilderD = MegaTapeBuilder<8, 8, 32_768, 32_768, 4>;
 
+    /// Sprint 10: Gemm — `D = A * B + C` (C zero) under AlongN
+    /// warp split. ITERS=1 path: full b_tile staged in scratch.
+    /// Smoke config: M=16, K=32, N=256, NCW=8. TILE_N=32,
+    /// CHUNK_K=K=32. b_tile = 32 * 256 * 2 = 16384 bytes (fits
+    /// in 32 KB scratch). All shapes multiples of 16 — required
+    /// by `kittens::warp::mma_AB`.
+    #[test]
+    fn gemm_emits_tk20_calls() {
+        use crate::substrate::{
+            BarSyncId, ChunkK, GemmScope, IterCount, MatmulK, MatmulM, MatmulN,
+            ScratchRegion, TileN,
+        };
+        let mut b = BuilderD::new();
+        b.push_gemm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // weight
+            PageId::<2, 8>::new(), // out
+            ScratchRegion::<0, 16_384, 32_768, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            MatmulN::<256>::new(),
+            MatmulK::<32>::new(),
+            MatmulM::<16>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            TileN::<32>::new(),
+            ChunkK::<32>::new(),
+            BarSyncId::<7>::new(),
+            "W::gemm".to_string(),
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_gemm", &tape);
+        assert!(cu.skipped_variants.is_empty(), "skipped: {:?}", cu.skipped_variants);
+        std::fs::write("/tmp/gemm_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // Loader: tile-flavored TMA load of activation + b_tile.
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[0], 1024);",
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[1], 16384);",
+            "kittens::group<1>::tma::load_async(",
+            "(*reinterpret_cast<kittens::st_bf<16, 32>*>(ss.pages[0]))",
+            "(*reinterpret_cast<kittens::st_bf<32, 256>*>(ss.scratch + 0))",
+            // Consumer: rt decls + warp::load + warp::zero + mma_AB
+            //          + warp::store + cross-warp sync + warp 0 publish.
+            "kittens::rt_bf<16, 32> __gemm_a;",
+            "kittens::rt_bf<32, 32, kittens::ducks::rt_layout::col> __gemm_b;",
+            "kittens::rt_fl<16, 32> __gemm_acc;",
+            "auto __gemm_b_sub = ",
+            "auto __gemm_out_sub = ",
+            ".template subtile<32, 32>(int2{0, static_cast<int>(kittens::warpid())})",
+            ".template subtile<16, 32>(int2{0, static_cast<int>(kittens::warpid())})",
+            "kittens::warp::load(__gemm_a, ",
+            "kittens::warp::load(__gemm_b, __gemm_b_sub);",
+            "kittens::warp::zero(__gemm_acc);",
+            "kittens::warp::mma_AB(__gemm_acc, __gemm_a, __gemm_b, __gemm_acc);",
+            "kittens::warp::store(__gemm_out_sub, __gemm_acc);",
+            "kittens::group<8>::sync(7);",
+            "kittens::group<1>::arrive(ss.page_done[2]);",
+            "kittens::group<1>::arrive(ss.page_consumed[0]);",
+            "kittens::group<1>::arrive(ss.page_consumed[1]);",
+            // Storer: full out_smem TMA back to gmem.
+            "kittens::group<1>::tma::store_async(",
+            "g.act_ptrs[2]",
+            "kittens::group<1>::tma::store_async_wait();",
+            "kittens::group<1>::arrive(ss.page_consumed[2]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// Sprint 1: Rust-side smoke. Verifies the emit walks without
     /// panicking AND that key TK 2.0 primitive calls land in the
     /// emitted source. The REAL DOD is `nvcc` compiling this on

@@ -110,6 +110,36 @@ impl Atom for AddRmsNormAtom {
         let rw  = &ctx.bound_inputs[2]; // rms_weight
         let out = &ctx.bound_outputs[0]; // x_norm (TG memory)
 
+        // INVARIANT (init=false branch): `residual_io` and `delta`
+        // MUST be distinct device buffers. The body emits
+        //   __res_row[i] = (residual[i] + delta[i]) * scale * rms_w[i]
+        // and a Q-head TG writeback that stores `__r + __d` back into
+        // `__res_row[i]`. If a caller aliases the two channels onto
+        // the same buffer name (which a sloppy synth glue did once —
+        // see `synthesize_forward_decode`'s `delta_buf = "__residual"`
+        // before commit 0233a8e92), the body becomes `residual *= 2`
+        // per layer ⇒ exponential blowup ⇒ NaN logits.
+        //
+        // The atom signature names the two channels distinctly but
+        // they're bound to plain `String` buffer names at the synth
+        // layer, so the type system doesn't reject the aliasing. This
+        // panic at emit time is the cheap-to-add backstop until the
+        // bigger "typed channel bindings" refactor lands. init=true
+        // explicitly ignores `delta` so aliasing is harmless there
+        // (and used intentionally by synth_forward_decode to keep the
+        // binding count stable across init=true / init=false).
+        if !self.init && res == del {
+            panic!(
+                "AddRmsNormAtom (init=false): residual_io and delta must \
+                 be distinct device buffers, both bound to `{}`. Aliasing \
+                 here emits `residual = residual + residual = 2*residual` \
+                 per call site. Either bind a separate delta buffer, or \
+                 use AddRmsNormAtom {{ init: true }} if the residual was \
+                 already accumulated upstream.",
+                res,
+            );
+        }
+
         let t_act = ctx.t_act;
         if self.init {
             // Layer-0 mode: `residual_io` is the (already-final) input
@@ -693,4 +723,73 @@ impl Atom for SiluMulAtom {
 #[allow(dead_code)]
 fn _atom_lib_uses() {
     let _: AtomConstantValue = AtomConstantValue::Uint(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_constants() -> Vec<(&'static str, AtomConstantValue)> {
+        vec![
+            ("HIDDEN", AtomConstantValue::Uint(2048)),
+            ("NUM_Q", AtomConstantValue::Uint(32)),
+            ("NUM_KV", AtomConstantValue::Uint(8)),
+            ("HEAD_DIM", AtomConstantValue::Uint(64)),
+            ("ROT_DIM", AtomConstantValue::Uint(64)),
+            ("BLOCK_SIZE", AtomConstantValue::Uint(16)),
+            ("M", AtomConstantValue::Uint(1)),
+            ("EPS", AtomConstantValue::Float(1e-5)),
+        ]
+    }
+
+    /// `init=false` with `residual_io` and `delta` bound to the same
+    /// buffer name emits a body that doubles the residual each call.
+    /// The atom rejects this at emit time so a future synth-glue bug
+    /// fails loud at macro expansion instead of silently producing
+    /// NaN logits at decode time (the `synthesize_forward_decode` bug
+    /// 0233a8e92 fixed).
+    #[test]
+    #[should_panic(expected = "residual_io and delta must be distinct")]
+    fn addrmsnorm_rejects_residual_delta_aliasing() {
+        let atom = AddRmsNormAtom { init: false };
+        let aliased = vec![
+            "__residual".to_string(),
+            "__residual".to_string(),
+            "__rms_w".to_string(),
+        ];
+        let outs = vec!["__x_norm".to_string()];
+        let constants = dummy_constants();
+        let ctx = AtomCtx {
+            bound_inputs: &aliased,
+            bound_outputs: &outs,
+            constants: &constants,
+            t_act: "bfloat",
+            t_scale: "half",
+        };
+        let _ = atom.emit_metal_body(&ctx);
+    }
+
+    /// `init=true` explicitly never reads `delta`, so aliasing is
+    /// harmless and the atom must NOT panic — `synthesize_forward_decode`
+    /// relies on this for its post-0233a8e92 channel-binding shape.
+    #[test]
+    fn addrmsnorm_init_allows_aliasing() {
+        let atom = AddRmsNormAtom { init: true };
+        let aliased = vec![
+            "__residual".to_string(),
+            "__residual".to_string(),
+            "__rms_w".to_string(),
+        ];
+        let outs = vec!["__x_norm".to_string()];
+        let constants = dummy_constants();
+        let ctx = AtomCtx {
+            bound_inputs: &aliased,
+            bound_outputs: &outs,
+            constants: &constants,
+            t_act: "bfloat",
+            t_scale: "half",
+        };
+        let body = atom.emit_metal_body(&ctx);
+        assert!(body.is_some(), "init=true must emit even when channels alias");
+    }
 }

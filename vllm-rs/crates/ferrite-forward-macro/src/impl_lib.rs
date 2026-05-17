@@ -372,6 +372,50 @@ pub enum WorkloadConstraint {
     },
 }
 
+/// Solver routing class for an Impl's claims. Determines which DP
+/// lane the candidate enters at solve time.
+///
+/// **Default — `Local`.** The Impl's `matches()` returns a claim
+/// whose tile span fits inside `ClaimMask::WINDOW`; the per-seed
+/// bitmask DP scores it against alternatives that cover the same
+/// tiles. This is the long-standing path and covers every fusion in
+/// the library to date.
+///
+/// **`Wide`.** The Impl's `matches()` returns a claim that spans
+/// much more than `ClaimMask::WINDOW` tiles — e.g. an entire decode
+/// forward pass. The bitmask DP can't represent such a claim
+/// (`mask |= 1 << off` would shift past the window). The solver
+/// routes Wide candidates through a separate lane:
+///
+///   1. Run the Local DP on every Local candidate as usual, producing
+///      a baseline assignment + total cost.
+///   2. For each Wide candidate `w`:
+///      - Filter Local candidates to those whose claim is entirely
+///        disjoint from `w`'s claim.
+///      - Run a constrained Local DP that treats every tile in
+///        `w.claimed_tiles` as externally pre-claimed (zero-cost
+///        pass-through at those positions; `w.cost` is added once).
+///      - Total cost = `w.cost + constrained_DP_cost`.
+///   3. Pick whichever total is lowest across the baseline + every
+///      Wide-augmented variant. Reconstruct the winning Assignment
+///      (one subgraph for `w`'s claim if Wide wins, plus per-Local
+///      subgraphs for the rest; or pure-Local otherwise).
+///
+/// Constraint: at most one Wide candidate may apply per workload
+/// point. The solver asserts this — if multiple Wides both match
+/// the same workload, the build fails loud (the library author has
+/// to disambiguate, typically by env-gating each Wide on a distinct
+/// flag).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimClass {
+    /// Claim fits in the bitmask DP's per-seed window. Default.
+    Local,
+    /// Claim spans the whole FUF (or a large enough fraction that
+    /// the bitmask DP can't represent it). Routed through the Wide
+    /// cost-comparison lane described on [`ClaimClass`].
+    Wide,
+}
+
 impl WorkloadConstraint {
     pub fn accepts(&self, num_tokens: u32, sk_bucket: u64) -> bool {
         match self {
@@ -504,6 +548,19 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// Workload eligibility. Default accepts any `num_tokens`.
     fn workload_constraint(&self) -> WorkloadConstraint {
         WorkloadConstraint::Any
+    }
+
+    /// How the solver routes this Impl's claims. Defaults to
+    /// [`ClaimClass::Local`] — the per-seed claim fits in
+    /// `ClaimMask::WINDOW` tiles and is scored by the bitmask DP.
+    /// Megakernel-style Impls that claim much larger subgraphs
+    /// (whole-forward decode, whole-prefill, etc.) override to
+    /// [`ClaimClass::Wide`]; the solver scores those in a separate
+    /// "at most one Wide per workload point + a constrained Local DP
+    /// over the uncovered tiles" lane that doesn't share the bitmask
+    /// window. See [`ClaimClass`] for the rules.
+    fn claim_class(&self) -> ClaimClass {
+        ClaimClass::Local
     }
 
     /// Try to match a subgraph rooted at the given seed tile.

@@ -29,44 +29,24 @@
 //! (`ferrite-fusion-synth::synthesize_forward_decode`) and the
 //! Binding / lowering / worker pieces this Impl plugs into.
 //!
-//! ## ⚠ DP-span blocker (2026-05-17 evening)
+//! ## Solver routing — `ClaimClass::Wide`
 //!
-//! `solver::solve_one` rejects any candidate whose claimed-tile span
-//! exceeds K=16 (see `const K: usize = 16; type ClaimMask = u16;`
-//! around `solver.rs:521`). Whole-forward claims span ~243 tiles for
-//! a 16-layer Llama-3.2-1B; the bitmask check at `mask |= 1 << off`
-//! drops the candidate before the DP scores it. So this Impl's
-//! `matches()` returns the correct claim, but the solver silently
-//! discards it.
-//!
-//! **Result**: the Impl is registered + wired (the solver invokes
-//! `matches()` and the matcher walks the full forward correctly +
-//! all the downstream lowering / worker plumbing is ready), but
-//! never fires end-to-end. Two paths forward:
-//!
-//! 1. Widen the DP's bitmask / span model to accept large claims
-//!    (invasive — `ClaimMask`, the per-seed mask layout, and the
-//!    DP table sizing all touch). Cleanest long-term.
-//! 2. Land an `interpreter_codegen::apply_forward_decode_persistent`
-//!    post-pass that runs after `lower_bucket` and rewrites the
-//!    bucket's instruction stream when the env flag is set —
-//!    bypassing the DP entirely. Mirrors the old
-//!    `apply_synth_replacement{,_mlp}` post-passes that the
-//!    SynthPreAttn / SynthMlpPreDown Impls replaced. Faster to
-//!    land but a regression in the "solver-driven" architecture.
-//!
-//! The matcher + opcode_shape + fan_out kept here are the shape the
-//! solver-driven path needs once the DP-span work lands; leaving
-//! them in place avoids re-deriving from scratch.
+//! The whole-forward claim spans ~243 tiles for Llama-3.2-1B, far
+//! beyond the per-seed `ClaimMask::WINDOW` the Local bitmask DP can
+//! represent. This Impl overrides `claim_class()` to
+//! [`ClaimClass::Wide`], routing it through the solver's Wide lane:
+//! at most one Wide candidate picks per workload point, and the
+//! solver scores `wide.cost + constrained_local_dp(uncovered_tiles)`
+//! against the baseline Local-only total before picking the cheaper.
 
 use std::collections::{BTreeMap, HashSet};
 
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::impl_lib::{
-    consumes_tile, default_required_weights, first_tile_input, CostCtx, Handoff, Implementation,
-    LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap, WeightAccessor,
-    WorkloadConstraint,
+    consumes_tile, default_required_weights, first_tile_input, ClaimClass, CostCtx, Handoff,
+    Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap,
+    WeightAccessor, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
@@ -194,6 +174,14 @@ impl Implementation for MetalForwardDecodePersistentImpl {
             return false;
         }
         Self::is_enabled()
+    }
+
+    fn claim_class(&self) -> ClaimClass {
+        // Whole-forward claim spans ~243 tiles for Llama-3.2-1B; it
+        // cannot fit `ClaimMask::WINDOW`. Routes through the solver's
+        // Wide lane: at most one Wide candidate picks per workload
+        // point, scored as `cost + constrained_local_dp(uncovered)`.
+        ClaimClass::Wide
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {

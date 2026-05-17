@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::classified::{OpKind, Program};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
-use crate::impl_lib::{CostCtx, ImplId, ImplementationLibrary, MatchContext, MatchInfo};
+use crate::impl_lib::{ClaimClass, CostCtx, ImplId, ImplementationLibrary, MatchContext, MatchInfo};
 use crate::shape::{Inferred, Shape, extern_shape};
 use crate::target::TargetProfile;
 
@@ -526,6 +526,10 @@ fn solve_one(
     let t_p1 = std::time::Instant::now();
     // ── Phase 1: per-point filter + cost evaluation ──
     let mut matches_at: Vec<Vec<(ImplId, MatchInfo, f64)>> = vec![Vec::new(); n];
+    // Wide candidates routed to the separate Phase-5 lane below. Each
+    // entry is `(imp_id, info, amortized_cost)`. See `ClaimClass::Wide`
+    // for the rationale.
+    let mut wide_candidates: Vec<(ImplId, MatchInfo, f64)> = Vec::new();
 
     let ctx = CostCtx {
         fuf,
@@ -563,7 +567,19 @@ fn solve_one(
                     point,
                 });
             }
-            matches_at[i].push((*imp_id, info.clone(), cost));
+            // Route Wide candidates to the Phase-5 lane; Local ones stay
+            // in matches_at[i] for the bitmask DP. A Wide Impl's matcher
+            // typically returns the same MatchInfo at only ONE seed (the
+            // megakernel's anchor — e.g. lm_head for whole-forward
+            // decode), so wide_candidates usually has 0 or 1 entries.
+            match imp.claim_class() {
+                ClaimClass::Local => {
+                    matches_at[i].push((*imp_id, info.clone(), cost));
+                }
+                ClaimClass::Wide => {
+                    wide_candidates.push((*imp_id, info.clone(), cost));
+                }
+            }
         }
 
         // Sort: claim size DESCENDING, then cost ASCENDING.
@@ -634,54 +650,266 @@ fn solve_one(
     ns_phase2.fetch_add(t_p2.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
     let t_p3 = std::time::Instant::now();
-    // ── Phase 3: sparse FORWARD DP ──
+    // ── Phase 3: sparse FORWARD DP (baseline, Local candidates only) ──
     //
     // Old formulation: dense backward-DP with `dp[i][cs]` a
-    // `Vec<Vec<DpEntry>>` of size `(n+1) × 2^K`. At K=16 (bumped
-    // for Gemma3's 12-tile QK-norm fusion) that's 65 536 states
-    // per position — a 972-tile FUF meant iterating 64M cells
-    // per solve × 20 workload points × 33 models = tens of
-    // billions of iterations plus ~1.5 GB of Vec allocation per
-    // solve. Measured: 174 seconds of Phase 3 alone for a single
-    // gemma2-27b solve set. That's the compile-time pain.
+    // `Vec<Vec<DpEntry>>` of size `(n+1) × 2^K`. Measured 174s of
+    // Phase 3 alone for one gemma2-27b solve set. The forward+sparse
+    // formulation propagates only REACHABLE states, dropping memory
+    // + time from `2^K × n` to roughly `candidates × n` while
+    // preserving the optimal-plan guarantee.
     //
-    // New formulation: forward DP with sparse state. Start from
-    // `dp[0]={0: 0.0}` and propagate only REACHABLE states.
-    // Each reachable cell records a back-pointer `(prev_cs,
-    // choice)` so we can reconstruct the picked sequence. Most
-    // positions have only a handful of reachable claim_states
-    // (bounded by the product of candidate-count × claim-spread
-    // up to that position), so memory + time collapse from
-    // `2^K × n` to roughly `candidates × n`.
+    // Hot loop + reconstruction live in `run_local_dp`; this Phase 3
+    // is the baseline call. Phase 5 below calls it again with a
+    // filtered candidate set + Wide-claim exclusion to score
+    // Wide-augmented alternatives.
+    let baseline = run_local_dp(n, &candidates, |_| false);
+    ns_phase3.fetch_add(t_p3.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+
+    let t_p4 = std::time::Instant::now();
+    // ── Phase 4: choose between baseline and Wide-augmented plans ──
     //
-    // Correctness: identical optimal-plan guarantee as backward
-    // DP — we cover the same transition graph, just visit only
-    // reachable nodes. Tie-breaking (min cost) is preserved.
-    #[derive(Clone, Copy)]
-    struct SparseCell {
-        cost: f64,
-        /// claim_state at position `i-1` that produced this cell
-        /// (via the transition at position i-1).
-        prev_cs: ClaimMask,
-        /// Candidate chosen AT position `i-1` to arrive here.
-        /// `None` means position i-1 was a pass-through (its
-        /// tile was pre-claimed by an earlier multi-tile impl).
-        choice: Option<(ImplId, ClaimMask)>,
-        /// Total number of impl picks taken on the path to this cell
-        /// (`choice = Some(_)` increments; pass-through does not).
-        /// **Tiebreaker on equal cost (lower wins).** Required
-        /// because alternatives at uncalibrated shapes (lm_head
-        /// vocab-N) often tie to fp precision between
-        /// `(fused N-tile)` and `(fused (N-1)-tile + 1 singleton)` —
-        /// both cover the same tiles for the same total cost, but
-        /// fewer picks = fewer kernel launches and matches the
-        /// design intent at solver.rs `// Multi-tile claims represent
-        /// fusion …`. Without this tiebreak, HashMap iteration
-        /// order made the DP non-deterministic — STATUS Step 1b(a)
-        /// 0-pick anomaly traced here.
-        picks_count: u32,
+    // If any Wide candidates passed Phase-1 filtering, score each by
+    // running a CONSTRAINED Local DP where the Wide's claimed tiles
+    // are externally pre-claimed (zero-cost pass-through at those
+    // positions). The Wide's own cost is added once. Compare the
+    // resulting total against the baseline; emit whichever is cheaper.
+    //
+    // At-most-one Wide-per-workload-point invariant: if multiple Wide
+    // Impls' matchers both fired for this point, pick the cheapest
+    // (the library author env-gates each Wide on a distinct flag if
+    // they don't want this implicit tiebreak).
+    let wide_pick: Option<(usize, &(ImplId, MatchInfo, f64))> = wide_candidates
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            a.1
+                .2
+                .partial_cmp(&b.1.2)
+                .unwrap_or(Ordering::Equal)
+        });
+
+    // Score the Wide-augmented variant (if applicable).
+    let wide_augmented: Option<(
+        &MatchInfo,
+        ImplId,
+        f64,                                       // wide.cost
+        Vec<Vec<Candidate>>,                       // filtered local candidates
+        Vec<bool>,                                 // per-position: wide-claimed?
+        Vec<Option<(ImplId, ClaimMask)>>,          // constrained-DP choices
+        f64,                                       // constrained-DP cost
+    )> = wide_pick.and_then(|(_, (wide_imp, wide_info, wide_cost))| {
+        // Build a position-indexed "is this tile claimed by the
+        // Wide?" lookup. Walk the FUF once; TileId.0 happens to equal
+        // position-in-fuf today but we don't rely on that — match by
+        // TileId via the claimed_tiles set.
+        let wide_tile_set: std::collections::HashSet<TileId> =
+            wide_info.claimed_tiles.iter().copied().collect();
+        let wide_at_pos: Vec<bool> = (0..n)
+            .map(|i| wide_tile_set.contains(&fuf.nodes[i].id))
+            .collect();
+
+        // Filter Local candidates: reject any whose claim would cover
+        // a Wide-claimed tile. Without this, a Local candidate at
+        // position 0 (e.g. an Embed multi-tile fusion) could try to
+        // double-claim tiles the Wide already owns.
+        let filtered: Vec<Vec<Candidate>> = candidates
+            .iter()
+            .enumerate()
+            .map(|(seed_pos, cands)| {
+                cands
+                    .iter()
+                    .filter(|c| {
+                        c.mask.iter_offsets().all(|off| {
+                            let tile_pos = seed_pos + off;
+                            tile_pos >= n || !wide_at_pos[tile_pos]
+                        })
+                    })
+                    .copied()
+                    .collect()
+            })
+            .collect();
+
+        let (choices, cost, _picks) =
+            run_local_dp(n, &filtered, |i| wide_at_pos[i])?;
+        Some((
+            wide_info,
+            *wide_imp,
+            *wide_cost,
+            filtered,
+            wide_at_pos,
+            choices,
+            cost,
+        ))
+    });
+
+    // Pick the cheaper of baseline-total vs Wide-augmented-total.
+    enum Winner<'a> {
+        Baseline {
+            choices: Vec<Option<(ImplId, ClaimMask)>>,
+            cost: f64,
+        },
+        WideAugmented {
+            wide_imp: ImplId,
+            wide_info: &'a MatchInfo,
+            wide_cost: f64,
+            constrained_choices: Vec<Option<(ImplId, ClaimMask)>>,
+            constrained_candidates: Vec<Vec<Candidate>>,
+            constrained_cost: f64,
+        },
     }
 
+    let winner = match (baseline, wide_augmented) {
+        (Some((b_choices, b_cost, _)), Some((w_info, w_imp, w_cost, f_cands, _, c_choices, c_cost))) => {
+            if w_cost + c_cost < b_cost {
+                Winner::WideAugmented {
+                    wide_imp: w_imp,
+                    wide_info: w_info,
+                    wide_cost: w_cost,
+                    constrained_choices: c_choices,
+                    constrained_candidates: f_cands,
+                    constrained_cost: c_cost,
+                }
+            } else {
+                Winner::Baseline {
+                    choices: b_choices,
+                    cost: b_cost,
+                }
+            }
+        }
+        (Some((b_choices, b_cost, _)), None) => Winner::Baseline {
+            choices: b_choices,
+            cost: b_cost,
+        },
+        (None, Some((w_info, w_imp, w_cost, f_cands, _, c_choices, c_cost))) => Winner::WideAugmented {
+            wide_imp: w_imp,
+            wide_info: w_info,
+            wide_cost: w_cost,
+            constrained_choices: c_choices,
+            constrained_candidates: f_cands,
+            constrained_cost: c_cost,
+        },
+        (None, None) => {
+            // Neither path finds a feasible plan — same diagnostic
+            // pattern as before: name the first unclaimed tile if we
+            // can, otherwise default to tile 0.
+            if let Some((i, _)) = candidates.iter().enumerate().find(|(_, c)| c.is_empty()) {
+                return Err(SolveError::UnclaimedTile {
+                    tile: fuf.nodes[i].id,
+                    op: fuf.nodes[i].op,
+                    point,
+                });
+            }
+            return Err(SolveError::UnclaimedTile {
+                tile: fuf.nodes[0].id,
+                op: fuf.nodes[0].op,
+                point,
+            });
+        }
+    };
+
+    // Build the Assignment from the winning plan.
+    let mut assignment = Assignment::default();
+    let mut next_sg: u32 = 0;
+    let total = match winner {
+        Winner::Baseline { choices, cost } => {
+            build_local_assignment(&choices, &candidates, fuf, n, &mut next_sg, &mut assignment);
+            cost
+        }
+        Winner::WideAugmented {
+            wide_imp,
+            wide_info,
+            wide_cost,
+            constrained_choices,
+            constrained_candidates,
+            constrained_cost,
+        } => {
+            // Wide subgraph first — owns every tile in its claim.
+            let wide_sg = SubgraphId(next_sg);
+            next_sg += 1;
+            for tile in &wide_info.claimed_tiles {
+                assignment.cover.insert(*tile, wide_sg);
+            }
+            assignment.impls.insert(wide_sg, wide_imp);
+            // Constrained-DP picks fill the un-Wide-claimed tiles.
+            build_local_assignment(
+                &constrained_choices,
+                &constrained_candidates,
+                fuf,
+                n,
+                &mut next_sg,
+                &mut assignment,
+            );
+            wide_cost + constrained_cost
+        }
+    };
+
+    debug_assert!(
+        assignment.cover.len() == n,
+        "solver left {} tiles uncovered (winner path failed to cover everything)",
+        n - assignment.cover.len(),
+    );
+
+    assignment.predicted_us = total;
+    ns_phase4.fetch_add(t_p4.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    Ok(assignment)
+}
+
+/// One candidate impl choice at a given tile position.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    imp_id: ImplId,
+    /// Bit `j` set ⇒ position `seed + j` is claimed. Bit 0 (seed)
+    /// is always set by construction.
+    mask: ClaimMask,
+    cost: f64,
+}
+
+/// One cell of the sparse forward DP. Lives at module scope so the
+/// helper functions (`run_local_dp`) and the orchestrator
+/// (`solve_one`) share the type.
+#[derive(Clone, Copy)]
+struct SparseCell {
+    cost: f64,
+    /// claim_state at position `i-1` that produced this cell (via
+    /// the transition at position `i-1`).
+    prev_cs: ClaimMask,
+    /// Candidate chosen AT position `i-1` to arrive here. `None`
+    /// means position `i-1` was a pass-through — either the tile was
+    /// pre-claimed by an earlier in-flight multi-tile impl, or it
+    /// was externally pre-claimed via the Wide-lane exclusion mask.
+    choice: Option<(ImplId, ClaimMask)>,
+    /// Total number of impl picks taken on the path to this cell
+    /// (`choice = Some(_)` increments; pass-through does not).
+    /// **Tiebreaker on equal cost (lower wins).** Required because
+    /// alternatives at uncalibrated shapes (lm_head vocab-N) often
+    /// tie to fp precision between `(fused N-tile)` and
+    /// `(fused (N-1)-tile + 1 singleton)` — both cover the same
+    /// tiles for the same total cost, but fewer picks = fewer
+    /// kernel launches and matches the design intent at
+    /// `// Multi-tile claims represent fusion …` above. Without
+    /// this tiebreak, HashMap iteration order made the DP
+    /// non-deterministic.
+    picks_count: u32,
+}
+
+/// Run the sparse forward bitmask DP over a per-tile candidate list.
+///
+/// Returns `Some((choices_at, total_cost, picks_count))` if every
+/// non-excluded tile is reachable from a chain of compatible
+/// candidates ending at `dp[n][ClaimMask::empty()]`. `choices_at[i]`
+/// is the candidate picked AT position `i`, or `None` for pass-through.
+///
+/// `is_excluded(i) = true` makes position `i` a zero-cost pass-through
+/// regardless of in-flight bitmask claims. This is the hook the Wide
+/// lane uses to mark tiles claimed by an external whole-FUF candidate
+/// as "already covered" so the constrained Local DP fills the rest.
+/// The baseline (Local-only) call passes `|_| false` for full coverage.
+fn run_local_dp(
+    n: usize,
+    candidates: &[Vec<Candidate>],
+    is_excluded: impl Fn(usize) -> bool,
+) -> Option<(Vec<Option<(ImplId, ClaimMask)>>, f64, u32)> {
     let mut dp: Vec<HashMap<ClaimMask, SparseCell>> = vec![HashMap::new(); n + 1];
     dp[0].insert(
         ClaimMask::empty(),
@@ -708,17 +936,30 @@ fn solve_one(
     };
 
     for i in 0..n {
-        // Snapshot `dp[i]` to avoid borrow conflicts while writing
-        // `dp[i+1]` in the same iteration. `dp[i]` is small
-        // (sparse), so cloning its (cost, picks_count) pairs is cheap.
         let at_i: Vec<(ClaimMask, f64, u32)> = dp[i]
             .iter()
             .map(|(k, c)| (*k, c.cost, c.picks_count))
             .collect();
+        let externally_pre_claimed = is_excluded(i);
         for (cs, cost, picks_count) in at_i {
-            if cs.test(0) {
-                // Tile i is pre-claimed by an in-flight multi-tile
-                // candidate committed earlier — pass through.
+            if externally_pre_claimed {
+                // Wide-lane exclusion: position is owned by the
+                // chosen Wide candidate; pass through at zero added
+                // cost (the Wide's cost is added once, separately).
+                let new_cs = cs.advance();
+                update(
+                    &mut dp[i + 1],
+                    new_cs,
+                    SparseCell {
+                        cost,
+                        prev_cs: cs,
+                        choice: None,
+                        picks_count,
+                    },
+                );
+            } else if cs.test(0) {
+                // In-flight Local claim from an earlier multi-tile
+                // candidate covers this position — pass through.
                 let new_cs = cs.advance();
                 update(
                     &mut dp[i + 1],
@@ -733,7 +974,7 @@ fn solve_one(
             } else {
                 for cand in &candidates[i] {
                     if cs.intersects(cand.mask) {
-                        continue; // conflict with pending claims
+                        continue;
                     }
                     let new_cs = cs.union(cand.mask).advance();
                     let new_cost = cost + cand.cost;
@@ -753,34 +994,7 @@ fn solve_one(
         }
     }
 
-    let Some(terminal) = dp[n].get(&ClaimMask::empty()).copied() else {
-        // No feasible plan for this workload. Emit the specific
-        // tile where we ran out of candidates.
-        if let Some((i, _)) = candidates.iter().enumerate().find(|(_, c)| c.is_empty()) {
-            return Err(SolveError::UnclaimedTile {
-                tile: fuf.nodes[i].id,
-                op: fuf.nodes[i].op,
-                point,
-            });
-        }
-        // Every tile has candidates but no feasible terminal state
-        // — K is too small or some multi-tile claim is unreachable.
-        return Err(SolveError::UnclaimedTile {
-            tile: fuf.nodes[0].id,
-            op: fuf.nodes[0].op,
-            point,
-        });
-    };
-    ns_phase3.fetch_add(t_p3.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-
-    let t_p4 = std::time::Instant::now();
-    // ── Phase 4: reconstruct from forward DP back-pointers. ──
-    //
-    // Walk dp[n] → dp[n-1] → … → dp[0], recovering the choice
-    // made at each position. `terminal` is the cell at dp[n][0];
-    // `terminal.prev_cs` is the claim-state at dp[n-1] that led
-    // here, and `terminal.choice` is the candidate picked at
-    // position n-1 (or None for pass-through).
+    let terminal = dp[n].get(&ClaimMask::empty()).copied()?;
     let mut choices_at: Vec<Option<(ImplId, ClaimMask)>> = vec![None; n];
     let mut cell = terminal;
     for i in (0..n).rev() {
@@ -790,55 +1004,46 @@ fn solve_one(
         }
     }
 
-    // Walk forward, allocating subgraph ids in visitation order.
-    let mut assignment = Assignment::default();
-    let mut next_sg: u32 = 0;
-    let mut total = 0.0_f64;
+    Some((choices_at, terminal.cost, terminal.picks_count))
+}
 
+/// Translate `run_local_dp`'s picks into per-tile subgraph IDs +
+/// per-subgraph impl entries on `out`. Returns the sum of per-pick
+/// candidate costs (the DP's predicted us total for the Local picks
+/// only — the Wide lane adds its own cost separately).
+///
+/// `next_sg` is threaded so the Wide lane can pre-allocate subgraph
+/// id 0 for the Wide claim and number Local subgraphs from there.
+fn build_local_assignment(
+    choices_at: &[Option<(ImplId, ClaimMask)>],
+    candidates: &[Vec<Candidate>],
+    fuf: &Fuf,
+    n: usize,
+    next_sg: &mut u32,
+    out: &mut Assignment,
+) -> f64 {
+    let mut total = 0.0_f64;
     for i in 0..n {
         let (imp_id, mask) = match choices_at[i] {
             Some(c) => c,
-            None => continue, // pass-through
+            None => continue,
         };
-
-        let sg = SubgraphId(next_sg);
-        next_sg += 1;
-
+        let sg = SubgraphId(*next_sg);
+        *next_sg += 1;
         let cand = candidates[i]
             .iter()
             .find(|c| c.imp_id == imp_id && c.mask == mask)
             .expect("DP stored a candidate that exists in the candidate list");
-
         for off in mask.iter_offsets() {
             let tile_idx = i + off;
             if tile_idx < n {
-                assignment.cover.insert(fuf.nodes[tile_idx].id, sg);
+                out.cover.insert(fuf.nodes[tile_idx].id, sg);
             }
         }
-        assignment.impls.insert(sg, imp_id);
+        out.impls.insert(sg, imp_id);
         total += cand.cost;
     }
-
-    // Invariant: every tile is claimed.
-    debug_assert!(
-        assignment.cover.len() == n,
-        "DP left {} tiles uncovered",
-        n - assignment.cover.len(),
-    );
-
-    assignment.predicted_us = total;
-    ns_phase4.fetch_add(t_p4.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-    Ok(assignment)
-}
-
-/// One candidate impl choice at a given tile position.
-#[derive(Debug, Clone, Copy)]
-struct Candidate {
-    imp_id: ImplId,
-    /// Bit `j` set ⇒ position `seed + j` is claimed. Bit 0 (seed)
-    /// is always set by construction.
-    mask: ClaimMask,
-    cost: f64,
+    total
 }
 
 /// Resolve each tile input's shape for the cost function.

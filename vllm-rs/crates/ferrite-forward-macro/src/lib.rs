@@ -1087,6 +1087,8 @@ fn compile_common(
                         || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_synth_"))
+                        || (cfg!(feature = "metal")
+                            && name == "metal_forward_decode_persistent")
                     {
                         // Metal GEMM is currently routed through MPS
                         // matmul2d (see ferrite-metal-kernels::gemm);

@@ -273,3 +273,18 @@ pub fn gmem_weight_ptr_raw(
 pub fn gmem_barrier_slot_ptr(edge: u32) -> CuExpr {
     CuExpr::new(format!("&g.barrier_slots[{edge}]"))
 }
+
+/// `g.input_ids` — raw `const uint32_t*` to the per-token vocab
+/// index table. Used by `Embed`'s loader for per-token TMA
+/// gather. Returns a [`CuExpr`] (no typed handle).
+pub fn gmem_input_ids() -> CuExpr {
+    CuExpr::new("g.input_ids".to_string())
+}
+
+/// `ss.pages[<page>]` — raw `uint8_t*` byte pointer to the page's
+/// shared-memory buffer. Used when the per-token TMA gather needs
+/// pointer arithmetic (`+ tok * row_bytes`) rather than a typed
+/// `kittens::sv_bf<LEN>` view.
+pub fn page_as_byte_ptr(page: PageRef) -> CuExpr {
+    CuExpr::new(format!("ss.pages[{}]", page.raw()))
+}

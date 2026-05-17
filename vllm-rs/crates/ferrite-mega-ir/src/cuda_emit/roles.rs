@@ -14,15 +14,16 @@
 //! 2.0 on the pod before it's "done."
 
 use crate::nodes::{
-    Add, BarrierSignal, BarrierWait, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul,
+    Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul,
     ScalarOffsetRmsNorm, TanhSoftCap,
 };
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr};
 use super::handles::{
-    gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_weight_ptr_raw, page_as_sv_bf,
-    page_consumed_sem, page_done_sem, page_ready_sem, scratch_as,
+    gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_weight_ptr_raw,
+    page_as_byte_ptr, page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem,
+    scratch_as,
 };
 use super::tk20;
 
@@ -53,7 +54,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::Add(n) => emit_add(n, budget),
         MegaNode::FusedAddRmsNorm(n) => emit_fused_add_rms_norm(n, budget),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
-        MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
+        MegaNode::Embed(n) => emit_embed(n, budget),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
         MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
@@ -881,6 +882,87 @@ fn emit_barrier_wait(n: &BarrierWait) -> RoleBodies {
         launcher: CuBlock::new(),
         consumer: CuBlock::new(),
         storer: CuBlock::new(),
+        skipped: None,
+    }
+}
+
+
+// ============================================================
+// Embed — per-token vocab table gather.
+// ============================================================
+//
+// out_page holds NUM_TOKENS contiguous rows of HIDDEN_DIM bf16
+// elements. Loader does a per-token TMA gather from the embed
+// table at row `input_ids[t]`. Consumer is a passthrough (no
+// compute). Storer TMA-stores the contiguous rows back to gmem
+// at out_act_slot.
+//
+// embed_weight_page is in the IR but unused by this emit — the
+// embed table is read directly from gmem (via weight_ptrs[acc *
+// NUM_LAYERS + 0]); no shared-memory landing required.
+
+fn emit_embed(n: &Embed, budget: TapeBudget) -> RoleBodies {
+    let out_page = n.out_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+
+    let num_layers = budget.num_layers.max(1);
+    // Embed table is layer-0 only (IR doc: "LAYER is always 0 for
+    // Embed").
+    let layer = 0_u32;
+
+    let out_byte = page_as_byte_ptr(out_page);
+    let out_ready = page_ready_sem(out_page);
+    let out_done = page_done_sem(out_page);
+    let out_consumed = page_consumed_sem(out_page);
+    let embed_table = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+    let input_ids = gmem_input_ids();
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+
+    // Loader: wait for page_consumed, expect_bytes for total, then
+    // per-token gather.
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &out_consumed, loader_phase));
+    loader.push(tk20::embed_per_token_gather(
+        &out_byte,
+        &embed_table,
+        &input_ids,
+        hidden_dim,
+        num_tokens,
+        &out_ready,
+    ));
+
+    let launcher = CuBlock::new();
+
+    // Consumer: passthrough. Wait, then warp 0 publishes done.
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &out_ready, consumer_phase));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &out_done),
+    ]));
+
+    // Storer: per-token TMA-store back to gmem at out_act_slot.
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &out_done, storer_phase));
+    storer.push(tk20::per_token_tma_store(
+        &out_gmem,
+        &out_byte,
+        hidden_dim,
+        num_tokens,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
         skipped: None,
     }
 }

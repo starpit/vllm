@@ -352,6 +352,76 @@ pub fn decl_rms_scale_local(
     (stmt, CuExpr::new(name.to_string()))
 }
 
+/// Per-token TMA gather: emits `kittens::group<1>::tma::expect_bytes`
+/// for the total transfer + a `for (int t = 0; t < NUM_TOKENS; ++t)`
+/// loop calling non-tensor `kittens::group<1>::tma::load_async` per
+/// token, with the source row computed as
+/// `embed_table_ptr + input_ids[t] * HIDDEN_DIM` and the
+/// destination row at `out_byte_ptr + t * HIDDEN_DIM * sizeof(bf16)`.
+///
+/// Composes only TK 2.0 primitives:
+///   - `kittens::group<1>::tma::expect_bytes`  (util/tma.cuh:18)
+///   - `kittens::group<1>::tma::load_async(void*, void*, bytes, sem)`
+///                                           (util/tma.cuh:72)
+/// + a vanilla C++ `for` loop and `+= tok * row_bytes` pointer
+/// arithmetic. The arithmetic is the standard "stride per row"
+/// pattern used by every per-token gather; not invented scheduling.
+pub fn embed_per_token_gather(
+    out_byte_ptr: &CuExpr,
+    embed_table_ptr: &GmemPtrRaw<Bf16>,
+    input_ids_ptr: &CuExpr,
+    hidden_dim: u32,
+    num_tokens: u32,
+    page_ready: &Semaphore,
+) -> CuStmt {
+    let row_bytes = hidden_dim * 2;
+    let total_bytes = row_bytes * num_tokens;
+    CuStmt::new(format!(
+        "kittens::group<1>::tma::expect_bytes({sem}, {total_bytes});\n\
+         for (int __embed_t = 0; __embed_t < {num_tokens}; ++__embed_t) {{\n\
+         \x20   const uint32_t __embed_row = {ids}[__embed_t];\n\
+         \x20   void* __embed_dst = static_cast<void*>(\
+         reinterpret_cast<char*>({dst}) + __embed_t * {row_bytes});\n\
+         \x20   void* __embed_src = static_cast<void*>(\
+         {table} + static_cast<size_t>(__embed_row) * {hidden_dim});\n\
+         \x20   kittens::group<1>::tma::load_async(__embed_dst, __embed_src, {row_bytes}, {sem});\n\
+         }}",
+        sem = page_ready.expr(),
+        ids = input_ids_ptr,
+        dst = out_byte_ptr,
+        table = embed_table_ptr.expr(),
+    ))
+}
+
+/// Per-token TMA store: emits a `for (int t = 0; t < NUM_TOKENS;
+/// ++t)` loop calling non-tensor `kittens::group<1>::tma::
+/// store_async` per row, target gmem at `out_gmem + t * HIDDEN_DIM`.
+/// Source rows are contiguous in shared memory at `src_byte +
+/// t * HIDDEN_DIM * sizeof(bf16)`.
+///
+/// Single TMA store would also work for contiguous gmem regions,
+/// but per-token mirrors the loader's gather pattern and stays
+/// correct even if the gmem destination layout changes.
+pub fn per_token_tma_store(
+    out_gmem: &GmemPtrRaw<Bf16>,
+    src_byte_ptr: &CuExpr,
+    hidden_dim: u32,
+    num_tokens: u32,
+) -> CuStmt {
+    let row_bytes = hidden_dim * 2;
+    CuStmt::new(format!(
+        "for (int __pt_t = 0; __pt_t < {num_tokens}; ++__pt_t) {{\n\
+         \x20   void* __pt_dst = static_cast<void*>(\
+         {gmem} + static_cast<size_t>(__pt_t) * {hidden_dim});\n\
+         \x20   void* __pt_src = static_cast<void*>(\
+         reinterpret_cast<char*>({src}) + __pt_t * {row_bytes});\n\
+         \x20   kittens::group<1>::tma::store_async(__pt_dst, __pt_src, {row_bytes});\n\
+         }}",
+        gmem = out_gmem.expr(),
+        src = src_byte_ptr,
+    ))
+}
+
 /// `ferrite::barrier_signal(slot_ptr, count);` — gmem cross-CTA
 /// counter bump from one thread. Provided by ferrite substrate
 /// (`crates/ferrite-kernels/csrc/tk/ferrite_barrier.cuh`). The

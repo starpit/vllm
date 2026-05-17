@@ -157,6 +157,10 @@ fn render_source(
     s.push_str("    const __nv_bfloat16* const* weight_ptrs;\n");
     s.push_str("    int32_t*                    barrier_slots;\n");
     s.push_str("    int32_t                     trace_level;\n");
+    // Host-ABI extension: per-token vocab index table for `Embed`.
+    // `input_ids[NUM_TOKENS]`; matches `LaunchArgsQkv::input_ids` /
+    // `LaunchArgsAttn::input_ids` (interpreter/mega/mod.rs:294).
+    s.push_str("    const uint32_t*             input_ids;\n");
     s.push_str("};\n\n");
 
     // Role-body fns (forward-declared as `__device__
@@ -192,13 +196,14 @@ fn render_source(
     s.push_str("    __nv_bfloat16* const*       act_ptrs,\n");
     s.push_str("    const __nv_bfloat16* const* weight_ptrs,\n");
     s.push_str("    int32_t*                    barrier_slots,\n");
-    s.push_str("    int32_t                     trace_level\n");
+    s.push_str("    int32_t                     trace_level,\n");
+    s.push_str("    const uint32_t*             input_ids\n");
     s.push_str(") {\n");
     s.push_str("    extern __shared__ uint8_t shmem_buf[];\n");
     s.push_str("    auto& ss = *reinterpret_cast<ferrite::SharedState<ConfigT>*>(shmem_buf);\n");
     s.push_str("    ferrite::init_shared_state<ConfigT>(ss);\n");
     s.push_str(
-        "    Globals g{act_ptrs, weight_ptrs, barrier_slots, trace_level};\n",
+        "    Globals g{act_ptrs, weight_ptrs, barrier_slots, trace_level, input_ids};\n",
     );
     s.push_str("    int wid = kittens::warpid();\n");
     s.push_str("    if (wid < ConfigT::NUM_CONSUMER_WARPS) {\n");
@@ -334,6 +339,44 @@ mod tests {
             assert!(
                 !cu.source.contains(forbidden),
                 "FORBIDDEN pattern {forbidden:?} found in source — TK 1.0 pollution. Source:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    /// Sprint 8: Embed — per-token TMA gather from vocab table.
+    #[test]
+    fn embed_emits_per_token_gather() {
+        use crate::substrate::VocabSize;
+        let mut b = BuilderD::new();
+        b.push_embed(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // out_page
+            PageId::<1, 8>::new(), // embed_weight_page (unused by emit)
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            VocabSize::<128_256>::new(),
+            ActSlotConst::<7, { u32::MAX }>::new(),
+            WeightAccessorConst::<11, { u32::MAX }>::new(),
+            "W::embed".to_string(),
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_embed", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/embed_emit.cu", &cu.source).ok();
+        for needle in [
+            "const uint32_t*             input_ids;",
+            "for (int __embed_t = 0; __embed_t < 1; ++__embed_t)",
+            "const uint32_t __embed_row = g.input_ids[__embed_t];",
+            "g.weight_ptrs[11 * 16 + 0]",
+            "kittens::group<1>::tma::load_async(__embed_dst, __embed_src, 4096,",
+            "kittens::group<1>::tma::store_async(__pt_dst, __pt_src, 4096);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
                 cu.source
             );
         }

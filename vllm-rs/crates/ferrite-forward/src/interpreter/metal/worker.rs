@@ -1821,9 +1821,29 @@ fn build_per_layer_arg_buffer<W: CanonicalParams + crate::WeightAccessors>(
     let mut seen_ptrs: std::collections::HashSet<*const std::ffi::c_void> =
         std::collections::HashSet::new();
 
+    // Env-gated diagnostic. When set, dump every (layer, arg_id) →
+    // gpuAddress + offset encoded into the arg buffer, plus a layer-0
+    // summary suitable for grep'ing against expected per-layer weight
+    // pointers. Intended use: bisect the persistent-decode K/V
+    // writeback bug. Cross-reference each address against
+    // `weights.<role>(0).<which>.raw_ptr()` resolved by the allocator
+    // to confirm worker-side encoding is correct before drilling into
+    // the kernel.
+    let debug = std::env::var_os("FERRITE_PERSISTENT_FORWARD_DEBUG").is_some();
+    if debug {
+        eprintln!(
+            "[persistent-arg-buffer] build: num_layers={} fields/layer={} stride_bytes={} \
+             total_bytes={}",
+            num_layers,
+            fields.len(),
+            stride_bytes,
+            total_bytes,
+        );
+    }
+
     for layer in 0..num_layers {
         for field in fields {
-            let (underlying, off, arg_id): (Buffer, u64, u8) = match field {
+            let (underlying, off, arg_id, kind_label): (Buffer, u64, u8, &'static str) = match field {
                 PerLayerArgField::Weight {
                     arg_id,
                     kind,
@@ -1831,7 +1851,15 @@ fn build_per_layer_arg_buffer<W: CanonicalParams + crate::WeightAccessors>(
                     locator,
                 } => {
                     let (b, o) = resolve_weight(weights, allocator, kind, layer, *which, *locator)?;
-                    (b, o, *arg_id)
+                    let label = match (kind, which) {
+                        (WeightBundleKind::RmsNorm, _) => "rms",
+                        (WeightBundleKind::LinearLayer, WeightTensor::Weight) => "lin.w",
+                        (WeightBundleKind::LinearLayer, WeightTensor::AffineScales) => "lin.s",
+                        (WeightBundleKind::LinearLayer, WeightTensor::AffineBiases) => "lin.b",
+                        (WeightBundleKind::CosSin, _) => "cos_sin",
+                        _ => "other",
+                    };
+                    (b, o, *arg_id, label)
                 }
                 PerLayerArgField::KvCache { arg_id, which } => {
                     let kind = match which {
@@ -1842,7 +1870,11 @@ fn build_per_layer_arg_buffer<W: CanonicalParams + crate::WeightAccessors>(
                             layer: super::ids::LayerId(layer),
                         },
                     };
-                    (runtime.buffer_for(kind).clone(), 0u64, *arg_id)
+                    let label = match which {
+                        KvCacheWhich::K => "kv.k",
+                        KvCacheWhich::V => "kv.v",
+                    };
+                    (runtime.buffer_for(kind).clone(), 0u64, *arg_id, label)
                 }
             };
 
@@ -1859,12 +1891,35 @@ fn build_per_layer_arg_buffer<W: CanonicalParams + crate::WeightAccessors>(
                     (buffer.contents().as_ptr() as *mut u8).add(byte_offset as usize) as *mut u64;
                 p.write_unaligned(addr);
             }
+            if debug && layer < 2 {
+                // Print first two layers' encoded entries — enough to
+                // see the per-layer stride is right (layer 1's
+                // addresses should differ from layer 0's for layered
+                // weights; cos_sin should match across layers).
+                eprintln!(
+                    "[persistent-arg-buffer] layer={} arg_id={:2} kind={:7} \
+                     addr=0x{:016x} (base=0x{:x} + off={})",
+                    layer,
+                    arg_id,
+                    kind_label,
+                    addr,
+                    underlying.gpuAddress(),
+                    off,
+                );
+            }
 
             let raw = Retained::as_ptr(&underlying) as *const std::ffi::c_void;
             if seen_ptrs.insert(raw) {
                 residency.push(underlying);
             }
         }
+    }
+
+    if debug {
+        eprintln!(
+            "[persistent-arg-buffer] dedup'd residency: {} distinct underlying buffers",
+            residency.len(),
+        );
     }
 
     Ok(PerLayerArgBufferBaking { buffer, residency })

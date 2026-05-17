@@ -2173,6 +2173,13 @@ impl TkFusedGemmAdd {
 /// with NUM_TOKENS = 1 today. The `norm_kind` enum selects which
 /// fused-norm sequence the codegen emits (RmsNorm / AddRmsNorm /
 /// MeanSubRmsNorm / AddScalarOffsetRmsNorm).
+///
+/// Sprint 13a (S13a) IR ext: `tile_n` + `chunk_k` (mirror Gemm
+/// Sprint 9 / TkFusedGemmAdd Sprint 11a) cover the AlongN +
+/// per-iter-K layout for the linear projection. `consumer_bar_reduce`
+/// + `consumer_bar_publish` (mirror FusedAddRmsNorm) cover the
+/// cross-warp norm reduce + the post-gemm publish before warp 0
+/// arrives on `page_done`.
 pub struct TkFusedNormGemm {
     in_page: crate::ir::substrate::PageRef,
     delta_page: Option<crate::ir::substrate::PageRef>,
@@ -2190,11 +2197,31 @@ pub struct TkFusedNormGemm {
     n: crate::ir::substrate::MatmulNRef,
     k: crate::ir::substrate::MatmulKRef,
     num_tokens: crate::ir::substrate::NumTokensRef,
+    /// Per-warp output N slice for the linear projection (AlongN
+    /// warp split). Mirrors `Gemm::tile_n` / `TkFusedGemmAdd::tile_n`.
+    tile_n: crate::ir::substrate::TileNRef,
+    /// Per-iter K-chunk width for the b_tile. Mirrors
+    /// `Gemm::chunk_k` / `TkFusedGemmAdd::chunk_k`. ITERS=1 today so
+    /// `chunk_k == k` is the only legal config.
+    chunk_k: crate::ir::substrate::ChunkKRef,
     in_act_slot: crate::ir::substrate::ActSlotRef,
     delta_act_slot: Option<crate::ir::substrate::ActSlotRef>,
     out_act_slot: crate::ir::substrate::ActSlotRef,
     norm_weight_accessor_idx: crate::ir::substrate::WeightAccessorRef,
     linear_weight_accessor_idx: crate::ir::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's sum-of-squares
+    /// reduction across consumer warps. Type-checked in 1..=15.
+    /// Mirror of `FusedAddRmsNorm::consumer_bar_reduce`.
+    consumer_bar_reduce: crate::ir::substrate::BarRef,
+    /// Cross-warp `bar.sync` ID used twice: once after the norm
+    /// writeback so all warps see the full normalized A in shared
+    /// memory before the linear matmul, and once after the matmul
+    /// writeback so warp 0 can safely arrive on `page_done`.
+    /// Distinct from `consumer_bar_reduce`.
+    consumer_bar_publish: crate::ir::substrate::BarRef,
+    /// Witness that `consumer_bar_reduce != consumer_bar_publish`.
+    /// Storage-erased zero-sized token whose existence is the proof.
+    bar_pair_proof: crate::ir::substrate::DistinctBarPairProof,
     eps: FiniteF32,
     pub norm_weight: WeightRef,
     pub linear_weight: WeightRef,
@@ -2231,12 +2258,24 @@ impl TkFusedNormGemm {
         const OUT_ACT_SLOT: u32,
         const NORM_WEIGHT_ACCESSOR_IDX: u32,
         const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         norm_weight: WeightRef,
         linear_weight: WeightRef,
         norm_kind: LmHeadNormKind,
         eps: FiniteF32,
-    ) -> Self {
+    ) -> Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsDistinctBarPair,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "TkFusedNormGemm: IN_ID OOB");
             assert!(NORM_W_ID < NUM_PAGES, "TkFusedNormGemm: NORM_W_ID OOB");
@@ -2277,6 +2316,18 @@ impl TkFusedNormGemm {
                 NUM_TOKENS > 0,
                 "TkFusedNormGemm: NUM_TOKENS must be > 0"
             );
+            // Tile-layout invariants (mirror of Gemm Sprint 9).
+            // AlongN warp split: each consumer warp covers TILE_N
+            // output cols. tile_n * NCW equality with N is enforced
+            // by the proc-macro (NCW isn't a const generic here);
+            // tile_n > 0 is.
+            assert!(TILE_N > 0, "TkFusedNormGemm: TILE_N must be > 0");
+            assert!(CHUNK_K > 0, "TkFusedNormGemm: CHUNK_K must be > 0");
+            // Per-iter K coverage: chunk_k * iters == K.
+            assert!(
+                CHUNK_K * ITERS == K,
+                "TkFusedNormGemm: CHUNK_K * ITERS must equal K"
+            );
         }
         // Runtime cross-field invariant: norm_kind must NOT carry
         // residual fold or scalar offset for this constructor.
@@ -2289,8 +2340,9 @@ impl TkFusedNormGemm {
             }
         }
         use crate::ir::substrate::{
-            ActSlotConst, IterCount, MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId,
-            ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, BarSyncPair, ChunkK, IterCount, MatmulK, MatmulN,
+            MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -2309,6 +2361,8 @@ impl TkFusedNormGemm {
             n: MatmulN::<N>::new().erase(),
             k: MatmulK::<K>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            tile_n: TileN::<TILE_N>::new().erase(),
+            chunk_k: ChunkK::<CHUNK_K>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             delta_act_slot: None,
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
@@ -2322,6 +2376,10 @@ impl TkFusedNormGemm {
                 { u32::MAX },
             >::new()
             .erase(),
+            consumer_bar_reduce: BarSyncId::<CONSUMER_BAR_REDUCE>::new().erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
+            bar_pair_proof: BarSyncPair::<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>::new()
+                .erase(),
             eps,
             norm_weight,
             linear_weight,
@@ -2359,13 +2417,25 @@ impl TkFusedNormGemm {
         const OUT_ACT_SLOT: u32,
         const NORM_WEIGHT_ACCESSOR_IDX: u32,
         const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         norm_weight: WeightRef,
         linear_weight: WeightRef,
         norm_kind: LmHeadNormKind,
         offset: Option<FiniteF32>,
         eps: FiniteF32,
-    ) -> Self {
+    ) -> Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsDistinctBarPair,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "TkFusedNormGemm: IN_ID OOB");
             assert!(DELTA_ID < NUM_PAGES, "TkFusedNormGemm: DELTA_ID OOB");
@@ -2411,6 +2481,12 @@ impl TkFusedNormGemm {
                 NUM_TOKENS > 0,
                 "TkFusedNormGemm: NUM_TOKENS must be > 0"
             );
+            assert!(TILE_N > 0, "TkFusedNormGemm: TILE_N must be > 0");
+            assert!(CHUNK_K > 0, "TkFusedNormGemm: CHUNK_K must be > 0");
+            assert!(
+                CHUNK_K * ITERS == K,
+                "TkFusedNormGemm: CHUNK_K * ITERS must equal K"
+            );
         }
         match (norm_kind, offset.is_some()) {
             (LmHeadNormKind::AddScalarOffsetRmsNorm, true)
@@ -2429,8 +2505,9 @@ impl TkFusedNormGemm {
             }
         }
         use crate::ir::substrate::{
-            ActSlotConst, IterCount, MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId,
-            ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, BarSyncPair, ChunkK, IterCount, MatmulK, MatmulN,
+            MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -2449,6 +2526,8 @@ impl TkFusedNormGemm {
             n: MatmulN::<N>::new().erase(),
             k: MatmulK::<K>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            tile_n: TileN::<TILE_N>::new().erase(),
+            chunk_k: ChunkK::<CHUNK_K>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             delta_act_slot: Some(ActSlotConst::<DELTA_ACT_SLOT, { u32::MAX }>::new().erase()),
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
@@ -2462,6 +2541,10 @@ impl TkFusedNormGemm {
                 { u32::MAX },
             >::new()
             .erase(),
+            consumer_bar_reduce: BarSyncId::<CONSUMER_BAR_REDUCE>::new().erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
+            bar_pair_proof: BarSyncPair::<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>::new()
+                .erase(),
             eps,
             norm_weight,
             linear_weight,
@@ -2532,6 +2615,21 @@ impl TkFusedNormGemm {
     }
     pub const fn linear_weight_accessor_idx(&self) -> crate::ir::substrate::WeightAccessorRef {
         self.linear_weight_accessor_idx
+    }
+    pub const fn tile_n(&self) -> crate::ir::substrate::TileNRef {
+        self.tile_n
+    }
+    pub const fn chunk_k(&self) -> crate::ir::substrate::ChunkKRef {
+        self.chunk_k
+    }
+    pub const fn consumer_bar_reduce(&self) -> crate::ir::substrate::BarRef {
+        self.consumer_bar_reduce
+    }
+    pub const fn consumer_bar_publish(&self) -> crate::ir::substrate::BarRef {
+        self.consumer_bar_publish
+    }
+    pub const fn bar_pair_proof(&self) -> crate::ir::substrate::DistinctBarPairProof {
+        self.bar_pair_proof
     }
     pub fn eps(&self) -> FiniteF32 {
         self.eps

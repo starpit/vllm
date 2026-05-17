@@ -1334,7 +1334,8 @@ fn emit_lm_head_no_delta(
     let b_tile_bytes = lit(state.scratch_bytes - state.num_consumer_warps * 4);
     let consumer_phase = lit(state.arrives & 1);
     let storer_phase = lit((state.arrives + 1) & 1);
-    let iters = lit(1u32);
+    let iters_const = 1_u32;
+    let iters = lit(iters_const);
     let arrives = lit(state.arrives);
     let num_layers = lit(state.num_layers);
     let layer_lit = lit(layer);
@@ -1348,6 +1349,18 @@ fn emit_lm_head_no_delta(
     let eps_lit = state.rms_norm_eps;
     let num_pages_lit = lit(state.num_pages_budget);
     let scratch_lit = lit(state.scratch_bytes);
+    // TILE_N = N / NCW (AlongN warp split). Fall back to N when NCW
+    // doesn't divide; the IR only requires TILE_N > 0. Mirrors the
+    // S10 / S11a / S12a proc-macro logic.
+    let ncw = state.num_consumer_warps;
+    let tile_n_const = if ncw > 0 && n % ncw == 0 { n / ncw } else { n };
+    let tile_n_lit = lit(tile_n_const);
+    // ITERS=1 today → CHUNK_K must equal K (S13a IR invariant).
+    let chunk_k_lit = lit(k / iters_const);
+    // Two named bars: reduce (cross-warp norm reduce) + publish
+    // (post-norm + post-gemm sync). Mirror of FusedAddRmsNorm.
+    let consumer_bar_reduce = lit(1u32);
+    let consumer_bar_publish = lit(2u32);
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
@@ -1379,6 +1392,14 @@ fn emit_lm_head_no_delta(
             >::new(),
             ::ferrite_megakernel::ir::WeightAccessorConst::<
                 #linear_weight_accessor_idx, { u32::MAX },
+            >::new(),
+            ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
+            ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
+            ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_reduce>::new(),
+            ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
+            ::ferrite_megakernel::ir::BarSyncPair::<
+                #consumer_bar_reduce,
+                #consumer_bar_publish,
             >::new(),
             #norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #eps_lit,
         );
@@ -1418,7 +1439,8 @@ fn emit_lm_head_with_delta(
     let b_tile_bytes = lit(state.scratch_bytes - state.num_consumer_warps * 4);
     let consumer_phase = lit(state.arrives & 1);
     let storer_phase = lit((state.arrives + 1) & 1);
-    let iters = lit(1u32);
+    let iters_const = 1_u32;
+    let iters = lit(iters_const);
     let arrives = lit(state.arrives);
     let num_layers = lit(state.num_layers);
     let layer_lit = lit(layer);
@@ -1437,6 +1459,12 @@ fn emit_lm_head_with_delta(
     };
     let num_pages_lit = lit(state.num_pages_budget);
     let scratch_lit = lit(state.scratch_bytes);
+    let ncw = state.num_consumer_warps;
+    let tile_n_const = if ncw > 0 && n % ncw == 0 { n / ncw } else { n };
+    let tile_n_lit = lit(tile_n_const);
+    let chunk_k_lit = lit(k / iters_const);
+    let consumer_bar_reduce = lit(1u32);
+    let consumer_bar_publish = lit(2u32);
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
@@ -1470,6 +1498,14 @@ fn emit_lm_head_with_delta(
             >::new(),
             ::ferrite_megakernel::ir::WeightAccessorConst::<
                 #linear_weight_accessor_idx, { u32::MAX },
+            >::new(),
+            ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
+            ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
+            ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_reduce>::new(),
+            ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
+            ::ferrite_megakernel::ir::BarSyncPair::<
+                #consumer_bar_reduce,
+                #consumer_bar_publish,
             >::new(),
             #norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #offset_expr, #eps_lit,
         );

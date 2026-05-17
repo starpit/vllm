@@ -1143,6 +1143,10 @@ impl<
         const OUT_ACT_SLOT: u32,
         const NORM_WEIGHT_ACCESSOR_IDX: u32,
         const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
@@ -1171,11 +1175,26 @@ impl<
         _linear_weight_accessor_idx: crate::ir::substrate::WeightAccessorConst<
             LINEAR_WEIGHT_ACCESSOR_IDX, { u32::MAX },
         >,
+        _tile_n: crate::ir::substrate::TileN<TILE_N>,
+        _chunk_k: crate::ir::substrate::ChunkK<CHUNK_K>,
+        _consumer_bar_reduce: crate::ir::substrate::BarSyncId<CONSUMER_BAR_REDUCE>,
+        _consumer_bar_publish: crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+        _bar_pair_proof: crate::ir::substrate::BarSyncPair<
+            CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH,
+        >,
         norm_weight_path: String,
         linear_weight_path: String,
         norm_kind: LmHeadNormKind,
         eps: f32,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsDistinctBarPair,
+    {
         self.verify_arrives(ARRIVES, "push_tk_fused_norm_gemm_no_delta");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(NORM_W_ID);
@@ -1208,6 +1227,10 @@ impl<
             OUT_ACT_SLOT,
             NORM_WEIGHT_ACCESSOR_IDX,
             LINEAR_WEIGHT_ACCESSOR_IDX,
+            TILE_N,
+            CHUNK_K,
+            CONSUMER_BAR_REDUCE,
+            CONSUMER_BAR_PUBLISH,
         >(norm_weight, linear_weight, norm_kind, eps);
         self.nodes.push(MegaNode::TkFusedNormGemm(node));
         self.pool.release(IN_ID);
@@ -1250,6 +1273,10 @@ impl<
         const OUT_ACT_SLOT: u32,
         const NORM_WEIGHT_ACCESSOR_IDX: u32,
         const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
@@ -1280,12 +1307,27 @@ impl<
         _linear_weight_accessor_idx: crate::ir::substrate::WeightAccessorConst<
             LINEAR_WEIGHT_ACCESSOR_IDX, { u32::MAX },
         >,
+        _tile_n: crate::ir::substrate::TileN<TILE_N>,
+        _chunk_k: crate::ir::substrate::ChunkK<CHUNK_K>,
+        _consumer_bar_reduce: crate::ir::substrate::BarSyncId<CONSUMER_BAR_REDUCE>,
+        _consumer_bar_publish: crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+        _bar_pair_proof: crate::ir::substrate::BarSyncPair<
+            CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH,
+        >,
         norm_weight_path: String,
         linear_weight_path: String,
         norm_kind: LmHeadNormKind,
         offset: Option<f32>,
         eps: f32,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+        crate::ir::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsDistinctBarPair,
+    {
         self.verify_arrives(ARRIVES, "push_tk_fused_norm_gemm_with_delta");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(DELTA_ID);
@@ -1322,6 +1364,10 @@ impl<
             OUT_ACT_SLOT,
             NORM_WEIGHT_ACCESSOR_IDX,
             LINEAR_WEIGHT_ACCESSOR_IDX,
+            TILE_N,
+            CHUNK_K,
+            CONSUMER_BAR_REDUCE,
+            CONSUMER_BAR_PUBLISH,
         >(norm_weight, linear_weight, norm_kind, offset, eps);
         self.nodes.push(MegaNode::TkFusedNormGemm(node));
         self.pool.release(IN_ID);
@@ -2047,8 +2093,9 @@ mod tests {
     #[test]
     fn lowers_lm_head_rms_norm_no_delta() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulN, MbarrierPhase,
-            NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount,
+            MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId, ScratchRegion, TileN,
+            WeightAccessorConst,
         };
         let mut b = BuilderD::new();
         b.push_tk_fused_norm_gemm_no_delta::<
@@ -2058,6 +2105,7 @@ mod tests {
             128_000, 4_096,
             16, 0,
             8, 0, 1, 0, 1,
+            128_000, 4_096, 1, 2,
         >(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
@@ -2077,6 +2125,11 @@ mod tests {
             ActSlotConst::<1, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             WeightAccessorConst::<1, { u32::MAX }>::new(),
+            TileN::<128_000>::new(),
+            ChunkK::<4_096>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::RmsNorm,
@@ -2093,8 +2146,9 @@ mod tests {
     #[test]
     fn lowers_lm_head_add_scalar_offset_rms_norm_with_delta() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulN, MbarrierPhase,
-            NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount,
+            MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId, ScratchRegion, TileN,
+            WeightAccessorConst,
         };
         let mut b = BuilderD::new();
         b.push_tk_fused_norm_gemm_with_delta::<
@@ -2104,6 +2158,7 @@ mod tests {
             128_000, 4_096,
             16, 0,
             8, 0, 1, 2, 0, 1,
+            128_000, 4_096, 1, 2,
         >(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
@@ -2125,6 +2180,11 @@ mod tests {
             ActSlotConst::<2, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             WeightAccessorConst::<1, { u32::MAX }>::new(),
+            TileN::<128_000>::new(),
+            ChunkK::<4_096>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::AddScalarOffsetRmsNorm,
@@ -2144,8 +2204,9 @@ mod tests {
     #[should_panic(expected = "AddScalarOffsetRmsNorm requires Some(offset)")]
     fn lm_head_rejects_missing_offset_for_scalar_offset_kind() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulN, MbarrierPhase,
-            NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount,
+            MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId, ScratchRegion, TileN,
+            WeightAccessorConst,
         };
         let mut b = BuilderD::new();
         b.push_tk_fused_norm_gemm_with_delta::<
@@ -2155,6 +2216,7 @@ mod tests {
             128_000, 4_096,
             16, 0,
             8, 0, 1, 2, 0, 1,
+            128_000, 4_096, 1, 2,
         >(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
@@ -2176,6 +2238,11 @@ mod tests {
             ActSlotConst::<2, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             WeightAccessorConst::<1, { u32::MAX }>::new(),
+            TileN::<128_000>::new(),
+            ChunkK::<4_096>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::AddScalarOffsetRmsNorm,

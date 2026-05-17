@@ -774,6 +774,10 @@ pub struct Add {
     num_tokens: crate::substrate::NumTokensRef,
     delta_act_slot: crate::substrate::ActSlotRef,
     residual_act_slot: crate::substrate::ActSlotRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their output slice" publish before warp 0 arrives on
+    /// `page_done`. Type-checked in 1..=15 by `BarSyncId`.
+    consumer_bar_publish: crate::substrate::BarRef,
 }
 
 impl Add {
@@ -789,7 +793,11 @@ impl Add {
         const NUM_TOKENS: u32,
         const DELTA_ACT_SLOT: u32,
         const RESIDUAL_ACT_SLOT: u32,
-    >() -> Self {
+        const CONSUMER_BAR_PUBLISH: u32,
+    >() -> Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+    {
         const {
             // Cross-field invariants — page non-alias, phase parity.
             // Stable Rust can't enumerate sealed witnesses for these
@@ -809,7 +817,7 @@ impl Add {
             );
         }
         use crate::substrate::{
-            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
         };
         Self {
             delta_page: PageId::<DELTA_ID, NUM_PAGES>::new().erase(),
@@ -820,6 +828,7 @@ impl Add {
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             delta_act_slot: ActSlotConst::<DELTA_ACT_SLOT, { u32::MAX }>::new().erase(),
             residual_act_slot: ActSlotConst::<RESIDUAL_ACT_SLOT, { u32::MAX }>::new().erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
         }
     }
 
@@ -846,6 +855,9 @@ impl Add {
     }
     pub const fn residual_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.residual_act_slot
+    }
+    pub const fn consumer_bar_publish(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_publish
     }
 }
 

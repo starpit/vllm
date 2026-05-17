@@ -13,7 +13,7 @@
 //! sprint, each variant's emitted `.cu` must compile against TK
 //! 2.0 on the pod before it's "done."
 
-use crate::nodes::{MegaNode, RmsNorm};
+use crate::nodes::{Add, MegaNode, RmsNorm};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -47,7 +47,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
     match node {
         MegaNode::RmsNorm(n) => emit_rms_norm(n, budget),
         MegaNode::FusedQkvRopeCache(_) => RoleBodies::skipped("FusedQkvRopeCache"),
-        MegaNode::Add(_) => RoleBodies::skipped("Add"),
+        MegaNode::Add(n) => emit_add(n, budget),
         MegaNode::FusedAddRmsNorm(_) => RoleBodies::skipped("FusedAddRmsNorm"),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
@@ -246,6 +246,139 @@ fn emit_rms_norm(n: &RmsNorm, budget: TapeBudget) -> RoleBodies {
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &in_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// Add — in-place residual fold (residual_smem += delta_smem).
+// ============================================================
+//
+// Page lifecycle:
+//   delta_page:    Empty → Filled (loader TMA)
+//                        → Empty (consumer arrive page_consumed)
+//   residual_page: Empty → Filled (loader TMA)
+//                        → Produced (consumer warp::store)
+//                        → Empty (storer TMA + arrive page_consumed)
+//
+// TK 2.0 primitives used (every cited):
+//   - kittens::group<1>::wait                    (sync.cuh:112)
+//   - kittens::group<1>::arrive                  (sync.cuh:69)
+//   - kittens::group<1>::tma::expect_bytes       (util/tma.cuh:18)
+//   - kittens::group<1>::tma::load_async (raw)   (util/tma.cuh:72)
+//   - kittens::group<1>::tma::store_async (raw)  (util/tma.cuh:82)
+//   - kittens::group<1>::tma::store_async_wait   (util/tma.cuh:46)
+//   - kittens::group<NCW>::load(rv_fl, sv_bf)    (vec/shared_to_register.cuh:14)
+//   - kittens::group<NCW>::store(sv_bf, rv_fl)   (vec/shared_to_register.cuh:101)
+//   - kittens::group<NCW>::sync(int id)          (group.cuh:33)
+//   - kittens::warp::add(rv, rv, rv)             (vec/maps.cuh:333)
+//
+// No reduction, no scratch — each warp's slice is independent.
+// One named-bar publish before warp 0 arrives on page_done so
+// the storer doesn't TMA out a partially-written page.
+
+fn emit_add(n: &Add, budget: TapeBudget) -> RoleBodies {
+    let delta_page = n.delta_page();
+    let residual_page = n.residual_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let delta_act_slot = n.delta_act_slot().raw();
+    let residual_act_slot = n.residual_act_slot().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_add: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+
+    let delta_smem = page_as_sv_bf(delta_page, hidden_dim);
+    let residual_smem = page_as_sv_bf(residual_page, hidden_dim);
+    let delta_ready = page_ready_sem(delta_page);
+    let residual_ready = page_ready_sem(residual_page);
+    let residual_done = page_done_sem(residual_page);
+    let delta_consumed = page_consumed_sem(delta_page);
+    let residual_consumed = page_consumed_sem(residual_page);
+    let delta_gmem = gmem_act_ptr_raw(delta_act_slot);
+    let residual_gmem = gmem_act_ptr_raw(residual_act_slot);
+
+    let bf16_size_bytes = 2_u32;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+
+    // Loader: TMA-load delta + residual.
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &delta_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &residual_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &delta_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1,
+        &delta_smem,
+        &delta_gmem,
+        act_bytes,
+        &delta_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &residual_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1,
+        &residual_smem,
+        &residual_gmem,
+        act_bytes,
+        &residual_ready,
+    ));
+
+    let launcher = CuBlock::new();
+
+    // Consumer: load delta+residual into per-warp register vecs,
+    // warp::add elementwise, store back to residual page.
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &delta_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &residual_ready, consumer_phase));
+
+    let (decl_delta, delta_rv) = tk20::decl_rv_fl("__add_delta_rv", k_per_warp);
+    let (decl_res, res_rv) = tk20::decl_rv_fl("__add_res_rv", k_per_warp);
+    consumer.push(decl_delta);
+    consumer.push(decl_res);
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(
+        ncw, &delta_rv, &delta_smem,
+    ));
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(
+        ncw,
+        &res_rv,
+        &residual_smem,
+    ));
+    consumer.push(tk20::warp_add_rv_rv(&res_rv, &res_rv, &delta_rv));
+    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(
+        ncw,
+        &residual_smem,
+        &res_rv,
+    ));
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(tk20::group_arrive(1, &residual_done));
+    consumer.push(tk20::group_arrive(1, &delta_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer: TMA-store residual back to gmem.
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &residual_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw(
+        1,
+        &residual_gmem,
+        &residual_smem,
+        act_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &residual_consumed));
 
     RoleBodies {
         loader,

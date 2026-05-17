@@ -432,6 +432,7 @@ impl<
         const NUM_TOKENS: u32,
         const DELTA_ACT_SLOT: u32,
         const RESIDUAL_ACT_SLOT: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::substrate::ArrivesCount<ARRIVES>,
@@ -443,7 +444,11 @@ impl<
         _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
         _delta_act_slot: crate::substrate::ActSlotConst<DELTA_ACT_SLOT, { u32::MAX }>,
         _residual_act_slot: crate::substrate::ActSlotConst<RESIDUAL_ACT_SLOT, { u32::MAX }>,
-    ) -> &mut Self {
+        _bar_publish: crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+    ) -> &mut Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+    {
         self.verify_arrives(ARRIVES, "push_add");
         let _ = self.pool.take(DELTA_ID);
         let _ = self.pool.take(RESIDUAL_ID);
@@ -458,6 +463,7 @@ impl<
             NUM_TOKENS,
             DELTA_ACT_SLOT,
             RESIDUAL_ACT_SLOT,
+            CONSUMER_BAR_PUBLISH,
         >();
         self.nodes.push(MegaNode::Add(node));
         self.pool.release(DELTA_ID);
@@ -1682,7 +1688,8 @@ mod tests {
     #[test]
     fn lowers_add_minimal() {
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            PageId,
         };
         let mut b = Builder6::new();
         b.push_add(
@@ -1695,6 +1702,7 @@ mod tests {
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
+            BarSyncId::<2>::new(),
         );
         let tape = b.finish(16);
         let MegaNode::Add(n) = &tape.nodes()[0] else {

@@ -314,6 +314,8 @@ mod tests {
             );
         }
 
+        // (S2 negative shared with rms_norm's NEGATIVE block below.)
+
         // NEGATIVE: must NOT contain any TK 1.0 / VM-reference
         // patterns or pre-existing ferrite_tk_helpers.cuh wrappers.
         for forbidden in [
@@ -332,6 +334,51 @@ mod tests {
             assert!(
                 !cu.source.contains(forbidden),
                 "FORBIDDEN pattern {forbidden:?} found in source — TK 1.0 pollution. Source:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    /// Sprint 2: Add. Same DOD pattern — Rust check + nvcc on pod.
+    #[test]
+    fn add_emits_tk20_calls() {
+        let mut b = BuilderD::new();
+        b.push_add(
+            ArrivesCount::<0>::new(),
+            PageId::<2, 8>::new(),
+            PageId::<3, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<5, { u32::MAX }>::new(),
+            ActSlotConst::<6, { u32::MAX }>::new(),
+            BarSyncId::<2>::new(),
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_add", &tape);
+        assert!(cu.skipped_variants.is_empty());
+
+        std::fs::write("/tmp/add_emit.cu", &cu.source).ok();
+
+        for needle in [
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[2], 4096);",
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[3], 4096);",
+            "kittens::rv_fl<256> __add_delta_rv;",
+            "kittens::rv_fl<256> __add_res_rv;",
+            "kittens::group<8>::load(__add_delta_rv,",
+            "kittens::group<8>::load(__add_res_rv,",
+            "kittens::warp::add(__add_res_rv, __add_res_rv, __add_delta_rv);",
+            "kittens::group<8>::store(",
+            "kittens::group<8>::sync(2);",
+            "kittens::group<1>::arrive(ss.page_done[3]);",
+            "kittens::group<1>::arrive(ss.page_consumed[2]);",
+            "kittens::group<1>::tma::store_async(",
+            "kittens::group<1>::tma::store_async_wait();",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected TK 2.0 call {needle:?}, got:\n{}",
                 cu.source
             );
         }

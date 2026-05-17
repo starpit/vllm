@@ -230,6 +230,24 @@ pub fn warp_mul_rv_rv(
     ))
 }
 
+/// `kittens::warp::add(dst, lhs, rhs);` — rv-rv elementwise add.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh:333`
+pub fn warp_add_rv_rv(
+    dst: &Rv<F32>,
+    lhs: &Rv<F32>,
+    rhs: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(dst.len(), lhs.len());
+    debug_assert_eq!(lhs.len(), rhs.len());
+    CuStmt::new(format!(
+        "kittens::warp::add({dst}, {lhs}, {rhs});",
+        dst = dst.expr(),
+        lhs = lhs.expr(),
+        rhs = rhs.expr()
+    ))
+}
+
 /// `kittens::warp::mul(dst, src, scalar);` — rv-scalar broadcast.
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:54-55` (the

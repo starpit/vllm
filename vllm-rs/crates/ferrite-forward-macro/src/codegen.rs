@@ -5477,6 +5477,9 @@ fn dispatch_instruction_to_push(
             let delta_act_slot = lit(*delta_slot);
             let residual_act_slot = lit(*residual_slot);
             let num_pages_lit = lit(state.num_pages_budget);
+            // Fixed bar.sync ID 2 in 1..=15 (bar 0 = __syncthreads;
+            // 1 reserved for RmsNorm-flavor reduce; 2 for publishes).
+            let consumer_bar_publish = lit(2u32);
             state.arrives += 1;
             Ok(quote! {
                 b.push_add(
@@ -5489,6 +5492,7 @@ fn dispatch_instruction_to_push(
                     ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_forward::mega_ir::ActSlotConst::<#delta_act_slot, { u32::MAX }>::new(),
                     ::ferrite_forward::mega_ir::ActSlotConst::<#residual_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_publish>::new(),
                 );
             })
         }

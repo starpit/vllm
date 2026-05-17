@@ -292,6 +292,53 @@ mod tests {
         }
     }
 
+    /// Sprint 2 — Add: in-place residual fold. Verifies the
+    /// emitted .cu carries the load/add/store sequence with values
+    /// pulled from the IR's typed getters.
+    #[test]
+    fn lower_add_to_cuda_smoke() {
+        let mut b = BuilderD::new();
+        b.push_add(
+            ArrivesCount::<0>::new(),
+            PageId::<2, 8>::new(), // delta page
+            PageId::<3, 8>::new(), // residual page
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<5, { u32::MAX }>::new(), // delta_act_slot
+            ActSlotConst::<6, { u32::MAX }>::new(), // residual_act_slot
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_add_only", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "expected zero skipped variants, got {:?}",
+            cu.skipped_variants
+        );
+        for needle in [
+            // Loader TMA-loads delta (page 2, slot 5) + residual (page 3, slot 6).
+            "kittens::tma::expect_bytes(ss.page_ready[2], 4096);",
+            "kittens::tma::expect_bytes(ss.page_ready[3], 4096);",
+            "g.act_ptrs[5]",
+            "g.act_ptrs[6]",
+            // Consumer load/add/store with NCW=8, K_PER_WARP=256.
+            "kittens::rv_fl<256> __add_delta_rv;",
+            "kittens::rv_fl<256> __add_res_rv;",
+            "kittens::warp::add(__add_res_rv, __add_res_rv, __add_delta_rv);",
+            "kittens::warp::sync();",
+            // Storer TMA-stores residual page (3) back to slot 6.
+            "kittens::tma::store_async(g.act_ptrs[6], (*reinterpret_cast<kittens::sv_bf<2048>*>(ss.pages[3]))",
+            "kittens::arrive(ss.page_consumed[3]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected source to contain {needle:?}, source was:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// A tape with only a SKIPPED variant produces a `.cu` that
     /// still has the full substrate scaffold but reports the
     /// skipped variant in diagnostics + as a `// SKIPPED` comment.

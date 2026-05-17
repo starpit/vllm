@@ -15,7 +15,7 @@
 //! at the corresponding tape position so the structural shape of
 //! the emitted `.cu` is preserved.
 
-use crate::nodes::{MegaNode, RmsNorm};
+use crate::nodes::{Add, MegaNode, RmsNorm};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -55,7 +55,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
     match node {
         MegaNode::RmsNorm(n) => emit_rms_norm(n, budget),
         MegaNode::FusedQkvRopeCache(_) => RoleBodies::skipped("FusedQkvRopeCache"),
-        MegaNode::Add(_) => RoleBodies::skipped("Add"),
+        MegaNode::Add(n) => emit_add(n, budget),
         MegaNode::FusedAddRmsNorm(_) => RoleBodies::skipped("FusedAddRmsNorm"),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
@@ -239,6 +239,122 @@ fn emit_rms_norm(n: &RmsNorm, budget: TapeBudget) -> RoleBodies {
     ));
     storer.push(tk::tma_store_async_wait());
     storer.push(tk::arrive(&in_consumed));
+    storer.push(CuStmt::new("}".to_string()));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// Add — in-place residual fold (residual += delta).
+// ============================================================
+//
+// Page lifecycle:
+//
+//   delta_page:    Empty → Filled (loader TMA)
+//                        → Empty (consumer arrive page_consumed)
+//   residual_page: Empty → Filled (loader TMA)
+//                        → Produced (consumer warp::store)
+//                        → Empty (storer TMA + arrive page_consumed)
+//
+// Per `MEGA_IR_PLAN.md` §4a Add row: "no per-op kernel — emit is a
+// per-page residual fold"; the consumer body is a load/add/store
+// loop in fp32 register vectors, no `ferrite::tk::*` helper needed.
+
+fn emit_add(n: &Add, budget: TapeBudget) -> RoleBodies {
+    let delta_page = n.delta_page();
+    let residual_page = n.residual_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let delta_act_slot = n.delta_act_slot().raw();
+    let residual_act_slot = n.residual_act_slot().raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_add: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+
+    let delta_smem = page_as_sv_bf(delta_page, hidden_dim);
+    let residual_smem = page_as_sv_bf(residual_page, hidden_dim);
+    let delta_ready = page_ready_sem(delta_page);
+    let residual_ready = page_ready_sem(residual_page);
+    let residual_done = page_done_sem(residual_page);
+    let delta_consumed = page_consumed_sem(delta_page);
+    let residual_consumed = page_consumed_sem(residual_page);
+    let delta_gmem = gmem_act_ptr_bf16(delta_act_slot);
+    let residual_gmem = gmem_act_ptr_bf16(residual_act_slot);
+
+    let bf16_size_bytes = 2;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+
+    // Loader: TMA-load both pages from gmem.
+    let mut loader = CuBlock::new();
+    let loader_phase = storer_phase;
+    loader.push(super::tk::wait(&delta_consumed, loader_phase));
+    loader.push(super::tk::wait(&residual_consumed, loader_phase));
+    loader.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    loader.push(super::tk::tma_expect_bytes(&delta_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &delta_smem,
+        &delta_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &delta_ready,
+    ));
+    loader.push(super::tk::tma_expect_bytes(&residual_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &residual_smem,
+        &residual_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &residual_ready,
+    ));
+    loader.push(CuStmt::new("}".to_string()));
+
+    // Launcher: nothing.
+    let launcher = CuBlock::new();
+
+    // Consumer: declare two rv_fl, warp-load both, add in fp32,
+    // warp-store back to residual page (bf16-narrowed by the TK
+    // store), warp-sync, then warp 0 publishes page_done /
+    // page_consumed.
+    let mut consumer = CuBlock::new();
+    consumer.push(super::tk::wait(&delta_ready, consumer_phase));
+    consumer.push(super::tk::wait(&residual_ready, consumer_phase));
+    let delta_slice = warp_slice_sv_bf(&delta_smem, ncw, k_per_warp);
+    let residual_slice = warp_slice_sv_bf(&residual_smem, ncw, k_per_warp);
+    let (decl_delta, delta_rv) = super::tk::decl_rv_fl("__add_delta_rv", k_per_warp);
+    let (decl_res, res_rv) = super::tk::decl_rv_fl("__add_res_rv", k_per_warp);
+    consumer.push(decl_delta);
+    consumer.push(decl_res);
+    consumer.push(super::tk::warp_load_bf16_to_f32(&delta_rv, &delta_slice));
+    consumer.push(super::tk::warp_load_bf16_to_f32(&res_rv, &residual_slice));
+    consumer.push(super::tk::warp_add_f32(&res_rv, &res_rv, &delta_rv));
+    consumer.push(super::tk::warp_store_bf16(&residual_slice, &res_rv));
+    consumer.push(super::tk::warp_sync());
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(super::tk::arrive(&residual_done));
+    consumer.push(super::tk::arrive(&delta_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer: TMA-store the residual page back to gmem.
+    let mut storer = CuBlock::new();
+    storer.push(super::tk::wait(&residual_done, storer_phase));
+    storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    storer.push(super::tk::tma_store_async_bf16(
+        &residual_gmem,
+        &residual_smem,
+        &CuExpr::new("{0}".to_string()),
+    ));
+    storer.push(super::tk::tma_store_async_wait());
+    storer.push(super::tk::arrive(&residual_consumed));
     storer.push(CuStmt::new("}".to_string()));
 
     RoleBodies {

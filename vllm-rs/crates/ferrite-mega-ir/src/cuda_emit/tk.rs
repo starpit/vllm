@@ -114,6 +114,62 @@ pub fn warp_store_bf16(dst: &SmemColVec<Bf16>, src: &RegColVec<F32>) -> CuStmt {
     ))
 }
 
+/// Declare a CUDA local `kittens::rv_fl<LEN> <name>;` and return the
+/// statement plus a handle bound to the named register vector. Used
+/// before `warp::load` since TK's `warp::load(rv, sv)` mutates
+/// `rv` in-place rather than returning.
+pub fn decl_rv_fl(name: &str, len: u32) -> (CuStmt, RegColVec<F32>) {
+    let stmt = CuStmt::new(format!("kittens::rv_fl<{len}> {name};"));
+    (stmt, RegColVec::from_expr(CuExpr::new(name.to_string()), len))
+}
+
+/// `kittens::warp::load(dst_rv, src_smem);` — load a bf16 shared
+/// column vector into an fp32 register vector (TK widens bf16→fp32
+/// on load). Lengths must match.
+pub fn warp_load_bf16_to_f32(dst: &RegColVec<F32>, src: &SmemColVec<Bf16>) -> CuStmt {
+    debug_assert_eq!(
+        dst.len(),
+        src.len(),
+        "warp_load_bf16_to_f32: dst.len() must equal src.len()"
+    );
+    CuStmt::new(format!(
+        "kittens::warp::load({dst}, {src});",
+        dst = dst.expr(),
+        src = src.expr()
+    ))
+}
+
+/// `kittens::warp::add(dst_rv, lhs_rv, rhs_rv);` — elementwise
+/// fp32 register-vector add. `dst` may alias `lhs` or `rhs`. All
+/// three lengths must match.
+pub fn warp_add_f32(
+    dst: &RegColVec<F32>,
+    lhs: &RegColVec<F32>,
+    rhs: &RegColVec<F32>,
+) -> CuStmt {
+    debug_assert_eq!(
+        dst.len(),
+        lhs.len(),
+        "warp_add_f32: dst.len() must equal lhs.len()"
+    );
+    debug_assert_eq!(
+        lhs.len(),
+        rhs.len(),
+        "warp_add_f32: lhs.len() must equal rhs.len()"
+    );
+    CuStmt::new(format!(
+        "kittens::warp::add({dst}, {lhs}, {rhs});",
+        dst = dst.expr(),
+        lhs = lhs.expr(),
+        rhs = rhs.expr()
+    ))
+}
+
+/// `kittens::warp::sync();` — single-warp sync (lane convergence).
+pub fn warp_sync() -> CuStmt {
+    CuStmt::new("kittens::warp::sync();".to_string())
+}
+
 // ============================================================
 // ferrite::tk helpers — generalised TK primitives
 // ============================================================

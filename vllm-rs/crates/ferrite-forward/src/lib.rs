@@ -23,12 +23,14 @@
 pub mod attack_surface;
 pub mod cpu_golden;
 
-/// Re-export of `ferrite-mega-ir` so the proc-macro's Phase C
-/// emission resolves through `ferrite_forward::mega_ir::...` —
-/// every consumer crate already imports `ferrite-forward`, so no
-/// per-crate Cargo.toml edits are needed for the const-generic
-/// `MegaTapeBuilder::push_*::<...>` paths the macro emits.
-pub use ferrite_mega_ir as mega_ir;
+// `pub use ferrite_mega_ir as mega_ir;` removed when the mega
+// crate moved to `ferrite-megakernel`. The proc-macro emits
+// `::ferrite_megakernel::ir::*` paths directly — model crates pull
+// `ferrite-megakernel` in transitively via `ferrite-forward-macro`,
+// so no per-crate Cargo.toml edits were needed at the consumer
+// side. Dropping the re-export breaks the
+// `mega → forward → mega` cycle and lets the mega crate depend on
+// `ferrite-forward` for the `Instruction` enum.
 #[cfg(feature = "cuda")]
 pub mod info;
 pub mod instr;

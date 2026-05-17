@@ -39,18 +39,17 @@ ferrite-cuda-targets = { path = "../ferrite-cuda-targets" }
 #
 # `ferrite-forward` must NOT depend on `ferrite-forward-macro` back
 # (the re-export of the proc-macro was dropped to break the cycle —
-# that edge previously closed `macro → mega-ir → ferrite-forward →
-# macro` into a cycle; with the proc-macro re-export gone, no cycle
-# exists and `ferrite-mega-ir` can be a direct dep here).
+# that edge previously closed `macro → megakernel → ferrite-forward
+# → macro`; with the proc-macro re-export gone, no cycle exists and
+# `ferrite-megakernel` can be a direct dep here).
 ferrite-forward = { path = "../ferrite-forward" }
-# Per `MEGA_IR_PLAN.md` §5: the proc-macro builds typed
-# `Vec<OpInput>` from each canonical's `LoweredBucket` and calls
-# `ferrite_mega_ir::lower(...)` to produce a substrate-proof-bearing
-# `MegaTape`. Sprint A–D coverage means every variant the tape can
-# carry has a substrate-typed lowering; variants outside that set
-# return `LowerError::NotYetLifted`, which the proc-macro treats as
-# "fall back to the host interpreter for this canonical".
-ferrite-mega-ir = { path = "../ferrite-mega-ir" }
+# `ferrite-megakernel` owns the substrate IR + the dispatch
+# helpers (`codegen::dispatch_instruction_to_push` etc.) the proc-
+# macro calls per-canonical. ALL megakernel codegen (Rust
+# TokenStreams + CUDA strings) lives in that crate; this proc-
+# macro is just the orchestrator that walks each canonical's
+# `LoweredBucket` and feeds Instructions into the dispatch.
+ferrite-megakernel = { path = "../ferrite-megakernel" }
 
 [dev-dependencies]
 trybuild = "1"

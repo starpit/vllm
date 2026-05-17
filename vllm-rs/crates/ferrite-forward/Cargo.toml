@@ -32,12 +32,15 @@ probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-vision = { path = "../ferrite-vision" }
-# Re-exported as `ferrite_forward::mega_ir` so the proc-macro's
-# Phase C emission (literal-const-arg `MegaTapeBuilder::push_*`
-# calls) resolves through ferrite-forward without every consumer
-# crate needing to add `ferrite-mega-ir` as a dep. The macro's
-# emitted code uses `::ferrite_forward::mega_ir::...` paths.
-ferrite-mega-ir = { path = "../ferrite-mega-ir" }
+# `ferrite-megakernel` (the mega crate that owns substrate IR +
+# Rust/CUDA codegen) used to be re-exported here as
+# `ferrite_forward::mega_ir`, and `ferrite-forward` depended on it
+# for that re-export only. The re-export has been dropped:
+# proc-macro emit now anchors at `::ferrite_megakernel::ir::*`
+# directly. Eliminating that edge breaks the
+# `mega → forward → mega` cycle that previously prevented
+# the mega crate from depending on `ferrite-forward` (which it
+# now does, for the `Instruction` enum input to `codegen`).
 anyhow = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }

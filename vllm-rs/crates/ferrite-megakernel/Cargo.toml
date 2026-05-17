@@ -1,0 +1,37 @@
+[package]
+name = "ferrite-megakernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Megakernel substrate IR + Rust/CUDA codegen. `ir` carries the typed correct-by-construction MegaTape (sealed Substrate trait + sealed witnesses). `codegen` emits the proc-macro TokenStreams that build a MegaTape at user-build time. `cuda_emit` emits the .cu source per MegaNode role. Owns ALL megakernel codegen — no megakernel logic leaks into non-mega crates."
+
+[features]
+default = []
+nccl = ["ferrite-forward/nccl"]
+
+[dependencies]
+# Token-stream emission helpers in `crate::codegen` produce
+# `proc_macro2::TokenStream`s for the proc-macro's `#[forward]`
+# expansion. `proc-macro2`/`quote` aren't proc-macro crates —
+# they're regular libraries the proc-macro ecosystem uses for
+# token manipulation. They compile fine here without turning
+# `ferrite-megakernel` into a proc-macro crate. Keeping the
+# dispatch helpers in this crate (rather than in the
+# `ferrite-forward-macro` proc-macro) is what isolates ALL
+# megakernel codegen to one mega-named crate.
+proc-macro2 = "1"
+quote = "1"
+# Frontend `Instruction` enum is the input to the dispatch
+# helpers in `crate::codegen`. `ferrite-forward` itself does
+# NOT depend on `ferrite-megakernel` (the cycle was broken when
+# `ferrite-forward` dropped its `pub use ferrite_mega_ir as
+# mega_ir` re-export — proc-macro emit now anchors at
+# `::ferrite_megakernel::ir::*` directly).
+ferrite-forward = { path = "../ferrite-forward" }
+
+# Compile-fail tests for const-generic substrate-proof rejection
+# live in `tests/compile_fail.rs` and shell out to `rustc` directly.
+# trybuild's primary-span filter rejects post-monomorphization E0080
+# const-eval errors (the primary span lands in `core::panic`), so we
+# don't use it; the hand-rolled driver works around it without
+# adding a dev-dep.

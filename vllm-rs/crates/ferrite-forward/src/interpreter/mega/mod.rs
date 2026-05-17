@@ -58,12 +58,12 @@
 
 #![cfg(feature = "cuda")]
 
-// Sprint 1b iter 2: the typed mega IR (`lowered.rs` + `lowering.rs`)
-// moved out into the standalone `ferrite-mega-ir` crate so the
-// proc-macro can depend on it. This module is now ABI-only — Rust
-// types matching the emitted megakernel's positional `extern "C"`
-// signature (LaunchArgs, LaunchTier, PersistentDecodeResources,
-// etc.). See `ferrite-mega-ir` for `MegaTape`, `MegaTapeBuilder`,
+// The typed mega IR (`lowered.rs` + `lowering.rs`) moved out into
+// the standalone `ferrite-megakernel` crate so the proc-macro can
+// depend on it. This module is now ABI-only — Rust types matching
+// the emitted megakernel's positional `extern "C"` signature
+// (LaunchArgs, LaunchTier, PersistentDecodeResources, etc.). See
+// `ferrite-megakernel::ir` for `MegaTape`, `MegaTapeBuilder`,
 // `Substrate`, and the typed newtypes.
 
 use std::ffi::c_void;

@@ -1874,11 +1874,11 @@ impl Gemm {
     }
 }
 
-/// TK-emit variant for the frontend `Instruction::TkFusedGemmAdd(in,
-/// residual, layer, n, k)` → `residual += gemm(in, weight[layer])` in
-/// place. Substrate shape is `TkGemm` plus a `residual_page` that's
-/// read AND written (the output writes back to the residual buffer;
-/// no separate out_page).
+/// TK-emit backend variant for the frontend
+/// `Instruction::FusedCublasGemmAdd(in, residual, layer, n, k)` →
+/// `residual += gemm(in, weight[layer])` in place. Substrate shape
+/// is `Gemm` plus a `residual_page` that's read AND written (the
+/// output writes back to the residual buffer; no separate out_page).
 ///
 /// Codegen inlines the role bodies. Template
 /// `<K, N, NUM_TOKENS, K_OFFSET, K_FULL>`. K_OFFSET / K_FULL
@@ -1899,9 +1899,24 @@ pub struct TkFusedGemmAdd {
     num_tokens: crate::ir::substrate::NumTokensRef,
     k_offset: crate::ir::substrate::KOffsetRef,
     k_full: crate::ir::substrate::KFullRef,
+    /// Per-warp output N slice (AlongN warp split). Mirrors the
+    /// `Gemm::tile_n` field added in Sprint 9.
+    tile_n: crate::ir::substrate::TileNRef,
+    /// Per-iter K-chunk width loaded into the b_tile. Mirrors the
+    /// `Gemm::chunk_k` field added in Sprint 9.
+    chunk_k: crate::ir::substrate::ChunkKRef,
     in_act_slot: crate::ir::substrate::ActSlotRef,
     residual_act_slot: crate::ir::substrate::ActSlotRef,
     weight_accessor_idx: crate::ir::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their `[M, TILE_N]` accumulator slice into the residual page"
+    /// publish before warp 0 arrives on `page_done[residual_page]`.
+    /// Mirrors `Gemm::consumer_bar_publish` (Sprint 10a). Validity
+    /// (1..=15) is enforced at construction by `BarSyncId<ID>:
+    /// IsValidBarSyncId`. TkFusedGemmAdd has no cross-warp
+    /// reduction (each warp owns disjoint output cols under the
+    /// AlongN split), so only one bar is needed.
+    consumer_bar_publish: crate::ir::substrate::BarRef,
     pub weight: WeightRef,
 }
 
@@ -1929,9 +1944,19 @@ impl TkFusedGemmAdd {
         const IN_ACT_SLOT: u32,
         const RESIDUAL_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         weight: WeightRef,
-    ) -> Self {
+    ) -> Self
+    where
+        // Sealed-witness: BAR_PUBLISH ∈ 1..=15. ID 0 is reserved
+        // for `__syncthreads`; 16+ is out of PTX range. Mirrors
+        // `Gemm::new` (Sprint 10a).
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "TkFusedGemmAdd: IN_ID OOB");
             assert!(WEIGHT_ID < NUM_PAGES, "TkFusedGemmAdd: WEIGHT_ID OOB");
@@ -1969,10 +1994,25 @@ impl TkFusedGemmAdd {
                 (K_OFFSET as u64) + (K as u64) <= K_FULL as u64,
                 "TkFusedGemmAdd: K_OFFSET + K must be <= K_FULL"
             );
+            // Tile-layout invariants (mirror of Gemm Sprint 9).
+            // AlongN warp split: each consumer warp covers TILE_N
+            // output cols. tile_n * NCW equality with N is enforced
+            // by the proc-macro (NCW isn't a const generic here);
+            // tile_n > 0 is.
+            assert!(TILE_N > 0, "TkFusedGemmAdd: TILE_N must be > 0");
+            assert!(CHUNK_K > 0, "TkFusedGemmAdd: CHUNK_K must be > 0");
+            // Per-iter K coverage: chunk_k * iters == K. Hard
+            // mathematical invariant — the kernel covers the full
+            // K dim in `iters` steps of `chunk_k` each.
+            assert!(
+                CHUNK_K * ITERS == K,
+                "TkFusedGemmAdd: CHUNK_K * ITERS must equal K"
+            );
         }
         use crate::ir::substrate::{
-            ActSlotConst, IterCount, KFull, KOffset, MatmulK, MatmulN, MbarrierPhase,
-            NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, ChunkK, IterCount, KFull, KOffset, MatmulK, MatmulN,
+            MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1989,10 +2029,13 @@ impl TkFusedGemmAdd {
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             k_offset: KOffset::<K_OFFSET>::new().erase(),
             k_full: KFull::<K_FULL>::new().erase(),
+            tile_n: TileN::<TILE_N>::new().erase(),
+            chunk_k: ChunkK::<CHUNK_K>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             residual_act_slot: ActSlotConst::<RESIDUAL_ACT_SLOT, { u32::MAX }>::new().erase(),
             weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
                 .erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
             weight,
         }
     }
@@ -2005,6 +2048,12 @@ impl TkFusedGemmAdd {
     }
     pub const fn residual_page(&self) -> crate::ir::substrate::PageRef {
         self.residual_page
+    }
+    pub const fn tile_n(&self) -> crate::ir::substrate::TileNRef {
+        self.tile_n
+    }
+    pub const fn chunk_k(&self) -> crate::ir::substrate::ChunkKRef {
+        self.chunk_k
     }
     pub const fn b_tile_offset(&self) -> crate::ir::substrate::ScratchOffsetRef {
         self.b_tile_offset
@@ -2047,6 +2096,13 @@ impl TkFusedGemmAdd {
     }
     pub const fn weight_accessor_idx(&self) -> crate::ir::substrate::WeightAccessorRef {
         self.weight_accessor_idx
+    }
+    /// `bar.sync` ID for the consumer's "all warps wrote their
+    /// `[M, TILE_N]` accumulator slice" publish before warp 0
+    /// arrives on `page_done[residual_page]`. Validity (1..=15) was
+    /// discharged by sealed-witness type-check at construction.
+    pub const fn consumer_bar_publish(&self) -> crate::ir::substrate::BarRef {
+        self.consumer_bar_publish
     }
 }
 

@@ -1028,6 +1028,9 @@ impl<
         const IN_ACT_SLOT: u32,
         const RESIDUAL_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
@@ -1051,8 +1054,15 @@ impl<
         _weight_accessor_idx: crate::ir::substrate::WeightAccessorConst<
             WEIGHT_ACCESSOR_IDX, { u32::MAX },
         >,
+        _tile_n: crate::ir::substrate::TileN<TILE_N>,
+        _chunk_k: crate::ir::substrate::ChunkK<CHUNK_K>,
+        _consumer_bar_publish: crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
         weight_path: String,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+    {
         self.verify_arrives(ARRIVES, "push_tk_fused_gemm_add");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
@@ -1080,6 +1090,9 @@ impl<
             IN_ACT_SLOT,
             RESIDUAL_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
+            TILE_N,
+            CHUNK_K,
+            CONSUMER_BAR_PUBLISH,
         >(weight);
         self.nodes.push(MegaNode::TkFusedGemmAdd(node));
         self.pool.release(IN_ID);

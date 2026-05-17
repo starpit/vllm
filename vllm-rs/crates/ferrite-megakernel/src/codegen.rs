@@ -1099,7 +1099,22 @@ pub fn dispatch_instruction_to_push(
             let b_tile_bytes = lit(state.scratch_bytes);
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
-            let iters = lit(1u32);
+            // ITERS=1 today (proc-macro hands op-level iters; the
+            // scheduler doesn't currently chunk K). With ITERS=1
+            // CHUNK_K must equal K (TkFusedGemmAdd IR invariant).
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
+            let chunk_k_const = *k / iters_const;
+            let chunk_k_lit = lit(chunk_k_const);
+            // TILE_N = N / NCW (AlongN warp split). Mirror of the
+            // Gemm proc-macro logic from Sprint 9.
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && n % ncw == 0 {
+                n / ncw
+            } else {
+                *n
+            };
+            let tile_n_lit = lit(tile_n_const);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -1114,6 +1129,10 @@ pub fn dispatch_instruction_to_push(
             let weight_str = weight.as_str();
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            // Fixed BAR ID in 1..=15 (bar 0 is __syncthreads).
+            // Mirror of Gemm Sprint 10a: AlongN warp split has no
+            // cross-warp reduction, so only one publish bar.
+            let consumer_bar_publish = lit(1u32);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
@@ -1140,6 +1159,9 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::WeightAccessorConst::<
                         #weight_accessor_idx, { u32::MAX },
                     >::new(),
+                    ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
+                    ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
+                    ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
                     #weight_str.to_string(),
                 );
             })

@@ -29,6 +29,7 @@ mod affine_qmm_sweep;
 mod affine_qmv_sweep;
 mod attention_sweep;
 mod rmsnorm_sweep;
+mod synth_gate_up_silu_mul_sweep;
 mod synth_mlp_pre_down_sweep;
 mod synth_pre_attn_sweep;
 mod util;
@@ -66,6 +67,9 @@ fn main() {
     }
     if want("synth_mlp_pre_down") {
         synth_mlp_pre_down_sweep::run(launch_overhead_us);
+    }
+    if want("synth_gate_up_silu_mul") {
+        synth_gate_up_silu_mul_sweep::run(launch_overhead_us);
     }
     if want("attention") {
         attention_sweep::run(launch_overhead_us);

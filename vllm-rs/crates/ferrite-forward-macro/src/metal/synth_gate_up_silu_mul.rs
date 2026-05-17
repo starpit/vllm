@@ -120,7 +120,6 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
     fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let num_tokens = ctx.num_tokens() as u32;
         let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
-        let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
 
         // SAFETY GATE — this fused-large-M kernel uses 32×32 simdgroup
         // tiles per threadgroup without M-direction weight reuse, so its
@@ -136,6 +135,14 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
             return 1.0e15;
         }
 
+        // Cost requires measured data — the analytic fallback used to
+        // claim `silu_us * 0.90`, a hardware-agnostic lie that beats
+        // the unfused AffineQmm + Silu + Mul chain on every platform
+        // regardless of whether the kernel is actually fast there
+        // (62318fb52 exposed the bug on M1 Max once the fused-MLP
+        // path stopped winning). Refuse to claim a low cost without
+        // a measurement; populate the CSV via
+        // `cargo run -p ferrite-metal-cost-sweep --release`.
         let synth_name = format!(
             "synth_gate_up_silu_mul_large_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,
@@ -143,19 +150,7 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         if let Some(cost) = ctx.profile.cost_us_for(&synth_name, num_tokens, hidden, 0) {
             return cost;
         }
-
-        if hidden == 0 || intermediate == 0 { return 1.0e9; }
-        let bw = ctx.profile.memory_bandwidth_gbps;
-        if bw <= 0.0 { return 1.0e9; }
-
-        let mf = num_tokens.max(1) as f64;
-        let im = intermediate as f64;
-        let act_bytes = 2.0_f64;
-
-        let silu_bytes = 3.0 * mf * im * act_bytes;
-        let silu_us    = silu_bytes / 1e9 / bw * 1e6;
-
-        silu_us * 0.90
+        1.0e15
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {

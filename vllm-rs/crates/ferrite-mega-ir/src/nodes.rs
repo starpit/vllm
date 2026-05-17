@@ -1911,27 +1911,27 @@ impl FusedCublasGemmAdd {
 /// fused-norm sequence the codegen emits (RmsNorm / AddRmsNorm /
 /// MeanSubRmsNorm / AddScalarOffsetRmsNorm).
 pub struct CutlassFusedNormGemm {
-    in_page_id: u32,
-    delta_page_id: Option<u32>,
-    norm_weight_page_id: u32,
-    linear_weight_page_id: u32,
-    out_page_id: u32,
-    partial_offset: u32,
-    partial_bytes: u32,
-    b_tile_offset: u32,
-    b_tile_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    iters: u32,
-    layer: u32,
-    n: u32,
-    k: u32,
-    num_tokens: u32,
-    in_act_slot: u32,
-    delta_act_slot: Option<u32>,
-    out_act_slot: u32,
-    norm_weight_accessor_idx: u32,
-    linear_weight_accessor_idx: u32,
+    in_page: crate::substrate::PageRef,
+    delta_page: Option<crate::substrate::PageRef>,
+    norm_weight_page: crate::substrate::PageRef,
+    linear_weight_page: crate::substrate::PageRef,
+    out_page: crate::substrate::PageRef,
+    partial_offset: crate::substrate::ScratchOffsetRef,
+    partial_bytes: crate::substrate::ScratchBytesRef,
+    b_tile_offset: crate::substrate::ScratchOffsetRef,
+    b_tile_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    iters: crate::substrate::IterCountRef,
+    layer: crate::substrate::LayerRef,
+    n: crate::substrate::MatmulNRef,
+    k: crate::substrate::MatmulKRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    delta_act_slot: Option<crate::substrate::ActSlotRef>,
+    out_act_slot: crate::substrate::ActSlotRef,
+    norm_weight_accessor_idx: crate::substrate::WeightAccessorRef,
+    linear_weight_accessor_idx: crate::substrate::WeightAccessorRef,
     eps: FiniteF32,
     pub norm_weight: WeightRef,
     pub linear_weight: WeightRef,
@@ -2025,28 +2025,40 @@ impl CutlassFusedNormGemm {
                 );
             }
         }
+        use crate::substrate::{
+            ActSlotConst, IterCount, MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId,
+            ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+        };
         Self {
-            in_page_id: IN_ID,
-            delta_page_id: None,
-            norm_weight_page_id: NORM_W_ID,
-            linear_weight_page_id: LIN_W_ID,
-            out_page_id: OUT_ID,
-            partial_offset: PARTIAL_OFF,
-            partial_bytes: PARTIAL_BYTES,
-            b_tile_offset: B_TILE_OFF,
-            b_tile_bytes: B_TILE_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            iters: ITERS,
-            layer: LAYER,
-            n: N,
-            k: K,
-            num_tokens: NUM_TOKENS,
-            in_act_slot: IN_ACT_SLOT,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            delta_page: None,
+            norm_weight_page: PageId::<NORM_W_ID, NUM_PAGES>::new().erase(),
+            linear_weight_page: PageId::<LIN_W_ID, NUM_PAGES>::new().erase(),
+            out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
+            partial_offset: ScratchOffsetRef::__new_for_erase(PARTIAL_OFF),
+            partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
+            b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
+            b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            iters: IterCount::<ITERS>::new().erase(),
+            layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            n: MatmulN::<N>::new().erase(),
+            k: MatmulK::<K>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             delta_act_slot: None,
-            out_act_slot: OUT_ACT_SLOT,
-            norm_weight_accessor_idx: NORM_WEIGHT_ACCESSOR_IDX,
-            linear_weight_accessor_idx: LINEAR_WEIGHT_ACCESSOR_IDX,
+            out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            norm_weight_accessor_idx: WeightAccessorConst::<
+                NORM_WEIGHT_ACCESSOR_IDX,
+                { u32::MAX },
+            >::new()
+            .erase(),
+            linear_weight_accessor_idx: WeightAccessorConst::<
+                LINEAR_WEIGHT_ACCESSOR_IDX,
+                { u32::MAX },
+            >::new()
+            .erase(),
             eps,
             norm_weight,
             linear_weight,
@@ -2153,28 +2165,40 @@ impl CutlassFusedNormGemm {
                 panic!("CutlassFusedNormGemm::new_with_delta: norm_kind cannot carry a delta page");
             }
         }
+        use crate::substrate::{
+            ActSlotConst, IterCount, MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId,
+            ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+        };
         Self {
-            in_page_id: IN_ID,
-            delta_page_id: Some(DELTA_ID),
-            norm_weight_page_id: NORM_W_ID,
-            linear_weight_page_id: LIN_W_ID,
-            out_page_id: OUT_ID,
-            partial_offset: PARTIAL_OFF,
-            partial_bytes: PARTIAL_BYTES,
-            b_tile_offset: B_TILE_OFF,
-            b_tile_bytes: B_TILE_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            iters: ITERS,
-            layer: LAYER,
-            n: N,
-            k: K,
-            num_tokens: NUM_TOKENS,
-            in_act_slot: IN_ACT_SLOT,
-            delta_act_slot: Some(DELTA_ACT_SLOT),
-            out_act_slot: OUT_ACT_SLOT,
-            norm_weight_accessor_idx: NORM_WEIGHT_ACCESSOR_IDX,
-            linear_weight_accessor_idx: LINEAR_WEIGHT_ACCESSOR_IDX,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            delta_page: Some(PageId::<DELTA_ID, NUM_PAGES>::new().erase()),
+            norm_weight_page: PageId::<NORM_W_ID, NUM_PAGES>::new().erase(),
+            linear_weight_page: PageId::<LIN_W_ID, NUM_PAGES>::new().erase(),
+            out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
+            partial_offset: ScratchOffsetRef::__new_for_erase(PARTIAL_OFF),
+            partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
+            b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
+            b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            iters: IterCount::<ITERS>::new().erase(),
+            layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            n: MatmulN::<N>::new().erase(),
+            k: MatmulK::<K>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            delta_act_slot: Some(ActSlotConst::<DELTA_ACT_SLOT, { u32::MAX }>::new().erase()),
+            out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            norm_weight_accessor_idx: WeightAccessorConst::<
+                NORM_WEIGHT_ACCESSOR_IDX,
+                { u32::MAX },
+            >::new()
+            .erase(),
+            linear_weight_accessor_idx: WeightAccessorConst::<
+                LINEAR_WEIGHT_ACCESSOR_IDX,
+                { u32::MAX },
+            >::new()
+            .erase(),
             eps,
             norm_weight,
             linear_weight,
@@ -2183,67 +2207,67 @@ impl CutlassFusedNormGemm {
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn delta_page_id(&self) -> Option<u32> {
-        self.delta_page_id
+    pub const fn delta_page(&self) -> Option<crate::substrate::PageRef> {
+        self.delta_page
     }
-    pub const fn norm_weight_page_id(&self) -> u32 {
-        self.norm_weight_page_id
+    pub const fn norm_weight_page(&self) -> crate::substrate::PageRef {
+        self.norm_weight_page
     }
-    pub const fn linear_weight_page_id(&self) -> u32 {
-        self.linear_weight_page_id
+    pub const fn linear_weight_page(&self) -> crate::substrate::PageRef {
+        self.linear_weight_page
     }
-    pub const fn out_page_id(&self) -> u32 {
-        self.out_page_id
+    pub const fn out_page(&self) -> crate::substrate::PageRef {
+        self.out_page
     }
-    pub const fn partial_offset(&self) -> u32 {
+    pub const fn partial_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.partial_offset
     }
-    pub const fn partial_bytes(&self) -> u32 {
+    pub const fn partial_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.partial_bytes
     }
-    pub const fn b_tile_offset(&self) -> u32 {
+    pub const fn b_tile_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.b_tile_offset
     }
-    pub const fn b_tile_bytes(&self) -> u32 {
+    pub const fn b_tile_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.b_tile_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn iters(&self) -> u32 {
+    pub const fn iters(&self) -> crate::substrate::IterCountRef {
         self.iters
     }
-    pub const fn layer(&self) -> u32 {
+    pub const fn layer(&self) -> crate::substrate::LayerRef {
         self.layer
     }
-    pub const fn n(&self) -> u32 {
+    pub const fn n(&self) -> crate::substrate::MatmulNRef {
         self.n
     }
-    pub const fn k(&self) -> u32 {
+    pub const fn k(&self) -> crate::substrate::MatmulKRef {
         self.k
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
-    pub const fn delta_act_slot(&self) -> Option<u32> {
+    pub const fn delta_act_slot(&self) -> Option<crate::substrate::ActSlotRef> {
         self.delta_act_slot
     }
-    pub const fn out_act_slot(&self) -> u32 {
+    pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
     }
-    pub const fn norm_weight_accessor_idx(&self) -> u32 {
+    pub const fn norm_weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.norm_weight_accessor_idx
     }
-    pub const fn linear_weight_accessor_idx(&self) -> u32 {
+    pub const fn linear_weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.linear_weight_accessor_idx
     }
     pub fn eps(&self) -> FiniteF32 {

@@ -1064,6 +1064,32 @@ impl<
         const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _norm_w_page: crate::substrate::PageId<NORM_W_ID, NUM_PAGES>,
+        _lin_w_page: crate::substrate::PageId<LIN_W_ID, NUM_PAGES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _partial: crate::substrate::ScratchRegion<
+            PARTIAL_OFF, PARTIAL_BYTES, SCRATCH_BYTES, crate::substrate::GemmScope,
+        >,
+        _b_tile: crate::substrate::ScratchRegion<
+            B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::substrate::GemmScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _n: crate::substrate::MatmulN<N>,
+        _k: crate::substrate::MatmulK<K>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _norm_weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            NORM_WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
+        _linear_weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            LINEAR_WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         norm_weight_path: String,
         linear_weight_path: String,
         norm_kind: LmHeadNormKind,
@@ -1145,6 +1171,34 @@ impl<
         const LINEAR_WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _delta_page: crate::substrate::PageId<DELTA_ID, NUM_PAGES>,
+        _norm_w_page: crate::substrate::PageId<NORM_W_ID, NUM_PAGES>,
+        _lin_w_page: crate::substrate::PageId<LIN_W_ID, NUM_PAGES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _partial: crate::substrate::ScratchRegion<
+            PARTIAL_OFF, PARTIAL_BYTES, SCRATCH_BYTES, crate::substrate::GemmScope,
+        >,
+        _b_tile: crate::substrate::ScratchRegion<
+            B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::substrate::GemmScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _n: crate::substrate::MatmulN<N>,
+        _k: crate::substrate::MatmulK<K>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _delta_act_slot: crate::substrate::ActSlotConst<DELTA_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _norm_weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            NORM_WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
+        _linear_weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            LINEAR_WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         norm_weight_path: String,
         linear_weight_path: String,
         norm_kind: LmHeadNormKind,
@@ -1841,6 +1895,10 @@ mod tests {
 
     #[test]
     fn lowers_lm_head_rms_norm_no_delta() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulN, MbarrierPhase,
+            NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = BuilderD::new();
         b.push_cutlass_fused_norm_gemm_no_delta::<
             0, 1, 2, 3,
@@ -1850,6 +1908,24 @@ mod tests {
             16, 0,
             8, 0, 1, 0, 1,
         >(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            PageId::<3, 8>::new(),
+            ScratchRegion::<0, 32, 32_768, GemmScope>::new(),
+            ScratchRegion::<4096, 4096, 32_768, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            crate::nodes::LayerIndex::<0, 16>::new(),
+            MatmulN::<128_000>::new(),
+            MatmulK::<4_096>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            WeightAccessorConst::<1, { u32::MAX }>::new(),
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::RmsNorm,
@@ -1860,11 +1936,15 @@ mod tests {
             panic!();
         };
         assert_eq!(n.norm_kind, LmHeadNormKind::RmsNorm);
-        assert!(n.delta_page_id().is_none());
+        assert!(n.delta_page().is_none());
     }
 
     #[test]
     fn lowers_lm_head_add_scalar_offset_rms_norm_with_delta() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulN, MbarrierPhase,
+            NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = BuilderD::new();
         b.push_cutlass_fused_norm_gemm_with_delta::<
             0, 1, 2, 3, 4,
@@ -1874,6 +1954,26 @@ mod tests {
             16, 0,
             8, 0, 1, 2, 0, 1,
         >(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            PageId::<3, 8>::new(),
+            PageId::<4, 8>::new(),
+            ScratchRegion::<0, 32, 32_768, GemmScope>::new(),
+            ScratchRegion::<4096, 4096, 32_768, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            crate::nodes::LayerIndex::<0, 16>::new(),
+            MatmulN::<128_000>::new(),
+            MatmulK::<4_096>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            WeightAccessorConst::<1, { u32::MAX }>::new(),
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::AddScalarOffsetRmsNorm,
@@ -1885,13 +1985,17 @@ mod tests {
             panic!();
         };
         assert_eq!(n.norm_kind, LmHeadNormKind::AddScalarOffsetRmsNorm);
-        assert_eq!(n.delta_page_id(), Some(1));
+        assert_eq!(n.delta_page().map(|p| p.raw()), Some(1));
         assert_eq!(n.offset.unwrap().raw(), 1.0);
     }
 
     #[test]
     #[should_panic(expected = "AddScalarOffsetRmsNorm requires Some(offset)")]
     fn lm_head_rejects_missing_offset_for_scalar_offset_kind() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulN, MbarrierPhase,
+            NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = BuilderD::new();
         b.push_cutlass_fused_norm_gemm_with_delta::<
             0, 1, 2, 3, 4,
@@ -1901,6 +2005,26 @@ mod tests {
             16, 0,
             8, 0, 1, 2, 0, 1,
         >(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            PageId::<3, 8>::new(),
+            PageId::<4, 8>::new(),
+            ScratchRegion::<0, 32, 32_768, GemmScope>::new(),
+            ScratchRegion::<4096, 4096, 32_768, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            crate::nodes::LayerIndex::<0, 16>::new(),
+            MatmulN::<128_000>::new(),
+            MatmulK::<4_096>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            WeightAccessorConst::<1, { u32::MAX }>::new(),
             "W::norm".to_string(),
             "W::lm_head".to_string(),
             LmHeadNormKind::AddScalarOffsetRmsNorm,

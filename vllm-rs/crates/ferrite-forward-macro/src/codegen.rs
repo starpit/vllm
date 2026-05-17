@@ -6318,19 +6318,42 @@ fn emit_lm_head_no_delta(
     let norm_weight_accessor_idx = lit(state.next_weight_accessor);
     let linear_weight_accessor_idx = lit(state.next_weight_accessor + 1);
     let eps_lit = state.rms_norm_eps;
+    let num_pages_lit = lit(state.num_pages_budget);
+    let scratch_lit = lit(state.scratch_bytes);
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
-        b.push_cutlass_fused_norm_gemm_no_delta::<
-            #in_id, #norm_w_id, #lin_w_id, #out_id,
-            #partial_off, #partial_bytes,
-            #b_tile_off, #b_tile_bytes,
-            #consumer_phase, #storer_phase,
-            #iters, #layer_lit, #n_lit, #k_lit,
-            #num_layers, #arrives,
-            #num_tokens, #in_act_slot, #out_act_slot,
-            #norm_weight_accessor_idx, #linear_weight_accessor_idx,
-        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #eps_lit);
+        b.push_cutlass_fused_norm_gemm_no_delta(
+            ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#norm_w_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#lin_w_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::ScratchRegion::<
+                #partial_off, #partial_bytes, #scratch_lit,
+                ::ferrite_forward::mega_ir::GemmScope,
+            >::new(),
+            ::ferrite_forward::mega_ir::ScratchRegion::<
+                #b_tile_off, #b_tile_bytes, #scratch_lit,
+                ::ferrite_forward::mega_ir::GemmScope,
+            >::new(),
+            ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+            ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+            ::ferrite_forward::mega_ir::IterCount::<#iters>::new(),
+            ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+            ::ferrite_forward::mega_ir::MatmulN::<#n_lit>::new(),
+            ::ferrite_forward::mega_ir::MatmulK::<#k_lit>::new(),
+            ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+            ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+            ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+            ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                #norm_weight_accessor_idx, { u32::MAX },
+            >::new(),
+            ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                #linear_weight_accessor_idx, { u32::MAX },
+            >::new(),
+            #norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #eps_lit,
+        );
     })
 }
 
@@ -6384,19 +6407,44 @@ fn emit_lm_head_with_delta(
         Some(v) => quote! { ::core::option::Option::Some(#v) },
         None => quote! { ::core::option::Option::None },
     };
+    let num_pages_lit = lit(state.num_pages_budget);
+    let scratch_lit = lit(state.scratch_bytes);
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
-        b.push_cutlass_fused_norm_gemm_with_delta::<
-            #in_id, #delta_id, #norm_w_id, #lin_w_id, #out_id,
-            #partial_off, #partial_bytes,
-            #b_tile_off, #b_tile_bytes,
-            #consumer_phase, #storer_phase,
-            #iters, #layer_lit, #n_lit, #k_lit,
-            #num_layers, #arrives,
-            #num_tokens, #in_act_slot, #delta_act_slot, #out_act_slot,
-            #norm_weight_accessor_idx, #linear_weight_accessor_idx,
-        >(#norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #offset_expr, #eps_lit);
+        b.push_cutlass_fused_norm_gemm_with_delta(
+            ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#delta_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#norm_w_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#lin_w_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+            ::ferrite_forward::mega_ir::ScratchRegion::<
+                #partial_off, #partial_bytes, #scratch_lit,
+                ::ferrite_forward::mega_ir::GemmScope,
+            >::new(),
+            ::ferrite_forward::mega_ir::ScratchRegion::<
+                #b_tile_off, #b_tile_bytes, #scratch_lit,
+                ::ferrite_forward::mega_ir::GemmScope,
+            >::new(),
+            ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+            ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+            ::ferrite_forward::mega_ir::IterCount::<#iters>::new(),
+            ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+            ::ferrite_forward::mega_ir::MatmulN::<#n_lit>::new(),
+            ::ferrite_forward::mega_ir::MatmulK::<#k_lit>::new(),
+            ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+            ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+            ::ferrite_forward::mega_ir::ActSlotConst::<#delta_act_slot, { u32::MAX }>::new(),
+            ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+            ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                #norm_weight_accessor_idx, { u32::MAX },
+            >::new(),
+            ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                #linear_weight_accessor_idx, { u32::MAX },
+            >::new(),
+            #norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #offset_expr, #eps_lit,
+        );
     })
 }
 

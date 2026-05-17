@@ -2568,6 +2568,452 @@ void {symbol}(
     }
 }
 
+// ───────────────────────────────────────────────────────────────────
+// synthesize_forward_decode — ONE Metal kernel for the whole decode
+// forward pass for one token. ONE dispatch per decode token.
+// ───────────────────────────────────────────────────────────────────
+//
+// This is the target the persistent-decode work has been building
+// toward. The per-chunk synth functions above
+// (`synthesize_pre_attn_chunk_persistent`,
+// `synthesize_pre_attn_attn_chunk_persistent`, etc.) each collapse a
+// region of the forward into one dispatch but leave the per-layer
+// dispatch boundary intact. That bounds the host-overhead win at a
+// constant factor of the per-layer dispatch count. The full win
+// comes from collapsing ALL layers into one dispatch with the layer
+// loop expressed in MSL and a cross-TG barrier between phases.
+//
+// Kernel shape:
+//   - ONE dispatch grid `(K, 1, 1)` where K ≤ `MetalTargetProfile::
+//     safe_max_concurrent_tgs(threads_per_tg)`. Each TG handles a
+//     subset of each phase's natural per-tile work via an inner
+//     tile-loop `for tile = tg_id; tile < phase_tiles; tile += K`.
+//   - ONE fixed `threads_per_tg` for the whole kernel lifetime. Pairs
+//     with `num_simdgroups = threads_per_tg / 32`. Atoms cover
+//     HEAD_DIM via the pass-loop landed in commit 7ac51f284.
+//   - Per-layer weights addressed via an MTLArgumentBuffer
+//     (`device const PerLayerWeights* layer_table`). 16+ layers × ~20
+//     weight bindings would blow Metal's 31-buffer cap; the argument
+//     buffer is the only correct primitive for this scale.
+//   - Cross-TG ticket-lock barriers between phases. Spin-lock safety
+//     requires `K ≤ safe_max_concurrent_tgs`; see chip_caps.
+//
+// Per-layer phase sequence:
+//   pre_attn    (AddRmsNorm + QKV qmv + RopeAppend → Q scratch, KV cache)
+//   ── barrier
+//   attention   (BN=8 in-kernel, via bn8_attention_body_msl)
+//   ── barrier
+//   o_proj      (small-N qmm: attn_out → residual_add at hidden) [TODO]
+//   ── barrier
+//   mlp_pre_down (post-attn AddRmsNorm + gate/up qmv + silu_mul) [TODO]
+//   ── barrier
+//   down_proj   (medium-N qmm: silu_mul_out → residual_add at hidden) [TODO]
+//   ── barrier
+//
+// Then post-layer: final RmsNorm + lm_head [TODO]
+//
+// Scope of this commit: kernel-side skeleton. Phases pre_attn and
+// attention have real atom bodies (reusing 7ac51f284 atom emits + the
+// `bn8_attention_body_msl` helper from 675de3ede). Phases o_proj /
+// mlp / down_proj / lm_head are stub markers. The skeleton compiles
+// via `xcrun metal -c`, validating the kernel signature + argument-
+// buffer access + layer-loop + barrier scaffolding. Follow-on commits
+// fill in each phase body.
+//
+// Wiring to the worker (MTLArgumentBuffer construction, dispatch arm,
+// per-arch codegen embed, `MetalForwardDecodePersistentImpl`) is
+// separate work and lands in its own series of commits — but ONLY
+// after the kernel-side body is structurally complete. No per-chunk
+// detours.
+
+/// Model-shape constants for the whole-forward synth. Wraps a
+/// `ChunkConstants` (which covers per-layer dims) with the cross-layer
+/// dims needed to bake the layer loop and final lm_head:
+///   - `num_layers`: bound for the in-kernel layer loop.
+///   - `vocab_size`: lm_head output dim (TODO: only needed when the
+///     final phase lands).
+#[derive(Clone, Debug)]
+pub struct ForwardDecodeConstants {
+    pub chunk: ChunkConstants,
+    pub num_layers: u32,
+    pub vocab_size: u32,
+}
+
+pub fn synthesize_forward_decode(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ForwardDecodeConstants,
+    threads_per_tg: u32,
+    // dispatched_tgs is the runtime grid size — the kernel itself
+    // reads `__tgs_per_grid.x * __tgs_per_grid.y` at dispatch time
+    // (the host sets the grid). We take it as a parameter for symmetry
+    // with `threads_per_tg` and so callers must consult the chip
+    // residency cap when sizing the grid, but don't bake it into the
+    // kernel source.
+    _dispatched_tgs: u32,
+) -> SynthesizedKernel {
+    assert_eq!(backend, SynthesisBackend::Metal, "MVP only emits Metal");
+    assert!(
+        threads_per_tg % MK_SIMD_SIZE == 0,
+        "threads_per_tg must be a multiple of MK_SIMD_SIZE (32); got {threads_per_tg}",
+    );
+    let num_simdgroups = threads_per_tg / MK_SIMD_SIZE;
+    assert_eq!(
+        num_simdgroups, 8,
+        "synthesize_forward_decode currently pairs with the BN=8 attention atom \
+         (threads_per_tg=256 → 8 simdgroups). Lift when bn_attention is BN-parameterized.",
+    );
+    let rows_per_pass = num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+    assert!(
+        consts.chunk.head_dim % rows_per_pass == 0,
+        "HEAD_DIM ({}) must be a multiple of num_simdgroups*MK_ROWS_PER_SIMDGROUP ({rows_per_pass})",
+        consts.chunk.head_dim,
+    );
+    assert!(consts.num_layers > 0, "num_layers must be > 0");
+
+    let c = &consts.chunk;
+    // ATTN_SCALE_BAKED = 1/sqrt(HEAD_DIM); see Phase 2c synth for why.
+    let attn_scale = 1.0_f64 / (c.head_dim as f64).sqrt();
+
+    // ── kernel-scope variable names (must match atom-body refs) ──
+    let x_norm_name   = "__x_norm";
+    let qmv_smem_name = "__qmv_smem";
+    let residual_io   = "__residual";
+    let delta_buf     = "__residual";    // self-aliased: in-kernel residual stream
+    let rms_wt_buf    = "__rms_w";
+    let q_wt_buf      = "__q_w"; let q_sc_buf = "__q_s"; let q_bi_buf = "__q_b";
+    let k_wt_buf      = "__k_w"; let k_sc_buf = "__k_s"; let k_bi_buf = "__k_b";
+    let v_wt_buf      = "__v_w"; let v_sc_buf = "__v_s"; let v_bi_buf = "__v_b";
+    let cos_sin_buf   = "__cos_sin";
+    let positions_buf = "__positions";
+    let slot_map_buf  = "__slot_mapping";
+    let q_out_buf     = "__q_scratch";
+    let kv_cache_k    = "__kv_cache_k";
+    let kv_cache_v    = "__kv_cache_v";
+    let attn_out_buf  = "__attn_scratch";
+    let seq_used_k    = "__seq_used_k";
+    let block_table   = "__block_table";
+
+    // Atom + body construction — same atoms the per-chunk synth uses,
+    // wrapped in tile-loops inside each phase. has_linear_bias=false
+    // for the MVP (Llama family); Qwen2 bias variant lands later.
+    let constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
+        ("HIDDEN",      AtomConstantValue::Uint(c.hidden)),
+        ("NUM_Q",       AtomConstantValue::Uint(c.num_q_heads)),
+        ("NUM_KV",      AtomConstantValue::Uint(c.num_kv_heads)),
+        ("HEAD_DIM",    AtomConstantValue::Uint(c.head_dim)),
+        ("ROT_DIM",     AtomConstantValue::Uint(c.rot_dim)),
+        ("BLOCK_SIZE",  AtomConstantValue::Uint(c.block_size)),
+        ("M",           AtomConstantValue::Uint(c.m)),
+        ("EPS",         AtomConstantValue::Float(c.rms_norm_eps)),
+    ];
+
+    // Layer-0 init variant of AddRmsNorm is unused here: the
+    // whole-forward kernel runs the embedding op upstream (host-side
+    // for now; in-kernel later) and the in-kernel residual stream
+    // starts from a pre-populated `__residual` buffer that holds the
+    // embedding output. So every layer's AddRmsNorm sees `init=false`.
+    let addrms = AddRmsNormAtom { init: false };
+    let rope   = RopeAppendAtom;
+    let qmv_q = AffineQmvAtom {
+        group_size: c.group_size, local_head_expr: "__head", has_linear_bias: false,
+    };
+    let qmv_k = AffineQmvAtom {
+        group_size: c.group_size, local_head_expr: "(__head - __num_q)", has_linear_bias: false,
+    };
+    let qmv_v = AffineQmvAtom {
+        group_size: c.group_size, local_head_expr: "(__head - __num_q - __num_kv)", has_linear_bias: false,
+    };
+
+    let addrms_in  = vec![residual_io.to_string(), delta_buf.to_string(), rms_wt_buf.to_string()];
+    let addrms_out = vec![x_norm_name.to_string()];
+    let addrms_ctx = AtomCtx {
+        bound_inputs: &addrms_in, bound_outputs: &addrms_out,
+        constants: &constants_slice, t_act, t_scale,
+    };
+    let rope_in  = vec![
+        qmv_smem_name.to_string(), cos_sin_buf.to_string(),
+        positions_buf.to_string(), slot_map_buf.to_string(),
+    ];
+    let rope_out = vec![q_out_buf.to_string(), kv_cache_k.to_string(), kv_cache_v.to_string()];
+    let rope_ctx = AtomCtx {
+        bound_inputs: &rope_in, bound_outputs: &rope_out,
+        constants: &constants_slice, t_act, t_scale,
+    };
+    let addrms_body = addrms.emit_metal_body(&addrms_ctx).expect("AddRmsNormAtom Metal emit");
+    let rope_body   = rope.emit_metal_body(&rope_ctx).expect("RopeAppendAtom Metal emit");
+
+    let emit_band_body = |atom: &AffineQmvAtom, w: &str, s: &str, b: &str| -> String {
+        let band_in = vec![
+            x_norm_name.to_string(), w.to_string(), s.to_string(), b.to_string(),
+        ];
+        let band_out = vec![qmv_smem_name.to_string()];
+        let band_ctx = AtomCtx {
+            bound_inputs: &band_in, bound_outputs: &band_out,
+            constants: &constants_slice, t_act, t_scale,
+        };
+        atom.emit_metal_body(&band_ctx).expect("AffineQmvAtom Metal emit")
+    };
+    let qmv_q_body = emit_band_body(&qmv_q, q_wt_buf, q_sc_buf, q_bi_buf);
+    let qmv_k_body = emit_band_body(&qmv_k, k_wt_buf, k_sc_buf, k_bi_buf);
+    let qmv_v_body = emit_band_body(&qmv_v, v_wt_buf, v_sc_buf, v_bi_buf);
+    let qmv_body = format!(
+        r#"
+        // QKV qmv (3× AffineQmvAtom, band-selected by __head)
+        if (__head < __num_q) {{
+            {qmv_q_body}
+        }} else if (__head < __num_q + __num_kv) {{
+            {qmv_k_body}
+        }} else {{
+            {qmv_v_body}
+        }}
+"#,
+    );
+
+    let attn_body = bn8_attention_body_msl(
+        t_act,
+        q_out_buf, attn_out_buf,
+        seq_used_k, block_table,
+        kv_cache_k, kv_cache_v,
+    );
+
+    // Per-phase tile counts (inner-loop bounds; each TG handles its
+    // share via `for (tile = tg_id; tile < T; tile += num_tgs)`):
+    //   pre_attn:  T = M * NUM_HEADS_TOTAL  (per-(token, head) tile)
+    //   attention: T = M * NUM_Q            (per-(token, q_head) tile)
+
+    let symbol = format!(
+        "forward_decode_persistent_{t_act}_{t_scale}_gs{gs}_hd{hd}_t{t}_L{nl}",
+        gs = c.group_size, hd = c.head_dim, t = threads_per_tg, nl = consts.num_layers,
+    );
+
+    let barrier_after_pre_attn = cross_tg_barrier_msl(0, "__barrier_counter");
+    let barrier_after_attn     = cross_tg_barrier_msl(1, "__barrier_counter");
+
+    let mk_header = inline_header(include_str!(
+        "../../ferrite-metal-kernels/shaders/metal_kittens.h"
+    ));
+
+    // Argument buffer struct laid out in device memory. Each layer is
+    // a struct of device-pointer fields. Runtime populates this once
+    // at worker init via the argument encoder. Inside the kernel we
+    // index `layer_table[__layer]` to get per-layer weight pointers.
+    //
+    // The fields enumerated below cover what pre_attn + attention need
+    // today (rmsnorm + QKV proj triples + cos_sin + KV cache). When the
+    // o_proj / mlp / down phases come online they add fields here.
+    let arg_buf_struct = format!(
+        r#"
+// Per-layer weight pointers (MTLArgumentBuffer).
+// One entry per layer; the kernel resolves `layer_table[__layer]`
+// inside the layer loop. Adding a phase = adding fields here +
+// populating them on the worker side.
+struct PerLayerWeights {{
+    device const {t_scale}* rms_weight        [[id(0)]];
+    device const uint32_t*  q_weight          [[id(1)]];
+    device const {t_scale}* q_scales          [[id(2)]];
+    device const {t_scale}* q_biases          [[id(3)]];
+    device const uint32_t*  k_weight          [[id(4)]];
+    device const {t_scale}* k_scales          [[id(5)]];
+    device const {t_scale}* k_biases          [[id(6)]];
+    device const uint32_t*  v_weight          [[id(7)]];
+    device const {t_scale}* v_scales          [[id(8)]];
+    device const {t_scale}* v_biases          [[id(9)]];
+    device const {t_act}*   cos_sin           [[id(10)]];
+    device       {t_act}*   kv_cache_k        [[id(11)]];
+    device       {t_act}*   kv_cache_v        [[id(12)]];
+    // TODO o_proj weight/scales/biases
+    // TODO post-attn rmsnorm weight
+    // TODO gate weight/scales/biases
+    // TODO up   weight/scales/biases
+    // TODO down weight/scales/biases
+}};
+"#,
+        t_act = t_act, t_scale = t_scale,
+    );
+
+    let source_tail = format!(
+        r#"
+// Model-invariant dims baked at synth time.
+constant constexpr uint  HIDDEN     = {hidden_lit}u;
+constant constexpr uint  NUM_Q      = {num_q_lit}u;
+constant constexpr uint  NUM_KV     = {num_kv_lit}u;
+constant constexpr uint  HEAD_DIM   = {head_dim_lit}u;
+constant constexpr uint  ROT_DIM    = {rot_dim_lit}u;
+constant constexpr uint  BLOCK_SIZE = {block_size_lit}u;
+constant constexpr uint  NUM_LAYERS = {num_layers_lit}u;
+constant constexpr float EPS        = {eps_lit}f;
+constant constexpr float ATTN_SCALE_BAKED = {attn_scale_lit}f;
+constant uint  M                  [[function_constant(0)]];
+constant uint  MAX_BLOCKS_PER_SEQ [[function_constant(1)]];
+
+constant constexpr uint __HIDDEN_MAX   = HIDDEN;
+constant constexpr uint __HEAD_DIM_MAX = HEAD_DIM;
+constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
+
+{arg_buf_struct}
+
+[[kernel, max_total_threads_per_threadgroup({threads_per_tg_lit}u)]]
+void {symbol}(
+    device atomic_uint*           __barrier_counter [[buffer(0)]],
+    device const PerLayerWeights* __layer_table     [[buffer(1)]],
+    device       {t_act}*         {residual_io}        [[buffer(2)]],
+    device       {t_act}*         {q_out_buf}      [[buffer(3)]],
+    device       {t_act}*         {attn_out_buf}    [[buffer(4)]],
+    device const uint*            {positions_buf}  [[buffer(5)]],
+    device const uint*            {slot_map_buf}   [[buffer(6)]],
+    device const uint*            {seq_used_k} [[buffer(7)]],
+    device const uint*            {block_table} [[buffer(8)]],
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tgs_per_grid [[threadgroups_per_grid]],
+    uint3 __tid_pos   [[thread_position_in_threadgroup]],
+    uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid  [[thread_index_in_simdgroup]])
+{{
+    const uint __tg_id            = __tg_pos.x;
+    const uint __tid              = __tid_pos.x;
+    const uint __head_dim         = HEAD_DIM;
+    const uint __hidden           = HIDDEN;
+    const uint __num_q            = NUM_Q;
+    const uint __num_kv           = NUM_KV;
+    const uint __rot_dim          = ROT_DIM;
+    const uint __half_dim         = __rot_dim / 2;
+    const uint __block_sz         = BLOCK_SIZE;
+    const uint __num_heads_total  = __num_q + 2u * __num_kv;
+    const uint __threads_per_tg   = {threads_per_tg_lit}u;
+    const uint __num_simdgroups   = {num_simdgroups_lit}u;
+    const float __eps             = EPS;
+
+    // cross_tg_barrier_msl emits `if (tid == 0u)`; alias to our
+    // underscored convention. Total dispatched TGs from the runtime
+    // grid (sized via MetalTargetProfile::safe_max_concurrent_tgs).
+    const uint tid     = __tid;
+    const uint num_tgs = __tgs_per_grid.x * __tgs_per_grid.y;
+
+    threadgroup {t_act} {x_norm_name}[__HIDDEN_MAX];
+    threadgroup float   __scratch  [__SCRATCH_MAX];
+    threadgroup float   {qmv_smem_name}[__HEAD_DIM_MAX];
+
+    // For now `__t = 0` for single-token decode (M=1). When batched
+    // decode lands, an outer tile loop covers the token axis too.
+    const uint __t = 0u;
+
+    // ───────── per-layer loop (the whole-forward unroll) ─────────
+    for (uint __layer = 0u; __layer < NUM_LAYERS; ++__layer) {{
+        // Per-layer weight resolution (MTLArgumentBuffer indexing).
+        device const {t_scale}* {rms_wt_buf} = __layer_table[__layer].rms_weight;
+        device const uint32_t*  {q_wt_buf}   = __layer_table[__layer].q_weight;
+        device const {t_scale}* {q_sc_buf}   = __layer_table[__layer].q_scales;
+        device const {t_scale}* {q_bi_buf}   = __layer_table[__layer].q_biases;
+        device const uint32_t*  {k_wt_buf}   = __layer_table[__layer].k_weight;
+        device const {t_scale}* {k_sc_buf}   = __layer_table[__layer].k_scales;
+        device const {t_scale}* {k_bi_buf}   = __layer_table[__layer].k_biases;
+        device const uint32_t*  {v_wt_buf}   = __layer_table[__layer].v_weight;
+        device const {t_scale}* {v_sc_buf}   = __layer_table[__layer].v_scales;
+        device const {t_scale}* {v_bi_buf}   = __layer_table[__layer].v_biases;
+        device const {t_act}*   {cos_sin_buf} = __layer_table[__layer].cos_sin;
+        device       {t_act}*   {kv_cache_k} = __layer_table[__layer].kv_cache_k;
+        device       {t_act}*   {kv_cache_v} = __layer_table[__layer].kv_cache_v;
+
+        // ── phase 0: pre-attn (AddRmsNorm + QKV qmv + RopeAppend) ──
+        // Tile-loop over (token, head) — token axis is M=1 today so
+        // we just iterate heads. Each TG owns `ceil(num_heads_total /
+        // num_tgs)` heads.
+        for (uint __head = __tg_id; __head < __num_heads_total; __head += num_tgs) {{
+            {addrms_body}
+            {qmv_body}
+            {rope_body}
+        }}
+        {barrier_after_pre_attn}
+
+        // ── phase 1: BN=8 in-kernel attention ──
+        // Heads with __head >= NUM_Q sit idle (guarded inside the
+        // attention body); the tile loop bounds skip them outright.
+        for (uint __head = __tg_id; __head < __num_q; __head += num_tgs) {{
+            {attn_body}
+        }}
+        {barrier_after_attn}
+
+        // ── phase 2: o_proj (TODO: small-N qmm into residual) ──
+        // For now this layer's residual stays as written by AddRmsNorm
+        // (which writes the pre-norm residual back for the next
+        // layer's chain via `__writes_residual`). End-to-end requires
+        // adding attn_out → residual here.
+
+        // ── phase 3: mlp_pre_down (TODO) ──
+
+        // ── phase 4: down_proj (TODO) ──
+    }}
+
+    // ── final: rmsnorm + lm_head (TODO) ──
+
+    // Silence unused-variable warnings until follow-on phases consume
+    // these. The whole-forward kernel signature is fixed even when
+    // intermediate phases are stubs.
+    (void)__hidden; (void)__half_dim; (void)__block_sz;
+    (void)__threads_per_tg; (void)__num_simdgroups; (void)__eps;
+    (void)__tid; (void)__simd_gid; (void)__simd_lid;
+    (void)__scratch;
+}}
+"#,
+        symbol = symbol, t_act = t_act, t_scale = t_scale,
+        residual_io = residual_io, q_out_buf = q_out_buf, attn_out_buf = attn_out_buf,
+        positions_buf = positions_buf, slot_map_buf = slot_map_buf,
+        seq_used_k = seq_used_k, block_table = block_table,
+        rms_wt_buf = rms_wt_buf,
+        q_wt_buf = q_wt_buf, q_sc_buf = q_sc_buf, q_bi_buf = q_bi_buf,
+        k_wt_buf = k_wt_buf, k_sc_buf = k_sc_buf, k_bi_buf = k_bi_buf,
+        v_wt_buf = v_wt_buf, v_sc_buf = v_sc_buf, v_bi_buf = v_bi_buf,
+        cos_sin_buf = cos_sin_buf, kv_cache_k = kv_cache_k, kv_cache_v = kv_cache_v,
+        x_norm_name = x_norm_name, qmv_smem_name = qmv_smem_name,
+        arg_buf_struct = arg_buf_struct,
+        addrms_body = addrms_body,
+        qmv_body = qmv_body,
+        rope_body = rope_body,
+        barrier_after_pre_attn = barrier_after_pre_attn,
+        barrier_after_attn = barrier_after_attn,
+        attn_body = attn_body,
+        threads_per_tg_lit = threads_per_tg,
+        num_simdgroups_lit = num_simdgroups,
+        hidden_lit = c.hidden,
+        num_q_lit = c.num_q_heads,
+        num_kv_lit = c.num_kv_heads,
+        head_dim_lit = c.head_dim,
+        rot_dim_lit = c.rot_dim,
+        block_size_lit = c.block_size,
+        num_layers_lit = consts.num_layers,
+        eps_lit = format_msl_float(c.rms_norm_eps),
+        attn_scale_lit = format_msl_float(attn_scale as f32),
+    );
+
+    let source = format!(
+        "// SPDX-License-Identifier: Apache-2.0\n\
+         //\n\
+         // SYNTHESIZED WHOLE-FORWARD PERSISTENT KERNEL — generated by\n\
+         // ferrite-fusion-synth::synthesize_forward_decode.\n\
+         // ONE Metal kernel for the entire decode forward pass for one\n\
+         // token. ONE dispatch per decode token. Layer loop in MSL.\n\
+         // Per-layer weights via MTLArgumentBuffer. Cross-TG barriers\n\
+         // between phases. Do not hand-edit.\n\n\
+         #include <metal_stdlib>\n\
+         #include <metal_atomic>\n\
+         using namespace metal;\n\n\
+         // === inlined metal_kittens.h ===\n\
+         {mk_header}\n\
+         // === end inlined metal_kittens.h ===\n\n\
+         {source_tail}",
+        mk_header = mk_header,
+        source_tail = source_tail,
+    );
+
+    SynthesizedKernel {
+        symbol,
+        source,
+        backend: SynthesisBackend::Metal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2772,6 +3218,108 @@ mod tests {
             rms_norm_eps:  1e-5,
             has_linear_bias: false,
         }
+    }
+
+    fn llama_3_2_1b_forward_constants() -> ForwardDecodeConstants {
+        // Llama-3.2-1B-Instruct: hidden=2048, q=32, kv=8, head_dim=64,
+        // 16 transformer layers, vocab=128256.
+        ForwardDecodeConstants {
+            chunk: llama_3_2_1b_constants(),
+            num_layers: 16,
+            vocab_size: 128_256,
+        }
+    }
+
+    #[test]
+    fn synthesize_forward_decode_structural() {
+        // Whole-forward kernel: ONE dispatch per token, layer loop in
+        // MSL, per-layer weights via MTLArgumentBuffer.
+        let consts = llama_3_2_1b_forward_constants();
+        let kernel = synthesize_forward_decode(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+            /*threads_per_tg=*/ 256,
+            /*dispatched_tgs=*/ 48,
+        );
+        assert!(kernel.symbol.starts_with("forward_decode_persistent_"));
+        assert!(kernel.symbol.contains("bfloat"));
+        assert!(kernel.symbol.contains("L16"));
+        assert!(kernel.symbol.contains("hd64"));
+        assert!(kernel.symbol.contains("t256"));
+
+        // Layer loop in MSL — the structural target.
+        assert!(kernel.source.contains("for (uint __layer = 0u; __layer < NUM_LAYERS"));
+        assert!(kernel.source.contains("constant constexpr uint  NUM_LAYERS = 16u"));
+
+        // MTLArgumentBuffer struct + per-layer indexing.
+        assert!(kernel.source.contains("struct PerLayerWeights"));
+        assert!(kernel.source.contains("[[id(0)]]"));
+        assert!(kernel.source.contains("__layer_table[__layer].rms_weight"));
+        assert!(kernel.source.contains("device const PerLayerWeights*"));
+
+        // Phase scaffolding: pre_attn body + barrier + attention body +
+        // barrier. (Phase comments + atom markers.)
+        assert!(kernel.source.contains("phase 0: pre-attn"));
+        assert!(kernel.source.contains("phase 1: BN=8 in-kernel attention"));
+        assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));   // AddRmsNorm atom
+        assert!(kernel.source.contains("mk_qdot"));                // AffineQmv atom
+        assert!(kernel.source.contains("mk_rope_pair"));           // RopeAppend atom
+        assert!(kernel.source.contains("__attn_partials"));        // bn8 attention
+
+        // Two cross-TG barriers (after pre_attn, after attention).
+        // Phases o_proj/mlp/down are TODO stubs — no additional
+        // barriers yet.
+        assert!(kernel.source.contains("cross-TG barrier (phase 0)"));
+        assert!(kernel.source.contains("cross-TG barrier (phase 1)"));
+
+        // Each phase wraps its work in a tile-loop sharded across TGs.
+        // Pre-attn iterates over `num_heads_total`, attention over
+        // `num_q`. The TG strides by `num_tgs` so the dispatched grid
+        // (sized via MetalTargetProfile::safe_max_concurrent_tgs)
+        // covers any phase tile count.
+        assert!(kernel.source.contains("__head = __tg_id; __head < __num_heads_total"));
+        assert!(kernel.source.contains("__head = __tg_id; __head < __num_q"));
+
+        // Function constants: M + MAX_BLOCKS_PER_SEQ baked at
+        // pipeline build.
+        assert!(kernel.source.contains("constant uint  M                  [[function_constant(0)]]"));
+        assert!(kernel.source.contains(
+            "constant uint  MAX_BLOCKS_PER_SEQ [[function_constant(1)]]"
+        ));
+
+        // num_tgs sourced from `[[threadgroups_per_grid]]` so the
+        // runtime can size the grid via safe_max_concurrent_tgs and
+        // the barrier ticket-lock still terminates.
+        assert!(kernel.source.contains("num_tgs = __tgs_per_grid.x * __tgs_per_grid.y"));
+
+        // Suppress unused for the silently-quoted ticket-lock vars.
+        let _ = consts;
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn synthesize_forward_decode_compiles_with_metal() {
+        // Whole-forward kernel must survive `xcrun metal -c`. This is
+        // the structural-correctness gate: the kernel signature +
+        // argument-buffer access + layer loop + barrier scaffolding +
+        // the pre_attn and attention phases all parse + typecheck.
+        // o_proj / mlp / down_proj / lm_head land in follow-on commits.
+        let consts = llama_3_2_1b_forward_constants();
+        let kernel = synthesize_forward_decode(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+            256,
+            48,
+        );
+        let bytes = crate::aot::aot_compile_metallib(&kernel.symbol, &kernel.source);
+        assert!(
+            !bytes.is_empty(),
+            "whole-forward metallib compile failed — set FERRITE_SYNTH_DUMP=1 + check /tmp/ferrite-synth-dump",
+        );
     }
 
     #[test]

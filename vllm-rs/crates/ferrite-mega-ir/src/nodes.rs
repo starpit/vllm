@@ -2544,17 +2544,17 @@ impl BarrierWait {
 /// AST shape: per-row D2D copy with `<HIDDEN_DIM, NUM_TOKENS>` shape
 /// and the target activation slot.
 pub struct SpliceMmEmbeds {
-    slot_id: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    hidden_dim: u32,
-    num_tokens: u32,
-    target_act_slot: u32,
+    slot: crate::substrate::PageRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    target_act_slot: crate::substrate::ActSlotRef,
 }
 
 impl SpliceMmEmbeds {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const SLOT_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
@@ -2577,32 +2577,35 @@ impl SpliceMmEmbeds {
             assert!(HIDDEN_DIM > 0, "SpliceMmEmbeds: HIDDEN_DIM must be > 0");
             assert!(NUM_TOKENS > 0, "SpliceMmEmbeds: NUM_TOKENS must be > 0");
         }
+        use crate::substrate::{
+            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         Self {
-            slot_id: SLOT_ID,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            hidden_dim: HIDDEN_DIM,
-            num_tokens: NUM_TOKENS,
-            target_act_slot: TARGET_ACT_SLOT,
+            slot: PageId::<SLOT_ID, NUM_PAGES>::new().erase(),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            target_act_slot: ActSlotConst::<TARGET_ACT_SLOT, { u32::MAX }>::new().erase(),
         }
     }
 
-    pub const fn slot_id(&self) -> u32 {
-        self.slot_id
+    pub const fn slot(&self) -> crate::substrate::PageRef {
+        self.slot
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn target_act_slot(&self) -> u32 {
+    pub const fn target_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.target_act_slot
     }
 }

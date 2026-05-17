@@ -1359,6 +1359,13 @@ impl<
         const TARGET_ACT_SLOT: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _slot: crate::substrate::PageId<SLOT_ID, NUM_PAGES>,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _target_act_slot: crate::substrate::ActSlotConst<TARGET_ACT_SLOT, { u32::MAX }>,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_splice_mm_embeds");
         let _ = self.pool.take(SLOT_ID);

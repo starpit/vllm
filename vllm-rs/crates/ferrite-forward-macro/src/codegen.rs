@@ -6204,14 +6204,18 @@ fn dispatch_instruction_to_push(
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
             let target_act_slot = lit(*slot);
+            let num_pages_lit = lit(state.num_pages_budget);
             state.arrives += 1;
             Ok(quote! {
-                b.push_splice_mm_embeds::<
-                    #slot_lit,
-                    #consumer_phase, #storer_phase,
-                    #arrives,
-                    #hidden_dim, #num_tokens, #target_act_slot,
-                >();
+                b.push_splice_mm_embeds(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#slot_lit, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#target_act_slot, { u32::MAX }>::new(),
+                );
             })
         }
         I::BarrierSignal(edge) => {

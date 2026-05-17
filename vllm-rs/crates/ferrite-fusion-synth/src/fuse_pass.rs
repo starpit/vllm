@@ -1603,6 +1603,602 @@ void {symbol}(
 }
 
 // ───────────────────────────────────────────────────────────────────
+// Phase 2c: pre-attn + in-kernel BN=8 attention persistent megakernel
+// ───────────────────────────────────────────────────────────────────
+//
+// Two-phase persistent kernel collapsing the existing per-chunk pair
+// (synth_pre_attn_persistent_* dispatch + AttentionViaCache dispatch)
+// into one dispatch per layer. Eliminates ~16 host dispatches/decode
+// token on Llama-3.2-1B (one attention dispatch per layer × 16 layers).
+//
+// Phase 0: pre-attn (AddRmsNorm → QKV qmv → RopeAppend), same atom
+// bodies as `synth_pre_attn_persistent_*`.
+//
+// Cross-TG barrier (ticket-lock; `__barrier_counter < num_tgs * 1u`)
+// to ensure all TGs have flushed Q + KV writes to L2 before attention
+// reads them.
+//
+// Phase 1: BN=8 paged-cache attention via `bn8_attention_body_msl`,
+// dispatched at the same grid as pre-attn `(M × num_heads_total)`. The
+// attention body guards `if (__head < NUM_Q)` so heads dispatched for
+// K/V projections in pre-attn sit idle during attention while still
+// bumping the surrounding barrier counter (no deadlock).
+//
+// Dispatch sizing: grid stays `(num_tokens × num_heads_total)` →
+// `1 × 48` for Llama-3.2-1B (32 Q + 8 K + 8 V). On M4-base with
+// `threads_per_tg = 32 * HEAD_DIM / MK_ROWS_PER_SIMDGROUP` = 256 (for
+// HEAD_DIM=64), `safe_max_concurrent_tgs(256) = 118` so 48 TGs fit
+// well under the residency cap — no deadlock risk.
+//
+// 1B-only today: HEAD_DIM=64 implies threads_per_tg=256 which matches
+// what the BN=8 attention atom needs (BN×32 = 256). For HEAD_DIM=128
+// (3B), pre-attn uses 512 threads_per_tg and the BN=8 attention atom
+// would only use 256 of them — needs either a pre-attn-at-256 redesign
+// or a BN=16 attention variant. Tracked for Step 2 (whole-forward).
+pub fn synthesize_pre_attn_attn_chunk_persistent(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    synthesize_pre_attn_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, false)
+}
+
+/// Layer-0 (init) variant of `synthesize_pre_attn_attn_chunk_persistent`.
+pub fn synthesize_pre_attn_attn_init_chunk_persistent(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+) -> SynthesizedKernel {
+    synthesize_pre_attn_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, true)
+}
+
+fn synthesize_pre_attn_attn_chunk_persistent_impl(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ChunkConstants,
+    init: bool,
+) -> SynthesizedKernel {
+    assert_eq!(
+        backend,
+        SynthesisBackend::Metal,
+        "MVP only emits Metal",
+    );
+    assert!(
+        consts.head_dim % 32 == 0,
+        "Phase 2c attention body requires HEAD_DIM divisible by 32 \
+         (qk_per_thread = HEAD_DIM/32). HEAD_DIM={}",
+        consts.head_dim,
+    );
+
+    // Channel-name allocation — identical to
+    // `synthesize_pre_attn_chunk_persistent_impl` for the pre-attn
+    // bindings, plus three new bindings for the attention phase
+    // (`__attn_out`, `__seq_used_k`, `__block_table`).
+    let x_norm_name   = "__x_norm".to_string();
+    let qmv_smem_name = "__qmv_smem".to_string();
+    let residual_io   = "__residual_io".to_string();
+    let delta_buf     = "__delta".to_string();
+    let rms_wt_buf    = "__rms_weight".to_string();
+    let q_wt_buf      = "__q_weight".to_string();
+    let q_sc_buf      = "__q_scales".to_string();
+    let q_bi_buf      = "__q_biases".to_string();
+    let k_wt_buf      = "__k_weight".to_string();
+    let k_sc_buf      = "__k_scales".to_string();
+    let k_bi_buf      = "__k_biases".to_string();
+    let v_wt_buf      = "__v_weight".to_string();
+    let v_sc_buf      = "__v_scales".to_string();
+    let v_bi_buf      = "__v_biases".to_string();
+    let q_lb_buf      = "__q_linear_bias".to_string();
+    let k_lb_buf      = "__k_linear_bias".to_string();
+    let v_lb_buf      = "__v_linear_bias".to_string();
+    let cos_sin_buf   = "__cos_sin".to_string();
+    let positions_buf = "__positions".to_string();
+    let slot_map_buf  = "__slot_mapping".to_string();
+    let q_out_buf     = "__q_out".to_string();
+    let kv_cache_k    = "__kv_cache_k".to_string();
+    let kv_cache_v    = "__kv_cache_v".to_string();
+    // New for Phase 2c.
+    let attn_out_buf    = "__attn_out".to_string();
+    let seq_used_k_buf  = "__seq_used_k".to_string();
+    let block_table_buf = "__block_table".to_string();
+
+    let constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
+        ("HIDDEN",      AtomConstantValue::Uint(consts.hidden)),
+        ("NUM_Q",       AtomConstantValue::Uint(consts.num_q_heads)),
+        ("NUM_KV",      AtomConstantValue::Uint(consts.num_kv_heads)),
+        ("HEAD_DIM",    AtomConstantValue::Uint(consts.head_dim)),
+        ("ROT_DIM",     AtomConstantValue::Uint(consts.rot_dim)),
+        ("BLOCK_SIZE",  AtomConstantValue::Uint(consts.block_size)),
+        ("M",           AtomConstantValue::Uint(consts.m)),
+        ("EPS",         AtomConstantValue::Float(consts.rms_norm_eps)),
+    ];
+
+    // Atom set + bodies — identical to the pre-attn-only persistent
+    // variant. Replicated rather than refactored-out to keep this
+    // function self-contained until Phase 2c step B lands and the
+    // duplication can be unified through an atom-DAG walker.
+    let addrms = AddRmsNormAtom { init };
+    let rope   = RopeAppendAtom;
+    let qmv_q = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "__head",
+        has_linear_bias: consts.has_linear_bias,
+    };
+    let qmv_k = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "(__head - __num_q)",
+        has_linear_bias: consts.has_linear_bias,
+    };
+    let qmv_v = AffineQmvAtom {
+        group_size: consts.group_size,
+        local_head_expr: "(__head - __num_q - __num_kv)",
+        has_linear_bias: consts.has_linear_bias,
+    };
+
+    let addrms_in  = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
+    let addrms_out = vec![x_norm_name.clone()];
+    let addrms_ctx = AtomCtx {
+        bound_inputs: &addrms_in, bound_outputs: &addrms_out,
+        constants: &constants_slice, t_act, t_scale,
+    };
+    let rope_in  = vec![
+        qmv_smem_name.clone(), cos_sin_buf.clone(),
+        positions_buf.clone(), slot_map_buf.clone(),
+    ];
+    let rope_out = vec![q_out_buf.clone(), kv_cache_k.clone(), kv_cache_v.clone()];
+    let rope_ctx = AtomCtx {
+        bound_inputs: &rope_in, bound_outputs: &rope_out,
+        constants: &constants_slice, t_act, t_scale,
+    };
+
+    let addrms_body = addrms.emit_metal_body(&addrms_ctx).expect("AddRmsNormAtom Metal emit");
+    let rope_body   = rope.emit_metal_body(&rope_ctx).expect("RopeAppendAtom Metal emit");
+
+    let emit_band_body =
+        |atom: &AffineQmvAtom, w: &str, s: &str, b: &str, lb: Option<&str>| -> String {
+            let mut band_in = vec![
+                x_norm_name.clone(), w.to_string(), s.to_string(), b.to_string(),
+            ];
+            if let Some(lb_name) = lb {
+                band_in.push(lb_name.to_string());
+            }
+            let band_out = vec![qmv_smem_name.clone()];
+            let band_ctx = AtomCtx {
+                bound_inputs: &band_in, bound_outputs: &band_out,
+                constants: &constants_slice, t_act, t_scale,
+            };
+            atom.emit_metal_body(&band_ctx).expect("AffineQmvAtom Metal emit")
+        };
+    let q_lb_opt: Option<&str> = consts.has_linear_bias.then_some(q_lb_buf.as_str());
+    let k_lb_opt: Option<&str> = consts.has_linear_bias.then_some(k_lb_buf.as_str());
+    let v_lb_opt: Option<&str> = consts.has_linear_bias.then_some(v_lb_buf.as_str());
+    let qmv_q_body = emit_band_body(&qmv_q, &q_wt_buf, &q_sc_buf, &q_bi_buf, q_lb_opt);
+    let qmv_k_body = emit_band_body(&qmv_k, &k_wt_buf, &k_sc_buf, &k_bi_buf, k_lb_opt);
+    let qmv_v_body = emit_band_body(&qmv_v, &v_wt_buf, &v_sc_buf, &v_bi_buf, v_lb_opt);
+    let qmv_body = format!(
+        r#"
+    // --- per-band QKV qmv (3× AffineQmvAtom, band-selected by __head) ---
+    if (__head < __num_q) {{
+        {qmv_q_body}
+    }} else if (__head < __num_q + __num_kv) {{
+        {qmv_k_body}
+    }} else {{
+        {qmv_v_body}
+    }}
+"#,
+    );
+
+    let attn_body = bn8_attention_body_msl(
+        t_act,
+        &q_out_buf, &attn_out_buf,
+        &seq_used_k_buf, &block_table_buf,
+        &kv_cache_k, &kv_cache_v,
+    );
+    let barrier_body = cross_tg_barrier_msl(0, "__barrier_counter");
+
+    let bias_suffix = if consts.has_linear_bias { "_bias" } else { "" };
+    let symbol = if init {
+        format!(
+            "synth_pre_attn_attn_init_persistent_{}_{}_gs{}{}",
+            t_act, t_scale, consts.group_size, bias_suffix,
+        )
+    } else {
+        format!(
+            "synth_pre_attn_attn_persistent_{}_{}_gs{}{}",
+            t_act, t_scale, consts.group_size, bias_suffix,
+        )
+    };
+
+    // Buffer indices: pre-attn 0..17 (same as synth_pre_attn_persistent),
+    // optional bias 18..20, then attention's new bindings:
+    //   attn_out     at next free index
+    //   seq_used_k   at +1
+    //   block_table  at +2
+    //   barrier_counter at +3
+    let pre_attn_end: u32 = if consts.has_linear_bias { 21 } else { 18 };
+    let attn_out_idx:    u32 = pre_attn_end;
+    let seq_used_k_idx:  u32 = pre_attn_end + 1;
+    let block_table_idx: u32 = pre_attn_end + 2;
+    let counter_idx:     u32 = pre_attn_end + 3;
+
+    let maybe_bias_params = if consts.has_linear_bias {
+        format!(
+            "    device const {t_act}*   {q_lb_buf}      [[buffer(18)]],\n\
+             \x20   device const {t_act}*   {k_lb_buf}      [[buffer(19)]],\n\
+             \x20   device const {t_act}*   {v_lb_buf}      [[buffer(20)]],\n",
+            t_act = t_act,
+            q_lb_buf = q_lb_buf, k_lb_buf = k_lb_buf, v_lb_buf = v_lb_buf,
+        )
+    } else {
+        String::new()
+    };
+
+    let mk_header = inline_header(include_str!(
+        "../../ferrite-metal-kernels/shaders/metal_kittens.h"
+    ));
+
+    // ATTN_SCALE_BAKED = 1/sqrt(HEAD_DIM), computed at synth time so
+    // the attention body can use a constexpr float literal (no
+    // function-constant indirection, no runtime sqrt).
+    let attn_scale = 1.0_f64 / (consts.head_dim as f64).sqrt();
+    let source_tail = format!(
+        r#"
+
+// Model-invariant dims baked at synth time, identical to the pre-attn
+// persistent variant. M stays a function constant.
+constant constexpr uint  HIDDEN     = {hidden_lit}u;
+constant constexpr uint  NUM_Q      = {num_q_lit}u;
+constant constexpr uint  NUM_KV     = {num_kv_lit}u;
+constant constexpr uint  HEAD_DIM   = {head_dim_lit}u;
+constant constexpr uint  ROT_DIM    = {rot_dim_lit}u;
+constant constexpr uint  BLOCK_SIZE = {block_size_lit}u;
+constant constexpr float EPS        = {eps_lit}f;
+constant constexpr float ATTN_SCALE_BAKED = {attn_scale_lit}f;
+constant uint  M                  [[function_constant(0)]];
+constant uint  MAX_BLOCKS_PER_SEQ [[function_constant(1)]];
+
+constant constexpr uint __HIDDEN_MAX   = HIDDEN;
+constant constexpr uint __HEAD_DIM_MAX = HEAD_DIM;
+constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
+
+[[kernel, max_total_threads_per_threadgroup({threads_per_tg}u)]]
+void {symbol}(
+    device       {t_act}*   {q_out_buf}      [[buffer(0)]],
+    device       {t_act}*   {residual_io}    [[buffer(1)]],
+    device const {t_act}*   {delta_buf}      [[buffer(2)]],
+    device const {t_scale}* {rms_wt_buf}     [[buffer(3)]],
+    device const uint32_t*  {q_wt_buf}       [[buffer(4)]],
+    device const {t_scale}* {q_sc_buf}       [[buffer(5)]],
+    device const {t_scale}* {q_bi_buf}       [[buffer(6)]],
+    device const uint32_t*  {k_wt_buf}       [[buffer(7)]],
+    device const {t_scale}* {k_sc_buf}       [[buffer(8)]],
+    device const {t_scale}* {k_bi_buf}       [[buffer(9)]],
+    device const uint32_t*  {v_wt_buf}       [[buffer(10)]],
+    device const {t_scale}* {v_sc_buf}       [[buffer(11)]],
+    device const {t_scale}* {v_bi_buf}       [[buffer(12)]],
+    device const {t_act}*   {cos_sin_buf}    [[buffer(13)]],
+    device const uint*      {positions_buf}  [[buffer(14)]],
+    device const uint*      {slot_map_buf}   [[buffer(15)]],
+    device       {t_act}*   {kv_cache_k}     [[buffer(16)]],
+    device       {t_act}*   {kv_cache_v}     [[buffer(17)]],
+{maybe_bias_params}    device       {t_act}*   {attn_out_buf}    [[buffer({attn_out_idx})]],
+    device const uint*      {seq_used_k_buf} [[buffer({seq_used_k_idx})]],
+    device const uint*      {block_table_buf} [[buffer({block_table_idx})]],
+    device atomic_uint* __barrier_counter [[buffer({counter_idx})]],
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tgs_per_grid [[threadgroups_per_grid]],
+    uint3 __tid_pos   [[thread_position_in_threadgroup]],
+    uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid  [[thread_index_in_simdgroup]])
+{{
+    const uint __t                = __tg_pos.x;
+    const uint __head             = __tg_pos.y;
+    const uint __tid              = __tid_pos.x;
+    const uint __head_dim         = HEAD_DIM;
+    const uint __hidden           = HIDDEN;
+    const uint __num_q            = NUM_Q;
+    const uint __num_kv           = NUM_KV;
+    const uint __rot_dim          = ROT_DIM;
+    const uint __half_dim         = __rot_dim / 2;
+    const uint __block_sz         = BLOCK_SIZE;
+    const uint __num_heads_total  = __num_q + 2u * __num_kv;
+    const uint __threads_per_tg   = MK_SIMD_SIZE * __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const uint __num_simdgroups   = __head_dim / MK_ROWS_PER_SIMDGROUP;
+    const float __eps             = EPS;
+
+    // Persistent envelope: total TGs derived from `[[threadgroups_per_grid]]`
+    // (the runtime m_scaling shrinks the X-axis to num_tokens). Required
+    // by the cross-TG ticket-lock barrier.
+    const uint num_tgs = __tgs_per_grid.x * __tgs_per_grid.y;
+
+    // NOTE: no early-return guard. The dispatch grid is exactly
+    // `(num_tokens × __num_heads_total)`, so every dispatched TG has
+    // valid __t / __head and proceeds through both phases + the
+    // intervening barrier. An early-return here would skip the barrier
+    // and deadlock the spin in TGs that did reach it.
+
+    threadgroup {t_act} {x_norm_name}[__HIDDEN_MAX];
+    threadgroup float   __scratch  [__SCRATCH_MAX];
+    threadgroup float   {qmv_smem_name}[__HEAD_DIM_MAX];
+
+    // ── phase 0: pre-attn (AddRmsNorm → QKV qmv → RopeAppend) ──
+    {addrms_body}
+
+    {qmv_body}
+
+    {rope_body}
+
+    // ── cross-TG barrier: pre-attn → attention ──
+    // Every dispatched TG must reach this barrier (no early return
+    // above). Heads with __head >= NUM_Q sit idle inside the attention
+    // body but still execute this barrier on their way to it.
+    // The `cross_tg_barrier_msl` helper emits `if (tid == 0u)`; atom
+    // bodies use `__tid` (pre-attn convention), so we alias the two.
+    const uint tid = __tid;
+    {barrier_body}
+
+    // ── phase 1: BN=8 paged-cache decode attention ──
+    {attn_body}
+
+    // No trailing barrier — the downstream chunk (o_proj + MLP) is
+    // dispatched as a separate kernel which provides the L2-flush via
+    // the queue-level fence between kernel boundaries.
+}}
+"#,
+        symbol = symbol, t_act = t_act, t_scale = t_scale,
+        q_out_buf = q_out_buf, residual_io = residual_io,
+        delta_buf = delta_buf, rms_wt_buf = rms_wt_buf,
+        q_wt_buf = q_wt_buf, q_sc_buf = q_sc_buf, q_bi_buf = q_bi_buf,
+        k_wt_buf = k_wt_buf, k_sc_buf = k_sc_buf, k_bi_buf = k_bi_buf,
+        v_wt_buf = v_wt_buf, v_sc_buf = v_sc_buf, v_bi_buf = v_bi_buf,
+        cos_sin_buf = cos_sin_buf, positions_buf = positions_buf,
+        slot_map_buf = slot_map_buf,
+        kv_cache_k = kv_cache_k, kv_cache_v = kv_cache_v,
+        maybe_bias_params = maybe_bias_params,
+        attn_out_buf = attn_out_buf,
+        seq_used_k_buf = seq_used_k_buf,
+        block_table_buf = block_table_buf,
+        attn_out_idx = attn_out_idx,
+        seq_used_k_idx = seq_used_k_idx,
+        block_table_idx = block_table_idx,
+        counter_idx = counter_idx,
+        x_norm_name = x_norm_name, qmv_smem_name = qmv_smem_name,
+        addrms_body = addrms_body,
+        qmv_body = qmv_body,
+        rope_body = rope_body,
+        barrier_body = barrier_body,
+        attn_body = attn_body,
+        threads_per_tg = 8 * consts.head_dim,
+        hidden_lit = consts.hidden,
+        num_q_lit = consts.num_q_heads,
+        num_kv_lit = consts.num_kv_heads,
+        head_dim_lit = consts.head_dim,
+        rot_dim_lit = consts.rot_dim,
+        block_size_lit = consts.block_size,
+        eps_lit = format_msl_float(consts.rms_norm_eps),
+        attn_scale_lit = format_msl_float(attn_scale as f32),
+    );
+
+    let source = format!(
+        "// SPDX-License-Identifier: Apache-2.0\n\
+         //\n\
+         // SYNTHESIZED PHASE-2c PERSISTENT KERNEL — generated by\n\
+         // ferrite-fusion-synth::synthesize_pre_attn_attn_chunk_persistent.\n\
+         // Pre-attn (AddRmsNorm + QKV qmv + RopeAppend) + in-kernel BN=8\n\
+         // decode attention, separated by a cross-TG ticket-lock barrier.\n\
+         // Do not hand-edit.\n\n\
+         #include <metal_stdlib>\n\
+         #include <metal_atomic>\n\
+         using namespace metal;\n\n\
+         // === inlined metal_kittens.h ===\n\
+         {mk_header}\n\
+         // === end inlined metal_kittens.h ===\n\n\
+         {source_tail}",
+        mk_header = mk_header,
+        source_tail = source_tail,
+    );
+
+    SynthesizedKernel {
+        symbol,
+        source,
+        backend: SynthesisBackend::Metal,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Persistent megakernel synthesis (multi-phase, cross-TG barrier).
+// ───────────────────────────────────────────────────────────────────
+//
+// Emits the MSL body fragment of `attention_via_cache_v2_<dtype>_bn8_*`
+// from `ferrite-metal-kernels/shaders/attention.metal`, adapted to
+// reference kernel-scope variables produced by `pre_attn_persistent_*`
+// instead of taking them as kernel arguments. Spliceable into a
+// persistent kernel's attention phase between cross-TG barriers.
+//
+// Kernel-scope variables this body expects (all declared by the
+// caller's persistent-kernel prologue / pre-attn phase):
+//   __t            : token index (uint, =tg_pos.x; for decode also =seq_idx)
+//   __head         : head index (uint, =tg_pos.y; covers Q+K+V band)
+//   __simd_gid     : simdgroup_index_in_threadgroup (uint, =[0..BN))
+//   __simd_lid     : thread_index_in_simdgroup       (uint, =[0..32))
+//
+// Compile-time constants the caller must declare (`constant constexpr`
+// at file scope or `#define` above the kernel):
+//   HEAD_DIM, NUM_Q, NUM_KV, BLOCK_SIZE  (already in pre-attn preamble)
+//   ATTN_SCALE_BAKED                     (NEW: 1/sqrt(HEAD_DIM))
+//   MAX_BLOCKS_PER_SEQ                   (NEW: function_constant(1) at
+//                                         pipeline build; runtime
+//                                         config-derived)
+//
+// Buffer names this body references (caller's signature must bind):
+//   `q_buf`       — Q tensor [tokens, NUM_Q, HEAD_DIM]   (READ)
+//   `out_buf`     — attention output [tokens, NUM_Q, HEAD_DIM] (WRITE)
+//   `seq_used_k_buf` — uint[batch], total cached K
+//   `block_table_buf` — uint[batch, MAX_BLOCKS_PER_SEQ]
+//   `k_cache_buf`, `v_cache_buf` — paged caches [num_blocks, NUM_KV,
+//                                  BLOCK_SIZE, HEAD_DIM]
+//
+// Threadgroup arrays this body declares inline (kept local to the body
+// so the same caller can splice multiple attention phases without name
+// collisions): `__attn_partials`, `__attn_max`, `__attn_sum`.
+//
+// The body wraps its work in `if (__head < NUM_Q) { ... }` so heads
+// dispatched for pre-attn's K/V projections sit idle during attention
+// (they still bump the surrounding barrier counter because the guard
+// is *inside* the phase, not around it).
+//
+// Constraint: HEAD_DIM must be a multiple of 32 (qk_per_thread =
+// HEAD_DIM/32). Llama-3.2/Qwen/Mistral/Phi all satisfy.
+pub fn bn8_attention_body_msl(
+    t_act: &str,
+    q_buf: &str,
+    out_buf: &str,
+    seq_used_k_buf: &str,
+    block_table_buf: &str,
+    k_cache_buf: &str,
+    v_cache_buf: &str,
+) -> String {
+    // ATTN_BN8_MAX_HEAD_DIM matches `attention.metal`'s define; sized to
+    // the largest HEAD_DIM the body supports (256 → 8KiB tg_partials).
+    const MAX_HEAD_DIM: u32 = 256;
+    format!(
+        r#"
+    // ── atom: BN=8 paged-cache decode attention (Phase 2c) ──
+    // BN-agnostic combine; same algorithm as attention_via_cache_v2_*_bn8_specialized.
+    // TG memory: BN*MAX_HD*4 + BN*4*2 = 8*256*4 + 64 ≈ 8.3 KiB.
+    if (__head < NUM_Q) {{
+        constexpr int __ATTN_BN     = 8;
+        constexpr int __ATTN_BD     = 32;
+        constexpr uint __ATTN_MAX_HEAD_DIM = {MAX_HEAD_DIM}u;
+        typedef float __ATTN_U;
+
+        const uint __attn_seq_idx     = __t;
+        const uint __attn_q_head_idx  = __head;
+        const uint __attn_qk_per_thread = HEAD_DIM / uint(__ATTN_BD);
+        const uint __attn_group_ratio = NUM_Q / NUM_KV;
+        const uint __attn_kv_head_idx = __attn_q_head_idx / __attn_group_ratio;
+        const uint __attn_kv_len      = {seq_used_k}[__attn_seq_idx];
+
+        const uint __attn_kv_blk_stride  = NUM_KV * BLOCK_SIZE * HEAD_DIM;
+        const uint __attn_kv_head_stride = BLOCK_SIZE * HEAD_DIM;
+        const uint __attn_kv_tok_stride  = HEAD_DIM;
+
+        thread __ATTN_U __attn_q_reg[8];
+        thread __ATTN_U __attn_o_reg[8];
+
+        threadgroup __ATTN_U __attn_partials[__ATTN_BN * __ATTN_MAX_HEAD_DIM];
+        threadgroup __ATTN_U __attn_max[__ATTN_BN];
+        threadgroup __ATTN_U __attn_sum[__ATTN_BN];
+
+        device const {t_act}* __attn_q_row = {q_buf}
+            + (__attn_seq_idx * NUM_Q + __attn_q_head_idx) * HEAD_DIM;
+        device       {t_act}* __attn_o_row = {out_buf}
+            + (__attn_seq_idx * NUM_Q + __attn_q_head_idx) * HEAD_DIM;
+        device const uint*   __attn_row_block_table = {block_table}
+            + __attn_seq_idx * MAX_BLOCKS_PER_SEQ;
+
+        for (uint __i = 0u; __i < __attn_qk_per_thread; ++__i) {{
+            __attn_q_reg[__i] = __ATTN_U(ATTN_SCALE_BAKED)
+                              * __ATTN_U(__attn_q_row[__simd_lid * __attn_qk_per_thread + __i]);
+            __attn_o_reg[__i] = 0;
+        }}
+
+        __ATTN_U __attn_max_score     = -FLT_MAX;
+        __ATTN_U __attn_sum_exp_score = 0;
+
+        for (uint __i = __simd_gid; __i < __attn_kv_len; __i += uint(__ATTN_BN)) {{
+            const uint __attn_logical_block  = __i / BLOCK_SIZE;
+            const uint __attn_physical_block = __attn_row_block_table[__attn_logical_block];
+            const uint __attn_token_in_block = __i - __attn_logical_block * BLOCK_SIZE;
+            device const {t_act}* __attn_k_ptr =
+                {k_cache}
+                + __attn_physical_block * __attn_kv_blk_stride
+                + __attn_kv_head_idx    * __attn_kv_head_stride
+                + __attn_token_in_block * __attn_kv_tok_stride
+                + __simd_lid * __attn_qk_per_thread;
+            device const {t_act}* __attn_v_ptr =
+                {v_cache}
+                + __attn_physical_block * __attn_kv_blk_stride
+                + __attn_kv_head_idx    * __attn_kv_head_stride
+                + __attn_token_in_block * __attn_kv_tok_stride
+                + __simd_lid * __attn_qk_per_thread;
+
+            __ATTN_U __attn_score = 0;
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+                __attn_score += __attn_q_reg[__j] * __ATTN_U(__attn_k_ptr[__j]);
+            }}
+            __attn_score = simd_sum(__attn_score);
+
+            __ATTN_U __attn_new_max  = max(__attn_max_score, __attn_score);
+            __ATTN_U __attn_factor   = metal::fast::exp(__attn_max_score - __attn_new_max);
+            __ATTN_U __attn_exp_score = metal::fast::exp(__attn_score - __attn_new_max);
+            __attn_max_score      = __attn_new_max;
+            __attn_sum_exp_score  = __attn_sum_exp_score * __attn_factor + __attn_exp_score;
+
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+                __attn_o_reg[__j] = __attn_o_reg[__j] * __attn_factor
+                                  + __attn_exp_score * __ATTN_U(__attn_v_ptr[__j]);
+            }}
+        }}
+
+        for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+            __attn_partials[__simd_gid * __ATTN_MAX_HEAD_DIM
+                            + __simd_lid * __attn_qk_per_thread + __j] = __attn_o_reg[__j];
+        }}
+        if (__simd_lid == 0u) {{
+            __attn_max[__simd_gid] = __attn_max_score;
+            __attn_sum[__simd_gid] = __attn_sum_exp_score;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        __ATTN_U __attn_global_max = -FLT_MAX;
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            __attn_global_max = max(__attn_global_max, __attn_max[__g]);
+        }}
+        __ATTN_U __attn_global_sum = 0;
+        __ATTN_U __attn_factors[__ATTN_BN];
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            __attn_factors[__g] = metal::fast::exp(__attn_max[__g] - __attn_global_max);
+            __attn_global_sum  += __attn_sum[__g] * __attn_factors[__g];
+        }}
+
+        thread __ATTN_U __attn_final_o[8];
+        for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) __attn_final_o[__j] = 0;
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            const __ATTN_U __attn_f = __attn_factors[__g];
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+                __attn_final_o[__j] += __attn_partials[__g * __ATTN_MAX_HEAD_DIM
+                                                       + __simd_lid * __attn_qk_per_thread + __j]
+                                        * __attn_f;
+            }}
+        }}
+        if (__attn_global_sum != 0) {{
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) __attn_final_o[__j] /= __attn_global_sum;
+        }}
+
+        if (__simd_gid == 0u) {{
+            device {t_act}* __attn_o_ptr = __attn_o_row + __simd_lid * __attn_qk_per_thread;
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+                __attn_o_ptr[__j] = {t_act}(__attn_final_o[__j]);
+            }}
+        }}
+    }}
+"#,
+        t_act = t_act,
+        q_buf = q_buf,
+        out_buf = out_buf,
+        seq_used_k = seq_used_k_buf,
+        block_table = block_table_buf,
+        k_cache = k_cache_buf,
+        v_cache = v_cache_buf,
+        MAX_HEAD_DIM = MAX_HEAD_DIM,
+    )
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Persistent megakernel synthesis (multi-phase, cross-TG barrier).
 //
 // Background: the synth chunks above (synthesize_pre_attn_chunk etc.)
@@ -2079,16 +2675,17 @@ mod tests {
         assert!(kernel.symbol.starts_with("synth_pre_attn_persistent_"));
         assert!(kernel.symbol.contains("bfloat"));
         assert!(kernel.symbol.contains("gs64"));
-        // Persistent envelope markers.
+        // Persistent envelope markers — counter binding is plumbed
+        // through the signature even though the single-phase variant
+        // doesn't currently use it (Phase 2b dropped the trailing
+        // barrier; the binding stays for forward-compat with
+        // multi-phase fusion like `synthesize_pre_attn_attn_*`).
         assert!(kernel.source.contains("__barrier_counter"));
-        assert!(kernel.source.contains("atomic_fetch_add_explicit"));
         assert!(kernel.source.contains("max_total_threads_per_threadgroup"));
         // Atom bodies survive.
         assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));
         assert!(kernel.source.contains("mk_qdot"));
         assert!(kernel.source.contains("mk_rope_pair"));
-        // One trailing barrier (single-phase envelope).
-        assert!(kernel.source.contains("trailing cross-TG barrier"));
         // Buffer indices match the non-persistent kernel (strict
         // signature superset). q_out at 0, kv_cache_v at 17, counter
         // appended at 18.
@@ -2097,8 +2694,162 @@ mod tests {
         assert!(kernel.source.contains("__barrier_counter [[buffer(18)]]"));
         // M function constant still wired.
         assert!(kernel.source.contains("constant uint  M [[function_constant(0)]]"));
-        // num_tgs derived inline (no runtime binding).
-        assert!(kernel.source.contains("__persistent_num_tgs = M * __num_heads_total"));
+        // num_tgs derived from `[[threadgroups_per_grid]]`, not from
+        // `M * num_heads_total` — the runtime m_scaling shrinks the
+        // X-axis to num_tokens ≤ M, so `M * num_heads_total` would
+        // over-count and a multi-phase ticket-lock would spin forever.
+        assert!(kernel.source.contains("__persistent_num_tgs = __tgs_per_grid.x * __tgs_per_grid.y"));
+    }
+
+    fn llama_3_2_1b_constants() -> ChunkConstants {
+        // Llama-3.2-1B-Instruct-4bit: hidden=2048, q_heads=32, kv_heads=8,
+        // head_dim=64, rot_dim=64, group_size=64, block_size=16.
+        ChunkConstants {
+            hidden:        2048,
+            num_q_heads:   32,
+            num_kv_heads:  8,
+            head_dim:      64,
+            rot_dim:       64,
+            block_size:    16,
+            intermediate:  8192,
+            m:             1,
+            group_size:    64,
+            rms_norm_eps:  1e-5,
+            has_linear_bias: false,
+        }
+    }
+
+    #[test]
+    fn synthesize_pre_attn_attn_chunk_persistent_structural() {
+        // Phase 2c structural test: pre-attn + cross-TG barrier +
+        // in-kernel BN=8 attention all appear in one synthesized kernel
+        // with the correct buffer signature and barrier scaffolding.
+        let consts = llama_3_2_1b_constants();
+        let kernel = synthesize_pre_attn_attn_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+        );
+        assert_eq!(kernel.backend, SynthesisBackend::Metal);
+        assert!(kernel.symbol.starts_with("synth_pre_attn_attn_persistent_"));
+        assert!(kernel.symbol.contains("bfloat"));
+        assert!(kernel.symbol.contains("gs64"));
+
+        // Pre-attn atom bodies survive verbatim.
+        assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));
+        assert!(kernel.source.contains("mk_qdot"));
+        assert!(kernel.source.contains("mk_rope_pair"));
+
+        // Phase comments delimit the two phases + the barrier.
+        assert!(kernel.source.contains("phase 0: pre-attn"));
+        assert!(kernel.source.contains("phase 1: BN=8 paged-cache decode attention"));
+        assert!(kernel.source.contains("cross-TG barrier: pre-attn"));
+
+        // Cross-TG ticket-lock barrier scaffolding (phase index 0,
+        // target = num_tgs * 1u).
+        assert!(kernel.source.contains("atomic_fetch_add_explicit"));
+        assert!(kernel.source.contains("num_tgs * 1u"));
+        assert!(kernel.source.contains("threadgroup_barrier(mem_flags::mem_device)"));
+
+        // Buffer signature: pre-attn 0..17, attention bindings 18..20,
+        // barrier counter 21 (no-bias variant). The strict-superset
+        // shape matches `synth_pre_attn_persistent_*` for 0..17.
+        assert!(kernel.source.contains("__q_out      [[buffer(0)]]"));
+        assert!(kernel.source.contains("__kv_cache_v     [[buffer(17)]]"));
+        assert!(kernel.source.contains("__attn_out    [[buffer(18)]]"));
+        assert!(kernel.source.contains("__seq_used_k [[buffer(19)]]"));
+        assert!(kernel.source.contains("__block_table [[buffer(20)]]"));
+        assert!(kernel.source.contains("__barrier_counter [[buffer(21)]]"));
+
+        // Function constants: M (existing) + MAX_BLOCKS_PER_SEQ (NEW).
+        assert!(kernel.source.contains("constant uint  M                  [[function_constant(0)]]"));
+        assert!(kernel.source.contains(
+            "constant uint  MAX_BLOCKS_PER_SEQ [[function_constant(1)]]"
+        ));
+
+        // Baked attention scale (1/sqrt(HEAD_DIM=64) = 0.125).
+        assert!(kernel.source.contains("ATTN_SCALE_BAKED"));
+
+        // Attention body uses the bn8 markers; head guard so K/V
+        // heads sit idle during attention.
+        assert!(kernel.source.contains("if (__head < NUM_Q)"));
+        assert!(kernel.source.contains("__attn_partials"));
+        assert!(kernel.source.contains("__attn_max"));
+        assert!(kernel.source.contains("__attn_sum"));
+
+        // Reads Q from the pre-attn output buffer, writes attn_out.
+        assert!(kernel.source.contains("__attn_q_row = __q_out"));
+        assert!(kernel.source.contains("__attn_o_row = __attn_out"));
+
+        // num_tgs derived from `[[threadgroups_per_grid]]` (not from
+        // M * num_heads_total which would over-count when m_scaling
+        // shrinks the X-axis to num_tokens < M).
+        assert!(kernel.source.contains("num_tgs = __tgs_per_grid.x * __tgs_per_grid.y"));
+
+        // Critically: no early-return guard before the barrier. The
+        // grid is exactly (num_tokens × num_heads_total) so every
+        // dispatched TG is valid; an early-return would deadlock the
+        // surviving TGs spinning on the ticket-lock.
+        assert!(
+            !kernel.source.contains("if (__t >= M || __head >= __num_heads_total) return;"),
+            "Phase 2c must NOT emit the defensive early-return — it bypasses the cross-TG barrier"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn synthesize_pre_attn_attn_chunk_persistent_compiles_with_metal() {
+        // Verify the Phase 2c synth source survives `xcrun metal -c`.
+        // Skipped on non-macOS (no `xcrun`). The non-bias / bias / init
+        // variants all share the same shape; testing the non-bias path
+        // catches the common case + the new attention body shape.
+        let consts = llama_3_2_1b_constants();
+        let kernel = synthesize_pre_attn_attn_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+        );
+        let bytes = crate::aot::aot_compile_metallib(&kernel.symbol, &kernel.source);
+        assert!(
+            !bytes.is_empty(),
+            "Phase 2c metallib compile returned empty bytes — `xcrun metal` likely failed (set FERRITE_SYNTH_DUMP=1 + check /tmp/ferrite-synth-dump)",
+        );
+    }
+
+    #[test]
+    fn synthesize_pre_attn_attn_chunk_persistent_init_variant() {
+        let consts = llama_3_2_1b_constants();
+        let kernel = synthesize_pre_attn_attn_init_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+        );
+        assert!(kernel.symbol.starts_with("synth_pre_attn_attn_init_persistent_"));
+        // Init body has the "no residual add" comment marker from
+        // AddRmsNormAtom { init: true }.
+        assert!(kernel.source.contains("layer-0 / no residual add"));
+    }
+
+    #[test]
+    fn synthesize_pre_attn_attn_chunk_persistent_with_bias_shifts_counter() {
+        // Bias variant (Qwen2/2.5 QKV linear bias): extra 18/19/20
+        // bindings push the new attention bindings to 21/22/23 and
+        // the counter to 24.
+        let consts = ChunkConstants { has_linear_bias: true, ..llama_3_2_1b_constants() };
+        let kernel = synthesize_pre_attn_attn_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+        );
+        assert!(kernel.symbol.ends_with("_bias"));
+        assert!(kernel.source.contains("__q_linear_bias      [[buffer(18)]]"));
+        assert!(kernel.source.contains("__v_linear_bias      [[buffer(20)]]"));
+        assert!(kernel.source.contains("__attn_out    [[buffer(21)]]"));
+        assert!(kernel.source.contains("__barrier_counter [[buffer(24)]]"));
     }
 
     #[test]

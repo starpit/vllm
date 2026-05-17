@@ -583,6 +583,51 @@ pub fn warp_load_rt_from_st_bf<L: RtLayoutTag>(
     ))
 }
 
+/// `kittens::warp::apply(rt_dst, rt_src, lambda);` — apply a
+/// per-element lambda over a register tile. The lambda
+/// signature is `(int row, int col, T x) -> T` (3-arg, vs the
+/// 2-arg `(idx, x)` of the vector-flavored apply at
+/// `vec/maps.cuh:79-112`). Used for tile-level activations
+/// (silu / gelu) in `FusedGateUpActivateMul`.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:89-115`.
+pub fn warp_apply_f32_rt_lambda(
+    dst: &Rt<F32, RtRow>,
+    src: &Rt<F32, RtRow>,
+    lambda_body: &str,
+) -> CuStmt {
+    debug_assert_eq!(dst.rows(), src.rows());
+    debug_assert_eq!(dst.cols(), src.cols());
+    CuStmt::new(format!(
+        "kittens::warp::apply({dst}, {src}, [] __device__ (int /*row*/, int /*col*/, float x) {{ return {body}; }});",
+        dst = dst.expr(),
+        src = src.expr(),
+        body = lambda_body
+    ))
+}
+
+/// `kittens::warp::mul(dst, lhs, rhs);` — elementwise tile
+/// multiplication. Both operands and dst share the same
+/// dtype/layout (TK 2.0's `bin_map<base_ops::mul, T>`).
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:707-710`.
+pub fn warp_mul_rt_rt(
+    dst: &Rt<F32, RtRow>,
+    lhs: &Rt<F32, RtRow>,
+    rhs: &Rt<F32, RtRow>,
+) -> CuStmt {
+    debug_assert_eq!(dst.rows(), lhs.rows());
+    debug_assert_eq!(dst.cols(), lhs.cols());
+    debug_assert_eq!(lhs.rows(), rhs.rows());
+    debug_assert_eq!(lhs.cols(), rhs.cols());
+    CuStmt::new(format!(
+        "kittens::warp::mul({dst}, {lhs}, {rhs});",
+        dst = dst.expr(),
+        lhs = lhs.expr(),
+        rhs = rhs.expr()
+    ))
+}
+
 /// `kittens::warp::load(rt_fl, st_bf);` — collaborative
 /// shared->register load with bf16->fp32 type conversion handled
 /// internally by TK 2.0 (`base_types::convertor<T2, U2>` at

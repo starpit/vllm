@@ -14,16 +14,17 @@
 //! 2.0 on the pod before it's "done."
 
 use crate::ir::nodes::{
-    Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, Gemm, MegaNode, RmsNorm,
-    ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap, TkFusedGemmAdd,
+    Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, FusedGateUpActivateMul,
+    GateUpActivation, Gemm, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
+    TkFusedGemmAdd,
 };
 use crate::ir::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr};
 use super::handles::{
     gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_weight_ptr_raw,
-    page_as_byte_ptr, page_as_st_bf, page_as_sv_bf, page_consumed_sem, page_done_sem,
-    page_ready_sem, scratch_as, scratch_as_st_bf,
+    gmem_weight_ptr_raw_offset, page_as_byte_ptr, page_as_st_bf, page_as_sv_bf,
+    page_consumed_sem, page_done_sem, page_ready_sem, scratch_as, scratch_as_st_bf,
 };
 use super::tk20;
 
@@ -53,7 +54,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::FusedQkvRopeCache(_) => RoleBodies::skipped("FusedQkvRopeCache"),
         MegaNode::Add(n) => emit_add(n, budget),
         MegaNode::FusedAddRmsNorm(n) => emit_fused_add_rms_norm(n, budget),
-        MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
+        MegaNode::FusedGateUpActivateMul(n) => emit_fused_gate_up_activate_mul(n, budget),
         MegaNode::Embed(n) => emit_embed(n, budget),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
@@ -1368,6 +1369,264 @@ fn emit_tk_fused_gemm_add(node: &TkFusedGemmAdd, budget: TapeBudget) -> RoleBodi
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &residual_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// FusedGateUpActivateMul — `out = activation(A @ W_gate) *
+// (A @ W_up)` where activation ∈ {silu, gelu}. Mirror of S10
+// emit_gemm extended with a second matmul + tile-elementwise
+// activation + tile-elementwise multiply.
+// ============================================================
+//
+// Page lifecycle:
+//   in_page:     Empty → Filled (loader TMA in)
+//                      → Empty (consumer arrive page_consumed)
+//   weight_page: Empty → Filled (loader TMA gate_buf + up_buf)
+//                      → Empty (consumer arrive page_consumed)
+//   out_page:    Empty → Filled (consumer warp::store of result)
+//                      → Empty (storer TMA + arrive page_consumed)
+//
+// Substrate uses 3 pages + 2 scratch regions (`gate_buf` and
+// `up_buf` under `MlpScope`). The single fused weight tensor is
+// `[gate || up]` concatenated; loader TMAs the gate half from
+// offset 0 and the up half from offset `gate_bytes`. Each warp
+// owns disjoint TILE_N output cols under the AlongN split (no
+// cross-warp reduction); a single `bar.sync` publishes before
+// warp 0 signals page_done[out].
+
+fn emit_fused_gate_up_activate_mul(
+    node: &FusedGateUpActivateMul,
+    budget: TapeBudget,
+) -> RoleBodies {
+    let in_page = node.in_page();
+    let weight_page = node.gate_up_weight_page();
+    let out_page = node.out_page();
+    let consumer_phase = node.consumer_phase().raw();
+    let storer_phase = node.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let iters = node.iters().raw();
+    let layer = node.layer().raw();
+    let hidden_dim = node.hidden_dim().raw();
+    let intermediate_dim = node.intermediate_dim().raw();
+    let m_dim = node.num_tokens().raw();
+    let tile_n = node.tile_n().raw();
+    let in_act_slot = node.in_act_slot().raw();
+    let out_act_slot = node.out_act_slot().raw();
+    let weight_accessor_idx = node.weight_accessor_idx().raw();
+    let bar_publish = node.consumer_bar_publish().raw();
+    let gate_offset = node.gate_offset();
+    let up_offset = node.up_offset();
+    let gate_bytes = node.gate_bytes().raw();
+    let up_bytes = node.up_bytes().raw();
+    let activation = node.activation;
+
+    let ncw = budget.num_consumer_warps;
+    let num_layers = budget.num_layers.max(1);
+
+    // Sprint 12 limit: single-shot b_tiles only. Multi-iter
+    // pipelining requires per-iter mbarrier phases the IR doesn't
+    // model. Mirrors S10 / S11.
+    if iters != 1 {
+        return RoleBodies::skipped("FusedGateUpActivateMul");
+    }
+
+    debug_assert_eq!(
+        tile_n * ncw,
+        intermediate_dim,
+        "emit_fused_gate_up: AlongN split requires TILE_N ({tile_n}) * NCW ({ncw}) == INTERMEDIATE_DIM ({intermediate_dim})"
+    );
+    debug_assert!(
+        m_dim % 16 == 0,
+        "emit_fused_gate_up: TK 2.0 mma_AB requires M ({m_dim}) divisible by 16"
+    );
+    debug_assert!(
+        hidden_dim % 16 == 0,
+        "emit_fused_gate_up: TK 2.0 mma_AB requires HIDDEN_DIM ({hidden_dim}) divisible by 16"
+    );
+    debug_assert!(
+        tile_n % 16 == 0,
+        "emit_fused_gate_up: TK 2.0 mma_AB requires TILE_N ({tile_n}) divisible by 16"
+    );
+    debug_assert_eq!(
+        gate_bytes,
+        hidden_dim * intermediate_dim * 2,
+        "emit_fused_gate_up: gate_bytes ({gate_bytes}) must equal HIDDEN_DIM*INTERMEDIATE_DIM*2"
+    );
+    debug_assert_eq!(
+        up_bytes,
+        hidden_dim * intermediate_dim * 2,
+        "emit_fused_gate_up: up_bytes ({up_bytes}) must equal HIDDEN_DIM*INTERMEDIATE_DIM*2"
+    );
+
+    // Substrate handles. M = num_tokens; K = hidden_dim;
+    // N = intermediate_dim. Activation lives in in_smem [M, K];
+    // gate/up b-tiles live in scratch [K, N]; output in
+    // out_smem [M, N].
+    let in_smem = page_as_st_bf(in_page, m_dim, hidden_dim);
+    let out_smem = page_as_st_bf(out_page, m_dim, intermediate_dim);
+    let gate_buf = scratch_as_st_bf(gate_offset, hidden_dim, intermediate_dim);
+    let up_buf = scratch_as_st_bf(up_offset, hidden_dim, intermediate_dim);
+
+    let in_ready = page_ready_sem(in_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let out_done = page_done_sem(out_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let out_consumed = page_consumed_sem(out_page);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let gate_gmem = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+    let up_gmem =
+        gmem_weight_ptr_raw_offset(weight_accessor_idx, layer, num_layers, gate_bytes);
+
+    let bf16 = 2_u32;
+    let act_bytes = m_dim * hidden_dim * bf16;
+    let out_bytes = m_dim * intermediate_dim * bf16;
+    let weight_total_bytes = gate_bytes + up_bytes;
+
+    // ---------------- Loader body ----------------
+    // Two semaphores total:
+    //   in_ready    — 1 TMA for activation (act_bytes)
+    //   weight_ready — 2 TMAs for gate + up (gate_bytes + up_bytes)
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &weight_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &out_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1, &in_smem, &in_gmem, act_bytes, &in_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(
+        1,
+        &weight_ready,
+        weight_total_bytes,
+    ));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1,
+        &gate_buf,
+        &gate_gmem,
+        gate_bytes,
+        &weight_ready,
+    ));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1,
+        &up_buf,
+        &up_gmem,
+        up_bytes,
+        &weight_ready,
+    ));
+
+    // ---------------- Launcher body ----------------
+    let launcher = CuBlock::new();
+
+    // ---------------- Consumer body ----------------
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &weight_ready, consumer_phase));
+
+    // Per-warp register tiles. A is loaded full `[M, K]` per
+    // warp; gate_b and up_b are per-warp `[K, TILE_N]` slices of
+    // their respective scratch buffers; gate_acc and up_acc are
+    // per-warp fp32 `[M, TILE_N]` accumulators.
+    let (decl_a, a_rt) = tk20::decl_rt_bf_row("__gu_a", m_dim, hidden_dim);
+    let (decl_gate_b, gate_b_rt) = tk20::decl_rt_bf_col("__gu_gate_b", hidden_dim, tile_n);
+    let (decl_up_b, up_b_rt) = tk20::decl_rt_bf_col("__gu_up_b", hidden_dim, tile_n);
+    let (decl_gate_acc, gate_acc_rt) = tk20::decl_rt_fl("__gu_gate_acc", m_dim, tile_n);
+    let (decl_up_acc, up_acc_rt) = tk20::decl_rt_fl("__gu_up_acc", m_dim, tile_n);
+    consumer.push(decl_a);
+    consumer.push(decl_gate_b);
+    consumer.push(decl_up_b);
+    consumer.push(decl_gate_acc);
+    consumer.push(decl_up_acc);
+
+    // Per-warp B subtiles + per-warp OUT subtile.
+    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
+    let (decl_gate_b_sub, gate_b_sub) = tk20::decl_st_bf_subtile(
+        "__gu_gate_b_sub",
+        &gate_buf,
+        hidden_dim,
+        tile_n,
+        "0",
+        warp_idx_expr,
+    );
+    let (decl_up_b_sub, up_b_sub) = tk20::decl_st_bf_subtile(
+        "__gu_up_b_sub",
+        &up_buf,
+        hidden_dim,
+        tile_n,
+        "0",
+        warp_idx_expr,
+    );
+    let (decl_out_sub, out_sub) =
+        tk20::decl_st_bf_subtile("__gu_out_sub", &out_smem, m_dim, tile_n, "0", warp_idx_expr);
+    consumer.push(decl_gate_b_sub);
+    consumer.push(decl_up_b_sub);
+    consumer.push(decl_out_sub);
+
+    // Load A; load gate_b, up_b. Zero both accumulators; mma
+    // both halves.
+    consumer.push(tk20::warp_load_rt_from_st_bf(&a_rt, &in_smem));
+    consumer.push(tk20::warp_load_rt_from_st_bf(&gate_b_rt, &gate_b_sub));
+    consumer.push(tk20::warp_load_rt_from_st_bf(&up_b_rt, &up_b_sub));
+    consumer.push(tk20::warp_zero_rt(&gate_acc_rt));
+    consumer.push(tk20::warp_zero_rt(&up_acc_rt));
+    consumer.push(tk20::warp_mma_AB(&gate_acc_rt, &a_rt, &gate_b_rt, &gate_acc_rt));
+    consumer.push(tk20::warp_mma_AB(&up_acc_rt, &a_rt, &up_b_rt, &up_acc_rt));
+
+    // Activation in-place on gate_acc.
+    //   silu(x) = x * sigmoid(x) = x / (1 + expf(-x))
+    //   gelu(x) = 0.5 * x * (1 + tanhf(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    //             (matches the GeLU-tanh approximation used
+    //              elsewhere in the kernel; per-element CUDA
+    //              math intrinsics, no TK-named gelu helper.)
+    let activation_lambda = match activation {
+        GateUpActivation::Silu => "x * (1.0f / (1.0f + __expf(-x)))",
+        GateUpActivation::Gelu => "0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)))",
+    };
+    consumer.push(tk20::warp_apply_f32_rt_lambda(
+        &gate_acc_rt,
+        &gate_acc_rt,
+        activation_lambda,
+    ));
+
+    // gate_acc *= up_acc (elementwise).
+    consumer.push(tk20::warp_mul_rt_rt(&gate_acc_rt, &gate_acc_rt, &up_acc_rt));
+
+    // Store final activated/multiplied tile to per-warp out
+    // subtile. TK's internal type-converter downcasts fp32 →
+    // bf16 in the same `kittens::warp::store` overload S10 uses.
+    consumer.push(tk20::warp_store_st_bf_from_rt_fl(&out_sub, &gate_acc_rt));
+
+    // Cross-warp publish. AlongN split → disjoint output cols
+    // → only need to ensure all warps' stores are visible
+    // before warp 0 signals page_done[out].
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive(1, &out_done),
+        tk20::group_arrive(1, &in_consumed),
+        tk20::group_arrive(1, &weight_consumed),
+    ]));
+
+    // ---------------- Storer body ----------------
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &out_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw_st_bf(
+        1,
+        &out_gmem,
+        &out_smem,
+        out_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &out_consumed));
 
     RoleBodies {
         loader,

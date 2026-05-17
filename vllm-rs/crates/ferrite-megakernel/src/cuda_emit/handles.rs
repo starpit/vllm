@@ -392,6 +392,28 @@ pub fn gmem_weight_ptr_raw(
     )))
 }
 
+/// `const_cast<__nv_bfloat16*>(g.weight_ptrs[<accessor> *
+/// NUM_LAYERS + <layer>]) + <byte_offset> / sizeof(__nv_bfloat16)`
+/// — raw bf16 pointer to a sub-region of the weight tensor at
+/// `byte_offset` past the accessor's base pointer. Used by
+/// `FusedGateUpActivateMul` whose single fused weight tensor is
+/// `[gate || up]` concatenated; the up half lives at byte offset
+/// `gate_bytes` past the base.
+///
+/// `byte_offset` is divided by `sizeof(__nv_bfloat16)` (== 2)
+/// because the underlying pointer arithmetic is in elements.
+pub fn gmem_weight_ptr_raw_offset(
+    accessor: u32,
+    layer: u32,
+    num_layers: u32,
+    byte_offset: u32,
+) -> GmemPtrRaw<Bf16> {
+    let element_offset = byte_offset / 2;
+    GmemPtrRaw::from_expr(CuExpr::new(format!(
+        "(const_cast<__nv_bfloat16*>(g.weight_ptrs[{accessor} * {num_layers} + {layer}]) + {element_offset})"
+    )))
+}
+
 /// `&g.barrier_slots[<edge>]` — raw int32 device pointer to the
 /// gmem cross-CTA barrier counter for the given edge. Used by
 /// `ferrite::barrier_signal/wait` (see `ferrite_barrier.cuh`).

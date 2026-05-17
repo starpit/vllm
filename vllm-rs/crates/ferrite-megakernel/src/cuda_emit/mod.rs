@@ -426,6 +426,148 @@ mod tests {
         );
     }
 
+    /// Sprint 12: FusedGateUpActivateMul — `out = silu(A @ W_gate)
+    /// * (A @ W_up)`. Mirror of the S10 Gemm smoke with two
+    /// matmuls + activation + elementwise mul. Smoke config:
+    /// M=16, HIDDEN=32, INTERMEDIATE=256, NCW=8. TILE_N=32.
+    /// gate_bytes = up_bytes = 32 * 256 * 2 = 16_384 bytes;
+    /// scratch budget 32_768 holds both halves.
+    #[test]
+    fn fused_gate_up_silu_emits_tk20_calls() {
+        use crate::ir::nodes::GateUpActivation;
+        use crate::ir::substrate::{
+            BarSyncId, HiddenDim, IntermediateDim, IterCount, MlpScope, ScratchRegion, TileN,
+        };
+        let mut b = BuilderD::new();
+        b.push_fused_gate_up_activate_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // weight
+            PageId::<2, 8>::new(), // out
+            ScratchRegion::<0, 16_384, 32_768, MlpScope>::new(),
+            ScratchRegion::<16_384, 16_384, 32_768, MlpScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            HiddenDim::<32>::new(),
+            IntermediateDim::<256>::new(),
+            NumTokensConst::<16>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            TileN::<32>::new(),
+            BarSyncId::<7>::new(),
+            "W::mlp".to_string(),
+            GateUpActivation::Silu,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_fused_gate_up_silu", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "skipped: {:?}",
+            cu.skipped_variants
+        );
+        std::fs::write("/tmp/fused_gate_up_silu_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // Loader: act + 2 weight TMAs (gate at offset 0, up at
+            // gate_bytes). Single weight_ready expects total bytes.
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[0], 1024);",
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[1], 32768);",
+            "(*reinterpret_cast<kittens::st_bf<32, 256>*>(ss.scratch + 0))",
+            "(*reinterpret_cast<kittens::st_bf<32, 256>*>(ss.scratch + 16384))",
+            // Up half pointer = base + gate_bytes/2 elements.
+            // gate_bytes=16384 → element offset = 8192.
+            "+ 8192)",
+            // Consumer: 5 register tiles (A, gate_b, up_b, gate_acc,
+            // up_acc) + 3 subtiles.
+            "kittens::rt_bf<16, 32> __gu_a;",
+            "kittens::rt_bf<32, 32, kittens::ducks::rt_layout::col> __gu_gate_b;",
+            "kittens::rt_bf<32, 32, kittens::ducks::rt_layout::col> __gu_up_b;",
+            "kittens::rt_fl<16, 32> __gu_gate_acc;",
+            "kittens::rt_fl<16, 32> __gu_up_acc;",
+            "auto __gu_gate_b_sub = ",
+            "auto __gu_up_b_sub = ",
+            "auto __gu_out_sub = ",
+            // mma both halves; both accs zeroed; activation lambda;
+            // tile-elementwise mul; store to out subtile.
+            "kittens::warp::zero(__gu_gate_acc);",
+            "kittens::warp::zero(__gu_up_acc);",
+            "kittens::warp::mma_AB(__gu_gate_acc, __gu_a, __gu_gate_b, __gu_gate_acc);",
+            "kittens::warp::mma_AB(__gu_up_acc, __gu_a, __gu_up_b, __gu_up_acc);",
+            // silu lambda
+            "x * (1.0f / (1.0f + __expf(-x)))",
+            "kittens::warp::apply(__gu_gate_acc, __gu_gate_acc,",
+            "kittens::warp::mul(__gu_gate_acc, __gu_gate_acc, __gu_up_acc);",
+            "kittens::warp::store(__gu_out_sub, __gu_gate_acc);",
+            "kittens::group<8>::sync(7);",
+            "kittens::group<1>::arrive(ss.page_done[2]);",
+            "kittens::group<1>::arrive(ss.page_consumed[0]);",
+            "kittens::group<1>::arrive(ss.page_consumed[1]);",
+            // Storer: TMA out_smem → act_ptrs[2].
+            "kittens::group<1>::tma::store_async(",
+            "g.act_ptrs[2]",
+            "kittens::group<1>::arrive(ss.page_consumed[2]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+
+        // Negative: must NOT contain the gelu tanhf lambda when
+        // activation is Silu.
+        assert!(
+            !cu.source.contains("tanhf(0.7978845608028654f"),
+            "Silu kernel must not emit gelu tanhf; got:\n{}",
+            cu.source
+        );
+    }
+
+    /// Sprint 12: FusedGateUpActivateMul with Gelu activation.
+    /// Same shape as the silu smoke; only the activation lambda
+    /// differs. Verifies the activation enum drives the lambda
+    /// selection in emit_fused_gate_up_activate_mul.
+    #[test]
+    fn fused_gate_up_gelu_emits_tk20_calls() {
+        use crate::ir::nodes::GateUpActivation;
+        use crate::ir::substrate::{
+            BarSyncId, HiddenDim, IntermediateDim, IterCount, MlpScope, ScratchRegion, TileN,
+        };
+        let mut b = BuilderD::new();
+        b.push_fused_gate_up_activate_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            ScratchRegion::<0, 16_384, 32_768, MlpScope>::new(),
+            ScratchRegion::<16_384, 16_384, 32_768, MlpScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            HiddenDim::<32>::new(),
+            IntermediateDim::<256>::new(),
+            NumTokensConst::<16>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            TileN::<32>::new(),
+            BarSyncId::<7>::new(),
+            "W::mlp".to_string(),
+            GateUpActivation::Gelu,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_fused_gate_up_gelu", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/fused_gate_up_gelu_emit.cu", &cu.source).ok();
+        // Gelu-tanh lambda present; silu lambda absent.
+        assert!(cu.source.contains("tanhf(0.7978845608028654f"));
+        assert!(!cu.source.contains("(1.0f / (1.0f + __expf(-x)))"));
+    }
+
     /// Sprint 1: Rust-side smoke. Verifies the emit walks without
     /// panicking AND that key TK 2.0 primitive calls land in the
     /// emitted source. The REAL DOD is `nvcc` compiling this on

@@ -69,12 +69,20 @@ impl Implementation for MetalSynthMlpPreDownImpl {
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        // SynthMlpPreDown deadlocks at M=1 on M1 Max (9419ca204:
-        // threadgroup barrier hang; reproduces on M1 only, not M3/M4).
-        // Gate it off on M1 entirely — at M>=2 the same kernel works
-        // on M1 Max but the affine-decomposed FusedGateUpSiluMul path
-        // gives equivalent coverage with the existing dispatch shape.
-        // M2 is untested for this kernel; gate-and-test if needed.
+        // SynthMlpPreDown is unsafe on M1 Max at every M tested:
+        //   - M=1 (single-stream decode): threadgroup barrier deadlock
+        //     in mk_tg_rmsnorm_scale, MTLCommandBufferStatus(5) abort
+        //     after 510 ms (9419ca204).
+        //   - M>=2 (batched decode / prefill): kernel runs to
+        //     completion but produces silently-wrong output — chat
+        //     emits garbage like "ctorctorctorctor..." or "!!!!!!".
+        //     Same failure mode the FusedGateUpSiluMul Affine path had
+        //     before 62318fb52, suggesting a shared root cause in
+        //     either the AddRmsNormAtom or AffineQmvAtom Metal emit
+        //     when run on M1 hardware. Reproduces on M1 only — M3/M4
+        //     produce correct output.
+        // Gate it off on M1 entirely until either the unsafe atom
+        // path is identified or the M1-specific divergence is fixed.
         if profile.backend != Backend::Metal {
             return false;
         }

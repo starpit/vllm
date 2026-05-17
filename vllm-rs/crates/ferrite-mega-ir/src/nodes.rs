@@ -1317,6 +1317,10 @@ pub struct ScalarMul {
     num_tokens: crate::substrate::NumTokensRef,
     in_act_slot: crate::substrate::ActSlotRef,
     out_act_slot: crate::substrate::ActSlotRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their output slice" publish before warp 0 arrives on
+    /// `page_done`. Sealed-witness BarSyncId in 1..=15.
+    consumer_bar_publish: crate::substrate::BarRef,
     pub scale: FiniteF32,
 }
 
@@ -1333,9 +1337,13 @@ impl ScalarMul {
         const NUM_TOKENS: u32,
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         scale: FiniteF32,
-    ) -> Self {
+    ) -> Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+    {
         const {
             // ScalarMul is elementwise; in-place (IN_ID == OUT_ID) is
             // valid (gemma2 post-attn `* hidden`).
@@ -1349,7 +1357,7 @@ impl ScalarMul {
             );
         }
         use crate::substrate::{
-            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1360,6 +1368,7 @@ impl ScalarMul {
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
             scale,
         }
     }
@@ -1387,6 +1396,9 @@ impl ScalarMul {
     }
     pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
+    }
+    pub const fn consumer_bar_publish(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_publish
     }
 }
 

@@ -720,6 +720,7 @@ impl<
         const NUM_TOKENS: u32,
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::substrate::ArrivesCount<ARRIVES>,
@@ -731,8 +732,12 @@ impl<
         _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
         _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
         _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _bar_publish: crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
         scale: f32,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+    {
         self.verify_arrives(ARRIVES, "push_scalar_mul");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(OUT_ID);
@@ -748,6 +753,7 @@ impl<
             NUM_TOKENS,
             IN_ACT_SLOT,
             OUT_ACT_SLOT,
+            CONSUMER_BAR_PUBLISH,
         >(scale);
         self.nodes.push(MegaNode::ScalarMul(node));
         self.pool.release(IN_ID);
@@ -1830,7 +1836,8 @@ mod tests {
     #[test]
     fn lowers_scalar_mul_finite_scale() {
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            PageId,
         };
         let mut b = BuilderD::new();
         b.push_scalar_mul(
@@ -1843,6 +1850,7 @@ mod tests {
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
+            BarSyncId::<2>::new(),
             0.5,
         );
         let tape = b.finish(16);
@@ -1859,7 +1867,8 @@ mod tests {
     #[should_panic(expected = "FiniteF32 rejects non-finite value: NaN")]
     fn scalar_mul_rejects_nan_scale() {
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            PageId,
         };
         let mut b = BuilderD::new();
         b.push_scalar_mul(
@@ -1872,6 +1881,7 @@ mod tests {
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
+            BarSyncId::<2>::new(),
             f32::NAN,
         );
     }

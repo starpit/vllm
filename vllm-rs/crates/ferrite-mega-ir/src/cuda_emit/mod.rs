@@ -339,6 +339,46 @@ mod tests {
         }
     }
 
+    /// Sprint 3: ScalarMul (in→out path; in==out exercised at user
+    /// build time when the proc-macro emits a tape with aliasing).
+    #[test]
+    fn scalar_mul_emits_tk20_calls() {
+        let mut b = BuilderD::new();
+        b.push_scalar_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<4, 8>::new(),
+            PageId::<5, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+            BarSyncId::<2>::new(),
+            0.5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_smul", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/scalar_mul_emit.cu", &cu.source).ok();
+
+        for needle in [
+            "kittens::rv_fl<256> __smul_rv;",
+            "kittens::group<8>::load(__smul_rv,",
+            "kittens::warp::mul(__smul_rv, __smul_rv, 5e-1f);",
+            "kittens::group<8>::sync(2);",
+            "kittens::group<1>::arrive(ss.page_done[5]);",
+            "kittens::group<1>::arrive(ss.page_consumed[4]);",
+            "kittens::group<1>::tma::store_async(",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// Sprint 2: Add. Same DOD pattern — Rust check + nvcc on pod.
     #[test]
     fn add_emits_tk20_calls() {

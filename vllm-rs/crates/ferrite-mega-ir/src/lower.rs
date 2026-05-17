@@ -466,9 +466,7 @@ impl<
         self
     }
 
-    /// Push a typed `FusedAddRmsNorm`. Carries `HIDDEN_DIM` /
-    /// `NUM_TOKENS` / `DELTA_ACT_SLOT` / `RESIDUAL_ACT_SLOT` /
-    /// `WEIGHT_ACCESSOR_IDX` const generics + runtime `eps` (§4a).
+    /// Push a typed `FusedAddRmsNorm`. Typed-args API.
     #[allow(clippy::too_many_arguments)]
     pub fn push_fused_add_rms_norm<
         const DELTA_ID: u32,
@@ -488,6 +486,27 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _delta_page: crate::substrate::PageId<DELTA_ID, NUM_PAGES>,
+        _residual_page: crate::substrate::PageId<RESIDUAL_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _partial: crate::substrate::ScratchRegion<
+            PARTIAL_OFF,
+            PARTIAL_BYTES,
+            SCRATCH_BYTES,
+            crate::substrate::RmsNormScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _delta_act_slot: crate::substrate::ActSlotConst<DELTA_ACT_SLOT, { u32::MAX }>,
+        _residual_act_slot: crate::substrate::ActSlotConst<RESIDUAL_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX,
+            { u32::MAX },
+        >,
         weight_path: String,
         eps: f32,
     ) -> &mut Self {
@@ -1456,11 +1475,26 @@ mod tests {
 
     #[test]
     fn lowers_fused_add_rms_norm() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            RmsNormScope, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = Builder6::new();
-        // DELTA=0, RES=1, WEIGHT=2, partial_off=0, partial_bytes=32,
-        // phases (0,1), layer 3 (NUM_LAYERS=16), ARRIVES=0.
-        // AST shape: HIDDEN_DIM=2048, NUM_TOKENS=8, slots 0/1, w_acc=0.
-        b.push_fused_add_rms_norm::<0, 1, 2, 0, 32, 0, 1, 3, 16, 0, 2048, 8, 0, 1, 0>(
+        b.push_fused_add_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            PageId::<2, 6>::new(),
+            ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
             "W::norm".to_string(),
             1.0e-5_f32,
         );
@@ -1468,8 +1502,8 @@ mod tests {
         let MegaNode::FusedAddRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.layer(), 3);
-        assert_eq!(n.partial_bytes(), 32);
+        assert_eq!(n.layer().raw(), 3);
+        assert_eq!(n.partial_bytes().raw(), 32);
     }
 
     #[test]

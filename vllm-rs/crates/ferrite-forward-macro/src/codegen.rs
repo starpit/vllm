@@ -5643,17 +5643,33 @@ fn dispatch_instruction_to_push(
             let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
             let eps_lit = state.rms_norm_eps;
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
-                b.push_fused_add_rms_norm::<
-                    #delta_id, #residual_id, #weight_id,
-                    #partial_off, #partial_bytes,
-                    #consumer_phase, #storer_phase,
-                    #layer_lit, #num_layers, #arrives,
-                    #hidden_dim, #num_tokens,
-                    #delta_act_slot, #residual_act_slot, #weight_accessor_idx,
-                >(#weight_str.to_string(), #eps_lit);
+                b.push_fused_add_rms_norm(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#delta_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#residual_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #partial_off, #partial_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::RmsNormScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#delta_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#residual_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                        #weight_accessor_idx, { u32::MAX },
+                    >::new(),
+                    #weight_str.to_string(),
+                    #eps_lit,
+                );
             })
         }
         I::FusedGateUpSiluMul(in_slot, out_slot, layer)

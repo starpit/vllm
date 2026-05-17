@@ -5100,6 +5100,8 @@ fn emit_canonical_build_fn(
     let fn_name = format_ident!("build_mega_tape_{}", canonical_name);
     let num_pages_lit = proc_macro2::Literal::u32_unsuffixed(NUM_PAGES);
     let num_warps_lit = proc_macro2::Literal::u32_unsuffixed(NUM_CONSUMER_WARPS);
+    let num_layers_lit_for_finish =
+        proc_macro2::Literal::u32_unsuffixed(effective_num_layers);
     let page_size_lit = proc_macro2::Literal::u32_unsuffixed(PAGE_SIZE);
     let scratch_lit = proc_macro2::Literal::u32_unsuffixed(SCRATCH_BYTES);
     let num_edges_lit = proc_macro2::Literal::u32_unsuffixed(num_edges);
@@ -5116,7 +5118,7 @@ fn emit_canonical_build_fn(
                 #num_pages_lit, #num_warps_lit, #page_size_lit, #scratch_lit, #num_edges_lit,
             > = ::ferrite_forward::mega_ir::MegaTapeBuilder::new();
             #body
-            b.finish()
+            b.finish(#num_layers_lit_for_finish)
         }
     })
 }

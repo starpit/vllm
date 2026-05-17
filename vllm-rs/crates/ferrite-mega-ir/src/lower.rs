@@ -1406,9 +1406,21 @@ impl<
         self
     }
 
-    /// Consume the builder and return the typed tape.
-    pub fn finish(self) -> MegaTape {
-        MegaTape::__build_from_nodes(self.nodes)
+    /// Consume the builder and return the typed tape. Stamps the
+    /// substrate budget snapshot from the builder's const generics
+    /// (plus the canonical's `num_layers`, which is a model
+    /// parameter, not a substrate budget) onto the tape so
+    /// `cuda_emit` can read the values without re-deriving them.
+    pub fn finish(self, num_layers: u32) -> MegaTape {
+        let budget = crate::tape::TapeBudget {
+            num_pages: NUM_PAGES,
+            num_consumer_warps: NUM_CONSUMER_WARPS,
+            page_size: PAGE_SIZE,
+            scratch_bytes: SCRATCH_BYTES,
+            num_edges: NUM_EDGES,
+            num_layers,
+        };
+        MegaTape::__build_from_nodes(self.nodes, budget)
     }
 }
 
@@ -1487,7 +1499,7 @@ mod tests {
             "W::norm".to_string(),
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         assert_eq!(tape.nodes().len(), 1);
         let MegaNode::RmsNorm(n) = &tape.nodes()[0] else {
             panic!("expected RmsNorm");
@@ -1558,7 +1570,7 @@ mod tests {
             "W::n1".to_string(),
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::RmsNorm(n0) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1623,7 +1635,7 @@ mod tests {
             true,
             false,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::FusedQkvRopeCache(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1658,7 +1670,7 @@ mod tests {
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::Add(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1695,7 +1707,7 @@ mod tests {
             "W::norm".to_string(),
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::FusedAddRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1731,7 +1743,7 @@ mod tests {
             "W::mlp".to_string(),
             GateUpActivation::Silu,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1765,7 +1777,7 @@ mod tests {
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             "W::embed".to_string(),
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::Embed(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1796,7 +1808,7 @@ mod tests {
             ActSlotConst::<1, { u32::MAX }>::new(),
             0.5,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::ScalarMul(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1845,7 +1857,7 @@ mod tests {
             ActSlotConst::<1, { u32::MAX }>::new(),
             30.0,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::TanhSoftCap(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1879,7 +1891,7 @@ mod tests {
             1.0,
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::ScalarOffsetRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1919,7 +1931,7 @@ mod tests {
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             "W::gemm".to_string(),
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::Gemm(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -1966,7 +1978,7 @@ mod tests {
             LmHeadNormKind::RmsNorm,
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -2015,7 +2027,7 @@ mod tests {
             Some(1.0),
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -2101,7 +2113,7 @@ mod tests {
             0.125_f32,
             0.0_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {
             panic!();
         };
@@ -2116,7 +2128,7 @@ mod tests {
         let mut b = BuilderD::new();
         b.push_barrier_signal::<0>(EdgeId::<0, 4>::new());
         b.push_barrier_wait::<0, 4>(EdgeId::<0, 4>::new(), ExpectedCount::<4>::new());
-        let tape = b.finish();
+        let tape = b.finish(16);
         let MegaNode::BarrierSignal(s) = &tape.nodes()[0] else {
             panic!();
         };
@@ -2162,7 +2174,7 @@ mod tests {
             "W::n".to_string(),
             1.0e-5_f32,
         );
-        let tape = b.finish();
+        let tape = b.finish(16);
         assert_eq!(tape.nodes().len(), 3);
     }
 

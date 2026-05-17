@@ -33,6 +33,7 @@
 //!   Phase C of the plan replaces this with literal const-arg
 //!   emission at proc-macro expansion time.
 
+pub mod cuda_emit;
 pub mod lower;
 pub mod nodes;
 pub mod substrate;

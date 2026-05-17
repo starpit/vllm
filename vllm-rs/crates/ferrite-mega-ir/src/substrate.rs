@@ -663,6 +663,62 @@ impl HeadDimRef {
     }
 }
 
+/// Verified column-offset for the down_proj K-chunk split (0 for
+/// un-chunked GemmAdd; multiple of K for chunks).
+pub struct KOffset<const OFF: u32>;
+impl<const OFF: u32> KOffset<OFF> {
+    pub const fn new() -> Self {
+        Self
+    }
+    pub const fn erase(self) -> KOffsetRef {
+        KOffsetRef::__new_for_erase(OFF)
+    }
+}
+impl<const OFF: u32> Default for KOffset<OFF> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KOffsetRef(u32);
+impl KOffsetRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive K_FULL — full reduction dim across all chunks.
+pub struct KFull<const FULL: u32>;
+impl<const FULL: u32> KFull<FULL> {
+    pub const fn new() -> Self {
+        const {
+            assert!(FULL > 0, "KFull: FULL must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> KFullRef {
+        KFullRef::__new_for_erase(FULL)
+    }
+}
+impl<const FULL: u32> Default for KFull<FULL> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KFullRef(u32);
+impl KFullRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified positive matmul-N (output cols / N dim).
 pub struct MatmulN<const N: u32>;
 impl<const N: u32> MatmulN<N> {

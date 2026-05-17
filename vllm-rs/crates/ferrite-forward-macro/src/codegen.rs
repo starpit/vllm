@@ -6130,18 +6130,36 @@ fn dispatch_instruction_to_push(
             let residual_act_slot = lit(*residual_slot);
             let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
-                b.push_fused_cublas_gemm_add::<
-                    #in_id, #weight_id, #residual_id,
-                    #b_tile_off, #b_tile_bytes,
-                    #consumer_phase, #storer_phase,
-                    #iters, #layer_lit, #n_lit, #k_lit,
-                    #num_layers, #arrives,
-                    #num_tokens_lit, #k_offset_lit, #k_full_lit,
-                    #in_act_slot, #residual_act_slot, #weight_accessor_idx,
-                >(#weight_str.to_string());
+                b.push_fused_cublas_gemm_add(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#residual_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #b_tile_off, #b_tile_bytes, #scratch_lit,
+                        ::ferrite_forward::mega_ir::GemmScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::IterCount::<#iters>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::MatmulN::<#n_lit>::new(),
+                    ::ferrite_forward::mega_ir::MatmulK::<#k_lit>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens_lit>::new(),
+                    ::ferrite_forward::mega_ir::KOffset::<#k_offset_lit>::new(),
+                    ::ferrite_forward::mega_ir::KFull::<#k_full_lit>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#residual_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                        #weight_accessor_idx, { u32::MAX },
+                    >::new(),
+                    #weight_str.to_string(),
+                );
             })
         }
         I::SpliceMmEmbeds(slot) => {

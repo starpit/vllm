@@ -1729,29 +1729,29 @@ impl Gemm {
 /// support the 4-chunk down_proj split (TkGemmAdd path); the
 /// un-split case has K_OFFSET = 0, K_FULL = K.
 pub struct FusedCublasGemmAdd {
-    in_page_id: u32,
-    weight_page_id: u32,
-    residual_page_id: u32,
-    b_tile_offset: u32,
-    b_tile_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    iters: u32,
-    layer: u32,
-    n: u32,
-    k: u32,
-    num_tokens: u32,
-    k_offset: u32,
-    k_full: u32,
-    in_act_slot: u32,
-    residual_act_slot: u32,
-    weight_accessor_idx: u32,
+    in_page: crate::substrate::PageRef,
+    weight_page: crate::substrate::PageRef,
+    residual_page: crate::substrate::PageRef,
+    b_tile_offset: crate::substrate::ScratchOffsetRef,
+    b_tile_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    iters: crate::substrate::IterCountRef,
+    layer: crate::substrate::LayerRef,
+    n: crate::substrate::MatmulNRef,
+    k: crate::substrate::MatmulKRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    k_offset: crate::substrate::KOffsetRef,
+    k_full: crate::substrate::KFullRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    residual_act_slot: crate::substrate::ActSlotRef,
+    weight_accessor_idx: crate::substrate::WeightAccessorRef,
     pub weight: WeightRef,
 }
 
 impl FusedCublasGemmAdd {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const IN_ID: u32,
         const WEIGHT_ID: u32,
         const RESIDUAL_ID: u32,
@@ -1814,77 +1814,82 @@ impl FusedCublasGemmAdd {
                 "FusedCublasGemmAdd: K_OFFSET + K must be <= K_FULL"
             );
         }
+        use crate::substrate::{
+            ActSlotConst, IterCount, KFull, KOffset, MatmulK, MatmulN, MbarrierPhase,
+            NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+        };
         Self {
-            in_page_id: IN_ID,
-            weight_page_id: WEIGHT_ID,
-            residual_page_id: RESIDUAL_ID,
-            b_tile_offset: B_TILE_OFF,
-            b_tile_bytes: B_TILE_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            iters: ITERS,
-            layer: LAYER,
-            n: N,
-            k: K,
-            num_tokens: NUM_TOKENS,
-            k_offset: K_OFFSET,
-            k_full: K_FULL,
-            in_act_slot: IN_ACT_SLOT,
-            residual_act_slot: RESIDUAL_ACT_SLOT,
-            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
+            residual_page: PageId::<RESIDUAL_ID, NUM_PAGES>::new().erase(),
+            b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
+            b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            iters: IterCount::<ITERS>::new().erase(),
+            layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            n: MatmulN::<N>::new().erase(),
+            k: MatmulK::<K>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            k_offset: KOffset::<K_OFFSET>::new().erase(),
+            k_full: KFull::<K_FULL>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            residual_act_slot: ActSlotConst::<RESIDUAL_ACT_SLOT, { u32::MAX }>::new().erase(),
+            weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
             weight,
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn weight_page_id(&self) -> u32 {
-        self.weight_page_id
+    pub const fn weight_page(&self) -> crate::substrate::PageRef {
+        self.weight_page
     }
-    pub const fn residual_page_id(&self) -> u32 {
-        self.residual_page_id
+    pub const fn residual_page(&self) -> crate::substrate::PageRef {
+        self.residual_page
     }
-    pub const fn b_tile_offset(&self) -> u32 {
+    pub const fn b_tile_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.b_tile_offset
     }
-    pub const fn b_tile_bytes(&self) -> u32 {
+    pub const fn b_tile_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.b_tile_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn iters(&self) -> u32 {
+    pub const fn iters(&self) -> crate::substrate::IterCountRef {
         self.iters
     }
-    pub const fn layer(&self) -> u32 {
+    pub const fn layer(&self) -> crate::substrate::LayerRef {
         self.layer
     }
-    pub const fn n(&self) -> u32 {
+    pub const fn n(&self) -> crate::substrate::MatmulNRef {
         self.n
     }
-    pub const fn k(&self) -> u32 {
+    pub const fn k(&self) -> crate::substrate::MatmulKRef {
         self.k
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn k_offset(&self) -> u32 {
+    pub const fn k_offset(&self) -> crate::substrate::KOffsetRef {
         self.k_offset
     }
-    pub const fn k_full(&self) -> u32 {
+    pub const fn k_full(&self) -> crate::substrate::KFullRef {
         self.k_full
     }
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
-    pub const fn residual_act_slot(&self) -> u32 {
+    pub const fn residual_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.residual_act_slot
     }
-    pub const fn weight_accessor_idx(&self) -> u32 {
+    pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
     }
 }

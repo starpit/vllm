@@ -973,6 +973,27 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _residual_page: crate::substrate::PageId<RESIDUAL_ID, NUM_PAGES>,
+        _b_tile: crate::substrate::ScratchRegion<
+            B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::substrate::GemmScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _n: crate::substrate::MatmulN<N>,
+        _k: crate::substrate::MatmulK<K>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _k_offset: crate::substrate::KOffset<K_OFFSET>,
+        _k_full: crate::substrate::KFull<K_FULL>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _residual_act_slot: crate::substrate::ActSlotConst<RESIDUAL_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         weight_path: String,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_fused_cublas_gemm_add");

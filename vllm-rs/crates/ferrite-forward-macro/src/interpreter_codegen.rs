@@ -3588,6 +3588,15 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         I::SynthPreAttn(..) | I::SynthPreAttnPersistent(..) => 4,
         I::SynthMlpPreDown(..) | I::SynthMlpPreDownPersistent(..) => 3,
         I::SynthGateUpSiluMul(..) => 2,
+        // Whole-forward decode megakernel — covers every per-layer
+        // weight role across all layers (`input_layernorm`,
+        // `q/k/v/o/gate/up/down_proj`, `post_attention_layernorm`)
+        // plus the cross-layer `model.norm` and `lm_head`. The
+        // matching Impl's `required_weights` dedupes by base name so
+        // exactly 11 entries land in the slot table (3 RmsNorm + 8
+        // LinearLayer). CosSin is auto-injected on top by the rotary
+        // check, not counted here.
+        I::ForwardDecodePersistent(..) => 11,
         // Fused QKV+RoPE family (cuda). Same 3-LinearLayer shape as
         // SynthPreAttn minus RmsNorm (RmsNorm is upstream/separate).
         I::FusedQkvRopeCache(..)
@@ -3654,6 +3663,10 @@ pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
             // this op.
             | I::SynthPreAttn(..)
             | I::SynthPreAttnPersistent(..)
+            // Whole-forward decode megakernel runs every layer's
+            // RoPE phase in-kernel; per-layer cos/sin tables ride
+            // the argument buffer at `[[id(10)]]`.
+            | I::ForwardDecodePersistent(..)
     )
 }
 

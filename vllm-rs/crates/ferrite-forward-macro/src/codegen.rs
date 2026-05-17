@@ -6236,8 +6236,39 @@ pub fn emit_model(
                     .expect("terminal subgraph's Impl must implement fan_out");
                 let term_accs = term_imp.required_weights(&term_match.claimed_tiles, fuf, program);
                 let term_slots = crate::interpreter_codegen::weight_accessors_to_slots(&term_accs);
-                let term_weight_slots: Vec<Vec<WeightSlot>> =
-                    term_emits.iter().map(|_| term_slots.clone()).collect();
+                // Mirror `lower_bucket`'s per-emit slot distribution +
+                // rotary auto-injection. The simple lm_head Gemm only
+                // needs one Linear slot per emit and never consumes
+                // rotary, so the old "clone term_slots to every emit"
+                // shortcut happened to work — but a Wide-class Impl
+                // like `MetalForwardDecodePersistentImpl` puts a
+                // whole-forward Instruction here whose
+                // `instruction_weight_count` is >1 and
+                // `instruction_consumes_rotary` is true. Without the
+                // proper slicing the lm_head slice's WeightAccessors
+                // arms come up missing the CosSin entry and the
+                // worker panics on `cos_sin_at(tape_index=1, …)`.
+                let term_rotary_base =
+                    crate::interpreter_codegen::rotary_base_for_claim(fuf, &term_match.claimed_tiles);
+                let mut term_weight_slots: Vec<Vec<WeightSlot>> = Vec::with_capacity(term_emits.len());
+                let mut term_slots_cursor: usize = 0;
+                for inst in &term_emits {
+                    let n_w = crate::interpreter_codegen::instruction_weight_count(inst);
+                    let mut slots_this: Vec<WeightSlot> = term_slots
+                        .iter()
+                        .skip(term_slots_cursor)
+                        .take(n_w)
+                        .cloned()
+                        .collect();
+                    term_slots_cursor += n_w;
+                    if crate::interpreter_codegen::instruction_consumes_rotary(inst) {
+                        slots_this.push(WeightSlot {
+                            kind: crate::impl_lib::WeightKind::CosSin,
+                            base: term_rotary_base.clone(),
+                        });
+                    }
+                    term_weight_slots.push(slots_this);
+                }
                 // Eval body lives in `ferrite_forward::Instruction::eval`
                 // — `arch_opcodes` keeps the shape registration for
                 // `emit_bucket_static_slice`'s shape-checking pass.

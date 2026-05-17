@@ -42,14 +42,18 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::classified::{OpKind, Program};
+use crate::codegen::split_base_layer;
+use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::impl_lib::{
-    consumes_tile, default_required_weights, first_tile_input, ClaimClass, CostCtx, Handoff,
-    Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap,
+    consumes_tile, first_tile_input, rust_type_for_weight_consumed_by, ClaimClass, CostCtx,
+    Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap,
     WeightAccessor, WorkloadConstraint,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
+
+use std::collections::HashSet as StdHashSet;
 
 /// Pull the storage format of `node`'s first weight input (if any).
 /// Mirrors the local helpers in the sibling synth Impls.
@@ -443,14 +447,60 @@ impl Implementation for MetalForwardDecodePersistentImpl {
         fuf: &Fuf,
         program: &Program,
     ) -> Vec<WeightAccessor> {
-        // Defer to the default walker — it produces one accessor per
-        // distinct `(WeightId, Option<index>)` pair referenced by any
-        // claimed tile, named via `weight_field_name`. The macro's
-        // post-pass collapses per-layer accessor families into a
-        // single `<base>_at(bucket, op_idx, slot, layer)` trait method,
-        // which is exactly what the metal lowering arm's
-        // `WeightLocator` indexes against.
-        default_required_weights(claimed_tiles, fuf, program)
+        // **NOT** `default_required_weights`. The default walker emits
+        // one accessor per `(WeightId, index)` pair, so a 16-layer
+        // claim returns 16 × N per-layer entries (`input_layernorm_0`,
+        // `input_layernorm_1`, …) interleaved by layer's position
+        // through the FUF. The macro's accessor codegen counts slots
+        // per `(op_idx, kind)`, so those 16 entries become slots
+        // 0..15 of `RmsNorm` at op_idx 0 — even though every entry
+        // calls the same loop-compressed `self.input_layernorm(layer)`
+        // method. The metal lowering arm assumes ROLES map to FIXED
+        // slot ids (RmsNorm slot 0 = input_ln, slot 1 = postattn_ln,
+        // slot 2 = model_norm; Linear slot 0..6 = q/k/v/o/g/u/d, slot
+        // 7 = lm_head). A per-layer interleaving makes slot 2 hit
+        // `input_layernorm` (layer-1's instance) instead of
+        // `model_norm`, and the worker resolves the wrong weight.
+        //
+        // Walk in FUF order (claimed_tiles arrives sorted by TileId =
+        // FUF position) and dedupe by `split_base_layer(name).0` so
+        // each ROLE contributes exactly one accessor in role-first
+        // order — Llama's per-block dataflow naturally produces the
+        // role sequence the lowering arm expects:
+        //
+        //   input_ln (RmsNorm slot 0)
+        //   q_proj, k_proj, v_proj (Linear slots 0..2)
+        //   o_proj (Linear slot 3)
+        //   postattn_ln (RmsNorm slot 1)
+        //   gate, up, down (Linear slots 4..6)
+        //   model.norm (RmsNorm slot 2)
+        //   lm_head (Linear slot 7)
+        //
+        // Per-layer accessor families (`input_layernorm_0..15`) all
+        // collapse to one slot since they share the base; the macro's
+        // base-collapse via `split_base_layer` in
+        // `weight_accessors_to_slots` then routes runtime calls
+        // through one `self.<base>(layer)` method.
+        let mut out: Vec<WeightAccessor> = Vec::new();
+        let mut seen_bases: StdHashSet<String> = StdHashSet::new();
+        for &tid in claimed_tiles {
+            let node = fuf.get(tid);
+            for input in &node.inputs {
+                if let FufInput::Weight { id, index, .. } = input {
+                    let name = weight_field_name(program, *id, *index);
+                    let (base, _layer) = split_base_layer(&name.to_string());
+                    if !seen_bases.insert(base) {
+                        continue;
+                    }
+                    out.push(WeightAccessor {
+                        name,
+                        rust_type: rust_type_for_weight_consumed_by(node.op),
+                        source_weights: vec![(*id, *index)],
+                    });
+                }
+            }
+        }
+        out
     }
 }
 

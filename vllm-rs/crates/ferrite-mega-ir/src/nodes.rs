@@ -1687,6 +1687,15 @@ pub struct Gemm {
     n: crate::substrate::MatmulNRef,
     k: crate::substrate::MatmulKRef,
     m: crate::substrate::MatmulMRef,
+    /// Per-warp output N slice. AlongN warp split convention: each
+    /// consumer warp covers all M rows of `tile_n` output cols.
+    /// Required `tile_n * NCW == n` (proc-macro emits consistent
+    /// values; substrate-level enforcement is a future sprint).
+    tile_n: crate::substrate::TileNRef,
+    /// Per-iter K-chunk width loaded into the b_tile. Required
+    /// `chunk_k * iters == k` AND
+    /// `b_tile_bytes == chunk_k * n * sizeof(bf16)`.
+    chunk_k: crate::substrate::ChunkKRef,
     in_act_slot: crate::substrate::ActSlotRef,
     out_act_slot: crate::substrate::ActSlotRef,
     weight_accessor_idx: crate::substrate::WeightAccessorRef,
@@ -1715,6 +1724,8 @@ impl Gemm {
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
     >(
         weight: WeightRef,
     ) -> Self {
@@ -1741,10 +1752,26 @@ impl Gemm {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "Gemm: STORER_PHASE parity"
             );
+            // Tile-layout consistency. AlongN warp split: each
+            // consumer warp covers TILE_N output cols. tile_n * NCW
+            // equality with N is enforced by the proc-macro (NCW
+            // isn't a const generic here); tile_n > 0 is.
+            assert!(TILE_N > 0, "Gemm: TILE_N must be > 0");
+            assert!(CHUNK_K > 0, "Gemm: CHUNK_K must be > 0");
+            // Per-iter K coverage: chunk_k * iters == K. Hard
+            // mathematical invariant — the kernel covers the full
+            // K dim in `iters` steps of `chunk_k` each.
+            assert!(
+                CHUNK_K * ITERS == K,
+                "Gemm: CHUNK_K * ITERS must equal K"
+            );
+            // (b_tile_bytes layout is an emit-side decision — could
+            // be [chunk_k, N] CTA-shared or [chunk_k, tile_n]
+            // per-warp. Don't pre-commit at the IR level.)
         }
         use crate::substrate::{
-            ActSlotConst, IterCount, MatmulK, MatmulM, MatmulN, MbarrierPhase, PageId,
-            ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, ChunkK, IterCount, MatmulK, MatmulM, MatmulN, MbarrierPhase, PageId,
+            ScratchBytesRef, ScratchOffsetRef, TileN, WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1759,6 +1786,8 @@ impl Gemm {
             n: MatmulN::<N>::new().erase(),
             k: MatmulK::<K>::new().erase(),
             m: MatmulM::<M>::new().erase(),
+            tile_n: TileN::<TILE_N>::new().erase(),
+            chunk_k: ChunkK::<CHUNK_K>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
@@ -1775,6 +1804,12 @@ impl Gemm {
     }
     pub const fn out_page(&self) -> crate::substrate::PageRef {
         self.out_page
+    }
+    pub const fn tile_n(&self) -> crate::substrate::TileNRef {
+        self.tile_n
+    }
+    pub const fn chunk_k(&self) -> crate::substrate::ChunkKRef {
+        self.chunk_k
     }
     pub const fn b_tile_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.b_tile_offset

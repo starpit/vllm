@@ -867,6 +867,69 @@ impl MatmulMRef {
     }
 }
 
+/// Verified positive per-warp output tile N dim — the slice of the
+/// matmul N axis that one consumer warp owns. Convention: AlongN
+/// warp split (each warp covers all M rows of its N slice). For
+/// `Gemm` and friends, `tile_n == N / NUM_CONSUMER_WARPS`.
+pub struct TileN<const N: u32>;
+impl<const N: u32> TileN<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "TileN: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> TileNRef {
+        TileNRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for TileN<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TileNRef(u32);
+impl TileNRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive per-iter K-chunk width — the K dim of one
+/// b_tile load. For `Gemm`, `chunk_k == K / iters` AND
+/// `b_tile_bytes == chunk_k * N * sizeof(bf16)`.
+pub struct ChunkK<const K: u32>;
+impl<const K: u32> ChunkK<K> {
+    pub const fn new() -> Self {
+        const {
+            assert!(K > 0, "ChunkK: K must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> ChunkKRef {
+        ChunkKRef::__new_for_erase(K)
+    }
+}
+impl<const K: u32> Default for ChunkK<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChunkKRef(u32);
+impl ChunkKRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified positive `VOCAB_SIZE` (Embed kernel template arg).
 pub struct VocabSize<const N: u32>;
 impl<const N: u32> VocabSize<N> {

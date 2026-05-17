@@ -5662,7 +5662,26 @@ fn dispatch_instruction_to_push(
             let b_tile_bytes = lit(state.scratch_bytes);
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
-            let iters = lit(1u32); // proc-macro hands op-level iters; revisit when scheduler exposes
+            // ITERS=1 today (proc-macro hands op-level iters; the
+            // scheduler doesn't currently chunk K). With ITERS=1
+            // CHUNK_K must equal K (Gemm IR invariant).
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
+            let chunk_k_const = *n; // placeholder — recomputed below
+            let chunk_k_const = *k / iters_const;
+            let chunk_k_lit = lit(chunk_k_const);
+            // TILE_N = N / NCW (AlongN warp split).
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && n % ncw == 0 {
+                n / ncw
+            } else {
+                // Fallback when N isn't divisible by NCW. The IR's
+                // `tile_n > 0` invariant still holds; downstream
+                // emit will need to handle this case (today's
+                // emit is RoleBodies::skipped, so it doesn't).
+                *n
+            };
+            let tile_n_lit = lit(tile_n_const);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -5699,6 +5718,8 @@ fn dispatch_instruction_to_push(
                     ::ferrite_forward::mega_ir::WeightAccessorConst::<
                         #weight_accessor_idx, { u32::MAX },
                     >::new(),
+                    ::ferrite_forward::mega_ir::TileN::<#tile_n_lit>::new(),
+                    ::ferrite_forward::mega_ir::ChunkK::<#chunk_k_lit>::new(),
                     #weight_str.to_string(),
                 );
             })

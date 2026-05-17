@@ -926,6 +926,8 @@ impl<
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
     >(
         &mut self,
         _arrives: crate::substrate::ArrivesCount<ARRIVES>,
@@ -947,6 +949,8 @@ impl<
         _weight_accessor_idx: crate::substrate::WeightAccessorConst<
             WEIGHT_ACCESSOR_IDX, { u32::MAX },
         >,
+        _tile_n: crate::substrate::TileN<TILE_N>,
+        _chunk_k: crate::substrate::ChunkK<CHUNK_K>,
         weight_path: String,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_gemm");
@@ -974,6 +978,8 @@ impl<
             IN_ACT_SLOT,
             OUT_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
+            TILE_N,
+            CHUNK_K,
         >(weight);
         self.nodes.push(MegaNode::Gemm(node));
         self.pool.release(IN_ID);
@@ -1967,9 +1973,10 @@ mod tests {
     fn lowers_gemm() {
         use crate::nodes::LayerIndex;
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulM, MatmulN,
-            MbarrierPhase, PageId, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, ChunkK, GemmScope, IterCount, MatmulK, MatmulM, MatmulN,
+            MbarrierPhase, PageId, ScratchRegion, TileN, WeightAccessorConst,
         };
+        // K=2048, ITERS=4 → CHUNK_K=512. N=4096, NCW=8 → TILE_N=512.
         let mut b = BuilderD::new();
         b.push_gemm(
             ArrivesCount::<0>::new(),
@@ -1987,6 +1994,8 @@ mod tests {
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<2, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
+            TileN::<512>::new(),
+            ChunkK::<512>::new(),
             "W::gemm".to_string(),
         );
         let tape = b.finish(16);

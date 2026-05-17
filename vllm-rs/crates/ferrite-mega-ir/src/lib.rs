@@ -54,8 +54,8 @@ pub use nodes::{
 };
 pub use substrate::{
     ActSlotConst, ActSlotRef, ArrivesCount, AttentionScope, BarRef, BarSyncId, BarSyncPair,
-    BlockSize, BlockSizeRef, DistinctBarPairProof, EdgeId, EdgeIdRef, Empty, ExpectedCount,
-    ExpectedCountRef, Filled, GemmScope,
+    BlockSize, BlockSizeRef, ChunkK, ChunkKRef, DistinctBarPairProof, EdgeId, EdgeIdRef, Empty,
+    ExpectedCount, ExpectedCountRef, Filled, GemmScope,
     HeadDim, HeadDimRef, HiddenDim, HiddenDimRef, IntermediateDim, IntermediateDimRef,
     IsDistinctBarPair, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidBarSyncId,
     IsValidHiddenDim, IsValidWarpRole, IterCount, IterCountRef, KFull, KFullRef, KOffset,
@@ -63,7 +63,7 @@ pub use substrate::{
     MaxSkRef, MbarrierPhase, MbarrierPhaseRef, MlpScope, NumKvHeads, NumKvHeadsRef, NumQHeads,
     NumQHeadsRef, NumTokensConst, NumTokensRef, Page, PageId, PagePool, PageRef, Produced,
     ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope,
-    ScratchBytesRef, ScratchOffsetRef, ScratchRegion, SubstrateBudget, VocabSize, VocabSizeRef,
-    WarpRoleTag, WeightAccessorConst, WeightAccessorRef,
+    ScratchBytesRef, ScratchOffsetRef, ScratchRegion, SubstrateBudget, TileN, TileNRef, VocabSize,
+    VocabSizeRef, WarpRoleTag, WeightAccessorConst, WeightAccessorRef,
 };
 pub use tape::MegaTape;

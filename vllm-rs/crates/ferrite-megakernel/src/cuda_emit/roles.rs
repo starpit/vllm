@@ -15,8 +15,8 @@
 
 use crate::ir::nodes::{
     Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, FusedGateUpActivateMul,
-    GateUpActivation, Gemm, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
-    TkFusedGemmAdd,
+    GateUpActivation, Gemm, LmHeadNormKind, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm,
+    TanhSoftCap, TkFusedGemmAdd, TkFusedNormGemm,
 };
 use crate::ir::tape::TapeBudget;
 
@@ -61,7 +61,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
         MegaNode::Gemm(n) => emit_gemm(n, budget),
         MegaNode::TkFusedGemmAdd(n) => emit_tk_fused_gemm_add(n, budget),
-        MegaNode::TkFusedNormGemm(_) => RoleBodies::skipped("TkFusedNormGemm"),
+        MegaNode::TkFusedNormGemm(n) => emit_tk_fused_norm_gemm(n, budget),
         MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
         MegaNode::SpliceMmEmbeds(_) => RoleBodies::skipped("SpliceMmEmbeds"),
         MegaNode::BarrierSignal(n) => emit_barrier_signal(n),
@@ -1624,6 +1624,371 @@ fn emit_fused_gate_up_activate_mul(
         &out_gmem,
         &out_smem,
         out_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// TkFusedNormGemm — `out = (norm(in [+ delta]) * norm_w) @ lin_w`.
+// Composition of the RmsNorm / FusedAddRmsNorm body (NCW-sliced
+// vector ops + cross-warp sum reduce) and the Gemm body (AlongN
+// per-warp [M, TILE_N] mma_AB) on the SAME `in_page`.
+// ============================================================
+//
+// Page lifecycle:
+//   in_page:          Empty -> Filled (loader TMA in)
+//                            -> Produced (consumer norm writeback)
+//                            -> Empty (consumer arrive page_consumed)
+//   delta_page (opt): Empty -> Filled (loader TMA delta)
+//                            -> Empty (consumer arrive page_consumed)
+//   norm_w_page:      Empty -> Filled (loader TMA)
+//                            -> Empty (consumer arrive page_consumed)
+//   lin_w_page:       Empty -> Filled (loader TMA -> b_tile scratch)
+//                            -> Empty (consumer arrive page_consumed)
+//   out_page:         Empty -> Filled (consumer warp::store of acc)
+//                            -> Empty (storer TMA + arrive page_consumed)
+//
+// `consumer_bar_publish` is reused TWICE: once after the norm
+// writeback so all warps observe the full normalized [M, K] in
+// shared memory before any warp reads it as the GEMM A operand,
+// and once after the GEMM writeback so warp 0 can safely arrive
+// on `page_done[out]`. Named bar.sync resets after all NCW arrive,
+// so reuse is sound.
+//
+// Norm-flavor selection (`node.norm_kind`):
+//   - RmsNorm:                  (no delta, no offset)
+//   - AddRmsNorm:                (delta fold, no offset)
+//   - AddScalarOffsetRmsNorm:    (delta fold, offset added to weight)
+//   - MeanSubRmsNorm:            mean-subtract before sum-of-squares
+//                                (uses bar_reduce twice -- named bar
+//                                resets after each round)
+
+fn emit_tk_fused_norm_gemm(node: &TkFusedNormGemm, budget: TapeBudget) -> RoleBodies {
+    let in_page = node.in_page();
+    let delta_page_opt = node.delta_page();
+    let norm_weight_page = node.norm_weight_page();
+    let linear_weight_page = node.linear_weight_page();
+    let out_page = node.out_page();
+    let consumer_phase = node.consumer_phase().raw();
+    let storer_phase = node.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let iters = node.iters().raw();
+    let layer = node.layer().raw();
+    let n_dim = node.n().raw();
+    let k_dim = node.k().raw();
+    let m_dim = node.num_tokens().raw();
+    let tile_n = node.tile_n().raw();
+    let chunk_k = node.chunk_k().raw();
+    let in_act_slot = node.in_act_slot().raw();
+    let delta_act_slot_opt = node.delta_act_slot();
+    let out_act_slot = node.out_act_slot().raw();
+    let norm_weight_accessor_idx = node.norm_weight_accessor_idx().raw();
+    let linear_weight_accessor_idx = node.linear_weight_accessor_idx().raw();
+    let bar_reduce = node.consumer_bar_reduce().raw();
+    let bar_publish = node.consumer_bar_publish().raw();
+    let eps_value = node.eps().raw();
+    let norm_kind = node.norm_kind;
+    let offset_opt = node.offset;
+    let b_tile_offset = node.b_tile_offset();
+    let partial_offset = node.partial_offset();
+
+    let ncw = budget.num_consumer_warps;
+    let num_layers = budget.num_layers.max(1);
+
+    // S13 limit: single-shot b_tile only. Multi-iter pipelining
+    // requires per-iter mbarrier phases the IR doesn't model.
+    // Mirrors S10 / S11 / S12.
+    if iters != 1 {
+        return RoleBodies::skipped("TkFusedNormGemm");
+    }
+
+    debug_assert!(
+        ncw > 0 && k_dim % ncw == 0,
+        "emit_tk_fused_norm_gemm: K ({k_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = k_dim / ncw;
+    debug_assert_eq!(
+        chunk_k, k_dim,
+        "emit_tk_fused_norm_gemm: ITERS=1 requires CHUNK_K ({chunk_k}) == K ({k_dim})"
+    );
+    debug_assert_eq!(
+        tile_n * ncw,
+        n_dim,
+        "emit_tk_fused_norm_gemm: AlongN split requires TILE_N ({tile_n}) * NCW ({ncw}) == N ({n_dim})"
+    );
+    debug_assert!(
+        m_dim % 16 == 0,
+        "emit_tk_fused_norm_gemm: TK 2.0 mma_AB requires M ({m_dim}) divisible by 16"
+    );
+    debug_assert!(
+        k_dim % 16 == 0,
+        "emit_tk_fused_norm_gemm: TK 2.0 mma_AB requires K ({k_dim}) divisible by 16"
+    );
+    debug_assert!(
+        tile_n % 16 == 0,
+        "emit_tk_fused_norm_gemm: TK 2.0 mma_AB requires TILE_N ({tile_n}) divisible by 16"
+    );
+
+    // Two views of the same in_page byte buffer: sv_bf<K> for the
+    // norm-phase per-warp NCW-sliced register-vector ops, st_bf<M, K>
+    // for the GEMM-phase A operand. Both reinterpret_cast the same
+    // shared-memory page; views overlap (sv covers the first K bf16
+    // elements = first row at M=1).
+    let in_sv = page_as_sv_bf(in_page, k_dim);
+    let in_st = page_as_st_bf(in_page, m_dim, k_dim);
+    let norm_weight_sv = page_as_sv_bf(norm_weight_page, k_dim);
+    let out_st = page_as_st_bf(out_page, m_dim, n_dim);
+    let b_tile = scratch_as_st_bf(b_tile_offset, k_dim, n_dim);
+    let partial = scratch_as::<super::handles::F32>(partial_offset);
+
+    let in_ready = page_ready_sem(in_page);
+    let norm_weight_ready = page_ready_sem(norm_weight_page);
+    let lin_weight_ready = page_ready_sem(linear_weight_page);
+    let out_done = page_done_sem(out_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let norm_weight_consumed = page_consumed_sem(norm_weight_page);
+    let lin_weight_consumed = page_consumed_sem(linear_weight_page);
+    let out_consumed = page_consumed_sem(out_page);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let norm_weight_gmem = gmem_weight_ptr_raw(norm_weight_accessor_idx, layer, num_layers);
+    let lin_weight_gmem = gmem_weight_ptr_raw(linear_weight_accessor_idx, layer, num_layers);
+
+    let bf16 = 2_u32;
+    let act_bytes = m_dim * k_dim * bf16;
+    let norm_weight_bytes = k_dim * bf16;
+    let lin_weight_bytes = k_dim * n_dim * bf16;
+    let out_bytes = m_dim * n_dim * bf16;
+
+    // Optional delta plumbing for AddRmsNorm / AddScalarOffsetRmsNorm.
+    let delta_sv_opt = delta_page_opt.map(|p| page_as_sv_bf(p, k_dim));
+    let delta_ready_opt = delta_page_opt.map(page_ready_sem);
+    let delta_consumed_opt = delta_page_opt.map(page_consumed_sem);
+    let delta_gmem_opt = delta_act_slot_opt.map(|s| gmem_act_ptr_raw(s.raw()));
+
+    // ---------------- Loader body ----------------
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    if let Some(delta_consumed) = delta_consumed_opt.as_ref() {
+        loader.push(tk20::group_wait(1, delta_consumed, loader_phase));
+    }
+    loader.push(tk20::group_wait(1, &norm_weight_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &lin_weight_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &out_consumed, loader_phase));
+
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &in_sv, &in_gmem, act_bytes, &in_ready,
+    ));
+
+    if let (Some(delta_sv), Some(delta_ready), Some(delta_gmem)) = (
+        delta_sv_opt.as_ref(),
+        delta_ready_opt.as_ref(),
+        delta_gmem_opt.as_ref(),
+    ) {
+        loader.push(tk20::group_tma_expect_bytes(1, delta_ready, act_bytes));
+        loader.push(tk20::group_tma_load_async_raw(
+            1, delta_sv, delta_gmem, act_bytes, delta_ready,
+        ));
+    }
+
+    loader.push(tk20::group_tma_expect_bytes(
+        1,
+        &norm_weight_ready,
+        norm_weight_bytes,
+    ));
+    loader.push(tk20::group_tma_load_async_raw(
+        1,
+        &norm_weight_sv,
+        &norm_weight_gmem,
+        norm_weight_bytes,
+        &norm_weight_ready,
+    ));
+
+    loader.push(tk20::group_tma_expect_bytes(
+        1,
+        &lin_weight_ready,
+        lin_weight_bytes,
+    ));
+    loader.push(tk20::group_tma_load_async_raw_st_bf(
+        1,
+        &b_tile,
+        &lin_weight_gmem,
+        lin_weight_bytes,
+        &lin_weight_ready,
+    ));
+
+    // ---------------- Launcher body ----------------
+    let launcher = CuBlock::new();
+
+    // ---------------- Consumer body ----------------
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    if let Some(delta_ready) = delta_ready_opt.as_ref() {
+        consumer.push(tk20::group_wait(1, delta_ready, consumer_phase));
+    }
+    consumer.push(tk20::group_wait(1, &norm_weight_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &lin_weight_ready, consumer_phase));
+
+    // === Norm phase ===
+    let (decl_act, act_rv) = tk20::decl_rv_fl("__lmh_act_rv", k_per_warp);
+    let (decl_sq, sq_rv) = tk20::decl_rv_fl("__lmh_sq_rv", k_per_warp);
+    let (decl_w, weight_rv) = tk20::decl_rv_fl("__lmh_norm_w_rv", k_per_warp);
+    consumer.push(decl_act);
+    consumer.push(decl_sq);
+    consumer.push(decl_w);
+
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &act_rv, &in_sv));
+
+    // Residual fold (AddRmsNorm / AddScalarOffsetRmsNorm).
+    if let Some(delta_sv) = delta_sv_opt.as_ref() {
+        let (decl_delta, delta_rv) = tk20::decl_rv_fl("__lmh_delta_rv", k_per_warp);
+        consumer.push(decl_delta);
+        consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(
+            ncw, &delta_rv, delta_sv,
+        ));
+        consumer.push(tk20::warp_add_rv_rv(&act_rv, &act_rv, &delta_rv));
+    }
+
+    // MeanSubRmsNorm: mean reduce + subtract before sum-of-squares.
+    // Reuses bar_reduce -- named bar resets after all NCW arrive,
+    // so a second cross-warp reduce later in the body is sound.
+    if matches!(norm_kind, LmHeadNormKind::MeanSubRmsNorm) {
+        let (decl_msum, msum_local) =
+            tk20::decl_local_f32("__lmh_mean_partial", "0.0f");
+        consumer.push(decl_msum);
+        consumer.push(tk20::warp_sum_to_scalar_f32(&msum_local, &act_rv));
+        let (decl_full_msum, full_msum) =
+            tk20::decl_local_f32("__lmh_mean_full", "0.0f");
+        consumer.push(decl_full_msum);
+        consumer.push(tk20::cross_warp_reduce_sum_f32(
+            full_msum.as_str(),
+            msum_local.as_str(),
+            &partial,
+            ncw,
+            bar_reduce,
+        ));
+        // act -= mean   (mean = full_sum / K).
+        let neg_mean = CuExpr::new(format!(
+            "-({} * (1.0f / {}.0f))",
+            full_msum.as_str(),
+            k_dim
+        ));
+        consumer.push(tk20::warp_add_rv_scalar_f32(&act_rv, &act_rv, &neg_mean));
+    }
+
+    // Sum-of-squares.
+    consumer.push(tk20::warp_copy_rv(&sq_rv, &act_rv));
+    consumer.push(tk20::warp_mul_rv_rv(&sq_rv, &sq_rv, &sq_rv));
+    let (decl_partial, partial_sum_expr) =
+        tk20::decl_local_f32("__lmh_partial_sum", "0.0f");
+    consumer.push(decl_partial);
+    consumer.push(tk20::warp_sum_to_scalar_f32(&partial_sum_expr, &sq_rv));
+
+    let (decl_full, full_sum_expr) =
+        tk20::decl_local_f32("__lmh_full_sum", "0.0f");
+    consumer.push(decl_full);
+    consumer.push(tk20::cross_warp_reduce_sum_f32(
+        full_sum_expr.as_str(),
+        partial_sum_expr.as_str(),
+        &partial,
+        ncw,
+        bar_reduce,
+    ));
+    let (decl_scale, scale_expr) = tk20::decl_rms_scale_local(
+        "__lmh_scale",
+        full_sum_expr.as_str(),
+        k_dim,
+        eps_value,
+    );
+    consumer.push(decl_scale);
+
+    // act *= scale; load norm_weight; (optional offset on weight); act *= norm_w.
+    consumer.push(tk20::warp_mul_rv_scalar_f32(&act_rv, &act_rv, &scale_expr));
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(
+        ncw,
+        &weight_rv,
+        &norm_weight_sv,
+    ));
+    if let Some(offset_value) = offset_opt {
+        let offset_lit = CuExpr::new(format!("{:e}f", offset_value.raw()));
+        consumer.push(tk20::warp_add_rv_scalar_f32(
+            &weight_rv,
+            &weight_rv,
+            &offset_lit,
+        ));
+    }
+    consumer.push(tk20::warp_mul_rv_rv(&act_rv, &act_rv, &weight_rv));
+
+    // Write normalized act back to in_smem (NCW-sliced).
+    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(ncw, &in_sv, &act_rv));
+
+    // Cross-warp barrier: all warps must finish their slice of the
+    // norm writeback before any warp reads in_st as the GEMM A
+    // operand (each consumer warp loads the FULL [M, K] tile).
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+
+    // === GEMM phase === (mirror of emit_gemm).
+    let (decl_a, a_rt) = tk20::decl_rt_bf_row("__lmh_a", m_dim, k_dim);
+    let (decl_b, b_rt) = tk20::decl_rt_bf_col("__lmh_b", k_dim, tile_n);
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl("__lmh_acc", m_dim, tile_n);
+    consumer.push(decl_a);
+    consumer.push(decl_b);
+    consumer.push(decl_acc);
+
+    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
+    let (decl_b_sub, b_sub) =
+        tk20::decl_st_bf_subtile("__lmh_b_sub", &b_tile, k_dim, tile_n, "0", warp_idx_expr);
+    let (decl_out_sub, out_sub) = tk20::decl_st_bf_subtile(
+        "__lmh_out_sub",
+        &out_st,
+        m_dim,
+        tile_n,
+        "0",
+        warp_idx_expr,
+    );
+    consumer.push(decl_b_sub);
+    consumer.push(decl_out_sub);
+
+    consumer.push(tk20::warp_load_rt_from_st_bf(&a_rt, &in_st));
+    consumer.push(tk20::warp_load_rt_from_st_bf(&b_rt, &b_sub));
+    consumer.push(tk20::warp_zero_rt(&acc_rt));
+    consumer.push(tk20::warp_mma_AB(&acc_rt, &a_rt, &b_rt, &acc_rt));
+    consumer.push(tk20::warp_store_st_bf_from_rt_fl(&out_sub, &acc_rt));
+
+    // Cross-warp publish (reuse bar_publish): all warps' [M, TILE_N]
+    // out subtile stores must be visible before warp 0 signals
+    // page_done[out].
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+
+    // Per-warp arrives. Warp 0 publishes page_done[out] + arrives
+    // on each input page's consumed sem.
+    let mut arrives = vec![
+        tk20::group_arrive(1, &out_done),
+        tk20::group_arrive(1, &in_consumed),
+        tk20::group_arrive(1, &norm_weight_consumed),
+        tk20::group_arrive(1, &lin_weight_consumed),
+    ];
+    if let Some(delta_consumed) = delta_consumed_opt.as_ref() {
+        arrives.push(tk20::group_arrive(1, delta_consumed));
+    }
+    consumer.push(tk20::block_warp_zero(&arrives));
+
+    // ---------------- Storer body ----------------
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &out_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw_st_bf(
+        1, &out_gmem, &out_st, out_bytes,
     ));
     storer.push(tk20::group_tma_store_async_wait(1));
     storer.push(tk20::group_arrive(1, &out_consumed));

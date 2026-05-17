@@ -970,4 +970,212 @@ mod tests {
             );
         }
     }
+
+    /// Builder type for S13 norm-gemm smoke: same params as
+    /// `BuilderD` but with double the scratch budget so the
+    /// linear-projection b_tile fits alongside the per-warp partial
+    /// sums.
+    type BuilderLg = MegaTapeBuilder<8, 8, 32_768, 65_536, 4>;
+
+    /// Sprint 13: TkFusedNormGemm — `out = (rms_norm(in) * norm_w)
+    /// @ lin_w` (no-delta RmsNorm flavor). Smoke config: M=16,
+    /// K=128, N=128, NCW=8. K_per_warp=16 (rv_fl<16>); TILE_N=16
+    /// (mma_AB ok). b_tile = 128*128*2 = 32_768 bytes; partial =
+    /// 8*4 = 32 bytes. Both fit in the 65_536-byte scratch budget.
+    #[test]
+    fn tk_fused_norm_gemm_no_delta_emits_tk20_calls() {
+        use crate::ir::nodes::LmHeadNormKind;
+        use crate::ir::substrate::{
+            BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount, MatmulK, MatmulN,
+            ScratchRegion, TileN,
+        };
+        let mut b = BuilderLg::new();
+        b.push_tk_fused_norm_gemm_no_delta(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // norm_weight
+            PageId::<2, 8>::new(), // linear_weight
+            PageId::<3, 8>::new(), // out
+            ScratchRegion::<0, 32, 65_536, GemmScope>::new(), // partial
+            ScratchRegion::<32, 32_768, 65_536, GemmScope>::new(), // b_tile
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            MatmulN::<128>::new(),
+            MatmulK::<128>::new(),
+            NumTokensConst::<16>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            WeightAccessorConst::<6, { u32::MAX }>::new(),
+            TileN::<16>::new(),
+            ChunkK::<128>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
+            "W::lmh_norm".to_string(),
+            "W::lmh_lin".to_string(),
+            LmHeadNormKind::RmsNorm,
+            1.0e-5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_tk_fused_norm_gemm_no_delta", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "skipped: {:?}",
+            cu.skipped_variants
+        );
+        std::fs::write("/tmp/tk_fused_norm_gemm_no_delta_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // Loader: TMA-loads activation, norm_weight, linear_weight (-> b_tile).
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[0], 4096);", // act
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[1], 256);",  // norm_w
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[2], 32768);", // lin_w
+            "(*reinterpret_cast<kittens::sv_bf<128>*>(ss.pages[0]))",
+            "(*reinterpret_cast<kittens::sv_bf<128>*>(ss.pages[1]))",
+            "(*reinterpret_cast<kittens::st_bf<128, 128>*>(ss.scratch + 32))",
+            // Norm phase: per-warp register vecs + cross-warp sum.
+            "kittens::rv_fl<16> __lmh_act_rv;",
+            "kittens::rv_fl<16> __lmh_sq_rv;",
+            "kittens::rv_fl<16> __lmh_norm_w_rv;",
+            "kittens::group<8>::load(__lmh_act_rv,",
+            "kittens::warp::sum(__lmh_partial_sum, __lmh_sq_rv);",
+            "kittens::group<8>::sync(1);", // bar_reduce
+            "rsqrtf(__lmh_full_sum / 128.0f + 1e-5f)",
+            "kittens::warp::mul(__lmh_act_rv, __lmh_act_rv, __lmh_scale);",
+            "kittens::warp::mul(__lmh_act_rv, __lmh_act_rv, __lmh_norm_w_rv);",
+            // Norm writeback to in_smem (sv_bf view).
+            "kittens::group<8>::store(",
+            // Cross-warp sync after norm writeback (bar_publish reused).
+            "kittens::group<8>::sync(2);",
+            // GEMM phase: rt decls + per-warp B + OUT subtiles + mma.
+            "kittens::rt_bf<16, 128> __lmh_a;",
+            "kittens::rt_bf<128, 16, kittens::ducks::rt_layout::col> __lmh_b;",
+            "kittens::rt_fl<16, 16> __lmh_acc;",
+            "auto __lmh_b_sub = ",
+            "auto __lmh_out_sub = ",
+            "kittens::warp::zero(__lmh_acc);",
+            "kittens::warp::mma_AB(__lmh_acc, __lmh_a, __lmh_b, __lmh_acc);",
+            "kittens::warp::store(__lmh_out_sub, __lmh_acc);",
+            // Per-warp arrives — out_done + 3 input page_consumeds.
+            "kittens::group<1>::arrive(ss.page_done[3]);",
+            "kittens::group<1>::arrive(ss.page_consumed[0]);",
+            "kittens::group<1>::arrive(ss.page_consumed[1]);",
+            "kittens::group<1>::arrive(ss.page_consumed[2]);",
+            // Storer: TMA out + arrive on out_consumed.
+            "kittens::group<1>::tma::store_async(",
+            "g.act_ptrs[3]",
+            "kittens::group<1>::tma::store_async_wait();",
+            "kittens::group<1>::arrive(ss.page_consumed[3]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+
+        // No-delta: must NOT emit a delta load or delta_consumed
+        // arrive. (delta_act_slot is None.)
+        assert!(
+            !cu.source.contains("__lmh_delta_rv"),
+            "no-delta variant must not declare a delta rv; got:\n{}",
+            cu.source
+        );
+        // RmsNorm flavor: must NOT emit a mean-subtract step.
+        assert!(
+            !cu.source.contains("__lmh_mean_partial"),
+            "RmsNorm flavor must not emit a mean-subtract; got:\n{}",
+            cu.source
+        );
+        // RmsNorm flavor (no offset): norm_weight must NOT have an
+        // offset add. The only `warp::add(__lmh_*` should be absent
+        // in the no-delta + no-offset case.
+        assert!(
+            !cu.source.contains("kittens::warp::add(__lmh_norm_w_rv,"),
+            "RmsNorm with no offset must not add to norm_weight; got:\n{}",
+            cu.source
+        );
+    }
+
+    /// Sprint 13: TkFusedNormGemm — AddScalarOffsetRmsNorm flavor
+    /// (delta fold + offset on norm_weight). Same shape config as
+    /// the no-delta smoke, with the delta page wired to slot 1.
+    #[test]
+    fn tk_fused_norm_gemm_with_delta_emits_tk20_calls() {
+        use crate::ir::nodes::LmHeadNormKind;
+        use crate::ir::substrate::{
+            BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount, MatmulK, MatmulN,
+            ScratchRegion, TileN,
+        };
+        let mut b = BuilderLg::new();
+        b.push_tk_fused_norm_gemm_with_delta(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in (residual)
+            PageId::<1, 8>::new(), // delta
+            PageId::<2, 8>::new(), // norm_weight
+            PageId::<3, 8>::new(), // linear_weight
+            PageId::<4, 8>::new(), // out
+            ScratchRegion::<0, 32, 65_536, GemmScope>::new(),
+            ScratchRegion::<32, 32_768, 65_536, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            MatmulN::<128>::new(),
+            MatmulK::<128>::new(),
+            NumTokensConst::<16>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            ActSlotConst::<4, { u32::MAX }>::new(),
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            WeightAccessorConst::<6, { u32::MAX }>::new(),
+            TileN::<16>::new(),
+            ChunkK::<128>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
+            "W::lmh_norm".to_string(),
+            "W::lmh_lin".to_string(),
+            LmHeadNormKind::AddScalarOffsetRmsNorm,
+            Some(1.5_f32),
+            1.0e-5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_tk_fused_norm_gemm_with_delta", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "skipped: {:?}",
+            cu.skipped_variants
+        );
+        std::fs::write("/tmp/tk_fused_norm_gemm_with_delta_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // Loader: TMA-loads in + delta + norm_weight + linear_weight.
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[0], 4096);", // in
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[1], 4096);", // delta
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[2], 256);",  // norm_w
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[3], 32768);", // lin_w
+            "(*reinterpret_cast<kittens::sv_bf<128>*>(ss.pages[1]))",
+            // Residual fold: act += delta in registers.
+            "kittens::rv_fl<16> __lmh_delta_rv;",
+            "kittens::warp::add(__lmh_act_rv, __lmh_act_rv, __lmh_delta_rv);",
+            // Offset added to norm_weight before mul.
+            "kittens::warp::add(__lmh_norm_w_rv, __lmh_norm_w_rv, 1.5e0f);",
+            // mma_AB still emits.
+            "kittens::warp::mma_AB(__lmh_acc, __lmh_a, __lmh_b, __lmh_acc);",
+            // Per-warp arrives now include delta_consumed.
+            "kittens::group<1>::arrive(ss.page_consumed[1]);",
+            "kittens::group<1>::arrive(ss.page_done[4]);",
+            "kittens::group<1>::arrive(ss.page_consumed[4]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+    }
 }

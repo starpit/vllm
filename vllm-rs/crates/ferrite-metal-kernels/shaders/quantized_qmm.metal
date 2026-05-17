@@ -68,6 +68,15 @@
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 
+// MLX steel/gemm vendor — pulls in `BlockMMA<T, U, BM, BN, BK, WM, WN, ...>`.
+// Used by qmm_t_impl_inline below to drive the inner MMA loop with the
+// SAME structure as MLX's prebuilt `affine_qmm_t_*` binary. The
+// per-fragment dtype + cast pattern this gives us is what compiles to
+// `multiply_accumulate.v64f32.v64f32.v64f32.v64f32` on Apple7 — the
+// hardware-fast MMA op that MLX's binary uses.
+#include "mlx_steel_gemm/mma.h"
+#include "mlx_steel_gemm/loader.h"
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -242,46 +251,37 @@ METAL_FUNC void qmm_t_impl_inline(
   const device T_scale* Bs_row = b_block + bi_w * K_g;
   int group_step_cnt = 0;
 
-  // Accumulators stored as `vec<float,2>` per frag — the per-thread
-  // half of an 8×8 simdgroup_matrix. Matches MLX MMATile<float,TM,TN>
-  // ::val_frags storage (mma.h:233). simdgroup_matrix is materialized
-  // only at MMA-call time, then result is read back. Apple's compiler
-  // is more aggressive with vec<float,2> in registers than with a
-  // live simdgroup_matrix across iterations.
-  vec<float, 2> acc[TM][TN];
-  MLX_MTL_PRAGMA_UNROLL
-  for (int i = 0; i < TM; ++i) {
-    MLX_MTL_PRAGMA_UNROLL
-    for (int j = 0; j < TN; ++j) {
-      acc[i][j] = vec<float, 2>(0.0f);
-    }
-  }
-
-  // Per-simdgroup tile origin within the threadgroup tile (sgM*16,
-  // sgN*16) — same as BlockMMA constructor `tm = kFragSize * (sg / WN);
-  // tn = kFragSize * (sg % WN)`.
-  const int sgM = int(simd_group_id) / WN;
-  const int sgN = int(simd_group_id) % WN;
-
-  // ── Per-lane coordinates in the 8×8 simdgroup_matrix fragment ───
-  // (BaseMMAFrag<T,8,8>::get_coord, MLX steel/gemm/mma.h:49-55).
-  // Each lane holds 2 contiguous elements: (fm, fn) and (fm, fn+1).
-  // We pre-compute the per-lane offsets ONCE so the inner K loop is
-  // pure scalar loads — replaces `simdgroup_load(...)` intrinsics
-  // which carry per-fragment coordination overhead. MLX's BlockMMA
-  // does the same (steel/gemm/mma.h:487-505).
-  const ushort qid_lane = simd_lane_id / 4;
-  const ushort fm = (qid_lane & 4) + ((simd_lane_id / 2) % 4);
-  const ushort fn = (qid_lane & 2) * 2 + (simd_lane_id % 2) * 2;
-  // A is stored in Xs as [BM × BK_padded]; A_str_m=BK_padded, A_str_k=1.
-  // Frag (i, 0) is at row (sgM*16 + i*8), col (0). Per-lane offset
-  // within the frag: (fm * BK_padded + fn).
-  // Bs is stored as [BN × BK_padded] (post-dequant) — but with
-  // transpose=true. In transposed view: B_str_k=1, B_str_n=BK_padded.
-  // Frag (0, j) is at K=0, N=sgN*16 + j*8. Per-lane offset: (fm *
-  // 1 + fn * BK_padded) → fm + fn*BK_padded.
-  // (Subtle: B's per-lane offset uses fm as the row-of-frag in the
-  // transposed view, which maps to K-axis of Ws.)
+  // ── BlockMMA — VERBATIM MLX `BlockMMA<T_compute, T_act, BM, BN, BK,
+  //    WM, WN, transpose_a=false, transpose_b=true, lda_tgp, ldb_tgp,
+  //    AccumType=float>`. Owns the simdgroup-matrix accumulators
+  //    (Ctile, MMATile<float, TM, TN>), the As/Bs offsets per lane,
+  //    and the K-loop MMA kernel (`mma_t::mma(Xs, Ws)`).
+  //
+  //    Template params:
+  //      T (compute dtype, MMA fragments)        : T_compute
+  //      U (output / store dtype)                : T_act
+  //      BM, BN, BK                              : 32, 32, 32
+  //      WM, WN                                  : 2, 2
+  //      transpose_a / transpose_b               : false / true
+  //      lda_tgp / ldb_tgp                       : BK_padded / BK_padded
+  //      AccumType                               : float (default)
+  //      Epilogue                                : TransformNone (default)
+  using mma_t = mlx::steel::BlockMMA<
+      /* T = */ T_compute,
+      /* U = */ T_act,
+      /* BM = */ BM,
+      /* BN = */ BN,
+      /* BK = */ BK,
+      /* WM = */ WM,
+      /* WN = */ WN,
+      /* transpose_a = */ false,
+      /* transpose_b = */ true,
+      /* lda_tgp = */ BK_padded,
+      /* ldb_tgp = */ BK_padded>;
+  mma_t mma_op(simd_group_id, simd_lane_id);
+  // Accumulator is BlockMMA's `Ctile` (zero-initialised by MMATile's
+  // default constructor — `mma.h:222-225`); it lives across the K loop
+  // in registers.
 
   // ── K loop: K_eff allows the splitk wrapper to shorten the loop ──
   //
@@ -346,96 +346,14 @@ METAL_FUNC void qmm_t_impl_inline(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ─── BlockMMA::mma — KFR = BK / 8 K-frag MMAs per BK iter ───
-    //   Inner loop matches MLX's `BlockMMA::mma`
-    //   (steel/gemm/mma.h:507-532): direct per-thread scalar loads
-    //   into `simdgroup_matrix`'s `thread_elements()` register pair,
-    //   bypassing the `simdgroup_load(...)` intrinsic which carries
-    //   per-fragment coordination cost. Saves ~18% per-TG in qmm_t
-    //   (matches MLX's ~2.22 µs/TG on M4 vs our prior ~2.7 µs/TG).
-    //   `simdgroup_barrier(mem_none)` fences mark the load→MMA
-    //   boundaries for the Apple compiler so it can software-
-    //   pipeline loads and MMAs across iterations.
-    // Match MLX `BlockMMA` frag layout (mma.h:492-505 + 514-530):
-    //   tm = kFragSize * (sgid / WN)  (= 8*sgM in our naming)
-    //   tn = kFragSize * (sgid % WN)  (= 8*sgN)
-    //   simdgroup frag at warp-tile (i, j) sits at
-    //     M-pos: tm + (i * kFragSize * WM)   [INTERLEAVED across sgM]
-    //     N-pos: tn + (j * kFragSize * WN)   [INTERLEAVED across sgN]
-    // Per-thread (fm, fn) per `BaseMMAFrag<...>::get_coord` then
-    // shifts the lane into the 8×8 frag. The interleaved layout is
-    // what their `WM`/`WN` (warp-tile-count) factors are for, and
-    // matches MLX's TM_stride/TN_stride math.
-    //
-    // Pointer setup: ONE per-thread base, advance by kFragSize per
-    // kk-step (tile_stride_a = kFragSize * A_str_k = 8, etc.).
-    constexpr int TM_stride = 8 * WM;  // = 16 (M-row stride between frags)
-    constexpr int TN_stride = 8 * WN;  // = 16 (N-col stride between frags)
-    const int sm = int(fm);
-    const int sn = int(fn);
-    const int tm = 8 * sgM;
-    const int tn = 8 * sgN;
-    // Per-thread base offsets — MLX `BlockMMA` constructor (mma.h:500-501):
-    //   As_offset = (tm + sm) * A_str_m + sn * A_str_k
-    //             = (tm + sm) * BK_padded + sn  (A_str_m=BK_padded, A_str_k=1)
-    //   Bs_offset = sm * B_str_k + (tn + sn) * B_str_n
-    //             = sm + (tn + sn) * BK_padded  (B_str_k=1, B_str_n=BK_padded
-    //                                            since transpose_b=true)
-    threadgroup const T_compute* As_iter = Xs + (tm + sm) * BK_padded + sn;
-    threadgroup const T_compute* Bs_iter = Ws + sm + (tn + sn) * BK_padded;
-
-    MLX_MTL_PRAGMA_UNROLL
-    for (int kf = 0; kf < KFR; ++kf) {
-      simdgroup_barrier(mem_flags::mem_none);
-
-      // A frag (TM, 1): per-thread reads dst[0]=src[0], dst[1]=src[1].
-      vec<T_compute, 2> a_frag[TM];
-      MLX_MTL_PRAGMA_UNROLL
-      for (int i = 0; i < TM; ++i) {
-        threadgroup const T_compute* p = As_iter + i * TM_stride * BK_padded;
-        a_frag[i][0] = p[0];
-        a_frag[i][1] = p[1];
-      }
-
-      simdgroup_barrier(mem_flags::mem_none);
-
-      // B frag (1, TN): per-thread reads dst[0]=src[0], dst[1]=src[BK_padded].
-      vec<T_compute, 2> b_frag[TN];
-      MLX_MTL_PRAGMA_UNROLL
-      for (int j = 0; j < TN; ++j) {
-        threadgroup const T_compute* p = Bs_iter + j * TN_stride * BK_padded;
-        b_frag[j][0] = p[0];
-        b_frag[j][1] = p[BK_padded];
-      }
-
-      simdgroup_barrier(mem_flags::mem_none);
-
-      // Serpentine MMA: matches MLX `tile_matmad` (mma.h:411).
-      // simdgroup_matrix runs in T_compute — that's the lever: when
-      // T_compute=half on Apple7, we hit the fast f16 simdgroup
-      // multiply-accumulate path instead of the slow bf16 emulation.
-      MLX_MTL_PRAGMA_UNROLL
-      for (int i = 0; i < TM; ++i) {
-        MLX_MTL_PRAGMA_UNROLL
-        for (int j = 0; j < TN; ++j) {
-          int j_serp = (i & 1) ? (TN - 1 - j) : j;
-          simdgroup_matrix<T_compute, 8, 8> A_mat;
-          simdgroup_matrix<T_compute, 8, 8> B_mat;
-          simdgroup_float8x8 C_mat;
-          simdgroup_float8x8 D_mat;
-          reinterpret_cast<thread vec<T_compute, 2>&>(A_mat.thread_elements()) = a_frag[i];
-          reinterpret_cast<thread vec<T_compute, 2>&>(B_mat.thread_elements()) = b_frag[j_serp];
-          reinterpret_cast<thread vec<float, 2>&>(C_mat.thread_elements()) = acc[i][j_serp];
-          simdgroup_multiply_accumulate(D_mat, A_mat, B_mat, C_mat);
-          acc[i][j_serp] = reinterpret_cast<thread vec<float, 2>&>(D_mat.thread_elements());
-        }
-      }
-
-      // tile_stride_a/b = kFragSize * A_str_k = 8 (along K for A,
-      // along K for transposed B).
-      As_iter += 8;
-      Bs_iter += 8;
-    }
+    // ─── MLX BlockMMA::mma (mma.h:507-532) ─────────────────────────
+    // Reads Xs/Ws threadgroup tiles, runs `BK / kFragSize = 4` 8-wide
+    // K-frag MMAs per BK-iter. The K-loop, per-frag scalar loads via
+    // MMAFrag::load (which casts T_compute → float), the serpentine
+    // MMA dispatch via tile_matmad, and the simdgroup_barrier fences
+    // are ALL inside `mma_op.mma`. Verbatim MLX semantics — same AIR
+    // shape as MLX's prebuilt `affine_qmm_t_*` binary on Apple7.
+    mma_op.mma(Xs, Ws);
 
     // ─── Advance pointers per BlockLoader / QuantizedBlockLoader.next() ──
     //   X: tile_stride = BCOLS = BK halves.
@@ -477,45 +395,14 @@ METAL_FUNC void qmm_t_impl_inline(
   //     fn  = (qid & 2) * 2 + (lane % 2) * 2
   //   Each lane holds two consecutive elements at (fm, fn) and
   //   (fm, fn+1) within the 8×8 frag.
-  const ushort qid    = simd_lane_id >> 2;
-  const ushort lane_fm = (qid & 4) | ((simd_lane_id >> 1) & 3);
-  const ushort lane_fn = (((qid & 2) << 1) | ((simd_lane_id & 1) << 1));
-  // Epilogue output coords use the MLX interleaved frag layout
-  // (mma.h: sm = tm + simd_coord.y; sn = tn + simd_coord.x; TM_stride =
-  // kFragSize*WM = 16; TN_stride = kFragSize*WN = 16).
-  //   tm = 8 * sgM (8 = kFragSize)
-  //   tn = 8 * sgN
-  //   frag(i,j)'s M-row = tm + i*TM_stride + lane_fm
-  //   frag(i,j)'s N-col = tn + j*TN_stride + lane_fn
-  const int tm_ep = 8 * sgM;
-  const int tn_ep = 8 * sgN;
-  constexpr int TM_stride_ep = 8 * WM;  // 16
-  constexpr int TN_stride_ep = 8 * WN;  // 16
-  MLX_MTL_PRAGMA_UNROLL
-  for (int i = 0; i < TM; ++i) {
-    MLX_MTL_PRAGMA_UNROLL
-    for (int j = 0; j < TN; ++j) {
-      // acc is now vec<float, 2>; per-thread elements [0]/[1] map
-      // to (lane_fm, lane_fn) and (lane_fm, lane_fn+1) per the
-      // BaseMMAFrag<float,8,8> get_coord convention.
-      const thread vec<float, 2>& elem = acc[i][j];
-      int row = tm_ep + i * TM_stride_ep + int(lane_fm);
-      int col = tn_ep + j * TN_stride_ep + int(lane_fn);
-      if (m_full && n_full) {
-        device T_act* p = y_block + row * N + col;
-        p[0] = T_act(elem[0]);
-        p[1] = T_act(elem[1]);
-      } else {
-        if (row < int(m_tile)) {
-          if (col + 0 < int(n_tile)) {
-            y_block[row * N + col + 0] = T_act(elem[0]);
-          }
-          if (col + 1 < int(n_tile)) {
-            y_block[row * N + col + 1] = T_act(elem[1]);
-          }
-        }
-      }
-    }
+  // ── Epilogue (MLX BlockMMA::store_result / store_result_safe) ────
+  // VERBATIM MLX. `store_result(D, ldd)` writes the float
+  // accumulator to device memory cast to U=T_act. The safe variant
+  // bounds-checks against `(num_outs, num_els)` for the M/N tail.
+  if (m_full && n_full) {
+    mma_op.store_result(y_block, N);
+  } else {
+    mma_op.store_result_safe(y_block, N, short2(int(n_tile), int(m_tile)));
   }
   (void)out_scratch;
 }

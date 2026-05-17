@@ -2680,7 +2680,12 @@ pub fn synthesize_forward_decode(
     let x_norm_name   = "__x_norm";
     let qmv_smem_name = "__qmv_smem";
     let residual_io   = "__residual";
-    let delta_buf     = "__residual";    // self-aliased: in-kernel residual stream
+    // Bound by the atom signature but unused at the kernel level —
+    // `addrms` runs in `init = true` mode (see comment below), which
+    // never reads `delta`. Kept as a stable channel name so the
+    // AtomCtx binding indices stay parallel to the per-chunk persistent
+    // synth that DOES consume a separate delta buffer.
+    let delta_buf     = "__residual";
     let rms_wt_buf    = "__rms_w";
     let q_wt_buf      = "__q_w"; let q_sc_buf = "__q_s"; let q_bi_buf = "__q_b";
     let k_wt_buf      = "__k_w"; let k_sc_buf = "__k_s"; let k_bi_buf = "__k_b";
@@ -2709,12 +2714,26 @@ pub fn synthesize_forward_decode(
         ("EPS",         AtomConstantValue::Float(c.rms_norm_eps)),
     ];
 
-    // Layer-0 init variant of AddRmsNorm is unused here: the
-    // whole-forward kernel runs the embedding op upstream (host-side
-    // for now; in-kernel later) and the in-kernel residual stream
-    // starts from a pre-populated `__residual` buffer that holds the
-    // embedding output. So every layer's AddRmsNorm sees `init=false`.
-    let addrms = AddRmsNormAtom { init: false };
+    // ALL layers' pre-attn rmsnorm runs in `init = true` mode.
+    //
+    // Rationale: this kernel keeps the residual stream entirely in
+    // `__residual` (one device buffer aliased across phases). Both
+    // `o_proj` and `down_proj` already accumulate their outputs into
+    // `__residual` in-place (`residual[i] = residual[i] + qmv_smem[i]`),
+    // so by the time layer L+1's pre-attn runs, `__residual` ALREADY
+    // contains `(prev_residual + attn_out + mlp_out)`. The `init=false`
+    // atom variant would do `residual = residual + delta` again —
+    // and with `delta` aliased to `__residual` that's `residual *= 2`,
+    // compounded exponentially across 16 layers ⇒ garbage logits.
+    //
+    // The `init=true` atom variant skips both the add AND the residual
+    // writeback; it just normalizes the already-accumulated value
+    // into `__x_norm` (TG memory) for the downstream qmv consumers.
+    // For layer 0, `__residual` arrives pre-populated with the
+    // embedding output (the kernel's caller dispatches `AffineEmbed`
+    // upstream); the init=true path treats it as the input directly,
+    // matching the comment on `AddRmsNormAtom::init`.
+    let addrms = AddRmsNormAtom { init: true };
     let rope   = RopeAppendAtom;
     let qmv_q = AffineQmvAtom {
         group_size: c.group_size, local_head_expr: "__head", has_linear_bias: false,

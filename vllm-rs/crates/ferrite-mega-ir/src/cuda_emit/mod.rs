@@ -339,6 +339,43 @@ mod tests {
         }
     }
 
+    /// Sprint 4: TanhSoftCap via `kittens::warp::apply` lambda.
+    #[test]
+    fn tanh_soft_cap_emits_tk20_apply_lambda() {
+        let mut b = BuilderD::new();
+        b.push_tanh_soft_cap(
+            ArrivesCount::<0>::new(),
+            PageId::<6, 8>::new(),
+            PageId::<7, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+            BarSyncId::<2>::new(),
+            30.0_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_softcap", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/tanh_soft_cap_emit.cu", &cu.source).ok();
+
+        for needle in [
+            "kittens::rv_fl<256> __tanh_rv;",
+            "kittens::warp::apply(__tanh_rv, __tanh_rv,",
+            "[] __device__ (int /*idx*/, float x) { return tanhf(x * (1.0f / 3e1f)) * 3e1f; }",
+            "kittens::group<8>::sync(2);",
+            "kittens::group<1>::tma::store_async(",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// Sprint 3: ScalarMul (in→out path; in==out exercised at user
     /// build time when the proc-macro emits a tape with aliasing).
     #[test]

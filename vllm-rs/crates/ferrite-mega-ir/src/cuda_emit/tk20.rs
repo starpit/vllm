@@ -280,6 +280,27 @@ pub fn warp_sum_to_scalar_f32(
     ))
 }
 
+/// `kittens::warp::apply(dst, src, lambda);` — per-lane unary map.
+/// `lambda_body` is a CUDA expression in `x` (the per-lane fp32
+/// value) returning a fp32 result. The wrapper takes a 2-arg
+/// lambda `(int /*idx*/, float x) -> float` because that's the TK
+/// 2.0 signature; we ignore the idx in lambda_body callers.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh:79-112`
+pub fn warp_apply_f32_lambda(
+    dst: &Rv<F32>,
+    src: &Rv<F32>,
+    lambda_body: &str,
+) -> CuStmt {
+    debug_assert_eq!(dst.len(), src.len());
+    CuStmt::new(format!(
+        "kittens::warp::apply({dst}, {src}, [] __device__ (int /*idx*/, float x) {{ return {body}; }});",
+        dst = dst.expr(),
+        src = src.expr(),
+        body = lambda_body
+    ))
+}
+
 // ============================================================
 // CUDA local-variable declarations.
 // ============================================================

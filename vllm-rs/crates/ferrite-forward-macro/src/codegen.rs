@@ -5574,6 +5574,7 @@ fn dispatch_instruction_to_push(
             let out_act_slot = lit(*out_slot);
             let cap_lit = state.tanh_soft_cap;
             let num_pages_lit = lit(state.num_pages_budget);
+            let consumer_bar_publish = lit(2u32);
             state.arrives += 1;
             Ok(quote! {
                 b.push_tanh_soft_cap(
@@ -5586,6 +5587,7 @@ fn dispatch_instruction_to_push(
                     ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
                     ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_publish>::new(),
                     #cap_lit,
                 );
             })

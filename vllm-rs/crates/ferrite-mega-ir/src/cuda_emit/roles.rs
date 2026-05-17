@@ -13,7 +13,7 @@
 //! sprint, each variant's emitted `.cu` must compile against TK
 //! 2.0 on the pod before it's "done."
 
-use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul};
+use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -52,7 +52,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
-        MegaNode::TanhSoftCap(_) => RoleBodies::skipped("TanhSoftCap"),
+        MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
         MegaNode::ScalarOffsetRmsNorm(_) => RoleBodies::skipped("ScalarOffsetRmsNorm"),
         MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
         MegaNode::FusedCublasGemmAdd(_) => RoleBodies::skipped("FusedCublasGemmAdd"),
@@ -452,6 +452,100 @@ fn emit_scalar_mul(n: &ScalarMul, budget: TapeBudget) -> RoleBodies {
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &act_rv, &in_smem));
     let scale_lit = CuExpr::new(format!("{:e}f", scale_value));
     consumer.push(tk20::warp_mul_rv_scalar_f32(&act_rv, &act_rv, &scale_lit));
+    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(
+        ncw,
+        if in_place { &in_smem } else { &out_smem },
+        &act_rv,
+    ));
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(tk20::group_arrive(1, &out_done));
+    if !in_place {
+        consumer.push(tk20::group_arrive(1, &in_consumed));
+    }
+    consumer.push(CuStmt::new("}".to_string()));
+
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &out_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw(
+        1,
+        &out_gmem,
+        if in_place { &in_smem } else { &out_smem },
+        act_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// TanhSoftCap — out = tanhf(in / cap) * cap, per-lane.
+// In-place (in_page == out_page) is valid (gemma2 lm_head softcap).
+// ============================================================
+//
+// Same substrate shape as ScalarMul. One per-lane unary map; uses
+// `kittens::warp::apply` (vec/maps.cuh:79) to splice a __device__
+// lambda doing the tanh.
+
+fn emit_tanh_soft_cap(n: &TanhSoftCap, budget: TapeBudget) -> RoleBodies {
+    let in_page = n.in_page();
+    let out_page = n.out_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase;
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let in_act_slot = n.in_act_slot().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+    let cap_value = n.cap.raw();
+    let in_place = in_page.raw() == out_page.raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(ncw > 0 && hidden_dim % ncw == 0);
+    let k_per_warp = hidden_dim / ncw;
+
+    let in_smem = page_as_sv_bf(in_page, hidden_dim);
+    let out_smem = page_as_sv_bf(out_page, hidden_dim);
+    let in_ready = page_ready_sem(in_page);
+    let out_done = page_done_sem(out_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let out_consumed = page_consumed_sem(out_page);
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+
+    let bf16_size_bytes = 2_u32;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1, &in_smem, &in_gmem, act_bytes, &in_ready,
+    ));
+
+    let launcher = CuBlock::new();
+
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    let (decl_act, act_rv) = tk20::decl_rv_fl("__tanh_rv", k_per_warp);
+    consumer.push(decl_act);
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &act_rv, &in_smem));
+
+    // tanhf(x / cap) * cap. cap baked in as a constexpr literal.
+    let lambda_body = format!(
+        "tanhf(x * (1.0f / {cap:e}f)) * {cap:e}f",
+        cap = cap_value
+    );
+    consumer.push(tk20::warp_apply_f32_lambda(&act_rv, &act_rv, &lambda_body));
+
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(
         ncw,
         if in_place { &in_smem } else { &out_smem },

@@ -19,6 +19,8 @@ fn main() {
         /*IN_ACT_SLOT=*/ 0,
         /*OUT_ACT_SLOT=*/ 1,
         /*WEIGHT_ACCESSOR_IDX=*/ 0,
+        /*CONSUMER_BAR_REDUCE=*/ 1,
+        /*CONSUMER_BAR_PUBLISH=*/ 2,
     >(
         WeightRef::new("W::norm".to_string()),
         FiniteF32::new(1.0e-5_f32),

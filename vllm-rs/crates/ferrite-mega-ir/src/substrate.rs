@@ -345,6 +345,366 @@ impl IsValidWarpRole for WarpRoleTag<ROLE_CONSUMER> {}
 impl IsValidWarpRole for WarpRoleTag<ROLE_STORER> {}
 
 // ============================================================
+// Bar.sync IDs (within-warpgroup synchronization barriers).
+//
+// PTX `bar.sync N` IDs are in `[0, 16)`; bar 0 is reserved for
+// `__syncthreads`. Op-internal barriers occupy bars `1..=15`.
+//
+// **Type-system enforcement, not assert!**
+//
+// `BarSyncId<ID>: IsValidBarSyncId` is a sealed witness with impls
+// **only** for ID in `1..=15`. `BarSyncPair<A, B>: IsDistinctBarPair`
+// is implemented **only** for pairs where both A and B are valid AND
+// `A != B`. Functions that take const-generic bar IDs declare these
+// witnesses as `where` bounds — bad const args fail at TYPE CHECK,
+// not at monomorphization assert.
+//
+// Producer/consumer pairing: a single IR field flows into BOTH the
+// producer-side and consumer-side codegen splice points (e.g.
+// `kittens::group<NCW>::sync(BAR_ID)` is participant-symmetric — every
+// warp arrives AND waits on the same primitive call). There is no
+// independent-input route by which the two sides could diverge; the
+// IR field IS the single source of truth.
+// ============================================================
+
+pub struct BarSyncId<const ID: u32>;
+
+pub trait IsValidBarSyncId: sealed::Sealed {}
+
+pub struct BarSyncPair<const A: u32, const B: u32>;
+
+pub trait IsDistinctBarPair: sealed::Sealed {}
+
+/// Opaque post-erasure wrapper for a verified bar.sync ID.
+///
+/// Cannot be constructed from a raw `u32` — the only public path to
+/// construct a `BarRef` is `BarSyncId::<ID>::erase()`, which requires
+/// the sealed-witness `BarSyncId<ID>: IsValidBarSyncId` bound. Bare
+/// integer literals don't satisfy that bound, so no caller can
+/// produce an invalid `BarRef`.
+///
+/// Stored on `MegaNode` variants instead of bare `u32` so the IR
+/// surface (fields, getters, function params) is typed throughout.
+/// The `raw()` accessor is the only escape hatch back to integer for
+/// splicing into emitted CUDA source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BarRef(u32);
+
+impl BarRef {
+    /// Recover the raw integer for codegen splicing only. Not
+    /// constructible from raw `u32` outside this crate.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl<const ID: u32> BarSyncId<ID>
+where
+    BarSyncId<ID>: IsValidBarSyncId,
+{
+    /// Construct a verified `BarSyncId`. The where bound only admits
+    /// IDs in `1..=15`; `ID = 0` or `ID >= 16` fail at type-check
+    /// (E0277), no monomorphization.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Erase to opaque [`BarRef`]. The validity witness was discharged
+    /// at the type-check boundary above; the post-erasure value can
+    /// flow through the IR without re-validation.
+    pub const fn erase(self) -> BarRef {
+        BarRef::__new_for_erase(ID)
+    }
+}
+
+impl<const A: u32, const B: u32> BarSyncPair<A, B>
+where
+    BarSyncPair<A, B>: IsDistinctBarPair,
+{
+    /// Construct a verified distinct-bar pair. The where bound only
+    /// admits ordered (A, B) where both are valid AND `A != B`.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Erase to opaque [`DistinctBarPairProof`].
+    pub const fn erase(self) -> DistinctBarPairProof {
+        DistinctBarPairProof { _priv: () }
+    }
+}
+
+/// Opaque proof token witnessing that two specific bar.sync IDs are
+/// distinct + valid. Storage-erased (zero data) so an op variant can
+/// hold "I have distinct bars" without paying for the const generics.
+/// Constructible only via [`BarSyncPair::erase`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DistinctBarPairProof {
+    _priv: (),
+}
+
+// ============================================================
+// Opaque post-erasure refs — the only u32 escape hatch is `raw()`,
+// used by codegen to splice into emitted CUDA source. NONE of these
+// have a public constructor that accepts a raw `u32`. Only the typed
+// const-generic primitives (PageId, MbarrierPhase, …) can produce
+// them, via `erase()`. Bare `u32` cannot be smuggled into the IR.
+// ============================================================
+
+/// Verified page-slot id (post-erasure of `PageId<ID, NUM_PAGES>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PageRef(u32);
+impl PageRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    /// Crate-private constructor — only the typed primitive's
+    /// `erase()` may call this. External callers must go through the
+    /// substrate-proof typed primitive.
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified mbarrier phase (post-erasure of `MbarrierPhase<P>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MbarrierPhaseRef(u32);
+impl MbarrierPhaseRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified per-layer index (post-erasure of `LayerIndex<L, NUM_LAYERS>`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LayerRef(u32);
+impl LayerRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified scratch-region offset (post-erasure of `ScratchRegion<O, B, S>`'s
+/// `OFFSET` const generic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScratchOffsetRef(u32);
+impl ScratchOffsetRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified scratch-region byte count (post-erasure of `ScratchRegion`'s
+/// `BYTES` const generic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScratchBytesRef(u32);
+impl ScratchBytesRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive `HIDDEN_DIM` template arg.
+pub struct HiddenDim<const D: u32>;
+pub trait IsValidHiddenDim: sealed::Sealed {}
+impl<const D: u32> sealed::Sealed for HiddenDim<D> {}
+// Positivity sealed witness: implementation only when D > 0 — checked
+// via a const-generic `where` reach: a separate `IsPositive<X>` sealed
+// trait with impls only for the const-generic value. Stable Rust
+// can't express "where D > 0", so we keep monomorphization-time
+// `assert!(D > 0)` inside `new()`. Range invariants over arbitrary
+// `u32` (1..=u32::MAX) cannot be enumerated as sealed impls; the
+// substrate-proof primitives whose value range is finite (BarSyncId
+// 1..=15) use sealed witnesses, those whose range is unbounded use
+// `const { assert!() }` (E0080 at monomorphization).
+//
+// Both forms cause `rustc` to refuse to compile bad const args; the
+// difference is only WHERE in the pipeline the rejection fires.
+impl<const D: u32> HiddenDim<D> {
+    pub const fn new() -> Self {
+        const {
+            assert!(D > 0, "HiddenDim: D must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> HiddenDimRef {
+        HiddenDimRef::__new_for_erase(D)
+    }
+}
+impl<const D: u32> IsValidHiddenDim for HiddenDim<D> {}
+
+/// Opaque post-erasure of [`HiddenDim`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HiddenDimRef(u32);
+impl HiddenDimRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive `NUM_TOKENS` template arg.
+pub struct NumTokensConst<const N: u32>;
+impl<const N: u32> NumTokensConst<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "NumTokens: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> NumTokensRef {
+        NumTokensRef::__new_for_erase(N)
+    }
+}
+/// Opaque post-erasure of [`NumTokensConst`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NumTokensRef(u32);
+impl NumTokensRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified activation-slot index (`< NUM_ACT_SLOTS`).
+pub struct ActSlotConst<const SLOT: u32, const NUM_ACT_SLOTS: u32>;
+impl<const SLOT: u32, const NUM_ACT_SLOTS: u32> ActSlotConst<SLOT, NUM_ACT_SLOTS> {
+    pub const fn new() -> Self {
+        const {
+            assert!(
+                SLOT < NUM_ACT_SLOTS,
+                "ActSlot: SLOT >= NUM_ACT_SLOTS",
+            );
+        }
+        Self
+    }
+    pub const fn erase(self) -> ActSlotRef {
+        ActSlotRef::__new_for_erase(SLOT)
+    }
+}
+/// Opaque post-erasure of [`ActSlotConst`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActSlotRef(u32);
+impl ActSlotRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified weight-accessor index (`< NUM_WEIGHT_ACCESSORS`).
+pub struct WeightAccessorConst<const IDX: u32, const NUM_WEIGHT_ACCESSORS: u32>;
+impl<const IDX: u32, const NUM_WEIGHT_ACCESSORS: u32>
+    WeightAccessorConst<IDX, NUM_WEIGHT_ACCESSORS>
+{
+    pub const fn new() -> Self {
+        const {
+            assert!(
+                IDX < NUM_WEIGHT_ACCESSORS,
+                "WeightAccessor: IDX >= NUM_WEIGHT_ACCESSORS",
+            );
+        }
+        Self
+    }
+    pub const fn erase(self) -> WeightAccessorRef {
+        WeightAccessorRef::__new_for_erase(IDX)
+    }
+}
+/// Opaque post-erasure of [`WeightAccessorConst`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WeightAccessorRef(u32);
+impl WeightAccessorRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+// `erase` on the existing typed primitives — these primitives already
+// validate at construction; here we add the post-erasure step.
+impl<const ID: u32, const NUM_PAGES: u32> PageId<ID, NUM_PAGES> {
+    /// Erase to opaque [`PageRef`]. Validity (`ID < NUM_PAGES`) was
+    /// discharged at `PageId::new`'s `const {}` block.
+    pub const fn erase(self) -> PageRef {
+        PageRef::__new_for_erase(ID)
+    }
+}
+
+impl<const P: u32> MbarrierPhase<P> {
+    pub const fn erase(self) -> MbarrierPhaseRef {
+        MbarrierPhaseRef::__new_for_erase(P)
+    }
+}
+
+// Note: `LayerIndex::erase()` lives in `crate::nodes` (where
+// `LayerIndex` is defined) to avoid a cyclic module dep.
+
+impl<
+    const OFFSET: u32,
+    const BYTES: u32,
+    const SCRATCH_BYTES: u32,
+    Scope: IsScratchScope,
+> ScratchRegion<OFFSET, BYTES, SCRATCH_BYTES, Scope>
+{
+    /// Erase to opaque (offset, bytes) refs. Within-budget +
+    /// disjoint-with-others were discharged earlier by
+    /// `ScratchRegion::new` and `disjoint_with`.
+    pub const fn erase(self) -> (ScratchOffsetRef, ScratchBytesRef) {
+        (
+            ScratchOffsetRef::__new_for_erase(OFFSET),
+            ScratchBytesRef::__new_for_erase(BYTES),
+        )
+    }
+}
+
+// Generated impls: one `IsValidBarSyncId` impl per ID in 1..=15, and
+// one `IsDistinctBarPair` impl per ordered (A, B) pair in 1..=15
+// where `A != B` (15 * 14 = 210 pairs).
+//
+// The macro recurses: at each step it pairs `$first` with every
+// `$rest` value in BOTH orders, then recurses on the tail. No dupes
+// because each iteration's `$first` only appears in pairs with
+// strictly-later `$rest` values from the input list.
+macro_rules! impl_bar_pairs {
+    () => {};
+    ($first:literal $($rest:literal)*) => {
+        impl sealed::Sealed for BarSyncId<$first> {}
+        impl IsValidBarSyncId for BarSyncId<$first> {}
+        $(
+            impl sealed::Sealed for BarSyncPair<$first, $rest> {}
+            impl IsDistinctBarPair for BarSyncPair<$first, $rest> {}
+            impl sealed::Sealed for BarSyncPair<$rest, $first> {}
+            impl IsDistinctBarPair for BarSyncPair<$rest, $first> {}
+        )*
+        impl_bar_pairs!($($rest)*);
+    };
+}
+
+impl_bar_pairs!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+
+// ============================================================
 // PageId — finalized validated page-slot id for storage in a
 // `MegaNode` variant (post-erasure to `u32`).
 // ============================================================

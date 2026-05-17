@@ -198,11 +198,25 @@ impl<
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         weight_path: String,
         eps: f32,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        // Sealed-witness type-check propagated from `RmsNorm::new` —
+        // ill-formed bar IDs (out of range or aliased) fail the
+        // builder's own type check, before the inner `new` is ever
+        // resolved.
+        crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
+            crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsDistinctBarPair,
+    {
         self.verify_arrives(ARRIVES, "push_rms_norm");
         // Cross-op alias check via runtime PagePool.
         let _ = self.pool.take(IN_ID);
@@ -226,6 +240,8 @@ impl<
             IN_ACT_SLOT,
             OUT_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
+            CONSUMER_BAR_REDUCE,
+            CONSUMER_BAR_PUBLISH,
         >(weight, eps);
         self.nodes.push(MegaNode::RmsNorm(node));
         self.pool.release(IN_ID);
@@ -1141,7 +1157,7 @@ mod tests {
         // (ARRIVES=0&1=0), STORER_PHASE=1, LAYER=0, NUM_LAYERS=16,
         // ARRIVES=0. AST shape: HIDDEN_DIM=2048, NUM_TOKENS=8,
         // IN_ACT_SLOT=0, OUT_ACT_SLOT=1, WEIGHT_ACCESSOR_IDX=0.
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
             "W::norm".to_string(),
             1.0e-5_f32,
         );
@@ -1169,12 +1185,12 @@ mod tests {
     #[test]
     fn lowers_two_rms_norms_with_phase_advance() {
         let mut b = Builder6::new();
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
             "W::n0".to_string(),
             1.0e-5_f32,
         );
         // After first op, ARRIVES = 1; CONSUMER_PHASE = 1, STORER_PHASE = 0.
-        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 1, 16, 1, 2048, 8, 0, 2, 1>(
+        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 1, 16, 1, 2048, 8, 0, 2, 1, 1, 2>(
             "W::n1".to_string(),
             1.0e-5_f32,
         );
@@ -1499,7 +1515,7 @@ mod tests {
         let mut b = BuilderD::new();
         b.push_barrier_signal::<0>();
         b.push_barrier_wait::<0, 4>();
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
             "W::n".to_string(),
             1.0e-5_f32,
         );
@@ -1511,12 +1527,12 @@ mod tests {
     fn builder_arrives_visible_to_caller() {
         let mut b = Builder6::new();
         assert_eq!(b.arrives(), 0);
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0>(
+        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
             "W::n".to_string(),
             1.0e-5_f32,
         );
         assert_eq!(b.arrives(), 1);
-        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 0, 16, 1, 2048, 8, 0, 1, 0>(
+        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 0, 16, 1, 2048, 8, 0, 1, 0, 1, 2>(
             "W::n".to_string(),
             1.0e-5_f32,
         );

@@ -47,9 +47,13 @@ pub use nodes::{
     WeightRef,
 };
 pub use substrate::{
-    AttentionScope, EdgeId, Empty, ExpectedCount, Filled, GemmScope, IsLifecycleState,
-    IsScratchScope, IsScratchScopePub, IsValidWarpRole, IterCount, MbarrierPhase, MlpScope, Page,
-    PageId, PagePool, Produced, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER,
-    RmsNormScope, RopeScope, ScratchRegion, SubstrateBudget, WarpRoleTag,
+    ActSlotConst, ActSlotRef, AttentionScope, BarRef, BarSyncId, BarSyncPair,
+    DistinctBarPairProof, EdgeId, Empty, ExpectedCount, Filled, GemmScope, HiddenDim, HiddenDimRef,
+    IsDistinctBarPair, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidBarSyncId,
+    IsValidHiddenDim, IsValidWarpRole, IterCount, LayerRef, MbarrierPhase, MbarrierPhaseRef,
+    MlpScope, NumTokensConst, NumTokensRef, Page, PageId, PagePool, PageRef, Produced,
+    ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope,
+    ScratchBytesRef, ScratchOffsetRef, ScratchRegion, SubstrateBudget, WarpRoleTag,
+    WeightAccessorConst, WeightAccessorRef,
 };
 pub use tape::MegaTape;

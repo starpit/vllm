@@ -157,6 +157,23 @@ const CASES: &[Case] = &[
         rs: "tests/compile-fail/matmul_shape_zero.rs",
         expect_msg: "MatmulShape: N must be > 0",
     },
+    // Sealed-witness type-checks for bar.sync IDs. These trip
+    // `error[E0277]: the trait bound ...` at type-check, NOT
+    // `assert!()` at monomorphization. The compile-fail driver
+    // greps stderr; trait-bound errors mention the unsatisfied
+    // trait name.
+    Case {
+        rs: "tests/compile-fail/rms_norm_bar_reduce_zero.rs",
+        expect_msg: "IsValidBarSyncId",
+    },
+    Case {
+        rs: "tests/compile-fail/rms_norm_bar_publish_oob.rs",
+        expect_msg: "IsValidBarSyncId",
+    },
+    Case {
+        rs: "tests/compile-fail/rms_norm_bar_alias.rs",
+        expect_msg: "IsDistinctBarPair",
+    },
 ];
 
 #[test]

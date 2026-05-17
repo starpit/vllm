@@ -37,6 +37,13 @@ impl<const LAYER: u32, const NUM_LAYERS: u32> LayerIndex<LAYER, NUM_LAYERS> {
     pub const fn raw(self) -> u32 {
         LAYER
     }
+
+    /// Erase to opaque [`crate::substrate::LayerRef`].
+    pub const fn erase(self) -> crate::substrate::LayerRef {
+        // Safety: validity discharged in `new`'s `const {}` block.
+        // The opaque ref's only public accessor is `raw()`.
+        crate::substrate::LayerRef::__new_for_erase(LAYER)
+    }
 }
 
 impl<const LAYER: u32, const NUM_LAYERS: u32> Default for LayerIndex<LAYER, NUM_LAYERS> {
@@ -241,6 +248,15 @@ pub struct RmsNorm {
     in_act_slot: u32,
     out_act_slot: u32,
     weight_accessor_idx: u32,
+    /// Cross-warp `bar.sync` ID for the consumer's sum-of-squares
+    /// reduction. PTX `bar.sync` IDs are `[0, 16)`; bar 0 is
+    /// reserved for `__syncthreads`. Must be distinct from
+    /// `consumer_bar_publish` so the two barriers don't alias.
+    consumer_bar_reduce: u32,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their output slice" publish before warp 0 arrives on the
+    /// page_done semaphore.
+    consumer_bar_publish: u32,
     eps: FiniteF32,
     pub weight: WeightRef,
 }
@@ -272,10 +288,31 @@ impl RmsNorm {
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         weight: WeightRef,
         eps: FiniteF32,
-    ) -> Self {
+    ) -> Self
+    where
+        // Sealed-witness type-check: `BarSyncId<ID>: IsValidBarSyncId`
+        // is implemented only for ID in 1..=15 (bar 0 is
+        // `__syncthreads`, IDs >= 16 are out of PTX range).
+        // `BarSyncPair<A, B>: IsDistinctBarPair` is implemented only
+        // for ordered (A, B) where both are valid AND A != B.
+        //
+        // If the caller passes BAR_REDUCE = 0, BAR_PUBLISH = 16, or
+        // BAR_REDUCE == BAR_PUBLISH, the corresponding bound has no
+        // matching impl and the compiler rejects the call at
+        // TYPE-CHECK time (E0277), before any monomorphization. No
+        // runtime check, no `assert!`, no path that could deadlock.
+        crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
+            crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsDistinctBarPair,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "RmsNorm: IN_ID out of bounds");
             assert!(WEIGHT_ID < NUM_PAGES, "RmsNorm: WEIGHT_ID out of bounds");
@@ -296,6 +333,9 @@ impl RmsNorm {
             );
             assert!(HIDDEN_DIM > 0, "RmsNorm: HIDDEN_DIM must be > 0");
             assert!(NUM_TOKENS > 0, "RmsNorm: NUM_TOKENS must be > 0");
+            // CONSUMER_BAR_REDUCE / CONSUMER_BAR_PUBLISH range +
+            // distinctness are enforced by the sealed-witness `where`
+            // bounds above — no asserts here.
         }
         Self {
             in_page_id: IN_ID,
@@ -310,6 +350,8 @@ impl RmsNorm {
             in_act_slot: IN_ACT_SLOT,
             out_act_slot: OUT_ACT_SLOT,
             weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            consumer_bar_reduce: CONSUMER_BAR_REDUCE,
+            consumer_bar_publish: CONSUMER_BAR_PUBLISH,
             eps,
             weight,
         }
@@ -356,6 +398,17 @@ impl RmsNorm {
     /// flat-table index for the per-layer rms weight.
     pub const fn weight_accessor_idx(&self) -> u32 {
         self.weight_accessor_idx
+    }
+    /// `bar.sync` ID for the consumer's sum-of-squares reduction.
+    /// Validated `(0, 16)` and distinct from `consumer_bar_publish`
+    /// at monomorphization time.
+    pub const fn consumer_bar_reduce(&self) -> u32 {
+        self.consumer_bar_reduce
+    }
+    /// `bar.sync` ID for the consumer's "all warps wrote their
+    /// output slice" publish before warp 0 arrives on page_done.
+    pub const fn consumer_bar_publish(&self) -> u32 {
+        self.consumer_bar_publish
     }
     /// Kernel `consumer(..., float eps)` runtime arg.
     pub fn eps(&self) -> FiniteF32 {

@@ -206,12 +206,13 @@ pub enum AttentionKind {
 ///
 /// ## AST contract (`MEGA_IR_PLAN.md` §0 / §4a / §8.0)
 ///
-/// Maps to `ferrite::ops::rms_norm::{loader, consumer, launcher,
-/// storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
-/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/rms_norm.cuh`.
-/// The emit step is a pure literal `format!()` of these typed
-/// getters into the per-role kernel-call lines from
-/// `crates/ferrite-kernels/csrc/smoke/ferrite_pool_abi_smoke.cu`.
+/// Codegen inlines the four role bodies (loader / consumer /
+/// launcher / storer) directly into the emitted kernel `.cu`,
+/// calling TK primitives (`kittens::*`, `ferrite::tk::*`) and the
+/// substrate (`ferrite::SharedState`, `ss.pages`, `ss.page_ready`,
+/// `ss.page_done`, `ss.scratch`). NO ferrite-owned per-op wrapper
+/// in scope — every value spliced into the `.cu` source comes from
+/// a typed getter on this variant.
 ///
 /// ## Substrate-proof fields
 ///
@@ -364,10 +365,13 @@ impl RmsNorm {
 
 /// The typed lowered FusedQkvRopeCache variant.
 ///
-/// Kernel ABI: `ferrite::ops::fused_qkv_rope_cache::{loader,
-/// consumer, launcher, storer}<Config, HIDDEN_DIM, HEAD_DIM,
-/// NUM_Q_HEADS, NUM_KV_HEADS, BIASED, INTERLEAVED>` in
-/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/fused_qkv_rope_cache.cuh`.
+/// Codegen inlines the four role bodies directly into the kernel
+/// `.cu`, calling TK + substrate primitives. Kernel-shape template
+/// args (HIDDEN_DIM, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BIASED,
+/// INTERLEAVED) come from typed getters; runtime args (positions,
+/// cos_sin_cache, KV cache pages, slot_mapping) come from the
+/// per-variant `KernelExtras` flag set propagated to the kernel
+/// signature.
 pub struct FusedQkvRopeCache {
     in_page_id: u32,
     qkv_weight_page_id: u32,
@@ -717,9 +721,9 @@ impl Add {
 
 /// The typed lowered `FusedAddRmsNorm` variant.
 ///
-/// Kernel ABI: `ferrite::ops::fused_add_rms_norm::{loader, consumer,
-/// launcher, storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
-/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/fused_add_rms_norm.cuh`.
+/// Codegen inlines the four role bodies directly into the kernel
+/// `.cu`. Template args `<HIDDEN_DIM, NUM_TOKENS>` come from typed
+/// getters; runtime arg `eps` from `eps()`.
 pub struct FusedAddRmsNorm {
     delta_page_id: u32,
     residual_page_id: u32,
@@ -852,10 +856,10 @@ impl FusedAddRmsNorm {
 
 /// The typed lowered `FusedGateUp{Silu,Gelu}Mul` variant.
 ///
-/// Kernel ABI: `ferrite::ops::silu_upgate::{loader, consumer,
-/// launcher, storer}<Config, HIDDEN_DIM, INTERMEDIATE_DIM,
-/// NUM_TOKENS>` (silu) / `ferrite::ops::gelu_upgate::...` (gelu) in
-/// `silu_upgate.cuh` / `gelu_upgate.cuh`.
+/// Codegen inlines the role bodies directly. Template args
+/// `<HIDDEN_DIM, INTERMEDIATE_DIM, NUM_TOKENS>` come from typed
+/// getters; activation enum (`GateUpActivation::{Silu,Gelu}`)
+/// selects which TK helper sequence the codegen emits.
 pub struct FusedGateUpActivateMul {
     in_page_id: u32,
     gate_up_weight_page_id: u32,
@@ -1023,12 +1027,11 @@ impl FusedGateUpActivateMul {
 
 /// `Embed` (vocab table lookup) variant.
 ///
-/// Kernel ABI: `ferrite::ops::embed::{loader, consumer, launcher,
-/// storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
-/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/embed.cuh`. The
-/// vocab table (size `VOCAB_SIZE × HIDDEN_DIM`) is loaded from
-/// `weight_ptrs[weight_accessor_idx * NUM_LAYERS + 0]` (embed has
-/// no per-layer indexing — `LAYER` is always 0).
+/// Codegen inlines the role bodies; loader pulls one row of
+/// `weight_ptrs[weight_accessor_idx * NUM_LAYERS + 0]` per token
+/// (LAYER is always 0 for Embed). The vocab table is sized
+/// `VOCAB_SIZE × HIDDEN_DIM`. Loader needs `input_ids` (uint32_t*)
+/// as a kernel-level extra ptr (see `KernelExtras::needs_input_ids`).
 pub struct Embed {
     out_page_id: u32,
     embed_weight_page_id: u32,
@@ -1294,9 +1297,9 @@ impl TanhSoftCap {
 
 /// `ScalarOffsetRmsNorm` variant.
 ///
-/// Kernel ABI: `ferrite::ops::rms_norm_offset::{loader, consumer,
-/// launcher, storer}<Config, HIDDEN_DIM, NUM_TOKENS>` in
-/// `crates/ferrite-kernels/csrc/tk/ferrite_kernels/rms_norm_offset.cuh`.
+/// Codegen inlines the role bodies. Same TK + substrate primitives
+/// as RmsNorm plus a `float offset` runtime arg in the consumer's
+/// scale-multiply step.
 pub struct ScalarOffsetRmsNorm {
     in_page_id: u32,
     weight_page_id: u32,
@@ -1427,11 +1430,11 @@ impl ScalarOffsetRmsNorm {
 }
 
 /// `Gemm` variant. Storage erases `(n, k)` to plain u32 fields.
-/// `Gemm` variant.
 ///
-/// Kernel ABI: `ferrite::ops::gemm_bf16::{loader, consumer, launcher,
-/// storer}<Config, K, N, M>` in `gemm_bf16.cuh`. M = NUM_TOKENS at
-/// the canonical's workload point.
+/// Codegen inlines the role bodies. Template `<K, N, M>` with
+/// M = NUM_TOKENS at the canonical's workload point. The consumer's
+/// inner-product loop uses TK `wgmma`/`mma_ABt` primitives (Hopper)
+/// or warp-level register tiles (Ampere).
 pub struct Gemm {
     in_page_id: u32,
     weight_page_id: u32,
@@ -1573,11 +1576,10 @@ impl Gemm {
 /// (the output writes back to the residual buffer; no separate
 /// out_page).
 ///
-/// Kernel ABI: `ferrite::ops::down_proj_residual::{loader, consumer,
-/// launcher, storer}<Config, K, N, NUM_TOKENS, K_OFFSET, K_FULL>`
-/// in `down_proj_residual.cuh`. K_OFFSET / K_FULL support the
-/// 4-chunk down_proj split (TkGemmAdd path); the un-split case has
-/// K_OFFSET = 0, K_FULL = K.
+/// Codegen inlines the role bodies. Template
+/// `<K, N, NUM_TOKENS, K_OFFSET, K_FULL>`. K_OFFSET / K_FULL
+/// support the 4-chunk down_proj split (TkGemmAdd path); the
+/// un-split case has K_OFFSET = 0, K_FULL = K.
 pub struct FusedCublasGemmAdd {
     in_page_id: u32,
     weight_page_id: u32,
@@ -1751,10 +1753,10 @@ impl FusedCublasGemmAdd {
 /// fields (page bounds, scratch budget, phase parity, n/k > 0) are
 /// const-generic.
 ///
-/// Kernel ABI: `ferrite::ops::lm_head::{loader, consumer, launcher,
-/// storer}<Config, K, N, NUM_TOKENS>` in `lm_head.cuh`. The norm
-/// kind selects between the four lm_head dispatch entry points
-/// (RmsNorm, AddRmsNorm, MeanSubRmsNorm, AddScalarOffsetRmsNorm).
+/// Codegen inlines the role bodies. Template `<K, N, NUM_TOKENS>`
+/// with NUM_TOKENS = 1 today. The `norm_kind` enum selects which
+/// fused-norm sequence the codegen emits (RmsNorm / AddRmsNorm /
+/// MeanSubRmsNorm / AddScalarOffsetRmsNorm).
 pub struct CutlassFusedNormGemm {
     in_page_id: u32,
     delta_page_id: Option<u32>,
@@ -2099,12 +2101,13 @@ impl CutlassFusedNormGemm {
 /// `AttentionViaCacheNode` (covers `AttentionViaCache` and
 /// `SlidingAttentionViaCache`).
 ///
-/// Kernel ABI: `ferrite::ops::attention_partial::{loader, consumer,
-/// launcher, storer}<Config, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
-/// BLOCK_SIZE, NUM_TOKENS, SPLITS, SLIDING_WINDOW, HAS_SOFTCAP,
-/// MAX_SK>` in `attention_partial.cuh`. `attention_reduction.cuh`
-/// fans the splits back together (SPLITS=1 today; SPLITS>1 is a
-/// future iteration).
+/// Codegen inlines the four role bodies. Template arg list:
+/// `<HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, NUM_TOKENS,
+/// SPLITS, SLIDING_WINDOW, HAS_SOFTCAP, MAX_SK>`. `kind`
+/// (Full/Sliding) → SLIDING_WINDOW; `attn_softcap > 0` →
+/// HAS_SOFTCAP. SPLITS = 1 today; SPLITS > 1 fans through a
+/// reduction step that the codegen will splice as a second per-tile
+/// pass.
 pub struct AttentionViaCacheNode {
     q_in_page_id: u32,
     attn_out_page_id: u32,

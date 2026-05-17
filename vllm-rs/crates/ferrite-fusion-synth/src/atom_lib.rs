@@ -651,21 +651,32 @@ impl Atom for SiluMulAtom {
 
         let t_act = ctx.t_act;
 
+        // Pass-loop over HEAD_DIM-axis (same shape-decoupling as
+        // AffineQmvAtom / RopeAppendAtom). At NUM_PASSES=1 (legacy
+        // `threads_per_tg = 4*HEAD_DIM`) the loop runs once and emit
+        // is byte-equivalent to pre-decoupling. NUM_PASSES > 1 (e.g.
+        // HEAD_DIM=128 at threads_per_tg=256 in the whole-forward
+        // megakernel) iterates to cover the full HEAD_DIM tile.
         Some(format!(
             r#"
     // --- atom: SiluMul ---
     {{
         if (__simd_lid == 0) {{
-            const uint __base_d = __simd_gid * MK_ROWS_PER_SIMDGROUP;
+            const uint __silu_rows_per_pass = __num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+            const uint __silu_num_passes    = __head_dim / __silu_rows_per_pass;
             device {t_act}* __out_row = {out}
                 + (size_t)__t    * (size_t)__intermediate
                 + (size_t)__head * (size_t)__head_dim;
-            for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++) {{
-                const uint __d  = __base_d + (uint)__r;
-                const float __gv = {g}[__d];
-                const float __uv = {u}[__d];
-                const float __sg = __gv / (1.0f + exp(-__gv));
-                __out_row[__d] = {t_act}(__sg * __uv);
+            for (uint __silu_pass = 0u; __silu_pass < __silu_num_passes; ++__silu_pass) {{
+                const uint __base_d = __silu_pass * __silu_rows_per_pass
+                                    + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+                for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++) {{
+                    const uint __d  = __base_d + (uint)__r;
+                    const float __gv = {g}[__d];
+                    const float __uv = {u}[__d];
+                    const float __sg = __gv / (1.0f + exp(-__gv));
+                    __out_row[__d] = {t_act}(__sg * __uv);
+                }}
             }}
         }}
     }}

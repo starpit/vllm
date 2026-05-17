@@ -2855,9 +2855,125 @@ pub fn synthesize_forward_decode(
         gs = c.group_size, hd = c.head_dim, t = threads_per_tg, nl = consts.num_layers,
     );
 
+    // ── mlp_pre_down body: post-attn AddRmsNorm + gate/up qmv + silu_mul
+    //
+    // Phase order:
+    //   1. Post-attn RmsNorm (init=true variant: no delta add — the
+    //      residual was already updated by o_proj). Reads __residual,
+    //      writes __x_norm.
+    //   2. Tile-loop over `intermediate / head_dim` tiles. Each tile
+    //      runs two qmvs (gate, up) into separate TG buffers
+    //      (__gate_smem, __up_smem) then a SiluMul writing one
+    //      HEAD_DIM slice of __mlp_scratch at
+    //      [__t*intermediate + tile*head_dim, +head_dim).
+    //
+    // Buffers added at this phase:
+    //   - __postattn_rms_w (PerLayerWeights id 16): post-attn rmsnorm
+    //   - __gate_w/s/b (ids 17-19)
+    //   - __up_w/s/b   (ids 20-22)
+    //   - __mlp_scratch (kernel arg): [tokens, intermediate]
+    //   - __gate_smem, __up_smem: TG memory (HEAD_DIM floats each)
+    //
+    // Constraint: intermediate must be a multiple of head_dim. Llama /
+    // Qwen / Mistral all satisfy (intermediate = 8192 = 128*64 for 1B,
+    // 8192 = 64*128 for 3B). Asserted at synth time.
+    assert!(
+        c.intermediate > 0 && c.intermediate % c.head_dim == 0,
+        "mlp_pre_down phase requires intermediate > 0 AND intermediate ({}) divisible by head_dim ({})",
+        c.intermediate, c.head_dim,
+    );
+    let postattn_rms_buf = "__postattn_rms_w";
+    let gate_wt_buf = "__gate_w"; let gate_sc_buf = "__gate_s"; let gate_bi_buf = "__gate_b";
+    let up_wt_buf   = "__up_w";   let up_sc_buf   = "__up_s";   let up_bi_buf   = "__up_b";
+    let mlp_scratch = "__mlp_scratch";
+    let gate_smem   = "__gate_smem";
+    let up_smem     = "__up_smem";
+
+    let addrms_init = AddRmsNormAtom { init: true };
+    let qmv_gate = AffineQmvAtom {
+        group_size: c.group_size, local_head_expr: "__head", has_linear_bias: false,
+    };
+    let qmv_up = AffineQmvAtom {
+        group_size: c.group_size, local_head_expr: "__head", has_linear_bias: false,
+    };
+    let silu_mul = SiluMulAtom;
+
+    // Constants slice for MLP phase must include INTERMEDIATE — the
+    // SiluMul atom references `__intermediate` and the qmv atoms
+    // implicitly assume tile addressing is in intermediate-sized rows.
+    let mlp_constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
+        ("HIDDEN",       AtomConstantValue::Uint(c.hidden)),
+        ("NUM_Q",        AtomConstantValue::Uint(c.num_q_heads)),
+        ("NUM_KV",       AtomConstantValue::Uint(c.num_kv_heads)),
+        ("HEAD_DIM",     AtomConstantValue::Uint(c.head_dim)),
+        ("INTERMEDIATE", AtomConstantValue::Uint(c.intermediate)),
+        ("ROT_DIM",      AtomConstantValue::Uint(c.rot_dim)),
+        ("BLOCK_SIZE",   AtomConstantValue::Uint(c.block_size)),
+        ("M",            AtomConstantValue::Uint(c.m)),
+        ("EPS",          AtomConstantValue::Float(c.rms_norm_eps)),
+    ];
+
+    let addrms_postattn_in = vec![
+        residual_io.to_string(), residual_io.to_string(),
+        postattn_rms_buf.to_string(),
+    ];
+    let addrms_postattn_out = vec![x_norm_name.to_string()];
+    let addrms_postattn_ctx = AtomCtx {
+        bound_inputs: &addrms_postattn_in, bound_outputs: &addrms_postattn_out,
+        constants: &mlp_constants_slice, t_act, t_scale,
+    };
+    let addrms_postattn_body = addrms_init.emit_metal_body(&addrms_postattn_ctx)
+        .expect("AddRmsNormAtom (post-attn init) Metal emit");
+
+    let emit_mlp_qmv_body = |atom: &AffineQmvAtom, w: &str, s: &str, b: &str, out_name: &str| -> String {
+        let band_in = vec![
+            x_norm_name.to_string(), w.to_string(), s.to_string(), b.to_string(),
+        ];
+        let band_out = vec![out_name.to_string()];
+        let band_ctx = AtomCtx {
+            bound_inputs: &band_in, bound_outputs: &band_out,
+            constants: &mlp_constants_slice, t_act, t_scale,
+        };
+        atom.emit_metal_body(&band_ctx).expect("AffineQmvAtom (MLP gate/up) Metal emit")
+    };
+    let qmv_gate_body = emit_mlp_qmv_body(&qmv_gate, gate_wt_buf, gate_sc_buf, gate_bi_buf, gate_smem);
+    let qmv_up_body   = emit_mlp_qmv_body(&qmv_up,   up_wt_buf,   up_sc_buf,   up_bi_buf,   up_smem);
+
+    let silu_mul_in  = vec![gate_smem.to_string(), up_smem.to_string()];
+    let silu_mul_out = vec![mlp_scratch.to_string()];
+    let silu_mul_ctx = AtomCtx {
+        bound_inputs: &silu_mul_in, bound_outputs: &silu_mul_out,
+        constants: &mlp_constants_slice, t_act, t_scale,
+    };
+    let silu_mul_body = silu_mul.emit_metal_body(&silu_mul_ctx)
+        .expect("SiluMulAtom Metal emit");
+
+    let mlp_body = format!(
+        r#"
+        // Post-attn RmsNorm: rmsnorm(residual) → x_norm. No delta add.
+        // init=true skips the residual+delta accumulation; just reads
+        // __residual, computes rms scale, writes scaled values to
+        // x_norm. Runs on ALL TGs (the AddRmsNorm body is per-token
+        // and head-agnostic; redundant work across TGs is wasted CPU
+        // but harmless — to be optimized via head-split later).
+        {addrms_postattn_body}
+
+        // Tile-loop: each TG owns `ceil(intermediate/head_dim / num_tgs)`
+        // tiles. Each tile runs gate qmv → gate_smem, up qmv → up_smem,
+        // then SiluMul writes a HEAD_DIM slice of __mlp_scratch.
+        const uint __mlp_tiles = INTERMEDIATE / __head_dim;
+        for (uint __head = __tg_id; __head < __mlp_tiles; __head += num_tgs) {{
+            {qmv_gate_body}
+            {qmv_up_body}
+            {silu_mul_body}
+        }}
+"#,
+    );
+
     let barrier_after_pre_attn = cross_tg_barrier_msl(0, "__barrier_counter");
     let barrier_after_attn     = cross_tg_barrier_msl(1, "__barrier_counter");
     let barrier_after_o_proj   = cross_tg_barrier_msl(2, "__barrier_counter");
+    let barrier_after_mlp      = cross_tg_barrier_msl(3, "__barrier_counter");
 
     let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
@@ -2894,9 +3010,13 @@ struct PerLayerWeights {{
     device const uint32_t*  o_weight          [[id(13)]];
     device const {t_scale}* o_scales          [[id(14)]];
     device const {t_scale}* o_biases          [[id(15)]];
-    // TODO post-attn rmsnorm weight (id 16)
-    // TODO gate weight/scales/biases     (id 17-19)
-    // TODO up   weight/scales/biases     (id 20-22)
+    device const {t_scale}* postattn_rms_w    [[id(16)]];
+    device const uint32_t*  gate_weight       [[id(17)]];
+    device const {t_scale}* gate_scales       [[id(18)]];
+    device const {t_scale}* gate_biases       [[id(19)]];
+    device const uint32_t*  up_weight         [[id(20)]];
+    device const {t_scale}* up_scales         [[id(21)]];
+    device const {t_scale}* up_biases         [[id(22)]];
     // TODO down weight/scales/biases     (id 23-25)
 }};
 "#,
@@ -2909,10 +3029,11 @@ struct PerLayerWeights {{
 constant constexpr uint  HIDDEN     = {hidden_lit}u;
 constant constexpr uint  NUM_Q      = {num_q_lit}u;
 constant constexpr uint  NUM_KV     = {num_kv_lit}u;
-constant constexpr uint  HEAD_DIM   = {head_dim_lit}u;
-constant constexpr uint  ROT_DIM    = {rot_dim_lit}u;
-constant constexpr uint  BLOCK_SIZE = {block_size_lit}u;
-constant constexpr uint  NUM_LAYERS = {num_layers_lit}u;
+constant constexpr uint  HEAD_DIM     = {head_dim_lit}u;
+constant constexpr uint  ROT_DIM      = {rot_dim_lit}u;
+constant constexpr uint  BLOCK_SIZE   = {block_size_lit}u;
+constant constexpr uint  INTERMEDIATE = {intermediate_lit}u;
+constant constexpr uint  NUM_LAYERS   = {num_layers_lit}u;
 constant constexpr float EPS        = {eps_lit}f;
 constant constexpr float ATTN_SCALE_BAKED = {attn_scale_lit}f;
 constant uint  M                  [[function_constant(0)]];
@@ -2931,10 +3052,11 @@ void {symbol}(
     device       {t_act}*         {residual_io}        [[buffer(2)]],
     device       {t_act}*         {q_out_buf}      [[buffer(3)]],
     device       {t_act}*         {attn_out_buf}    [[buffer(4)]],
-    device const uint*            {positions_buf}  [[buffer(5)]],
-    device const uint*            {slot_map_buf}   [[buffer(6)]],
-    device const uint*            {seq_used_k} [[buffer(7)]],
-    device const uint*            {block_table} [[buffer(8)]],
+    device       {t_act}*         {mlp_scratch}    [[buffer(5)]],
+    device const uint*            {positions_buf}  [[buffer(6)]],
+    device const uint*            {slot_map_buf}   [[buffer(7)]],
+    device const uint*            {seq_used_k} [[buffer(8)]],
+    device const uint*            {block_table} [[buffer(9)]],
     uint3 __tg_pos    [[threadgroup_position_in_grid]],
     uint3 __tgs_per_grid [[threadgroups_per_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
@@ -2950,6 +3072,7 @@ void {symbol}(
     const uint __rot_dim          = ROT_DIM;
     const uint __half_dim         = __rot_dim / 2;
     const uint __block_sz         = BLOCK_SIZE;
+    const uint __intermediate     = INTERMEDIATE;
     const uint __num_heads_total  = __num_q + 2u * __num_kv;
     const uint __threads_per_tg   = {threads_per_tg_lit}u;
     const uint __num_simdgroups   = {num_simdgroups_lit}u;
@@ -2964,6 +3087,10 @@ void {symbol}(
     threadgroup {t_act} {x_norm_name}[__HIDDEN_MAX];
     threadgroup float   __scratch  [__SCRATCH_MAX];
     threadgroup float   {qmv_smem_name}[__HEAD_DIM_MAX];
+    // gate/up TG-mem staging buffers for the SiluMul atom inside
+    // mlp_pre_down. Each holds HEAD_DIM floats per tile.
+    threadgroup float   {gate_smem}[__HEAD_DIM_MAX];
+    threadgroup float   {up_smem}[__HEAD_DIM_MAX];
 
     // For now `__t = 0` for single-token decode (M=1). When batched
     // decode lands, an outer tile loop covers the token axis too.
@@ -2988,6 +3115,13 @@ void {symbol}(
         device const uint32_t*  {o_wt_buf}   = __layer_table[__layer].o_weight;
         device const {t_scale}* {o_sc_buf}   = __layer_table[__layer].o_scales;
         device const {t_scale}* {o_bi_buf}   = __layer_table[__layer].o_biases;
+        device const {t_scale}* {postattn_rms_buf} = __layer_table[__layer].postattn_rms_w;
+        device const uint32_t*  {gate_wt_buf} = __layer_table[__layer].gate_weight;
+        device const {t_scale}* {gate_sc_buf} = __layer_table[__layer].gate_scales;
+        device const {t_scale}* {gate_bi_buf} = __layer_table[__layer].gate_biases;
+        device const uint32_t*  {up_wt_buf}   = __layer_table[__layer].up_weight;
+        device const {t_scale}* {up_sc_buf}   = __layer_table[__layer].up_scales;
+        device const {t_scale}* {up_bi_buf}   = __layer_table[__layer].up_biases;
 
         // ── phase 0: pre-attn (AddRmsNorm + QKV qmv + RopeAppend) ──
         // Tile-loop over (token, head) — token axis is M=1 today so
@@ -3015,9 +3149,11 @@ void {symbol}(
         {o_proj_body}
         {barrier_after_o_proj}
 
-        // ── phase 3: mlp_pre_down (TODO) ──
+        // ── phase 3: mlp_pre_down (post-attn RmsNorm + gate/up qmv + silu_mul) ──
+        {mlp_body}
+        {barrier_after_mlp}
 
-        // ── phase 4: down_proj (TODO) ──
+        // ── phase 4: down_proj (TODO: medium-N qmm: mlp_scratch → residual) ──
     }}
 
     // ── final: rmsnorm + lm_head (TODO) ──
@@ -3048,9 +3184,17 @@ void {symbol}(
         barrier_after_pre_attn = barrier_after_pre_attn,
         barrier_after_attn = barrier_after_attn,
         barrier_after_o_proj = barrier_after_o_proj,
+        barrier_after_mlp = barrier_after_mlp,
         attn_body = attn_body,
         o_proj_body = o_proj_body,
+        mlp_body = mlp_body,
         o_wt_buf = o_wt_buf, o_sc_buf = o_sc_buf, o_bi_buf = o_bi_buf,
+        postattn_rms_buf = postattn_rms_buf,
+        gate_wt_buf = gate_wt_buf, gate_sc_buf = gate_sc_buf, gate_bi_buf = gate_bi_buf,
+        up_wt_buf = up_wt_buf,     up_sc_buf = up_sc_buf,     up_bi_buf = up_bi_buf,
+        mlp_scratch = mlp_scratch,
+        gate_smem = gate_smem, up_smem = up_smem,
+        intermediate_lit = c.intermediate,
         threads_per_tg_lit = threads_per_tg,
         num_simdgroups_lit = num_simdgroups,
         hidden_lit = c.hidden,
@@ -3328,7 +3472,9 @@ mod tests {
 
         // Layer loop in MSL — the structural target.
         assert!(kernel.source.contains("for (uint __layer = 0u; __layer < NUM_LAYERS"));
-        assert!(kernel.source.contains("constant constexpr uint  NUM_LAYERS = 16u"));
+        assert!(kernel.source.contains("NUM_LAYERS   = 16u"));
+        // INTERMEDIATE baked at synth time (needed by SiluMul + tile bound).
+        assert!(kernel.source.contains("INTERMEDIATE = 8192u"));
 
         // MTLArgumentBuffer struct + per-layer indexing.
         assert!(kernel.source.contains("struct PerLayerWeights"));
@@ -3337,12 +3483,13 @@ mod tests {
         assert!(kernel.source.contains("device const PerLayerWeights*"));
 
         // Phase scaffolding: pre_attn body + barrier + attention body +
-        // barrier + o_proj body + barrier. (Phase comments + atom
-        // markers.) Phases mlp_pre_down / down_proj / lm_head are
-        // still TODO stubs.
+        // barrier + o_proj body + barrier + mlp_pre_down body +
+        // barrier. (Phase comments + atom markers.) Phases down_proj
+        // and lm_head are still TODO stubs.
         assert!(kernel.source.contains("phase 0: pre-attn"));
         assert!(kernel.source.contains("phase 1: BN=8 in-kernel attention"));
         assert!(kernel.source.contains("phase 2: o_proj"));
+        assert!(kernel.source.contains("phase 3: mlp_pre_down"));
         assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));   // AddRmsNorm atom
         assert!(kernel.source.contains("mk_qdot"));                // AffineQmv atom
         assert!(kernel.source.contains("mk_rope_pair"));           // RopeAppend atom
@@ -3351,12 +3498,20 @@ mod tests {
         // add-back of qmv result.
         assert!(kernel.source.contains("__o_proj_tiles = __hidden / __head_dim"));
         assert!(kernel.source.contains("o_weight          [[id(13)]]"));
+        // mlp_pre_down-specific: tile loop over intermediate/head_dim,
+        // gate/up TG buffers, post-attn rms weight at id 16.
+        assert!(kernel.source.contains("__mlp_tiles = INTERMEDIATE / __head_dim"));
+        assert!(kernel.source.contains("__gate_smem"));
+        assert!(kernel.source.contains("__up_smem"));
+        assert!(kernel.source.contains("postattn_rms_w    [[id(16)]]"));
 
-        // Three cross-TG barriers (after pre_attn, attention, o_proj).
-        // Phases mlp/down/lm_head land next; their barriers come with.
+        // Four cross-TG barriers (after pre_attn, attention, o_proj,
+        // mlp_pre_down). Phases down_proj/lm_head land next; their
+        // barriers come with.
         assert!(kernel.source.contains("cross-TG barrier (phase 0)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 1)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 2)"));
+        assert!(kernel.source.contains("cross-TG barrier (phase 3)"));
 
         // Each phase wraps its work in a tile-loop sharded across TGs.
         // Pre-attn iterates over `num_heads_total`, attention over

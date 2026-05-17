@@ -46,8 +46,8 @@ pub mod tape;
 
 pub use lower::{ArriveCount, LowerError, MegaTapeBuilder};
 pub use nodes::{
-    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
-    Embed, FiniteF32, FusedAddRmsNorm, FusedCublasGemmAdd, FusedGateUpActivateMul,
+    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, Embed, FiniteF32,
+    FusedAddRmsNorm, FusedGateUpActivateMul, TkFusedGemmAdd, TkFusedNormGemm,
     FusedQkvRopeCache, GateUpActivation, Gemm, LayerIndex, LmHeadNormKind, MatmulShape, MegaNode,
     RmsNorm, RotaryRef, ScalarMul, ScalarOffsetRmsNorm, SlidingWindow, SpliceMmEmbeds, TanhSoftCap,
     WeightRef,

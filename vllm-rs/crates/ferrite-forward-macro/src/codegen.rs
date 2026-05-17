@@ -6234,7 +6234,7 @@ fn dispatch_instruction_to_push(
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
-                b.push_fused_cublas_gemm_add(
+                b.push_tk_fused_gemm_add(
                     ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
                     ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
                     ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
@@ -6433,7 +6433,7 @@ fn emit_lm_head_no_delta(
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
-        b.push_cutlass_fused_norm_gemm_no_delta(
+        b.push_tk_fused_norm_gemm_no_delta(
             ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
             ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
             ::ferrite_forward::mega_ir::PageId::<#norm_w_id, #num_pages_lit>::new(),
@@ -6522,7 +6522,7 @@ fn emit_lm_head_with_delta(
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
-        b.push_cutlass_fused_norm_gemm_with_delta(
+        b.push_tk_fused_norm_gemm_with_delta(
             ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
             ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
             ::ferrite_forward::mega_ir::PageId::<#delta_id, #num_pages_lit>::new(),

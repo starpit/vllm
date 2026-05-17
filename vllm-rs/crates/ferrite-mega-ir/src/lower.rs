@@ -52,8 +52,8 @@
 #![allow(dead_code)]
 
 use crate::nodes::{
-    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, CutlassFusedNormGemm,
-    Embed, FiniteF32, FusedAddRmsNorm, FusedCublasGemmAdd, FusedGateUpActivateMul,
+    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, TkFusedNormGemm,
+    Embed, FiniteF32, FusedAddRmsNorm, TkFusedGemmAdd, FusedGateUpActivateMul,
     FusedQkvRopeCache, GateUpActivation, Gemm, LmHeadNormKind, MegaNode, RmsNorm, RotaryRef,
     ScalarMul, ScalarOffsetRmsNorm, SpliceMmEmbeds, TanhSoftCap, WeightRef,
 };
@@ -998,7 +998,7 @@ impl<
         self
     }
 
-    /// Push a typed `FusedCublasGemmAdd` onto the tape. Substrate
+    /// Push a typed `TkFusedGemmAdd` onto the tape. Substrate
     /// shape: 3 pages (in / weight / residual=output), `GemmScope`
     /// B-tile, multi-iter. The residual page is read AND written
     /// (in-place residual fold after the gemm).
@@ -1008,7 +1008,7 @@ impl<
     /// / K_FULL drive the down_proj 4-chunk split (TkGemmAdd path);
     /// the un-split case has K_OFFSET = 0, K_FULL = K.
     #[allow(clippy::too_many_arguments)]
-    pub fn push_fused_cublas_gemm_add<
+    pub fn push_tk_fused_gemm_add<
         const IN_ID: u32,
         const WEIGHT_ID: u32,
         const RESIDUAL_ID: u32,
@@ -1053,12 +1053,12 @@ impl<
         >,
         weight_path: String,
     ) -> &mut Self {
-        self.verify_arrives(ARRIVES, "push_fused_cublas_gemm_add");
+        self.verify_arrives(ARRIVES, "push_tk_fused_gemm_add");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
         let _ = self.pool.take(RESIDUAL_ID);
         let weight = WeightRef::new(weight_path);
-        let node = FusedCublasGemmAdd::new::<
+        let node = TkFusedGemmAdd::new::<
             IN_ID,
             WEIGHT_ID,
             RESIDUAL_ID,
@@ -1081,7 +1081,7 @@ impl<
             RESIDUAL_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
         >(weight);
-        self.nodes.push(MegaNode::FusedCublasGemmAdd(node));
+        self.nodes.push(MegaNode::TkFusedGemmAdd(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
         self.pool.release(RESIDUAL_ID);
@@ -1091,13 +1091,13 @@ impl<
         self
     }
 
-    /// Push a typed `CutlassFusedNormGemm` for the no-delta flavors
+    /// Push a typed `TkFusedNormGemm` for the no-delta flavors
     /// (RmsNorm, MeanSubRmsNorm). AST-shape const generics:
     /// NUM_TOKENS, IN_ACT_SLOT, OUT_ACT_SLOT,
     /// NORM_WEIGHT_ACCESSOR_IDX, LINEAR_WEIGHT_ACCESSOR_IDX. Runtime
     /// `eps` for the kernel's consumer eps arg.
     #[allow(clippy::too_many_arguments)]
-    pub fn push_cutlass_fused_norm_gemm_no_delta<
+    pub fn push_tk_fused_norm_gemm_no_delta<
         const IN_ID: u32,
         const NORM_W_ID: u32,
         const LIN_W_ID: u32,
@@ -1152,7 +1152,7 @@ impl<
         norm_kind: LmHeadNormKind,
         eps: f32,
     ) -> &mut Self {
-        self.verify_arrives(ARRIVES, "push_cutlass_fused_norm_gemm_no_delta");
+        self.verify_arrives(ARRIVES, "push_tk_fused_norm_gemm_no_delta");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(NORM_W_ID);
         let _ = self.pool.take(LIN_W_ID);
@@ -1160,7 +1160,7 @@ impl<
         let norm_weight = WeightRef::new(norm_weight_path);
         let linear_weight = WeightRef::new(linear_weight_path);
         let eps = FiniteF32::new(eps);
-        let node = CutlassFusedNormGemm::new_no_delta::<
+        let node = TkFusedNormGemm::new_no_delta::<
             IN_ID,
             NORM_W_ID,
             LIN_W_ID,
@@ -1185,7 +1185,7 @@ impl<
             NORM_WEIGHT_ACCESSOR_IDX,
             LINEAR_WEIGHT_ACCESSOR_IDX,
         >(norm_weight, linear_weight, norm_kind, eps);
-        self.nodes.push(MegaNode::CutlassFusedNormGemm(node));
+        self.nodes.push(MegaNode::TkFusedNormGemm(node));
         self.pool.release(IN_ID);
         self.pool.release(NORM_W_ID);
         self.pool.release(LIN_W_ID);
@@ -1196,13 +1196,13 @@ impl<
         self
     }
 
-    /// Push a typed `CutlassFusedNormGemm` for the residual-fold
+    /// Push a typed `TkFusedNormGemm` for the residual-fold
     /// flavors (AddRmsNorm, AddScalarOffsetRmsNorm). AST-shape:
     /// NUM_TOKENS, IN_ACT_SLOT, DELTA_ACT_SLOT, OUT_ACT_SLOT,
     /// NORM_WEIGHT_ACCESSOR_IDX, LINEAR_WEIGHT_ACCESSOR_IDX. Runtime
     /// `eps`; offset present only for AddScalarOffsetRmsNorm.
     #[allow(clippy::too_many_arguments)]
-    pub fn push_cutlass_fused_norm_gemm_with_delta<
+    pub fn push_tk_fused_norm_gemm_with_delta<
         const IN_ID: u32,
         const DELTA_ID: u32,
         const NORM_W_ID: u32,
@@ -1262,7 +1262,7 @@ impl<
         offset: Option<f32>,
         eps: f32,
     ) -> &mut Self {
-        self.verify_arrives(ARRIVES, "push_cutlass_fused_norm_gemm_with_delta");
+        self.verify_arrives(ARRIVES, "push_tk_fused_norm_gemm_with_delta");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(DELTA_ID);
         let _ = self.pool.take(NORM_W_ID);
@@ -1272,7 +1272,7 @@ impl<
         let linear_weight = WeightRef::new(linear_weight_path);
         let offset = offset.map(FiniteF32::new);
         let eps = FiniteF32::new(eps);
-        let node = CutlassFusedNormGemm::new_with_delta::<
+        let node = TkFusedNormGemm::new_with_delta::<
             IN_ID,
             DELTA_ID,
             NORM_W_ID,
@@ -1299,7 +1299,7 @@ impl<
             NORM_WEIGHT_ACCESSOR_IDX,
             LINEAR_WEIGHT_ACCESSOR_IDX,
         >(norm_weight, linear_weight, norm_kind, offset, eps);
-        self.nodes.push(MegaNode::CutlassFusedNormGemm(node));
+        self.nodes.push(MegaNode::TkFusedNormGemm(node));
         self.pool.release(IN_ID);
         self.pool.release(DELTA_ID);
         self.pool.release(NORM_W_ID);
@@ -2022,7 +2022,7 @@ mod tests {
             NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
         };
         let mut b = BuilderD::new();
-        b.push_cutlass_fused_norm_gemm_no_delta::<
+        b.push_tk_fused_norm_gemm_no_delta::<
             0, 1, 2, 3,
             0, 32, 4096, 4096,
             0, 1, 1, 0,
@@ -2054,7 +2054,7 @@ mod tests {
             1.0e-5_f32,
         );
         let tape = b.finish(16);
-        let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
+        let MegaNode::TkFusedNormGemm(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.norm_kind, LmHeadNormKind::RmsNorm);
@@ -2068,7 +2068,7 @@ mod tests {
             NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
         };
         let mut b = BuilderD::new();
-        b.push_cutlass_fused_norm_gemm_with_delta::<
+        b.push_tk_fused_norm_gemm_with_delta::<
             0, 1, 2, 3, 4,
             0, 32, 4096, 4096,
             0, 1, 1, 0,
@@ -2103,7 +2103,7 @@ mod tests {
             1.0e-5_f32,
         );
         let tape = b.finish(16);
-        let MegaNode::CutlassFusedNormGemm(n) = &tape.nodes()[0] else {
+        let MegaNode::TkFusedNormGemm(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.norm_kind, LmHeadNormKind::AddScalarOffsetRmsNorm);
@@ -2119,7 +2119,7 @@ mod tests {
             NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
         };
         let mut b = BuilderD::new();
-        b.push_cutlass_fused_norm_gemm_with_delta::<
+        b.push_tk_fused_norm_gemm_with_delta::<
             0, 1, 2, 3, 4,
             0, 32, 4096, 4096,
             0, 1, 1, 0,

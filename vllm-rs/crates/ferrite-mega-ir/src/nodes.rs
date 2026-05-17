@@ -1874,17 +1874,17 @@ impl Gemm {
     }
 }
 
-/// `Instruction::FusedCublasGemmAdd(in, residual, layer, n, k)` —
-/// `residual += gemm(in, weight[layer])` in place. Substrate shape
-/// is `Gemm` plus a `residual_page` that's read AND written
-/// (the output writes back to the residual buffer; no separate
-/// out_page).
+/// TK-emit variant for the frontend `Instruction::TkFusedGemmAdd(in,
+/// residual, layer, n, k)` → `residual += gemm(in, weight[layer])` in
+/// place. Substrate shape is `TkGemm` plus a `residual_page` that's
+/// read AND written (the output writes back to the residual buffer;
+/// no separate out_page).
 ///
 /// Codegen inlines the role bodies. Template
 /// `<K, N, NUM_TOKENS, K_OFFSET, K_FULL>`. K_OFFSET / K_FULL
-/// support the 4-chunk down_proj split (TkGemmAdd path); the
-/// un-split case has K_OFFSET = 0, K_FULL = K.
-pub struct FusedCublasGemmAdd {
+/// support the 4-chunk down_proj split (`TkGemmAdd` frontend path);
+/// the un-split case has K_OFFSET = 0, K_FULL = K.
+pub struct TkFusedGemmAdd {
     in_page: crate::substrate::PageRef,
     weight_page: crate::substrate::PageRef,
     residual_page: crate::substrate::PageRef,
@@ -1905,7 +1905,7 @@ pub struct FusedCublasGemmAdd {
     pub weight: WeightRef,
 }
 
-impl FusedCublasGemmAdd {
+impl TkFusedGemmAdd {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const IN_ID: u32,
@@ -1933,41 +1933,41 @@ impl FusedCublasGemmAdd {
         weight: WeightRef,
     ) -> Self {
         const {
-            assert!(IN_ID < NUM_PAGES, "FusedCublasGemmAdd: IN_ID OOB");
-            assert!(WEIGHT_ID < NUM_PAGES, "FusedCublasGemmAdd: WEIGHT_ID OOB");
+            assert!(IN_ID < NUM_PAGES, "TkFusedGemmAdd: IN_ID OOB");
+            assert!(WEIGHT_ID < NUM_PAGES, "TkFusedGemmAdd: WEIGHT_ID OOB");
             assert!(
                 RESIDUAL_ID < NUM_PAGES,
-                "FusedCublasGemmAdd: RESIDUAL_ID OOB"
+                "TkFusedGemmAdd: RESIDUAL_ID OOB"
             );
             assert!(
                 IN_ID != WEIGHT_ID && IN_ID != RESIDUAL_ID && WEIGHT_ID != RESIDUAL_ID,
-                "FusedCublasGemmAdd: page alias"
+                "TkFusedGemmAdd: page alias"
             );
             let end = (B_TILE_OFF as u64) + (B_TILE_BYTES as u64);
             assert!(
                 end <= SCRATCH_BYTES as u64,
-                "FusedCublasGemmAdd: b_tile OOB scratch budget"
+                "TkFusedGemmAdd: b_tile OOB scratch budget"
             );
-            assert!(ITERS > 0, "FusedCublasGemmAdd: ITERS must be > 0");
-            assert!(LAYER < NUM_LAYERS, "FusedCublasGemmAdd: LAYER OOB");
-            assert!(N > 0, "FusedCublasGemmAdd: N must be > 0");
-            assert!(K > 0, "FusedCublasGemmAdd: K must be > 0");
+            assert!(ITERS > 0, "TkFusedGemmAdd: ITERS must be > 0");
+            assert!(LAYER < NUM_LAYERS, "TkFusedGemmAdd: LAYER OOB");
+            assert!(N > 0, "TkFusedGemmAdd: N must be > 0");
+            assert!(K > 0, "TkFusedGemmAdd: K must be > 0");
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
-                "FusedCublasGemmAdd: CONSUMER_PHASE parity"
+                "TkFusedGemmAdd: CONSUMER_PHASE parity"
             );
             assert!(
                 STORER_PHASE == (ARRIVES + 1) & 1,
-                "FusedCublasGemmAdd: STORER_PHASE parity"
+                "TkFusedGemmAdd: STORER_PHASE parity"
             );
             assert!(
                 NUM_TOKENS > 0,
-                "FusedCublasGemmAdd: NUM_TOKENS must be > 0"
+                "TkFusedGemmAdd: NUM_TOKENS must be > 0"
             );
-            assert!(K_FULL > 0, "FusedCublasGemmAdd: K_FULL must be > 0");
+            assert!(K_FULL > 0, "TkFusedGemmAdd: K_FULL must be > 0");
             assert!(
                 (K_OFFSET as u64) + (K as u64) <= K_FULL as u64,
-                "FusedCublasGemmAdd: K_OFFSET + K must be <= K_FULL"
+                "TkFusedGemmAdd: K_OFFSET + K must be <= K_FULL"
             );
         }
         use crate::substrate::{
@@ -2050,7 +2050,12 @@ impl FusedCublasGemmAdd {
     }
 }
 
-/// `CutlassFusedNormGemm` (lm_head fusion) variant.
+/// `TkFusedNormGemm` (lm_head fusion) variant. TK-emit-only union
+/// over the four frontend `Cutlass*` variants
+/// (`CutlassFusedRmsNormGemm`, `CutlassFusedMeanSubRmsNormGemm`,
+/// `CutlassFusedAddRmsNormGemm`, `CutlassFusedAddScalarOffsetRmsNormGemm`)
+/// — the `norm_kind` enum + optional `delta_page` / `offset` select
+/// which frontend flavor lowers to this backend node.
 ///
 /// `delta_page_id`: `Some` for AddRmsNorm / AddScalarOffsetRmsNorm.
 /// `offset`: `Some` only for AddScalarOffsetRmsNorm.
@@ -2066,7 +2071,7 @@ impl FusedCublasGemmAdd {
 /// with NUM_TOKENS = 1 today. The `norm_kind` enum selects which
 /// fused-norm sequence the codegen emits (RmsNorm / AddRmsNorm /
 /// MeanSubRmsNorm / AddScalarOffsetRmsNorm).
-pub struct CutlassFusedNormGemm {
+pub struct TkFusedNormGemm {
     in_page: crate::substrate::PageRef,
     delta_page: Option<crate::substrate::PageRef>,
     norm_weight_page: crate::substrate::PageRef,
@@ -2095,7 +2100,7 @@ pub struct CutlassFusedNormGemm {
     pub offset: Option<FiniteF32>,
 }
 
-impl CutlassFusedNormGemm {
+impl TkFusedNormGemm {
     /// Const-generic constructor for the residual-fold-free flavors
     /// (RmsNorm / MeanSubRmsNorm — `delta_page_id` = None,
     /// `offset` = None).
@@ -2131,10 +2136,10 @@ impl CutlassFusedNormGemm {
         eps: FiniteF32,
     ) -> Self {
         const {
-            assert!(IN_ID < NUM_PAGES, "CutlassFusedNormGemm: IN_ID OOB");
-            assert!(NORM_W_ID < NUM_PAGES, "CutlassFusedNormGemm: NORM_W_ID OOB");
-            assert!(LIN_W_ID < NUM_PAGES, "CutlassFusedNormGemm: LIN_W_ID OOB");
-            assert!(OUT_ID < NUM_PAGES, "CutlassFusedNormGemm: OUT_ID OOB");
+            assert!(IN_ID < NUM_PAGES, "TkFusedNormGemm: IN_ID OOB");
+            assert!(NORM_W_ID < NUM_PAGES, "TkFusedNormGemm: NORM_W_ID OOB");
+            assert!(LIN_W_ID < NUM_PAGES, "TkFusedNormGemm: LIN_W_ID OOB");
+            assert!(OUT_ID < NUM_PAGES, "TkFusedNormGemm: OUT_ID OOB");
             assert!(
                 IN_ID != NORM_W_ID
                     && IN_ID != LIN_W_ID
@@ -2142,33 +2147,33 @@ impl CutlassFusedNormGemm {
                     && NORM_W_ID != LIN_W_ID
                     && NORM_W_ID != OUT_ID
                     && LIN_W_ID != OUT_ID,
-                "CutlassFusedNormGemm: page alias"
+                "TkFusedNormGemm: page alias"
             );
             let p_end = (PARTIAL_OFF as u64) + (PARTIAL_BYTES as u64);
             let b_end = (B_TILE_OFF as u64) + (B_TILE_BYTES as u64);
             assert!(
                 p_end <= SCRATCH_BYTES as u64,
-                "CutlassFusedNormGemm: partial_sums OOB"
+                "TkFusedNormGemm: partial_sums OOB"
             );
             assert!(
                 b_end <= SCRATCH_BYTES as u64,
-                "CutlassFusedNormGemm: b_tile OOB"
+                "TkFusedNormGemm: b_tile OOB"
             );
-            assert!(ITERS > 0, "CutlassFusedNormGemm: ITERS must be > 0");
-            assert!(LAYER < NUM_LAYERS, "CutlassFusedNormGemm: LAYER OOB");
-            assert!(N > 0, "CutlassFusedNormGemm: N must be > 0");
-            assert!(K > 0, "CutlassFusedNormGemm: K must be > 0");
+            assert!(ITERS > 0, "TkFusedNormGemm: ITERS must be > 0");
+            assert!(LAYER < NUM_LAYERS, "TkFusedNormGemm: LAYER OOB");
+            assert!(N > 0, "TkFusedNormGemm: N must be > 0");
+            assert!(K > 0, "TkFusedNormGemm: K must be > 0");
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
-                "CutlassFusedNormGemm: CONSUMER_PHASE parity"
+                "TkFusedNormGemm: CONSUMER_PHASE parity"
             );
             assert!(
                 STORER_PHASE == (ARRIVES + 1) & 1,
-                "CutlassFusedNormGemm: STORER_PHASE parity"
+                "TkFusedNormGemm: STORER_PHASE parity"
             );
             assert!(
                 NUM_TOKENS > 0,
-                "CutlassFusedNormGemm: NUM_TOKENS must be > 0"
+                "TkFusedNormGemm: NUM_TOKENS must be > 0"
             );
         }
         // Runtime cross-field invariant: norm_kind must NOT carry
@@ -2177,7 +2182,7 @@ impl CutlassFusedNormGemm {
             LmHeadNormKind::RmsNorm | LmHeadNormKind::MeanSubRmsNorm => {}
             LmHeadNormKind::AddRmsNorm | LmHeadNormKind::AddScalarOffsetRmsNorm => {
                 panic!(
-                    "CutlassFusedNormGemm::new_no_delta: norm_kind requires a delta page; use new_with_delta",
+                    "TkFusedNormGemm::new_no_delta: norm_kind requires a delta page; use new_with_delta",
                 );
             }
         }
@@ -2260,11 +2265,11 @@ impl CutlassFusedNormGemm {
         eps: FiniteF32,
     ) -> Self {
         const {
-            assert!(IN_ID < NUM_PAGES, "CutlassFusedNormGemm: IN_ID OOB");
-            assert!(DELTA_ID < NUM_PAGES, "CutlassFusedNormGemm: DELTA_ID OOB");
-            assert!(NORM_W_ID < NUM_PAGES, "CutlassFusedNormGemm: NORM_W_ID OOB");
-            assert!(LIN_W_ID < NUM_PAGES, "CutlassFusedNormGemm: LIN_W_ID OOB");
-            assert!(OUT_ID < NUM_PAGES, "CutlassFusedNormGemm: OUT_ID OOB");
+            assert!(IN_ID < NUM_PAGES, "TkFusedNormGemm: IN_ID OOB");
+            assert!(DELTA_ID < NUM_PAGES, "TkFusedNormGemm: DELTA_ID OOB");
+            assert!(NORM_W_ID < NUM_PAGES, "TkFusedNormGemm: NORM_W_ID OOB");
+            assert!(LIN_W_ID < NUM_PAGES, "TkFusedNormGemm: LIN_W_ID OOB");
+            assert!(OUT_ID < NUM_PAGES, "TkFusedNormGemm: OUT_ID OOB");
             assert!(
                 IN_ID != DELTA_ID
                     && IN_ID != NORM_W_ID
@@ -2276,33 +2281,33 @@ impl CutlassFusedNormGemm {
                     && NORM_W_ID != LIN_W_ID
                     && NORM_W_ID != OUT_ID
                     && LIN_W_ID != OUT_ID,
-                "CutlassFusedNormGemm: page alias"
+                "TkFusedNormGemm: page alias"
             );
             let p_end = (PARTIAL_OFF as u64) + (PARTIAL_BYTES as u64);
             let b_end = (B_TILE_OFF as u64) + (B_TILE_BYTES as u64);
             assert!(
                 p_end <= SCRATCH_BYTES as u64,
-                "CutlassFusedNormGemm: partial_sums OOB"
+                "TkFusedNormGemm: partial_sums OOB"
             );
             assert!(
                 b_end <= SCRATCH_BYTES as u64,
-                "CutlassFusedNormGemm: b_tile OOB"
+                "TkFusedNormGemm: b_tile OOB"
             );
-            assert!(ITERS > 0, "CutlassFusedNormGemm: ITERS must be > 0");
-            assert!(LAYER < NUM_LAYERS, "CutlassFusedNormGemm: LAYER OOB");
-            assert!(N > 0, "CutlassFusedNormGemm: N must be > 0");
-            assert!(K > 0, "CutlassFusedNormGemm: K must be > 0");
+            assert!(ITERS > 0, "TkFusedNormGemm: ITERS must be > 0");
+            assert!(LAYER < NUM_LAYERS, "TkFusedNormGemm: LAYER OOB");
+            assert!(N > 0, "TkFusedNormGemm: N must be > 0");
+            assert!(K > 0, "TkFusedNormGemm: K must be > 0");
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
-                "CutlassFusedNormGemm: CONSUMER_PHASE parity"
+                "TkFusedNormGemm: CONSUMER_PHASE parity"
             );
             assert!(
                 STORER_PHASE == (ARRIVES + 1) & 1,
-                "CutlassFusedNormGemm: STORER_PHASE parity"
+                "TkFusedNormGemm: STORER_PHASE parity"
             );
             assert!(
                 NUM_TOKENS > 0,
-                "CutlassFusedNormGemm: NUM_TOKENS must be > 0"
+                "TkFusedNormGemm: NUM_TOKENS must be > 0"
             );
         }
         match (norm_kind, offset.is_some()) {
@@ -2310,15 +2315,15 @@ impl CutlassFusedNormGemm {
             | (LmHeadNormKind::AddRmsNorm, false) => {}
             (LmHeadNormKind::AddScalarOffsetRmsNorm, false) => {
                 panic!(
-                    "CutlassFusedNormGemm::new_with_delta: AddScalarOffsetRmsNorm requires Some(offset)"
+                    "TkFusedNormGemm::new_with_delta: AddScalarOffsetRmsNorm requires Some(offset)"
                 );
             }
             (LmHeadNormKind::AddRmsNorm, true) => {
-                panic!("CutlassFusedNormGemm::new_with_delta: AddRmsNorm must not carry an offset");
+                panic!("TkFusedNormGemm::new_with_delta: AddRmsNorm must not carry an offset");
             }
             (kind, _) => {
                 let _ = kind;
-                panic!("CutlassFusedNormGemm::new_with_delta: norm_kind cannot carry a delta page");
+                panic!("TkFusedNormGemm::new_with_delta: norm_kind cannot carry a delta page");
             }
         }
         use crate::substrate::{
@@ -2773,8 +2778,8 @@ pub enum MegaNode {
     TanhSoftCap(TanhSoftCap),
     ScalarOffsetRmsNorm(ScalarOffsetRmsNorm),
     Gemm(Gemm),
-    FusedCublasGemmAdd(FusedCublasGemmAdd),
-    CutlassFusedNormGemm(CutlassFusedNormGemm),
+    TkFusedGemmAdd(TkFusedGemmAdd),
+    TkFusedNormGemm(TkFusedNormGemm),
     AttentionViaCache(AttentionViaCacheNode),
     BarrierSignal(BarrierSignal),
     BarrierWait(BarrierWait),

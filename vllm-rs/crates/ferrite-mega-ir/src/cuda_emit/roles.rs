@@ -1,0 +1,257 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Per-`MegaNode` role-body emit. Sprint 1: RmsNorm only.
+//!
+//! Each variant's emit fn pulls typed-getter values from the node
+//! and assembles four [`CuBlock`](super::cu::CuBlock)s — one per
+//! warp role (loader / launcher / consumer / storer). The
+//! top-level [`lower_to_cuda`](super::lower_to_cuda) walks the tape
+//! and concatenates each variant's role bodies into the per-role
+//! sections of the final kernel.
+//!
+//! Sprint 1 = RmsNorm only; every other variant returns
+//! [`RoleBodies::skipped`]. Per-variant emit lands one variant per
+//! sprint, each variant's emitted `.cu` must compile against TK
+//! 2.0 on the pod before it's "done."
+
+use crate::nodes::{MegaNode, RmsNorm};
+use crate::tape::TapeBudget;
+
+use super::cu::{CuBlock, CuExpr, CuStmt};
+use super::handles::{
+    gmem_act_ptr_raw, gmem_weight_ptr_raw, page_as_sv_bf, page_consumed_sem,
+    page_done_sem, page_ready_sem, scratch_as,
+};
+use super::tk20;
+
+/// Four role-body chunks for a single MegaNode.
+#[derive(Debug, Default)]
+pub struct RoleBodies {
+    pub loader: CuBlock,
+    pub launcher: CuBlock,
+    pub consumer: CuBlock,
+    pub storer: CuBlock,
+    pub skipped: Option<&'static str>,
+}
+
+impl RoleBodies {
+    pub fn skipped(variant: &'static str) -> Self {
+        Self {
+            skipped: Some(variant),
+            ..Self::default()
+        }
+    }
+}
+
+/// Per-`MegaNode` dispatch.
+pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
+    match node {
+        MegaNode::RmsNorm(n) => emit_rms_norm(n, budget),
+        MegaNode::FusedQkvRopeCache(_) => RoleBodies::skipped("FusedQkvRopeCache"),
+        MegaNode::Add(_) => RoleBodies::skipped("Add"),
+        MegaNode::FusedAddRmsNorm(_) => RoleBodies::skipped("FusedAddRmsNorm"),
+        MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
+        MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
+        MegaNode::ScalarMul(_) => RoleBodies::skipped("ScalarMul"),
+        MegaNode::TanhSoftCap(_) => RoleBodies::skipped("TanhSoftCap"),
+        MegaNode::ScalarOffsetRmsNorm(_) => RoleBodies::skipped("ScalarOffsetRmsNorm"),
+        MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
+        MegaNode::FusedCublasGemmAdd(_) => RoleBodies::skipped("FusedCublasGemmAdd"),
+        MegaNode::CutlassFusedNormGemm(_) => RoleBodies::skipped("CutlassFusedNormGemm"),
+        MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
+        MegaNode::SpliceMmEmbeds(_) => RoleBodies::skipped("SpliceMmEmbeds"),
+        MegaNode::BarrierSignal(_) => RoleBodies::skipped("BarrierSignal"),
+        MegaNode::BarrierWait(_) => RoleBodies::skipped("BarrierWait"),
+    }
+}
+
+// ============================================================
+// RmsNorm — in-place per-row normalization.
+// ============================================================
+//
+// Page lifecycle:
+//   in_page:     Empty → Filled (loader TMA)
+//                      → Produced (consumer warp::store)
+//                      → Empty (storer TMA + arrive page_consumed)
+//   weight_page: Empty → Filled (loader TMA)
+//                      → Empty (consumer arrive page_consumed)
+//
+// TK 2.0 primitives used (every call cited to its source line in
+// `third_party/thunderkittens/include/`):
+//   - kittens::group<1>::wait        (sync.cuh:112)
+//   - kittens::group<1>::arrive      (sync.cuh:69)
+//   - kittens::group<1>::tma::expect_bytes  (util/tma.cuh:18)
+//   - kittens::group<1>::tma::load_async (raw)  (util/tma.cuh:72)
+//   - kittens::group<1>::tma::store_async (raw) (util/tma.cuh:82)
+//   - kittens::group<1>::tma::store_async_wait  (util/tma.cuh:46)
+//   - kittens::group<NCW>::load(rv_fl, sv_bf)   (vec/shared_to_register.cuh:14)
+//   - kittens::group<NCW>::store(sv_bf, rv_fl)  (vec/shared_to_register.cuh:101)
+//   - kittens::group<NCW>::sync(int id)         (group.cuh:33)
+//   - kittens::warp::copy(rv, rv)              (vec/maps.cuh:176)
+//   - kittens::warp::mul(rv, rv, rv)           (vec/maps.cuh:359)
+//   - kittens::warp::mul(rv, rv, scalar)       (vec/maps.cuh:54)
+//   - kittens::warp::sum(scalar_out, rv)       (vec/reductions.cuh:129)
+//
+// Plus ferrite substrate: `SharedState<ConfigT>::pages[N]`,
+// `::page_ready[N]`, `::page_done[N]`, `::page_consumed[N]`,
+// `::scratch + offset`. No `ferrite::tk::*` helpers — the consumer
+// body inlines the RMS-scale computation in pure TK 2.0 + raw
+// `rsqrtf` / scratch access.
+
+fn emit_rms_norm(n: &RmsNorm, budget: TapeBudget) -> RoleBodies {
+    let in_page = n.in_page();
+    let weight_page = n.weight_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let loader_phase = storer_phase; // loader waits on consumed; same parity as storer.
+    let layer = n.layer().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let in_act_slot = n.in_act_slot().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+    let bar_reduce = n.consumer_bar_reduce().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+    let eps_value = n.eps().raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_rms_norm: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+    let num_layers = budget.num_layers.max(1);
+
+    // Substrate handles.
+    let in_smem = page_as_sv_bf(in_page, hidden_dim);
+    let weight_smem = page_as_sv_bf(weight_page, hidden_dim);
+    let in_ready = page_ready_sem(in_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let in_done = page_done_sem(in_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let partial = scratch_as::<super::handles::F32>(n.partial_offset());
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor_idx, layer, num_layers);
+
+    let bf16_size_bytes = 2_u32;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+    let weight_bytes = hidden_dim * bf16_size_bytes;
+
+    // ---------------- Loader body ----------------
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait(1, &in_consumed, loader_phase));
+    loader.push(tk20::group_wait(1, &weight_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes(1, &in_ready, act_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1,
+        &in_smem,
+        &in_gmem,
+        act_bytes,
+        &in_ready,
+    ));
+    loader.push(tk20::group_tma_expect_bytes(1, &weight_ready, weight_bytes));
+    loader.push(tk20::group_tma_load_async_raw(
+        1,
+        &weight_smem,
+        &weight_gmem,
+        weight_bytes,
+        &weight_ready,
+    ));
+
+    // ---------------- Launcher body ----------------
+    // RmsNorm has no launcher work.
+    let launcher = CuBlock::new();
+
+    // ---------------- Consumer body ----------------
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait(1, &in_ready, consumer_phase));
+    consumer.push(tk20::group_wait(1, &weight_ready, consumer_phase));
+
+    // Declare per-warp register vectors.
+    let (decl_act, act_rv) = tk20::decl_rv_fl("__rms_act_rv", k_per_warp);
+    let (decl_sq, sq_rv) = tk20::decl_rv_fl("__rms_sq_rv", k_per_warp);
+    let (decl_weight, weight_rv) = tk20::decl_rv_fl("__rms_weight_rv", k_per_warp);
+    consumer.push(decl_act);
+    consumer.push(decl_sq);
+    consumer.push(decl_weight);
+
+    // Cooperative load: NCW warps each get their own subvec of the
+    // full HIDDEN_DIM activation row (TK 2.0 auto-slices when NCW>1).
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(ncw, &act_rv, &in_smem));
+
+    // Sum-of-squares: copy + multiply + warp::sum.
+    consumer.push(tk20::warp_copy_rv(&sq_rv, &act_rv));
+    consumer.push(tk20::warp_mul_rv_rv(&sq_rv, &sq_rv, &sq_rv));
+    let (decl_partial, partial_sum_expr) =
+        tk20::decl_local_f32("__rms_partial_sum", "0.0f");
+    consumer.push(decl_partial);
+    consumer.push(tk20::warp_sum_to_scalar_f32(&partial_sum_expr, &sq_rv));
+
+    // Cross-warp accumulation through scratch.
+    consumer.push(CuStmt::new(format!(
+        "if (kittens::laneid() == 0) {{ {p}[kittens::warpid()] = __rms_partial_sum; }}",
+        p = partial.expr()
+    )));
+    consumer.push(tk20::group_sync_named(ncw, bar_reduce));
+
+    // Compute the full sum + scale on every thread (broadcast read
+    // from scratch — every lane reads the same NCW slots).
+    consumer.push(CuStmt::new("float __rms_full_sum = 0.0f;".to_string()));
+    consumer.push(CuStmt::new(format!(
+        "#pragma unroll\nfor (int __i = 0; __i < {ncw}; ++__i) {{ \
+         __rms_full_sum += {p}[__i]; }}",
+        p = partial.expr()
+    )));
+    consumer.push(CuStmt::new(format!(
+        "const float __rms_scale = rsqrtf(__rms_full_sum / {hidden_dim}.0f + {eps:e}f);",
+        eps = eps_value
+    )));
+
+    // Apply scale + weight in registers.
+    consumer.push(tk20::warp_mul_rv_scalar_f32(
+        &act_rv,
+        &act_rv,
+        &CuExpr::new("__rms_scale".to_string()),
+    ));
+    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32(
+        ncw,
+        &weight_rv,
+        &weight_smem,
+    ));
+    consumer.push(tk20::warp_mul_rv_rv(&act_rv, &act_rv, &weight_rv));
+
+    // Write back to in_page (in-place) — auto-slices per warp.
+    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16(
+        ncw,
+        &in_smem,
+        &act_rv,
+    ));
+
+    // Cross-warp publish before warp 0 signals page_done.
+    consumer.push(tk20::group_sync_named(ncw, bar_publish));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(tk20::group_arrive(1, &in_done));
+    consumer.push(tk20::group_arrive(1, &weight_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // ---------------- Storer body ----------------
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait(1, &in_done, storer_phase));
+    storer.push(tk20::group_tma_store_async_raw(
+        1,
+        &out_gmem,
+        &in_smem,
+        act_bytes,
+    ));
+    storer.push(tk20::group_tma_store_async_wait(1));
+    storer.push(tk20::group_arrive(1, &in_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}

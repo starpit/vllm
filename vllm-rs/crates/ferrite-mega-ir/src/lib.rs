@@ -33,17 +33,12 @@
 //!   Phase C of the plan replaces this with literal const-arg
 //!   emission at proc-macro expansion time.
 
-// `cuda_emit` was nuked — the entire module pattern-matched against
-// TK 1.0-era VM reference code (`tests/vm/llama_official/*.cu`,
-// raw-pointer TMA, `bf16**` Globals tables) and would not compile
-// against TK 2.0's actual primitive surface (`kittens::gl<...>` global
-// layout descriptors, `kittens::tma::load_async(ST&, const GL&,
-// const COORD&, semaphore&)`). The IR-side additions stay (they're
-// substrate / model-metadata, ABI-neutral); the emit module itself
-// is to be rebuilt against TK 2.0 from a clean audit. See
-// `MEGA_IR_PLAN.md` section 8.0a for the inviolable TK 2.0-only
-// constraint and the audit workflow.
+// `cuda_emit` rebuilt against TK 2.0 only (per CUDA_EMIT_TK20_AUDIT.md
+// + MEGA_IR_PLAN.md §8.0a). Every TK call cited to its source line
+// in `third_party/thunderkittens/include/`. The DOD for any variant
+// shipping is "the emitted .cu compiles on the pod against TK 2.0."
 
+pub mod cuda_emit;
 pub mod lower;
 pub mod nodes;
 pub mod substrate;

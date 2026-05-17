@@ -69,13 +69,23 @@ impl Implementation for MetalSynthMlpPreDownImpl {
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
-        profile.backend == Backend::Metal
+        // SynthMlpPreDown deadlocks at M=1 on M1 Max (9419ca204:
+        // threadgroup barrier hang; reproduces on M1 only, not M3/M4).
+        // Gate it off on M1 entirely — at M>=2 the same kernel works
+        // on M1 Max but the affine-decomposed FusedGateUpSiluMul path
+        // gives equivalent coverage with the existing dispatch shape.
+        // M2 is untested for this kernel; gate-and-test if needed.
+        if profile.backend != Backend::Metal {
+            return false;
+        }
+        match &profile.backend_spec {
+            crate::target::BackendSpec::Metal(m) => !m.generation.starts_with("M1"),
+            _ => false,
+        }
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        // SynthMlpPreDown hangs on M1 Max at M=1 (threadgroup barrier deadlock).
-        // Only enable for M>=2 (prefill path); decode uses unfused AffineQmv.
-        WorkloadConstraint::NumTokensRange { min: 2, max: u32::MAX }
+        WorkloadConstraint::Any
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {

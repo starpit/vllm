@@ -262,6 +262,58 @@ impl MetalFusedGateUpSiluMulImpl {
         }
     }
 
+    /// Decomposed cost for Affine 4-bit Gate-Up-SiLU-Mul. `fan_out`
+    /// emits 3 separate Instructions for this storage (gate AffineQmm
+    /// + up AffineQmm + SiluMul) — there is no fused affine kernel —
+    /// so the cost must equal `cost(qmm gate) + cost(qmm up) + cost(silu_and_mul)`,
+    /// not the analytical "single fused bandwidth pass" estimate that
+    /// applies to the Dense path. Without this branch the impl claims
+    /// the 4-tile region at a fictitiously low cost and starves
+    /// SynthMlpPreDown at decode (project_metal_mlppredown_decode_cost).
+    fn affine_decomposed_cost_us(
+        &self,
+        gate_node: &crate::fuf::FufNode,
+        m: u32,
+        n: u32,
+        _group_size: u32,
+        _bits: u32,
+        ctx: &CostCtx,
+    ) -> f64 {
+        // K from gate's activation input.
+        let k = gate_node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                crate::fuf::FufInput::Tile { id, slot } => ctx
+                    .fuf
+                    .get(*id)
+                    .outputs
+                    .get(*slot as usize)
+                    .and_then(|s| ctx.eval_shape(s))
+                    .and_then(|v| v.last().copied())
+                    .map(|x| x as u32),
+                _ => None,
+            })
+            .unwrap_or(2048);
+
+        let qmm = crate::metal::affine_qmm::empirical_cost_us(
+            self.dtype, m, n, k, gate_node, ctx,
+        );
+        let one_qmm = qmm.unwrap_or_else(|| {
+            // Analytical fallback (compute-bound roofline for the gemm).
+            let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
+            flops / (ctx.profile.peak_tflops_fp16 * 1e12) * 1e6
+        });
+
+        // SiluMul: bandwidth-bound, reads gate+up [M,N] and writes [M,N].
+        let act_bytes = 2.0_f64;
+        let silu_bytes = 3.0 * (m as f64) * (n as f64) * act_bytes;
+        let silu_us =
+            silu_bytes / 1e9 / ctx.profile.memory_bandwidth_gbps * 1e6;
+
+        2.0 * one_qmm + silu_us
+    }
+
     /// Analytical cost model for fused Gate-Up-SiLU-Mul (memory-bound operation).
     /// Cost = (bytes_read + bytes_written) / bandwidth
     /// Reads: gate [M,N] + up [M,N]
@@ -391,6 +443,28 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
             let m = dims[0] as u32;
             let n = dims[1] as u32;
 
+            // Storage-aware cost. For Dense weights, a real fused
+            // kernel runs (silu+mul+matmul stays in registers across
+            // the bandwidth boundary), so the analytical bandwidth
+            // model applies. For Affine 4-bit weights, `fan_out`
+            // emits 3 SEPARATE Instructions (AffineQmm gate + AffineQmm
+            // up + SiluMul) — there is no fused affine variant — so
+            // the cost must sum the unfused components or it tells
+            // the solver a lie. The lie was: at M=1 affine, this
+            // returned ~20 µs (analytical fused) + startup that
+            // amortizes to ~314 µs/call, beating SynthMlpPreDown's
+            // real CSV cost of 670 µs and starving the synth at
+            // decode (project_metal_mlppredown_decode_cost).
+            let gate_tile = match_info.claimed_tiles[0];
+            let gate_node = ctx.fuf.get(gate_tile);
+            let storage = weight_storage_of(gate_node);
+            if let Some(StorageFormat::Affine { group_size, bits }) = storage {
+                return self.affine_decomposed_cost_us(
+                    gate_node, m, n, *group_size, *bits, ctx,
+                );
+            }
+
+            // Dense path: existing fused-kernel cost model.
             // Try empirical cost first
             if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, n, 0) {
                 return cost;

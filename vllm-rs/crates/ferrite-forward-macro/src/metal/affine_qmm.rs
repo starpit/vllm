@@ -269,7 +269,7 @@ impl Implementation for MetalAffineQmmImpl {
 ///
 /// Kernel-name format mirrors the rows emitted by
 /// `ferrite-metal-cost-sweep::affine_q{mv,mm}_sweep::csv_kernel_name`.
-fn empirical_cost_us(
+pub(crate) fn empirical_cost_us(
     dtype: &'static str,
     m: u32,
     n: u32,

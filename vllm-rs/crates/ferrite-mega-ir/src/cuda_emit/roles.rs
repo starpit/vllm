@@ -15,7 +15,9 @@
 //! at the corresponding tape position so the structural shape of
 //! the emitted `.cu` is preserved.
 
-use crate::nodes::{Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
+use crate::nodes::{
+    Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
+};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -61,7 +63,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
-        MegaNode::ScalarOffsetRmsNorm(_) => RoleBodies::skipped("ScalarOffsetRmsNorm"),
+        MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
         MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
         MegaNode::FusedCublasGemmAdd(_) => RoleBodies::skipped("FusedCublasGemmAdd"),
         MegaNode::CutlassFusedNormGemm(_) => RoleBodies::skipped("CutlassFusedNormGemm"),
@@ -732,6 +734,144 @@ fn emit_fused_add_rms_norm(n: &FusedAddRmsNorm, budget: TapeBudget) -> RoleBodie
     ));
     storer.push(super::tk::tma_store_async_wait());
     storer.push(super::tk::arrive(&residual_consumed));
+    storer.push(CuStmt::new("}".to_string()));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// ScalarOffsetRmsNorm — out = x * scale * (weight + offset)
+// ============================================================
+//
+// Same substrate shape as RmsNorm (in_page + weight_page, partial
+// scratch, BAR_REDUCE/BAR_PUBLISH) but the consumer body adds the
+// runtime `offset` to the per-warp weight slice before multiplying.
+// Used by gemma2's `rms_norm_offset` reformulation.
+
+fn emit_scalar_offset_rms_norm(
+    n: &ScalarOffsetRmsNorm,
+    budget: TapeBudget,
+) -> RoleBodies {
+    let in_page = n.in_page();
+    let weight_page = n.weight_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let layer = n.layer().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let in_act_slot = n.in_act_slot().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+    let bar_reduce = n.consumer_bar_reduce().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+    let eps_value = n.eps().raw();
+    let offset_value = n.offset.raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_scalar_offset_rms_norm: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+    let num_layers = budget.num_layers.max(1);
+
+    let in_smem = page_as_sv_bf(in_page, hidden_dim);
+    let weight_smem = page_as_sv_bf(weight_page, hidden_dim);
+    let in_ready = page_ready_sem(in_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let in_done = page_done_sem(in_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let partial = scratch_as::<super::handles::F32>(n.partial_offset());
+    let in_gmem = gmem_act_ptr_bf16(in_act_slot);
+    let out_gmem = gmem_act_ptr_bf16(out_act_slot);
+    let weight_gmem = gmem_weight_ptr_bf16(weight_accessor_idx, layer, num_layers);
+
+    let bf16_size_bytes = 2;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+    let weight_bytes = hidden_dim * bf16_size_bytes;
+
+    // Loader: TMA-load in + weight pages.
+    let mut loader = CuBlock::new();
+    let loader_phase = storer_phase;
+    loader.push(super::tk::wait(&in_consumed, loader_phase));
+    loader.push(super::tk::wait(&weight_consumed, loader_phase));
+    loader.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    loader.push(super::tk::tma_expect_bytes(&in_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &in_smem,
+        &in_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &in_ready,
+    ));
+    loader.push(super::tk::tma_expect_bytes(&weight_ready, weight_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &weight_smem,
+        &weight_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &weight_ready,
+    ));
+    loader.push(CuStmt::new("}".to_string()));
+
+    let launcher = CuBlock::new();
+
+    // Consumer.
+    let mut consumer = CuBlock::new();
+    consumer.push(super::tk::wait(&in_ready, consumer_phase));
+    consumer.push(super::tk::wait(&weight_ready, consumer_phase));
+    let in_slice = warp_slice_sv_bf(&in_smem, ncw, k_per_warp);
+    let weight_slice = warp_slice_sv_bf(&weight_smem, ncw, k_per_warp);
+    let (decl_act, act_rv) = super::tk::decl_rv_fl("__sors_act_rv", k_per_warp);
+    let (decl_w, weight_rv) = super::tk::decl_rv_fl("__sors_weight_rv", k_per_warp);
+    consumer.push(decl_act);
+    consumer.push(decl_w);
+    consumer.push(super::tk::warp_load_bf16_to_f32(&act_rv, &in_slice));
+    let eps_lit = CuExpr::new(format!("{:e}f", eps_value));
+    let scale_expr = super::tk::rms_norm_scale_from_rv(
+        ncw, hidden_dim, bar_reduce, &act_rv, &eps_lit, &partial,
+    );
+    consumer.push(CuStmt::new(format!(
+        "const float __sors_scale = {scale_expr};"
+    )));
+    consumer.push(super::tk::warp_mul_f32_scalar(
+        &act_rv,
+        &act_rv,
+        &CuExpr::new("__sors_scale".to_string()),
+    ));
+    consumer.push(super::tk::warp_load_bf16_to_f32(&weight_rv, &weight_slice));
+    let offset_lit = CuExpr::new(format!("{:e}f", offset_value));
+    consumer.push(super::tk::warp_add_f32_scalar(
+        &weight_rv,
+        &weight_rv,
+        &offset_lit,
+    ));
+    consumer.push(super::tk::warp_mul_f32(&act_rv, &act_rv, &weight_rv));
+    consumer.push(super::tk::warp_store_bf16(&in_slice, &act_rv));
+    consumer.push(CuStmt::new(format!(
+        "kittens::group<{ncw}>::sync({bar_publish});"
+    )));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(super::tk::arrive(&in_done));
+    consumer.push(super::tk::arrive(&weight_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer.
+    let mut storer = CuBlock::new();
+    storer.push(super::tk::wait(&in_done, storer_phase));
+    storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    storer.push(super::tk::tma_store_async_bf16(
+        &out_gmem,
+        &in_smem,
+        &CuExpr::new("{0}".to_string()),
+    ));
+    storer.push(super::tk::tma_store_async_wait());
+    storer.push(super::tk::arrive(&in_consumed));
     storer.push(CuStmt::new("}".to_string()));
 
     RoleBodies {

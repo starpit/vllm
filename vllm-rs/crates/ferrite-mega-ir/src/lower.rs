@@ -819,6 +819,8 @@ impl<
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::substrate::ArrivesCount<ARRIVES>,
@@ -837,10 +839,19 @@ impl<
         _weight_accessor_idx: crate::substrate::WeightAccessorConst<
             WEIGHT_ACCESSOR_IDX, { u32::MAX },
         >,
+        _bar_reduce: crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>,
+        _bar_publish: crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+        _bar_pair: crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>,
         weight_path: String,
         offset: f32,
         eps: f32,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsDistinctBarPair,
+    {
         self.verify_arrives(ARRIVES, "push_scalar_offset_rms_norm");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
@@ -864,6 +875,8 @@ impl<
             IN_ACT_SLOT,
             OUT_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
+            CONSUMER_BAR_REDUCE,
+            CONSUMER_BAR_PUBLISH,
         >(weight, offset, eps);
         self.nodes.push(MegaNode::ScalarOffsetRmsNorm(node));
         self.pool.release(IN_ID);
@@ -1886,8 +1899,8 @@ mod tests {
     fn lowers_scalar_offset_rms_norm() {
         use crate::nodes::LayerIndex;
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
-            RmsNormScope, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         let mut b = BuilderD::new();
         b.push_scalar_offset_rms_norm(
@@ -1903,6 +1916,9 @@ mod tests {
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::norm".to_string(),
             1.0,
             1.0e-5_f32,

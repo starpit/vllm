@@ -190,6 +190,26 @@ pub fn warp_mul_f32_scalar(
     ))
 }
 
+/// `kittens::warp::add(dst_rv, lhs_rv, <scalar>);` — elementwise
+/// fp32 register-vector add of a scalar (broadcast). `dst` may
+/// alias `lhs`.
+pub fn warp_add_f32_scalar(
+    dst: &RegColVec<F32>,
+    lhs: &RegColVec<F32>,
+    scalar: &CuExpr,
+) -> CuStmt {
+    debug_assert_eq!(
+        dst.len(),
+        lhs.len(),
+        "warp_add_f32_scalar: dst.len() must equal lhs.len()"
+    );
+    CuStmt::new(format!(
+        "kittens::warp::add({dst}, {lhs}, {scalar});",
+        dst = dst.expr(),
+        lhs = lhs.expr()
+    ))
+}
+
 // ============================================================
 // ferrite::tk helpers — generalised TK primitives
 // ============================================================

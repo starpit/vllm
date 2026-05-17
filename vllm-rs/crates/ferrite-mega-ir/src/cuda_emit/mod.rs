@@ -494,6 +494,62 @@ mod tests {
         }
     }
 
+    /// Sprint 5b — ScalarOffsetRmsNorm: gemma2 weight-offset RMS.
+    /// Verifies the consumer body splices the rms_norm_scale_from_rv
+    /// + warp::mul(scale) + warp::add(weight, offset) +
+    /// warp::mul(act, weight+offset) sequence.
+    #[test]
+    fn lower_scalar_offset_rms_norm_to_cuda_smoke() {
+        use crate::substrate::RmsNormScope;
+        let mut b = BuilderD::new();
+        b.push_scalar_offset_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // weight
+            ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<5, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<3, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
+            "W::sors_norm".to_string(),
+            1.0_f32,
+            1.0e-5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_sors", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "expected zero skipped variants, got {:?}",
+            cu.skipped_variants
+        );
+        for needle in [
+            // RMS scale on activations.
+            "ferrite::tk::rms_norm_scale_from_rv<8, 2048, 1>(__sors_act_rv,",
+            "kittens::warp::mul(__sors_act_rv, __sors_act_rv, __sors_scale);",
+            // weight + offset (1.0).
+            "kittens::warp::add(__sors_weight_rv, __sors_weight_rv, 1e0f);",
+            // act * (weight + offset).
+            "kittens::warp::mul(__sors_act_rv, __sors_act_rv, __sors_weight_rv);",
+            // BAR_PUBLISH=2.
+            "kittens::group<8>::sync(2);",
+            // Weight ptr layer=5, accessor=3 → 3*16+5.
+            "g.weight_ptrs[3 * 16 + 5]",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected source to contain {needle:?}, source was:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// A tape with only a SKIPPED variant produces a `.cu` that
     /// still has the full substrate scaffold but reports the
     /// skipped variant in diagnostics + as a `// SKIPPED` comment.

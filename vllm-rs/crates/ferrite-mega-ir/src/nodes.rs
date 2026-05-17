@@ -1482,6 +1482,15 @@ pub struct ScalarOffsetRmsNorm {
     in_act_slot: crate::substrate::ActSlotRef,
     out_act_slot: crate::substrate::ActSlotRef,
     weight_accessor_idx: crate::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's RMS sum-of-squares
+    /// reduction. Sealed-witness type-checked in 1..=15.
+    consumer_bar_reduce: crate::substrate::BarRef,
+    /// Cross-warp `bar.sync` ID for the consumer's publish before
+    /// warp 0 arrives on `page_done`. Distinct from
+    /// `consumer_bar_reduce`.
+    consumer_bar_publish: crate::substrate::BarRef,
+    /// Witness that the two BAR IDs are distinct.
+    bar_pair_proof: crate::substrate::DistinctBarPairProof,
     eps: FiniteF32,
     pub weight: WeightRef,
     pub offset: FiniteF32,
@@ -1506,11 +1515,19 @@ impl ScalarOffsetRmsNorm {
         const IN_ACT_SLOT: u32,
         const OUT_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         weight: WeightRef,
         offset: FiniteF32,
         eps: FiniteF32,
-    ) -> Self {
+    ) -> Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsDistinctBarPair,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "ScalarOffsetRmsNorm: IN_ID OOB");
             assert!(WEIGHT_ID < NUM_PAGES, "ScalarOffsetRmsNorm: WEIGHT_ID OOB");
@@ -1539,8 +1556,8 @@ impl ScalarOffsetRmsNorm {
             );
         }
         use crate::substrate::{
-            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef,
-            ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase, NumTokensConst,
+            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1555,6 +1572,10 @@ impl ScalarOffsetRmsNorm {
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
+            consumer_bar_reduce: BarSyncId::<CONSUMER_BAR_REDUCE>::new().erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
+            bar_pair_proof: BarSyncPair::<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>::new()
                 .erase(),
             eps,
             weight,
@@ -1597,6 +1618,15 @@ impl ScalarOffsetRmsNorm {
     }
     pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
+    }
+    pub const fn consumer_bar_reduce(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_reduce
+    }
+    pub const fn consumer_bar_publish(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_publish
+    }
+    pub const fn bar_pair_proof(&self) -> crate::substrate::DistinctBarPairProof {
+        self.bar_pair_proof
     }
     pub fn eps(&self) -> FiniteF32 {
         self.eps

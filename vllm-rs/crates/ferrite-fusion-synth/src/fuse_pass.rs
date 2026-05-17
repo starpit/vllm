@@ -26,6 +26,14 @@
 use crate::atom::{Atom, AtomConstantValue, AtomCtx};
 use crate::atom_lib::{AddRmsNormAtom, AffineQmvAtom, RopeAppendAtom, SiluMulAtom};
 
+/// Threads per Apple GPU simdgroup. Defined here in Rust (not just MSL)
+/// for synth-time arithmetic on threads_per_tg / simdgroup counts.
+/// Matches `MK_SIMD_SIZE` in `metal_kittens.h`.
+const MK_SIMD_SIZE: u32 = 32;
+/// HEAD_DIM rows owned per simdgroup per atom-loop pass. Matches
+/// `MK_ROWS_PER_SIMDGROUP` in `metal_kittens.h`.
+const MK_ROWS_PER_SIMDGROUP: u32 = 8;
+
 /// Backend-neutral synthesis target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SynthesisBackend {
@@ -1640,8 +1648,9 @@ pub fn synthesize_pre_attn_attn_chunk_persistent(
     t_act: &'static str,
     t_scale: &'static str,
     consts: &ChunkConstants,
+    threads_per_tg: u32,
 ) -> SynthesizedKernel {
-    synthesize_pre_attn_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, false)
+    synthesize_pre_attn_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, threads_per_tg, false)
 }
 
 /// Layer-0 (init) variant of `synthesize_pre_attn_attn_chunk_persistent`.
@@ -1650,8 +1659,9 @@ pub fn synthesize_pre_attn_attn_init_chunk_persistent(
     t_act: &'static str,
     t_scale: &'static str,
     consts: &ChunkConstants,
+    threads_per_tg: u32,
 ) -> SynthesizedKernel {
-    synthesize_pre_attn_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, true)
+    synthesize_pre_attn_attn_chunk_persistent_impl(backend, t_act, t_scale, consts, threads_per_tg, true)
 }
 
 fn synthesize_pre_attn_attn_chunk_persistent_impl(
@@ -1659,6 +1669,7 @@ fn synthesize_pre_attn_attn_chunk_persistent_impl(
     t_act: &'static str,
     t_scale: &'static str,
     consts: &ChunkConstants,
+    threads_per_tg: u32,
     init: bool,
 ) -> SynthesizedKernel {
     assert_eq!(
@@ -1670,6 +1681,37 @@ fn synthesize_pre_attn_attn_chunk_persistent_impl(
         consts.head_dim % 32 == 0,
         "Phase 2c attention body requires HEAD_DIM divisible by 32 \
          (qk_per_thread = HEAD_DIM/32). HEAD_DIM={}",
+        consts.head_dim,
+    );
+    // threads_per_tg shape contract: must be a multiple of MK_SIMD_SIZE
+    // (32) so it decomposes cleanly into simdgroups. The chosen value
+    // is chip-driven (the persistent megakernel needs ONE fixed value
+    // across all phases, picked from `MetalTargetProfile::
+    // safe_max_concurrent_tgs` given the dispatched-TG count). For
+    // M4-base targeting Llama-3.2 today, 256 (= 8 simdgroups × 32
+    // lanes) is the choice — fits the 48-TG (num_q+2*num_kv on 1B)
+    // dispatch comfortably under the safe cap of 118, and pairs with
+    // the BN=8 attention atom (BN×32 = 256).
+    assert!(
+        threads_per_tg % MK_SIMD_SIZE == 0,
+        "threads_per_tg must be a multiple of MK_SIMD_SIZE (32); got {threads_per_tg}",
+    );
+    let num_simdgroups = threads_per_tg / MK_SIMD_SIZE;
+    assert!(
+        num_simdgroups == 8,
+        "Phase 2c currently pairs with the BN=8 attention atom, requiring \
+         threads_per_tg = 256 (8 simdgroups × 32 lanes). Got threads_per_tg={threads_per_tg} \
+         (would yield {num_simdgroups} simdgroups). Lift this when bn_attention_body_msl \
+         is parameterized on BN.",
+    );
+    // HEAD_DIM must divide evenly into the atom-loop's rows-per-pass
+    // (num_simdgroups × MK_ROWS_PER_SIMDGROUP = 8 × 8 = 64 for the
+    // BN=8 / 256-threads-per-tg case). HEAD_DIM=64 → 1 pass, HEAD_DIM=128
+    // → 2 passes, HEAD_DIM=192 → 3 passes, HEAD_DIM=256 → 4 passes.
+    let rows_per_pass = num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+    assert!(
+        consts.head_dim % rows_per_pass == 0,
+        "HEAD_DIM ({}) must be a multiple of num_simdgroups*MK_ROWS_PER_SIMDGROUP ({rows_per_pass})",
         consts.head_dim,
     );
 
@@ -1799,16 +1841,20 @@ fn synthesize_pre_attn_attn_chunk_persistent_impl(
     );
     let barrier_body = cross_tg_barrier_msl(0, "__barrier_counter");
 
+    // Symbol encodes HEAD_DIM + threads_per_tg so distinct
+    // (model, chip-choice) pairs don't collide in the
+    // SpecializedPipelineCache when multiple model variants are loaded
+    // by the same worker.
     let bias_suffix = if consts.has_linear_bias { "_bias" } else { "" };
     let symbol = if init {
         format!(
-            "synth_pre_attn_attn_init_persistent_{}_{}_gs{}{}",
-            t_act, t_scale, consts.group_size, bias_suffix,
+            "synth_pre_attn_attn_init_persistent_{}_{}_gs{}_hd{}_t{}{}",
+            t_act, t_scale, consts.group_size, consts.head_dim, threads_per_tg, bias_suffix,
         )
     } else {
         format!(
-            "synth_pre_attn_attn_persistent_{}_{}_gs{}{}",
-            t_act, t_scale, consts.group_size, bias_suffix,
+            "synth_pre_attn_attn_persistent_{}_{}_gs{}_hd{}_t{}{}",
+            t_act, t_scale, consts.group_size, consts.head_dim, threads_per_tg, bias_suffix,
         )
     };
 
@@ -1864,7 +1910,7 @@ constant constexpr uint __HIDDEN_MAX   = HIDDEN;
 constant constexpr uint __HEAD_DIM_MAX = HEAD_DIM;
 constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
 
-[[kernel, max_total_threads_per_threadgroup({threads_per_tg}u)]]
+[[kernel, max_total_threads_per_threadgroup({threads_per_tg_lit}u)]]
 void {symbol}(
     device       {t_act}*   {q_out_buf}      [[buffer(0)]],
     device       {t_act}*   {residual_io}    [[buffer(1)]],
@@ -1905,8 +1951,16 @@ void {symbol}(
     const uint __half_dim         = __rot_dim / 2;
     const uint __block_sz         = BLOCK_SIZE;
     const uint __num_heads_total  = __num_q + 2u * __num_kv;
-    const uint __threads_per_tg   = MK_SIMD_SIZE * __head_dim / MK_ROWS_PER_SIMDGROUP;
-    const uint __num_simdgroups   = __head_dim / MK_ROWS_PER_SIMDGROUP;
+    // threads_per_tg + num_simdgroups are SHAPE-DECOUPLED from HEAD_DIM
+    // — baked from the synth-time `threads_per_tg` parameter, not
+    // derived from `HEAD_DIM`. The atom bodies' HEAD_DIM-axis pass
+    // loops use these to cover HEAD_DIM in `head_dim / (num_simdgroups
+    // * MK_ROWS_PER_SIMDGROUP)` passes (1 for HEAD_DIM=64, 2 for
+    // HEAD_DIM=128, etc.). The whole persistent megakernel runs at one
+    // fixed `(threads_per_tg, dispatched_tgs)` regardless of model
+    // HEAD_DIM (see project_persistent_decode_handoff).
+    const uint __threads_per_tg   = {threads_per_tg_lit}u;
+    const uint __num_simdgroups   = {num_simdgroups_lit}u;
     const float __eps             = EPS;
 
     // Persistent envelope: total TGs derived from `[[threadgroups_per_grid]]`
@@ -1971,7 +2025,8 @@ void {symbol}(
         rope_body = rope_body,
         barrier_body = barrier_body,
         attn_body = attn_body,
-        threads_per_tg = 8 * consts.head_dim,
+        threads_per_tg_lit = threads_per_tg,
+        num_simdgroups_lit = num_simdgroups,
         hidden_lit = consts.hidden,
         num_q_lit = consts.num_q_heads,
         num_kv_lit = consts.num_kv_heads,
@@ -2730,6 +2785,7 @@ mod tests {
             "bfloat",
             "half",
             &consts,
+            256,
         );
         assert_eq!(kernel.backend, SynthesisBackend::Metal);
         assert!(kernel.symbol.starts_with("synth_pre_attn_attn_persistent_"));
@@ -2810,11 +2866,39 @@ mod tests {
             "bfloat",
             "half",
             &consts,
+            256,
         );
         let bytes = crate::aot::aot_compile_metallib(&kernel.symbol, &kernel.source);
         assert!(
             !bytes.is_empty(),
             "Phase 2c metallib compile returned empty bytes — `xcrun metal` likely failed (set FERRITE_SYNTH_DUMP=1 + check /tmp/ferrite-synth-dump)",
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn synthesize_pre_attn_attn_chunk_persistent_compiles_3b_at_256_t_per_tg() {
+        // Shape-decoupling guarantee: same `synth_pre_attn_attn_persistent_*`
+        // family compiles at 256 threads/TG for HEAD_DIM=128 (Llama-3.2-3B)
+        // via the atom-body pass loop (NUM_PASSES=2). Pre-decoupling this
+        // would have required threads_per_tg=512 (which exceeds the
+        // safe-residency cap on M4 when grid >= 60 TGs).
+        let consts = llama_3_2_3b_constants();
+        let kernel = synthesize_pre_attn_attn_chunk_persistent(
+            SynthesisBackend::Metal,
+            "bfloat",
+            "half",
+            &consts,
+            256,
+        );
+        // Threads-per-TG attribute is the chosen 256, NOT 4*HEAD_DIM=512.
+        assert!(kernel.source.contains("[[kernel, max_total_threads_per_threadgroup(256u)]]"));
+        // num_simdgroups baked at the chip-driven value, NOT HEAD_DIM/8.
+        assert!(kernel.source.contains("__num_simdgroups   = 8u"));
+        let bytes = crate::aot::aot_compile_metallib(&kernel.symbol, &kernel.source);
+        assert!(
+            !bytes.is_empty(),
+            "3B-at-256 Phase 2c metallib compile failed — set FERRITE_SYNTH_DUMP=1 to dump the source",
         );
     }
 
@@ -2826,6 +2910,7 @@ mod tests {
             "bfloat",
             "half",
             &consts,
+            256,
         );
         assert!(kernel.symbol.starts_with("synth_pre_attn_attn_init_persistent_"));
         // Init body has the "no residual add" comment marker from
@@ -2844,6 +2929,7 @@ mod tests {
             "bfloat",
             "half",
             &consts,
+            256,
         );
         assert!(kernel.symbol.ends_with("_bias"));
         assert!(kernel.source.contains("__q_linear_bias      [[buffer(18)]]"));

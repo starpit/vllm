@@ -299,9 +299,13 @@ impl Atom for AffineQmvAtom {
         // a separate `linear_bias` channel).
         let bias_decl = if self.has_linear_bias {
             let lb = &ctx.bound_inputs[4];
+            // Offset includes `__qmv_pass_base` so the bias pointer
+            // advances with the head-axis pass loop. Equivalent to the
+            // pre-decoupling offset when NUM_PASSES=1 (pass_base=0).
             format!(
                 "const device {t_act}* __lb = {lb} \
                  + (size_t)__local_head * __head_dim \
+                 + __qmv_pass_base \
                  + __simd_gid * MK_ROWS_PER_SIMDGROUP;",
                 t_act = t_act,
                 lb = lb,
@@ -320,6 +324,15 @@ impl Atom for AffineQmvAtom {
             String::new()
         };
 
+        // Pass-loop over HEAD_DIM-axis. __ROWS_PER_PASS =
+        // __num_simdgroups * MK_ROWS_PER_SIMDGROUP is the head-dim
+        // span covered by all simdgroups working in parallel; if it
+        // equals HEAD_DIM (the legacy `threads_per_tg = 4*HEAD_DIM`
+        // case) NUM_PASSES=1 and behavior is byte-identical to the
+        // pre-decoupling emit. When `threads_per_tg` is fixed below
+        // `4*HEAD_DIM` (chip-driven choice in the persistent megakernel
+        // — see project_persistent_decode_handoff for why), NUM_PASSES
+        // > 1 and each TG loops to cover the full HEAD_DIM.
         Some(format!(
             r#"
     // --- atom: AffineQmv (gs={gs}, local_head={local_head_expr}, has_linear_bias={has_lb}) ---
@@ -330,44 +343,51 @@ impl Atom for AffineQmvAtom {
         constexpr int __values_per_thread = __pack_factor * MK_PACKS_PER_THREAD;
         constexpr int __scale_step        = {gs} / __values_per_thread;
         const uint __local_head           = ({local_head_expr});
-        const uint __global_out_row_base = __local_head * __head_dim + __simd_gid * MK_ROWS_PER_SIMDGROUP;
-        const int  __in_vec_size_w       = (int)__hidden * __bytes_per_pack / __pack_factor;
-        const int  __in_vec_size_g       = (int)__hidden / {gs};
-        const device uint8_t*  __ws = (const device uint8_t*){w}
-            + (size_t)__global_out_row_base * (size_t)__in_vec_size_w
-            + (size_t)__simd_lid * MK_PACKS_PER_THREAD * __bytes_per_pack;
-        const device {t_scale}* __sc = {s}
-            + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
-            + __simd_lid / __scale_step;
-        const device {t_scale}* __bi = {b}
-            + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
-            + __simd_lid / __scale_step;
-        {bias_decl}
-        thread float __x_thread[__values_per_thread];
-        thread float __result[MK_ROWS_PER_SIMDGROUP] = {{ 0 }};
-        const int __block_size = __values_per_thread * MK_SIMD_SIZE;
-        threadgroup {t_act}* __x_tg = {x} + __simd_lid * __values_per_thread;
-        const device uint8_t*  __ws_iter = __ws;
-        const device {t_scale}* __sc_iter = __sc;
-        const device {t_scale}* __bi_iter = __bi;
-        for (int __k = 0; __k < (int)__hidden; __k += __block_size) {{
-            float __sum = mk_load_vector<{t_act}, float, __values_per_thread, __bits>(__x_tg, __x_thread);
-            for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
-                const device uint8_t*  __wl = __ws_iter + __row * __in_vec_size_w;
-                float __s = float(__sc_iter[__row * __in_vec_size_g]);
-                float __b = float(__bi_iter[__row * __in_vec_size_g]);
-                __result[__row] += mk_qdot<float, __values_per_thread, __bits>(__wl, __x_thread, __s, __b, __sum);
+        const uint __qmv_rows_per_pass    = __num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+        const uint __qmv_num_passes       = __head_dim / __qmv_rows_per_pass;
+        const int  __in_vec_size_w        = (int)__hidden * __bytes_per_pack / __pack_factor;
+        const int  __in_vec_size_g        = (int)__hidden / {gs};
+        for (uint __qmv_pass = 0u; __qmv_pass < __qmv_num_passes; ++__qmv_pass) {{
+            const uint __qmv_pass_base = __qmv_pass * __qmv_rows_per_pass;
+            const uint __global_out_row_base = __local_head * __head_dim
+                                             + __qmv_pass_base
+                                             + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+            const device uint8_t*  __ws = (const device uint8_t*){w}
+                + (size_t)__global_out_row_base * (size_t)__in_vec_size_w
+                + (size_t)__simd_lid * MK_PACKS_PER_THREAD * __bytes_per_pack;
+            const device {t_scale}* __sc = {s}
+                + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
+                + __simd_lid / __scale_step;
+            const device {t_scale}* __bi = {b}
+                + (size_t)__global_out_row_base * (size_t)__in_vec_size_g
+                + __simd_lid / __scale_step;
+            {bias_decl}
+            thread float __x_thread[__values_per_thread];
+            thread float __result[MK_ROWS_PER_SIMDGROUP] = {{ 0 }};
+            const int __block_size = __values_per_thread * MK_SIMD_SIZE;
+            threadgroup {t_act}* __x_tg = {x} + __simd_lid * __values_per_thread;
+            const device uint8_t*  __ws_iter = __ws;
+            const device {t_scale}* __sc_iter = __sc;
+            const device {t_scale}* __bi_iter = __bi;
+            for (int __k = 0; __k < (int)__hidden; __k += __block_size) {{
+                float __sum = mk_load_vector<{t_act}, float, __values_per_thread, __bits>(__x_tg, __x_thread);
+                for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+                    const device uint8_t*  __wl = __ws_iter + __row * __in_vec_size_w;
+                    float __s = float(__sc_iter[__row * __in_vec_size_g]);
+                    float __b = float(__bi_iter[__row * __in_vec_size_g]);
+                    __result[__row] += mk_qdot<float, __values_per_thread, __bits>(__wl, __x_thread, __s, __b, __sum);
+                }}
+                __ws_iter += __block_size * __bytes_per_pack / __pack_factor;
+                __sc_iter += __block_size / {gs};
+                __bi_iter += __block_size / {gs};
+                __x_tg    += __block_size;
             }}
-            __ws_iter += __block_size * __bytes_per_pack / __pack_factor;
-            __sc_iter += __block_size / {gs};
-            __bi_iter += __block_size / {gs};
-            __x_tg    += __block_size;
-        }}
-        for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
-            __result[__row] = simd_sum(__result[__row]);
-            if (__simd_lid == 0) {{
-                {bias_apply}
-                {out}[__simd_gid * MK_ROWS_PER_SIMDGROUP + __row] = __result[__row];
+            for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+                __result[__row] = simd_sum(__result[__row]);
+                if (__simd_lid == 0) {{
+                    {bias_apply}
+                    {out}[__qmv_pass_base + __simd_gid * MK_ROWS_PER_SIMDGROUP + __row] = __result[__row];
+                }}
             }}
         }}
         mk_sync();
@@ -472,12 +492,20 @@ impl Atom for RopeAppendAtom {
 
         let t_act = ctx.t_act;
 
+        // Pass-loop over HEAD_DIM-axis — same shape-decoupling pattern
+        // as AffineQmvAtom. With legacy `threads_per_tg = 4*HEAD_DIM`,
+        // __num_simdgroups * MK_ROWS_PER_SIMDGROUP == HEAD_DIM and
+        // NUM_PASSES=1 (behavior identical to pre-decoupling emit).
         Some(format!(
             r#"
     // --- atom: RopeAppend + KvPagedWrite ---
     {{
         if (__simd_lid == 0) {{
-            const uint __base_d = __simd_gid * MK_ROWS_PER_SIMDGROUP;
+        const uint __rope_rows_per_pass = __num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+        const uint __rope_num_passes    = __head_dim / __rope_rows_per_pass;
+        for (uint __rope_pass = 0u; __rope_pass < __rope_num_passes; ++__rope_pass) {{
+            const uint __base_d = __rope_pass * __rope_rows_per_pass
+                                + __simd_gid * MK_ROWS_PER_SIMDGROUP;
             const uint __kQ_END = __num_q;
             const uint __kK_END = __num_q + __num_kv;
             if (__head < __kQ_END) {{
@@ -541,7 +569,8 @@ impl Atom for RopeAppendAtom {
                         __v_dst[__base_d + __r] = {t_act}({qmv}[__base_d + __r]);
                 }}
             }}
-        }}
+        }}  // end pass loop
+        }}  // end if simd_lid == 0
     }}
 "#,
             t_act = t_act,

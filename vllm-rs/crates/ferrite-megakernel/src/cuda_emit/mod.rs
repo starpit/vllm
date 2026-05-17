@@ -149,49 +149,10 @@ fn render_source(
     s.push_str("};\n");
     s.push_str(&format!("using ConfigT = {cfg_name};\n\n"));
 
-    // Globals struct — kernel-internal aggregation of the host
-    // ABI's positional args, packaged so role-body fns take a
-    // single-arg reference.
-    s.push_str("struct Globals {\n");
-    s.push_str("    __nv_bfloat16* const*       act_ptrs;\n");
-    s.push_str("    const __nv_bfloat16* const* weight_ptrs;\n");
-    s.push_str("    int32_t*                    barrier_slots;\n");
-    s.push_str("    int32_t                     trace_level;\n");
-    // Host-ABI extension: per-token vocab index table for `Embed`.
-    // `input_ids[NUM_TOKENS]`; matches `LaunchArgsQkv::input_ids` /
-    // `LaunchArgsAttn::input_ids` (interpreter/mega/mod.rs:294).
-    s.push_str("    const uint32_t*             input_ids;\n");
-    s.push_str("};\n\n");
-
-    // Role-body fns (forward-declared as `__device__
-    // __forceinline__` so the kernel can dispatch by warp role).
-    s.push_str(
-        "__device__ __forceinline__ void loader_body(const Globals& g, ferrite::SharedState<ConfigT>& ss) {\n",
-    );
-    s.push_str(&loader.render(4));
-    s.push_str("}\n\n");
-
-    s.push_str(
-        "__device__ __forceinline__ void launcher_body(const Globals& g, ferrite::SharedState<ConfigT>& ss) {\n",
-    );
-    s.push_str(&launcher.render(4));
-    s.push_str("}\n\n");
-
-    s.push_str(
-        "__device__ __forceinline__ void consumer_body(const Globals& g, ferrite::SharedState<ConfigT>& ss) {\n",
-    );
-    s.push_str(&consumer.render(4));
-    s.push_str("}\n\n");
-
-    s.push_str(
-        "__device__ __forceinline__ void storer_body(const Globals& g, ferrite::SharedState<ConfigT>& ss) {\n",
-    );
-    s.push_str(&storer.render(4));
-    s.push_str("}\n\n");
-
-    // Kernel entry. Signature matches the host-side base-tier
-    // `LaunchFn` ABI in `crates/ferrite-forward/src/interpreter/
-    // mega/mod.rs:370`.
+    // Kernel entry. Args are referenced directly inside the role
+    // blocks below (no aggregation struct). Signature matches the
+    // host-side base-tier `LaunchFn` ABI in
+    // `crates/ferrite-forward/src/interpreter/mega/mod.rs:370`.
     s.push_str(&format!("extern \"C\" __global__ void {kernel_name}(\n"));
     s.push_str("    __nv_bfloat16* const*       act_ptrs,\n");
     s.push_str("    const __nv_bfloat16* const* weight_ptrs,\n");
@@ -199,28 +160,30 @@ fn render_source(
     s.push_str("    int32_t                     trace_level,\n");
     s.push_str("    const uint32_t*             input_ids\n");
     s.push_str(") {\n");
+    s.push_str("    (void)trace_level;\n");
     s.push_str("    extern __shared__ uint8_t shmem_buf[];\n");
     s.push_str("    auto& ss = *reinterpret_cast<ferrite::SharedState<ConfigT>*>(shmem_buf);\n");
     s.push_str("    ferrite::init_shared_state<ConfigT>(ss);\n");
-    s.push_str(
-        "    Globals g{act_ptrs, weight_ptrs, barrier_slots, trace_level, input_ids};\n",
-    );
     s.push_str("    int wid = kittens::warpid();\n");
     s.push_str("    if (wid < ConfigT::NUM_CONSUMER_WARPS) {\n");
     s.push_str("        ferrite::set_consumer_registers<ConfigT>();\n");
-    s.push_str("        consumer_body(g, ss);\n");
+    s.push_str("        // consumer\n");
+    s.push_str(&consumer.render(8));
     s.push_str("    } else {\n");
     s.push_str("        ferrite::set_non_consumer_registers<ConfigT>();\n");
     s.push_str("        switch (wid - ConfigT::NUM_CONSUMER_WARPS) {\n");
-    s.push_str(
-        "            case ferrite::kLoaderSlot:   loader_body(g, ss); break;\n",
-    );
-    s.push_str(
-        "            case ferrite::kLauncherSlot: launcher_body(g, ss); break;\n",
-    );
-    s.push_str(
-        "            case ferrite::kStorerSlot:   storer_body(g, ss); break;\n",
-    );
+    s.push_str("            case ferrite::kLoaderSlot: {\n");
+    s.push_str(&loader.render(16));
+    s.push_str("                break;\n");
+    s.push_str("            }\n");
+    s.push_str("            case ferrite::kLauncherSlot: {\n");
+    s.push_str(&launcher.render(16));
+    s.push_str("                break;\n");
+    s.push_str("            }\n");
+    s.push_str("            case ferrite::kStorerSlot: {\n");
+    s.push_str(&storer.render(16));
+    s.push_str("                break;\n");
+    s.push_str("            }\n");
     s.push_str("        }\n");
     s.push_str("    }\n");
     s.push_str("}\n\n");
@@ -307,7 +270,7 @@ mod tests {
             "kittens::group<1>::arrive(ss.page_consumed[1]);",
             // Storer: full out_smem TMA back to gmem.
             "kittens::group<1>::tma::store_async(",
-            "g.act_ptrs[2]",
+            "act_ptrs[2]",
             "kittens::group<1>::tma::store_async_wait();",
             "kittens::group<1>::arrive(ss.page_consumed[2]);",
         ] {
@@ -399,7 +362,7 @@ mod tests {
             // Storer: TMA-store residual back to its own gmem slot
             // (act_ptrs[2]) and arrive on residual's consumed sem.
             "kittens::group<1>::tma::store_async(",
-            "g.act_ptrs[2]",
+            "act_ptrs[2]",
             "kittens::group<1>::tma::store_async_wait();",
             "kittens::group<1>::arrive(ss.page_consumed[2]);",
         ] {
@@ -507,7 +470,7 @@ mod tests {
             "kittens::group<1>::arrive(ss.page_consumed[1]);",
             // Storer: TMA out_smem → act_ptrs[2].
             "kittens::group<1>::tma::store_async(",
-            "g.act_ptrs[2]",
+            "act_ptrs[2]",
             "kittens::group<1>::arrive(ss.page_consumed[2]);",
         ] {
             assert!(
@@ -694,10 +657,10 @@ mod tests {
         assert!(cu.skipped_variants.is_empty());
         std::fs::write("/tmp/embed_emit.cu", &cu.source).ok();
         for needle in [
-            "const uint32_t*             input_ids;",
+            "const uint32_t*             input_ids\n",
             "for (int __embed_t = 0; __embed_t < 1; ++__embed_t)",
-            "const uint32_t __embed_row = g.input_ids[__embed_t];",
-            "g.weight_ptrs[11 * 16 + 0]",
+            "const uint32_t __embed_row = input_ids[__embed_t];",
+            "weight_ptrs[11 * 16 + 0]",
             "kittens::group<1>::tma::load_async(__embed_dst, __embed_src, 4096,",
             "kittens::group<1>::tma::store_async(__pt_dst, __pt_src, 4096);",
         ] {
@@ -721,7 +684,7 @@ mod tests {
         assert!(cu.skipped_variants.is_empty());
         std::fs::write("/tmp/barrier_signal_emit.cu", &cu.source).ok();
         for needle in [
-            "ferrite::barrier_signal(&g.barrier_slots[2], 1);",
+            "ferrite::barrier_signal(&barrier_slots[2], 1);",
             "kittens::group<1>::sync();",
         ] {
             assert!(
@@ -743,7 +706,7 @@ mod tests {
         std::fs::write("/tmp/barrier_wait_emit.cu", &cu.source).ok();
         assert!(
             cu.source
-                .contains("ferrite::barrier_wait(&g.barrier_slots[1], 16);"),
+                .contains("ferrite::barrier_wait(&barrier_slots[1], 16);"),
             "got:\n{}",
             cu.source
         );
@@ -839,7 +802,7 @@ mod tests {
             "kittens::warp::mul(__farn_res_rv, __farn_res_rv, __farn_scale);",
             "kittens::warp::mul(__farn_res_rv, __farn_res_rv, __farn_weight_rv);",
             "kittens::group<8>::store(",
-            "g.weight_ptrs[5 * 16 + 3]",
+            "weight_ptrs[5 * 16 + 3]",
         ] {
             assert!(
                 cu.source.contains(needle),
@@ -1066,7 +1029,7 @@ mod tests {
             "kittens::group<1>::arrive(ss.page_consumed[2]);",
             // Storer: TMA out + arrive on out_consumed.
             "kittens::group<1>::tma::store_async(",
-            "g.act_ptrs[3]",
+            "act_ptrs[3]",
             "kittens::group<1>::tma::store_async_wait();",
             "kittens::group<1>::arrive(ss.page_consumed[3]);",
         ] {

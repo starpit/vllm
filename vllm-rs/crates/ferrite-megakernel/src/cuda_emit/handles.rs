@@ -285,7 +285,7 @@ impl Semaphore {
     }
 }
 
-/// Raw global-memory pointer of dtype `T` (e.g. `g.act_ptrs[3]`).
+/// Raw global-memory pointer of dtype `T` (e.g. `act_ptrs[3]`).
 /// Used for non-tensor TMA which takes raw pointers + byte counts
 /// — matches the existing host-side ABI (`__nv_bfloat16* const*
 /// act_ptrs` etc.) without requiring `kittens::gl<...>` host
@@ -328,8 +328,9 @@ impl<T: DtypeName> ScratchPtr<T> {
 
 // ============================================================
 // Ferrite substrate accessors. Emit references against the
-// `SharedState<ConfigT>& ss` and `Globals& g` symbols established
-// at the kernel entry by `lower_to_cuda::render_source`.
+// `SharedState<ConfigT>& ss` symbol and the kernel-entry args
+// (`act_ptrs`, `weight_ptrs`, `barrier_slots`, `input_ids`)
+// established by `lower_to_cuda::render_source`.
 // ============================================================
 
 /// `ss.page_ready[<page>]` — loader-arrives / consumer-waits.
@@ -367,15 +368,14 @@ pub fn scratch_as<T: DtypeName>(offset: ScratchOffsetRef) -> ScratchPtr<T> {
     )))
 }
 
-/// `g.act_ptrs[<slot>]` — raw bf16 device pointer to the gmem
-/// activation row at slot `slot`. Matches the host-side ABI
-/// (`__nv_bfloat16* const* act_ptrs`) — no `kittens::gl<...>`
-/// construction required.
+/// `act_ptrs[<slot>]` — raw bf16 device pointer to the gmem
+/// activation row at slot `slot`. References the kernel's
+/// `__nv_bfloat16* const* act_ptrs` parameter directly.
 pub fn gmem_act_ptr_raw(slot: u32) -> GmemPtrRaw<Bf16> {
-    GmemPtrRaw::from_expr(CuExpr::new(format!("g.act_ptrs[{slot}]")))
+    GmemPtrRaw::from_expr(CuExpr::new(format!("act_ptrs[{slot}]")))
 }
 
-/// `const_cast<__nv_bfloat16*>(g.weight_ptrs[<accessor> *
+/// `const_cast<__nv_bfloat16*>(weight_ptrs[<accessor> *
 /// NUM_LAYERS + <layer>])` — raw bf16 pointer with the `const`
 /// stripped (TK 2.0's non-tensor `tma::load_async(void* dst,
 /// void* src, ...)` takes `void*` non-const for src).
@@ -388,11 +388,11 @@ pub fn gmem_weight_ptr_raw(
     num_layers: u32,
 ) -> GmemPtrRaw<Bf16> {
     GmemPtrRaw::from_expr(CuExpr::new(format!(
-        "const_cast<__nv_bfloat16*>(g.weight_ptrs[{accessor} * {num_layers} + {layer}])"
+        "const_cast<__nv_bfloat16*>(weight_ptrs[{accessor} * {num_layers} + {layer}])"
     )))
 }
 
-/// `const_cast<__nv_bfloat16*>(g.weight_ptrs[<accessor> *
+/// `const_cast<__nv_bfloat16*>(weight_ptrs[<accessor> *
 /// NUM_LAYERS + <layer>]) + <byte_offset> / sizeof(__nv_bfloat16)`
 /// — raw bf16 pointer to a sub-region of the weight tensor at
 /// `byte_offset` past the accessor's base pointer. Used by
@@ -410,24 +410,24 @@ pub fn gmem_weight_ptr_raw_offset(
 ) -> GmemPtrRaw<Bf16> {
     let element_offset = byte_offset / 2;
     GmemPtrRaw::from_expr(CuExpr::new(format!(
-        "(const_cast<__nv_bfloat16*>(g.weight_ptrs[{accessor} * {num_layers} + {layer}]) + {element_offset})"
+        "(const_cast<__nv_bfloat16*>(weight_ptrs[{accessor} * {num_layers} + {layer}]) + {element_offset})"
     )))
 }
 
-/// `&g.barrier_slots[<edge>]` — raw int32 device pointer to the
+/// `&barrier_slots[<edge>]` — raw int32 device pointer to the
 /// gmem cross-CTA barrier counter for the given edge. Used by
 /// `ferrite::barrier_signal/wait` (see `ferrite_barrier.cuh`).
 /// Returns a [`CuExpr`] since the ferrite-substrate barrier
 /// helpers take a raw `int32_t*`.
 pub fn gmem_barrier_slot_ptr(edge: u32) -> CuExpr {
-    CuExpr::new(format!("&g.barrier_slots[{edge}]"))
+    CuExpr::new(format!("&barrier_slots[{edge}]"))
 }
 
-/// `g.input_ids` — raw `const uint32_t*` to the per-token vocab
+/// `input_ids` — raw `const uint32_t*` to the per-token vocab
 /// index table. Used by `Embed`'s loader for per-token TMA
 /// gather. Returns a [`CuExpr`] (no typed handle).
 pub fn gmem_input_ids() -> CuExpr {
-    CuExpr::new("g.input_ids".to_string())
+    CuExpr::new("input_ids".to_string())
 }
 
 /// `ss.pages[<page>]` — raw `uint8_t*` byte pointer to the page's

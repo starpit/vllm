@@ -2778,10 +2778,77 @@ pub fn synthesize_forward_decode(
         kv_cache_k, kv_cache_v,
     );
 
+    // ── o_proj body: GEMV (hidden ← attn_out via o_proj weight) + residual add
+    // Structurally a tiled qmv where each TG owns one tile of
+    // HEAD_DIM output rows. `hidden / head_dim` tiles total; each TG
+    // processes `ceil(hidden/head_dim / num_tgs)` tiles via the outer
+    // tile loop. attn_out is staged from device → __x_norm first so
+    // the AffineQmvAtom (which reads from threadgroup) can run as-is.
+    // After qmv, each tile's HEAD_DIM-element result is added to the
+    // residual slice [tile*head_dim, (tile+1)*head_dim). Disjoint
+    // slices across TGs → no contention.
+    //
+    // Constraint: hidden must equal NUM_Q * HEAD_DIM (standard
+    // multi-head attention) so the o_proj weight's input axis matches
+    // attn_out's flat layout. Llama / Qwen / Mistral / Phi all satisfy.
+    let o_wt_buf = "__o_w"; let o_sc_buf = "__o_s"; let o_bi_buf = "__o_b";
+    let qmv_o = AffineQmvAtom {
+        group_size: c.group_size,
+        // o_proj weight is one band; tile index IS the local head.
+        local_head_expr: "__head",
+        has_linear_bias: false,
+    };
+    let qmv_o_body = {
+        let band_in = vec![
+            x_norm_name.to_string(), o_wt_buf.to_string(),
+            o_sc_buf.to_string(), o_bi_buf.to_string(),
+        ];
+        let band_out = vec![qmv_smem_name.to_string()];
+        let band_ctx = AtomCtx {
+            bound_inputs: &band_in, bound_outputs: &band_out,
+            constants: &constants_slice, t_act, t_scale,
+        };
+        qmv_o.emit_metal_body(&band_ctx).expect("AffineQmvAtom (o_proj) Metal emit")
+    };
+    let o_proj_body = format!(
+        r#"
+        // Stage attn_out [hidden] from device → __x_norm (TG memory)
+        // so AffineQmvAtom can read it. Every TG stages independently
+        // (each only needs its tile's input, but the whole vector is
+        // cheap to stage and saves a per-tile re-stage). 256 t/TG cover
+        // 2048-element load in 8 strided reads.
+        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
+            {x_norm_name}[__i] = {attn_out_buf}[__t * __hidden + __i];
+        }}
+        mk_sync();
+
+        // Tile-loop: each TG owns `ceil((hidden/head_dim) / num_tgs)`
+        // tiles of HEAD_DIM output rows. `__head = __tile` aliases the
+        // qmv atom's per-band local-head index.
+        const uint __o_proj_tiles = __hidden / __head_dim;
+        for (uint __head = __tg_id; __head < __o_proj_tiles; __head += num_tgs) {{
+            {qmv_o_body}
+            // qmv_smem now holds HEAD_DIM floats — add to residual at
+            // [__t * __hidden + __head * __head_dim, +HEAD_DIM).
+            // simd_lid==0 of each simdgroup wrote MK_ROWS_PER_SIMDGROUP
+            // slots (one pass per HEAD_DIM/64 chunks). Use all threads
+            // to read + add back to residual.
+            for (uint __i = __tid; __i < __head_dim; __i += __threads_per_tg) {{
+                const uint __out_idx = __t * __hidden + __head * __head_dim + __i;
+                {residual_io}[__out_idx] = {t_act}(
+                    float({residual_io}[__out_idx]) + {qmv_smem_name}[__i]
+                );
+            }}
+            mk_sync();
+        }}
+"#,
+    );
+
     // Per-phase tile counts (inner-loop bounds; each TG handles its
     // share via `for (tile = tg_id; tile < T; tile += num_tgs)`):
     //   pre_attn:  T = M * NUM_HEADS_TOTAL  (per-(token, head) tile)
     //   attention: T = M * NUM_Q            (per-(token, q_head) tile)
+    //   o_proj:    T = M * (hidden/head_dim)
 
     let symbol = format!(
         "forward_decode_persistent_{t_act}_{t_scale}_gs{gs}_hd{hd}_t{t}_L{nl}",
@@ -2790,6 +2857,7 @@ pub fn synthesize_forward_decode(
 
     let barrier_after_pre_attn = cross_tg_barrier_msl(0, "__barrier_counter");
     let barrier_after_attn     = cross_tg_barrier_msl(1, "__barrier_counter");
+    let barrier_after_o_proj   = cross_tg_barrier_msl(2, "__barrier_counter");
 
     let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
@@ -2823,11 +2891,13 @@ struct PerLayerWeights {{
     device const {t_act}*   cos_sin           [[id(10)]];
     device       {t_act}*   kv_cache_k        [[id(11)]];
     device       {t_act}*   kv_cache_v        [[id(12)]];
-    // TODO o_proj weight/scales/biases
-    // TODO post-attn rmsnorm weight
-    // TODO gate weight/scales/biases
-    // TODO up   weight/scales/biases
-    // TODO down weight/scales/biases
+    device const uint32_t*  o_weight          [[id(13)]];
+    device const {t_scale}* o_scales          [[id(14)]];
+    device const {t_scale}* o_biases          [[id(15)]];
+    // TODO post-attn rmsnorm weight (id 16)
+    // TODO gate weight/scales/biases     (id 17-19)
+    // TODO up   weight/scales/biases     (id 20-22)
+    // TODO down weight/scales/biases     (id 23-25)
 }};
 "#,
         t_act = t_act, t_scale = t_scale,
@@ -2915,6 +2985,9 @@ void {symbol}(
         device const {t_act}*   {cos_sin_buf} = __layer_table[__layer].cos_sin;
         device       {t_act}*   {kv_cache_k} = __layer_table[__layer].kv_cache_k;
         device       {t_act}*   {kv_cache_v} = __layer_table[__layer].kv_cache_v;
+        device const uint32_t*  {o_wt_buf}   = __layer_table[__layer].o_weight;
+        device const {t_scale}* {o_sc_buf}   = __layer_table[__layer].o_scales;
+        device const {t_scale}* {o_bi_buf}   = __layer_table[__layer].o_biases;
 
         // ── phase 0: pre-attn (AddRmsNorm + QKV qmv + RopeAppend) ──
         // Tile-loop over (token, head) — token axis is M=1 today so
@@ -2935,11 +3008,12 @@ void {symbol}(
         }}
         {barrier_after_attn}
 
-        // ── phase 2: o_proj (TODO: small-N qmm into residual) ──
-        // For now this layer's residual stays as written by AddRmsNorm
-        // (which writes the pre-norm residual back for the next
-        // layer's chain via `__writes_residual`). End-to-end requires
-        // adding attn_out → residual here.
+        // ── phase 2: o_proj (GEMV: hidden ← attn_out, into residual) ──
+        // Tile-loop over hidden/head_dim output tiles. Each tile is
+        // an AffineQmv producing HEAD_DIM rows that are added back
+        // into the residual stream.
+        {o_proj_body}
+        {barrier_after_o_proj}
 
         // ── phase 3: mlp_pre_down (TODO) ──
 
@@ -2973,7 +3047,10 @@ void {symbol}(
         rope_body = rope_body,
         barrier_after_pre_attn = barrier_after_pre_attn,
         barrier_after_attn = barrier_after_attn,
+        barrier_after_o_proj = barrier_after_o_proj,
         attn_body = attn_body,
+        o_proj_body = o_proj_body,
+        o_wt_buf = o_wt_buf, o_sc_buf = o_sc_buf, o_bi_buf = o_bi_buf,
         threads_per_tg_lit = threads_per_tg,
         num_simdgroups_lit = num_simdgroups,
         hidden_lit = c.hidden,
@@ -3260,19 +3337,26 @@ mod tests {
         assert!(kernel.source.contains("device const PerLayerWeights*"));
 
         // Phase scaffolding: pre_attn body + barrier + attention body +
-        // barrier. (Phase comments + atom markers.)
+        // barrier + o_proj body + barrier. (Phase comments + atom
+        // markers.) Phases mlp_pre_down / down_proj / lm_head are
+        // still TODO stubs.
         assert!(kernel.source.contains("phase 0: pre-attn"));
         assert!(kernel.source.contains("phase 1: BN=8 in-kernel attention"));
+        assert!(kernel.source.contains("phase 2: o_proj"));
         assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));   // AddRmsNorm atom
         assert!(kernel.source.contains("mk_qdot"));                // AffineQmv atom
         assert!(kernel.source.contains("mk_rope_pair"));           // RopeAppend atom
         assert!(kernel.source.contains("__attn_partials"));        // bn8 attention
+        // o_proj-specific: tile loop over hidden/head_dim + residual
+        // add-back of qmv result.
+        assert!(kernel.source.contains("__o_proj_tiles = __hidden / __head_dim"));
+        assert!(kernel.source.contains("o_weight          [[id(13)]]"));
 
-        // Two cross-TG barriers (after pre_attn, after attention).
-        // Phases o_proj/mlp/down are TODO stubs — no additional
-        // barriers yet.
+        // Three cross-TG barriers (after pre_attn, attention, o_proj).
+        // Phases mlp/down/lm_head land next; their barriers come with.
         assert!(kernel.source.contains("cross-TG barrier (phase 0)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 1)"));
+        assert!(kernel.source.contains("cross-TG barrier (phase 2)"));
 
         // Each phase wraps its work in a tile-loop sharded across TGs.
         // Pre-attn iterates over `num_heads_total`, attention over

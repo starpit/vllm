@@ -180,6 +180,16 @@ pub enum WorkerError {
         bucket_index: usize,
         command_index: usize,
     },
+    /// A command referenced `Binding::PerLayerArgumentBuffer` but
+    /// `bake_bucket` has not yet built the corresponding MTLArgument
+    /// buffer for this command. The per-layer-arg-buffer construction
+    /// path is wired in step 4 of the persistent-decode lowering
+    /// chain (`MetalForwardDecodePersistentImpl`); reaching this arm
+    /// before that's wired indicates a lowering / Impl mismatch.
+    PerLayerArgumentBufferUnwired {
+        bucket_index: usize,
+        command_index: usize,
+    },
 }
 
 impl std::fmt::Display for WorkerError {
@@ -237,6 +247,16 @@ impl std::fmt::Display for WorkerError {
                 "MetalWorker: bucket {bucket_index} command {command_index}: \
                  Binding::PersistentBarrierCounter referenced but the worker \
                  has no counter buffer (probably called via the GEMM sub-path)"
+            ),
+            Self::PerLayerArgumentBufferUnwired {
+                bucket_index,
+                command_index,
+            } => write!(
+                f,
+                "MetalWorker: bucket {bucket_index} command {command_index}: \
+                 Binding::PerLayerArgumentBuffer referenced but no argument \
+                 buffer was built at bake time (forward-decode persistent \
+                 lowering not yet wired end-to-end)"
             ),
         }
     }
@@ -1765,6 +1785,22 @@ fn resolve_bindings<W: CanonicalParams>(
                     p.write(0);
                 }
                 (counter.clone(), 0u64, *binding_index as u64)
+            }
+            Binding::PerLayerArgumentBuffer { .. } => {
+                // The argument-buffer construction path lives in
+                // `bake_bucket` (step 4 of the persistent-decode chain).
+                // The bake step is responsible for allocating the
+                // MTLBuffer + encoding all `num_layers × fields.len()`
+                // pointer entries BEFORE calling `resolve_bindings`, so
+                // by the time the binding reaches this resolver it
+                // must already be paired with a concrete buffer through
+                // a side-channel. Until step 4 is wired, surface a
+                // distinct error rather than silently producing a
+                // half-baked binding.
+                return Err(WorkerError::PerLayerArgumentBufferUnwired {
+                    bucket_index,
+                    command_index,
+                });
             }
         };
         out.push((buf, off, idx));

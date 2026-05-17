@@ -495,6 +495,60 @@ pub enum Binding {
     /// binding. Used exclusively by `KernelId::SynthPreAttnPersistent`
     /// (and future persistent-envelope kernels).
     PersistentBarrierCounter { binding_index: u8 },
+    /// MTLArgumentBuffer carrying per-layer weight + KV-cache pointers
+    /// for `KernelId::ForwardDecodePersistent`. The worker bakes ONE
+    /// argument buffer per dispatch at init: iterates
+    /// `layer ∈ [0, num_layers)`, resolves each `PerLayerArgField` via
+    /// `WeightAccessors` (weights) or the runtime KV-cache pool
+    /// (KvCacheK/V), and packs into a stride-`fields.len()` argument
+    /// buffer that maps 1:1 to the `struct PerLayerWeights` emitted by
+    /// `ferrite-fusion-synth::synthesize_forward_decode`. MSL signature:
+    /// `device const PerLayerWeights* __layer_table [[buffer(idx)]]`,
+    /// indexed as `__layer_table[__layer]` inside the kernel's
+    /// per-layer loop.
+    ///
+    /// Per-layer weight buffers (referenced indirectly via the argument
+    /// buffer's pointer fields) must be made resident via
+    /// `useResources:count:usage:` on the compute encoder before
+    /// dispatch — the indirect-pointer load through the argument
+    /// buffer doesn't itself trigger residency.
+    PerLayerArgumentBuffer {
+        binding_index: u8,
+        num_layers: u32,
+        fields: Vec<PerLayerArgField>,
+    },
+}
+
+/// One pointer-field inside the per-layer argument buffer struct
+/// (`struct PerLayerWeights` in the synth'd MSL). Resolved by the
+/// worker for each `layer ∈ [0, num_layers)` and encoded into the
+/// argument buffer at index `arg_id` of layer `L`'s slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PerLayerArgField {
+    /// Weight bundle resolved via the same `WeightAccessors` path as
+    /// `Binding::Weight`. The `layer` axis is the iteration variable
+    /// at bake time — the locator only carries `(bucket, op_idx, slot)`.
+    Weight {
+        arg_id: u8,
+        kind: WeightBundleKind,
+        which: WeightTensor,
+        locator: WeightLocator,
+    },
+    /// Per-layer KV-cache buffer (`KvCacheK` or `KvCacheV`) drawn from
+    /// the runtime's paged-cache pool. The `layer` axis on the
+    /// runtime kind is the iteration variable.
+    KvCache {
+        arg_id: u8,
+        which: KvCacheWhich,
+    },
+}
+
+/// Discriminator for the per-layer KV-cache half a
+/// [`PerLayerArgField::KvCache`] references.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KvCacheWhich {
+    K,
+    V,
 }
 
 /// Per-bundle locator for the macro-emitted `WeightAccessors` impl.

@@ -663,6 +663,35 @@ impl HeadDimRef {
     }
 }
 
+/// Verified positive `INTERMEDIATE_DIM` template arg.
+pub struct IntermediateDim<const D: u32>;
+impl<const D: u32> IntermediateDim<D> {
+    pub const fn new() -> Self {
+        const {
+            assert!(D > 0, "IntermediateDim: D must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> IntermediateDimRef {
+        IntermediateDimRef::__new_for_erase(D)
+    }
+}
+impl<const D: u32> Default for IntermediateDim<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IntermediateDimRef(u32);
+impl IntermediateDimRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified positive Q-head count.
 pub struct NumQHeads<const N: u32>;
 impl<const N: u32> NumQHeads<N> {

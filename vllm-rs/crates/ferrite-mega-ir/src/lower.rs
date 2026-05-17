@@ -570,6 +570,28 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _gate: crate::substrate::ScratchRegion<
+            GATE_OFF, GATE_BYTES, SCRATCH_BYTES, crate::substrate::MlpScope,
+        >,
+        _up: crate::substrate::ScratchRegion<
+            UP_OFF, UP_BYTES, SCRATCH_BYTES, crate::substrate::MlpScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _intermediate_dim: crate::substrate::IntermediateDim<INTERMEDIATE_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         weight_path: String,
         activation: GateUpActivation,
     ) -> &mut Self {
@@ -1508,13 +1530,29 @@ mod tests {
 
     #[test]
     fn lowers_fused_gate_up_silu_mul() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, IntermediateDim, IterCount, MbarrierPhase,
+            MlpScope, NumTokensConst, PageId, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = Builder8::new();
-        // IN=0, WEIGHT=1, OUT=2, gate(0,2048), up(2048,2048),
-        // phases (0,1), ITERS=8, LAYER=5, NUM_LAYERS=16, ARRIVES=0.
-        b.push_fused_gate_up_activate_mul::<
-            0, 1, 2, 0, 2048, 2048, 2048, 0, 1, 8, 5, 16, 0,
-            2048, 8192, 8, 0, 2, 0,
-        >(
+        b.push_fused_gate_up_activate_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            ScratchRegion::<0, 2048, 8192, MlpScope>::new(),
+            ScratchRegion::<2048, 2048, 8192, MlpScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<8>::new(),
+            LayerIndex::<5, 16>::new(),
+            HiddenDim::<2048>::new(),
+            IntermediateDim::<8192>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
             "W::mlp".to_string(),
             GateUpActivation::Silu,
         );
@@ -1522,14 +1560,14 @@ mod tests {
         let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.iters(), 8);
+        assert_eq!(n.iters().raw(), 8);
         assert_eq!(n.activation, GateUpActivation::Silu);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.intermediate_dim(), 8192);
-        assert_eq!(n.num_tokens(), 8);
-        assert_eq!(n.in_act_slot(), 0);
-        assert_eq!(n.out_act_slot(), 2);
-        assert_eq!(n.weight_accessor_idx(), 0);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.intermediate_dim().raw(), 8192);
+        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.in_act_slot().raw(), 0);
+        assert_eq!(n.out_act_slot().raw(), 2);
+        assert_eq!(n.weight_accessor_idx().raw(), 0);
     }
 
     #[test]

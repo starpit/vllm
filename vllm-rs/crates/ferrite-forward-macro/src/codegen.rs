@@ -5707,17 +5707,37 @@ fn dispatch_instruction_to_push(
             let out_act_slot = lit(*out_slot);
             let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
-                b.push_fused_gate_up_activate_mul::<
-                    #in_id, #weight_id, #out_id,
-                    #gate_off, #gate_bytes, #up_off, #up_bytes,
-                    #consumer_phase, #storer_phase,
-                    #iters, #layer_lit, #num_layers, #arrives,
-                    #hidden_dim, #intermediate_dim, #num_tokens,
-                    #in_act_slot, #out_act_slot, #weight_accessor_idx,
-                >(#weight_str.to_string(), #activation_path);
+                b.push_fused_gate_up_activate_mul(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #gate_off, #gate_bytes, #scratch_lit, ::ferrite_forward::mega_ir::MlpScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #up_off, #up_bytes, #scratch_lit, ::ferrite_forward::mega_ir::MlpScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::IterCount::<#iters>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::IntermediateDim::<#intermediate_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                        #weight_accessor_idx, { u32::MAX },
+                    >::new(),
+                    #weight_str.to_string(),
+                    #activation_path,
+                );
             })
         }
         I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => {

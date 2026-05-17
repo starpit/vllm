@@ -996,30 +996,30 @@ impl FusedAddRmsNorm {
 /// getters; activation enum (`GateUpActivation::{Silu,Gelu}`)
 /// selects which TK helper sequence the codegen emits.
 pub struct FusedGateUpActivateMul {
-    in_page_id: u32,
-    gate_up_weight_page_id: u32,
-    out_page_id: u32,
-    gate_offset: u32,
-    gate_bytes: u32,
-    up_offset: u32,
-    up_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    iters: u32,
-    layer: u32,
-    hidden_dim: u32,
-    intermediate_dim: u32,
-    num_tokens: u32,
-    in_act_slot: u32,
-    out_act_slot: u32,
-    weight_accessor_idx: u32,
+    in_page: crate::substrate::PageRef,
+    gate_up_weight_page: crate::substrate::PageRef,
+    out_page: crate::substrate::PageRef,
+    gate_offset: crate::substrate::ScratchOffsetRef,
+    gate_bytes: crate::substrate::ScratchBytesRef,
+    up_offset: crate::substrate::ScratchOffsetRef,
+    up_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    iters: crate::substrate::IterCountRef,
+    layer: crate::substrate::LayerRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    intermediate_dim: crate::substrate::IntermediateDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    out_act_slot: crate::substrate::ActSlotRef,
+    weight_accessor_idx: crate::substrate::WeightAccessorRef,
     pub weight: WeightRef,
     pub activation: GateUpActivation,
 }
 
 impl FusedGateUpActivateMul {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const IN_ID: u32,
         const WEIGHT_ID: u32,
         const OUT_ID: u32,
@@ -1084,78 +1084,83 @@ impl FusedGateUpActivateMul {
             );
             assert!(NUM_TOKENS > 0, "FusedGateUp: NUM_TOKENS must be > 0");
         }
+        use crate::substrate::{
+            ActSlotConst, HiddenDim, IntermediateDim, IterCount, MbarrierPhase, NumTokensConst,
+            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+        };
         Self {
-            in_page_id: IN_ID,
-            gate_up_weight_page_id: WEIGHT_ID,
-            out_page_id: OUT_ID,
-            gate_offset: GATE_OFF,
-            gate_bytes: GATE_BYTES,
-            up_offset: UP_OFF,
-            up_bytes: UP_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            iters: ITERS,
-            layer: LAYER,
-            hidden_dim: HIDDEN_DIM,
-            intermediate_dim: INTERMEDIATE_DIM,
-            num_tokens: NUM_TOKENS,
-            in_act_slot: IN_ACT_SLOT,
-            out_act_slot: OUT_ACT_SLOT,
-            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            gate_up_weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
+            out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
+            gate_offset: ScratchOffsetRef::__new_for_erase(GATE_OFF),
+            gate_bytes: ScratchBytesRef::__new_for_erase(GATE_BYTES),
+            up_offset: ScratchOffsetRef::__new_for_erase(UP_OFF),
+            up_bytes: ScratchBytesRef::__new_for_erase(UP_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            iters: IterCount::<ITERS>::new().erase(),
+            layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            intermediate_dim: IntermediateDim::<INTERMEDIATE_DIM>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
             weight,
             activation,
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn gate_up_weight_page_id(&self) -> u32 {
-        self.gate_up_weight_page_id
+    pub const fn gate_up_weight_page(&self) -> crate::substrate::PageRef {
+        self.gate_up_weight_page
     }
-    pub const fn out_page_id(&self) -> u32 {
-        self.out_page_id
+    pub const fn out_page(&self) -> crate::substrate::PageRef {
+        self.out_page
     }
-    pub const fn gate_offset(&self) -> u32 {
+    pub const fn gate_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.gate_offset
     }
-    pub const fn gate_bytes(&self) -> u32 {
+    pub const fn gate_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.gate_bytes
     }
-    pub const fn up_offset(&self) -> u32 {
+    pub const fn up_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.up_offset
     }
-    pub const fn up_bytes(&self) -> u32 {
+    pub const fn up_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.up_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn iters(&self) -> u32 {
+    pub const fn iters(&self) -> crate::substrate::IterCountRef {
         self.iters
     }
-    pub const fn layer(&self) -> u32 {
+    pub const fn layer(&self) -> crate::substrate::LayerRef {
         self.layer
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn intermediate_dim(&self) -> u32 {
+    pub const fn intermediate_dim(&self) -> crate::substrate::IntermediateDimRef {
         self.intermediate_dim
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
-    pub const fn out_act_slot(&self) -> u32 {
+    pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
     }
-    pub const fn weight_accessor_idx(&self) -> u32 {
+    pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
     }
 }

@@ -77,6 +77,13 @@
 #include "mlx_steel_gemm/mma.h"
 #include "mlx_steel_gemm/loader.h"
 
+// MLX quantized vendor — `QuantizedBlockLoader<T, BROWS, BCOLS, dst_ld,
+// reduction_dim, tgp_size, group_size, bits>` plus its `dequantize<U,N,
+// bits>` helper from `quantized.h:483-689`. Drives the per-K-iter
+// weight tile load + dequant with the SAME unrolled structure as
+// MLX's prebuilt qmm_t binary.
+#include "mlx_quantized/quantized_loader.h"
+
 using namespace metal;
 
 #define MLX_MTL_CONST static constant constexpr const
@@ -117,16 +124,10 @@ constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
 // stand-alone — `build.rs` produces one .metallib per file).
 // ─────────────────────────────────────────────────────────────────
 
-template <int bits, int wsize = 8>
-inline constexpr short get_pack_factor() {
-  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
-}
-
-template <int bits, int wsize = 8>
-inline constexpr short get_bytes_per_pack() {
-  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
-  return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
-}
+// `get_pack_factor` / `get_bytes_per_pack` come from
+// `mlx_quantized/quantized_loader.h` (vendored from
+// `quantized.h:18-26`); duplicating them here would conflict with the
+// vendored definitions on the same translation unit.
 
 // ─────────────────────────────────────────────────────────────────
 // qmm_t_impl — quantized.h:1094-1212. Implemented for bits=4 by
@@ -238,18 +239,44 @@ METAL_FUNC void qmm_t_impl_inline(
   const device T_scale* b_block  = biases + c_col * K_g;
   device T_act* y_block          = y + int64_t(c_row) * N + c_col;
 
-  // ── Per-thread source/dest pointers (BlockLoader constructor :47-58
-  //    and QuantizedBlockLoader constructor :605-626) ──────────────
-  // Xs_dst/Ws_dst are T_compute (the threadgroup-tile dtype); X_src is
-  // T_act (device-memory dtype) and gets cast on load.
+  // ── X loader: per-thread source/dest pointers. The X path stays
+  // inline because `BlockLoader<T, ...>` requires `T_act == T_compute`
+  // (single-T template); we need a bf16→half cast on the way into Xs.
   threadgroup T_compute* Xs_dst = Xs + bi_x * BK_padded + bj_x;
   const device T_act* X_src = x_block + bi_x * K + bj_x;
 
-  threadgroup T_compute* Ws_dst = Ws + bi_w * BK_padded + bj_w * pack_factor;
-  const device uint8_t* W_src = w_block + bi_w * K_w + bj_w * bytes_per_pack;
-  const device T_scale* Sc_row = s_block + bi_w * K_g;
-  const device T_scale* Bs_row = b_block + bi_w * K_g;
-  int group_step_cnt = 0;
+  // ── W loader. When `T_compute == T_scale` (M1 fast-path with
+  //    T_compute = half = T_scale), delegate to MLX's
+  //    `QuantizedBlockLoader<T, BN, BK, BK_padded, reduction_dim=1,
+  //    TGP, group_size, 4>` (vendored verbatim from
+  //    `quantized.h:572-689`). The loader reads packed-int4 weights,
+  //    dequantises to T = T_compute inside `load_unsafe`/`load_safe`,
+  //    advances scales/biases per `next()`. Same shape as MLX's
+  //    prebuilt qmm_t binary.
+  //
+  //    On the legacy path (T_compute = bfloat ≠ T_scale = half — only
+  //    instantiated when the M1 f16-compute fast-path is disabled),
+  //    the inline dequant block inside the K-loop runs instead;
+  //    `loader_w` is unused there. `if constexpr` (C++17, supported
+  //    by metal-stdlib) keeps the unused branch from being
+  //    instantiated.
+  using loader_w_t = QuantizedBlockLoader<
+      /* T = */ T_scale,
+      /* BROWS = */ BN,
+      /* BCOLS = */ BK,
+      /* dst_ld = */ BK_padded,
+      /* reduction_dim = */ 1,
+      /* tgp_size = */ TGP,
+      /* group_size = */ group_size,
+      /* bits = */ bits>;
+  loader_w_t loader_w(
+      (const device uint8_t*)w_block,
+      s_block,
+      b_block,
+      /*src_ld=*/K,
+      reinterpret_cast<threadgroup T_scale*>(Ws),
+      simd_group_id,
+      simd_lane_id);
 
   // ── BlockMMA — VERBATIM MLX `BlockMMA<T_compute, T_act, BM, BN, BK,
   //    WM, WN, transpose_a=false, transpose_b=true, lda_tgp, ldb_tgp,
@@ -283,94 +310,146 @@ METAL_FUNC void qmm_t_impl_inline(
   // default constructor — `mma.h:222-225`); it lives across the K loop
   // in registers.
 
-  // ── K loop: K_eff allows the splitk wrapper to shorten the loop ──
+  // ── K loop: VERBATIM MLX `qmm_t_impl` (`quantized.h:1158-1202`).
+  //   Four specialized loops based on the (m_full, n_full) cross
+  //   product so each loop body runs UNCONDITIONAL load_safe /
+  //   load_unsafe — no per-iter branches, no register-pressure cost
+  //   for unused branches. Each call to `load_X` lambdas is the one
+  //   inline cast we can't replace with `BlockLoader<T,...>` (need
+  //   T_act → T_compute conversion); load_W goes through the
+  //   vendored `QuantizedBlockLoader::load_unsafe` /
+  //   `load_safe(short2(BK, n_tile))` when `T_compute == T_scale`
+  //   (M1 fast-path), else falls back to the inline dequant. The
+  //   `mma_op.mma(Xs, Ws)` and `loader_x.next()` / `loader_w.next()`
+  //   calls match MLX line-for-line.
   //
-  // Each iter loads a 32×32 X tile + dequant'd 32×32 W tile, runs four
-  // 8-wide K-frag MMAs, and advances pointers.
-  for (int k = 0; k < K_eff; k += BK) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ─── X loader (BlockLoader<T, BM, BK, BK_padded, 1, TGP>) ─────
-    //   load_unsafe: contiguous vec4 of T × 2 per thread → 8 elements.
-    //   load_safe (M-tail): zero rows past m_tile.
-    // Loads 8 T_act values from device, casts to T_compute on store
-    // into Xs. When T_compute == T_act the compiler emits the same
-    // vec4 burst copy. When they differ (T_act=bfloat, T_compute=half)
-    // it inserts per-element converting moves; still memory-bound.
-    if (m_full || bi_x < m_tile) {
-      const device vec<T_act, 4>* X_src_v4 =
-          (const device vec<T_act, 4>*)X_src;
-      threadgroup vec<T_compute, 4>* Xs_dst_v4 =
-          (threadgroup vec<T_compute, 4>*)Xs_dst;
-      vec<T_act, 4> a0 = X_src_v4[0];
-      vec<T_act, 4> a1 = X_src_v4[1];
-      Xs_dst_v4[0] = vec<T_compute, 4>(
-          T_compute(a0[0]), T_compute(a0[1]), T_compute(a0[2]), T_compute(a0[3]));
-      Xs_dst_v4[1] = vec<T_compute, 4>(
-          T_compute(a1[0]), T_compute(a1[1]), T_compute(a1[2]), T_compute(a1[3]));
+  //   Lambdas keep the X-cast and the W-load body declared once and
+  //   reused across the four loops. Apple's metal compiler inlines
+  //   them at the call site so the unrolling structure is the same
+  //   as if they were inlined manually.
+  auto load_x_unsafe = [&]() {
+    const device vec<T_act, 4>* X_src_v4 =
+        (const device vec<T_act, 4>*)X_src;
+    threadgroup vec<T_compute, 4>* Xs_dst_v4 =
+        (threadgroup vec<T_compute, 4>*)Xs_dst;
+    vec<T_act, 4> a0 = X_src_v4[0];
+    vec<T_act, 4> a1 = X_src_v4[1];
+    Xs_dst_v4[0] = vec<T_compute, 4>(
+        T_compute(a0[0]), T_compute(a0[1]), T_compute(a0[2]), T_compute(a0[3]));
+    Xs_dst_v4[1] = vec<T_compute, 4>(
+        T_compute(a1[0]), T_compute(a1[1]), T_compute(a1[2]), T_compute(a1[3]));
+  };
+  auto load_x_safe_m = [&](short bm_lim) {
+    if (bi_x < uint(bm_lim)) {
+      load_x_unsafe();
     } else {
       ((threadgroup vec<T_compute, 4>*)Xs_dst)[0] = vec<T_compute, 4>(0);
       ((threadgroup vec<T_compute, 4>*)Xs_dst)[1] = vec<T_compute, 4>(0);
     }
-
-    // ─── W loader (QuantizedBlockLoader<T, BN, BK, ..., 1, TGP, gs, 4>) ──
-    //   load_unsafe: dequantize N_READS=4 packed bytes (= 8 halves).
-    //   load_safe (N-tail): zero rows past n_tile.
-    //
-    // Inlined 4-bit `dequantize` body (`quantized.h:521-527`):
-    //   s0 = scale; s1 = scale / 16.
-    //   w_local[2i]   = s0 * (b & 0x0f) + bias;
-    //   w_local[2i+1] = s1 * (b & 0xf0) + bias;
-    if (n_full || bi_w < n_tile) {
-      // Dequant math runs in T_compute (the threadgroup-tile dtype).
-      // T_scale → T_compute cast keeps the in-register dtype consistent
-      // with what the MMA inner loop will read out of Ws.
-      T_compute scale = static_cast<T_compute>(*Sc_row);
-      T_compute bias  = static_cast<T_compute>(*Bs_row);
+  };
+  // W: legacy inline dequant for the (T_compute != T_scale) case
+  // (M1 fast-path uses QuantizedBlockLoader; this branch is
+  // dead-code-eliminated when the constexpr check is true).
+  auto load_w_inline = [&](int kk, bool n_unsafe) {
+    threadgroup T_compute* Ws_dst_inline =
+        Ws + bi_w * BK_padded + bj_w * pack_factor;
+    const device uint8_t* W_src_inline =
+        w_block + bi_w * K_w + bj_w * bytes_per_pack;
+    const device T_scale* Sc_row_inline = s_block + bi_w * K_g;
+    const device T_scale* Bs_row_inline = b_block + bi_w * K_g;
+    W_src_inline += kk * BCOLS_PACKED * bytes_per_pack;
+    const int sb_step = (group_steps > 1) ? (kk / group_steps) : kk;
+    Sc_row_inline += sb_step;
+    Bs_row_inline += sb_step;
+    bool in_bounds = n_unsafe ? true : (bi_w < n_tile);
+    if (in_bounds) {
+      T_compute scale = static_cast<T_compute>(*Sc_row_inline);
+      T_compute bias  = static_cast<T_compute>(*Bs_row_inline);
       T_compute s0 = scale;
       T_compute s1 = scale / static_cast<T_compute>(16.0f);
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < N_READS; ++i) {
-        uint8_t b = W_src[i * bytes_per_pack];
-        Ws_dst[i * pack_factor + 0] =
+        uint8_t b = W_src_inline[i * bytes_per_pack];
+        Ws_dst_inline[i * pack_factor + 0] =
             s0 * static_cast<T_compute>(b & 0x0f) + bias;
-        Ws_dst[i * pack_factor + 1] =
+        Ws_dst_inline[i * pack_factor + 1] =
             s1 * static_cast<T_compute>(b & 0xf0) + bias;
       }
     } else {
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < N_READS * pack_factor; ++i) {
-        Ws_dst[i] = T_compute(0);
+        Ws_dst_inline[i] = T_compute(0);
       }
     }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ─── MLX BlockMMA::mma (mma.h:507-532) ─────────────────────────
-    // Reads Xs/Ws threadgroup tiles, runs `BK / kFragSize = 4` 8-wide
-    // K-frag MMAs per BK-iter. The K-loop, per-frag scalar loads via
-    // MMAFrag::load (which casts T_compute → float), the serpentine
-    // MMA dispatch via tile_matmad, and the simdgroup_barrier fences
-    // are ALL inside `mma_op.mma`. Verbatim MLX semantics — same AIR
-    // shape as MLX's prebuilt `affine_qmm_t_*` binary on Apple7.
-    mma_op.mma(Xs, Ws);
-
-    // ─── Advance pointers per BlockLoader / QuantizedBlockLoader.next() ──
-    //   X: tile_stride = BCOLS = BK halves.
-    //   W: tile_stride = BCOLS_PACKED * bytes_per_pack = BK/pack_factor bytes.
-    //   Scales/biases: advance once per `group_steps` BK iters (reduction_dim=1).
+  };
+  auto load_w_unsafe = [&](int kk) {
+    if (metal::is_same_v<T_compute, T_scale>) {
+      loader_w.load_unsafe();
+    } else {
+      load_w_inline(kk, /*n_unsafe=*/true);
+    }
+  };
+  auto load_w_safe = [&](int kk) {
+    if (metal::is_same_v<T_compute, T_scale>) {
+      loader_w.load_safe(short2(BK, n_tile));
+    } else {
+      load_w_inline(kk, /*n_unsafe=*/false);
+    }
+  };
+  auto next_loaders = [&]() {
     X_src += BK;
-    W_src += BCOLS_PACKED * bytes_per_pack;
-    if (group_steps > 1) {
-      group_step_cnt += 1;
-      if (group_step_cnt == group_steps) {
-        group_step_cnt = 0;
-        Sc_row += 1;
-        Bs_row += 1;
+    if (metal::is_same_v<T_compute, T_scale>) {
+      loader_w.next();
+    }
+  };
+
+  if (!m_full) {
+    if (!aligned_N && !n_full) {
+      // m_full=false, n_full=false: load_x_safe + load_w_safe.
+      int kk = 0;
+      for (int k = 0; k < K_eff; k += BK, ++kk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        load_x_safe_m(short(m_tile));
+        load_w_safe(kk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        next_loaders();
       }
     } else {
-      Sc_row += 1;
-      Bs_row += 1;
+      // m_full=false, n_full=true: load_x_safe + load_w_unsafe.
+      int kk = 0;
+      for (int k = 0; k < K_eff; k += BK, ++kk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        load_x_safe_m(short(m_tile));
+        load_w_unsafe(kk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        next_loaders();
+      }
+    }
+  } else {
+    if (!aligned_N && !n_full) {
+      // m_full=true, n_full=false: load_x_unsafe + load_w_safe.
+      int kk = 0;
+      for (int k = 0; k < K_eff; k += BK, ++kk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        load_x_unsafe();
+        load_w_safe(kk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        next_loaders();
+      }
+    } else {
+      // m_full=true, n_full=true: HOT PATH — both unsafe loads.
+      int kk = 0;
+      for (int k = 0; k < K_eff; k += BK, ++kk) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        load_x_unsafe();
+        load_w_unsafe(kk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(Xs, Ws);
+        next_loaders();
+      }
     }
   }
 

@@ -1271,11 +1271,27 @@ impl<const IDX: u32, const NUM_EDGES: u32> EdgeId<IDX, NUM_EDGES> {
     pub const fn raw(self) -> u32 {
         IDX
     }
+
+    pub const fn erase(self) -> EdgeIdRef {
+        EdgeIdRef::__new_for_erase(IDX)
+    }
 }
 
 impl<const IDX: u32, const NUM_EDGES: u32> Default for EdgeId<IDX, NUM_EDGES> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Opaque post-erasure of [`EdgeId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EdgeIdRef(u32);
+impl EdgeIdRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
     }
 }
 
@@ -1294,11 +1310,27 @@ impl<const COUNT: u32> ExpectedCount<COUNT> {
     pub const fn raw(self) -> u32 {
         COUNT
     }
+
+    pub const fn erase(self) -> ExpectedCountRef {
+        ExpectedCountRef::__new_for_erase(COUNT)
+    }
 }
 
 impl<const COUNT: u32> Default for ExpectedCount<COUNT> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Opaque post-erasure of [`ExpectedCount`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExpectedCountRef(u32);
+impl ExpectedCountRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
     }
 }
 

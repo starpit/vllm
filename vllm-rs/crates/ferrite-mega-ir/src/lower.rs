@@ -1386,14 +1386,21 @@ impl<
     }
 
     /// Push a typed `BarrierSignal`.
-    pub fn push_barrier_signal<const IDX: u32>(&mut self) -> &mut Self {
+    pub fn push_barrier_signal<const IDX: u32>(
+        &mut self,
+        _edge: crate::substrate::EdgeId<IDX, NUM_EDGES>,
+    ) -> &mut Self {
         let node = BarrierSignal::new::<IDX, NUM_EDGES>();
         self.nodes.push(MegaNode::BarrierSignal(node));
         self
     }
 
     /// Push a typed `BarrierWait`.
-    pub fn push_barrier_wait<const IDX: u32, const COUNT: u32>(&mut self) -> &mut Self {
+    pub fn push_barrier_wait<const IDX: u32, const COUNT: u32>(
+        &mut self,
+        _edge: crate::substrate::EdgeId<IDX, NUM_EDGES>,
+        _expected: crate::substrate::ExpectedCount<COUNT>,
+    ) -> &mut Self {
         let node = BarrierWait::new::<IDX, COUNT, NUM_EDGES>();
         self.nodes.push(MegaNode::BarrierWait(node));
         self
@@ -2105,19 +2112,20 @@ mod tests {
 
     #[test]
     fn lowers_barrier_signal_and_wait() {
+        use crate::substrate::{EdgeId, ExpectedCount};
         let mut b = BuilderD::new();
-        b.push_barrier_signal::<0>();
-        b.push_barrier_wait::<0, 4>();
+        b.push_barrier_signal::<0>(EdgeId::<0, 4>::new());
+        b.push_barrier_wait::<0, 4>(EdgeId::<0, 4>::new(), ExpectedCount::<4>::new());
         let tape = b.finish();
         let MegaNode::BarrierSignal(s) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(s.edge(), 0);
+        assert_eq!(s.edge().raw(), 0);
         let MegaNode::BarrierWait(w) = &tape.nodes()[1] else {
             panic!();
         };
-        assert_eq!(w.edge(), 0);
-        assert_eq!(w.expected(), 4);
+        assert_eq!(w.edge().raw(), 0);
+        assert_eq!(w.expected().raw(), 4);
     }
 
     #[test]
@@ -2130,8 +2138,11 @@ mod tests {
         // Barriers don't bump the per-CTA mbarrier count, so the
         // next op's ARRIVES const stays at 0 even after two barriers.
         let mut b = BuilderD::new();
-        b.push_barrier_signal::<0>();
-        b.push_barrier_wait::<0, 4>();
+        b.push_barrier_signal::<0>(crate::substrate::EdgeId::<0, 4>::new());
+        b.push_barrier_wait::<0, 4>(
+            crate::substrate::EdgeId::<0, 4>::new(),
+            crate::substrate::ExpectedCount::<4>::new(),
+        );
         b.push_rms_norm(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),

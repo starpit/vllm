@@ -48,7 +48,8 @@ pub use nodes::{
 };
 pub use substrate::{
     ActSlotConst, ActSlotRef, ArrivesCount, AttentionScope, BarRef, BarSyncId, BarSyncPair,
-    BlockSize, BlockSizeRef, DistinctBarPairProof, EdgeId, Empty, ExpectedCount, Filled, GemmScope,
+    BlockSize, BlockSizeRef, DistinctBarPairProof, EdgeId, EdgeIdRef, Empty, ExpectedCount,
+    ExpectedCountRef, Filled, GemmScope,
     HeadDim, HeadDimRef, HiddenDim, HiddenDimRef, IntermediateDim, IntermediateDimRef,
     IsDistinctBarPair, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidBarSyncId,
     IsValidHiddenDim, IsValidWarpRole, IterCount, IterCountRef, KFull, KFullRef, KOffset,

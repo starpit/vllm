@@ -2494,44 +2494,39 @@ impl AttentionViaCacheNode {
 
 /// `BarrierSignal` variant.
 pub struct BarrierSignal {
-    edge: u32,
+    edge: crate::substrate::EdgeIdRef,
 }
 
 impl BarrierSignal {
-    pub const fn new<const IDX: u32, const NUM_EDGES: u32>() -> Self {
-        const {
-            assert!(IDX < NUM_EDGES, "BarrierSignal: IDX OOB");
+    pub fn new<const IDX: u32, const NUM_EDGES: u32>() -> Self {
+        Self {
+            edge: crate::substrate::EdgeId::<IDX, NUM_EDGES>::new().erase(),
         }
-        Self { edge: IDX }
     }
 
-    pub const fn edge(&self) -> u32 {
+    pub const fn edge(&self) -> crate::substrate::EdgeIdRef {
         self.edge
     }
 }
 
 /// `BarrierWait` variant.
 pub struct BarrierWait {
-    edge: u32,
-    expected: u32,
+    edge: crate::substrate::EdgeIdRef,
+    expected: crate::substrate::ExpectedCountRef,
 }
 
 impl BarrierWait {
-    pub const fn new<const IDX: u32, const COUNT: u32, const NUM_EDGES: u32>() -> Self {
-        const {
-            assert!(IDX < NUM_EDGES, "BarrierWait: IDX OOB");
-            assert!(COUNT > 0, "BarrierWait: COUNT must be > 0");
-        }
+    pub fn new<const IDX: u32, const COUNT: u32, const NUM_EDGES: u32>() -> Self {
         Self {
-            edge: IDX,
-            expected: COUNT,
+            edge: crate::substrate::EdgeId::<IDX, NUM_EDGES>::new().erase(),
+            expected: crate::substrate::ExpectedCount::<COUNT>::new().erase(),
         }
     }
 
-    pub const fn edge(&self) -> u32 {
+    pub const fn edge(&self) -> crate::substrate::EdgeIdRef {
         self.edge
     }
-    pub const fn expected(&self) -> u32 {
+    pub const fn expected(&self) -> crate::substrate::ExpectedCountRef {
         self.expected
     }
 }

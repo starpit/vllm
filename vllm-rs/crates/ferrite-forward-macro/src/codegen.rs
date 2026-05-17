@@ -4915,6 +4915,11 @@ struct PhaseCState {
     /// Maps directly to `weight_ptrs[idx * NUM_LAYERS + layer]` in
     /// the emitted `.cu` (see `ferrite_pool_abi_smoke.cu` reference).
     next_weight_accessor: u32,
+    /// `NUM_EDGES` from the synthesized substrate budget. Needed at
+    /// `BarrierSignal` / `BarrierWait` dispatch sites so the emitted
+    /// `EdgeId<IDX, NUM_EDGES>` typed primitive bound matches the
+    /// surrounding `MegaTapeBuilder<…, NUM_EDGES>` const-generic.
+    num_edges: u32,
 }
 
 impl PhaseCState {
@@ -4937,6 +4942,7 @@ impl PhaseCState {
         attn_softcap: f32,
         sliding_window: u32,
         sk_bucket: u32,
+        num_edges: u32,
     ) -> Self {
         Self {
             arrives: 0,
@@ -4959,6 +4965,7 @@ impl PhaseCState {
             sliding_window,
             sk_bucket,
             next_weight_accessor: 0,
+            num_edges,
         }
     }
 
@@ -5079,6 +5086,7 @@ fn emit_canonical_build_fn(
         attn_softcap,
         sliding_window,
         wp_sk_bucket,
+        num_edges,
     );
     let mut body = TokenStream::new();
 
@@ -6220,15 +6228,22 @@ fn dispatch_instruction_to_push(
         }
         I::BarrierSignal(edge) => {
             let edge_lit = lit(*edge);
+            let num_edges_lit = lit(state.num_edges.max(1));
             Ok(quote! {
-                b.push_barrier_signal::<#edge_lit>();
+                b.push_barrier_signal(
+                    ::ferrite_forward::mega_ir::EdgeId::<#edge_lit, #num_edges_lit>::new(),
+                );
             })
         }
         I::BarrierWait(edge, count) => {
             let edge_lit = lit(*edge);
             let count_lit = lit(*count);
+            let num_edges_lit = lit(state.num_edges.max(1));
             Ok(quote! {
-                b.push_barrier_wait::<#edge_lit, #count_lit>();
+                b.push_barrier_wait(
+                    ::ferrite_forward::mega_ir::EdgeId::<#edge_lit, #num_edges_lit>::new(),
+                    ::ferrite_forward::mega_ir::ExpectedCount::<#count_lit>::new(),
+                );
             })
         }
         I::CutlassFusedRmsNormGemm(in_slot, out_slot, layer, _tile_m, _tile_n, _stages, n, k) => {

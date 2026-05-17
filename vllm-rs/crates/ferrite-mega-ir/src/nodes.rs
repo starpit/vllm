@@ -1699,6 +1699,14 @@ pub struct Gemm {
     in_act_slot: crate::substrate::ActSlotRef,
     out_act_slot: crate::substrate::ActSlotRef,
     weight_accessor_idx: crate::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their `[M, TILE_N]` output slice" publish before warp 0
+    /// arrives on `page_done[out_page]`. Validity (1..=15) is
+    /// enforced at construction by `BarSyncId<ID>:
+    /// IsValidBarSyncId`. Gemm has no cross-warp reduction (each
+    /// warp owns disjoint output cols under the AlongN split), so
+    /// only one bar is needed.
+    consumer_bar_publish: crate::substrate::BarRef,
     pub weight: WeightRef,
 }
 
@@ -1726,9 +1734,18 @@ impl Gemm {
         const WEIGHT_ACCESSOR_IDX: u32,
         const TILE_N: u32,
         const CHUNK_K: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         weight: WeightRef,
-    ) -> Self {
+    ) -> Self
+    where
+        // Sealed-witness: BAR_PUBLISH ∈ 1..=15. ID 0 is reserved
+        // for `__syncthreads`; 16+ is out of PTX range. The where
+        // bound has no matching impl outside that range, so the
+        // call is rejected at type-check time.
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsValidBarSyncId,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "Gemm: IN_ID OOB");
             assert!(WEIGHT_ID < NUM_PAGES, "Gemm: WEIGHT_ID OOB");
@@ -1770,8 +1787,8 @@ impl Gemm {
             // per-warp. Don't pre-commit at the IR level.)
         }
         use crate::substrate::{
-            ActSlotConst, ChunkK, IterCount, MatmulK, MatmulM, MatmulN, MbarrierPhase, PageId,
-            ScratchBytesRef, ScratchOffsetRef, TileN, WeightAccessorConst,
+            ActSlotConst, BarSyncId, ChunkK, IterCount, MatmulK, MatmulM, MatmulN,
+            MbarrierPhase, PageId, ScratchBytesRef, ScratchOffsetRef, TileN, WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1792,6 +1809,7 @@ impl Gemm {
             out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
                 .erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
             weight,
         }
     }
@@ -1846,6 +1864,13 @@ impl Gemm {
     }
     pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
+    }
+    /// `bar.sync` ID for the consumer's "all warps wrote their
+    /// `[M, TILE_N]` output slice" publish before warp 0 arrives
+    /// on `page_done[out_page]`. Validity (1..=15) was discharged
+    /// by sealed-witness type-check at construction.
+    pub const fn consumer_bar_publish(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_publish
     }
 }
 

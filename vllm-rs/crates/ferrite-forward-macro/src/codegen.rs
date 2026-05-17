@@ -5694,6 +5694,12 @@ fn dispatch_instruction_to_push(
             let weight_str = weight.as_str();
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            // Fixed BAR ID in 1..=15 (bar 0 is __syncthreads). Gemm
+            // has no cross-warp reduction (each warp owns disjoint
+            // output cols), so only one publish bar is needed; the
+            // distinctness witness needed by reduce+publish pairs
+            // does not apply.
+            let consumer_bar_publish = lit(1u32);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
@@ -5720,6 +5726,7 @@ fn dispatch_instruction_to_push(
                     >::new(),
                     ::ferrite_forward::mega_ir::TileN::<#tile_n_lit>::new(),
                     ::ferrite_forward::mega_ir::ChunkK::<#chunk_k_lit>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_publish>::new(),
                     #weight_str.to_string(),
                 );
             })

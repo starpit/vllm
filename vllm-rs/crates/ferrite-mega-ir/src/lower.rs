@@ -928,6 +928,7 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
         const TILE_N: u32,
         const CHUNK_K: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::substrate::ArrivesCount<ARRIVES>,
@@ -951,8 +952,13 @@ impl<
         >,
         _tile_n: crate::substrate::TileN<TILE_N>,
         _chunk_k: crate::substrate::ChunkK<CHUNK_K>,
+        _consumer_bar_publish: crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
         weight_path: String,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsValidBarSyncId,
+    {
         self.verify_arrives(ARRIVES, "push_gemm");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(WEIGHT_ID);
@@ -980,6 +986,7 @@ impl<
             WEIGHT_ACCESSOR_IDX,
             TILE_N,
             CHUNK_K,
+            CONSUMER_BAR_PUBLISH,
         >(weight);
         self.nodes.push(MegaNode::Gemm(node));
         self.pool.release(IN_ID);
@@ -1973,8 +1980,8 @@ mod tests {
     fn lowers_gemm() {
         use crate::nodes::LayerIndex;
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, ChunkK, GemmScope, IterCount, MatmulK, MatmulM, MatmulN,
-            MbarrierPhase, PageId, ScratchRegion, TileN, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, ChunkK, GemmScope, IterCount, MatmulK,
+            MatmulM, MatmulN, MbarrierPhase, PageId, ScratchRegion, TileN, WeightAccessorConst,
         };
         // K=2048, ITERS=4 → CHUNK_K=512. N=4096, NCW=8 → TILE_N=512.
         let mut b = BuilderD::new();
@@ -1996,6 +2003,7 @@ mod tests {
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             TileN::<512>::new(),
             ChunkK::<512>::new(),
+            BarSyncId::<3>::new(),
             "W::gemm".to_string(),
         );
         let tape = b.finish(16);

@@ -480,6 +480,15 @@ impl RmsNorm {
 /// cos_sin_cache, KV cache pages, slot_mapping) come from the
 /// per-variant `KernelExtras` flag set propagated to the kernel
 /// signature.
+///
+/// Sprint 15a (S15a) IR ext: `num_tokens` (M dim) + `tile_n` +
+/// `chunk_k` (mirror Gemm S9 / TkFusedGemmAdd S11a / TkFusedNormGemm
+/// S13a) cover the AlongN + per-iter-K layout for the QKV linear
+/// projection. `consumer_bar_publish` (mirror FusedGateUpActivateMul
+/// S12a) covers the cross-warp publish before warp 0 arrives on
+/// `page_done` — only a single bar (no cross-warp reduction; the
+/// per-warp [M, TILE_N] mma + per-row RoPE rotates each warp's
+/// disjoint output cols independently).
 pub struct FusedQkvRopeCache {
     in_page: crate::ir::substrate::PageRef,
     qkv_weight_page: crate::ir::substrate::PageRef,
@@ -499,12 +508,33 @@ pub struct FusedQkvRopeCache {
     head_dim: crate::ir::substrate::HeadDimRef,
     num_q_heads: crate::ir::substrate::NumQHeadsRef,
     num_kv_heads: crate::ir::substrate::NumKvHeadsRef,
+    num_tokens: crate::ir::substrate::NumTokensRef,
+    /// Per-warp output N slice for the QKV linear projection
+    /// (AlongN warp split). Mirrors `Gemm::tile_n` /
+    /// `TkFusedGemmAdd::tile_n` / `FusedGateUpActivateMul::tile_n`.
+    /// Equality with `qkv_n / NCW` (where `qkv_n =
+    /// (num_q_heads + 2 * num_kv_heads) * head_dim`) is enforced at
+    /// emit time (NCW isn't a const generic on the builder).
+    tile_n: crate::ir::substrate::TileNRef,
+    /// Per-iter K-chunk width for the b_tile. Mirrors
+    /// `Gemm::chunk_k` / `TkFusedGemmAdd::chunk_k` /
+    /// `TkFusedNormGemm::chunk_k`. `chunk_k * iters == hidden_dim`
+    /// is enforced at construction.
+    chunk_k: crate::ir::substrate::ChunkKRef,
     in_act_slot: crate::ir::substrate::ActSlotRef,
     q_out_act_slot: crate::ir::substrate::ActSlotRef,
     k_out_act_slot: crate::ir::substrate::ActSlotRef,
     v_out_act_slot: crate::ir::substrate::ActSlotRef,
     qkv_weight_accessor_idx: crate::ir::substrate::WeightAccessorRef,
     rotary_accessor_idx: crate::ir::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their `[M, TILE_N]` matmul + RoPE-rotated output slice"
+    /// publish before warp 0 arrives on `page_done[q_out|k_out|v_out]`.
+    /// Mirrors `FusedGateUpActivateMul::consumer_bar_publish` (S12a).
+    /// Validity (1..=15) is enforced at construction by `BarSyncId<ID>:
+    /// IsValidBarSyncId`. AlongN split → no cross-warp reduction over
+    /// the tile, so only one bar is needed.
+    consumer_bar_publish: crate::ir::substrate::BarRef,
     pub qkv_weight: WeightRef,
     pub rotary: RotaryRef,
     pub biased: bool,
@@ -547,18 +577,27 @@ impl FusedQkvRopeCache {
         const HEAD_DIM: u32,
         const NUM_Q_HEADS: u32,
         const NUM_KV_HEADS: u32,
+        const NUM_TOKENS: u32,
         const IN_ACT_SLOT: u32,
         const Q_OUT_ACT_SLOT: u32,
         const K_OUT_ACT_SLOT: u32,
         const V_OUT_ACT_SLOT: u32,
         const QKV_WEIGHT_ACCESSOR_IDX: u32,
         const ROTARY_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         qkv_weight: WeightRef,
         rotary: RotaryRef,
         biased: bool,
         interleaved: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        // Sealed-witness: BAR_PUBLISH ∈ 1..=15. Mirrors S12a precedent.
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+    {
         const {
             assert!(IN_ID < NUM_PAGES, "FusedQkvRopeCache: IN_ID out of bounds");
             assert!(
@@ -635,14 +674,31 @@ impl FusedQkvRopeCache {
                 NUM_KV_HEADS > 0,
                 "FusedQkvRopeCache: NUM_KV_HEADS must be > 0"
             );
+            assert!(
+                NUM_TOKENS > 0,
+                "FusedQkvRopeCache: NUM_TOKENS must be > 0"
+            );
+            // Tile-layout invariants (mirror Gemm S9 / TkFusedGemmAdd
+            // S11a / TkFusedNormGemm S13a). AlongN warp split: each
+            // consumer warp covers TILE_N output cols. tile_n * NCW
+            // == qkv_n is enforced at emit time (NCW + qkv_n aren't
+            // const generics here). tile_n > 0 / chunk_k > 0 are.
+            assert!(TILE_N > 0, "FusedQkvRopeCache: TILE_N must be > 0");
+            assert!(CHUNK_K > 0, "FusedQkvRopeCache: CHUNK_K must be > 0");
+            // Per-iter K coverage: chunk_k * iters == hidden_dim.
+            assert!(
+                CHUNK_K * ITERS == HIDDEN_DIM,
+                "FusedQkvRopeCache: CHUNK_K * ITERS must equal HIDDEN_DIM"
+            );
         }
         // Each typed primitive's `new()` runs its substrate proof
         // (PageId<>: ID < NUM_PAGES; MbarrierPhase<>: P <= 1; etc.);
         // erase to opaque refs for storage. Bare `u32` cannot reach
         // the IR — they flow through typed primitive constructors.
         use crate::ir::substrate::{
-            ActSlotConst, HeadDim, HiddenDim, IterCount, MbarrierPhase, NumKvHeads, NumQHeads,
-            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, ChunkK, HeadDim, HiddenDim, IterCount, MbarrierPhase,
+            NumKvHeads, NumQHeads, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef,
+            TileN, WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -669,6 +725,9 @@ impl FusedQkvRopeCache {
             head_dim: HeadDim::<HEAD_DIM>::new().erase(),
             num_q_heads: NumQHeads::<NUM_Q_HEADS>::new().erase(),
             num_kv_heads: NumKvHeads::<NUM_KV_HEADS>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            tile_n: TileN::<TILE_N>::new().erase(),
+            chunk_k: ChunkK::<CHUNK_K>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
             q_out_act_slot: ActSlotConst::<Q_OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             k_out_act_slot: ActSlotConst::<K_OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
@@ -680,6 +739,7 @@ impl FusedQkvRopeCache {
             .erase(),
             rotary_accessor_idx: WeightAccessorConst::<ROTARY_ACCESSOR_IDX, { u32::MAX }>::new()
                 .erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
             qkv_weight,
             rotary,
             biased,
@@ -741,6 +801,15 @@ impl FusedQkvRopeCache {
     pub const fn num_kv_heads(&self) -> crate::ir::substrate::NumKvHeadsRef {
         self.num_kv_heads
     }
+    pub const fn num_tokens(&self) -> crate::ir::substrate::NumTokensRef {
+        self.num_tokens
+    }
+    pub const fn tile_n(&self) -> crate::ir::substrate::TileNRef {
+        self.tile_n
+    }
+    pub const fn chunk_k(&self) -> crate::ir::substrate::ChunkKRef {
+        self.chunk_k
+    }
     pub const fn in_act_slot(&self) -> crate::ir::substrate::ActSlotRef {
         self.in_act_slot
     }
@@ -758,6 +827,13 @@ impl FusedQkvRopeCache {
     }
     pub const fn rotary_accessor_idx(&self) -> crate::ir::substrate::WeightAccessorRef {
         self.rotary_accessor_idx
+    }
+    /// `bar.sync` ID for the consumer's "all warps wrote their
+    /// `[M, TILE_N]` matmul + RoPE-rotated output slice" publish
+    /// before warp 0 arrives on `page_done`. Validity (1..=15) was
+    /// discharged by sealed-witness type-check at construction.
+    pub const fn consumer_bar_publish(&self) -> crate::ir::substrate::BarRef {
+        self.consumer_bar_publish
     }
 }
 

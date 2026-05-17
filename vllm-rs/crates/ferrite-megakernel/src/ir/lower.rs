@@ -316,12 +316,16 @@ impl<
         const HEAD_DIM: u32,
         const NUM_Q_HEADS: u32,
         const NUM_KV_HEADS: u32,
+        const NUM_TOKENS: u32,
         const IN_ACT_SLOT: u32,
         const Q_OUT_ACT_SLOT: u32,
         const K_OUT_ACT_SLOT: u32,
         const V_OUT_ACT_SLOT: u32,
         const QKV_WEIGHT_ACCESSOR_IDX: u32,
         const ROTARY_ACCESSOR_IDX: u32,
+        const TILE_N: u32,
+        const CHUNK_K: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
@@ -351,6 +355,7 @@ impl<
         _head_dim: crate::ir::substrate::HeadDim<HEAD_DIM>,
         _num_q_heads: crate::ir::substrate::NumQHeads<NUM_Q_HEADS>,
         _num_kv_heads: crate::ir::substrate::NumKvHeads<NUM_KV_HEADS>,
+        _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
         _in_act_slot: crate::ir::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
         _q_out_act_slot: crate::ir::substrate::ActSlotConst<Q_OUT_ACT_SLOT, { u32::MAX }>,
         _k_out_act_slot: crate::ir::substrate::ActSlotConst<K_OUT_ACT_SLOT, { u32::MAX }>,
@@ -363,11 +368,18 @@ impl<
             ROTARY_ACCESSOR_IDX,
             { u32::MAX },
         >,
+        _tile_n: crate::ir::substrate::TileN<TILE_N>,
+        _chunk_k: crate::ir::substrate::ChunkK<CHUNK_K>,
+        _consumer_bar_publish: crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
         qkv_weight_path: String,
         rotary_path: String,
         biased: bool,
         interleaved: bool,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
+            crate::ir::substrate::IsValidBarSyncId,
+    {
         self.verify_arrives(ARRIVES, "push_fused_qkv_rope_cache");
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(QKV_ID);
@@ -400,12 +412,16 @@ impl<
             HEAD_DIM,
             NUM_Q_HEADS,
             NUM_KV_HEADS,
+            NUM_TOKENS,
             IN_ACT_SLOT,
             Q_OUT_ACT_SLOT,
             K_OUT_ACT_SLOT,
             V_OUT_ACT_SLOT,
             QKV_WEIGHT_ACCESSOR_IDX,
             ROTARY_ACCESSOR_IDX,
+            TILE_N,
+            CHUNK_K,
+            CONSUMER_BAR_PUBLISH,
         >(qkv_weight, rotary, biased, interleaved);
         self.nodes.push(MegaNode::FusedQkvRopeCache(node));
         self.pool.release(IN_ID);
@@ -1727,13 +1743,16 @@ mod tests {
     fn lowers_fused_qkv_rope_cache() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, HeadDim, HiddenDim, IterCount, MbarrierPhase,
-            NumKvHeads, NumQHeads, PageId, RopeScope, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, ChunkK, HeadDim, HiddenDim, IterCount,
+            MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId, RopeScope,
+            ScratchRegion, TileN, WeightAccessorConst,
         };
         let mut b = Builder8::new();
         // 6 distinct page ids, q_rope (0,2048) + k_rope (2048,2048) —
         // disjoint, within 8192 SCRATCH_BYTES. ITERS=4, LAYER=0,
         // NUM_LAYERS=16, ARRIVES=0, CONSUMER_PHASE=0, STORER_PHASE=1.
+        // S15a: NUM_TOKENS=8, TILE_N=768 (qkv_n=3072 / 4 NCW),
+        // CHUNK_K=512 (HIDDEN_DIM=2048 / ITERS=4), bar_publish=1.
         b.push_fused_qkv_rope_cache(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
@@ -1752,12 +1771,16 @@ mod tests {
             HeadDim::<64>::new(),
             NumQHeads::<32>::new(),
             NumKvHeads::<8>::new(),
+            NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
             ActSlotConst::<2, { u32::MAX }>::new(),
             ActSlotConst::<3, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
             WeightAccessorConst::<1, { u32::MAX }>::new(),
+            TileN::<768>::new(),
+            ChunkK::<512>::new(),
+            BarSyncId::<1>::new(),
             "W::qkv".to_string(),
             "W::rot".to_string(),
             true,
@@ -1778,6 +1801,10 @@ mod tests {
         assert_eq!(n.k_rope_offset().raw(), 2048);
         assert_eq!(n.k_rope_bytes().raw(), 2048);
         assert_eq!(n.iters().raw(), 4);
+        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.tile_n().raw(), 768);
+        assert_eq!(n.chunk_k().raw(), 512);
+        assert_eq!(n.consumer_bar_publish().raw(), 1);
         assert!(n.biased);
     }
 

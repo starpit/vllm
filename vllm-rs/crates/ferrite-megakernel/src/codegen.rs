@@ -806,7 +806,8 @@ pub fn dispatch_instruction_to_push(
             let k_bytes = lit(half);
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
-            let iters = lit(1u32);
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -824,6 +825,23 @@ pub fn dispatch_instruction_to_push(
             let interleaved_lit = *interleaved;
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            // S15a: matmul layout. M = num_tokens; K = hidden_dim;
+            // N = qkv_n = (num_q_heads + 2*num_kv_heads) * head_dim.
+            // TILE_N = qkv_n / NCW (AlongN warp split). Fall back to
+            // qkv_n when NCW doesn't divide; the IR only requires
+            // TILE_N > 0. Mirrors S10 / S11a / S12a / S13a.
+            let num_tokens_const = state.num_tokens;
+            let num_tokens_lit = lit(num_tokens_const);
+            let qkv_n =
+                (state.num_q_heads + 2 * state.num_kv_heads) * state.head_dim;
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && qkv_n % ncw == 0 { qkv_n / ncw } else { qkv_n };
+            let tile_n_lit = lit(tile_n_const);
+            // ITERS=1 today → CHUNK_K must equal HIDDEN_DIM (S15a IR invariant).
+            let chunk_k_lit = lit(state.hidden_dim / iters_const);
+            // Single named bar for the post-mma + RoPE publish.
+            // Mirror of FusedGateUpActivateMul S12a (BarSyncId=1).
+            let consumer_bar_publish = lit(1u32);
             state.arrives += 1;
             state.next_weight_accessor += 2;
             Ok(quote! {
@@ -849,6 +867,7 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::HeadDim::<#head_dim>::new(),
                     ::ferrite_megakernel::ir::NumQHeads::<#num_q_heads>::new(),
                     ::ferrite_megakernel::ir::NumKvHeads::<#num_kv_heads>::new(),
+                    ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens_lit>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#q_out_act_slot, { u32::MAX }>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#k_out_act_slot, { u32::MAX }>::new(),
@@ -859,6 +878,9 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::WeightAccessorConst::<
                         #rotary_accessor_idx, { u32::MAX },
                     >::new(),
+                    ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
+                    ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
+                    ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
                     #qkv_path.to_string(),
                     #rotary_path.to_string(),
                     #biased_lit,
@@ -915,7 +937,8 @@ pub fn dispatch_instruction_to_push(
             let k_bytes = lit(half);
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
-            let iters = lit(1u32);
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -933,6 +956,18 @@ pub fn dispatch_instruction_to_push(
             let interleaved_lit = *interleaved;
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            // S15a: same matmul-layout defaults as FusedQkvRopeCache.
+            // RopeAppend is structurally identical at the IR level
+            // (the runtime kernel handles the no-qkv-matmul shape via
+            // the qkv sentinel path).
+            let num_tokens_lit = lit(state.num_tokens);
+            let qkv_n =
+                (state.num_q_heads + 2 * state.num_kv_heads) * state.head_dim;
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && qkv_n % ncw == 0 { qkv_n / ncw } else { qkv_n };
+            let tile_n_lit = lit(tile_n_const);
+            let chunk_k_lit = lit(state.hidden_dim / iters_const);
+            let consumer_bar_publish = lit(1u32);
             state.arrives += 1;
             state.next_weight_accessor += 2;
             Ok(quote! {
@@ -958,6 +993,7 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::HeadDim::<#head_dim>::new(),
                     ::ferrite_megakernel::ir::NumQHeads::<#num_q_heads>::new(),
                     ::ferrite_megakernel::ir::NumKvHeads::<#num_kv_heads>::new(),
+                    ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens_lit>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#q_out_act_slot, { u32::MAX }>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#k_out_act_slot, { u32::MAX }>::new(),
@@ -968,6 +1004,9 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::WeightAccessorConst::<
                         #rotary_accessor_idx, { u32::MAX },
                     >::new(),
+                    ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
+                    ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
+                    ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
                     #qkv_sentinel.to_string(),
                     #rotary_path.to_string(),
                     #biased_lit,

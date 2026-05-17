@@ -15,7 +15,7 @@
 //! at the corresponding tape position so the structural shape of
 //! the emitted `.cu` is preserved.
 
-use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
+use crate::nodes::{Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -56,7 +56,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::RmsNorm(n) => emit_rms_norm(n, budget),
         MegaNode::FusedQkvRopeCache(_) => RoleBodies::skipped("FusedQkvRopeCache"),
         MegaNode::Add(n) => emit_add(n, budget),
-        MegaNode::FusedAddRmsNorm(_) => RoleBodies::skipped("FusedAddRmsNorm"),
+        MegaNode::FusedAddRmsNorm(n) => emit_fused_add_rms_norm(n, budget),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
@@ -583,4 +583,164 @@ fn emit_tanh_soft_cap(n: &TanhSoftCap, budget: TapeBudget) -> RoleBodies {
         skipped: None,
     }
 }
+
+// ============================================================
+// FusedAddRmsNorm — residual += delta, then RmsNorm in-place.
+// ============================================================
+//
+// Page lifecycle:
+//
+//   delta_page:    Empty → Filled (loader TMA)
+//                        → Empty (consumer arrive page_consumed)
+//   residual_page: Empty → Filled (loader TMA)
+//                        → Produced (consumer warp::store)
+//                        → Empty (storer TMA + arrive page_consumed)
+//   weight_page:   Empty → Filled (loader TMA)
+//                        → Empty (consumer arrive page_consumed)
+//
+// Consumer body: warp::load delta + residual into fp32 rvs;
+// warp::add to fold; rms_norm_scale_from_rv on the folded rv (uses
+// BAR_REDUCE for cross-warp sum-of-squares); warp::mul by scale;
+// warp::load weight; warp::mul by weight; warp::store back to
+// residual page. group<NCW>::sync(BAR_PUBLISH) before warp 0
+// publishes page_done.
+
+fn emit_fused_add_rms_norm(n: &FusedAddRmsNorm, budget: TapeBudget) -> RoleBodies {
+    let delta_page = n.delta_page();
+    let residual_page = n.residual_page();
+    let weight_page = n.weight_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let layer = n.layer().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let delta_act_slot = n.delta_act_slot().raw();
+    let residual_act_slot = n.residual_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+    let bar_reduce = n.consumer_bar_reduce().raw();
+    let bar_publish = n.consumer_bar_publish().raw();
+    let eps_value = n.eps().raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_fused_add_rms_norm: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+    let num_layers = budget.num_layers.max(1);
+
+    let delta_smem = page_as_sv_bf(delta_page, hidden_dim);
+    let residual_smem = page_as_sv_bf(residual_page, hidden_dim);
+    let weight_smem = page_as_sv_bf(weight_page, hidden_dim);
+    let delta_ready = page_ready_sem(delta_page);
+    let residual_ready = page_ready_sem(residual_page);
+    let weight_ready = page_ready_sem(weight_page);
+    let residual_done = page_done_sem(residual_page);
+    let delta_consumed = page_consumed_sem(delta_page);
+    let residual_consumed = page_consumed_sem(residual_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let partial = scratch_as::<super::handles::F32>(n.partial_offset());
+    let delta_gmem = gmem_act_ptr_bf16(delta_act_slot);
+    let residual_gmem = gmem_act_ptr_bf16(residual_act_slot);
+    let weight_gmem = gmem_weight_ptr_bf16(weight_accessor_idx, layer, num_layers);
+
+    let bf16_size_bytes = 2;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+    let weight_bytes = hidden_dim * bf16_size_bytes;
+
+    // Loader.
+    let mut loader = CuBlock::new();
+    let loader_phase = storer_phase;
+    loader.push(super::tk::wait(&delta_consumed, loader_phase));
+    loader.push(super::tk::wait(&residual_consumed, loader_phase));
+    loader.push(super::tk::wait(&weight_consumed, loader_phase));
+    loader.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    loader.push(super::tk::tma_expect_bytes(&delta_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &delta_smem,
+        &delta_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &delta_ready,
+    ));
+    loader.push(super::tk::tma_expect_bytes(&residual_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &residual_smem,
+        &residual_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &residual_ready,
+    ));
+    loader.push(super::tk::tma_expect_bytes(&weight_ready, weight_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &weight_smem,
+        &weight_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &weight_ready,
+    ));
+    loader.push(CuStmt::new("}".to_string()));
+
+    let launcher = CuBlock::new();
+
+    // Consumer.
+    let mut consumer = CuBlock::new();
+    consumer.push(super::tk::wait(&delta_ready, consumer_phase));
+    consumer.push(super::tk::wait(&residual_ready, consumer_phase));
+    consumer.push(super::tk::wait(&weight_ready, consumer_phase));
+    let delta_slice = warp_slice_sv_bf(&delta_smem, ncw, k_per_warp);
+    let residual_slice = warp_slice_sv_bf(&residual_smem, ncw, k_per_warp);
+    let weight_slice = warp_slice_sv_bf(&weight_smem, ncw, k_per_warp);
+    let (decl_delta, delta_rv) = super::tk::decl_rv_fl("__farn_delta_rv", k_per_warp);
+    let (decl_res, res_rv) = super::tk::decl_rv_fl("__farn_res_rv", k_per_warp);
+    let (decl_w, weight_rv) = super::tk::decl_rv_fl("__farn_weight_rv", k_per_warp);
+    consumer.push(decl_delta);
+    consumer.push(decl_res);
+    consumer.push(decl_w);
+    consumer.push(super::tk::warp_load_bf16_to_f32(&delta_rv, &delta_slice));
+    consumer.push(super::tk::warp_load_bf16_to_f32(&res_rv, &residual_slice));
+    consumer.push(super::tk::warp_add_f32(&res_rv, &res_rv, &delta_rv));
+    let eps_lit = CuExpr::new(format!("{:e}f", eps_value));
+    let scale_expr = super::tk::rms_norm_scale_from_rv(
+        ncw, hidden_dim, bar_reduce, &res_rv, &eps_lit, &partial,
+    );
+    consumer.push(CuStmt::new(format!(
+        "const float __farn_scale = {scale_expr};"
+    )));
+    consumer.push(super::tk::warp_mul_f32_scalar(
+        &res_rv,
+        &res_rv,
+        &CuExpr::new("__farn_scale".to_string()),
+    ));
+    consumer.push(super::tk::warp_load_bf16_to_f32(&weight_rv, &weight_slice));
+    consumer.push(super::tk::warp_mul_f32(&res_rv, &res_rv, &weight_rv));
+    consumer.push(super::tk::warp_store_bf16(&residual_slice, &res_rv));
+    consumer.push(CuStmt::new(format!(
+        "kittens::group<{ncw}>::sync({bar_publish});"
+    )));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(super::tk::arrive(&residual_done));
+    consumer.push(super::tk::arrive(&delta_consumed));
+    consumer.push(super::tk::arrive(&weight_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer.
+    let mut storer = CuBlock::new();
+    storer.push(super::tk::wait(&residual_done, storer_phase));
+    storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    storer.push(super::tk::tma_store_async_bf16(
+        &residual_gmem,
+        &residual_smem,
+        &CuExpr::new("{0}".to_string()),
+    ));
+    storer.push(super::tk::tma_store_async_wait());
+    storer.push(super::tk::arrive(&residual_consumed));
+    storer.push(CuStmt::new("}".to_string()));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
 

@@ -5709,6 +5709,10 @@ fn dispatch_instruction_to_push(
             let eps_lit = state.rms_norm_eps;
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            // Fixed BAR IDs in 1..=15 (bar 0 is __syncthreads).
+            // Distinct so the IsDistinctBarPair witness compiles.
+            let consumer_bar_reduce = lit(1u32);
+            let consumer_bar_publish = lit(2u32);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
@@ -5730,6 +5734,12 @@ fn dispatch_instruction_to_push(
                     ::ferrite_forward::mega_ir::ActSlotConst::<#residual_act_slot, { u32::MAX }>::new(),
                     ::ferrite_forward::mega_ir::WeightAccessorConst::<
                         #weight_accessor_idx, { u32::MAX },
+                    >::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_reduce>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_publish>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncPair::<
+                        #consumer_bar_reduce,
+                        #consumer_bar_publish,
                     >::new(),
                     #weight_str.to_string(),
                     #eps_lit,

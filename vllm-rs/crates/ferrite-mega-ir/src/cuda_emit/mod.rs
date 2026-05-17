@@ -435,6 +435,65 @@ mod tests {
         }
     }
 
+    /// Sprint 5 — FusedAddRmsNorm: residual += delta then RmsNorm
+    /// in-place. Verifies the consumer body splices warp::add for
+    /// the residual fold AND `rms_norm_scale_from_rv` (not
+    /// `rms_norm_vec`, which would re-load the activations).
+    #[test]
+    fn lower_fused_add_rms_norm_to_cuda_smoke() {
+        use crate::substrate::RmsNormScope;
+        let mut b = BuilderD::new();
+        b.push_fused_add_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // delta
+            PageId::<1, 8>::new(), // residual
+            PageId::<2, 8>::new(), // weight
+            ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<3, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(), // delta_act_slot
+            ActSlotConst::<1, { u32::MAX }>::new(), // residual_act_slot
+            WeightAccessorConst::<5, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
+            "W::farn_norm".to_string(),
+            1.0e-5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_farn", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "expected zero skipped variants, got {:?}",
+            cu.skipped_variants
+        );
+        for needle in [
+            // Loader TMA-loads delta (page 0), residual (page 1), weight (page 2).
+            "kittens::tma::expect_bytes(ss.page_ready[0], 4096);",
+            "kittens::tma::expect_bytes(ss.page_ready[1], 4096);",
+            "kittens::tma::expect_bytes(ss.page_ready[2], 4096);",
+            "g.weight_ptrs[5 * 16 + 3]",
+            // Consumer: warp::add for the residual fold + scale_from_rv.
+            "kittens::warp::add(__farn_res_rv, __farn_res_rv, __farn_delta_rv);",
+            "ferrite::tk::rms_norm_scale_from_rv<8, 2048, 1>(__farn_res_rv,",
+            "kittens::warp::mul(__farn_res_rv, __farn_res_rv, __farn_scale);",
+            "kittens::warp::mul(__farn_res_rv, __farn_res_rv, __farn_weight_rv);",
+            // BAR_PUBLISH=2.
+            "kittens::group<8>::sync(2);",
+            // Storer back to residual_act_slot=1.
+            "kittens::tma::store_async(g.act_ptrs[1], (*reinterpret_cast<kittens::sv_bf<2048>*>(ss.pages[1]))",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected source to contain {needle:?}, source was:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// A tape with only a SKIPPED variant produces a `.cu` that
     /// still has the full substrate scaffold but reports the
     /// skipped variant in diagnostics + as a `// SKIPPED` comment.

@@ -244,6 +244,68 @@ pub fn rms_norm_vec(
     )
 }
 
+/// `ferrite::tk::rms_norm_scale_from_rv<NCW, HIDDEN_DIM, BAR>(rv,
+/// eps, partial_sums_scratch)` returning the scalar `rsqrt(mean(x^2)
+/// + eps)` replicated across all lanes of the warp.
+///
+/// Mirrors `ferrite_tk_helpers.cuh::rms_norm_scale_from_rv`. Used
+/// by `FusedAddRmsNorm` (where the rv comes from a residual add in
+/// registers, not from a shared load — `rms_norm_vec` is the wrong
+/// shape because it does its own `warp::load`).
+///
+/// Returns a CUDA expression of fp32 type — typically bound to a
+/// local with `auto scale = ...;` then passed as the scalar arg to
+/// `warp::mul`.
+pub fn rms_norm_scale_from_rv(
+    ncw: u32,
+    hidden_dim: u32,
+    bar: u32,
+    rv: &RegColVec<F32>,
+    eps_expr: &CuExpr,
+    partial_sums_scratch: &ScratchPtr<F32>,
+) -> CuExpr {
+    debug_assert!(
+        (1..=15).contains(&bar),
+        "rms_norm_scale_from_rv: bar ({bar}) must be in 1..=15"
+    );
+    debug_assert!(
+        ncw > 0 && rv.len() == hidden_dim / ncw,
+        "rms_norm_scale_from_rv: rv length ({}) must equal HIDDEN_DIM ({hidden_dim}) / NCW ({ncw})",
+        rv.len()
+    );
+    CuExpr::new(format!(
+        "ferrite::tk::rms_norm_scale_from_rv<{ncw}, {hidden_dim}, {bar}>({rv}, {eps}, {partial})",
+        rv = rv.expr(),
+        eps = eps_expr,
+        partial = partial_sums_scratch.expr()
+    ))
+}
+
+/// `kittens::warp::mul(dst_rv, lhs_rv, rhs_rv);` — elementwise
+/// fp32 register-vector multiply. `dst` may alias `lhs` or `rhs`.
+pub fn warp_mul_f32(
+    dst: &RegColVec<F32>,
+    lhs: &RegColVec<F32>,
+    rhs: &RegColVec<F32>,
+) -> CuStmt {
+    debug_assert_eq!(
+        dst.len(),
+        lhs.len(),
+        "warp_mul_f32: dst.len() must equal lhs.len()"
+    );
+    debug_assert_eq!(
+        lhs.len(),
+        rhs.len(),
+        "warp_mul_f32: lhs.len() must equal rhs.len()"
+    );
+    CuStmt::new(format!(
+        "kittens::warp::mul({dst}, {lhs}, {rhs});",
+        dst = dst.expr(),
+        lhs = lhs.expr(),
+        rhs = rhs.expr()
+    ))
+}
+
 /// `ferrite::tk::tanh_softcap_vec(rv, cap);` — in-place per-lane
 /// `x = tanhf(x / cap) * cap`. Mirrors
 /// `ferrite_tk_helpers.cuh::tanh_softcap_vec`. No cross-warp

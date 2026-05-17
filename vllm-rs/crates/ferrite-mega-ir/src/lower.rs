@@ -484,6 +484,8 @@ impl<
         const DELTA_ACT_SLOT: u32,
         const RESIDUAL_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
         _arrives: crate::substrate::ArrivesCount<ARRIVES>,
@@ -507,9 +509,18 @@ impl<
             WEIGHT_ACCESSOR_IDX,
             { u32::MAX },
         >,
+        _bar_reduce: crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>,
+        _bar_publish: crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+        _bar_pair: crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>,
         weight_path: String,
         eps: f32,
-    ) -> &mut Self {
+    ) -> &mut Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsDistinctBarPair,
+    {
         self.verify_arrives(ARRIVES, "push_fused_add_rms_norm");
         let _ = self.pool.take(DELTA_ID);
         let _ = self.pool.take(RESIDUAL_ID);
@@ -534,6 +545,8 @@ impl<
             DELTA_ACT_SLOT,
             RESIDUAL_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
+            CONSUMER_BAR_REDUCE,
+            CONSUMER_BAR_PUBLISH,
         >(weight, eps);
         self.nodes.push(MegaNode::FusedAddRmsNorm(node));
         self.pool.release(DELTA_ID);
@@ -1686,8 +1699,8 @@ mod tests {
     fn lowers_fused_add_rms_norm() {
         use crate::nodes::LayerIndex;
         use crate::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
-            RmsNormScope, ScratchRegion, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         let mut b = Builder6::new();
         b.push_fused_add_rms_norm(
@@ -1704,6 +1717,9 @@ mod tests {
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
             WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::norm".to_string(),
             1.0e-5_f32,
         );

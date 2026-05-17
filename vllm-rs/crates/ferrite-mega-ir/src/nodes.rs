@@ -868,6 +868,16 @@ pub struct FusedAddRmsNorm {
     delta_act_slot: crate::substrate::ActSlotRef,
     residual_act_slot: crate::substrate::ActSlotRef,
     weight_accessor_idx: crate::substrate::WeightAccessorRef,
+    /// Cross-warp `bar.sync` ID for the consumer's sum-of-squares
+    /// reduction across consumer warps. Type-checked in 1..=15.
+    consumer_bar_reduce: crate::substrate::BarRef,
+    /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
+    /// their output slice" publish before warp 0 arrives on
+    /// `page_done`. Distinct from `consumer_bar_reduce`.
+    consumer_bar_publish: crate::substrate::BarRef,
+    /// Witness that `consumer_bar_reduce != consumer_bar_publish`.
+    /// Storage-erased zero-sized token whose existence is the proof.
+    bar_pair_proof: crate::substrate::DistinctBarPairProof,
     eps: FiniteF32,
     pub weight: WeightRef,
 }
@@ -892,10 +902,18 @@ impl FusedAddRmsNorm {
         const DELTA_ACT_SLOT: u32,
         const RESIDUAL_ACT_SLOT: u32,
         const WEIGHT_ACCESSOR_IDX: u32,
+        const CONSUMER_BAR_REDUCE: u32,
+        const CONSUMER_BAR_PUBLISH: u32,
     >(
         weight: WeightRef,
         eps: FiniteF32,
-    ) -> Self {
+    ) -> Self
+    where
+        crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>: crate::substrate::IsValidBarSyncId,
+        crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>:
+            crate::substrate::IsDistinctBarPair,
+    {
         const {
             assert!(DELTA_ID < NUM_PAGES, "FusedAddRmsNorm: DELTA_ID OOB");
             assert!(RESIDUAL_ID < NUM_PAGES, "FusedAddRmsNorm: RESIDUAL_ID OOB");
@@ -922,8 +940,8 @@ impl FusedAddRmsNorm {
             assert!(NUM_TOKENS > 0, "FusedAddRmsNorm: NUM_TOKENS must be > 0");
         }
         use crate::substrate::{
-            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef,
-            ScratchOffsetRef, WeightAccessorConst,
+            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase, NumTokensConst,
+            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
         };
         Self {
             delta_page: PageId::<DELTA_ID, NUM_PAGES>::new().erase(),
@@ -939,6 +957,10 @@ impl FusedAddRmsNorm {
             delta_act_slot: ActSlotConst::<DELTA_ACT_SLOT, { u32::MAX }>::new().erase(),
             residual_act_slot: ActSlotConst::<RESIDUAL_ACT_SLOT, { u32::MAX }>::new().erase(),
             weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
+            consumer_bar_reduce: BarSyncId::<CONSUMER_BAR_REDUCE>::new().erase(),
+            consumer_bar_publish: BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase(),
+            bar_pair_proof: BarSyncPair::<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>::new()
                 .erase(),
             eps,
             weight,
@@ -983,6 +1005,15 @@ impl FusedAddRmsNorm {
     }
     pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
+    }
+    pub const fn consumer_bar_reduce(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_reduce
+    }
+    pub const fn consumer_bar_publish(&self) -> crate::substrate::BarRef {
+        self.consumer_bar_publish
+    }
+    pub const fn bar_pair_proof(&self) -> crate::substrate::DistinctBarPairProof {
+        self.bar_pair_proof
     }
     pub fn eps(&self) -> FiniteF32 {
         self.eps
